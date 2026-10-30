@@ -67,7 +67,7 @@ bad_sql(q{SELECT dolt_rebase('--abort')},qr/no rebase in progress/,'nothing to a
 # Conflicting picks abort with Dolt's message.
 $s->query_safe(q{SELECT dolt_checkout('main'); UPDATE t SET v='main-one' WHERE pk=0; SELECT dolt_commit('-am','main edits 0'); SELECT dolt_checkout('branch1'); UPDATE t SET v='branch-one' WHERE pk=0; SELECT dolt_commit('-am','branch edits 0')});
 $s->query_safe(q{SELECT dolt_rebase('-i','main')});
-bad_sql(q{SELECT dolt_rebase('--continue')},qr/data conflict detected while rebasing commit [0-9a-f]+ \(branch edits 0\)/,'conflicting commit');
+bad_sql(q{SELECT dolt_rebase('--continue')},qr/data conflict detected while rebasing commit [0-9a-v]{32} \(branch edits 0\)/,'conflicting commit');
 $s->query_safe(q{SELECT dolt_rebase('--abort')});
 # ---- stash ----
 $s->query_safe(q{SELECT dolt_checkout('main')});

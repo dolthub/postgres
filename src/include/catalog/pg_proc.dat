@@ -12922,3 +12922,8 @@
  proname => 'dolt_user_table', prorows => '100', proretset => 't',
  provolatile => 'v', proparallel => 'u', prorettype => 'record',
  proargtypes => 'text', prosrc => 'dolt_user_table' },
+
+{ oid => '9245', descr => 'format a Dolt content address', proname => 'dolt_hash_encode',
+ prorettype => 'text', proargtypes => 'bytea', prosrc => 'dolt_hash_encode' },
+{ oid => '9246', descr => 'parse a Dolt content address', proname => 'dolt_hash_decode',
+ prorettype => 'bytea', proargtypes => 'text', prosrc => 'dolt_hash_decode' },

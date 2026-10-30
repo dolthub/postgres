@@ -67,6 +67,56 @@ pl_hash_bytes(PLSlice bytes, PLHash *out)
 	return true;
 }
 
+/* Dolt's big-endian, unpadded base-32 alphabet; 20 bytes = 32 digits. */
+void
+pl_hash_format(PLHash hash, char out[PL_HASH_TEXT_SIZE + 1])
+{
+	static const char alphabet[] = "0123456789abcdefghijklmnopqrstuv";
+	int			i;
+
+	for (i = 0; i < PL_HASH_TEXT_SIZE; i++)
+	{
+		int			bit = i * 5;
+		int			byte = bit / 8;
+		unsigned int pair = (unsigned int) hash.bytes[byte] << 8;
+
+		if (byte + 1 < PL_HASH_SIZE)
+			pair |= hash.bytes[byte + 1];
+		out[i] = alphabet[(pair >> (11 - bit % 8)) & 31];
+	}
+	out[PL_HASH_TEXT_SIZE] = '\0';
+}
+
+bool
+pl_hash_parse(const char *text, PLHash *out)
+{
+	PLHash		result = {{0}};
+	int			i;
+
+	if (strlen(text) != PL_HASH_TEXT_SIZE)
+		return false;
+	for (i = 0; i < PL_HASH_TEXT_SIZE; i++)
+	{
+		unsigned char c = (unsigned char) text[i];
+		unsigned int value;
+		int			bit = i * 5;
+		int			byte = bit / 8;
+
+		if (c >= '0' && c <= '9')
+			value = c - '0';
+		else if (c >= 'a' && c <= 'v')
+			value = c - 'a' + 10;
+		else
+			return false;
+		value <<= 11 - bit % 8;
+		result.bytes[byte] |= value >> 8;
+		if (byte + 1 < PL_HASH_SIZE)
+			result.bytes[byte + 1] |= value & 255;
+	}
+	*out = result;
+	return true;
+}
+
 int
 pl_compare(PLSlice a, PLSlice b)
 {

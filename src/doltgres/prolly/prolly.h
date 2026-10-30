@@ -11,6 +11,7 @@
  * addresses are. Nodes, rows and version objects are all addressed by it.
  */
 #define PL_HASH_SIZE 20
+#define PL_HASH_TEXT_SIZE 32
 #define PL_SHA256_SIZE 32
 #define PL_MAX_ITEM (16U * 1024U * 1024U)
 
@@ -35,6 +36,9 @@ typedef struct PLHash
 {
 	uint8_t		bytes[PL_HASH_SIZE];
 } PLHash;
+
+void pl_hash_format(PLHash hash, char out[PL_HASH_TEXT_SIZE + 1]);
+bool pl_hash_parse(const char *text, PLHash *out);
 
 typedef struct PLStore PLStore;
 typedef struct PLTree

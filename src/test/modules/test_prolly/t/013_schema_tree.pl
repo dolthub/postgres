@@ -42,11 +42,11 @@ is(sql("SELECT v FROM t AS OF '$commented'"), 'second', 'aborted schema capture 
 # JSON descriptor from the live catalog's known portable fields, with the same
 # content child. This tests a mixed-format commit, not an upgrade rewrite.
 my $legacy = sql(q{SELECT encode(dolt_manifest_put('schema',convert_to('{"format":"DGTABLE1","name":"public.t","owner":"reader","acl":[],"columns":[{"name":"id","type":"int4","typmod":-1},{"name":"v","type":"text","typmod":-1}]}','UTF8'),ARRAY[]::bytea[]),'hex')});
-my $db = sql("SELECT encode(objchildren[1],'hex') FROM pg_dolt_object WHERE objhash=decode('$commented','hex')");
+my $db = sql("SELECT encode(objchildren[1],'hex') FROM pg_dolt_object WHERE objhash=dolt_hash_decode('$commented')");
 my $table = sql("SELECT encode(t.objhash,'hex') FROM pg_dolt_object db CROSS JOIN LATERAL unnest(db.objchildren) ch JOIN pg_dolt_object t ON t.objhash=ch WHERE db.objhash=decode('$db','hex') AND t.objkind='table'");
 my $legacy_table = sql("SELECT encode(dolt_manifest_put('table',objpayload,ARRAY[decode('$legacy','hex'),objchildren[2]]),'hex') FROM pg_dolt_object WHERE objhash=decode('$table','hex')");
 my $legacy_db = sql("SELECT encode(dolt_manifest_put('database',objpayload,ARRAY(SELECT CASE WHEN h=decode('$table','hex') THEN decode('$legacy_table','hex') ELSE h END FROM unnest(objchildren) h)),'hex') FROM pg_dolt_object WHERE objhash=decode('$db','hex')");
-my $legacy_commit = sql("SELECT encode(dolt_manifest_put('commit',objpayload,ARRAY[decode('$legacy_db','hex')]),'hex') FROM pg_dolt_object WHERE objhash=decode('$commented','hex')");
+my $legacy_commit = sql("SELECT dolt_hash_encode(dolt_manifest_put('commit',objpayload,ARRAY[decode('$legacy_db','hex')])) FROM pg_dolt_object WHERE objhash=dolt_hash_decode('$commented')");
 is(sql("SET ROLE reader; SELECT v FROM t AS OF '$legacy_commit'"), 'second', 'legacy JSON schemas remain readable in mixed-format history');
 # Invalid typed edges are rejected before publication.
 my ($status, $out, $err) = $node->psql('postgres', "SELECT dolt_manifest_put('schema','invalid'::bytea,ARRAY[(SELECT objchildren[1] FROM pg_dolt_object WHERE objhash=decode('$schema','hex'))])");

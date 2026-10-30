@@ -1153,10 +1153,42 @@ test_format_and_resolver_lifetime(void)
 	pl_store_free(store);
 }
 
+static void
+test_hash_text(void)
+{
+	PLHash		hash = {{0}}, parsed;
+	char text[	PL_HASH_TEXT_SIZE + 1];
+	int			i;
+
+	pl_hash_format(hash, text);
+	CHECK(strcmp(text, "00000000000000000000000000000000") == 0);
+	for (i = 0; i < PL_HASH_SIZE; i++)
+		hash.bytes[i] = (uint8_t) i;
+	pl_hash_format(hash, text);
+	CHECK(strcmp(text, "000g40o40k30e209185go38e1s8124gj") == 0);
+	CHECK(pl_hash_parse(text, &parsed) && pl_hash_equal(hash, parsed));
+	memset(hash.bytes, 255, PL_HASH_SIZE);
+	pl_hash_format(hash, text);
+	CHECK(strcmp(text, "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv") == 0);
+	CHECK(pl_hash_parse(text, &parsed) && pl_hash_equal(hash, parsed));
+	CHECK(!pl_hash_parse("0000000000000000000000000000000", &parsed));
+	CHECK(!pl_hash_parse("000000000000000000000000000000000", &parsed));
+	CHECK(!pl_hash_parse("w0000000000000000000000000000000", &parsed));
+	CHECK(!pl_hash_parse("V0000000000000000000000000000000", &parsed));
+	for (i = 0; i < PL_HASH_SIZE * 8; i++)
+	{
+		memset(hash.bytes, 0, PL_HASH_SIZE);
+		hash.bytes[i / 8] = 1 << (i % 8);
+		pl_hash_format(hash, text);
+		CHECK(pl_hash_parse(text, &parsed) && pl_hash_equal(hash, parsed));
+	}
+}
+
 int
 main(int argc, char **argv)
 {
 	file_mode = argc == 2 && strcmp(argv[1], "--file") == 0;
+	test_hash_text();
 	test_tuples();
 	test_tuple_view();
 	test_tree();

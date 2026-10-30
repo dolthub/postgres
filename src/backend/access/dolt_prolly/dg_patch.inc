@@ -272,7 +272,7 @@ revision_hash_label(const char *revision)
 {
 	if (!pg_strcasecmp(revision, "WORKING") || !pg_strcasecmp(revision, "STAGED"))
 		return pstrdup(revision);
-	return hex(resolve(revision));
+	return hash_format(resolve(revision));
 }
 
 Datum

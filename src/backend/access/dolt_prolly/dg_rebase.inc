@@ -92,7 +92,7 @@ rebase_plan_rows(const char *rebasebranch, bytea *head, bytea *upstream)
 	char	  **hashes,
 			  **messages;
 
-	run("WITH RECURSIVE a(h,d) AS (SELECT $1::bytea,0 UNION SELECT unnest(o.objchildren[2:]),a.d+1 FROM a JOIN pg_dolt_object_visible o ON o.objhash=a.h), b(h) AS (SELECT $2::bytea UNION SELECT unnest(o.objchildren[2:]) FROM b JOIN pg_dolt_object_visible o ON o.objhash=b.h), x AS (SELECT h,min(d) AS d FROM a WHERE h NOT IN (SELECT h FROM b) GROUP BY h) SELECT encode(x.h,'hex'),convert_from(o.objpayload,'UTF8')::jsonb->>'message' FROM x JOIN pg_dolt_object_visible o ON o.objhash=x.h WHERE o.objkind='commit' ORDER BY x.d DESC,x.h", 2, VC_TYPES(BYTEAOID, BYTEAOID), VC_ARGS(PointerGetDatum(head), PointerGetDatum(upstream)), NULL, true);
+	run("WITH RECURSIVE a(h,d) AS (SELECT $1::bytea,0 UNION SELECT unnest(o.objchildren[2:]),a.d+1 FROM a JOIN pg_dolt_object_visible o ON o.objhash=a.h), b(h) AS (SELECT $2::bytea UNION SELECT unnest(o.objchildren[2:]) FROM b JOIN pg_dolt_object_visible o ON o.objhash=b.h), x AS (SELECT h,min(d) AS d FROM a WHERE h NOT IN (SELECT h FROM b) GROUP BY h) SELECT pg_catalog.dolt_hash_encode(x.h),convert_from(o.objpayload,'UTF8')::jsonb->>'message' FROM x JOIN pg_dolt_object_visible o ON o.objhash=x.h WHERE o.objkind='commit' ORDER BY x.d DESC,x.h", 2, VC_TYPES(BYTEAOID, BYTEAOID), VC_ARGS(PointerGetDatum(head), PointerGetDatum(upstream)), NULL, true);
 	n = SPI_processed;
 	if (n == 0)
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("didn't identify any commits!")));
@@ -152,7 +152,7 @@ start_rebase(FunctionCallInfo fcinfo, int nest, const char *upstream_spec)
 		ereport(ERROR, (errcode(ERRCODE_DUPLICATE_OBJECT), errmsg("branch already exists: %s", rebasebranch)));
 	rebase_plan_rows(rebasebranch, head.target, upstream);
 	initStringInfo(&json);
-	appendStringInfo(&json, "{\"branch\":%s,\"upstream\":\"%s\",\"head\":\"%s\"}", quote_json(branch), hex(upstream), hex(head.target));
+	appendStringInfo(&json, "{\"branch\":%s,\"upstream\":\"%s\",\"head\":\"%s\"}", quote_json(branch), hash_format(upstream), hash_format(head.target));
 	state = put("rebase", json.data, VC_ARGS(PointerGetDatum(upstream), PointerGetDatum(head.target)), 2);
 	create_branch_refs(rebasebranch, upstream, NULL);
 	move_ref(psprintf("rebase/%s", rebasebranch), read_ref(psprintf("rebase/%s", rebasebranch)), state);
@@ -429,9 +429,9 @@ stash_push(const char *name)
 	workingdb = compose_database(headdb, current.hash, changed);
 	run("SELECT coalesce(max(split_part(refname,'/',3)::bigint),0)+1 FROM pg_catalog.pg_dolt_ref WHERE refname LIKE 'stash/' || $1 || '/%'", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(name)), NULL, true);
 	seq = DatumGetInt64(cell(0, 1));
-	message = psprintf("WIP on %s: %.7s %s", branch, hex(head.target), json_value(headmeta, "message"));
+	message = psprintf("WIP on %s: %.7s %s", branch, hash_format(head.target), json_value(headmeta, "message"));
 	initStringInfo(&json);
-	appendStringInfo(&json, "{\"branch\":%s,\"head\":\"%s\",\"message\":%s}", quote_json(branch), hex(head.target), quote_json(message));
+	appendStringInfo(&json, "{\"branch\":%s,\"head\":\"%s\",\"message\":%s}", quote_json(branch), hash_format(head.target), quote_json(message));
 	state = put("stash", json.data, VC_ARGS(PointerGetDatum(workingdb), PointerGetDatum(stageddb), PointerGetDatum(head.target)), 3);
 	move_ref(psprintf("stash/%s/" INT64_FORMAT, name, seq), empty_ref, state);
 	restore_tables(headdb);

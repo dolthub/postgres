@@ -66,7 +66,7 @@ is(sql(q{SELECT count(*) FROM pg_statistic WHERE starelid = 't'::regclass}), '3'
 
 # Another branch's table has its own OID and statistics.
 my $commit = sql(q{SELECT dolt_commit('-Am', 'tables'); SELECT dolt_branch('feature')});
-($commit) = $commit =~ /([0-9a-f]{40})/;
+($commit) = $commit =~ /([0-9a-v]{32})/;
 is(sql(qq{SELECT count(*) FROM t AS OF '$commit' WHERE k = 3}), '2000', 'a revision of an analyzed table is planned without its statistics');
 my $feature_t = on_branch('feature', q{SELECT 't'::regclass::oid});
 isnt($feature_t, $main_t, 'the table has another OID on another branch');

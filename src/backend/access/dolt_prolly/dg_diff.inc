@@ -628,7 +628,7 @@ diff_descriptor(const char *kind, DiffTable *from, DiffTable *to)
 typedef struct CommitInfo
 {
 	bytea	   *hash;
-	char	   *hex;
+	char	   *hash_text;
 	char	   *committer;
 	char	   *email;
 	char	   *message;
@@ -645,7 +645,7 @@ reachable_commits(bytea *head, int *count)
 	int			n,
 				i;
 
-	run("WITH RECURSIVE walk(h) AS (SELECT $1::bytea UNION SELECT unnest(o.objchildren[2:]) FROM walk w JOIN pg_dolt_object_visible o ON o.objhash=w.h) SELECT o.objhash,encode(o.objhash,'hex'),m->>'committer',m->>'email',m->>'message',(m->>'date_us')::bigint,o.objchildren[2:] FROM walk w JOIN pg_dolt_object_visible o ON o.objhash=w.h, LATERAL (SELECT convert_from(o.objpayload,'UTF8')::jsonb) AS x(m) WHERE o.objkind='commit' ORDER BY (m->>'height')::bigint DESC,(m->>'date_us')::bigint DESC,o.objhash", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(head)), NULL, true);
+	run("WITH RECURSIVE walk(h) AS (SELECT $1::bytea UNION SELECT unnest(o.objchildren[2:]) FROM walk w JOIN pg_dolt_object_visible o ON o.objhash=w.h) SELECT o.objhash,pg_catalog.dolt_hash_encode(o.objhash),m->>'committer',m->>'email',m->>'message',(m->>'date_us')::bigint,o.objchildren[2:] FROM walk w JOIN pg_dolt_object_visible o ON o.objhash=w.h, LATERAL (SELECT convert_from(o.objpayload,'UTF8')::jsonb) AS x(m) WHERE o.objkind='commit' ORDER BY (m->>'height')::bigint DESC,(m->>'date_us')::bigint DESC,o.objhash", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(head)), NULL, true);
 	n = SPI_processed;
 	result = palloc0(sizeof(CommitInfo) * Max(n, 1));
 	for (i = 0; i < n; i++)
@@ -657,7 +657,7 @@ reachable_commits(bytea *head, int *count)
 					j;
 
 		result[i].hash = DatumGetByteaPCopy(cell(i, 1));
-		result[i].hex = strcell(i, 2);
+		result[i].hash_text = strcell(i, 2);
 		result[i].committer = strcell(i, 3);
 		result[i].email = strcell(i, 4);
 		result[i].message = strcell(i, 5);
@@ -883,7 +883,7 @@ split_dots(const char *spec, char **from, char **to)
 		if (!*right)
 			right = "HEAD";
 		base = merge_base(resolve(left), resolve(right));
-		*from = hex(base);
+		*from = hash_format(base);
 		*to = right;
 	}
 	else
@@ -973,14 +973,14 @@ diff_partitions(FunctionCallInfo fcinfo, const char *kind, const char *name, con
 	e.schema_from = layout;
 	e.schema_to = layout;
 	commits = reachable_commits(head.target, &count);
-	if ((!to_hint || !strcmp(to_hint, "WORKING")) && (!from_hint || !strcmp(from_hint, commits[0].hex)))
+	if ((!to_hint || !strcmp(to_hint, "WORKING")) && (!from_hint || !strcmp(from_hint, commits[0].hash_text)))
 	{
 		DiffTable  *a = diff_table_at(child(head.target, 1), name, true),
 				   *b = diff_table_working(name, true);
 
 		e.to_label = "WORKING";
 		e.to_date_null = true;
-		e.from_label = commits[0].hex;
+		e.from_label = commits[0].hash_text;
 		e.from_date = commits[0].date_us;
 		e.from_date_null = false;
 		diff_rows(a, b, emit_diff_row, &e);
@@ -992,7 +992,7 @@ diff_partitions(FunctionCallInfo fcinfo, const char *kind, const char *name, con
 		CommitInfo *c = &commits[i];
 		DiffTable  *b;
 
-		if (to_hint && strcmp(to_hint, c->hex))
+		if (to_hint && strcmp(to_hint, c->hash_text))
 			continue;
 		b = diff_table_at(child(c->hash, 1), name, true);
 		for (j = 0; j < Max(c->nparents, 1); j++)
@@ -1000,13 +1000,13 @@ diff_partitions(FunctionCallInfo fcinfo, const char *kind, const char *name, con
 			CommitInfo *parent = c->nparents ? find_commit(commits, count, c->parents[j]) : NULL;
 			DiffTable  *a;
 
-			if (from_hint && (!parent || strcmp(from_hint, parent->hex)))
+			if (from_hint && (!parent || strcmp(from_hint, parent->hash_text)))
 				continue;
 			a = diff_table_at(parent ? child(parent->hash, 1) : NULL, name, true);
-			e.to_label = c->hex;
+			e.to_label = c->hash_text;
 			e.to_date = c->date_us;
 			e.to_date_null = false;
-			e.from_label = parent ? parent->hex : NULL;
+			e.from_label = parent ? parent->hash_text : NULL;
 			e.from_date_null = parent == NULL;
 			if (parent)
 				e.from_date = parent->date_us;
@@ -1107,7 +1107,7 @@ dolt_history_table(PG_FUNCTION_ARGS)
 					bytes.len -= 8;
 				}
 				place_values(out, 0, layout->desc, t, DG_VALUE(true, bytes), values, nulls);
-				values[out->natts - 3] = CStringGetTextDatum(c->hex);
+				values[out->natts - 3] = CStringGetTextDatum(c->hash_text);
 				values[out->natts - 2] = CStringGetTextDatum(c->committer);
 				values[out->natts - 1] = TimestampGetDatum((Timestamp) c->date_us);
 				nulls[out->natts - 3] = nulls[out->natts - 2] = nulls[out->natts - 1] = false;
@@ -1184,7 +1184,7 @@ blame_row(DiffTable *from, DiffTable *to, DiffRow *row, void *arg)
 		nulls[i] = n[to->keys[i]];
 	}
 	i = b->layout->nkeys;
-	values[i] = CStringGetTextDatum(b->commit->hex);
+	values[i] = CStringGetTextDatum(b->commit->hash_text);
 	values[i + 1] = TimestampGetDatum((Timestamp) b->commit->date_us);
 	values[i + 2] = CStringGetTextDatum(b->commit->committer);
 	values[i + 3] = CStringGetTextDatum(b->commit->email);
@@ -1506,7 +1506,7 @@ dolt_column_diff(PG_FUNCTION_ARGS)
 				DiffTable  *a = diff_table_at(pdb, names[k], true),
 						   *b = diff_table_at(db, names[k], true);
 
-				column_diff_partition(rsinfo, c->hex, c, a, b);
+				column_diff_partition(rsinfo, c->hash_text, c, a, b);
 				diff_table_close(a);
 				diff_table_close(b);
 			}

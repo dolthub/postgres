@@ -316,7 +316,7 @@ dolt_conflicts_table(PG_FUNCTION_ARGS)
 		theirs = diff_table_at(child(theirsc, 1), name, false);
 	}
 	e.rsinfo = rsinfo;
-	e.root_ish = hex(theirsc);
+	e.root_ish = hash_format(theirsc);
 	e.base = base;
 	e.ours = ours;
 	e.theirs = theirs;
@@ -458,7 +458,7 @@ dolt_constraint_violations_table(PG_FUNCTION_ARGS)
 				   *info = SPI_getvalue(tuptable->vals[i], tuptable->tupdesc, 3);
 
 		memset(nulls, true, out->natts);
-		values[0] = CStringGetTextDatum(hex(theirsc));
+		values[0] = CStringGetTextDatum(hash_format(theirsc));
 		values[1] = CStringGetTextDatum(type);
 		nulls[0] = nulls[1] = false;
 		place_values(out, 2, t->desc, t, DG_VALUE(true, DG_SLICE((uint8 *) VARDATA_ANY(rowbytes), VARSIZE_ANY_EXHDR(rowbytes))), values, nulls);
@@ -507,7 +507,7 @@ preview_branch(const char *name, bool summary)
 	ref = read_ref(psprintf("heads/%s", name));
 	if (ref.target)
 		return ref.target;
-	if (strlen(name) >= 8 && strspn(name, "0123456789abcdef") == strlen(name))
+	if (commit_prefix(name) != NULL)
 		return resolve(name);
 	ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("branch not found: %s", name)));
 	return NULL;
@@ -633,7 +633,7 @@ dolt_preview_merge_conflicts(PG_FUNCTION_ARGS)
 	ours = diff_table_at(child(oursc, 1), name, true);
 	theirs = diff_table_at(child(theirsc, 1), name, true);
 	e.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	e.root_ish = hex(theirsc);
+	e.root_ish = hash_format(theirsc);
 	e.base = base;
 	e.ours = ours;
 	e.theirs = theirs;
