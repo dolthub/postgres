@@ -1358,7 +1358,11 @@ commit_object(bytea *database, bytea *parent, bytea *second, const char *message
 
 	TimestampTz committer_date = GetCurrentTimestamp();
 	bool explicit_author = author != NULL;
-	bool committer_set = setting_present(dolt_committer_name) || setting_present(dolt_committer_email);
+	bool committer_set = (setting_present(dolt_committer_name) || setting_present(dolt_committer_email)) &&
+		(strcmp(setting_present(dolt_committer_name) ? dolt_committer_name : name,
+				setting_present(dolt_author_name) ? dolt_author_name : name) ||
+		 strcmp(setting_present(dolt_committer_email) ? dolt_committer_email : email,
+				setting_present(dolt_author_email) ? dolt_author_email : email));
 
 	if (!author)
 	{
