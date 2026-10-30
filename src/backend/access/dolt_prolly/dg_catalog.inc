@@ -500,8 +500,17 @@ catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool ta
 		if (!IsA(expression, Const) || ((Const *) expression)->constisnull)
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("AS OF requires a non-null constant revision expression")));
 		revision = TextDatumGetCString(((Const *) expression)->constvalue);
-		if (rv->catalogname && strcmp(rv->catalogname, get_database_name(MyDatabaseId)))
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("cross-database versioned queries are not supported")));
+		if (rv->catalogname)
+		{
+			sep = strpbrk(rv->catalogname, "@/");
+			dbname = sep ? pnstrdup(rv->catalogname, sep - rv->catalogname) : rv->catalogname;
+			if (strcmp(dbname, get_database_name(MyDatabaseId)))
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("cross-database versioned queries are not supported")));
+			/* HEAD in a qualified relation belongs to that branch, not the session. */
+			if (sep && pg_strncasecmp(revision, "HEAD", 4) == 0 &&
+				(revision[4] == '\0' || revision[4] == '~' || revision[4] == '^'))
+				revision = psprintf("%s%s", sep + 1, revision + 4);
+		}
 	}
 revision_selected:
 	if (target && rv->dolt_revision)
