@@ -1578,8 +1578,9 @@ dolt_add(PG_FUNCTION_ARGS)
 	int			nest;
 
 	standalone(fcinfo, false);
-	/* Import pre-repository namespaces into the branch before capturing it. */
-	catalog_activate();
+	/* Import pre-repository namespaces before the first capture only. */
+	if (!dg_catalog_active())
+		catalog_activate();
 	nest = begin_api();
 	ensure_repository();
 	if (n == 0)
@@ -1636,8 +1637,9 @@ dolt_commit(PG_FUNCTION_ARGS)
 	int			nest;
 
 	standalone(fcinfo, true);
-	/* Import pre-repository namespaces into the branch before capturing it. */
-	catalog_activate();
+	/* Import pre-repository namespaces before the first capture only. */
+	if (!dg_catalog_active())
+		catalog_activate();
 	nest = begin_api();
 	for (i = 0; i < n; i++)
 	{
