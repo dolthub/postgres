@@ -7,6 +7,8 @@ typedef struct CommitDirtyBranch
 static List *commit_dirty_branches;
 static bool commit_callbacks_registered;
 static bool commit_publishing;
+static bool commit_sql_requested;
+static bool commit_explicit;
 
 static void
 commit_session_xact(XactEvent event, void *arg)
@@ -15,6 +17,8 @@ commit_session_xact(XactEvent event, void *arg)
 	{
 		commit_dirty_branches = NIL;
 		commit_publishing = false;
+		commit_sql_requested = false;
+		commit_explicit = false;
 	}
 }
 
@@ -36,6 +40,44 @@ commit_session_subxact(SubXactEvent event, SubTransactionId id, SubTransactionId
 	}
 }
 
+static void
+commit_session_register(void)
+{
+	if (!commit_callbacks_registered)
+	{
+		RegisterXactCallback(commit_session_xact, NULL);
+		RegisterSubXactCallback(commit_session_subxact, NULL);
+		commit_callbacks_registered = true;
+	}
+}
+
+static void
+commit_request_sql_end(void)
+{
+	commit_session_register();
+	commit_sql_requested = true;
+	commit_explicit = true;
+	MyXactFlags |= XACT_FLAGS_NEEDIMMEDIATECOMMIT;
+}
+
+bool
+dg_version_commit_requested(void)
+{
+	return commit_sql_requested;
+}
+
+/* Called only after top-level PortalRun has delivered the complete result. */
+void
+dg_version_end_statement(void)
+{
+	if (!commit_sql_requested)
+		return;
+	EndImplicitTransactionBlock();
+	if (IsTransactionBlock())
+		EndTransactionBlock(false);
+	commit_sql_requested = false;
+}
+
 void
 dg_version_mark_branch(const char *branch)
 {
@@ -53,12 +95,7 @@ dg_version_mark_branch(const char *branch)
 		if (entry->subid == id && strcmp(entry->branch, branch) == 0)
 			return;
 	}
-	if (!commit_callbacks_registered)
-	{
-		RegisterXactCallback(commit_session_xact, NULL);
-		RegisterSubXactCallback(commit_session_subxact, NULL);
-		commit_callbacks_registered = true;
-	}
+	commit_session_register();
 	old = MemoryContextSwitchTo(TopTransactionContext);
 	entry = palloc(sizeof(*entry));
 	entry->branch = pstrdup(branch);
@@ -115,7 +152,7 @@ dg_version_pre_commit(void)
 	ListCell   *lc;
 	TimestampTz commit_time = GetCurrentTimestamp();
 
-	if (!dolt_transaction_commit || !commit_dirty_branches || commit_publishing)
+	if (commit_explicit || !dolt_transaction_commit || !commit_dirty_branches || commit_publishing)
 		return;
 	branches = commit_branches();
 	if (list_length(branches) > 1 && !dolt_multi_branch_commit)

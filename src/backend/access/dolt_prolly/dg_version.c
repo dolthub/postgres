@@ -374,9 +374,16 @@ standalone(FunctionCallInfo fcinfo, bool commits)
 	if (stmt->commandType != CMD_SELECT)
 		goto bad;
 	plan = stmt->planTree;
-	if (plan->qual || plan->initPlan || outerPlan(plan) || innerPlan(plan))
+	/* A target-list SRF is represented by ProjectSet over a dummy Result. */
+	if (IsA(plan, Result) && outerPlan(plan) && IsA(outerPlan(plan), ProjectSet) &&
+		!plan->qual && !plan->initPlan && !innerPlan(plan))
+		plan = outerPlan(plan);
+	if (plan->qual || plan->initPlan || innerPlan(plan) ||
+		(outerPlan(plan) && !(IsA(plan, ProjectSet) && IsA(outerPlan(plan), Result) &&
+			!outerPlan(plan)->qual && !outerPlan(plan)->initPlan &&
+			!outerPlan(outerPlan(plan)) && !innerPlan(outerPlan(plan)))))
 		goto bad;
-	if (IsA(plan, Result) && list_length(plan->targetlist) == 1)
+	if ((IsA(plan, Result) || IsA(plan, ProjectSet)) && list_length(plan->targetlist) == 1)
 	{
 		Node	   *expr = (Node *) linitial_node(TargetEntry, plan->targetlist)->expr;
 		StandaloneCall found = {fcinfo->flinfo->fn_oid, NULL, 0};
@@ -1668,8 +1675,11 @@ dolt_add(PG_FUNCTION_ARGS)
 	end_api(nest);
 	PG_RETURN_INT64(0);
 }
-Datum
-dolt_commit(PG_FUNCTION_ARGS)
+static List *commit_branches(void);
+static void commit_request_sql_end(void);
+
+static Datum
+dolt_commit_impl(FunctionCallInfo fcinfo, bool named_rows)
 {
 	int			n,
 				i;
@@ -1685,21 +1695,14 @@ dolt_commit(PG_FUNCTION_ARGS)
 				allow_empty = false,
 				skip_empty = false;
 	TimestampTz author_date = GetCurrentTimestamp();
-	VersionRef	head,
-				staged,
-				working;
-	Capture		full;
-	bytea	   *database,
-			   *parentdb,
-			   *commit;
-	char	   *answer;
-	int			nest;
+	List *branches;
+	ListCell *lc;
+	const char *previous_branch;
+	TimestampTz commit_time = GetCurrentTimestamp();
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	bool multi = named_rows || dolt_multi_branch_commit;
 
-	standalone(fcinfo, true);
-	nest = begin_api();
-	/* Activation advances command visibility on our private API snapshot. */
-	if (!read_ref("views/enabled").target)
-		catalog_activate();
+	standalone(fcinfo, false);
 	for (i = 0; i < n; i++)
 	{
 		if (!strcmp(args[i], "-A") || !strcmp(args[i], "--ALL"))
@@ -1746,48 +1749,102 @@ dolt_commit(PG_FUNCTION_ARGS)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("commit message is required (-m)")));
 	if (allow_empty && skip_empty)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("--allow-empty and --skip-empty are incompatible")));
-	ensure_repository();
-	if (modified && !all)
-		stage_modified_tables();
-	head = read_ref(branch_ref("heads"));
-	staged = read_ref(branch_ref("staged"));
-	working = read_ref(branch_ref("working"));
-	parentdb = child(head.target, 1);
-	database = all ? staged_capture(&full) : staged.target;
-	if (!database)
-		database = parentdb;
-	if (database_same(database, parentdb) && !allow_empty && !merge_parent())
-	{
-		if (skip_empty)
-		{
-			end_api(nest);
-			PG_RETURN_NULL();
-		}
-		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("nothing to commit")));
-	}
+
+	/* Apply deferred constraints under the caller's normal catalog context.
+	 * The transaction ends after the standalone result has been consumed. */
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "cannot connect commit constraint SPI");
+	if (SPI_execute("SET CONSTRAINTS ALL IMMEDIATE", false, 0) != SPI_OK_UTILITY)
+		elog(ERROR, "cannot fire deferred commit constraints");
+	SPI_finish();
+	CommandCounterIncrement();
+	dg_flush_version_batches();
+	CommandCounterIncrement();
+	branches = commit_branches();
+	if (list_length(branches) > 1 && !multi)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot commit multiple dirty branches without dolt_multi_branch_commit")));
+	if (!multi || branches == NIL)
+		branches = list_make1(pstrdup(dg_current_branch()));
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC | MAT_SRF_BLESS);
+	previous_branch = dg_switch_execution_branch(linitial(branches));
 	commit_committer_name = committer;
 	commit_committer_email = committer_email;
 	commit_author_date_explicit = date_explicit;
 	PG_TRY();
 	{
-		commit = commit_object(database, head.target, merge_parent(), message, author, email, author_date);
+		foreach(lc, branches)
+		{
+			const char *branch = lfirst(lc);
+			VersionRef head, staged, working;
+			Capture full;
+			bytea *database, *parentdb, *commit;
+			Datum values[2];
+			bool nulls[2] = {false, false};
+			int nest;
+
+			dg_switch_execution_branch(branch);
+			nest = begin_api();
+			if (!read_ref("views/enabled").target)
+				catalog_activate();
+			ensure_repository();
+			if (modified && !all)
+				stage_modified_tables();
+			head = read_ref(branch_ref("heads"));
+			staged = read_ref(branch_ref("staged"));
+			working = read_ref(branch_ref("working"));
+			parentdb = child(head.target, 1);
+			database = all ? staged_capture(&full) : staged.target;
+			if (!database)
+				database = parentdb;
+			if (database_same(database, parentdb) && !allow_empty && !merge_parent())
+			{
+				if (skip_empty)
+				{
+					end_api(nest);
+					continue;
+				}
+				ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+								errmsg("nothing to commit on branch %s", branch)));
+			}
+			commit = commit_object_at(database, head.target, merge_parent(), message,
+									  author, email, author_date, commit_time);
+			move_ref(branch_ref("heads"), head, commit);
+			move_ref(branch_ref("staged"), staged, database);
+			if (all)
+				move_ref(branch_ref("working"), working, full.hash);
+			finish_merge();
+			values[0] = CStringGetTextDatum(named_rows ? branch : hash_format(commit));
+			if (named_rows)
+				values[1] = CStringGetTextDatum(hash_format(commit));
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+			end_api(nest);
+		}
 	}
 	PG_FINALLY();
 	{
+		dg_switch_execution_branch(previous_branch);
 		commit_committer_name = NULL;
 		commit_committer_email = NULL;
 		commit_author_date_explicit = false;
 	}
 	PG_END_TRY();
-	move_ref(branch_ref("heads"), head, commit);
-	move_ref(branch_ref("staged"), staged, database);
-	if (all)
-		move_ref(branch_ref("working"), working, full.hash);
-	finish_merge();
-	answer = hash_format(commit);
-	end_api(nest);
-	PG_RETURN_TEXT_P(cstring_to_text(answer));
+	commit_request_sql_end();
+	return (Datum) 0;
 }
+
+Datum
+dolt_commit(PG_FUNCTION_ARGS)
+{
+	return dolt_commit_impl(fcinfo, false);
+}
+
+Datum
+dolt_commit_all(PG_FUNCTION_ARGS)
+{
+	return dolt_commit_impl(fcinfo, true);
+}
+
 Datum
 dolt_branch(PG_FUNCTION_ARGS)
 {

@@ -16,4 +16,6 @@ extern PGDLLIMPORT char *dolt_committer_date;
 extern void dg_version_mark_branch(const char *branch);
 extern void dg_version_pre_commit(void);
 extern void dg_version_pre_prepare(void);
+extern bool dg_version_commit_requested(void);
+extern void dg_version_end_statement(void);
 #endif

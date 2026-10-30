@@ -18,6 +18,7 @@
  */
 
 #include "postgres.h"
+#include "access/doltversion.h"
 
 #include <fcntl.h>
 #include <limits.h>
@@ -1281,6 +1282,7 @@ exec_simple_query(const char *query_string)
 		receiver->rDestroy(receiver);
 
 		PortalDrop(portal, false);
+		dg_version_end_statement();
 
 		if (lnext(parsetree_list, parsetree_item) == NULL)
 		{
@@ -1297,7 +1299,8 @@ exec_simple_query(const char *query_string)
 				EndImplicitTransactionBlock();
 			finish_xact_command();
 		}
-		else if (IsA(parsetree->stmt, TransactionStmt))
+		else if (IsA(parsetree->stmt, TransactionStmt) ||
+				 (MyXactFlags & XACT_FLAGS_NEEDIMMEDIATECOMMIT))
 		{
 			/*
 			 * If this was a transaction control statement, commit it. We will
@@ -2276,6 +2279,12 @@ exec_execute_message(const char *portal_name, long max_rows)
 						  receiver,
 						  receiver,
 						  &qc);
+
+	/* A commit function closes this transaction and its portal. Deliver its
+	 * entire materialized result before closing, even with a fetch limit. */
+	if (!completed && dg_version_commit_requested())
+		completed = PortalRun(portal, FETCH_ALL, true, receiver, receiver, &qc);
+	dg_version_end_statement();
 
 	receiver->rDestroy(receiver);
 
