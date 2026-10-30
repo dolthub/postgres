@@ -33,6 +33,7 @@ bundle_capture(void)
 	char **names;
 	bytea **targets;
 	char *objects;
+	char *extensions;
 	char **definitions;
 	int definition_count;
 	int count;
@@ -76,6 +77,10 @@ bundle_capture(void)
 	}
 	appendStringInfoChar(&refs, ']');
 	advance_snapshot();
+	/* Extension installation is native cluster infrastructure, not part of a
+	 * versioned schema. Reinstall the exact extension versions at the target. */
+	run("SELECT COALESCE(jsonb_agg(jsonb_build_array(e.extname,e.extversion,n.nspname) ORDER BY e.extname),'[]'::jsonb)::text FROM pg_extension e JOIN pg_namespace n ON n.oid=e.extnamespace WHERE e.extname <> 'plpgsql'", 0, NULL, NULL, NULL, true);
+	extensions = strcell(0, 1);
 	/* Include retained historical objects as well as the live working sets.
 	 * JSON is a framing format only; payload bytes retain their native codec. */
 	run("SELECT COALESCE(jsonb_agg(jsonb_build_array(dolt_hash_encode(objhash),objkind,encode(objpayload,'base64'),ARRAY(SELECT dolt_hash_encode(h) FROM unnest(objchildren) h))),'[]'::jsonb)::text FROM pg_dolt_object_visible", 0, NULL, NULL, NULL, true);
@@ -102,7 +107,7 @@ bundle_capture(void)
 		appendStringInfoString(&sequences, sequence_capture(definitions[i]));
 	}
 	appendStringInfoChar(&sequences, ']');
-	return psprintf("{\"format\":\"DGBUNDLE1\",\"encoding\":%d,\"refs\":%s,\"objects\":%s,\"sequences\":%s}", GetDatabaseEncoding(), refs.data, objects, sequences.data);
+	return psprintf("{\"format\":\"DGBUNDLE1\",\"encoding\":%d,\"refs\":%s,\"objects\":%s,\"sequences\":%s,\"extensions\":%s}", GetDatabaseEncoding(), refs.data, objects, sequences.data, extensions);
 }
 
 static void
@@ -244,6 +249,29 @@ bundle_import(const char *url)
 	while ((object = hash_seq_search(&scan)) != NULL)
 		bundle_import_object(objects, object);
 	advance_snapshot();
+	{
+		char **names;
+		char **versions;
+		char **schemas;
+		int n;
+
+		run("SELECT v->>0,v->>1,v->>2 FROM jsonb_array_elements($1::jsonb->'extensions') v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(payload)), NULL, true);
+		n = SPI_processed;
+		names = palloc(sizeof(char *) * n);
+		versions = palloc(sizeof(char *) * n);
+		schemas = palloc(sizeof(char *) * n);
+		for (int i = 0; i < n; i++)
+		{
+			names[i] = strcell(i, 1);
+			versions[i] = strcell(i, 2);
+			schemas[i] = strcell(i, 3);
+		}
+		for (int i = 0; i < n; i++)
+		{
+			run(psprintf("CREATE SCHEMA IF NOT EXISTS %s", quote_identifier(schemas[i])), 0, NULL, NULL, NULL, false);
+			run(psprintf("CREATE EXTENSION %s WITH SCHEMA %s VERSION %s CASCADE", quote_identifier(names[i]), quote_identifier(schemas[i]), quote_literal_cstr(versions[i])), 0, NULL, NULL, NULL, false);
+		}
+	}
 	/* Allocation state is shared across branches and also survives when its
 	 * definition exists only in retained history. Install it before bindings. */
 	{
