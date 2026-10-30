@@ -77,6 +77,7 @@ pack_fields(PLValue * fields, int count)
  * contents, with no local identifier, so a server with the extension reads
  * it back. PostGIS sends geometry and geography as extended well-known
  * binary, whose spatial reference is an SRID, a value the data defines.
+ * hstore sends its pairs, which it keeps sorted, as lengths and bytes.
  */
 static const struct
 {
@@ -85,6 +86,7 @@ static const struct
 }			reviewed_extension_types[] = {
 	{"postgis", "geometry"},
 	{"postgis", "geography"},
+	{"hstore", "hstore"},
 };
 
 /* Whether |type| is an extension's type listed in reviewed_extension_types. */
