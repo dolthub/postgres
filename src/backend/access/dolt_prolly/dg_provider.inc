@@ -201,6 +201,100 @@ provider_member(const char *name, const char *kind)
 static CatalogViewBase *provider_base;
 static bool provider_bootstrap(Oid catalog, HeapTuple tuple, TupleDesc desc);
 
+/*
+ * Native objects that belong to extensions, while the base is built: the
+ * members pg_depend lists, their tables' indexes and row types, and their
+ * types' arrays. An extension is the server's, as built-in objects are, so
+ * every branch's catalogs list its objects.
+ */
+static HTAB *extension_objects;
+
+static void
+extension_object_add(Oid oid)
+{
+	(void) hash_search(extension_objects, &oid, HASH_ENTER, NULL);
+}
+
+static bool
+extension_object(Oid oid)
+{
+	return extension_objects && OidIsValid(oid) && hash_search(extension_objects, &oid, HASH_FIND, NULL);
+}
+
+static void
+extension_objects_load(void)
+{
+	HASHCTL		ctl = {0};
+	const Oid	catalogs[] = {DependRelationId, IndexRelationId, TypeRelationId};
+
+	ctl.keysize = sizeof(Oid);
+	ctl.entrysize = sizeof(Oid);
+	ctl.hcxt = CurrentMemoryContext;
+	extension_objects = hash_create("extension objects", 1024, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	for (int i = 0; i < lengthof(catalogs); i++)
+	{
+		Relation	rel = table_open(catalogs[i], AccessShareLock);
+		TableScanDesc scan = table_beginscan_catalog(rel, 0, NULL);
+		HeapTuple	tuple;
+
+		while ((tuple = heap_getnext(scan, ForwardScanDirection)))
+		{
+			if (catalogs[i] == DependRelationId)
+			{
+				Form_pg_depend dep = (Form_pg_depend) GETSTRUCT(tuple);
+
+				if (dep->deptype == DEPENDENCY_EXTENSION)
+					extension_object_add(dep->objid);
+			}
+			else if (catalogs[i] == IndexRelationId)
+			{
+				Form_pg_index index = (Form_pg_index) GETSTRUCT(tuple);
+
+				if (extension_object(index->indrelid))
+					extension_object_add(index->indexrelid);
+			}
+			else
+			{
+				Form_pg_type type = (Form_pg_type) GETSTRUCT(tuple);
+
+				if (extension_object(type->typrelid) || extension_object(type->typelem))
+					extension_object_add(type->oid);
+			}
+		}
+		table_endscan(scan);
+		table_close(rel, AccessShareLock);
+	}
+}
+
+/* The object a native catalog row describes, for rows that describe another's part. */
+static Oid
+provider_row_owner(Oid catalog, HeapTuple tuple, Oid object)
+{
+	switch (catalog)
+	{
+		case RewriteRelationId:
+			return ((Form_pg_rewrite) GETSTRUCT(tuple))->ev_class;
+		case ConstraintRelationId:
+			{
+				Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tuple);
+
+				return OidIsValid(con->conrelid) ? con->conrelid : con->contypid;
+			}
+		case AttrDefaultRelationId:
+			return ((Form_pg_attrdef) GETSTRUCT(tuple))->adrelid;
+		case TriggerRelationId:
+			return ((Form_pg_trigger) GETSTRUCT(tuple))->tgrelid;
+		case EnumRelationId:
+			return ((Form_pg_enum) GETSTRUCT(tuple))->enumtypid;
+		case PolicyRelationId:
+			return ((Form_pg_policy) GETSTRUCT(tuple))->polrelid;
+		case StatisticExtRelationId:
+			return ((Form_pg_statistic_ext) GETSTRUCT(tuple))->stxrelid;
+		default:
+			return object;
+	}
+}
+
 static void
 provider_base_forget(Datum arg, int cacheid, uint32 hashvalue)
 {
@@ -232,6 +326,7 @@ provider_shared_base(void)
 	previous = MemoryContextSwitchTo(scratch);
 	PG_TRY();
 	{
+		extension_objects_load();
 		for (int i = 0; i < lengthof(provider_catalogs); i++)
 		{
 			Relation	rel = table_open(provider_catalogs[i], AccessShareLock);
@@ -249,11 +344,13 @@ provider_shared_base(void)
 	}
 	PG_CATCH();
 	{
+		extension_objects = NULL;
 		MemoryContextSwitchTo(previous);
 		CatalogViewBaseRelease(base);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	extension_objects = NULL;
 	MemoryContextSwitchTo(previous);
 	MemoryContextDelete(scratch);
 	if (provider_base)
@@ -639,13 +736,14 @@ provider_bootstrap(Oid catalog, HeapTuple tuple, TupleDesc desc)
 		Form_pg_shdepend dep = (Form_pg_shdepend) GETSTRUCT(tuple);
 
 		return dep->dbid == InvalidOid ||
-			(dep->dbid == MyDatabaseId && dep->objid < FirstNormalObjectId);
+			(dep->dbid == MyDatabaseId && (dep->objid < FirstNormalObjectId || extension_object(dep->objid)));
 	}
 	if (catalog == ProcedureRelationId)
 	{
 		Oid			ns = ((Form_pg_proc) GETSTRUCT(tuple))->pronamespace;
 
-		return ns == PG_CATALOG_NAMESPACE || !strcmp(get_namespace_name(ns), "information_schema");
+		return ns == PG_CATALOG_NAMESPACE || !strcmp(get_namespace_name(ns), "information_schema") ||
+			extension_object(((Form_pg_proc) GETSTRUCT(tuple))->oid);
 	}
 	if (catalog == DependRelationId)
 		object = ((Form_pg_depend) GETSTRUCT(tuple))->objid;
@@ -653,7 +751,10 @@ provider_bootstrap(Oid catalog, HeapTuple tuple, TupleDesc desc)
 		return false;
 	if (catalog == DescriptionRelationId && ((Form_pg_description) GETSTRUCT(tuple))->classoid == NamespaceRelationId && object == PG_PUBLIC_NAMESPACE)
 		return false;
-	return object < FirstNormalObjectId;
+	/* An extension's own comment, as \dx shows it. */
+	if (catalog == DescriptionRelationId && ((Form_pg_description) GETSTRUCT(tuple))->classoid == ExtensionRelationId)
+		return true;
+	return object < FirstNormalObjectId || extension_object(provider_row_owner(catalog, tuple, object));
 }
 
 static int
