@@ -1,24 +1,20 @@
 /*-------------------------------------------------------------------------
  *
  * dg_node_cache.c
- *	  Prolly nodes shared by every backend, read in place.
+ *	  Prolly nodes shared by every backend.
  *
  * The cache is laid out like the buffer pool: a fixed array of slots, each
  * naming one node, and a partitioned hash table mapping node hashes to slots.
- * A slot's state word holds its pin count, a usage count and its flags. Node
- * bytes vary in size, so they live in a dynamic shared memory area created in
- * place in the main shared memory segment and capped at dolt_node_cache_size;
- * the cache never asks for dynamic segments.
+ * A slot's state word holds a usage count and its flags. Node bytes vary in
+ * size, so they live in a dynamic shared memory area created in place in the
+ * main shared memory segment and capped at dolt_node_cache_size; the cache
+ * never asks for dynamic segments.
  *
- * Borrowing a node pins its slot under the shared partition lock, so eviction,
- * which takes the exclusive lock and requires a zero pin count, never frees
- * bytes in use. A borrower reads the bytes without any lock until it returns
- * them. Adding a node claims a slot by clock sweep, evicting unpinned slots
- * whose usage has run down, and evicts more when the area lacks room for the
- * bytes. A cache full of pinned nodes refuses additions; callers then keep a
- * private copy.
- *
- * Callers must return every loan: pins are not released at transaction end.
+ * A reader copies a node out under the shared partition lock. Eviction takes
+ * the exclusive lock, so it never frees bytes being copied, and nothing is
+ * held once the copy is made. Adding a node claims a slot by clock sweep,
+ * evicting slots whose usage has run down, and evicts more when the area
+ * lacks room for the bytes.
  *
  * src/backend/access/dolt_prolly/dg_node_cache.c
  *
@@ -55,11 +51,9 @@ int			dolt_node_cache_size = 1024 * 1024;	/* kB */
 /* Evictions to try to make room for one node's bytes before refusing it. */
 #define NODE_ROOM_ATTEMPTS 64
 
-/* A slot's state: pins, then usage, then flags. */
-#define NODE_PIN_ONE 1U
-#define NODE_PIN_MASK 0x0003FFFFU
-#define NODE_USAGE_ONE (1U << 18)
-#define NODE_USAGE_MASK 0x003C0000U
+/* A slot's state: usage, then flags. */
+#define NODE_USAGE_ONE 1U
+#define NODE_USAGE_MASK 0x0000000FU
 #define NODE_USAGE_MAX 5
 #define NODE_VALID (1U << 30)	/* mapped and readable */
 #define NODE_BUSY (1U << 31)	/* claimed by one backend, unmapped */
@@ -100,7 +94,8 @@ static HTAB *mapping;
 static dsa_area *area;
 static uint64 local_hits;
 static uint64 local_misses;
-static uint64 local_borrowed;
+static uint8 *copied;			/* the last node read, until the next */
+static Size copied_size;
 
 /* The cache's capacity in bytes, or zero if it is disabled. */
 static Size
@@ -216,80 +211,63 @@ partition_lock(uint32 hashcode)
 	return &cache->locks[hashcode % NODE_PARTITIONS].lock;
 }
 
-/* Pin a mapped slot; the caller holds its partition lock. */
+/* Count a use of a mapped slot; the caller holds its partition lock. */
 static void
-pin_slot(NodeSlot *slot)
+use_slot(NodeSlot *slot)
 {
 	uint32		state = pg_atomic_read_u32(&slot->state);
 
-	for (;;)
-	{
-		uint32		next = state + NODE_PIN_ONE;
-
-		Assert(state & NODE_VALID);
-		if ((state & NODE_USAGE_MASK) < NODE_USAGE_MAX * NODE_USAGE_ONE)
-			next += NODE_USAGE_ONE;
-		if (pg_atomic_compare_exchange_u32(&slot->state, &state, next))
-			return;
-	}
+	while ((state & NODE_USAGE_MASK) < NODE_USAGE_MAX * NODE_USAGE_ONE &&
+		   !pg_atomic_compare_exchange_u32(&slot->state, &state, state + NODE_USAGE_ONE))
+		;
 }
 
-static void
-lend(int32 index, DoltNodeLoan *loan)
-{
-	NodeSlot   *slot = &cache->slots[index];
-
-	loan->data = dsa_get_address(area, slot->data);
-	loan->length = slot->length;
-	loan->token = (uintptr_t) index + 1;
-	local_borrowed++;
-}
-
-bool
-dolt_node_cache_borrow(const uint8 *hash, DoltNodeLoan *loan)
+/*
+ * A copy of the node |hash|, valid until the next call, with its length in
+ * |*length|; NULL if the cache lacks it.
+ */
+const uint8 *
+dolt_node_cache_get(const uint8 *hash, Size *length)
 {
 	NodeMapping *entry;
 	uint32		hashcode;
 	LWLock	   *lock;
-	int32		index = -1;
 
 	if (!cache_attach())
-		return false;
+		return NULL;
 	hashcode = key_hash(hash, DOLT_CHUNK_HASH_SIZE);
 	lock = partition_lock(hashcode);
 	LWLockAcquire(lock, LW_SHARED);
 	entry = hash_search_with_hash_value(mapping, hash, hashcode, HASH_FIND, NULL);
 	if (entry)
 	{
-		index = entry->slot;
-		pin_slot(&cache->slots[index]);
+		NodeSlot   *slot = &cache->slots[entry->slot];
+
+		/* Should this fail, abort releases the lock. */
+		if (slot->length > copied_size)
+		{
+			Size		size = Max(slot->length, 2 * copied_size);
+
+			copied = copied ? repalloc(copied, size) : MemoryContextAlloc(TopMemoryContext, size);
+			copied_size = size;
+		}
+		memcpy(copied, dsa_get_address(area, slot->data), slot->length);
+		*length = slot->length;
+		use_slot(slot);
 	}
 	LWLockRelease(lock);
-	if (index < 0)
+	if (!entry)
 	{
 		local_misses++;
-		return false;
+		return NULL;
 	}
 	local_hits++;
-	lend(index, loan);
-	return true;
-}
-
-void
-dolt_node_cache_return(uintptr_t token)
-{
-	NodeSlot   *slot = &cache->slots[token - 1];
-
-	Assert(token >= 1 && token <= (uintptr_t) cache->nslots);
-	Assert(local_borrowed > 0);
-	Assert(pg_atomic_read_u32(&slot->state) & NODE_PIN_MASK);
-	pg_atomic_fetch_sub_u32(&slot->state, NODE_PIN_ONE);
-	local_borrowed--;
+	return copied;
 }
 
 /*
  * Unmap and free the mapped slot |index|, seen in |state|, unless it was
- * pinned, used or replaced since. The slot is left claimed.
+ * used or replaced since. The slot is left claimed.
  */
 static bool
 evict(int32 index, uint32 state)
@@ -301,7 +279,7 @@ evict(int32 index, uint32 state)
 	NodeMapping *entry;
 	bool		evicted = false;
 
-	/* Pins are taken under the shared lock: none can be taken while we hold it. */
+	/* Readers copy under the shared lock: none is copying while we hold it. */
 	LWLockAcquire(lock, LW_EXCLUSIVE);
 	entry = hash_search_with_hash_value(mapping, &key, hashcode, HASH_FIND, NULL);
 	if (entry && entry->slot == index &&
@@ -331,7 +309,7 @@ claim_slot(int32 *out)
 		NodeSlot   *slot = &cache->slots[index];
 		uint32		state = pg_atomic_read_u32(&slot->state);
 
-		if (state & (NODE_BUSY | NODE_PIN_MASK))
+		if (state & NODE_BUSY)
 			continue;
 		if (!(state & NODE_VALID))
 		{
@@ -371,12 +349,9 @@ allocate_bytes(Size length)
 	}
 }
 
-/*
- * Add the node |hash|, unless the cache cannot make room for it. With |loan|,
- * also borrow it. Adding a node already cached borrows the cached copy.
- */
-bool
-dolt_node_cache_add(const uint8 *hash, const uint8 *data, Size length, DoltNodeLoan *loan)
+/* Add the node |hash|, unless the cache cannot make room for it. */
+void
+dolt_node_cache_add(const uint8 *hash, const uint8 *data, Size length)
 {
 	NodeMapping *entry;
 	NodeSlot   *slot;
@@ -387,18 +362,18 @@ dolt_node_cache_add(const uint8 *hash, const uint8 *data, Size length, DoltNodeL
 	bool		found;
 
 	if (!cache_attach() || length > NODE_MAX_BYTES)
-		return false;
+		return;
 	bytes = allocate_bytes(length);
 	if (!DsaPointerIsValid(bytes))
 	{
 		pg_atomic_fetch_add_u64(&cache->rejected, 1);
-		return false;
+		return;
 	}
 	if (!claim_slot(&index))
 	{
 		dsa_free(area, bytes);
 		pg_atomic_fetch_add_u64(&cache->rejected, 1);
-		return false;
+		return;
 	}
 	slot = &cache->slots[index];
 	memcpy(dsa_get_address(area, bytes), data, length);
@@ -410,33 +385,24 @@ dolt_node_cache_add(const uint8 *hash, const uint8 *data, Size length, DoltNodeL
 	lock = partition_lock(hashcode);
 	LWLockAcquire(lock, LW_EXCLUSIVE);
 	entry = hash_search_with_hash_value(mapping, hash, hashcode, HASH_ENTER_NULL, &found);
-	if (!entry || found)
+	if (entry && !found)
 	{
-		/* Another backend added it first, so use its copy; or no mapping is free. */
-		int32		existing = entry ? entry->slot : -1;
-
-		if (entry && loan)
-			pin_slot(&cache->slots[existing]);
-		LWLockRelease(lock);
-		slot->data = InvalidDsaPointer;
-		pg_atomic_write_u32(&slot->state, 0);
-		dsa_free(area, bytes);
-		if (!entry)
-		{
-			pg_atomic_fetch_add_u64(&cache->rejected, 1);
-			return false;
-		}
-		if (loan)
-			lend(existing, loan);
-		return true;
+		entry->slot = index;
+		pg_atomic_write_u32(&slot->state, NODE_VALID | NODE_USAGE_ONE);
 	}
-	entry->slot = index;
-	pg_atomic_write_u32(&slot->state, NODE_VALID | NODE_USAGE_ONE | (loan ? NODE_PIN_ONE : 0));
 	LWLockRelease(lock);
-	pg_atomic_fetch_add_u64(&cache->added, 1);
-	if (loan)
-		lend(index, loan);
-	return true;
+	if (entry && !found)
+	{
+		pg_atomic_fetch_add_u64(&cache->added, 1);
+		return;
+	}
+
+	/* Another backend added it first, or no mapping is free. */
+	slot->data = InvalidDsaPointer;
+	pg_atomic_write_u32(&slot->state, 0);
+	dsa_free(area, bytes);
+	if (!entry)
+		pg_atomic_fetch_add_u64(&cache->rejected, 1);
 }
 
 void
@@ -445,7 +411,6 @@ dolt_node_cache_stats(DoltNodeCacheStats *stats)
 	memset(stats, 0, sizeof(*stats));
 	stats->hits = local_hits;
 	stats->misses = local_misses;
-	stats->borrowed = local_borrowed;
 	if (!cache)
 		return;
 	stats->added = pg_atomic_read_u64(&cache->added);
@@ -459,31 +424,27 @@ dolt_node_cache_stats(DoltNodeCacheStats *stats)
 			continue;
 		stats->entries++;
 		stats->bytes += cache->slots[i].length;
-		if (state & NODE_PIN_MASK)
-			stats->pinned++;
 	}
 }
 
-/* SQL: dolt_node_cache_stats(); hits, misses and borrowed are this session's. */
+/* SQL: dolt_node_cache_stats(); hits and misses are this session's. */
 Datum
 dolt_node_cache_stats_sql(PG_FUNCTION_ARGS)
 {
 	DoltNodeCacheStats stats;
 	TupleDesc	desc;
-	Datum		values[9];
-	bool		nulls[9] = {false};
+	Datum		values[7];
+	bool		nulls[7] = {false};
 
 	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 	dolt_node_cache_stats(&stats);
 	values[0] = Int64GetDatum(stats.hits);
 	values[1] = Int64GetDatum(stats.misses);
-	values[2] = Int64GetDatum(stats.borrowed);
-	values[3] = Int64GetDatum(stats.added);
-	values[4] = Int64GetDatum(stats.evictions);
-	values[5] = Int64GetDatum(stats.rejected);
-	values[6] = Int64GetDatum(stats.entries);
-	values[7] = Int64GetDatum(stats.bytes);
-	values[8] = Int64GetDatum(stats.pinned);
+	values[2] = Int64GetDatum(stats.added);
+	values[3] = Int64GetDatum(stats.evictions);
+	values[4] = Int64GetDatum(stats.rejected);
+	values[5] = Int64GetDatum(stats.entries);
+	values[6] = Int64GetDatum(stats.bytes);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls)));
 }

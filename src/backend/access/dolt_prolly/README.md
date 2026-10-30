@@ -133,20 +133,23 @@ test, not the complete phase 3 concurrency certification.
 
 Every backend reads prolly nodes through one cache in main shared memory,
 `dolt_node_cache_size` (1GB by default; 0 disables it; changing it requires a
-restart), laid out like the buffer pool: slots with pin and usage counts, a
+restart), laid out like the buffer pool: slots with usage counts, a
 partitioned hash table from node hash to slot, and clock-sweep eviction. Node
 bytes live in a dynamic shared memory area created in place in that segment.
-There is no per-session node cache. The working store borrows nodes and reads
-them in place, and returns every loan when the transaction ends, so idle
-sessions pin nothing. It holds a transaction's unwritten nodes, so that only
-the nodes reachable from the roots a transaction publishes reach the chunk
-store, never its intermediate trees; at transaction end it keeps only pinned
-unwritten nodes, such as the empty tree. A miss reads the chunk store, checks
-the node's encoding once and adds it. A committing transaction adds the nodes
-it wrote. A node the cache cannot take, because it is full of
-pinned nodes, is copied privately instead. History imports leave subtrees the
-chunk store already holds to be read through the cache. `dolt_node_cache_stats()`
-reports the cache's use.
+A reader copies a node out under the shared partition lock; eviction takes the
+lock exclusively. A miss reads the chunk store and adds the node; a committing
+transaction adds the nodes it wrote.
+
+There is no per-session node cache. The working store holds the nodes a
+transaction reads and builds until it ends; it holds a transaction's unwritten
+nodes so that only the nodes reachable from the roots a transaction publishes
+reach the chunk store, never its intermediate trees. At transaction end it
+keeps only pinned unwritten nodes, such as the empty tree.
+
+Nodes read from the chunk store are this library's own encoding and are not
+checked again; nodes imported from elsewhere are checked in full. History
+imports leave subtrees the chunk store already holds to be read through the
+cache. `dolt_node_cache_stats()` reports the cache's use.
 
 ### Core interfaces
 

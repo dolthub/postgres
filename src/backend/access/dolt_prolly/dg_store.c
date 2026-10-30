@@ -281,11 +281,6 @@ static uint64 store_epoch = 1;	/* moves when the working store is recreated */
 static DoltChunkStore *working_chunks;
 static DoltChunk working_fetched;
 
-/* Private stores borrowing nodes, whose loans transaction end returns. */
-static PLStore **private_stores;
-static int	private_count;
-static int	private_capacity;
-
 /* Nodes this transaction wrote, to share once it commits. */
 static PLHash *written;
 static int	written_count;
@@ -347,38 +342,22 @@ fetch_chunk(void *arg, PLHash hash, PLSlice *bytes)
 
 static void register_callbacks(void);
 
-/*
- * Lend node |hash| from the shared node cache, adding it from the chunk store
- * on a miss. A node the cache cannot take is lent as transient bytes, which
- * the store copies and checks.
- */
+/* Read node |hash| through the shared node cache, adding it on a miss. */
 static PLStatus
-lend_node(void *arg, PLHash hash, PLLoan *loan)
+fetch_node(void *arg, PLHash hash, PLSlice *bytes)
 {
-	DoltNodeLoan cached;
+	Size		length;
+	const uint8 *cached = dolt_node_cache_get(hash.bytes, &length);
 
-	if (!dolt_node_cache_borrow(hash.bytes, &cached))
+	if (cached)
 	{
-		PLSlice		bytes;
-
-		fetch_chunk(arg, hash, &bytes);
-		if (!pl_node_check(bytes) || !dolt_node_cache_add(hash.bytes, bytes.data, bytes.len, &cached))
-		{
-			loan->bytes = bytes;
-			loan->token = 0;
-			return PL_OK;
-		}
+		bytes->data = cached;
+		bytes->len = length;
+		return PL_OK;
 	}
-	loan->bytes.data = cached.data;
-	loan->bytes.len = cached.length;
-	loan->token = cached.token;
+	fetch_chunk(arg, hash, bytes);
+	dolt_node_cache_add(hash.bytes, bytes->data, bytes->len);
 	return PL_OK;
-}
-
-static void
-return_node(void *arg, uintptr_t token)
-{
-	dolt_node_cache_return(token);
 }
 
 PLStore *
@@ -390,51 +369,25 @@ dg_working_store(void)
 		working_store = pl_store_create();
 		if (!working_store)
 			ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("out of memory creating prolly store")));
-		pl_store_set_lender(working_store, lend_node, return_node, NULL);
+		pl_store_set_fetch(working_store, fetch_node, NULL);
 		store_epoch++;
 	}
 	return working_store;
 }
 
-/*
- * A store of the caller's own that reads nodes through the shared node cache,
- * as the working store does. Its loans are returned when each transaction
- * ends, so it may outlive one; free it with dg_private_store_free.
- */
+/* A store of the caller's own that reads nodes as the working store does. */
 PLStore *
 dg_private_store(void)
 {
 	PLStore    *store;
 
-	/* Transaction end returns the loans, and closes the chunk store misses read. */
+	/* Transaction end closes the chunk store that misses read. */
 	register_callbacks();
 	store = pl_store_create();
 	if (!store)
 		ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("out of memory creating prolly store")));
-	if (private_count == private_capacity)
-	{
-		int			capacity = private_capacity ? private_capacity * 2 : 8;
-
-		private_stores = private_stores ?
-			repalloc(private_stores, capacity * sizeof(PLStore *)) :
-			MemoryContextAlloc(TopMemoryContext, capacity * sizeof(PLStore *));
-		private_capacity = capacity;
-	}
-	pl_store_set_lender(store, lend_node, return_node, NULL);
-	private_stores[private_count++] = store;
+	pl_store_set_fetch(store, fetch_node, NULL);
 	return store;
-}
-
-void
-dg_private_store_free(PLStore *store)
-{
-	for (int i = 0; i < private_count; i++)
-		if (private_stores[i] == store)
-		{
-			private_stores[i] = private_stores[--private_count];
-			break;
-		}
-	pl_store_free(store);
 }
 
 /* Share the nodes this transaction wrote, now that it has committed. */
@@ -445,8 +398,8 @@ share_written(void)
 	{
 		PLNode	   *node = pl_find_local(working_store, written[i]);
 
-		if (node && !node->loan)
-			dolt_node_cache_add(node->hash.bytes, node->data, node->size, NULL);
+		if (node)
+			dolt_node_cache_add(node->hash.bytes, node->data, node->size);
 	}
 }
 
@@ -1075,20 +1028,16 @@ store_xact(XactEvent event, void *arg)
 
 			/*
 			 * Nodes in the chunk store are read through the shared cache, so
-			 * the working store keeps none across transactions: borrowed
-			 * nodes go back, so that no idle session pins the cache, and
-			 * written ones are shared once committed, then dropped. Unwritten
-			 * nodes are dropped too, unless pinned, such as the empty tree
-			 * and journal folds; they are written only when a published root
-			 * reaches them.
+			 * the working store keeps none across transactions: those it
+			 * read are dropped, and those it wrote are shared once committed,
+			 * then dropped. Unwritten nodes are dropped too, unless pinned,
+			 * such as the empty tree and journal folds; they are written only
+			 * when a published root reaches them.
 			 */
 			if (event == XACT_EVENT_COMMIT)
 				share_written();
-			for (int i = 0; i < private_count; i++)
-				pl_store_return_loans(private_stores[i]);
 			if (working_store)
 			{
-				pl_store_return_loans(working_store);
 				pl_store_drop_unbacked(working_store);
 				pl_store_drop_backed(working_store);
 			}

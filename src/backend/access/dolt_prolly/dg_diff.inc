@@ -255,7 +255,7 @@ diff_table_close(DiffTable *t)
 	if (t->live)
 		dg_release(t->live);
 	if (t->store)
-		dg_private_store_free(t->store);
+		pl_store_free(t->store);
 	t->live = NULL;
 	t->store = NULL;
 }

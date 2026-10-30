@@ -1,7 +1,6 @@
 # Prolly nodes are cached in shared memory for every session: a session reads
 # from the chunk store only the nodes no session has read or written since the
-# server started. Sessions borrow nodes only for the length of a transaction,
-# results stay right when the cache is too small to hold a table, or holds
+# server started. Results stay right when the cache is too small to hold a table, or holds
 # nothing at all, and history imports leave the subtrees the chunk store holds
 # to be read through the cache. Reads of pg_dolt_chunk's hash index count the
 # chunks a transaction reads from the store.
@@ -20,7 +19,7 @@ sub sql { return $node->safe_psql('postgres', shift) }
 # The chunk store reads and cache statistics of |query|, run in a new session.
 sub reads {
 	my ($query) = @_;
-	my @lines = split /\n/, sql("BEGIN; $query; SELECT pg_stat_get_xact_numscans(9126) || ' ' || hits || ' ' || misses || ' ' || borrowed FROM dolt_node_cache_stats(); COMMIT");
+	my @lines = split /\n/, sql("BEGIN; $query; SELECT pg_stat_get_xact_numscans(9126) || ' ' || hits || ' ' || misses FROM dolt_node_cache_stats(); COMMIT");
 	return split / /, $lines[-1];
 }
 
@@ -31,13 +30,10 @@ my $count = 'SELECT count(*), sum(length(v)) FROM t';
 my $expected = sql($count);
 
 # A committed transaction shares the nodes it wrote.
-my ($store, $hits, $misses, $borrowed) = reads($count);
+my ($store, $hits, $misses) = reads($count);
 is($store, 0, 'a new session reads nothing from the chunk store after the writer commits');
 cmp_ok($hits, '>', 100, "the scan borrows from the shared cache ($hits nodes)");
 is($misses, 0, 'and finds every node there');
-cmp_ok($borrowed, '>', 0, 'nodes stay borrowed until the transaction ends');
-is(sql('SELECT borrowed FROM dolt_node_cache_stats()'), 0, 'a session borrows nothing between transactions');
-is(sql('SELECT pinned FROM dolt_node_cache_stats()'), 0, 'no idle session pins the cache');
 
 # After a restart, the first session reads the table from the store, and the next none of it.
 $node->restart;
@@ -93,28 +89,25 @@ is(sql(q{SELECT count(*) FROM dolt_diff('HEAD~2', 'HEAD', 't')}), 41, 'a diff ac
 $node->restart;
 my ($rc, $out, $err) = $node->psql('postgres', q{SELECT count(*) FROM dolt_diff('HEAD~2', 'HEAD', 't')});
 is("$out|$err", '41|', 'a new session diffing nodes missing from the cache leaks nothing');
-is(sql('SELECT pinned FROM dolt_node_cache_stats()'), 0, 'and leaves nothing pinned');
 sql(q{SELECT dolt_branch('old', 'HEAD~3')});
 is(sql(q{SELECT dolt_checkout('old'); SELECT count(*), sum(length(v)) FROM t}),
 	qq{(0,"Switched to branch 'old'")\n20000|1920000}, 'an old branch reads its own table');
 $expected = sql($count);
 
-# A cache too small for the table evicts as it goes; one too small for a
-# transaction's working set refuses nodes, and the store keeps private copies.
+# A cache too small for the table evicts as it goes, and stays within its size.
 $node->append_conf('postgresql.conf', "dolt_node_cache_size=1MB\n");
 $node->restart;
 is(sql(q{SELECT count(*), sum(length(v)) FROM t}), $expected, 'a scan through a 1 MB cache is right');
-my ($evictions, $rejected, $pinned);
-($evictions, $rejected, $bytes, $pinned) = split /\|/, sql('SELECT evictions, rejected, bytes, pinned FROM dolt_node_cache_stats()');
-cmp_ok($rejected, '>', 0, "a scan pinning the whole cache has nodes refused ($rejected)");
+my ($evictions);
+($evictions, $bytes) = split /\|/, sql('SELECT evictions, bytes FROM dolt_node_cache_stats()');
+cmp_ok($evictions, '>', 1000, "a scan larger than the cache evicts as it goes ($evictions)");
 cmp_ok($bytes, '<=', 1024 * 1024, "the cache stays within its size ($bytes bytes)");
-is($pinned, 0, 'and is unpinned when the scan ends');
 sql(q{DO $$ BEGIN FOR i IN 1..20 LOOP PERFORM v FROM t WHERE id = i * 997; END LOOP; END $$});
 for my $i (1 .. 30) {
 	sql("SELECT v FROM t WHERE id = " . ($i * 613));
 }
-($evictions) = split /\|/, sql('SELECT evictions FROM dolt_node_cache_stats()');
-cmp_ok($evictions, '>', 0, "lookups across the table evict ($evictions)");
+my ($after) = split /\|/, sql('SELECT evictions FROM dolt_node_cache_stats()');
+cmp_ok($after, '>', $evictions, 'lookups across the table evict too (' . ($after - $evictions) . ')');
 is(sql(q{SELECT count(*), sum(length(v)) FROM t}), $expected, 'and results stay right');
 
 # With no cache, every node is read from the store, privately.

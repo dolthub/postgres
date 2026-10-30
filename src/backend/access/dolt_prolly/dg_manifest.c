@@ -902,7 +902,7 @@ import_node(PLStore *store, DoltChunkStore *chunks, bytea *address, int depth)
 PLTree
 dg_history_import(PLStore *store, bytea *address)
 {
-	DoltChunkStore *chunks = store->lend ? dolt_chunk_open(DOLT_CHUNK_READ) : NULL;
+	DoltChunkStore *chunks = store->fetch ? dolt_chunk_open(DOLT_CHUNK_READ) : NULL;
 	PLTree		result;
 	PLHash		hash;
 

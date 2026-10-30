@@ -12562,9 +12562,9 @@
 { oid => '9249', descr => 'statistics of the shared prolly node cache',
   proname => 'dolt_node_cache_stats', provolatile => 'v', proparallel => 'r',
   prorettype => 'record', proargtypes => '',
-  proallargtypes => '{int8,int8,int8,int8,int8,int8,int8,int8,int8}',
-  proargmodes => '{o,o,o,o,o,o,o,o,o}',
-  proargnames => '{hits,misses,borrowed,added,evictions,rejected,entries,bytes,pinned}',
+  proallargtypes => '{int8,int8,int8,int8,int8,int8,int8}',
+  proargmodes => '{o,o,o,o,o,o,o}',
+  proargnames => '{hits,misses,added,evictions,rejected,entries,bytes}',
   prosrc => 'dolt_node_cache_stats_sql' },
 
 

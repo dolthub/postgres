@@ -698,43 +698,6 @@ fetch_from_source(void *arg, PLHash hash, PLSlice *bytes)
 	return pl_store_export(fetch->source, hash, bytes);
 }
 
-/* A lender of another store's nodes, in place, counting loans still out. */
-typedef struct LendSource
-{
-	PLStore    *source;
-	bool		copy;			/* lend transient bytes instead */
-	uintptr_t	next_token;
-	size_t		outstanding;
-	size_t		lent;
-} LendSource;
-
-static PLStatus
-lend_from_source(void *arg, PLHash hash, PLLoan *loan)
-{
-	LendSource *lender = arg;
-	PLStatus	status = pl_store_export(lender->source, hash, &loan->bytes);
-
-	if (status != PL_OK)
-		return status;
-	CHECK(pl_node_check(loan->bytes));
-	loan->token = lender->copy ? 0 : ++lender->next_token;
-	if (loan->token)
-	{
-		lender->outstanding++;
-		lender->lent++;
-	}
-	return PL_OK;
-}
-
-static void
-return_to_source(void *arg, uintptr_t token)
-{
-	LendSource *lender = arg;
-
-	CHECK(token != 0 && token <= lender->next_token && lender->outstanding > 0);
-	lender->outstanding--;
-}
-
 /*
  * Batched edits on deep trees: every result must equal a fresh build of the
  * same entries, and a small edit on a fetch-backed store must load only a
@@ -951,86 +914,34 @@ test_apply_batches(void)
 			pl_store_retain(backed, &tree.root, 1);
 			CHECK(pl_find_local(backed, edited.root) == NULL);
 		}
+
+		/*
+		 * Dropping backed nodes keeps unwritten ones, even one that was
+		 * listed as unwritten when it was written, and finds fetch again.
+		 */
+		{
+			PLTree		base_remote = {backed, tree.root},
+						edited;
+			uint8_t		other[4] = {6, 6, 6, 6};
+			PLEdit		edit4 = {{keys[SLOTS / 9], 8}, {true, {other, 4}}};
+			PLNode	   *root;
+			PLValue		got;
+			unsigned	fetches;
+
+			OK(pl_apply(&base_remote, &edit4, 1, &edited));
+			root = pl_find_local(backed, edited.root);
+			CHECK(root != NULL && !root->backed);
+			pl_node_set_backed(root);
+			CHECK(pl_store_drop_backed(backed) > 0);
+			CHECK(pl_find_local(backed, tree.root) == NULL);
+			CHECK(pl_find_local(backed, edited.root) == NULL);
+			CHECK(pl_store_stats(backed).chunks > 0);
+			CHECK(pl_store_drop_unbacked(backed) > 0);
+			fetches = fetch.fetches;
+			OK(pl_get(&base_remote, edit4.key, &got));
+			CHECK(fetch.fetches > fetches);
+		}
 		pl_store_free(backed);
-	}
-
-	/*
-	 * A lending store reads lent nodes in place, and returns each loan once:
-	 * when collection frees the node, when the store returns its loans, or
-	 * when it is freed.
-	 */
-	{
-		LendSource	lender = {store, false, 0, 0, 0};
-		PLStore    *lending = pl_store_create();
-		PLTree		remote = {lending, tree.root},
-					edited,
-					expected_tree;
-		uint8_t		changed[4] = {4, 3, 2, 1};
-		PLEdit		edit = {{keys[SLOTS / 7], 8}, {true, {changed, 4}}};
-		PLValue		got;
-		PLNode	   *root;
-		PLStats		stats;
-
-		CHECK(lending != NULL);
-		pl_store_set_lender(lending, lend_from_source, return_to_source, &lender);
-		OK(pl_apply(&tree, &edit, 1, &expected_tree));
-		OK(pl_apply(&remote, &edit, 1, &edited));
-		CHECK(pl_hash_equal(edited.root, expected_tree.root));
-		stats = pl_store_stats(lending);
-		CHECK(lender.outstanding > 0 && stats.borrowed == lender.outstanding);
-		CHECK(stats.fetched == lender.lent);
-		root = pl_find_local(lending, tree.root);
-		CHECK(root != NULL && root->backed && root->loan != 0);
-		CHECK(root->data == pl_find_local(store, tree.root)->data);
-		CHECK(root->level == pl_find_local(store, tree.root)->level);
-
-		/* Collection returns the loans of the nodes it frees. */
-		CHECK(pl_store_retain(lending, &edited.root, 1) > 0);
-		CHECK(pl_store_stats(lending).borrowed == lender.outstanding);
-		CHECK(pl_find_local(lending, tree.root) == NULL);
-		OK(pl_get(&edited, edit.key, &got));
-		CHECK(got.present && got.bytes.len == 4 && memcmp(got.bytes.data, changed, 4) == 0);
-
-		/* Returning the loans keeps the store's own nodes; finds borrow again. */
-		{
-			size_t		out = lender.outstanding;
-
-			CHECK(pl_store_return_loans(lending) == out);
-		}
-		CHECK(lender.outstanding == 0 && pl_store_stats(lending).borrowed == 0);
-		CHECK(pl_find_local(lending, edited.root) != NULL);
-		OK(pl_get(&remote, edit.key, &got));
-		CHECK(lender.outstanding > 0);
-
-		/* Dropping backed nodes keeps unwritten and borrowed ones. */
-		{
-			PLNode	   *written = pl_find_local(lending, edited.root);
-			size_t		chunks;
-
-			CHECK(written != NULL && !written->backed && !written->loan);
-			pl_node_set_backed(written);
-			chunks = pl_store_stats(lending).chunks;
-			CHECK(pl_store_drop_backed(lending) == 1);
-			CHECK(pl_store_stats(lending).chunks == chunks - 1);
-			CHECK(pl_find_local(lending, edited.root) == NULL);
-			CHECK(pl_store_stats(lending).borrowed == lender.outstanding);
-			CHECK(pl_store_drop_unbacked(lending) > 0);
-		}
-		pl_store_free(lending);
-		CHECK(lender.outstanding == 0);
-
-		/* Transient loans are copied and checked like fetched bytes. */
-		lending = pl_store_create();
-		CHECK(lending != NULL);
-		lender.copy = true;
-		pl_store_set_lender(lending, lend_from_source, return_to_source, &lender);
-		remote.store = lending;
-		OK(pl_get(&remote, edit.key, &got));
-		CHECK(pl_store_stats(lending).fetched > 0 && pl_store_stats(lending).borrowed == 0);
-		CHECK(pl_find_local(lending, tree.root)->data != pl_find_local(store, tree.root)->data);
-		CHECK(pl_store_return_loans(lending) == 0);
-		pl_store_free(lending);
-		CHECK(lender.outstanding == 0);
 	}
 
 	/* Diff and merge of small changes on a large tree also stay local. */
@@ -1144,8 +1055,6 @@ test_import_and_malformed(void)
 		bad[PL_HEADER + width - 1] = 1; /* first key offset must be zero */
 		CHECK(pl_node_address(bytes(bad, data.len), &hash));
 		CHECK(pl_store_import(target, hash, bytes(bad, data.len)) == PL_CORRUPT);
-		CHECK(pl_node_check(data) && !pl_node_check(bytes(bad, data.len)));
-		CHECK(!pl_node_check(bytes(data.data, PL_HEADER - 1)));
 		memcpy(bad, data.data, data.len);
 		/* Valid local encoding, but nonexistent child address. */
 		bad[PL_HEADER + 2 * width * (pl_read32(bad + 12) + 1) + pl_read32(bad + 16)] ^= 128;
