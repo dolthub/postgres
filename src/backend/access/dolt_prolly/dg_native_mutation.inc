@@ -1276,8 +1276,9 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 	{
 		CatalogViewSwitch(previous);
 		native_mutation_view = saved_mutation;
-		foreach_ptr(NativeMutationTable, table, native_mutation_tables)
-			if (table->source != state) dg_release(table->source);
+		if (native_mutation_tables != saved_tables)
+			foreach_ptr(NativeMutationTable, table, native_mutation_tables)
+				if (table->source != state) dg_release(table->source);
 		native_mutation_tables = saved_tables;
 		native_mutation_relation = saved_relation;
 		native_mutation_indexes = saved_indexes;
