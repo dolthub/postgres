@@ -56,6 +56,40 @@ sql(q{CREATE TABLE pnumeric(id numeric PRIMARY KEY); INSERT INTO pnumeric VALUES
 is(sql(q{INSERT INTO cnumeric VALUES (1); SELECT id FROM cnumeric}), '1',
  'a by-value integer is coerced to a by-reference numeric operator input');
 
+# Datetime cross-type operators are exact comparisons, not lossy casts of the
+# referencing value. Exercise both directions and timezone-sensitive keys.
+sql(q{SET TIME ZONE 'America/New_York'; SET enable_seqscan=off});
+for my $parent ('date', 'timestamp', 'timestamptz')
+{
+ for my $child ('date', 'timestamp', 'timestamptz')
+ {
+  next if $parent eq $child;
+  sql("CREATE TABLE dt_parent(k $parent PRIMARY KEY); " .
+      "CREATE TABLE dt_child(k $child REFERENCES dt_parent ON UPDATE CASCADE); " .
+      "CREATE INDEX ON dt_child(k); INSERT INTO dt_parent VALUES ('2020-01-01')");
+  is(sql(q{SET TIME ZONE 'America/New_York'; INSERT INTO dt_child VALUES ('2020-01-01');
+   SELECT count(*) FROM dt_child}), '1', "$child child finds $parent parent");
+  fails(q{SET TIME ZONE 'America/New_York'; SET enable_seqscan=off; DELETE FROM dt_parent},
+   qr/violates foreign key constraint/, "$parent delete sees $child reference");
+  is(sql(q{SET TIME ZONE 'America/New_York'; SET enable_seqscan=off;
+   UPDATE dt_parent SET k='2020-01-02'; SELECT count(*) FROM dt_child WHERE k='2020-01-02'}),
+   '1', "$parent update cascades to $child");
+  sql('DROP TABLE dt_child; DROP TABLE dt_parent');
+ }
+}
+
+# A cross-type range must not turn a timestamp into a raw date byte bound.
+# Check equality, both bounds, descending keys, and a retained leading prefix.
+sql(q{CREATE TABLE dt_bounds(prefix int, k date);
+ INSERT INTO dt_bounds VALUES (1,'2020-01-01'), (1,'2020-01-02'),
+ (1,'2020-01-03'), (2,'2020-01-02');
+ CREATE INDEX ON dt_bounds(prefix, k DESC)});
+is(sql(q{SET enable_seqscan=off; SELECT count(*) FROM dt_bounds
+ WHERE prefix=1 AND k='2020-01-02'::timestamp}), '1', 'cross-type equality retains the prefix');
+is(sql(q{SET enable_seqscan=off; SELECT count(*) FROM dt_bounds
+ WHERE prefix=1 AND k>'2020-01-01 12:00'::timestamp AND k<'2020-01-03'::timestamp}),
+ '1', 'cross-type descending range rechecks both bounds');
+
 # Rows the transaction itself inserted are found; rows it deleted are not.
 is(sql(q{BEGIN; INSERT INTO p2 VALUES (20); INSERT INTO c2 VALUES (3, 20); COMMIT; SELECT pid FROM c2 WHERE id = 3}), '20',
 	'a parent inserted earlier in the transaction is found');
