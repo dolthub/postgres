@@ -8,6 +8,7 @@ typedef struct DGProvider
 	char	   *database;
 	CatalogView *view;
 	uint64		generation;		/* identity generation a branch view binds */
+	uint64		extension_generation;	/* the extensions whose objects it binds */
 	List	   *bindings;		/* the durable OIDs a branch view binds */
 	MemoryContext memory;		/* holds the entry */
 	struct DGProvider *next;
@@ -36,11 +37,20 @@ static DGProvider *provider_current_entry;
 static uint64 identity_generation = 1;
 static bool identity_callback;
 
+/*
+ * A view binds extensions' objects, which definitions name, to their OIDs
+ * here. Creating, altering or dropping an extension replaces those and resets
+ * every relcache entry, so no view built before it is used again.
+ */
+static uint64 extension_generation = 1;
+
 static void
 provider_identities_changed(Datum arg, Oid relid)
 {
 	if (!OidIsValid(relid) || relid == DoltIdentityRelationId)
 		identity_generation++;
+	if (!OidIsValid(relid))
+		extension_generation++;
 }
 
 /* Whether every durable OID |entry|'s view binds is still bound so. */
@@ -62,6 +72,8 @@ provider_bindings_current(DGProvider *entry)
 static bool
 provider_current(DGProvider *entry, const char *branch)
 {
+	if (entry->extension_generation != extension_generation)
+		return false;
 	if (!branch)
 		return !entry->branch;
 	if (!entry->branch || strcmp(entry->branch, branch))
@@ -1681,6 +1693,7 @@ provider_lookup(const char *branch, bytea *database)
 	entry->branch = branch ? MemoryContextStrdup(memory, branch) : NULL;
 	entry->view = view;
 	entry->generation = identity_generation;
+	entry->extension_generation = extension_generation;
 	entry->next = providers;
 	providers = entry;
 	saved_entry = provider_current_entry;

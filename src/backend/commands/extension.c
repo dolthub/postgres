@@ -2176,6 +2176,17 @@ CreateExtension(ParseState *pstate, CreateExtensionStmt *stmt)
 }
 
 /*
+ * A change to an installed extension, its objects or its version. Catalog
+ * views, and the relations and plans built from them, bound its objects by
+ * name: every backend binds them again.
+ */
+static void
+extension_changed(void)
+{
+	CacheInvalidateRelcacheAll();
+}
+
+/*
  * InsertExtensionTuple
  *
  * Insert the new pg_extension row, and create extension's dependency entries.
@@ -2267,6 +2278,7 @@ InsertExtensionTuple(const char *extName, Oid extOwner,
 	/* Post creation hook for new extension */
 	InvokeObjectPostCreateHook(ExtensionRelationId, extensionOid, 0);
 
+	extension_changed();
 	return myself;
 }
 
@@ -2319,6 +2331,7 @@ RemoveExtensionById(Oid extId)
 	systable_endscan(scandesc);
 
 	table_close(rel, RowExclusiveLock);
+	extension_changed();
 }
 
 /*
@@ -3395,6 +3408,7 @@ AlterExtensionNamespace(const char *extensionName, const char *newschema, Oid *o
 			 NameStr(extForm->extname));
 
 	InvokeObjectPostAlterHook(ExtensionRelationId, extensionOid, 0);
+	extension_changed();
 
 	ObjectAddressSet(extAddr, ExtensionRelationId, extensionOid);
 
@@ -3699,6 +3713,7 @@ ApplyExtensionUpdates(Oid extensionOid,
 		 */
 		oldVersionName = versionName;
 	}
+	extension_changed();
 }
 
 /*
@@ -3775,6 +3790,7 @@ ExecAlterExtensionContentsStmt(AlterExtensionContentsStmt *stmt,
 
 	/* Finish up */
 	InvokeObjectPostAlterHook(ExtensionRelationId, extension.objectId, 0);
+	extension_changed();
 
 	/*
 	 * If get_object_address() opened the relation for us, we close it to keep
