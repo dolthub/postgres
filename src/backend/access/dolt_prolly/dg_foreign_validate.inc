@@ -76,6 +76,18 @@ collect_foreign_violations(HeapTuple constraint, Relation fk, Relation pk, Strin
 		appendStringInfo(&present, "f.%s IS NOT NULL", dg_quote_identifier(f));
 		appendStringInfo(&missing, "f.%s IS NULL", dg_quote_identifier(f));
 		appendStringInfo(&join, "(p.%s)::%s OPERATOR(%s.%s) (f.%s)::%s", dg_quote_identifier(p), format_type_be_qualified(op->oprleft), dg_quote_identifier(get_namespace_name(op->oprnamespace)), NameStr(op->oprname), dg_quote_identifier(f), format_type_be_qualified(op->oprright));
+		/* Match native RI checks when the columns have distinct collations. */
+		{
+			Oid pkcoll = TupleDescAttr(RelationGetDescr(pk), DatumGetInt16(pkcols[i]) - 1)->attcollation;
+			Oid fkcoll = TupleDescAttr(RelationGetDescr(fk), DatumGetInt16(fkcols[i]) - 1)->attcollation;
+			if (OidIsValid(pkcoll) && pkcoll != fkcoll)
+			{
+				HeapTuple colltuple = SearchSysCache1(COLLOID, ObjectIdGetDatum(pkcoll));
+				Form_pg_collation coll = (Form_pg_collation) GETSTRUCT(colltuple);
+				appendStringInfo(&join, " COLLATE %s", dg_qualified_name(get_namespace_name(coll->collnamespace), NameStr(coll->collname)));
+				ReleaseSysCache(colltuple);
+			}
+		}
 		escape_json(&columns, f);
 		escape_json(&referenced, p);
 		ReleaseSysCache(optuple);
