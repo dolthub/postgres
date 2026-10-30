@@ -1,0 +1,25 @@
+use strict;
+use warnings FATAL => 'all';
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
+my $node = PostgreSQL::Test::Cluster->new('inheritance');
+$node->init(extra => ['--encoding=UTF8', '--locale=C']);
+$node->append_conf('postgresql.conf', "default_table_access_method='dolt_prolly_table'\nautovacuum=off\n");
+$node->start;
+sub sql { $node->safe_psql('postgres', $_[0]); }
+sql(q{CREATE TABLE parent(a int CHECK(a>0)); INSERT INTO parent VALUES(1);
+ CREATE TABLE child(b text) INHERITS(parent); INSERT INTO child VALUES(2,'child')});
+is(sql(q{SELECT a FROM parent ORDER BY a}), "1\n2", 'parent scans child storage');
+is(sql(q{SELECT a FROM ONLY parent}), '1', 'ONLY excludes child');
+is(sql(q{SELECT attislocal,attinhcount FROM pg_attribute WHERE attrelid='child'::regclass AND attname='a'}), 'f|1', 'inherited attribute metadata');
+is(sql(q{SELECT conislocal,coninhcount FROM pg_constraint WHERE conrelid='child'::regclass AND contype='c'}), 'f|1', 'inherited constraint metadata');
+sql(q{SELECT dolt_commit('-Am','inheritance'); SELECT dolt_branch('feature')});
+is(sql(q{SELECT status FROM dolt_checkout('feature'); UPDATE parent SET a=a+10; SELECT a FROM parent ORDER BY a}), "0\n11\n12", 'inherited UPDATE on feature');
+is(sql(q{SELECT a FROM parent ORDER BY a}), "1\n2", 'main retains original parent and child rows');
+sql(q{SELECT dolt_checkout('feature'); SELECT dolt_commit('-Am','update'); SELECT dolt_checkout('main'); SELECT dolt_merge('feature')});
+is(sql(q{SELECT a FROM parent ORDER BY a}), "11\n12", 'merge includes child data');
+$node->restart;
+is(sql(q{SELECT a FROM parent ORDER BY a}), "11\n12", 'inheritance survives restart');
+$node->stop;
+done_testing();

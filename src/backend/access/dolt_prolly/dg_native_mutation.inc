@@ -8,7 +8,7 @@ native_alter_action(AlterTableType type)
 {
 	return type == AT_AlterConstraint || type == AT_AddIndex || type == AT_SetStatistics || type == AT_SetOptions || type == AT_ResetOptions ||
 		type == AT_SetStorage || type == AT_SetCompression || type == AT_SetNotNull || type == AT_DropNotNull || type == AT_AddColumn || type == AT_DropColumn || type == AT_ColumnDefault || type == AT_AddConstraint || type == AT_DropConstraint || type == AT_ValidateConstraint || type == AT_AlterColumnType ||
-		type == AT_AddIdentity || type == AT_SetIdentity || type == AT_DropIdentity;
+		type == AT_AddInherit || type == AT_DropInherit || type == AT_AddIdentity || type == AT_SetIdentity || type == AT_DropIdentity;
 }
 
 static CatalogView *native_mutation_view;
@@ -98,8 +98,8 @@ mutation_columns(CatalogView *view, Oid relation, const char *definition, int **
 		if (has_old)
 			old = json_element(&oldcolumns, ordinal);
 		{
-			static const char *const keys[] = {"name", "comment", "type", "typmod", "notnull", "collation"};
-			JsonbValue	values[6];
+			static const char *const keys[] = {"name", "comment", "type", "typmod", "notnull", "collation", "islocal", "inhcount"};
+			JsonbValue	values[8];
 			JsonbValue	comment;
 
 			values[0] = jv_string(NameStr(attr->attname));
@@ -109,6 +109,8 @@ mutation_columns(CatalogView *view, Oid relation, const char *definition, int **
 			values[3] = jv_int(attr->atttypmod);
 			values[4] = jv_bool(false);
 			values[5] = jv_null();
+			values[6] = jv_bool(attr->attislocal);
+			values[7] = jv_int(attr->attinhcount);
 			if (OidIsValid(attr->attcollation))
 			{
 				/* Collations are the database's own, as internal SQL reads them. */
@@ -145,7 +147,7 @@ mutation_columns(CatalogView *view, Oid relation, const char *definition, int **
 				CatalogViewSwitch(previous);
 			}
 			column = has_old ? JsonbValueToJsonb(&old) : jb_object(0, NULL, NULL, false);
-			column = jb_merge(column, jb_object(6, keys, values, false));
+			column = jb_merge(column, jb_object(8, keys, values, false));
 		}
 
 		{
@@ -371,6 +373,25 @@ compare_constraint_entries(const void *a, const void *b)
 }
 
 static char *
+mutation_inheritance(CatalogView *view, Oid relation, const char *definition)
+{
+	List *tuples = CatalogViewTuplesWith(view, InheritsRelationId, Anum_pg_inherits_inhrelid, relation);
+	int n = list_length(tuples);
+	JsonbValue *parents = palloc_array(JsonbValue, Max(n, 1));
+
+	foreach_ptr(HeapTupleData, tuple, tuples)
+	{
+		Form_pg_inherits form = (Form_pg_inherits) GETSTRUCT(tuple);
+		const char *name = CatalogViewObjectIdentity(form->inhparent, RelationRelationId);
+
+		if (!name || form->inhseqno < 1 || form->inhseqno > n || form->inhdetachpending)
+			unsupported("inheritance outside the branch catalog");
+		parents[form->inhseqno - 1] = jv_string(name);
+	}
+	return json_set_jsonb(definition, "inherits", jb_array(n, parents));
+}
+
+static char *
 mutation_constraints(CatalogView *view, Oid relation, const char *definition)
 {
 	ListCell   *lc;
@@ -423,10 +444,15 @@ mutation_constraints(CatalogView *view, Oid relation, const char *definition)
 			escape_json(&json, NameStr(constraint->conname));
 			appendStringInfoChar(&json, ',');
 			escape_json(&json, sql);
-			if (constraint->contype == CONSTRAINT_FOREIGN)
 			{
+				const char *keys[] = {"islocal", "inhcount", "noinherit"};
+				JsonbValue values[] = {jv_bool(constraint->conislocal), jv_int(constraint->coninhcount), jv_bool(constraint->connoinherit)};
+				Jsonb *meta = jb_object(3, keys, values, false);
+
+				if (constraint->contype == CONSTRAINT_FOREIGN)
+					meta = jb_merge(DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(foreign_metadata(tuple)))), meta);
 				appendStringInfoChar(&json, ',');
-				appendStringInfoString(&json, foreign_metadata(tuple));
+				appendStringInfoString(&json, JsonbToCString(NULL, &meta->root, VARSIZE(meta)));
 			}
 			appendStringInfoChar(&json, ']');
 		}
@@ -567,7 +593,7 @@ mutation_index_list(const char *definition, List *indexes)
 static bool
 identity_action(AlterTableCmd *action)
 {
-	return action->subtype == AT_AddIdentity || action->subtype == AT_SetIdentity ||
+	return action->subtype == AT_AddInherit || type == AT_DropInherit || type == AT_AddIdentity || action->subtype == AT_SetIdentity ||
 		action->subtype == AT_DropIdentity;
 }
 
@@ -1086,7 +1112,10 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 				}
 
 				if (!strcmp(kinds[i], "table"))
+					{
 					definition = mutation_constraints(view, object, definition);
+					definition = mutation_inheritance(view, object, definition);
+				}
 				if (!strcmp(names[i], name))
 					definition = mutation_index_list(definition, indexes);
 				if (!touched && !json_same(definition, old))
@@ -1370,6 +1399,7 @@ native_create_definitions(Capture current, CreateStmt *statement, const char *qu
 		definition = canonical_definition(name, owner, acl, "[]", "[]", "[]", NULL);
 		definition = mutation_columns(view, id, definition, &mapping, &attributes);
 		definition = mutation_constraints(view, id, definition);
+		definition = mutation_inheritance(view, id, definition);
 		indexes = mutation_indexes(view, id);
 		foreach(lc, indexes)
 		{
