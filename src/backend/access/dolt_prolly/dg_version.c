@@ -1578,10 +1578,10 @@ dolt_add(PG_FUNCTION_ARGS)
 	int			nest;
 
 	standalone(fcinfo, false);
-	/* Import pre-repository namespaces before the first capture only. */
+	nest = begin_api();
+	/* Activation advances command visibility on our private API snapshot. */
 	if (!dg_catalog_active())
 		catalog_activate();
-	nest = begin_api();
 	ensure_repository();
 	if (n == 0)
 		unsupported("dolt_add requires '.', '-A' or table names");
@@ -1637,10 +1637,10 @@ dolt_commit(PG_FUNCTION_ARGS)
 	int			nest;
 
 	standalone(fcinfo, true);
-	/* Import pre-repository namespaces before the first capture only. */
+	nest = begin_api();
+	/* Activation advances command visibility on our private API snapshot. */
 	if (!dg_catalog_active())
 		catalog_activate();
-	nest = begin_api();
 	for (i = 0; i < n; i++)
 	{
 		if (!strcmp(args[i], "-A") || !strcmp(args[i], "--ALL"))
