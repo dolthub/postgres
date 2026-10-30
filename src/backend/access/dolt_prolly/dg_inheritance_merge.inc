@@ -8,6 +8,7 @@ inheritance_invalid(Member *members, int count)
 		JsonbValue	definition,
 					parents,
 					columns;
+		int *inherited;
 
 		if (strcmp(members[i].kind, "table"))
 			continue;
@@ -15,7 +16,7 @@ inheritance_invalid(Member *members, int count)
 		if (!json_get(&definition, "inherits", &parents))
 			continue;
 		json_get(&definition, "columns", &columns);
-		int		   *inherited = palloc0_array(int, Max(json_length(&columns), 1));
+		inherited = palloc0_array(int, Max(json_length(&columns), 1));
 
 		for (int p = 0; p < json_length(&parents); p++)
 		{

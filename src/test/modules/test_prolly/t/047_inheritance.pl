@@ -43,7 +43,7 @@ sql(q{ALTER TABLE parent RENAME TO renamed_parent});
 is(sql(q{SELECT a FROM renamed_parent ORDER BY a}), "111\n112", 'parent rename preserves edges');
 sql(q{BEGIN; ALTER TABLE renamed_parent ADD COLUMN rolled_back int DEFAULT 3; ROLLBACK});
 is(sql(q{SELECT count(*) FROM pg_attribute WHERE attrelid='child'::regclass AND attname='rolled_back'}), '0', 'recursive DDL rolls back');
-sql(q{BEGIN; TRUNCATE renamed_parent; ROLLBACK});
+is(sql(q{BEGIN; TRUNCATE renamed_parent; SELECT count(*) FROM child; ROLLBACK}), '0', 'inherited TRUNCATE clears child rows');
 is(sql(q{SELECT a FROM renamed_parent ORDER BY a}), "111\n112", 'inherited TRUNCATE rolls back');
 sql(q{DELETE FROM renamed_parent WHERE a=112});
 is(sql(q{SELECT count(*) FROM child}), '0', 'inherited DELETE reaches child storage');
@@ -88,5 +88,9 @@ sql(q{ALTER TABLE cycle_b INHERIT cycle_a; SELECT dolt_commit('-Am','other direc
 is(sql(q{SELECT conflicts FROM dolt_merge('cycle_source')}), '1', 'merge cannot introduce an inheritance cycle');
 sql(q{SELECT dolt_conflicts_resolve('--theirs','.')});
 is(sql(q{SELECT inhrelid::regclass,inhparent::regclass FROM pg_inherits WHERE inhrelid IN ('cycle_a'::regclass,'cycle_b'::regclass)}), 'cycle_a|cycle_b', 'cycle conflict resolves as a complete component');
+sql(q{SELECT dolt_commit('-Am','resolve cycle'); CREATE TABLE constraint_parent(v int); SELECT dolt_commit('-Am','constraint base');
+ SELECT dolt_branch('constraint_source'); SELECT dolt_checkout('constraint_source'); CREATE TABLE constraint_child() INHERITS(constraint_parent); SELECT dolt_commit('-Am','child before constraint')});
+sql(q{ALTER TABLE constraint_parent ADD CONSTRAINT positive CHECK(v>0); SELECT dolt_commit('-Am','parent constraint')});
+is(sql(q{SELECT conflicts FROM dolt_merge('constraint_source')}), '1', 'merged child cannot omit a newly inherited constraint');
 $node->stop;
 done_testing();
