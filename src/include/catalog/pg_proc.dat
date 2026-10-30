@@ -12895,7 +12895,7 @@
  provariadic => 'text', prosrc => 'dolt_stats_timers' },
 { oid => '9248', descr => 'backup usage', proname => 'dolt_backup',
  provolatile => 'v', proparallel => 'u', prorettype => 'int8', proargtypes => '',
- prosrc => 'dolt_backup' },
+ prosrc => 'dolt_backup_noargs' },
 { oid => '9238', descr => 'manage native database backups', proname => 'dolt_backup',
  provolatile => 'v', proparallel => 'u', proisstrict => 'f', prorettype => 'int8', proargtypes => '_text', proallargtypes => '{_text}', proargmodes => '{v}',
  provariadic => 'text', prosrc => 'dolt_backup' },

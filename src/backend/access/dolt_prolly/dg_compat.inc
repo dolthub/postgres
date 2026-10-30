@@ -186,6 +186,12 @@ dolt_backup(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(0);
 }
 
+Datum
+dolt_backup_noargs(PG_FUNCTION_ARGS)
+{
+	return dolt_backup(fcinfo);
+}
+
 /* ---- remotes and clusters: no transport ---- */
 
 static Datum
