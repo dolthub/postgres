@@ -2086,6 +2086,12 @@ dolt_commit_noargs(PG_FUNCTION_ARGS)
 }
 
 Datum
+dolt_commit_all_noargs(PG_FUNCTION_ARGS)
+{
+	return dolt_commit_all(fcinfo);
+}
+
+Datum
 dolt_branch_noargs(PG_FUNCTION_ARGS)
 {
 	return dolt_branch(fcinfo);

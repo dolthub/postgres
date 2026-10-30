@@ -12621,7 +12621,7 @@
   proretset => 't', prorows => '100', provolatile => 'v', proparallel => 'u', proisstrict => 'f',
   prorettype => 'record', proargtypes => '',
   proallargtypes => '{text,text}', proargmodes => '{o,o}', proargnames => '{branch,hash}',
-  prosrc => 'dolt_commit_all' },
+  prosrc => 'dolt_commit_all_noargs' },
 { oid => '9154', descr => 'native version-control command', proname => 'dolt_branch',
   provolatile => 'v', proparallel => 'u', proisstrict => 'f', prorettype => 'int8', proargtypes => '',
   proallargtypes => '{int8}', proargmodes => '{o}', proargnames => '{status}',
