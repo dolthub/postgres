@@ -1,6 +1,28 @@
 static Oid provider_array_of(DGProviderRows *rows, Oid element);
 
 /* Resolve symbolic signatures against the view under construction. */
+/* The type an installed extension names |name|, or InvalidOid. */
+static Oid
+extension_type_oid(const char *name)
+{
+	CatalogView *previous = CatalogViewSwitch(NULL);
+	Oid			result = InvalidOid;
+	int32		typmod;
+
+	PG_TRY();
+	{
+		if (parseTypeString(name, &result, &typmod, (Node *) &(ErrorSaveContext) {T_ErrorSaveContext}) &&
+			OidIsValid(result) && !schema_extension_member(TypeRelationId, result))
+			result = InvalidOid;
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	return result;
+}
+
 static Oid
 routine_type_oid(DGProviderRows *rows, CatalogView *view, const char *name)
 {
@@ -18,7 +40,8 @@ routine_type_oid(DGProviderRows *rows, CatalogView *view, const char *name)
 
 		if (OidIsValid(array))
 			return array;
-		if (element < FirstNormalObjectId)
+		/* A built-in or extension element type has a native array type. */
+		if (element < FirstDurableObjectId)
 			return get_array_type(element);
 		foreach(lc, rows->rows[provider_catalog_index(TypeRelationId)])
 		{
@@ -31,6 +54,8 @@ routine_type_oid(DGProviderRows *rows, CatalogView *view, const char *name)
 	}
 	result = CatalogViewFindObject(view, TypeRelationId, name);
 	if (OidIsValid(result))
+		return result;
+	if (strncmp(name, "pg_catalog.", strlen("pg_catalog.")) && OidIsValid(result = extension_type_oid(name)))
 		return result;
 	parseTypeString(name, &result, &typmod, false);
 	if (strncmp(name, "pg_catalog.", strlen("pg_catalog.")))

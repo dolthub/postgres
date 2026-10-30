@@ -19,8 +19,12 @@ routine_type_name(Oid id)
 	if (!HeapTupleIsValid(tuple))
 		elog(ERROR, "cache lookup failed for type %u", id);
 	type = (Form_pg_type) GETSTRUCT(tuple);
-	/* A user type is portable once versioned: a table's row type or a type of its own. */
-	if (type->typnamespace != PG_CATALOG_NAMESPACE && id < FirstDurableObjectId)
+	/*
+	 * A user type is portable once versioned: a table's row type or a type of
+	 * its own. An extension's type is named as a built-in one is.
+	 */
+	if (type->typnamespace != PG_CATALOG_NAMESPACE && id < FirstDurableObjectId &&
+		!schema_extension_member(TypeRelationId, id))
 		unsupported("versioned object referring to an unversioned type");
 	result = dg_qualified_name(get_namespace_name(type->typnamespace), NameStr(type->typname));
 	ReleaseSysCache(tuple);
