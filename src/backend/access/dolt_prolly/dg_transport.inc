@@ -416,16 +416,16 @@ bundle_restore(const char *url, const char *name, bool force)
 		ErrorData *original = CopyErrorData();
 
 		FlushErrorState();
-		PG_TRY();
+		PG_TRY(cleanup);
 		{
 			request.operation = 3;
 			bundle_worker(&request);
 		}
-		PG_CATCH();
+		PG_CATCH(cleanup);
 		{
 			FlushErrorState();
 		}
-		PG_END_TRY();
+		PG_END_TRY(cleanup);
 		MemoryContextSwitchTo(context);
 		ReThrowError(original);
 	}
