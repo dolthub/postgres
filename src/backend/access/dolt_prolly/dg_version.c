@@ -353,6 +353,11 @@ standalone_walker(Node *node, StandaloneCall * found)
 		found->count++;
 		return false;
 	}
+	if (IsA(node, FuncExpr) && func_volatile(((FuncExpr *) node)->funcid) == PROVOLATILE_VOLATILE)
+	{
+		found->count += 2;
+		return true;
+	}
 	if (IsA(node, SubPlan) || IsA(node, SubLink) || IsA(node, Var))
 	{
 		found->count += 2;		/* disqualify */
@@ -377,7 +382,11 @@ standalone(FunctionCallInfo fcinfo, bool commits)
 	/* A target-list SRF is represented by ProjectSet over a dummy Result. */
 	if (IsA(plan, Result) && outerPlan(plan) && IsA(outerPlan(plan), ProjectSet) &&
 		!plan->qual && !plan->initPlan && !innerPlan(plan))
+	{
+		if (contain_volatile_functions((Node *) plan->targetlist))
+			goto bad;
 		plan = outerPlan(plan);
+	}
 	if (plan->qual || plan->initPlan || innerPlan(plan) ||
 		(outerPlan(plan) && !(IsA(plan, ProjectSet) && IsA(outerPlan(plan), Result) &&
 			!outerPlan(plan)->qual && !outerPlan(plan)->initPlan &&
@@ -1752,11 +1761,14 @@ dolt_commit_impl(FunctionCallInfo fcinfo, bool named_rows)
 
 	/* Apply deferred constraints under the caller's normal catalog context.
 	 * The transaction ends after the standalone result has been consumed. */
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "cannot connect commit constraint SPI");
-	if (SPI_execute("SET CONSTRAINTS ALL IMMEDIATE", false, 0) != SPI_OK_UTILITY)
-		elog(ERROR, "cannot fire deferred commit constraints");
-	SPI_finish();
+	do
+	{
+		if (SPI_connect() != SPI_OK_CONNECT)
+			elog(ERROR, "cannot connect commit constraint SPI");
+		if (SPI_execute("SET CONSTRAINTS ALL IMMEDIATE", false, 0) != SPI_OK_UTILITY)
+			elog(ERROR, "cannot fire deferred commit constraints");
+		SPI_finish();
+	} while (PreCommit_PortalsForVersionCommit());
 	CommandCounterIncrement();
 	dg_flush_version_batches();
 	CommandCounterIncrement();
