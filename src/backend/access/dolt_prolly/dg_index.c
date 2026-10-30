@@ -891,6 +891,25 @@ append_key_value(IndexScanDesc scan, int j, ScanKey key, StringInfo out)
 }
 
 /*
+ * Datetime cross-type operators compare after unit/time-zone conversion.
+ * Their independently encoded operands are not comparable byte bounds: dates
+ * count days, timestamps count microseconds, and timestamptz uses UTC. Leave
+ * these predicates to matches(), retaining any usable leading-column bounds.
+ */
+static bool
+key_has_compatible_encoding(IndexScanDesc scan, int j, ScanKey key)
+{
+	Oid			column = getBaseType(TupleDescAttr(RelationGetDescr(scan->heapRelation),
+											 scan->indexRelation->rd_index->indkey.values[j] - 1)->atttypid);
+	Oid			argument = OidIsValid(key->sk_subtype) ? getBaseType(key->sk_subtype) : column;
+
+	if (column != argument &&
+		(column == DATEOID || column == TIMESTAMPOID || column == TIMESTAMPTZOID))
+		return false;
+	return true;
+}
+
+/*
  * Conservative key bounds for the scan: equality keys on leading columns,
  * then at most one range column. matches() rechecks every candidate, so the
  * bounds only need to contain every match.
@@ -914,7 +933,8 @@ scan_bounds(IndexScanDesc scan, StringInfo lower, StringInfo upper, bool *has_lo
 		{
 			ScanKey		key = &scan->keyData[i];
 
-			if (key->sk_attno != j + 1 || key->sk_flags != 0)
+			if (key->sk_attno != j + 1 || key->sk_flags != 0 ||
+				!key_has_compatible_encoding(scan, j, key))
 				continue;
 			if (key->sk_strategy == BTEqualStrategyNumber)
 				equal = key;
