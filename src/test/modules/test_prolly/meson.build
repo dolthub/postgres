@@ -56,5 +56,6 @@ tests += {
     't/046_schema_objects.pl',
     't/047_inheritance.pl',
     't/048_schema_workspace.pl',
+    't/049_node_cache.pl',
   ]},
 }

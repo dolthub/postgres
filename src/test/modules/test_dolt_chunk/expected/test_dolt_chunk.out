@@ -141,27 +141,13 @@ SELECT error_of($$SELECT test_chunk_put(chunk_hash('contract zeta'), 'something 
 (1 row)
 
 RESET dolt_chunk_verify_hashes;
--- Pins keep a chunk's bytes valid while the cache evicts around them.
-SET dolt_chunk_cache_size = '64kB';
-SELECT test_chunk_cache_reset();
- test_chunk_cache_reset 
-------------------------
- 
-(1 row)
-
-SELECT test_chunk_pin_survives_eviction(chunk_hash('contract alpha'), 40) AS pin_survives;
+-- Pins keep a chunk's bytes valid while other chunks are put.
+SELECT test_chunk_pin_survives_puts(chunk_hash('contract alpha'), 40) AS pin_survives;
  pin_survives 
 --------------
  t
 (1 row)
 
-SELECT pinned FROM test_chunk_cache_stats();
- pinned 
---------
-      0
-(1 row)
-
-RESET dolt_chunk_cache_size;
 SELECT test_chunk_use_store('memory') AS previous_store;
  previous_store 
 ----------------
@@ -296,27 +282,13 @@ SELECT error_of($$SELECT test_chunk_put(chunk_hash('contract zeta'), 'something 
 (1 row)
 
 RESET dolt_chunk_verify_hashes;
--- Pins keep a chunk's bytes valid while the cache evicts around them.
-SET dolt_chunk_cache_size = '64kB';
-SELECT test_chunk_cache_reset();
- test_chunk_cache_reset 
-------------------------
- 
-(1 row)
-
-SELECT test_chunk_pin_survives_eviction(chunk_hash('contract alpha'), 40) AS pin_survives;
+-- Pins keep a chunk's bytes valid while other chunks are put.
+SELECT test_chunk_pin_survives_puts(chunk_hash('contract alpha'), 40) AS pin_survives;
  pin_survives 
 --------------
  t
 (1 row)
 
-SELECT pinned FROM test_chunk_cache_stats();
- pinned 
---------
-      0
-(1 row)
-
-RESET dolt_chunk_cache_size;
 -- Rollback semantics are not part of the contract: this store keeps puts.
 BEGIN;
 SELECT test_chunk_put(chunk_hash('memory rollback'), 'memory rollback');
@@ -368,12 +340,11 @@ SELECT indisunique, indisprimary FROM pg_index WHERE indexrelid = 'pg_dolt_chunk
 (1 row)
 
 SELECT name, setting, unit FROM pg_settings
-  WHERE name IN ('dolt_chunk_cache_size', 'dolt_chunk_verify_hashes') ORDER BY name;
+  WHERE name IN ('dolt_chunk_verify_hashes') ORDER BY name;
            name           | setting | unit 
 --------------------------+---------+------
- dolt_chunk_cache_size    | 262144  | kB
  dolt_chunk_verify_hashes | off     | 
-(2 rows)
+(1 row)
 
 -- A put that finds a committed copy stores nothing, so repeated puts keep one row.
 SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = chunk_hash('contract alpha');
@@ -533,14 +504,7 @@ BEGIN READ ONLY;
 SELECT test_chunk_put(chunk_hash('delta'), 'delta');
 ERROR:  cannot write dolt chunks in a read-only transaction
 ROLLBACK;
--- The cache serves repeated reads and stays within its budget.
-SET dolt_chunk_cache_size = '64kB';
-SELECT test_chunk_cache_reset();
- test_chunk_cache_reset 
-------------------------
- 
-(1 row)
-
+-- Repeated reads return the same bytes, and every chunk put is readable.
 SELECT test_chunk_get(chunk_hash('contract alpha')) = 'contract alpha' AS first_read;
  first_read 
 ------------
@@ -553,26 +517,12 @@ SELECT test_chunk_get(chunk_hash('contract alpha')) = 'contract alpha' AS second
  t
 (1 row)
 
-SELECT hits, misses FROM test_chunk_cache_stats();
- hits | misses 
-------+--------
-    1 |      1
-(1 row)
-
 SELECT count(*) FILTER (WHERE test_chunk_put(chunk_hash(x), x)) AS inserted
   FROM (SELECT decode(repeat(lpad(to_hex(g), 2, '0'), 8000), 'hex') AS x
         FROM generate_series(1, 20) g) s;
  inserted 
 ----------
        20
-(1 row)
-
-SELECT evictions > 0 AS evicted, bytes <= 65536 AS within_budget, entries < 20 AS bounded,
-       pinned = 0 AS unpinned
-  FROM test_chunk_cache_stats();
- evicted | within_budget | bounded | unpinned 
----------+---------------+---------+----------
- t       | t             | t       | t
 (1 row)
 
 SELECT count(*) FILTER (WHERE test_chunk_get(chunk_hash(x)) = x) AS all_readable
@@ -583,27 +533,6 @@ SELECT count(*) FILTER (WHERE test_chunk_get(chunk_hash(x)) = x) AS all_readable
            20
 (1 row)
 
--- With caching disabled, reads still work and nothing is retained.
-SET dolt_chunk_cache_size = 0;
-SELECT test_chunk_cache_reset();
- test_chunk_cache_reset 
-------------------------
- 
-(1 row)
-
-SELECT test_chunk_get(chunk_hash('contract alpha')) = 'contract alpha' AS uncached_read;
- uncached_read 
----------------
- t
-(1 row)
-
-SELECT hits, misses, entries, bytes, pinned FROM test_chunk_cache_stats();
- hits | misses | entries | bytes | pinned 
-------+--------+---------+-------+--------
-    0 |      1 |       0 |     0 |      0
-(1 row)
-
-RESET dolt_chunk_cache_size;
 -- The catalog is private.
 CREATE ROLE regress_chunk_reader;
 SET ROLE regress_chunk_reader;

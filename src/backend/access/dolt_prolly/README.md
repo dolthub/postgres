@@ -129,6 +129,28 @@ freeze horizon. A production retention/freezing protocol is required before
 long-lived deployments. Prepared-transaction recovery has a basic integration
 test, not the complete phase 3 concurrency certification.
 
+### Shared node cache
+
+Every backend reads prolly nodes through one cache in main shared memory,
+`dolt_node_cache_size` (1GB by default; 0 disables it; changing it requires a
+restart), laid out like the buffer pool: slots with usage counts, a
+partitioned hash table from node hash to slot, and clock-sweep eviction. Node
+bytes live in a dynamic shared memory area created in place in that segment.
+A reader copies a node out under the shared partition lock; eviction takes the
+lock exclusively. A miss reads the chunk store and adds the node; a committing
+transaction adds the nodes it wrote.
+
+There is no per-session node cache. The working store holds the nodes a
+transaction reads and builds until it ends; it holds a transaction's unwritten
+nodes so that only the nodes reachable from the roots a transaction publishes
+reach the chunk store, never its intermediate trees. At transaction end it
+keeps only pinned unwritten nodes, such as the empty tree.
+
+Nodes read from the chunk store are this library's own encoding and are not
+checked again; nodes imported from elsewhere are checked in full. History
+imports leave subtrees the chunk store already holds to be read through the
+cache. `dolt_node_cache_stats()` reports the cache's use.
+
 ### Core interfaces
 
 Two optional callbacks are added to TableAmRoutine:

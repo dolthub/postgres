@@ -207,9 +207,7 @@ diff_table_at(bytea *db, const char *name, bool rows)
 	t->keyed = t->nkeys > 0;
 	if (!rows)
 		return t;
-	t->store = pl_store_create();
-	if (!t->store)
-		elog(ERROR, "cannot allocate diff store");
+	t->store = dg_private_store();
 	content = dg_history_import(t->store, chunk);
 	t->rows = logical_rows_for(t, &content);
 	return t;

@@ -914,6 +914,33 @@ test_apply_batches(void)
 			pl_store_retain(backed, &tree.root, 1);
 			CHECK(pl_find_local(backed, edited.root) == NULL);
 		}
+
+		/*
+		 * Dropping backed nodes keeps unwritten ones, even one that was
+		 * listed as unwritten when it was written, and finds fetch again.
+		 */
+		{
+			PLTree		base_remote = {backed, tree.root},
+						edited;
+			uint8_t		other[4] = {6, 6, 6, 6};
+			PLEdit		edit4 = {{keys[SLOTS / 9], 8}, {true, {other, 4}}};
+			PLNode	   *root;
+			PLValue		got;
+			unsigned	fetches;
+
+			OK(pl_apply(&base_remote, &edit4, 1, &edited));
+			root = pl_find_local(backed, edited.root);
+			CHECK(root != NULL && !root->backed);
+			pl_node_set_backed(root);
+			CHECK(pl_store_drop_backed(backed) > 0);
+			CHECK(pl_find_local(backed, tree.root) == NULL);
+			CHECK(pl_find_local(backed, edited.root) == NULL);
+			CHECK(pl_store_stats(backed).chunks > 0);
+			CHECK(pl_store_drop_unbacked(backed) > 0);
+			fetches = fetch.fetches;
+			OK(pl_get(&base_remote, edit4.key, &got));
+			CHECK(fetch.fetches > fetches);
+		}
 		pl_store_free(backed);
 	}
 

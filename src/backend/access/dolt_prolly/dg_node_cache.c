@@ -1,0 +1,476 @@
+/*-------------------------------------------------------------------------
+ *
+ * dg_node_cache.c
+ *	  Prolly nodes shared by every backend.
+ *
+ * The cache is laid out like the buffer pool: a fixed array of slots, each
+ * naming one node, and a partitioned hash table mapping node hashes to slots.
+ * A slot's state word holds a usage count and its flags. Node bytes vary in
+ * size, so they live in a dynamic shared memory area created in place in the
+ * main shared memory segment and capped at dolt_node_cache_size; the cache
+ * never asks for dynamic segments.
+ *
+ * A reader copies a node out under the shared partition lock. Eviction takes
+ * the exclusive lock, so it never frees bytes being copied, and nothing is
+ * held once the copy is made. Adding a node claims a slot by clock sweep,
+ * evicting slots whose usage has run down, and evicts more when the area
+ * lacks room for the bytes.
+ *
+ * src/backend/access/dolt_prolly/dg_node_cache.c
+ *
+ *-------------------------------------------------------------------------
+ */
+#include "postgres.h"
+
+#include "access/doltchunk.h"
+#include "access/doltnode.h"
+#include "access/htup_details.h"
+#include "fmgr.h"
+#include "funcapi.h"
+#include "port/atomics.h"
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
+#include "utils/dsa.h"
+#include "utils/hsearch.h"
+#include "utils/fmgrprotos.h"
+#include "utils/memutils.h"
+
+int			dolt_node_cache_size = 1024 * 1024;	/* kB */
+
+#define NODE_PARTITIONS 128
+
+/* Bytes of cache per slot: nodes average a little more. */
+#define NODE_SLOT_BYTES 1024
+
+/* The smallest cache, so that the area's own bookkeeping fits. */
+#define NODE_CACHE_MIN ((Size) 1024 * 1024)
+
+/* Larger nodes are not cached: each would evict too many others. */
+#define NODE_MAX_BYTES ((Size) 64 * 1024)
+
+/* Evictions to try to make room for one node's bytes before refusing it. */
+#define NODE_ROOM_ATTEMPTS 64
+
+/* A slot's state: usage, then flags. */
+#define NODE_USAGE_ONE 1U
+#define NODE_USAGE_MASK 0x0000000FU
+#define NODE_USAGE_MAX 5
+#define NODE_VALID (1U << 30)	/* mapped and readable */
+#define NODE_BUSY (1U << 31)	/* claimed by one backend, unmapped */
+
+typedef struct NodeKey
+{
+	uint8		hash[DOLT_CHUNK_HASH_SIZE];
+} NodeKey;
+
+typedef struct NodeMapping
+{
+	NodeKey		key;
+	int32		slot;
+} NodeMapping;
+
+typedef struct NodeSlot
+{
+	NodeKey		key;
+	dsa_pointer data;
+	uint32		length;
+	pg_atomic_uint32 state;
+} NodeSlot;
+
+typedef struct NodeCache
+{
+	int32		nslots;
+	Size		area_size;
+	pg_atomic_uint64 hand;
+	pg_atomic_uint64 added;
+	pg_atomic_uint64 evictions;
+	pg_atomic_uint64 rejected;
+	pg_atomic_uint64 hits;		/* as sessions report them */
+	pg_atomic_uint64 misses;
+	LWLockPadded locks[NODE_PARTITIONS];
+	NodeSlot	slots[FLEXIBLE_ARRAY_MEMBER];
+} NodeCache;
+
+static NodeCache *cache;
+static HTAB *mapping;
+static dsa_area *area;
+static uint64 local_hits;
+static uint64 local_misses;
+static uint64 unreported_hits;
+static uint64 unreported_misses;
+static uint8 *copied;			/* the last node read, until the next */
+static Size copied_size;
+
+/* The cache's capacity in bytes, or zero if it is disabled. */
+static Size
+cache_bytes(void)
+{
+	Size		bytes = (Size) dolt_node_cache_size * 1024;
+
+	return bytes == 0 ? 0 : Max(bytes, NODE_CACHE_MIN);
+}
+
+static int32
+cache_slots(void)
+{
+	return (int32) Min(cache_bytes() / NODE_SLOT_BYTES, (Size) PG_INT32_MAX);
+}
+
+static Size
+control_size(void)
+{
+	return MAXALIGN(add_size(offsetof(NodeCache, slots),
+							 mul_size(cache_slots(), sizeof(NodeSlot))));
+}
+
+/* The node bytes' area, in place after the slots. */
+static void *
+area_place(void)
+{
+	return (char *) cache + control_size();
+}
+
+/* Node hashes are digests: their first bytes hash them well enough. */
+static uint32
+key_hash(const void *key, Size keysize)
+{
+	uint32		h;
+
+	memcpy(&h, key, sizeof(h));
+	return h;
+}
+
+Size
+DoltNodeCacheShmemSize(void)
+{
+	Size		size;
+
+	if (cache_bytes() == 0)
+		return 0;
+	size = add_size(control_size(), cache_bytes());
+	return add_size(size, hash_estimate_size(cache_slots(), sizeof(NodeMapping)));
+}
+
+void
+DoltNodeCacheShmemInit(void)
+{
+	HASHCTL		info = {0};
+	bool		found;
+
+	if (cache_bytes() == 0)
+		return;
+	cache = ShmemInitStruct("Dolt node cache", add_size(control_size(), cache_bytes()), &found);
+	if (!found)
+	{
+		dsa_area   *created;
+
+		cache->nslots = cache_slots();
+		cache->area_size = cache_bytes();
+		pg_atomic_init_u64(&cache->hand, 0);
+		pg_atomic_init_u64(&cache->added, 0);
+		pg_atomic_init_u64(&cache->evictions, 0);
+		pg_atomic_init_u64(&cache->rejected, 0);
+		pg_atomic_init_u64(&cache->hits, 0);
+		pg_atomic_init_u64(&cache->misses, 0);
+		for (int i = 0; i < NODE_PARTITIONS; i++)
+			LWLockInitialize(&cache->locks[i].lock, LWTRANCHE_DOLT_NODE_MAPPING);
+		for (int i = 0; i < cache->nslots; i++)
+		{
+			cache->slots[i].data = InvalidDsaPointer;
+			pg_atomic_init_u32(&cache->slots[i].state, 0);
+		}
+
+		/* The postmaster cannot use dynamic segments: cap the area at its place. */
+		created = dsa_create_in_place(area_place(), cache->area_size, LWTRANCHE_DOLT_NODE_DSA, NULL);
+		dsa_pin(created);
+		dsa_set_size_limit(created, cache->area_size);
+		dsa_detach(created);
+	}
+	info.keysize = sizeof(NodeKey);
+	info.entrysize = sizeof(NodeMapping);
+	info.hash = key_hash;
+	info.num_partitions = NODE_PARTITIONS;
+	mapping = ShmemInitHash("Dolt node cache mapping", cache_slots(), cache_slots(), &info,
+							HASH_ELEM | HASH_FUNCTION | HASH_PARTITION | HASH_FIXED_SIZE);
+}
+
+/* Whether the cache is available; attaches to its area on first use. */
+static bool
+cache_attach(void)
+{
+	if (!cache)
+		return false;
+	if (!area)
+	{
+		MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+		area = dsa_attach_in_place(area_place(), NULL);
+		dsa_pin_mapping(area);
+		MemoryContextSwitchTo(old);
+	}
+	return true;
+}
+
+static LWLock *
+partition_lock(uint32 hashcode)
+{
+	return &cache->locks[hashcode % NODE_PARTITIONS].lock;
+}
+
+/* Count a use of a mapped slot; the caller holds its partition lock. */
+static void
+use_slot(NodeSlot *slot)
+{
+	uint32		state = pg_atomic_read_u32(&slot->state);
+
+	while ((state & NODE_USAGE_MASK) < NODE_USAGE_MAX * NODE_USAGE_ONE &&
+		   !pg_atomic_compare_exchange_u32(&slot->state, &state, state + NODE_USAGE_ONE))
+		;
+}
+
+/*
+ * A copy of the node |hash|, valid until the next call, with its length in
+ * |*length|; NULL if the cache lacks it.
+ */
+const uint8 *
+dolt_node_cache_get(const uint8 *hash, Size *length)
+{
+	NodeMapping *entry;
+	uint32		hashcode;
+	LWLock	   *lock;
+
+	if (!cache_attach())
+		return NULL;
+	hashcode = key_hash(hash, DOLT_CHUNK_HASH_SIZE);
+	lock = partition_lock(hashcode);
+	LWLockAcquire(lock, LW_SHARED);
+	entry = hash_search_with_hash_value(mapping, hash, hashcode, HASH_FIND, NULL);
+	if (entry)
+	{
+		NodeSlot   *slot = &cache->slots[entry->slot];
+
+		/* Should this fail, abort releases the lock. */
+		if (slot->length > copied_size)
+		{
+			Size		size = Max(slot->length, 2 * copied_size);
+
+			copied = copied ? repalloc(copied, size) : MemoryContextAlloc(TopMemoryContext, size);
+			copied_size = size;
+		}
+		memcpy(copied, dsa_get_address(area, slot->data), slot->length);
+		*length = slot->length;
+		use_slot(slot);
+	}
+	LWLockRelease(lock);
+	if (!entry)
+	{
+		local_misses++;
+		unreported_misses++;
+		return NULL;
+	}
+	local_hits++;
+	unreported_hits++;
+	return copied;
+}
+
+/*
+ * Unmap and free the mapped slot |index|, seen in |state|, unless it was
+ * used or replaced since. The slot is left claimed.
+ */
+static bool
+evict(int32 index, uint32 state)
+{
+	NodeSlot   *slot = &cache->slots[index];
+	NodeKey		key = slot->key;
+	uint32		hashcode = key_hash(&key, sizeof(key));
+	LWLock	   *lock = partition_lock(hashcode);
+	NodeMapping *entry;
+	bool		evicted = false;
+
+	/* Readers copy under the shared lock: none is copying while we hold it. */
+	LWLockAcquire(lock, LW_EXCLUSIVE);
+	entry = hash_search_with_hash_value(mapping, &key, hashcode, HASH_FIND, NULL);
+	if (entry && entry->slot == index &&
+		pg_atomic_compare_exchange_u32(&slot->state, &state, NODE_BUSY))
+	{
+		hash_search_with_hash_value(mapping, &key, hashcode, HASH_REMOVE, NULL);
+		evicted = true;
+	}
+	LWLockRelease(lock);
+	if (!evicted)
+		return false;
+	dsa_free(area, slot->data);
+	slot->data = InvalidDsaPointer;
+	pg_atomic_fetch_add_u64(&cache->evictions, 1);
+	return true;
+}
+
+/* Claim a free slot by clock sweep, evicting one if need be. */
+static bool
+claim_slot(int32 *out)
+{
+	uint64		limit = (uint64) cache->nslots * (NODE_USAGE_MAX + 1);
+
+	for (uint64 tries = 0; tries < limit; tries++)
+	{
+		int32		index = (int32) (pg_atomic_fetch_add_u64(&cache->hand, 1) % cache->nslots);
+		NodeSlot   *slot = &cache->slots[index];
+		uint32		state = pg_atomic_read_u32(&slot->state);
+
+		if (state & NODE_BUSY)
+			continue;
+		if (!(state & NODE_VALID))
+		{
+			if (pg_atomic_compare_exchange_u32(&slot->state, &state, NODE_BUSY))
+			{
+				*out = index;
+				return true;
+			}
+			continue;
+		}
+		if (state & NODE_USAGE_MASK)
+		{
+			pg_atomic_compare_exchange_u32(&slot->state, &state, state - NODE_USAGE_ONE);
+			continue;
+		}
+		if (evict(index, state))
+		{
+			*out = index;
+			return true;
+		}
+	}
+	return false;
+}
+
+/* Room in the area for |length| bytes, evicting nodes to make it. */
+static dsa_pointer
+allocate_bytes(Size length)
+{
+	for (int attempt = 0;; attempt++)
+	{
+		dsa_pointer data = dsa_allocate_extended(area, length, DSA_ALLOC_NO_OOM);
+		int32		freed;
+
+		if (DsaPointerIsValid(data) || attempt == NODE_ROOM_ATTEMPTS || !claim_slot(&freed))
+			return data;
+		pg_atomic_write_u32(&cache->slots[freed].state, 0);
+	}
+}
+
+/* Add the node |hash|, unless the cache cannot make room for it. */
+void
+dolt_node_cache_add(const uint8 *hash, const uint8 *data, Size length)
+{
+	NodeMapping *entry;
+	NodeSlot   *slot;
+	dsa_pointer bytes;
+	uint32		hashcode;
+	LWLock	   *lock;
+	int32		index;
+	bool		found;
+
+	if (!cache_attach() || length > NODE_MAX_BYTES)
+		return;
+	bytes = allocate_bytes(length);
+	if (!DsaPointerIsValid(bytes))
+	{
+		pg_atomic_fetch_add_u64(&cache->rejected, 1);
+		return;
+	}
+	if (!claim_slot(&index))
+	{
+		dsa_free(area, bytes);
+		pg_atomic_fetch_add_u64(&cache->rejected, 1);
+		return;
+	}
+	slot = &cache->slots[index];
+	memcpy(dsa_get_address(area, bytes), data, length);
+	memcpy(slot->key.hash, hash, DOLT_CHUNK_HASH_SIZE);
+	slot->data = bytes;
+	slot->length = (uint32) length;
+
+	hashcode = key_hash(hash, DOLT_CHUNK_HASH_SIZE);
+	lock = partition_lock(hashcode);
+	LWLockAcquire(lock, LW_EXCLUSIVE);
+	entry = hash_search_with_hash_value(mapping, hash, hashcode, HASH_ENTER_NULL, &found);
+	if (entry && !found)
+	{
+		entry->slot = index;
+		pg_atomic_write_u32(&slot->state, NODE_VALID | NODE_USAGE_ONE);
+	}
+	LWLockRelease(lock);
+	if (entry && !found)
+	{
+		pg_atomic_fetch_add_u64(&cache->added, 1);
+		return;
+	}
+
+	/* Another backend added it first, or no mapping is free. */
+	slot->data = InvalidDsaPointer;
+	pg_atomic_write_u32(&slot->state, 0);
+	dsa_free(area, bytes);
+	if (!entry)
+		pg_atomic_fetch_add_u64(&cache->rejected, 1);
+}
+
+/* Add this session's hits and misses to the server's; once per transaction. */
+void
+dolt_node_cache_report(void)
+{
+	if (!cache || (unreported_hits == 0 && unreported_misses == 0))
+		return;
+	pg_atomic_fetch_add_u64(&cache->hits, unreported_hits);
+	pg_atomic_fetch_add_u64(&cache->misses, unreported_misses);
+	unreported_hits = unreported_misses = 0;
+}
+
+void
+dolt_node_cache_stats(DoltNodeCacheStats *stats)
+{
+	memset(stats, 0, sizeof(*stats));
+	stats->hits = local_hits;
+	stats->misses = local_misses;
+	if (cache)
+	{
+		stats->total_hits = pg_atomic_read_u64(&cache->hits) + unreported_hits;
+		stats->total_misses = pg_atomic_read_u64(&cache->misses) + unreported_misses;
+	}
+	if (!cache)
+		return;
+	stats->added = pg_atomic_read_u64(&cache->added);
+	stats->evictions = pg_atomic_read_u64(&cache->evictions);
+	stats->rejected = pg_atomic_read_u64(&cache->rejected);
+	for (int32 i = 0; i < cache->nslots; i++)
+	{
+		uint32		state = pg_atomic_read_u32(&cache->slots[i].state);
+
+		if (!(state & NODE_VALID))
+			continue;
+		stats->entries++;
+		stats->bytes += cache->slots[i].length;
+	}
+}
+
+/* SQL: dolt_node_cache_stats(); hits and misses are this session's, total_ the server's. */
+Datum
+dolt_node_cache_stats_sql(PG_FUNCTION_ARGS)
+{
+	DoltNodeCacheStats stats;
+	TupleDesc	desc;
+	Datum		values[9];
+	bool		nulls[9] = {false};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	dolt_node_cache_stats(&stats);
+	values[0] = Int64GetDatum(stats.hits);
+	values[1] = Int64GetDatum(stats.misses);
+	values[2] = Int64GetDatum(stats.added);
+	values[3] = Int64GetDatum(stats.evictions);
+	values[4] = Int64GetDatum(stats.rejected);
+	values[5] = Int64GetDatum(stats.entries);
+	values[6] = Int64GetDatum(stats.bytes);
+	values[7] = Int64GetDatum(stats.total_hits);
+	values[8] = Int64GetDatum(stats.total_misses);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls)));
+}

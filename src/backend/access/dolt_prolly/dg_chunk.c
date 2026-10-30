@@ -1,18 +1,13 @@
 /*-------------------------------------------------------------------------
  *
  * dg_chunk.c
- *	  The chunk store layer above every implementation: dispatch, the node
- *	  cache, pins, hash verification and size checks.
+ *	  The chunk store layer above every implementation: dispatch, pins, hash
+ *	  verification and size checks.
  *
- * The node cache maps hashes to copies of chunk bytes. Chunks are immutable, so
- * entries never need invalidation. Unpinned entries sit on an LRU list and are
- * evicted above dolt_chunk_cache_size; pinned entries sit on a separate list and
- * are never evicted. When the cache cannot take a chunk, a get returns a private
- * copy instead. Pins are tracked per store handle and dropped at transaction end,
- * so an error or a forgotten release cannot pin the cache permanently.
- *
- * Existence checks always ask the store: a cached copy proves only that the bytes
- * for a hash are known, not that the store still holds them.
+ * Nothing is cached here: prolly nodes are cached once for every backend, in
+ * dg_node_cache.c. A get returns a copy of each chunk, pinned through the
+ * store handle: it stays valid until released, the handle closes or the
+ * transaction ends, so an error or a forgotten release cannot leak it.
  *
  * src/backend/access/dolt_prolly/dg_chunk.c
  *
@@ -24,26 +19,13 @@
 #include "access/xact.h"
 #include "common/cryptohash.h"
 #include "common/sha2.h"
-#include "lib/ilist.h"
-#include "utils/hsearch.h"
 #include "utils/memutils.h"
 
-int			dolt_chunk_cache_size = 256 * 1024; /* kB */
 bool		dolt_chunk_verify_hashes = false;
 
-typedef struct CacheEntry
-{
-	uint8		hash[DOLT_CHUNK_HASH_SIZE];
-	uint8	   *data;
-	Size		length;
-	int			pins;
-	dlist_node	node;			/* on cache_lru if unpinned, else cache_pinned */
-} CacheEntry;
-
-/* A pin held through a store handle: a cache entry, or a private copy. */
+/* A copy held through a store handle. */
 typedef struct Pin
 {
-	CacheEntry *entry;
 	uint8	   *copy;
 	int			next_free;		/* free-list link while unused, 1-based */
 } Pin;
@@ -62,13 +44,6 @@ struct DoltChunkStore
 
 static const DoltChunkStoreRoutine *current_routine;
 static int	open_stores;
-
-static MemoryContext cache_context;
-static HTAB *cache;
-static dlist_head cache_lru = DLIST_STATIC_INIT(cache_lru);
-static dlist_head cache_pinned = DLIST_STATIC_INIT(cache_pinned);
-static Size cache_bytes;
-static DoltChunkCacheStats cache_stats;
 static uint64 pin_epoch = 1;
 static bool xact_callback_registered;
 
@@ -78,114 +53,16 @@ routine(void)
 	return current_routine ? current_routine : dolt_chunk_heap_routine();
 }
 
-/* Bytes an entry is charged against dolt_chunk_cache_size. */
-static Size
-entry_cost(Size length)
-{
-	return length + sizeof(CacheEntry) + 64;
-}
-
 /* Pins never outlive a transaction; abandoned handles cannot leak them. */
 static void
 chunk_xact_callback(XactEvent event, void *arg)
 {
-	dlist_mutable_iter iter;
-
 	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT &&
 		event != XACT_EVENT_PREPARE && event != XACT_EVENT_PARALLEL_COMMIT &&
 		event != XACT_EVENT_PARALLEL_ABORT)
 		return;
 	pin_epoch++;
 	open_stores = 0;
-	dlist_foreach_modify(iter, &cache_pinned)
-	{
-		CacheEntry *entry = dlist_container(CacheEntry, node, iter.cur);
-
-		entry->pins = 0;
-		dlist_delete(&entry->node);
-		dlist_push_head(&cache_lru, &entry->node);
-	}
-}
-
-static void
-cache_init(void)
-{
-	HASHCTL		ctl = {0};
-
-	if (!xact_callback_registered)
-	{
-		RegisterXactCallback(chunk_xact_callback, NULL);
-		xact_callback_registered = true;
-	}
-	if (cache)
-		return;
-	cache_context = AllocSetContextCreate(TopMemoryContext, "dolt chunk cache", ALLOCSET_DEFAULT_SIZES);
-	ctl.keysize = DOLT_CHUNK_HASH_SIZE;
-	ctl.entrysize = sizeof(CacheEntry);
-	ctl.hcxt = cache_context;
-	cache = hash_create("dolt chunk cache", 1024, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-}
-
-static void
-cache_evict(CacheEntry *entry)
-{
-	Assert(entry->pins == 0);
-	dlist_delete(&entry->node);
-	cache_bytes -= entry_cost(entry->length);
-	pfree(entry->data);
-	hash_search(cache, entry->hash, HASH_REMOVE, NULL);
-	cache_stats.evictions++;
-}
-
-static void
-cache_pin(CacheEntry *entry)
-{
-	if (entry->pins++ == 0)
-	{
-		dlist_delete(&entry->node);
-		dlist_push_head(&cache_pinned, &entry->node);
-	}
-}
-
-static void
-cache_unpin(CacheEntry *entry)
-{
-	Assert(entry->pins > 0);
-	if (--entry->pins == 0)
-	{
-		dlist_delete(&entry->node);
-		dlist_push_head(&cache_lru, &entry->node);
-	}
-}
-
-/*
- * Copy a chunk into the cache, evicting least recently used unpinned entries
- * to make room. Returns the entry, or NULL if the chunk cannot fit.
- */
-static CacheEntry *
-cache_insert(const uint8 *hash, const uint8 *data, Size length)
-{
-	Size		limit = (Size) dolt_chunk_cache_size * 1024;
-	CacheEntry *entry;
-	bool		found;
-
-	cache_init();
-	entry = hash_search(cache, hash, HASH_FIND, NULL);
-	if (entry)
-		return entry;
-	while (cache_bytes + entry_cost(length) > limit && !dlist_is_empty(&cache_lru))
-		cache_evict(dlist_container(CacheEntry, node, dlist_tail_node(&cache_lru)));
-	if (cache_bytes + entry_cost(length) > limit)
-		return NULL;
-
-	entry = hash_search(cache, hash, HASH_ENTER, &found);
-	entry->data = MemoryContextAlloc(cache_context, Max(length, 1));
-	memcpy(entry->data, data, length);
-	entry->length = length;
-	entry->pins = 0;
-	dlist_push_head(&cache_lru, &entry->node);
-	cache_bytes += entry_cost(length);
-	return entry;
 }
 
 static void
@@ -211,7 +88,11 @@ dolt_chunk_open(DoltChunkIntent intent)
 {
 	DoltChunkStore *store = palloc0(sizeof(DoltChunkStore));
 
-	cache_init();
+	if (!xact_callback_registered)
+	{
+		RegisterXactCallback(chunk_xact_callback, NULL);
+		xact_callback_registered = true;
+	}
 	store->routine = routine();
 	store->intent = intent;
 	store->epoch = pin_epoch;
@@ -225,11 +106,8 @@ release_pin(DoltChunkStore *store, int slot)
 {
 	Pin		   *pin = &store->pins[slot];
 
-	if (pin->entry)
-		cache_unpin(pin->entry);
 	if (pin->copy)
 		pfree(pin->copy);
-	pin->entry = NULL;
 	pin->copy = NULL;
 	pin->next_free = store->free_pin;
 	store->free_pin = slot + 1;
@@ -241,7 +119,8 @@ dolt_chunk_close(DoltChunkStore *store)
 	if (store->epoch == pin_epoch)
 	{
 		for (int i = 0; i < store->npins; i++)
-			release_pin(store, i);
+			if (store->pins[i].copy)
+				release_pin(store, i);
 		open_stores--;
 	}
 	store->routine->close(store->state);
@@ -251,7 +130,7 @@ dolt_chunk_close(DoltChunkStore *store)
 }
 
 static int
-new_pin(DoltChunkStore *store, CacheEntry *entry, uint8 *copy)
+new_pin(DoltChunkStore *store, uint8 *copy)
 {
 	int			slot;
 
@@ -273,10 +152,7 @@ new_pin(DoltChunkStore *store, CacheEntry *entry, uint8 *copy)
 		}
 		slot = store->npins++;
 	}
-	store->pins[slot].entry = entry;
 	store->pins[slot].copy = copy;
-	if (entry)
-		cache_pin(entry);
 	return slot + 1;			/* pin numbers start at 1; 0 means none */
 }
 
@@ -295,78 +171,37 @@ typedef struct GetContext
 	DoltChunkStore *store;
 	const uint8 *hashes;
 	DoltChunk  *chunks;
-	int		   *positions;		/* miss index -> caller index */
 } GetContext;
 
 static void
 store_found(void *arg, int index, const uint8 *data, Size length)
 {
 	GetContext *ctx = arg;
-	int			position = ctx->positions[index];
-	const uint8 *hash = ctx->hashes + (Size) position * DOLT_CHUNK_HASH_SIZE;
-	DoltChunk  *chunk = &ctx->chunks[position];
-	CacheEntry *entry;
+	DoltChunk  *chunk = &ctx->chunks[index];
+	uint8	   *copy;
 
 	if (dolt_chunk_verify_hashes)
-		verify(hash, data, length);
-	entry = cache_insert(hash, data, length);
-	if (entry)
-	{
-		chunk->pin = new_pin(ctx->store, entry, NULL);
-		chunk->data = entry->data;
-	}
-	else
-	{
-		uint8	   *copy = MemoryContextAlloc(GetMemoryChunkContext(ctx->store), Max(length, 1));
-
-		memcpy(copy, data, length);
-		chunk->pin = new_pin(ctx->store, NULL, copy);
-		chunk->data = copy;
-	}
+		verify(ctx->hashes + (Size) index * DOLT_CHUNK_HASH_SIZE, data, length);
+	copy = MemoryContextAlloc(GetMemoryChunkContext(ctx->store), Max(length, 1));
+	memcpy(copy, data, length);
+	chunk->pin = new_pin(ctx->store, copy);
+	chunk->data = copy;
 	chunk->length = length;
 }
 
 void
 dolt_chunk_get_many(DoltChunkStore *store, int n, const uint8 *hashes, DoltChunk *chunks)
 {
-	uint8	   *missing = NULL;
-	int		   *positions = NULL;
-	int			nmissing = 0;
+	GetContext	ctx = {store, hashes, chunks};
 
-	cache_init();
 	for (int i = 0; i < n; i++)
 	{
-		const uint8 *hash = hashes + (Size) i * DOLT_CHUNK_HASH_SIZE;
-		CacheEntry *entry = hash_search(cache, hash, HASH_FIND, NULL);
-
 		chunks[i].data = NULL;
 		chunks[i].length = 0;
 		chunks[i].pin = 0;
-		if (entry)
-		{
-			cache_stats.hits++;
-			chunks[i].pin = new_pin(store, entry, NULL);
-			chunks[i].data = entry->data;
-			chunks[i].length = entry->length;
-			continue;
-		}
-		cache_stats.misses++;
-		if (!missing)
-		{
-			missing = palloc((Size) n * DOLT_CHUNK_HASH_SIZE);
-			positions = palloc(n * sizeof(int));
-		}
-		memcpy(missing + (Size) nmissing * DOLT_CHUNK_HASH_SIZE, hash, DOLT_CHUNK_HASH_SIZE);
-		positions[nmissing++] = i;
 	}
-	if (nmissing)
-	{
-		GetContext	ctx = {store, hashes, chunks, positions};
-
-		store->routine->get(store->state, nmissing, missing, store_found, &ctx);
-		pfree(missing);
-		pfree(positions);
-	}
+	if (n > 0)
+		store->routine->get(store->state, n, hashes, store_found, &ctx);
 }
 
 bool
@@ -421,10 +256,6 @@ dolt_chunk_put_many(DoltChunkStore *store, int n, const uint8 *hashes,
 			verify(hashes + (Size) i * DOLT_CHUNK_HASH_SIZE, data[i], lengths[i]);
 	}
 	stored = store->routine->put(store->state, n, hashes, data, lengths);
-
-	/* Newly written chunks are likely to be read soon. */
-	for (int i = 0; i < n; i++)
-		cache_insert(hashes + (Size) i * DOLT_CHUNK_HASH_SIZE, data[i], lengths[i]);
 	return stored;
 }
 
@@ -444,11 +275,6 @@ int
 dolt_chunk_delete_many(DoltChunkStore *store, int n, const uint8 *hashes)
 {
 	require_write(store);
-
-	/*
-	 * Cached copies stay valid: a hash's bytes never change, and a deleted
-	 * chunk is unreachable by definition.
-	 */
 	return store->routine->remove(store->state, n, hashes);
 }
 
@@ -464,36 +290,6 @@ dolt_chunk_store_stats(DoltChunkStoreStats *stats)
 	routine()->stats(stats);
 }
 
-void
-dolt_chunk_cache_stats(DoltChunkCacheStats *stats)
-{
-	dlist_iter	iter;
-
-	*stats = cache_stats;
-	stats->entries = cache ? hash_get_num_entries(cache) : 0;
-	stats->bytes = cache_bytes;
-	stats->pinned = 0;
-	dlist_foreach(iter, &cache_pinned)
-		stats->pinned++;
-}
-
-void
-dolt_chunk_cache_reset(void)
-{
-	if (!dlist_is_empty(&cache_pinned))
-		elog(ERROR, "cannot reset the dolt chunk cache while chunks are pinned");
-	if (cache)
-	{
-		MemoryContextDelete(cache_context);
-		cache = NULL;
-		cache_context = NULL;
-	}
-	dlist_init(&cache_lru);
-	dlist_init(&cache_pinned);
-	cache_bytes = 0;
-	memset(&cache_stats, 0, sizeof(cache_stats));
-}
-
 const DoltChunkStoreRoutine *
 dolt_chunk_set_routine(const DoltChunkStoreRoutine *replacement)
 {
@@ -501,7 +297,6 @@ dolt_chunk_set_routine(const DoltChunkStoreRoutine *replacement)
 
 	if (open_stores > 0)
 		elog(ERROR, "cannot change the dolt chunk store while a store is open");
-	dolt_chunk_cache_reset();
 	current_routine = replacement;
 	return previous;
 }

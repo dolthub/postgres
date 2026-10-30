@@ -42,9 +42,5 @@ SELECT test_chunk_put(chunk_hash('contract epsilon'), 'contract epsilon') AS ver
 SELECT error_of($$SELECT test_chunk_put(chunk_hash('contract zeta'), 'something else')$$);
 RESET dolt_chunk_verify_hashes;
 
--- Pins keep a chunk's bytes valid while the cache evicts around them.
-SET dolt_chunk_cache_size = '64kB';
-SELECT test_chunk_cache_reset();
-SELECT test_chunk_pin_survives_eviction(chunk_hash('contract alpha'), 40) AS pin_survives;
-SELECT pinned FROM test_chunk_cache_stats();
-RESET dolt_chunk_cache_size;
+-- Pins keep a chunk's bytes valid while other chunks are put.
+SELECT test_chunk_pin_survives_puts(chunk_hash('contract alpha'), 40) AS pin_survives;

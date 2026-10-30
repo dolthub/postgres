@@ -35,7 +35,7 @@ SELECT attname, attstorage FROM pg_attribute
 SELECT reltoastrelid = 0 AS no_toast FROM pg_class WHERE oid = 'pg_dolt_chunk'::regclass;
 SELECT indisunique, indisprimary FROM pg_index WHERE indexrelid = 'pg_dolt_chunk_hash_index'::regclass;
 SELECT name, setting, unit FROM pg_settings
-  WHERE name IN ('dolt_chunk_cache_size', 'dolt_chunk_verify_hashes') ORDER BY name;
+  WHERE name IN ('dolt_chunk_verify_hashes') ORDER BY name;
 
 -- A put that finds a committed copy stores nothing, so repeated puts keep one row.
 SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = chunk_hash('contract alpha');
@@ -93,28 +93,15 @@ BEGIN READ ONLY;
 SELECT test_chunk_put(chunk_hash('delta'), 'delta');
 ROLLBACK;
 
--- The cache serves repeated reads and stays within its budget.
-SET dolt_chunk_cache_size = '64kB';
-SELECT test_chunk_cache_reset();
+-- Repeated reads return the same bytes, and every chunk put is readable.
 SELECT test_chunk_get(chunk_hash('contract alpha')) = 'contract alpha' AS first_read;
 SELECT test_chunk_get(chunk_hash('contract alpha')) = 'contract alpha' AS second_read;
-SELECT hits, misses FROM test_chunk_cache_stats();
 SELECT count(*) FILTER (WHERE test_chunk_put(chunk_hash(x), x)) AS inserted
   FROM (SELECT decode(repeat(lpad(to_hex(g), 2, '0'), 8000), 'hex') AS x
         FROM generate_series(1, 20) g) s;
-SELECT evictions > 0 AS evicted, bytes <= 65536 AS within_budget, entries < 20 AS bounded,
-       pinned = 0 AS unpinned
-  FROM test_chunk_cache_stats();
 SELECT count(*) FILTER (WHERE test_chunk_get(chunk_hash(x)) = x) AS all_readable
   FROM (SELECT decode(repeat(lpad(to_hex(g), 2, '0'), 8000), 'hex') AS x
         FROM generate_series(1, 20) g) s;
-
--- With caching disabled, reads still work and nothing is retained.
-SET dolt_chunk_cache_size = 0;
-SELECT test_chunk_cache_reset();
-SELECT test_chunk_get(chunk_hash('contract alpha')) = 'contract alpha' AS uncached_read;
-SELECT hits, misses, entries, bytes, pinned FROM test_chunk_cache_stats();
-RESET dolt_chunk_cache_size;
 
 -- The catalog is private.
 CREATE ROLE regress_chunk_reader;

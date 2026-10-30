@@ -403,6 +403,8 @@ SubtransSLRU	"Waiting to access the sub-transaction SLRU cache."
 XactSLRU	"Waiting to access the transaction status SLRU cache."
 ParallelVacuumDSA	"Waiting for parallel vacuum dynamic shared memory allocation."
 AioUringCompletion	"Waiting for another process to complete IO via io_uring."
+DoltNodeMapping	"Waiting to associate a prolly node with a slot in the shared node cache."
+DoltNodeDSA	"Waiting for shared node cache memory allocation."
 
 # No "ABI_compatibility" region here as WaitEventLWLock has its own C code.
 

@@ -12559,6 +12559,13 @@
 { oid => '9004', descr => 'inspect canonical prolly relation root',
   proname => 'dolt_prolly_root', provolatile => 'v',
   prorettype => 'text', proargtypes => 'regclass', prosrc => 'dolt_prolly_root' },
+{ oid => '9249', descr => 'statistics of the shared prolly node cache',
+  proname => 'dolt_node_cache_stats', provolatile => 'v', proparallel => 'r',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{int8,int8,int8,int8,int8,int8,int8,int8,int8}',
+  proargmodes => '{o,o,o,o,o,o,o,o,o}',
+  proargnames => '{hits,misses,added,evictions,rejected,entries,bytes,total_hits,total_misses}',
+  prosrc => 'dolt_node_cache_stats_sql' },
 
 
 # Internal manifest building blocks; superuser-only, not version-control commands.

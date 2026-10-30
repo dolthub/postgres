@@ -221,6 +221,82 @@ pl_store_drop_unbacked(PLStore *store)
 	return freed;
 }
 
+/* Rehash |store| into |capacity| buckets. */
+static PLStatus
+store_resize(PLStore *store, size_t capacity)
+{
+	PLNode	  **buckets = calloc(capacity, sizeof(*buckets));
+
+	if (!buckets)
+		return PL_NOMEM;
+	for (size_t i = 0; i < store->capacity; i++)
+	{
+		PLNode	   *current = store->buckets[i];
+
+		while (current)
+		{
+			PLNode	   *next = current->next;
+			size_t		bucket = pl_read64(current->hash.bytes) % capacity;
+
+			current->next = buckets[bucket];
+			buckets[bucket] = current;
+			current = next;
+		}
+	}
+	free(store->buckets);
+	store->buckets = buckets;
+	store->capacity = capacity;
+	return PL_OK;
+}
+
+size_t
+pl_store_drop_backed(PLStore *store)
+{
+	size_t		freed = 0,
+				kept = 0,
+				capacity;
+
+	if (!store)
+		return 0;
+
+	/* Nodes written since they were listed as unbacked are about to be freed: forget them. */
+	for (size_t i = 0; i < store->unbacked_count; i++)
+		if (!store->unbacked[i]->backed)
+		{
+			store->unbacked[i]->unbacked_slot = kept;
+			store->unbacked[kept++] = store->unbacked[i];
+		}
+	store->unbacked_count = kept;
+	for (size_t i = 0; i < store->capacity; i++)
+	{
+		PLNode	  **link = &store->buckets[i];
+
+		while (*link)
+		{
+			PLNode	   *node = *link;
+
+			if (!node->backed)
+			{
+				link = &node->next;
+				continue;
+			}
+			*link = node->next;
+			store->stats.chunks--;
+			store->stats.bytes -= node->size;
+			free(node->data);
+			free(node);
+			freed++;
+		}
+	}
+
+	/* Shrink, so that later drops walk few buckets. */
+	for (capacity = store->capacity; capacity > 256 && store->stats.chunks < capacity / 8; capacity /= 2)
+		;
+	if (capacity < store->capacity)
+		store_resize(store, capacity);
+	return freed;
+}
+
 PLStats
 pl_store_stats(const PLStore *store)
 {
@@ -372,7 +448,8 @@ pl_find_local(PLStore *store, PLHash hash)
 	return NULL;
 }
 
-static PLStatus store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, bool backed, PLNode **out);
+static PLStatus store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, bool backed,
+							 bool trusted, PLNode **out);
 
 PLNode *
 pl_find(PLStore *store, PLHash hash)
@@ -383,7 +460,7 @@ pl_find(PLStore *store, PLHash hash)
 	if (node || !store || !store->fetch)
 		return node;
 	if (store->fetch(store->fetch_arg, hash, &bytes) != PL_OK ||
-		store_buffer(store, hash, bytes.data, bytes.len, true, &node) != PL_OK)
+		store_buffer(store, hash, bytes.data, bytes.len, true, true, &node) != PL_OK)
 		return NULL;
 	store->stats.fetched++;
 	return node;
@@ -544,6 +621,20 @@ pl_node_rows(const PLNode *node)
 	return rows;
 }
 
+/* Decode a node's header: all a node written by this library needs. */
+static PLStatus
+parse_header(PLNode *node)
+{
+	if (node->size < PL_HEADER)
+		return PL_CORRUPT;
+	node->level = pl_read32(node->data + 8);
+	node->count = pl_read32(node->data + 12);
+	node->key_bytes = pl_read32(node->data + 16);
+	node->value_bytes = pl_read32(node->data + 20);
+	node->offset_width = (uint8_t) offset_width(node->key_bytes, node->value_bytes);
+	return PL_OK;
+}
+
 /* Decode metadata only after all offsets have been checked against buffer bounds. */
 static PLStatus
 parse_node(PLNode *node)
@@ -554,17 +645,12 @@ parse_node(PLNode *node)
 				width;
 	uint64_t	rows = 0;
 
-	if (node->size < PL_HEADER || memcmp(node->data, node_magic, 8) != 0)
+	if (parse_header(node) != PL_OK || memcmp(node->data, node_magic, 8) != 0)
 		return PL_CORRUPT;
-	node->level = pl_read32(node->data + 8);
-	node->count = pl_read32(node->data + 12);
-	node->key_bytes = pl_read32(node->data + 16);
-	node->value_bytes = pl_read32(node->data + 20);
 	if (node->level >= PL_MAX_DEPTH || node->count > PL_MAX_ENTRIES ||
 		(node->level && !node->count))
 		return PL_CORRUPT;
-	width = offset_width(node->key_bytes, node->value_bytes);
-	node->offset_width = (uint8_t) width;
+	width = node->offset_width;
 	directory = PL_HEADER + directory_size(node->count, width);
 	if (directory + (uint64_t) node->key_bytes + node->value_bytes != node->size)
 		return PL_CORRUPT;
@@ -603,8 +689,13 @@ parse_node(PLNode *node)
 	return PL_OK;
 }
 
+/*
+ * Add a node. Only bytes from outside are checked in full: those a backing
+ * store holds, or this library built, were written by this library.
+ */
 static PLStatus
-store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, bool backed, PLNode **out)
+store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, bool backed,
+			 bool trusted, PLNode **out)
 {
 	PLNode	   *node = pl_find_local(store, hash);
 	size_t		bucket;
@@ -633,41 +724,18 @@ store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, b
 	memcpy(node->data, bytes, length);
 	node->size = length;
 	node->hash = hash;
-	if (parse_node(node) != PL_OK)
+	if ((trusted ? parse_header(node) : parse_node(node)) != PL_OK)
 	{
 		free(node->data);
 		free(node);
 		return PL_CORRUPT;
 	}
-	if (store->stats.chunks >= store->capacity * 2)
+	if (store->stats.chunks >= store->capacity * 2 &&
+		store_resize(store, store->capacity * 2) != PL_OK)
 	{
-		size_t		capacity = store->capacity * 2,
-					i;
-		PLNode	  **buckets = calloc(capacity, sizeof(*buckets));
-
-		if (!buckets)
-		{
-			free(node->data);
-			free(node);
-			return PL_NOMEM;
-		}
-		for (i = 0; i < store->capacity; i++)
-		{
-			PLNode	   *current = store->buckets[i];
-
-			while (current)
-			{
-				PLNode	   *next = current->next;
-
-				bucket = pl_read64(current->hash.bytes) % capacity;
-				current->next = buckets[bucket];
-				buckets[bucket] = current;
-				current = next;
-			}
-		}
-		free(store->buckets);
-		store->buckets = buckets;
-		store->capacity = capacity;
+		free(node->data);
+		free(node);
+		return PL_NOMEM;
 	}
 	if (!backed && store->unbacked_count == store->unbacked_capacity)
 	{
@@ -734,7 +802,7 @@ pl_store_import(PLStore *store, PLHash hash, PLSlice bytes)
 		return PL_INVALID;
 	if (!pl_node_address(bytes, &actual) || !pl_hash_equal(hash, actual))
 		return PL_CORRUPT;
-	return store_buffer(store, hash, bytes.data, bytes.len, false, &node);
+	return store_buffer(store, hash, bytes.data, bytes.len, false, false, &node);
 }
 
 PLStatus
@@ -792,7 +860,7 @@ pl_save(PLStore *store, uint32_t level, const PLEntry *entries, uint32_t count, 
 		return PL_CORRUPT;
 	}
 	store->stats.writes++;
-	status = store_buffer(store, hash, data, length, false, out);
+	status = store_buffer(store, hash, data, length, false, true, out);
 	free(data);
 	return status;
 }
