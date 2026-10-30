@@ -73,7 +73,7 @@ publish_deletions(List *objects, CatalogView *view)
 		payloads[i] = metadata(hashes[i], kinds[i]);
 		definitions[i] = !strcmp(kinds[i], "namespace") ? payloads[i] : metadata(child(hashes[i], 1), "schema");
 		names[i] = json_value(definitions[i], "name");
-		classid = !strcmp(kinds[i], "namespace") ? NamespaceRelationId :
+		classid = schema_object_class(kinds[i]) ? schema_object_class(kinds[i]) : !strcmp(kinds[i], "namespace") ? NamespaceRelationId :
 			!strcmp(kinds[i], "routine") ? ProcedureRelationId :
 			!strcmp(kinds[i], "trigger") ? TriggerRelationId :
 			!strcmp(kinds[i], "type") ? TypeRelationId : RelationRelationId;
@@ -288,6 +288,7 @@ canonical_drop(Node *statement)
 		return false;
 	if (stmt->removeType != OBJECT_TABLE && stmt->removeType != OBJECT_INDEX &&
 		stmt->removeType != OBJECT_FUNCTION && stmt->removeType != OBJECT_ROUTINE &&
+		stmt->removeType != OBJECT_AGGREGATE && stmt->removeType != OBJECT_OPERATOR && stmt->removeType != OBJECT_CAST &&
 		stmt->removeType != OBJECT_SCHEMA && stmt->removeType != OBJECT_TYPE &&
 		stmt->removeType != OBJECT_TABCONSTRAINT && stmt->removeType != OBJECT_TRIGGER &&
 		stmt->removeType != OBJECT_DOMAIN && stmt->removeType != OBJECT_VIEW &&
@@ -317,7 +318,15 @@ canonical_drop(Node *statement)
 				branch = true;
 			else
 			{
-				if (stmt->removeType == OBJECT_TYPE || stmt->removeType == OBJECT_DOMAIN)
+				if (stmt->removeType == OBJECT_OPERATOR || stmt->removeType == OBJECT_CAST)
+				{
+					Relation relation;
+					ObjectAddress address = get_object_address(stmt->removeType, lfirst(lc), &relation, AccessExclusiveLock, true);
+
+					id = address.objectId;
+					if (relation) relation_close(relation, NoLock);
+				}
+				else if (stmt->removeType == OBJECT_TYPE || stmt->removeType == OBJECT_DOMAIN)
 					id = LookupTypeNameOid(NULL, lfirst_node(TypeName, lc), true);
 				else
 					id = LookupFuncWithArgs(stmt->removeType, lfirst_node(ObjectWithArgs, lc), true);
@@ -440,6 +449,13 @@ canonical_drop(Node *statement)
 					namespaceid = get_rel_namespace(owning_table);
 				}
 			}
+			else if (stmt->removeType == OBJECT_OPERATOR || stmt->removeType == OBJECT_CAST)
+			{
+				Relation relation;
+
+				object = get_object_address(stmt->removeType, lfirst(lc), &relation, AccessExclusiveLock, stmt->missing_ok);
+				if (relation) relation_close(relation, NoLock);
+			}
 			else if (stmt->removeType == OBJECT_SCHEMA)
 			{
 				object.classId = NamespaceRelationId;
@@ -509,7 +525,7 @@ canonical_drop(Node *statement)
 				 object->classId != ProcedureRelationId && object->classId != TypeRelationId &&
 				 object->classId != ConstraintRelationId && object->classId != TriggerRelationId &&
 				 object->classId != AttrDefaultRelationId && object->classId != RewriteRelationId &&
-				 object->classId != CastRelationId))
+				 object->classId != CastRelationId && object->classId != OperatorRelationId))
 				unsupported("canonical dependency deletion object kind");
 		}
 		CatalogViewSwitch(NULL);
