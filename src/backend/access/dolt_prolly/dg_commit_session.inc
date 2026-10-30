@@ -160,7 +160,7 @@ dg_version_pre_commit(void)
 					run("SELECT COALESCE(NULLIF(btrim($1),''),'Transaction commit')", 1,
 						VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(dolt_transaction_commit_message)), NULL, true);
 					message = strcell(0, 1);
-					commit = commit_object(database, head.target, NULL, message, NULL, NULL, commit_time);
+					commit = commit_object_at(database, head.target, NULL, message, NULL, NULL, commit_time, commit_time);
 					move_ref(branch_ref("heads"), head, commit);
 					move_ref(branch_ref("staged"), staged, database);
 					move_ref(branch_ref("working"), working, full.hash);

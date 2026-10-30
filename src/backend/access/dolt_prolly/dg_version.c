@@ -1350,14 +1350,13 @@ static char *commit_committer_name;
 static char *commit_committer_email;
 
 static bytea *
-commit_object(bytea *database, bytea *parent, bytea *second, const char *message, const char *author, const char *author_email, TimestampTz author_date)
+commit_object_at(bytea *database, bytea *parent, bytea *second, const char *message, const char *author, const char *author_email, TimestampTz author_date, TimestampTz committer_date)
 {
 	StringInfoData json;
 	const char *name = GetUserNameFromId(GetUserId(), false);
 	char	   *email = default_email(name);
 	int64		height = 1;
 
-	TimestampTz committer_date = GetCurrentTimestamp();
 	bool explicit_author = author != NULL;
 	bool committer_set = (setting_present(dolt_committer_name) || setting_present(dolt_committer_email)) &&
 		(strcmp(setting_present(dolt_committer_name) ? dolt_committer_name : name,
@@ -1414,6 +1413,13 @@ commit_object(bytea *database, bytea *parent, bytea *second, const char *message
 	appendStringInfo(&json, ",\"date_us\":%lld,\"author_date_us\":%lld,\"height\":%lld}", (long long) committer_date, (long long) author_date, (long long) height);
 	return put("commit", json.data, VC_ARGS(PointerGetDatum(database), PointerGetDatum(parent), PointerGetDatum(second)), second ? 3 : parent ? 2 : 1);
 }
+static bytea *
+commit_object(bytea *database, bytea *parent, bytea *second, const char *message, const char *author, const char *author_email, TimestampTz author_date)
+{
+	return commit_object_at(database, parent, second, message, author, author_email,
+							author_date, GetCurrentTimestamp());
+}
+
 static void
 ensure_repository(void)
 {
