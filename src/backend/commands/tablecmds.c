@@ -3672,7 +3672,9 @@ SetRelationHasSubclass(Oid relationId, bool relhassubclass)
 	HeapTuple	tuple;
 	Form_pg_class classtuple;
 
-	Assert(CheckRelationOidLockedByMe(relationId,
+	/* Provisional branch rows are private; their publisher holds the working-root lock. */
+	Assert(CatalogViewIsProvisional(CatalogViewObjectContext(relationId)) ||
+		   CheckRelationOidLockedByMe(relationId,
 									  ShareUpdateExclusiveLock, false) ||
 		   CheckRelationOidLockedByMe(relationId,
 									  ShareRowExclusiveLock, true));

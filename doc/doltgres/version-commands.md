@@ -13,12 +13,16 @@ Dolt checkout 72e0a00a1a, sqle/dprocedures/{init,dolt_commit,dolt_branch,dolt_ta
 sqle/dtablefunctions/dolt_diff_summary.go and sqle/dtables/log_table.go.
 
 Commands use variadic text arguments and named OUT columns. Both scalar SELECT
-and SELECT * FROM forms work. Hashes are this engine's 64-character SHA-256 hex,
-not Dolt's 32-character hashes. Unsupported flags raise errors.
+and SELECT * FROM forms work. Content addresses are 20 bytes, displayed as 32 lowercase base-32 characters
+using Dolt's `0123456789abcdefghijklmnopqrstuv` alphabet, without padding.
+`dolt_hash_encode(bytea)` and `dolt_hash_decode(text)` convert addresses at the
+SQL boundary. Full hashes and unique prefixes of at least eight characters
+resolve revisions; malformed or ambiguous hashes are rejected. This shares
+Dolt's string encoding, not necessarily its content hashing or object format. Unsupported flags raise errors.
 
 | Function | Implemented arguments and result |
 |---|---|
-| `dolt_add(...)` | `.`, `-A` or `--all`; stage all supported live objects; `status bigint` = 0. |
+| `dolt_add(...)` | `.`, `-a`, `-A` or `--all`; stage all supported live objects, including empty namespaces; `status bigint` = 0. |
 | `dolt_commit(...)` | Required `-m/--message`; optional `-A/--all` (also `-Am message` / `-am message`), `--author 'Name <email>'`, `--committer 'Name <email>'`, `--date`, `--allow-empty`, `--skip-empty`; `hash text`, NULL for skipped empty commit. |
 | `dolt_branch(...)` | `name [start-point]`; create only; `status bigint` = 0. |
 | `dolt_tag(...)` | `name [start-point]`, optional `-m/--message`, `--author`; create annotated tag; `status bigint` = 0. |

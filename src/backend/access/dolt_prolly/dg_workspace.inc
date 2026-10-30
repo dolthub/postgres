@@ -151,8 +151,21 @@ compose_database(bytea *base, bytea *source, List *tables)
 			{
 				char *ns;
 
-				run("SELECT (parse_ident($1,false))[1]", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum((char *) lfirst(lc))), NULL, true);
-				ns = strcell(0, 1);
+				const char *selected = lfirst(lc);
+				Member *special = NULL;
+
+				for (int k = 0; k < nsource; k++)
+					if ((!strcmp(sm[k].kind, "cast") || !strcmp(sm[k].kind, "operator")) && !strcmp(sm[k].name, selected))
+						special = &sm[k];
+				if (special && !strcmp(special->kind, "cast"))
+					continue; /* Casts do not own a namespace. */
+				if (special)
+					ns = json_value(json_value(metadata(child(special->hash, 1), "schema"), "row"), "oprnamespace");
+				else
+				{
+					run("SELECT (parse_ident($1,false))[1]", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(selected)), NULL, true);
+					ns = strcell(0, 1);
+				}
 
 				if (!strcmp(ns, sm[i].name))
 					wanted = true;
@@ -488,12 +501,16 @@ merge_schemas(bytea *base, bytea *ours, bytea *theirs, List **row_merges, String
  * common |base|: the merged schema is installed, then the rows of tables
  * changed on both sides are merged.
  */
+#include "dg_inheritance_merge.inc"
+
 static void
 merge_databases(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts, StringInfo violations,
 				StringInfo schema_conflicts)
 {
 	List	   *row_merges;
 	bytea	   *merged = merge_schemas(base, ours, theirs, &row_merges, schema_conflicts);
+
+	merged = merge_inheritance(base, ours, theirs, merged, &row_merges, schema_conflicts);
 
 	replace_working(dg_current_branch(), merged, NIL);
 	if (row_merges)
@@ -546,6 +563,11 @@ resolve_object_argument(const char *arg, const char *json_a, const char *json_b,
 
 	if (!*arg)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("object name cannot be empty")));
+	/* Operator and cast identities are not SQL identifiers. Accept the exact
+	 * portable identity shown by dolt_status before parsing routine syntax. */
+	run("SELECT DISTINCT v->>'name' FROM (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v UNION ALL SELECT v FROM jsonb_array_elements($2::jsonb->'members') v) m WHERE v->>'kind' IN ('aggregate','operator','cast') AND v->>'name'=$3", 3,
+		VC_TYPES(TEXTOID,TEXTOID,TEXTOID), VC_ARGS(CStringGetTextDatum(json_a),CStringGetTextDatum(json_b),CStringGetTextDatum(arg)), NULL, true);
+	if (SPI_processed) return strcell(0, 1);
 	if (arg[strlen(arg) - 1] == ')')
 	{
 		List *parsed = raw_parser(psprintf("DROP ROUTINE %s", arg), RAW_PARSE_DEFAULT);
@@ -594,7 +616,7 @@ resolve_object_argument(const char *arg, const char *json_a, const char *json_b,
 
 	/* parse_ident(...,false) stops at the signature, retaining quoted names.
 	 * Compare the full suffix as well, so overloads never select each other. */
-	run("WITH members AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v UNION ALL SELECT v FROM jsonb_array_elements($2::jsonb->'members') v), names AS (SELECT DISTINCT v->>'name' AS name FROM members WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence')), path AS (SELECT s,ord FROM (SELECT CASE WHEN btrim(s)='\"$user\"' THEN current_user::text ELSE btrim(btrim(s),'\"') END AS s,ord FROM unnest(string_to_array($5,',')) WITH ORDINALITY p(s,ord)) x WHERE EXISTS (SELECT 1 FROM pg_namespace WHERE nspname=x.s)) SELECT name,path.ord IS NOT NULL FROM names LEFT JOIN path ON (parse_ident(name,false))[1]=path.s WHERE ($3::text IS NOT NULL AND name=$3) OR ($3::text IS NULL AND substr(name,length(quote_ident((parse_ident(name,false))[1]))+2)=$4) ORDER BY path.ord NULLS LAST,name COLLATE \"C\"", 5, VC_TYPES(TEXTOID,TEXTOID,TEXTOID,TEXTOID,TEXTOID), VC_ARGS(CStringGetTextDatum(json_a),CStringGetTextDatum(json_b),qualified ? CStringGetTextDatum(qualified) : (Datum) 0,CStringGetTextDatum(local),CStringGetTextDatum(api_search_path ? api_search_path : "public")), qualified ? NULL : "  n  ", true);
+	run("WITH members AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v UNION ALL SELECT v FROM jsonb_array_elements($2::jsonb->'members') v), names AS (SELECT DISTINCT v->>'name' AS name FROM members WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence','aggregate')), path AS (SELECT s,ord FROM (SELECT CASE WHEN btrim(s)='\"$user\"' THEN current_user::text ELSE btrim(btrim(s),'\"') END AS s,ord FROM unnest(string_to_array($5,',')) WITH ORDINALITY p(s,ord)) x WHERE EXISTS (SELECT 1 FROM pg_namespace WHERE nspname=x.s)) SELECT name,path.ord IS NOT NULL FROM names LEFT JOIN path ON (parse_ident(name,false))[1]=path.s WHERE ($3::text IS NOT NULL AND name=$3) OR ($3::text IS NULL AND substr(name,length(quote_ident((parse_ident(name,false))[1]))+2)=$4) ORDER BY path.ord NULLS LAST,name COLLATE \"C\"", 5, VC_TYPES(TEXTOID,TEXTOID,TEXTOID,TEXTOID,TEXTOID), VC_ARGS(CStringGetTextDatum(json_a),CStringGetTextDatum(json_b),qualified ? CStringGetTextDatum(qualified) : (Datum) 0,CStringGetTextDatum(local),CStringGetTextDatum(api_search_path ? api_search_path : "public")), qualified ? NULL : "  n  ", true);
 	if (!SPI_processed)
 	{
 		if (!required)
@@ -611,7 +633,7 @@ state_objects(const char *json)
 {
 	List *result = NIL;
 
-	run("SELECT v->>'name' FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence') ORDER BY v->>'name' COLLATE \"C\"", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
+	run("SELECT v->>'name' FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence','aggregate','operator','cast') ORDER BY v->>'name' COLLATE \"C\"", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
 	for (int i = 0; i < SPI_processed; i++)
 		result = lappend(result, strcell(i, 1));
 	return result;
@@ -1255,7 +1277,7 @@ dolt_merge_base(PG_FUNCTION_ARGS)
 	int			nest = begin_api();
 	bytea	   *a = resolve(text_to_cstring(PG_GETARG_TEXT_PP(0))),
 			   *b = resolve(text_to_cstring(PG_GETARG_TEXT_PP(1)));
-	char	   *answer = hex(merge_base(a, b));
+	char	   *answer = hash_format(merge_base(a, b));
 
 	end_api(nest);
 	PG_RETURN_TEXT_P(cstring_to_text(answer));
@@ -1297,7 +1319,7 @@ dolt_hashof_db(PG_FUNCTION_ARGS)
 
 		db = revision_database(revision, &working);
 	}
-	answer = hex(db);
+	answer = hash_format(db);
 	end_api(nest);
 	PG_RETURN_TEXT_P(cstring_to_text(answer));
 }
@@ -1332,7 +1354,7 @@ dolt_reflog(PG_FUNCTION_ARGS)
 			filter = args[i];
 	}
 	nest = begin_api();
-	run("SELECT CASE WHEN l.reflogname LIKE 'heads/%' THEN 'refs/heads/' || substr(l.reflogname,7) WHEN l.reflogname LIKE 'tags/%' THEN 'refs/tags/' || substr(l.reflogname,6) ELSE 'refs/' || l.reflogname END,l.reflogtime,encode(CASE WHEN o.objkind='tag' THEN o.objchildren[1] ELSE l.reflogtarget END,'hex'),m.meta->>'message' FROM pg_catalog.pg_dolt_reflog l JOIN pg_dolt_object_visible o ON o.objhash=l.reflogtarget LEFT JOIN pg_dolt_commit_visible m ON m.objhash=CASE WHEN o.objkind='tag' THEN o.objchildren[1] ELSE l.reflogtarget END WHERE (l.reflogname LIKE 'heads/%' OR l.reflogname LIKE 'tags/%' OR $3) AND ($1::text IS NULL OR l.reflogname=$1 OR l.reflogname='heads/' || $1 OR l.reflogname='tags/' || $1 OR 'refs/' || l.reflogname=$1 OR $2) ORDER BY l.reflogtime DESC,l.reflogname", 3, VC_TYPES(TEXTOID, BOOLOID, BOOLOID), VC_ARGS(filter ? CStringGetTextDatum(filter) : (Datum) 0, BoolGetDatum(filter == NULL), BoolGetDatum(all)), filter ? NULL : "n  ", true);
+	run("SELECT CASE WHEN l.reflogname LIKE 'heads/%' THEN 'refs/heads/' || substr(l.reflogname,7) WHEN l.reflogname LIKE 'tags/%' THEN 'refs/tags/' || substr(l.reflogname,6) ELSE 'refs/' || l.reflogname END,l.reflogtime,pg_catalog.dolt_hash_encode(CASE WHEN o.objkind='tag' THEN o.objchildren[1] ELSE l.reflogtarget END),m.meta->>'message' FROM pg_catalog.pg_dolt_reflog l JOIN pg_dolt_object_visible o ON o.objhash=l.reflogtarget LEFT JOIN pg_dolt_commit_visible m ON m.objhash=CASE WHEN o.objkind='tag' THEN o.objchildren[1] ELSE l.reflogtarget END WHERE (l.reflogname LIKE 'heads/%' OR l.reflogname LIKE 'tags/%' OR $3) AND ($1::text IS NULL OR l.reflogname=$1 OR l.reflogname='heads/' || $1 OR l.reflogname='tags/' || $1 OR 'refs/' || l.reflogname=$1 OR $2) ORDER BY l.reflogtime DESC,l.reflogname", 3, VC_TYPES(TEXTOID, BOOLOID, BOOLOID), VC_ARGS(filter ? CStringGetTextDatum(filter) : (Datum) 0, BoolGetDatum(filter == NULL), BoolGetDatum(all)), filter ? NULL : "n  ", true);
 	return_rows(fcinfo, nest);
 	return (Datum) 0;
 }
@@ -1418,7 +1440,7 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 		move_ref(branch_ref("working"), read_ref(branch_ref("working")), database);
 		advance_snapshot();
 	}
-	values[0] = CStringGetTextDatum(hex(commit));
+	values[0] = CStringGetTextDatum(hash_format(commit));
 	values[1] = Int64GetDatum(0);
 	values[2] = Int64GetDatum(0);
 	values[3] = Int64GetDatum(0);

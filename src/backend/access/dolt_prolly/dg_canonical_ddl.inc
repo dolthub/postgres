@@ -26,7 +26,7 @@ canonical_empty_member(const char *kind, const char *name, const char *definitio
 
 	SET_VARSIZE(raw, VARHDRSZ + PL_HASH_SIZE);
 	memcpy(VARDATA(raw), empty->root.bytes, PL_HASH_SIZE);
-	run("SELECT jsonb_build_object('kind',$1::text,'name',$2::text,'schema',encode(sha256(convert_to($3,'UTF8')),'hex'),'content',$4::text)::text", 4, VC_TYPES(TEXTOID, TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(kind), CStringGetTextDatum(name), CStringGetTextDatum(definition), CStringGetTextDatum(hex(raw))), NULL, true);
+	run("SELECT jsonb_build_object('kind',$1::text,'name',$2::text,'schema',encode(sha256(convert_to($3,'UTF8')),'hex'),'content',$4::text)::text", 4, VC_TYPES(TEXTOID, TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(kind), CStringGetTextDatum(name), CStringGetTextDatum(definition), CStringGetTextDatum(hash_format(raw))), NULL, true);
 	payload = strcell(0, 1);
 	return put(kind, payload, VC_ARGS(PointerGetDatum(schema), PointerGetDatum(content)), 2);
 }
@@ -252,8 +252,8 @@ dg_catalog_create(Node *statement, const char *query)
 		PreventCommandIfReadOnly("CREATE TABLE");
 	if (stmt->relation->relpersistence != RELPERSISTENCE_PERMANENT)
 		unsupported("unlogged versioned tables");
-	if (stmt->inhRelations || stmt->partbound || stmt->partspec)
-		unsupported("partitioned and inherited versioned tables");
+	if (stmt->partbound || stmt->partspec)
+		unsupported("partitioned versioned tables");
 	if (stmt->ofTypename)
 		unsupported("typed versioned tables");
 	if (!ActiveSnapshotSet())

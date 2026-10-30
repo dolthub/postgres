@@ -59,7 +59,7 @@ fails(q{SELECT dolt_reset('--hard','--soft')},qr/mutually exclusive/,'incompatib
 sql("SELECT dolt_reset('--hard','$c2')");
 sql(q{INSERT INTO t VALUES(4,'four')});
 my $c3=sql(q{SELECT dolt_commit('-Am','third')});
-like(sql(q{SELECT substring(dolt_revert('HEAD')::text,66)}),qr/^,0,0,0\)$/,'revert returns hash and zero conflict counts');
+like(sql(q{SELECT substring(dolt_revert('HEAD')::text,34)}),qr/^,0,0,0\)$/,'revert returns hash and zero conflict counts');
 is(sql(q{SELECT message FROM dolt_log('-n','1')}),'Revert "third"','revert commit message');
 is(sql(q{SELECT count(*) FROM t WHERE pk=4}),'0','revert undid the insert');
 is(sql(q{SELECT count(*) FROM dolt.status}),'0','revert leaves a clean working set');
@@ -98,7 +98,7 @@ is(sql(q{SELECT * FROM dolt_branch_status('b1','main')}),'main|1|0','branch stat
 is(sql(q{SELECT * FROM dolt_count_commits('--from','b1','--to','main')}),'1|0','count commits');
 is(sql(q{SELECT dolt_merge_base('main','b1')=dolt_hashof('b1')}),'t','merge base');
 is(sql(q{SELECT dolt_version() LIKE '%-dolt'}),'t','version string');
-is(sql(q{SELECT length(dolt_hashof_table('t')),dolt_hashof_db()=dolt_hashof_db('HEAD'),dolt_hashof_db('STAGED')=dolt_hashof_db('HEAD')}),'64|t|t','database and table hashes');
+is(sql(q{SELECT length(dolt_hashof_table('t')),dolt_hashof_db()=dolt_hashof_db('HEAD'),dolt_hashof_db('STAGED')=dolt_hashof_db('HEAD')}),'32|t|t','database and table hashes');
 sql(q{INSERT INTO t VALUES(9,'nine')});
 is(sql(q{SELECT dolt_hashof_db()=dolt_hashof_db('HEAD')}),'f','working hash reflects live changes');
 sql(q{SELECT dolt_checkout('t')});

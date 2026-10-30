@@ -19,9 +19,9 @@ SELECT test_chunk_use_store('memory') AS previous_store;
 \i :contract
 -- Rollback semantics are not part of the contract: this store keeps puts.
 BEGIN;
-SELECT test_chunk_put(sha256('memory rollback'), 'memory rollback');
+SELECT test_chunk_put(chunk_hash('memory rollback'), 'memory rollback');
 ROLLBACK;
-SELECT test_chunk_exists(sha256('memory rollback')) AS kept_after_rollback;
+SELECT test_chunk_exists(chunk_hash('memory rollback')) AS kept_after_rollback;
 SELECT test_chunk_use_store('heap') AS previous_store;
 SELECT test_chunk_use_store('bogus');
 
@@ -35,38 +35,38 @@ SELECT attname, attstorage FROM pg_attribute
 SELECT reltoastrelid = 0 AS no_toast FROM pg_class WHERE oid = 'pg_dolt_chunk'::regclass;
 SELECT indisunique, indisprimary FROM pg_index WHERE indexrelid = 'pg_dolt_chunk_hash_index'::regclass;
 SELECT name, setting, unit FROM pg_settings
-  WHERE name IN ('dolt_chunk_cache_size', 'dolt_chunk_verify_hashes') ORDER BY name;
+  WHERE name IN ('dolt_chunk_verify_hashes') ORDER BY name;
 
 -- A put that finds a committed copy stores nothing, so repeated puts keep one row.
-SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = sha256('contract alpha');
+SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = chunk_hash('contract alpha');
 
 -- A chunk longer than one heap tuple spans parts, each inline and uncompressed.
-SELECT test_chunk_put(sha256(x), x) FROM (SELECT decode(repeat('cd', 20000), 'hex') AS x) s;
+SELECT test_chunk_put(chunk_hash(x), x) FROM (SELECT decode(repeat('cd', 20000), 'hex') AS x) s;
 SELECT chunkpart, chunksize, length(chunkdata), pg_column_compression(chunkdata) IS NULL AS uncompressed
-  FROM pg_dolt_chunk WHERE chunkhash = sha256(decode(repeat('cd', 20000), 'hex')) ORDER BY chunkpart;
-SELECT test_chunk_get(sha256(x)) = x AS multipart_roundtrip
+  FROM pg_dolt_chunk WHERE chunkhash = chunk_hash(decode(repeat('cd', 20000), 'hex')) ORDER BY chunkpart;
+SELECT test_chunk_get(chunk_hash(x)) = x AS multipart_roundtrip
   FROM (SELECT decode(repeat('cd', 20000), 'hex') AS x) s;
-SELECT test_chunk_delete(sha256(decode(repeat('cd', 20000), 'hex'))) AS multipart_deleted;
-SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = sha256(decode(repeat('cd', 20000), 'hex'));
+SELECT test_chunk_delete(chunk_hash(decode(repeat('cd', 20000), 'hex'))) AS multipart_deleted;
+SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = chunk_hash(decode(repeat('cd', 20000), 'hex'));
 
 -- Puts are transactional here: own writes are visible, rollback removes them.
 BEGIN;
-SELECT test_chunk_put(sha256('beta'), 'beta');
-SELECT test_chunk_exists(sha256('beta')) AS own_write;
-SELECT test_chunk_put(sha256('beta'), 'beta') AS second_put;
+SELECT test_chunk_put(chunk_hash('beta'), 'beta');
+SELECT test_chunk_exists(chunk_hash('beta')) AS own_write;
+SELECT test_chunk_put(chunk_hash('beta'), 'beta') AS second_put;
 ROLLBACK;
-SELECT test_chunk_exists(sha256('beta')) AS after_rollback;
-SELECT test_chunk_put(sha256('beta'), 'beta') AS reinserted;
+SELECT test_chunk_exists(chunk_hash('beta')) AS after_rollback;
+SELECT test_chunk_put(chunk_hash('beta'), 'beta') AS reinserted;
 BEGIN;
 SAVEPOINT s;
-SELECT test_chunk_put(sha256('gamma'), 'gamma');
+SELECT test_chunk_put(chunk_hash('gamma'), 'gamma');
 ROLLBACK TO s;
-SELECT test_chunk_exists(sha256('gamma')) AS after_savepoint_rollback;
+SELECT test_chunk_exists(chunk_hash('gamma')) AS after_savepoint_rollback;
 COMMIT;
 
 -- A deleted chunk can be put again.
-SELECT test_chunk_put(sha256('contract delta'), 'contract delta') AS reput_after_delete;
-SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = sha256('contract delta');
+SELECT test_chunk_put(chunk_hash('contract delta'), 'contract delta') AS reput_after_delete;
+SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = chunk_hash('contract delta');
 
 -- Existence probes do not set hint bits on rows they examine. With data
 -- checksums, a hint on a page's first change after a checkpoint logs a
@@ -78,43 +78,30 @@ CREATE FUNCTION chunk_xmin_hinted(hash bytea) RETURNS bool LANGUAGE sql AS $$
          heap_page_items(get_raw_page('pg_dolt_chunk', b::int)) AS i
    WHERE t_data IS NOT NULL AND position(hash IN t_data) > 0
 $$;
-SELECT test_chunk_put(sha256('hintless'), 'hintless');
-SELECT test_chunk_exists(sha256('hintless')) AS exists;
-SELECT test_chunk_put(sha256('hintless'), 'hintless') AS reput;
-SELECT chunk_xmin_hinted(sha256('hintless')) AS hinted_after_probes;
+SELECT test_chunk_put(chunk_hash('hintless'), 'hintless');
+SELECT test_chunk_exists(chunk_hash('hintless')) AS exists;
+SELECT test_chunk_put(chunk_hash('hintless'), 'hintless') AS reput;
+SELECT chunk_xmin_hinted(chunk_hash('hintless')) AS hinted_after_probes;
 -- Control: an ordinary MVCC read of the row sets the hint.
-SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = sha256('hintless');
-SELECT chunk_xmin_hinted(sha256('hintless')) AS hinted_after_select;
+SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = chunk_hash('hintless');
+SELECT chunk_xmin_hinted(chunk_hash('hintless')) AS hinted_after_select;
 DROP FUNCTION chunk_xmin_hinted(bytea);
 DROP EXTENSION pageinspect;
 
 -- Read-only transactions cannot write.
 BEGIN READ ONLY;
-SELECT test_chunk_put(sha256('delta'), 'delta');
+SELECT test_chunk_put(chunk_hash('delta'), 'delta');
 ROLLBACK;
 
--- The cache serves repeated reads and stays within its budget.
-SET dolt_chunk_cache_size = '64kB';
-SELECT test_chunk_cache_reset();
-SELECT test_chunk_get(sha256('contract alpha')) = 'contract alpha' AS first_read;
-SELECT test_chunk_get(sha256('contract alpha')) = 'contract alpha' AS second_read;
-SELECT hits, misses FROM test_chunk_cache_stats();
-SELECT count(*) FILTER (WHERE test_chunk_put(sha256(x), x)) AS inserted
+-- Repeated reads return the same bytes, and every chunk put is readable.
+SELECT test_chunk_get(chunk_hash('contract alpha')) = 'contract alpha' AS first_read;
+SELECT test_chunk_get(chunk_hash('contract alpha')) = 'contract alpha' AS second_read;
+SELECT count(*) FILTER (WHERE test_chunk_put(chunk_hash(x), x)) AS inserted
   FROM (SELECT decode(repeat(lpad(to_hex(g), 2, '0'), 8000), 'hex') AS x
         FROM generate_series(1, 20) g) s;
-SELECT evictions > 0 AS evicted, bytes <= 65536 AS within_budget, entries < 20 AS bounded,
-       pinned = 0 AS unpinned
-  FROM test_chunk_cache_stats();
-SELECT count(*) FILTER (WHERE test_chunk_get(sha256(x)) = x) AS all_readable
+SELECT count(*) FILTER (WHERE test_chunk_get(chunk_hash(x)) = x) AS all_readable
   FROM (SELECT decode(repeat(lpad(to_hex(g), 2, '0'), 8000), 'hex') AS x
         FROM generate_series(1, 20) g) s;
-
--- With caching disabled, reads still work and nothing is retained.
-SET dolt_chunk_cache_size = 0;
-SELECT test_chunk_cache_reset();
-SELECT test_chunk_get(sha256('contract alpha')) = 'contract alpha' AS uncached_read;
-SELECT hits, misses, entries, bytes, pinned FROM test_chunk_cache_stats();
-RESET dolt_chunk_cache_size;
 
 -- The catalog is private.
 CREATE ROLE regress_chunk_reader;

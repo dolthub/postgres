@@ -38,6 +38,7 @@
 #include "catalog/catalog.h"
 #include "catalog/namespace.h"
 #include "catalog/catalogview.h"
+#include "access/doltcatalog.h"
 #include "catalog/heap.h"
 #include "catalog/index.h"
 #include "catalog/objectaccess.h"
@@ -1928,7 +1929,8 @@ heap_drop_with_catalog(Oid relid)
 	/* Sequences cannot have table synchronization state. Their branch-local
 	 * catalog handles must never be used to scan the physical subscription
 	 * catalog. */
-	if (relkind != RELKIND_SEQUENCE)
+	/* Provisional definitions have no physical subscription state. */
+	if (relkind != RELKIND_SEQUENCE && !CatalogViewIsProvisional(CatalogViewObjectContext(relid)))
 		RemoveSubscriptionRel(InvalidOid, relid);
 
 	/*
@@ -3581,6 +3583,9 @@ RemoveStatistics(Oid relid, AttrNumber attnum)
 	systable_endscan(scan);
 
 	table_close(pgstatistic, RowExclusiveLock);
+
+	if (attnum == 0 && CatalogViewIsDurable(relid))
+		dg_remove_relation_stats(relid);
 }
 
 

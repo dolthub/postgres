@@ -184,6 +184,115 @@ test_tree(void)
 	pl_store_free(store);
 }
 
+/* A child reference is a 20-byte address prefix and a varint row count. */
+static void
+test_child_references(void)
+{
+	const uint64_t counts[] = {1, 127, 128, 16383, 16384, UINT64_C(1) << 35, UINT64_MAX};
+	uint8_t		encoded[PL_CHILD_MAX + 1];
+	PLHash		hash,
+				decoded;
+	uint64_t	rows;
+
+	for (int i = 0; i < PL_HASH_SIZE; i++)
+		hash.bytes[i] = (uint8_t) (i + 1);
+	for (size_t c = 0; c < sizeof(counts) / sizeof(counts[0]); c++)
+	{
+		size_t		length = pl_child_encode(encoded, hash, counts[c]);
+
+		CHECK(length > PL_HASH_SIZE && length <= PL_CHILD_MAX);
+		CHECK(pl_child_decode(bytes(encoded, length), &decoded, &rows));
+		CHECK(rows == counts[c]);
+		CHECK(memcmp(decoded.bytes, hash.bytes, PL_HASH_SIZE) == 0);
+		for (int i = PL_HASH_SIZE; i < PL_HASH_SIZE; i++)
+			CHECK(decoded.bytes[i] == 0);
+		/* Truncated or trailing bytes are rejected. */
+		CHECK(!pl_child_decode(bytes(encoded, length - 1), NULL, &rows));
+		encoded[length] = 0;
+		CHECK(!pl_child_decode(bytes(encoded, length + 1), NULL, &rows) || length + 1 > PL_CHILD_MAX);
+	}
+	CHECK(pl_child_encode(encoded, hash, 100) == PL_HASH_SIZE + 1);
+	CHECK(pl_child_encode(encoded, hash, 5000) == PL_HASH_SIZE + 2);
+	CHECK(!pl_child_decode(bytes(encoded, PL_HASH_SIZE), NULL, &rows));
+}
+
+/* Node sizes and counts by level: leaves below, interior nodes from 1 up. */
+typedef struct LevelSizes
+{
+	size_t		nodes[2],
+				bytes[2],
+				largest[2];
+	uint32_t	most_entries;
+} LevelSizes;
+
+static void
+measure(PLStore *store, PLHash hash, LevelSizes *sizes)
+{
+	PLNode	   *node = pl_find(store, hash);
+	int			interior;
+
+	CHECK(node);
+	interior = node->level > 0;
+	/* Ordinary nodes use two-byte directory offsets. */
+	CHECK(node->offset_width == 2);
+	CHECK(node->size == PL_HEADER + 2 * 2 * (node->count + 1) + node->key_bytes + node->value_bytes);
+	sizes->nodes[interior]++;
+	sizes->bytes[interior] += node->size;
+	if (node->size > sizes->largest[interior])
+		sizes->largest[interior] = node->size;
+	if (interior && node->count > sizes->most_entries)
+		sizes->most_entries = node->count;
+	for (uint32_t i = 0; node->level && i < node->count; i++)
+	{
+		PLHash		child;
+
+		PLHash		decoded;
+		uint64_t	rows;
+
+		child = pl_child_hash(node, i);
+		/* The unchecked reads agree with the validating decoder. */
+		CHECK(pl_child_decode(pl_node_value(node, i), &decoded, &rows));
+		CHECK(pl_hash_equal(child, decoded) && rows == pl_child_rows(node, i));
+		measure(store, child, sizes);
+	}
+}
+
+/* Leaves and interior nodes average about the target size and stay within the maximum. */
+static void
+test_node_sizes(void)
+{
+	PLStore    *store = test_store_create();
+	size_t		n = 200000;
+	PLEntry    *entries = calloc(n, sizeof(*entries));
+	uint8_t		(*keys)[8] = calloc(n, 8);
+	LevelSizes	sizes = {0};
+	PLTree		tree;
+	double		leaf,
+				interior;
+
+	CHECK(store && entries && keys);
+	for (size_t i = 0; i < n; i++)
+	{
+		pl_key_int64((int64_t) i, keys[i]);
+		entries[i] = (PLEntry) {{keys[i], 8}, slice("a value of some forty bytes for each row")};
+	}
+	OK(pl_build(store, entries, n, &tree));
+	OK(pl_validate(&tree));
+	measure(store, tree.root, &sizes);
+	leaf = (double) sizes.bytes[0] / sizes.nodes[0];
+	interior = (double) sizes.bytes[1] / sizes.nodes[1];
+	printf("node sizes: %zu leaves of %.0f bytes on average, %zu interior nodes of %.0f, largest %zu\n",
+		   sizes.nodes[0], leaf, sizes.nodes[1], interior, sizes.largest[1]);
+	CHECK(leaf > PL_TARGET_BYTES / 2 && leaf < 2 * PL_TARGET_BYTES);
+	CHECK(interior > PL_TARGET_BYTES / 2 && interior < 2 * PL_TARGET_BYTES);
+	CHECK(sizes.largest[0] <= PL_MAX_BYTES + PL_HEADER + 64);
+	CHECK(sizes.largest[1] <= PL_MAX_BYTES + PL_HEADER + 64);
+	CHECK(sizes.nodes[1] > 1);
+	free(keys);
+	free(entries);
+	pl_store_free(store);
+}
+
 typedef struct DiffResult
 {
 	unsigned	inserts,
@@ -805,6 +914,33 @@ test_apply_batches(void)
 			pl_store_retain(backed, &tree.root, 1);
 			CHECK(pl_find_local(backed, edited.root) == NULL);
 		}
+
+		/*
+		 * Dropping backed nodes keeps unwritten ones, even one that was
+		 * listed as unwritten when it was written, and finds fetch again.
+		 */
+		{
+			PLTree		base_remote = {backed, tree.root},
+						edited;
+			uint8_t		other[4] = {6, 6, 6, 6};
+			PLEdit		edit4 = {{keys[SLOTS / 9], 8}, {true, {other, 4}}};
+			PLNode	   *root;
+			PLValue		got;
+			unsigned	fetches;
+
+			OK(pl_apply(&base_remote, &edit4, 1, &edited));
+			root = pl_find_local(backed, edited.root);
+			CHECK(root != NULL && !root->backed);
+			pl_node_set_backed(root);
+			CHECK(pl_store_drop_backed(backed) > 0);
+			CHECK(pl_find_local(backed, tree.root) == NULL);
+			CHECK(pl_find_local(backed, edited.root) == NULL);
+			CHECK(pl_store_stats(backed).chunks > 0);
+			CHECK(pl_store_drop_unbacked(backed) > 0);
+			fetches = fetch.fetches;
+			OK(pl_get(&base_remote, edit4.key, &got));
+			CHECK(fetch.fetches > fetches);
+		}
 		pl_store_free(backed);
 	}
 
@@ -908,20 +1044,21 @@ test_import_and_malformed(void)
 	{
 		PLSlice		data;
 		PLHash		hash;
-		unsigned	length;
 		uint8_t    *bad;
+		size_t		width;
 
 		OK(pl_store_export(source, tree.root, &data));
 		bad = malloc(data.len);
 		CHECK(bad != NULL);
 		memcpy(bad, data.data, data.len);
-		pl_write32(bad + PL_HEADER, 1); /* first key offset must be zero */
-		CHECK(EVP_Digest(bad, data.len, hash.bytes, &length, EVP_sha256(), NULL) == 1);
+		width = pl_read32(bad + 16) <= PL_NARROW_LIMIT && pl_read32(bad + 20) <= PL_NARROW_LIMIT ? 2 : 4;
+		bad[PL_HEADER + width - 1] = 1; /* first key offset must be zero */
+		CHECK(pl_node_address(bytes(bad, data.len), &hash));
 		CHECK(pl_store_import(target, hash, bytes(bad, data.len)) == PL_CORRUPT);
 		memcpy(bad, data.data, data.len);
 		/* Valid local encoding, but nonexistent child address. */
-		bad[PL_HEADER + 8 * (pl_read32(bad + 12) + 1) + pl_read32(bad + 16)] ^= 128;
-		CHECK(EVP_Digest(bad, data.len, hash.bytes, &length, EVP_sha256(), NULL) == 1);
+		bad[PL_HEADER + 2 * width * (pl_read32(bad + 12) + 1) + pl_read32(bad + 16)] ^= 128;
+		CHECK(pl_node_address(bytes(bad, data.len), &hash));
 		OK(pl_store_import(target, hash, bytes(bad, data.len)));
 		CHECK(pl_open(target, hash, &untouched) == PL_CORRUPT);
 		CHECK(pl_hash_equal(untouched.root, tree.root));
@@ -955,6 +1092,15 @@ test_large_and_binary_tuples(void)
 	CHECK(got.present && got.bytes.len == 0);
 	OK(pl_get(&tree, entries[1].key, &got));
 	CHECK(got.present && got.bytes.len == 100000);
+	CHECK(memcmp(got.bytes.data, large, 100000) == 0);
+	{
+		/* Values past 64 kB keep four-byte directory offsets: tuple size is not limited. */
+		PLNode	   *leaf = pl_find(store, tree.root);
+
+		CHECK(leaf && leaf->level == 0);
+		CHECK(leaf->offset_width == 4);
+		CHECK(leaf->size == PL_HEADER + 2 * 4 * (leaf->count + 1) + leaf->key_bytes + leaf->value_bytes);
+	}
 	edit = (PLEdit)
 	{
 		entries[1].key,
@@ -1018,10 +1164,11 @@ test_format_and_resolver_lifetime(void)
 
 	OK(pl_build(store, NULL, 0, &empty));
 	OK(pl_store_export(store, empty.root, &serialized));
-	CHECK(serialized.len == 32);
-	for (i = 0; i < 32; i++)
+	/* The empty tree's address pins the format: its SHA-256 truncated to the hash size. */
+	CHECK(serialized.len == 28);
+	for (i = 0; i < PL_HASH_SIZE; i++)
 		snprintf(hex + 2 * i, 3, "%02x", empty.root.bytes[i]);
-	CHECK(strcmp(hex, "4b1e28e6c3a8ed67c9b4b4cdb924805bf39c217d3ea8049877c6c6a9e0c77218") == 0);
+	CHECK(strcmp(hex, "c611f574ef24eb5785f74f9277220117b134de73") == 0);
 	OK(pl_build(store, a, 2, &left));
 	OK(pl_build(store, b, 2, &right));
 	OK(pl_merge(&empty, &left, &right, resolve_scratch, scratch, &merged));
@@ -1033,13 +1180,47 @@ test_format_and_resolver_lifetime(void)
 	pl_store_free(store);
 }
 
+static void
+test_hash_text(void)
+{
+	PLHash		hash = {{0}}, parsed;
+	char text[	PL_HASH_TEXT_SIZE + 1];
+	int			i;
+
+	pl_hash_format(hash, text);
+	CHECK(strcmp(text, "00000000000000000000000000000000") == 0);
+	for (i = 0; i < PL_HASH_SIZE; i++)
+		hash.bytes[i] = (uint8_t) i;
+	pl_hash_format(hash, text);
+	CHECK(strcmp(text, "000g40o40k30e209185go38e1s8124gj") == 0);
+	CHECK(pl_hash_parse(text, &parsed) && pl_hash_equal(hash, parsed));
+	memset(hash.bytes, 255, PL_HASH_SIZE);
+	pl_hash_format(hash, text);
+	CHECK(strcmp(text, "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv") == 0);
+	CHECK(pl_hash_parse(text, &parsed) && pl_hash_equal(hash, parsed));
+	CHECK(!pl_hash_parse("0000000000000000000000000000000", &parsed));
+	CHECK(!pl_hash_parse("000000000000000000000000000000000", &parsed));
+	CHECK(!pl_hash_parse("w0000000000000000000000000000000", &parsed));
+	CHECK(!pl_hash_parse("V0000000000000000000000000000000", &parsed));
+	for (i = 0; i < PL_HASH_SIZE * 8; i++)
+	{
+		memset(hash.bytes, 0, PL_HASH_SIZE);
+		hash.bytes[i / 8] = 1 << (i % 8);
+		pl_hash_format(hash, text);
+		CHECK(pl_hash_parse(text, &parsed) && pl_hash_equal(hash, parsed));
+	}
+}
+
 int
 main(int argc, char **argv)
 {
 	file_mode = argc == 2 && strcmp(argv[1], "--file") == 0;
+	test_hash_text();
 	test_tuples();
 	test_tuple_view();
 	test_tree();
+	test_node_sizes();
+	test_child_references();
 	test_versions();
 	test_random_history();
 	test_apply_batches();

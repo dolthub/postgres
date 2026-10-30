@@ -7,7 +7,7 @@ dolt_fetch,dolt_push,dolt_pull,dolt_clone,dolt_cluster}.go`; Doltgres
 `testing/go/{stats_usage_test,dolt_backup_test,dolt_remote_test,pgcatalog_test}.go`.
 
 These pieces give the Dolt names a PostgreSQL meaning where one exists and a
-clear error where it does not. None of them move data between servers.
+clear error where it does not. Native file backups now transfer canonical objects between forks.
 
 ## dolt.statistics and dolt_stats_*
 
@@ -25,21 +25,16 @@ on every versioned user table; `dolt_stats_stop/restart/gc/purge/timers` are
 no-ops that explain that autovacuum owns collection; `dolt_stats_info()`
 returns a JSON summary over `pg_stats`.
 
-Blocker: the prolly access method rejects `ANALYZE` ("prolly phase 2 does
-not support ANALYZE"), so versioned tables never get rows in
-`dolt.statistics` and the refresh procedures report "statistics refresh
-unavailable: …" instead of failing. Before this change the analyze scan
-crashed the backend because it carried no snapshot (`dg_table.c` now uses the
-active snapshot for `SO_TYPE_ANALYZE` scans so the intended error is raised).
-The view is verified with heap tables in the native test; the Doltgres
-statistics scenarios are excluded in the prolly profile for this reason.
+The earlier ANALYZE limitation is resolved. See
+[branch-local statistics](branch-statistics.md) for collection and current
+single-bucket approximation limits.
 
 ## dolt_backup and dolt.backups
 
 `dolt_backup('add', name, url)` and `dolt_backup('remove', name)` maintain
 `pg_catalog.pg_dolt_backup`, listed by `dolt.backups`, `dolt.dolt_backups` and
-`dolt_backups` (`name, url`). `sync`, `sync-url` and `restore` raise
-`FEATURE_NOT_SUPPORTED`: the fork has no transport for manifest objects.
+`dolt_backups` (`name, url`). `sync`, `sync-url` and `restore` support native
+file bundles; see [native backups](native-backups.md).
 
 ## dolt_fetch, dolt_push, dolt_pull, dolt_clone, cluster procedures
 

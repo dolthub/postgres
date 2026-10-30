@@ -18,7 +18,7 @@ sub rows
 {
 	my ($data) = @_;
 	return $node->safe_psql('postgres',
-		"SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = sha256('$data')");
+		"SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = chunk_hash('$data')");
 }
 
 # The second inserter neither waits for nor relies on the first. If both
@@ -30,19 +30,19 @@ foreach my $outcome ('COMMIT', 'ROLLBACK')
 	my $second = $node->background_psql('postgres');
 
 	$first->query_safe('BEGIN');
-	is($first->query_safe("SELECT test_chunk_put(sha256('$data'), '$data')"),
+	is($first->query_safe("SELECT test_chunk_put(chunk_hash('$data'), '$data')"),
 		't', "first inserter inserts ($outcome)");
 	$second->query_safe('BEGIN');
-	is($second->query_safe("SELECT test_chunk_put(sha256('$data'), '$data')"),
+	is($second->query_safe("SELECT test_chunk_put(chunk_hash('$data'), '$data')"),
 		't', "second inserter stores its own copy without waiting ($outcome)");
 	$first->query_safe($outcome);
 	$second->query_safe('COMMIT');
 	$second->quit;
 	$first->quit;
 	is(rows($data), $outcome eq 'COMMIT' ? '2' : '1', "copies after $outcome");
-	is($node->safe_psql('postgres', "SELECT test_chunk_get(sha256('$data')) = '$data'"),
+	is($node->safe_psql('postgres', "SELECT test_chunk_get(chunk_hash('$data')) = '$data'"),
 		't', "chunk readable after $outcome");
-	is($node->safe_psql('postgres', "SELECT test_chunk_put(sha256('$data'), '$data')"),
+	is($node->safe_psql('postgres', "SELECT test_chunk_put(chunk_hash('$data'), '$data')"),
 		'f', "later put finds a committed copy after $outcome");
 }
 
@@ -67,20 +67,20 @@ is( $node->safe_psql(
 	'a transaction stores at most one copy of a chunk part');
 
 # Committed chunks survive a crash; an in-progress insert does not.
-$node->safe_psql('postgres', "SELECT test_chunk_put(sha256('durable'), 'durable')");
+$node->safe_psql('postgres', "SELECT test_chunk_put(chunk_hash('durable'), 'durable')");
 my $pending = $node->background_psql('postgres');
 $pending->query_safe('BEGIN');
-$pending->query_safe("SELECT test_chunk_put(sha256('pending'), 'pending')");
+$pending->query_safe("SELECT test_chunk_put(chunk_hash('pending'), 'pending')");
 $node->stop('immediate');
 $pending->quit;
 $node->start;
 is( $node->safe_psql(
-		'postgres', "SELECT test_chunk_get(sha256('durable')) = 'durable'"),
+		'postgres', "SELECT test_chunk_get(chunk_hash('durable')) = 'durable'"),
 	't',
 	'committed chunk recovered');
-is( $node->safe_psql('postgres', "SELECT test_chunk_exists(sha256('pending'))"),
+is( $node->safe_psql('postgres', "SELECT test_chunk_exists(chunk_hash('pending'))"),
 	'f', 'uncommitted chunk absent after recovery');
-is($node->safe_psql('postgres', "SELECT test_chunk_put(sha256('pending'), 'pending')"),
+is($node->safe_psql('postgres', "SELECT test_chunk_put(chunk_hash('pending'), 'pending')"),
 	't', 'uncommitted chunk can be inserted again');
 
 $node->stop;

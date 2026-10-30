@@ -166,7 +166,7 @@ routine_alter(ParseState *pstate, Node *statement)
 		catalog = table_open(ProcedureRelationId, AccessShareLock);
 		scan = systable_beginscan(catalog, InvalidOid, false, NULL, 0, NULL);
 		while (HeapTupleIsValid(tuple = systable_getnext(scan)))
-			if (((Form_pg_proc) GETSTRUCT(tuple))->oid >= FirstNormalObjectId && !routine_derived(tuple))
+			if (((Form_pg_proc) GETSTRUCT(tuple))->oid >= FirstNormalObjectId && ((Form_pg_proc) GETSTRUCT(tuple))->prokind != PROKIND_AGGREGATE && !routine_derived(tuple))
 				definitions = lappend(definitions, routine_encode(tuple, RelationGetDescr(catalog)));
 		systable_endscan(scan);
 		table_close(catalog, AccessShareLock);

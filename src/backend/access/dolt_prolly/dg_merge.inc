@@ -110,7 +110,7 @@ dolt_checkout(PG_FUNCTION_ARGS)
 			 */
 			if (n == 1 && !*name)
 				ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("error: cannot checkout empty string")));
-			if (n == 1 && (read_ref(psprintf("tags/%s", name)).target || (strlen(name) >= 8 && strspn(name, "0123456789abcdef") == strlen(name))))
+			if (n == 1 && (read_ref(psprintf("tags/%s", name)).target || commit_prefix(name) != NULL))
 				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("dolt does not support a detached head state. To create a branch at this tag, run: dolt checkout %s -b {new_branch_name}", name)));
 			checkout_tables(args, n);
 			values[0] = Int64GetDatum(0);
@@ -265,13 +265,13 @@ canonical_rows(const PLTree * logical, bool keyed)
 	for (i = 0; i < rows.count; i++)
 	{
 		PLHash		hash = dg_rowhash(rows.items[i].value);
-		uint8	   *key = palloc(32),
+		uint8	   *key = palloc(PL_HASH_SIZE),
 				   *value = palloc(8 + rows.items[i].value.len);
 
-		memcpy(key, hash.bytes, 32);
+		memcpy(key, hash.bytes, PL_HASH_SIZE);
 		pl_write64(value, 1);
 		memcpy(value + 8, rows.items[i].value.data, rows.items[i].value.len);
-		items[i].key = DG_SLICE(key, 32);
+		items[i].key = DG_SLICE(key, PL_HASH_SIZE);
 		items[i].value = DG_SLICE(value, 8 + rows.items[i].value.len);
 	}
 	qsort(items, rows.count, sizeof(*items), entry_compare);
@@ -289,7 +289,7 @@ json_bytes(StringInfo json, PLValue value)
 
 		SET_VARSIZE(b, VARHDRSZ + value.bytes.len);
 		memcpy(VARDATA(b), value.bytes.data, value.bytes.len);
-		escape_json(json, hex(b));
+		escape_json(json, TextDatumGetCString(DirectFunctionCall2(binary_encode, PointerGetDatum(b), CStringGetTextDatum("hex"))));
 	}
 }
 /* Whether conflicting rows are laid out in the merged definition, not their commits'. */
@@ -941,7 +941,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 		move_ref(branch_ref("staged"), read_ref(branch_ref("staged")), database);
 done:
 	nulls[0] = commit == NULL;
-	values[0] = commit ? CStringGetTextDatum(hex(commit)) : (Datum) 0;
+	values[0] = commit ? CStringGetTextDatum(hash_format(commit)) : (Datum) 0;
 	values[1] = Int64GetDatum(ff);
 	values[2] = Int64GetDatum(conflicted);
 	values[3] = CStringGetTextDatum(result_message);
@@ -1087,6 +1087,17 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 			if (schema_remaining.len)
 				appendStringInfoChar(&schema_remaining, ',');
 			appendStringInfoString(&schema_remaining, records[i]);
+		}
+		else if (theirs && json_value(records[i], "inheritance_group"))
+		{
+			JsonbValue document = json_document(records[i]), names;
+			List *group = NIL;
+			bytea *source = child((bytea *) DatumGetPointer(parents[1]), 1);
+
+			json_get(&document, "inheritance_group", &names);
+			for (int j = 0; j < json_length(&names); j++)
+				group = lappend(group, json_item_text(&names, j));
+			replace_working(dg_current_branch(), compose_database(capture(true).hash, source, group), group);
 		}
 		else if (theirs || !strcmp(json_value(records[i], "kind"), "sequence"))
 			restore_table(child((bytea *) DatumGetPointer(parents[theirs ? 1 : 0]), 1), name);

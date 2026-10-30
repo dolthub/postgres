@@ -47,15 +47,15 @@ unauthorized tables. The function is a diagnostic, not a branch/ref API.
 
 ### Canonical and runtime trees
 
-A table content tree maps a SHA-256 digest of canonical row bytes to an
-eight-byte occurrence count followed by the packed tuple. Internal routing keys
-therefore stay fixed at 32 bytes; tuple payloads stay in leaves. A digest
+A table content tree maps a digest of canonical row bytes, SHA-256 truncated to
+20 bytes as every content hash is, to an eight-byte occurrence count followed by
+the packed tuple. Internal routing keys therefore stay fixed at 20 bytes; tuple payloads stay in leaves. A digest
 collision between unequal rows is rejected. This multiset representation handles keyless duplicate rows and does not
 change when rows are inserted in a different order. Primary-key enforcement is
 performed by the unique ordered index, not by changing table content keys.
 
 A separate runtime tree maps monotonically allocated 64-bit occurrence handles
-to those 32-byte canonical row keys. Those handles are adapted into PostgreSQL ItemPointers;
+to those 20-byte canonical row keys. Those handles are adapted into PostgreSQL ItemPointers;
 they are not disk addresses. Updates allocate a new handle. The handle tree and
 allocator counter are explicitly outside the canonical table root. Heap-style
 XIDs, tuple padding and lock bits are not in canonical row encodings.
@@ -128,6 +128,28 @@ wraparound. VACUUM fails explicitly, rather than pretending to advance a safe
 freeze horizon. A production retention/freezing protocol is required before
 long-lived deployments. Prepared-transaction recovery has a basic integration
 test, not the complete phase 3 concurrency certification.
+
+### Shared node cache
+
+Every backend reads prolly nodes through one cache in main shared memory,
+`dolt_node_cache_size` (1GB by default; 0 disables it; changing it requires a
+restart), laid out like the buffer pool: slots with usage counts, a
+partitioned hash table from node hash to slot, and clock-sweep eviction. Node
+bytes live in a dynamic shared memory area created in place in that segment.
+A reader copies a node out under the shared partition lock; eviction takes the
+lock exclusively. A miss reads the chunk store and adds the node; a committing
+transaction adds the nodes it wrote.
+
+There is no per-session node cache. The working store holds the nodes a
+transaction reads and builds until it ends; it holds a transaction's unwritten
+nodes so that only the nodes reachable from the roots a transaction publishes
+reach the chunk store, never its intermediate trees. At transaction end it
+keeps only pinned unwritten nodes, such as the empty tree.
+
+Nodes read from the chunk store are this library's own encoding and are not
+checked again; nodes imported from elsewhere are checked in full. History
+imports leave subtrees the chunk store already holds to be read through the
+cache. `dolt_node_cache_stats()` reports the cache's use.
 
 ### Core interfaces
 

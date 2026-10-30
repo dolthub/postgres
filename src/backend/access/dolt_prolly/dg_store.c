@@ -33,6 +33,7 @@
 #include "dg.h"
 #include "nodes/tidbitmap.h"
 #include "access/doltchunk.h"
+#include "access/doltnode.h"
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/parallel.h"
@@ -273,12 +274,17 @@ roots_latest(const RootKey *key)
  */
 
 static PLStore *working_store;
+StaticAssertDecl(PL_HASH_SIZE == DOLT_CHUNK_HASH_SIZE, "prolly and chunk store hashes differ in size");
+
 static uint64 store_epoch = 1;	/* moves when the working store is recreated */
 
-/* Parsed nodes kept across transactions, at most. */
-#define DG_NODE_CACHE_BYTES ((size_t) 64 * 1024 * 1024)
 static DoltChunkStore *working_chunks;
 static DoltChunk working_fetched;
+
+/* Nodes this transaction wrote, to share once it commits. */
+static PLHash *written;
+static int	written_count;
+static int	written_capacity;
 
 /* Open the read handle under the top transaction, so subtransaction rollback
  * cannot close it underneath the working store. */
@@ -334,18 +340,67 @@ fetch_chunk(void *arg, PLHash hash, PLSlice *bytes)
 	return PL_OK;
 }
 
+static void register_callbacks(void);
+
+/* Read node |hash| through the shared node cache, adding it on a miss. */
+static PLStatus
+fetch_node(void *arg, PLHash hash, PLSlice *bytes)
+{
+	Size		length;
+	const uint8 *cached = dolt_node_cache_get(hash.bytes, &length);
+
+	if (cached)
+	{
+		bytes->data = cached;
+		bytes->len = length;
+		return PL_OK;
+	}
+	fetch_chunk(arg, hash, bytes);
+	dolt_node_cache_add(hash.bytes, bytes->data, bytes->len);
+	return PL_OK;
+}
+
 PLStore *
 dg_working_store(void)
 {
 	if (!working_store)
 	{
+		register_callbacks();
 		working_store = pl_store_create();
 		if (!working_store)
 			ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("out of memory creating prolly store")));
-		pl_store_set_fetch(working_store, fetch_chunk, NULL);
+		pl_store_set_fetch(working_store, fetch_node, NULL);
 		store_epoch++;
 	}
 	return working_store;
+}
+
+/* A store of the caller's own that reads nodes as the working store does. */
+PLStore *
+dg_private_store(void)
+{
+	PLStore    *store;
+
+	/* Transaction end closes the chunk store that misses read. */
+	register_callbacks();
+	store = pl_store_create();
+	if (!store)
+		ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("out of memory creating prolly store")));
+	pl_store_set_fetch(store, fetch_node, NULL);
+	return store;
+}
+
+/* Share the nodes this transaction wrote, now that it has committed. */
+static void
+share_written(void)
+{
+	for (int i = 0; working_store && i < written_count; i++)
+	{
+		PLNode	   *node = pl_find_local(working_store, written[i]);
+
+		if (node)
+			dolt_node_cache_add(node->hash.bytes, node->data, node->size);
+	}
 }
 
 static void
@@ -423,7 +478,7 @@ collect_unbacked(PLStore *store, PLHash root, Pending *pending)
 	{
 		PLHash		child;
 
-		memcpy(child.bytes, pl_node_value(node, i).data, PL_HASH_SIZE);
+		child = pl_child_hash(node, i);
 		collect_unbacked(store, child, pending);
 	}
 	if (node->backed)
@@ -462,6 +517,16 @@ persist_roots(const Roots *roots)
 		}
 		dolt_chunk_put_many(chunks, pending.count, hashes, data, lengths);
 		dolt_chunk_close(chunks);
+		if (written_count + pending.count > written_capacity)
+		{
+			int			capacity = Max(written_count + pending.count, written_capacity * 2);
+
+			written = written ? repalloc(written, capacity * sizeof(PLHash)) :
+				MemoryContextAlloc(TopTransactionContext, capacity * sizeof(PLHash));
+			written_capacity = capacity;
+		}
+		for (int i = 0; i < pending.count; i++)
+			written[written_count++] = pending.nodes[i]->hash;
 		pfree(hashes);
 		pfree(data);
 		pfree(lengths);
@@ -960,20 +1025,25 @@ store_xact(XactEvent event, void *arg)
 			live_states = NULL;
 			live_count = live_capacity = 0;
 			collect_threshold = DG_COLLECT_MINIMUM;
+
 			/*
-			 * Parsed nodes are content-addressed, so those the chunk store
-			 * holds stay valid for the next transaction: keep them, up to a
-			 * bound, and drop only this transaction's own unwritten nodes.
+			 * Nodes in the chunk store are read through the shared cache, so
+			 * the working store keeps none across transactions: those it
+			 * read are dropped, and those it wrote are shared once committed,
+			 * then dropped. Unwritten nodes are dropped too, unless pinned,
+			 * such as the empty tree and journal folds; they are written only
+			 * when a published root reaches them.
 			 */
+			if (event == XACT_EVENT_COMMIT)
+				share_written();
+			dolt_node_cache_report();
 			if (working_store)
 			{
 				pl_store_drop_unbacked(working_store);
-				if (pl_store_stats(working_store).bytes > DG_NODE_CACHE_BYTES)
-				{
-					pl_store_free(working_store);
-					working_store = NULL;
-				}
+				pl_store_drop_backed(working_store);
 			}
+			written = NULL;		/* in TopTransactionContext */
+			written_count = written_capacity = 0;
 			break;
 		default:
 			break;
@@ -1999,15 +2069,13 @@ dolt_prolly_root(PG_FUNCTION_ARGS)
 {
 	Relation	rel = relation_open(PG_GETARG_OID(0), AccessShareLock);
 	DGState    *s;
-	char		result[65];
-	int			i;
+	char		result[PL_HASH_TEXT_SIZE + 1];
 
 	if (rel->rd_tableam != dg_table_routine() &&
 		!(rel->rd_rel->relkind == RELKIND_INDEX && !strcmp(get_am_name(rel->rd_rel->relam), "dolt_prolly_index")))
 		dg_unsupported("root inspection of other AMs");
 	s = dg_load(rel, GetActiveSnapshot());
-	for (i = 0; i < 32; i++)
-		sprintf(result + i * 2, "%02x", s->content.root.bytes[i]);
+	pl_hash_format(s->content.root, result);
 	dg_release(s);
 	relation_close(rel, AccessShareLock);
 	PG_RETURN_TEXT_P(cstring_to_text(result));

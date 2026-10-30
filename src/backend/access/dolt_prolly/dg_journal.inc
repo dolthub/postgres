@@ -1130,7 +1130,7 @@ journal_fold_pin_tree(JournalFold *fold, PLStore *store, PLHash root)
 	{
 		PLHash		child;
 
-		memcpy(child.bytes, pl_node_value(node, i).data, PL_HASH_SIZE);
+		child = pl_child_hash(node, i);
 		journal_fold_pin_tree(fold, store, child);
 	}
 	pl_node_pin(store, node);

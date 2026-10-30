@@ -100,7 +100,7 @@ provider_current(DGProvider *entry, const char *branch)
  * physically, under their durable OIDs, and a revision's tables have none.
  */
 static const Oid provider_catalogs[] = {
-	NamespaceRelationId, SequenceRelationId, RelationRelationId, AttributeRelationId, ProcedureRelationId, LanguageRelationId,
+	NamespaceRelationId, AggregateRelationId, SequenceRelationId, RelationRelationId, AttributeRelationId, ProcedureRelationId, LanguageRelationId,
 	TypeRelationId, EnumRelationId, OperatorRelationId, RangeRelationId, DescriptionRelationId, DependRelationId, IndexRelationId, ConstraintRelationId, CastRelationId, StatisticExtRelationId, StatisticExtDataRelationId, PublicationRelRelationId, PublicationNamespaceRelationId, InheritsRelationId, RewriteRelationId, TriggerRelationId, PolicyRelationId, AttrDefaultRelationId, SharedDependRelationId, SecLabelRelationId, InitPrivsRelationId
 };
 
@@ -311,7 +311,7 @@ provider_shared_base(void)
 
 	if (!registered)
 	{
-		const int	caches[] = {RELOID, PROCOID, TYPEOID, NAMESPACEOID, OPEROID, CONSTROID};
+		const int	caches[] = {RELOID, PROCOID, TYPEOID, NAMESPACEOID, OPEROID, CONSTROID, AGGFNOID, CASTSOURCETARGET};
 
 		for (int i = 0; i < lengthof(caches); i++)
 			CacheRegisterSyscacheCallback(caches[i], provider_base_forget, (Datum) 0);
@@ -709,7 +709,14 @@ provider_decode_columns(const char *definition)
 			TupleDescAttr(desc, i)->attcollation = InvalidOid;
 		}
 		TupleDescAttr(desc, i)->attnotnull = notnull[i];
-		TupleDescAttr(desc, i)->attislocal = true;
+		{
+			JsonbValue column = json_element(&columns, i);
+			char *local = json_field_text(&column, "islocal");
+			char *inherited = json_field_text(&column, "inhcount");
+
+			TupleDescAttr(desc, i)->attislocal = !local || !strcmp(local, "true");
+			TupleDescAttr(desc, i)->attinhcount = inherited ? pg_strtoint32(inherited) : 0;
+		}
 		TupleDescAttr(desc, i)->atthasdef = hasdef[i];
 		if (generated[i])
 			TupleDescAttr(desc, i)->attgenerated = generated[i][0];
@@ -795,6 +802,10 @@ provider_routine_references(Node *node, ProviderRoutineReferences *context)
 	if (IsA(node, FuncExpr) && ((FuncExpr *) node)->funcid >= FirstDurableObjectId)
 		provider_dependency(context->rows, context->classid, context->objid, 0, ProcedureRelationId,
 							((FuncExpr *) node)->funcid, 0, DEPENDENCY_NORMAL);
+	if ((IsA(node, OpExpr) || IsA(node, DistinctExpr) || IsA(node, NullIfExpr)) && ((OpExpr *) node)->opno >= FirstDurableObjectId)
+		provider_dependency(context->rows, context->classid, context->objid, 0, OperatorRelationId, ((OpExpr *) node)->opno, 0, DEPENDENCY_NORMAL);
+	if (IsA(node, ScalarArrayOpExpr) && ((ScalarArrayOpExpr *) node)->opno >= FirstDurableObjectId)
+		provider_dependency(context->rows, context->classid, context->objid, 0, OperatorRelationId, ((ScalarArrayOpExpr *) node)->opno, 0, DEPENDENCY_NORMAL);
 	if (IsA(node, Const) && ((Const *) node)->consttype == REGCLASSOID && !((Const *) node)->constisnull &&
 		DatumGetObjectId(((Const *) node)->constvalue) >= FirstDurableObjectId)
 		provider_dependency(context->rows, context->classid, context->objid, 0, RelationRelationId,
@@ -1045,6 +1056,16 @@ provider_constraints(DGProviderRows *rows, CatalogView *view, const char *defini
 		form.convalidated = !constraint->skip_validation;
 		form.conislocal = true;
 		form.connoinherit = form.contype == CONSTRAINT_FOREIGN || constraint->is_no_inherit;
+		if (metadata[i])
+		{
+			char *local = json_value(metadata[i], "islocal");
+			char *inherited = json_value(metadata[i], "inhcount");
+			char *noinherit = json_value(metadata[i], "noinherit");
+
+			form.conislocal = !local || !strcmp(local, "true");
+			form.coninhcount = inherited ? pg_strtoint32(inherited) : 0;
+			if (noinherit) form.connoinherit = !strcmp(noinherit, "true");
+		}
 		form.confupdtype = ' ';
 		form.confdeltype = ' ';
 		form.confmatchtype = ' ';
@@ -1195,6 +1216,7 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 }
 
 #include "dg_routine_provider.inc"
+#include "dg_schema_object_provider.inc"
 #include "dg_type_provider.inc"
 #include "dg_view_provider.inc"
 #include "dg_trigger_provider.inc"
@@ -1221,9 +1243,9 @@ provider_role_dependency(DGProviderRows *rows, Oid catalog, Oid object,
 static void
 provider_role_dependencies(DGProviderRows *rows)
 {
-	const Oid	catalogs[] = {NamespaceRelationId, RelationRelationId, TypeRelationId, ProcedureRelationId};
-	const int	owners[] = {Anum_pg_namespace_nspowner, Anum_pg_class_relowner, Anum_pg_type_typowner, Anum_pg_proc_proowner};
-	const int	acls[] = {Anum_pg_namespace_nspacl, Anum_pg_class_relacl, Anum_pg_type_typacl, Anum_pg_proc_proacl};
+	const Oid	catalogs[] = {NamespaceRelationId, RelationRelationId, TypeRelationId, ProcedureRelationId, OperatorRelationId};
+	const int	owners[] = {Anum_pg_namespace_nspowner, Anum_pg_class_relowner, Anum_pg_type_typowner, Anum_pg_proc_proowner, Anum_pg_operator_oprowner};
+	const int	acls[] = {Anum_pg_namespace_nspacl, Anum_pg_class_relacl, Anum_pg_type_typacl, Anum_pg_proc_proacl, 0};
 
 	for (int i = 0; i < lengthof(catalogs); i++)
 	{
@@ -1243,6 +1265,7 @@ provider_role_dependencies(DGProviderRows *rows)
 				continue;		/* bootstrap objects are shared */
 			owner = DatumGetObjectId(heap_getattr(tuple, owners[i], desc, &isnull));
 			provider_role_dependency(rows, catalogs[i], object, owner, SHARED_DEPENDENCY_OWNER);
+			if (!acls[i]) continue;
 			acl = heap_getattr(tuple, acls[i], desc, &isnull);
 			if (!isnull)
 			{
@@ -1517,7 +1540,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	{
 		if (!strcmp(kinds[i], "namespace"))
 			definitions[i] = metadata(addresses[i], "namespace");
-		else if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index") || !strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger") || !strcmp(kinds[i], "type") || !strcmp(kinds[i], "view") || !strcmp(kinds[i], "sequence"))
+		else if (schema_object_class(kinds[i]) || !strcmp(kinds[i], "table") || !strcmp(kinds[i], "index") || !strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger") || !strcmp(kinds[i], "type") || !strcmp(kinds[i], "view") || !strcmp(kinds[i], "sequence"))
 		{
 			schemas[i] = child(addresses[i], 1);
 			definitions[i] = metadata(schemas[i], "schema");
@@ -1548,6 +1571,13 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			rows.rows[slot] = lappend(rows.rows[slot], tuple);
 			provider_description(&rows, form.oid, NamespaceRelationId, 0, json_value(definitions[i], "comment"));
 		}
+	for (i = 0; i < n; i++)
+	{
+		Oid catalog = schema_object_class(kinds[i]);
+
+		if (!strcmp(kinds[i], "routine")) catalog = ProcedureRelationId;
+		if (catalog) CatalogViewBindObject(view, catalog, json_value(definitions[i], "name"), InvalidOid);
+	}
 	provider_filter_server_objects(view);
 	/* Bind all class identities before resolving cross-object edges. */
 	for (i = 0; i < n; i++)
@@ -1618,6 +1648,17 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			form.relpersistence = RELPERSISTENCE_PERMANENT;
 			form.relnatts = desc->natts;
 			document = json_document(definition);
+			/* Derive this flag from the canonical child definitions. */
+			for (int c = 0; c < n; c++)
+				if (!strcmp(kinds[c], "table"))
+				{
+					JsonbValue childdef = json_document(definitions[c]), parents;
+
+					if (json_get(&childdef, "inherits", &parents))
+						for (int p = 0; p < json_length(&parents); p++)
+							if (!strcmp(json_item_text(&parents, p), name))
+								form.relhassubclass = true;
+				}
 			form.relchecks = 0;
 			if (json_get(&document, "constraints", &list))
 				for (j = 0; j < json_length(&list); j++)
@@ -1716,8 +1757,11 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 		if (!strcmp(kinds[i], "view"))
 			provider_view_member(&rows, view, definitions[i]);
 	for (i = 0; i < n; i++)
-		if (!strcmp(kinds[i], "routine"))
-			provider_routine(&rows, view, definitions[i]);
+		if (!strcmp(kinds[i], "routine") || !strcmp(kinds[i], "aggregate"))
+			provider_routine(&rows, view, !strcmp(kinds[i], "aggregate") ? json_value(definitions[i], "routine") : definitions[i]);
+	for (i = 0; i < n; i++)
+		if (schema_object_class(kinds[i]))
+			provider_schema_object(&rows, view, kinds[i], definitions[i]);
 
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "sequence"))
@@ -1726,12 +1770,34 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			CatalogViewObjectSetRetained(view, CatalogViewFindObject(view, RelationRelationId, json_value(definitions[i], "name")), schemas[i], NULL);
 		}
 
+	for (i = 0; i < n; i++)
+		if (!strcmp(kinds[i], "table"))
+		{
+			JsonbValue document = json_document(definitions[i]), parents;
+			Oid childid = CatalogViewLookupObject(view, RelationRelationId, json_value(definitions[i], "name"));
+
+			if (json_get(&document, "inherits", &parents))
+				for (int p = 0; p < json_length(&parents); p++)
+				{
+					FormData_pg_inherits form = {0};
+
+					form.inhrelid = childid;
+					form.inhparent = CatalogViewLookupObject(view, RelationRelationId, json_item_text(&parents, p));
+					form.inhseqno = p + 1;
+					provider_add(&rows, InheritsRelationId, &form, sizeof(form), Natts_pg_inherits);
+					provider_dependency(&rows, RelationRelationId, childid, 0, RelationRelationId, form.inhparent, 0, DEPENDENCY_NORMAL);
+				}
+		}
+
 	/*
 	 * Table expressions may call versioned routines, which they name; the
 	 * routines and their schemas are visible while those are bound.
 	 */
 	CatalogViewAddRows(view, NamespaceRelationId, rows.rows[provider_catalog_index(NamespaceRelationId)]);
 	CatalogViewAddRows(view, ProcedureRelationId, rows.rows[provider_catalog_index(ProcedureRelationId)]);
+	CatalogViewAddRows(view, AggregateRelationId, rows.rows[provider_catalog_index(AggregateRelationId)]);
+	CatalogViewAddRows(view, OperatorRelationId, rows.rows[provider_catalog_index(OperatorRelationId)]);
+	CatalogViewAddRows(view, CastRelationId, rows.rows[provider_catalog_index(CastRelationId)]);
 	CatalogViewAddRows(view, EnumRelationId, rows.rows[provider_catalog_index(EnumRelationId)]);
 	CatalogViewAddRows(view, TypeRelationId, rows.rows[provider_catalog_index(TypeRelationId)]);
 	/* Whole-row expressions also need the relation's row type and attributes. */
@@ -1809,7 +1875,7 @@ provider_reload(CatalogView *view, void *arg)
 			pushed = true;
 		}
 		nest = begin_api();
-		database = unhex(entry->database);
+		database = hash_parse(entry->database);
 		if (!object_read(database, "database", NULL, NULL, NULL))
 			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("revision does not name a visible database object")));
 		/* The view keeps its durable OIDs, and so the bindings recorded. */
@@ -1849,7 +1915,7 @@ provider_creator(bytea *database)
 static CatalogView *
 provider_lookup(const char *branch, bytea *database)
 {
-	char	   *key = hex(database);
+	char	   *key = hash_format(database);
 	DGProvider *entry;
 	DGProvider *saved_entry;
 	CatalogView *view;
@@ -2047,7 +2113,7 @@ dg_catalog_view(const char *database, const char *branch)
 	PG_TRY();
 	{
 		nest = begin_api();
-		result = provider_lookup(branch, unhex(database));
+		result = provider_lookup(branch, hash_parse(database));
 		end_api(nest);
 	}
 	PG_FINALLY();

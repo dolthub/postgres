@@ -26,12 +26,7 @@ CREATE FUNCTION test_chunk_max_size() RETURNS int4
 	AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION test_chunk_store_stats(OUT chunks float8, OUT bytes int8)
 	AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
-CREATE FUNCTION test_chunk_cache_stats(OUT hits int8, OUT misses int8, OUT evictions int8,
-									   OUT entries int8, OUT bytes int8, OUT pinned int8)
-	AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
-CREATE FUNCTION test_chunk_cache_reset() RETURNS void
-	AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
-CREATE FUNCTION test_chunk_pin_survives_eviction(hash bytea, count int4) RETURNS bool
+CREATE FUNCTION test_chunk_pin_survives_puts(hash bytea, count int4) RETURNS bool
 	AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- Benchmarks over synthetic chunks: chunk i of a seed has a pseudo-random
@@ -44,3 +39,7 @@ CREATE FUNCTION test_chunk_bench_get(seed int4, nchunks int8, count int8, rngsee
 	AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION test_chunk_bench_get_spi(seed int4, nchunks int8, count int8, rngseed int4) RETURNS float8
 	AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- A chunk's hash: SHA-256 truncated to the store's hash size.
+CREATE FUNCTION chunk_hash(data bytea) RETURNS bytea
+LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT substr(sha256(data), 1, 20) $$;

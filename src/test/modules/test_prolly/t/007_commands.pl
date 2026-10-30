@@ -12,10 +12,26 @@ sub fails {
  my($q,$pat,$label)=@_;my($status,$out,$err)=$node->psql('postgres',$q);
  isnt($status,0,$label);like($err,$pat,"$label diagnostic");
 }
+is(sql(q{SELECT dolt_hash_encode(decode('000102030405060708090a0b0c0d0e0f10111213','hex'))}),
+ '000g40o40k30e209185go38e1s8124gj','Dolt base-32 known vector');
+is(sql(q{SELECT encode(dolt_hash_decode('000g40o40k30e209185go38e1s8124gj'),'hex')}),
+ '000102030405060708090a0b0c0d0e0f10111213','Dolt base-32 inverse');
+for my $bad ('0' x 31, '0' x 33, 'w' x 32, 'V' x 32, '0' x 40) {
+ fails("SELECT dolt_hash_decode('$bad')",qr/invalid commit hash/,'reject noncanonical hash');
+}
+fails(q{SELECT dolt_hash_encode('short'::bytea)},qr/invalid content hash length/,'reject wrong binary length');
 is(sql('SELECT message FROM dolt_log()'),'Initialize data repository','repository initialized with the database');
 sql(q{CREATE SCHEMA empty_space; CREATE TABLE t(id int PRIMARY KEY,v text COLLATE "C") USING dolt_prolly_table; INSERT INTO t VALUES(1,'one')});
 my $first=sql(q{SELECT dolt_commit('-Am','first','--author','Test Author <author@example.com>','--date','2020-01-02 03:04:05+00')});
-like($first,qr/^[0-9a-f]{64}$/,'commit returns native SHA256 hash');
+like($first,qr/^[0-9a-v]{32}$/,'commit returns a native 20-byte hash');
+is(sql("SELECT dolt_hashof('$first')"),$first,'full base-32 revision resolves');
+my $prefix=substr($first,0,8);
+is(sql("SELECT dolt_hashof('$prefix')"),$first,'base-32 prefix resolves');
+fails("SELECT dolt_checkout('$prefix')",qr/detached head/,'retained prefix is a revision');
+fails(q{SELECT dolt_checkout('original')},qr/tablespec 'original'/,'base-32 alphabet alone does not make a revision');
+is(sql("SELECT commit_hash FROM dolt_commits WHERE commit_hash='$first'"),$first,'system table uses canonical hash');
+is(sql("SELECT dolt_hash_encode(objhash) FROM pg_dolt_object WHERE objhash=dolt_hash_decode('$first')"),$first,'raw address matches public hash');
+
 is(sql('SELECT count(*) FROM dolt_log()'),'2','repository initialization and first user commit');
 is(sql("SELECT message,author,author_email,author_date FROM dolt_log('$first') LIMIT 1"),'first|Test Author|author@example.com|2020-01-02 03:04:05','log metadata matches commit arguments');
 is(sql(q{SELECT message FROM dolt_log('HEAD~1')}),'Initialize data repository','repository ancestor');
@@ -38,7 +54,7 @@ is(sql(q{SELECT * FROM dolt_diff_summary('HEAD','STAGED')}),'','staging not auto
 is(sql(q{SELECT status FROM dolt_add('.')}),'0','add stages all');
 sql(q{UPDATE t SET v='three' WHERE id=1});
 my $second=sql(q{SELECT hash FROM dolt_commit('-m','staged version')});
-like($second,qr/^[0-9a-f]{64}$/,'commit named hash column');
+like($second,qr/^[0-9a-v]{32}$/,'commit named hash column');
 is(sql(q{SELECT * FROM dolt_diff_summary('HEAD','WORKING','t')}),'public.t|public.t|modified|t|f','unstaged later change survives commit');
 is(sql("SELECT * FROM dolt_diff_summary('$first','$second','public.t')"),'public.t|public.t|modified|t|f','historical diff');
 my $third=sql(q{SELECT dolt_commit('-A','-m','all current')});
@@ -49,7 +65,7 @@ my $empty=sql(q{SELECT dolt_commit('--allow-empty','-m','empty allowed')});
 isnt($empty,$third,'allow empty creates history node');
 is(sql(q{SELECT count(*) FROM dolt_diff_summary('HEAD~1','HEAD')}),'0','empty commit has identical state');
 fails(q{BEGIN; SELECT dolt_commit('-Am','invalid'); COMMIT},qr/transaction block/,'commit rejects explicit transaction');
-is(sql(q{SELECT length(upper(dolt_commit('--allow-empty','-m','wrapped')))}),'64','scalar-wrapped command accepted');
+is(sql(q{SELECT length(upper(dolt_commit('--allow-empty','-m','wrapped')))}),'32','scalar-wrapped command accepted');
 fails(q{SELECT dolt_commit('-Am','invalid') WHERE (SELECT true)},qr/standalone SELECT/,'subquery-wrapped command rejected');
 fails(q{SELECT dolt_commit('-Am','invalid') FROM t},qr/standalone SELECT/,'per-row invocation rejected');
 fails(q{SELECT dolt_commit('--amend','-m','invalid')},qr/unsupported/,'unsupported flag explicit');
@@ -110,13 +126,13 @@ $node->stop('immediate');$node->start;
 is(sql(q{SELECT commit_hash FROM dolt_log('-n','1')}),$dropped,'committed HEAD recovers');
 is(sql("SELECT * FROM dolt_diff_summary('$first','$dropped')"),'public.t||dropped|t|t','history diff survives source drop and restart');
 # Reconstructing identical definitions/data yields identical database state.
-my $first_state=sql("SELECT encode(objchildren[1],'hex') FROM pg_dolt_object WHERE objhash=decode('$first','hex')");
+my $first_state=sql("SELECT encode(objchildren[1],'hex') FROM pg_dolt_object WHERE objhash=dolt_hash_decode('$first')");
 sql(q{CREATE TABLE t(id int PRIMARY KEY,v text COLLATE "C") USING dolt_prolly_table; INSERT INTO t VALUES(1,'one')});
 my $restored=sql(q{SELECT dolt_commit('-Am','restored same contents')});
-is(sql("SELECT encode(objchildren[1],'hex') FROM pg_dolt_object WHERE objhash=decode('$restored','hex')"),$first_state,'database root independent of relation OIDs and prior history');
+is(sql("SELECT encode(objchildren[1],'hex') FROM pg_dolt_object WHERE objhash=dolt_hash_decode('$restored')"),$first_state,'database root independent of relation OIDs and prior history');
 sql('CREATE SCHEMA another_empty');
 my $with_namespace=sql(q{SELECT dolt_commit('-Am','empty namespace')});
-isnt(sql("SELECT encode(objchildren[1],'hex') FROM pg_dolt_object WHERE objhash=decode('$with_namespace','hex')"),$first_state,'empty namespace participates in database hash');
+isnt(sql("SELECT encode(objchildren[1],'hex') FROM pg_dolt_object WHERE objhash=dolt_hash_decode('$with_namespace')"),$first_state,'empty namespace participates in database hash');
 is(sql(q{SELECT count(*) FROM dolt_diff_summary('HEAD~1','HEAD')}),'0','table diff summary does not invent rows for namespace changes');
 sql(q{COMMENT ON TABLE t IS 'description'});
 is(sql(q{SELECT data_change,schema_change FROM dolt_diff_summary('HEAD','WORKING','t')}),'f|t','table comment captured as schema metadata');

@@ -75,7 +75,7 @@ diff_expand(DiffStack *stack)
 		if (node->level)
 		{
 			item.level = node->level - 1;
-			memcpy(item.hash.bytes, pl_node_value(node, i).data, PL_HASH_SIZE);
+			item.hash = pl_child_hash(node, i);
 		}
 		else
 		{

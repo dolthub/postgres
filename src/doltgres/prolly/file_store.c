@@ -72,6 +72,7 @@ pl_file_append(PLStore *store, PLHash hash, PLSlice bytes)
 		if (status != PL_OK)
 			return status;
 	}
+	memset(header, 0, sizeof(header));
 	memcpy(header, record_magic, 8);
 	pl_write64(header + 8, bytes.len);
 	memcpy(header + 16, hash.bytes, PL_HASH_SIZE);

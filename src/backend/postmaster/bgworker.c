@@ -13,6 +13,7 @@
 #include "postgres.h"
 
 #include "access/parallel.h"
+#include "access/dolttransport.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -118,6 +119,9 @@ static const struct
 }			InternalBGWorkers[] =
 
 {
+	{
+		"DoltBundleWorkerMain", DoltBundleWorkerMain
+	},
 	{
 		"ParallelWorkerMain", ParallelWorkerMain
 	},

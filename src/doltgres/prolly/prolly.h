@@ -6,7 +6,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define PL_HASH_SIZE 32
+/*
+ * Every content hash: SHA-256 truncated to this many bytes, as Dolt's
+ * addresses are. Nodes, rows and version objects are all addressed by it.
+ */
+#define PL_NODE_FORMAT "DGPTR001"
+#define PL_HASH_SIZE 20
+#define PL_HASH_TEXT_SIZE 32
+#define PL_SHA256_SIZE 32
 #define PL_MAX_ITEM (16U * 1024U * 1024U)
 
 typedef enum PLStatus
@@ -30,6 +37,9 @@ typedef struct PLHash
 {
 	uint8_t		bytes[PL_HASH_SIZE];
 } PLHash;
+
+void pl_hash_format(PLHash hash, char out[PL_HASH_TEXT_SIZE + 1]);
+bool pl_hash_parse(const char *text, PLHash *out);
 
 typedef struct PLStore PLStore;
 typedef struct PLTree
@@ -75,7 +85,8 @@ typedef PLStatus (*PLBeforeWriteFn) (void *arg, PLHash hash, PLSlice bytes);
 
 /* Called when a node is missing from a store, to load it from a backing store.
  * On PL_OK, *bytes must hold the node's encoding until the callback's next call;
- * the store copies them. Return PL_NOT_FOUND if the backing store lacks it.
+ * the store copies them, trusting the encoding as its own: only imports are
+ * checked. Return PL_NOT_FOUND if the backing store lacks it.
  */
 typedef PLStatus (*PLFetchFn) (void *arg, PLHash hash, PLSlice *bytes);
 
@@ -94,6 +105,9 @@ void		pl_store_free(PLStore *store);
 /* Load missing nodes on demand. Fetched nodes are marked as backed. */
 void		pl_store_set_fetch(PLStore *store, PLFetchFn fetch, void *arg);
 size_t		pl_store_drop_unbacked(PLStore *store);
+
+/* Free the nodes known to be in the backing store, which finds fetch again. */
+size_t		pl_store_drop_backed(PLStore *store);
 PLStats		pl_store_stats(const PLStore *store);
 
 /*
@@ -110,6 +124,12 @@ PLStatus	pl_store_export(PLStore *store, PLHash hash, PLSlice *bytes);
 /* Import checks hash and local encoding. pl_open also validates the whole DAG. */
 PLStatus	pl_store_import(PLStore *store, PLHash hash, PLSlice bytes);
 PLStatus	pl_open(PLStore *store, PLHash root, PLTree *out);
+
+/*
+ * As pl_open, for a tree imported in part over a backing store: the subtree
+ * of a node the backing store holds is trusted once it fits its parent.
+ */
+PLStatus	pl_open_imported(PLStore *store, PLHash root, PLTree *out);
 PLStatus	pl_validate(const PLTree *tree);
 
 /* Bulk input and edits must be strictly ordered by unsigned byte comparison. */

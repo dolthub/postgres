@@ -124,7 +124,7 @@ dolt_stats_info(PG_FUNCTION_ARGS)
 	return stats_message(info);
 }
 
-/* ---- backups: definitions only ---- */
+/* ---- native file backups ---- */
 
 Datum
 dolt_backup(PG_FUNCTION_ARGS)
@@ -134,7 +134,7 @@ dolt_backup(PG_FUNCTION_ARGS)
 	char	  **args = arguments(fcinfo, &n);
 
 	if (n == 0)
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("dolt_backup requires a subcommand: add, remove, sync, sync-url or restore")));
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("use 'dolt_backups' table to list backups")));
 	nest = begin_api();
 	if (!strcmp(args[0], "add"))
 	{
@@ -143,7 +143,7 @@ dolt_backup(PG_FUNCTION_ARGS)
 		valid_name(args[1]);
 		run("SELECT 1 FROM pg_catalog.pg_dolt_backup WHERE backupname=$1", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(args[1])), NULL, true);
 		if (SPI_processed)
-			ereport(ERROR, (errcode(ERRCODE_DUPLICATE_OBJECT), errmsg("backup already exists: %s", args[1])));
+			ereport(ERROR, (errcode(ERRCODE_DUPLICATE_OBJECT), errmsg("backup '%s' already exists", args[1])));
 		run("INSERT INTO pg_catalog.pg_dolt_backup(backupname,backupurl) VALUES ($1,$2)", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(args[1]), CStringGetTextDatum(args[2])), NULL, false);
 	}
 	else if (!strcmp(args[0], "remove") || !strcmp(args[0], "rm"))
@@ -152,14 +152,44 @@ dolt_backup(PG_FUNCTION_ARGS)
 			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("dolt_backup remove requires a name")));
 		run("DELETE FROM pg_catalog.pg_dolt_backup WHERE backupname=$1", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(args[1])), NULL, false);
 		if (!SPI_processed)
-			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("backup not found: %s", args[1])));
+			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("backup '%s' not found", args[1])));
 	}
-	else if (!strcmp(args[0], "sync") || !strcmp(args[0], "sync-url") || !strcmp(args[0], "restore"))
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("dolt_backup %s is not supported: the server has no remote transport for manifest objects", args[0]), errhint("Use pg_basebackup or pg_dump for backups of this server.")));
+	else if (!strcmp(args[0], "sync") || !strcmp(args[0], "sync-url"))
+	{
+		char *url;
+
+		standalone(fcinfo, true);
+		if (n != 2)
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("dolt_backup sync requires a name or URL")));
+		url = args[1];
+		if (!strcmp(args[0], "sync"))
+		{
+			run("SELECT backupurl FROM pg_dolt_backup WHERE backupname=$1", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(args[1])), NULL, true);
+			if (!SPI_processed)
+				ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("backup '%s' not found", args[1])));
+			url = strcell(0, 1);
+		}
+		bundle_write(url);
+	}
+	else if (!strcmp(args[0], "restore"))
+	{
+		bool force = n > 1 && !strcmp(args[1], "--force");
+
+		standalone(fcinfo, true);
+		if (n != (force ? 4 : 3))
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("dolt_backup restore requires a URL and database name")));
+		bundle_restore(args[force ? 2 : 1], args[force ? 3 : 2], force);
+	}
 	else
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("unknown backup subcommand: %s", args[0])));
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("unrecognized dolt_backup parameter '%s'", args[0])));
 	end_api(nest);
 	PG_RETURN_INT64(0);
+}
+
+Datum
+dolt_backup_noargs(PG_FUNCTION_ARGS)
+{
+	return dolt_backup(fcinfo);
 }
 
 /* ---- remotes and clusters: no transport ---- */

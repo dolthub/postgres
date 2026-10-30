@@ -38,6 +38,7 @@
 #include "access/xlog_internal.h"
 #include "access/xlogprefetcher.h"
 #include "access/doltchunk.h"
+#include "access/doltnode.h"
 #include "access/doltschema.h"
 #include "access/doltsystem.h"
 #include "access/xlogrecovery.h"
@@ -3658,13 +3659,13 @@ struct config_int ConfigureNamesInt[] =
 	},
 
 	{
-		{"dolt_chunk_cache_size", PGC_USERSET, RESOURCES_MEM,
-			gettext_noop("Sets the memory for prolly chunks cached per session."),
-			gettext_noop("Least recently used chunks are evicted above this size; 0 disables caching."),
+		{"dolt_node_cache_size", PGC_POSTMASTER, RESOURCES_MEM,
+			gettext_noop("Sets the shared memory for prolly nodes cached for all sessions."),
+			gettext_noop("Nodes are evicted by clock sweep; 0 disables sharing."),
 			GUC_UNIT_KB
 		},
-		&dolt_chunk_cache_size,
-		256 * 1024, 0, MAX_KILOBYTES, NULL, NULL, NULL
+		&dolt_node_cache_size,
+		1024 * 1024, 0, MAX_KILOBYTES, NULL, NULL, NULL
 	},
 
 	{

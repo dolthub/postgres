@@ -106,8 +106,11 @@ key_region         concatenated key bytes
 value_region       concatenated values
 ```
 
-An internal value is `child_hash[32] || subtree_entry_count[8]`. SHA-256 covers
-the entire node encoding, including the format magic. Offset zero, monotonic
+An internal value is the child's hash followed by its subtree entry count: eight
+bytes, or a varint with compact bookkeeping, which also narrows the offsets to
+two bytes in nodes whose key and value regions each fit in 64 kB. A hash is the
+SHA-256 of the entire node encoding, including the format magic, truncated to
+`PL_HASH_SIZE` bytes (20, as Dolt's addresses are). Offset zero, monotonic
 bounds, exact lengths, ordered keys, child count overflow, depth and child
 address lengths are validated. Opening an imported root also validates its DAG.
 The validator checks structural integrity, not whether a foreign producer used
@@ -222,8 +225,8 @@ Each append has this endian-independent framing:
 ```
 magic "DGCHNK01"       8 bytes
 payload length        uint64 big-endian
-chunk SHA-256         32 bytes (hash of canonical node payload)
-header SHA-256        32 bytes (hash of preceding 48 header bytes)
+chunk hash            32 bytes (hash of canonical node payload, zero padded)
+header hash           32 bytes (hash of preceding 48 header bytes, zero padded)
 payload               canonical DGPTR001 node bytes
 ```
 

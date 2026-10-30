@@ -9,7 +9,7 @@
 #include <limits.h>
 #include <unistd.h>
 
-static const uint8_t node_magic[8] = {'D', 'G', 'P', 'T', 'R', '0', '0', '1'};
+static const uint8_t node_magic[8] = PL_NODE_FORMAT;
 
 uint32_t
 pl_read32(const uint8_t *p)
@@ -43,6 +43,7 @@ pl_write64(uint8_t *p, uint64_t v)
 bool
 pl_hash_bytes(PLSlice bytes, PLHash *out)
 {
+	uint8_t		digest[PL_SHA256_SIZE];
 #ifdef PL_POSTGRES
 	pg_cryptohash_ctx *ctx = pg_cryptohash_create(PG_SHA256);
 	bool		ok;
@@ -51,15 +52,69 @@ pl_hash_bytes(PLSlice bytes, PLHash *out)
 		return false;
 	ok = pg_cryptohash_init(ctx) == 0 &&
 		pg_cryptohash_update(ctx, bytes.data, bytes.len) == 0 &&
-		pg_cryptohash_final(ctx, out->bytes, PL_HASH_SIZE) == 0;
+		pg_cryptohash_final(ctx, digest, sizeof(digest)) == 0;
 	pg_cryptohash_free(ctx);
-	return ok;
+	if (!ok)
+		return false;
 #else
 	unsigned int length = 0;
 
-	return EVP_Digest(bytes.data, bytes.len, out->bytes, &length,
-					  EVP_sha256(), NULL) == 1 && length == PL_HASH_SIZE;
+	if (EVP_Digest(bytes.data, bytes.len, digest, &length, EVP_sha256(), NULL) != 1 ||
+		length != PL_SHA256_SIZE)
+		return false;
 #endif
+	memcpy(out->bytes, digest, PL_HASH_SIZE);
+	return true;
+}
+
+/* Dolt's big-endian, unpadded base-32 alphabet; 20 bytes = 32 digits. */
+void
+pl_hash_format(PLHash hash, char out[PL_HASH_TEXT_SIZE + 1])
+{
+	static const char alphabet[] = "0123456789abcdefghijklmnopqrstuv";
+	int			i;
+
+	for (i = 0; i < PL_HASH_TEXT_SIZE; i++)
+	{
+		int			bit = i * 5;
+		int			byte = bit / 8;
+		unsigned int pair = (unsigned int) hash.bytes[byte] << 8;
+
+		if (byte + 1 < PL_HASH_SIZE)
+			pair |= hash.bytes[byte + 1];
+		out[i] = alphabet[(pair >> (11 - bit % 8)) & 31];
+	}
+	out[PL_HASH_TEXT_SIZE] = '\0';
+}
+
+bool
+pl_hash_parse(const char *text, PLHash *out)
+{
+	PLHash		result = {{0}};
+	int			i;
+
+	if (strlen(text) != PL_HASH_TEXT_SIZE)
+		return false;
+	for (i = 0; i < PL_HASH_TEXT_SIZE; i++)
+	{
+		unsigned char c = (unsigned char) text[i];
+		unsigned int value;
+		int			bit = i * 5;
+		int			byte = bit / 8;
+
+		if (c >= '0' && c <= '9')
+			value = c - '0';
+		else if (c >= 'a' && c <= 'v')
+			value = c - 'a' + 10;
+		else
+			return false;
+		value <<= 11 - bit % 8;
+		result.bytes[byte] |= value >> 8;
+		if (byte + 1 < PL_HASH_SIZE)
+			result.bytes[byte + 1] |= value & 255;
+	}
+	*out = result;
+	return true;
 }
 
 int
@@ -166,6 +221,82 @@ pl_store_drop_unbacked(PLStore *store)
 	return freed;
 }
 
+/* Rehash |store| into |capacity| buckets. */
+static PLStatus
+store_resize(PLStore *store, size_t capacity)
+{
+	PLNode	  **buckets = calloc(capacity, sizeof(*buckets));
+
+	if (!buckets)
+		return PL_NOMEM;
+	for (size_t i = 0; i < store->capacity; i++)
+	{
+		PLNode	   *current = store->buckets[i];
+
+		while (current)
+		{
+			PLNode	   *next = current->next;
+			size_t		bucket = pl_read64(current->hash.bytes) % capacity;
+
+			current->next = buckets[bucket];
+			buckets[bucket] = current;
+			current = next;
+		}
+	}
+	free(store->buckets);
+	store->buckets = buckets;
+	store->capacity = capacity;
+	return PL_OK;
+}
+
+size_t
+pl_store_drop_backed(PLStore *store)
+{
+	size_t		freed = 0,
+				kept = 0,
+				capacity;
+
+	if (!store)
+		return 0;
+
+	/* Nodes written since they were listed as unbacked are about to be freed: forget them. */
+	for (size_t i = 0; i < store->unbacked_count; i++)
+		if (!store->unbacked[i]->backed)
+		{
+			store->unbacked[i]->unbacked_slot = kept;
+			store->unbacked[kept++] = store->unbacked[i];
+		}
+	store->unbacked_count = kept;
+	for (size_t i = 0; i < store->capacity; i++)
+	{
+		PLNode	  **link = &store->buckets[i];
+
+		while (*link)
+		{
+			PLNode	   *node = *link;
+
+			if (!node->backed)
+			{
+				link = &node->next;
+				continue;
+			}
+			*link = node->next;
+			store->stats.chunks--;
+			store->stats.bytes -= node->size;
+			free(node->data);
+			free(node);
+			freed++;
+		}
+	}
+
+	/* Shrink, so that later drops walk few buckets. */
+	for (capacity = store->capacity; capacity > 256 && store->stats.chunks < capacity / 8; capacity /= 2)
+		;
+	if (capacity < store->capacity)
+		store_resize(store, capacity);
+	return freed;
+}
+
 PLStats
 pl_store_stats(const PLStore *store)
 {
@@ -184,7 +315,7 @@ mark_reachable(PLStore *store, PLHash hash)
 	{
 		PLHash		child;
 
-		memcpy(child.bytes, pl_node_value(node, i).data, PL_HASH_SIZE);
+		child = pl_child_hash(node, i);
 		mark_reachable(store, child);
 	}
 }
@@ -317,7 +448,8 @@ pl_find_local(PLStore *store, PLHash hash)
 	return NULL;
 }
 
-static PLStatus store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, bool backed, PLNode **out);
+static PLStatus store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, bool backed,
+							 bool trusted, PLNode **out);
 
 PLNode *
 pl_find(PLStore *store, PLHash hash)
@@ -328,7 +460,7 @@ pl_find(PLStore *store, PLHash hash)
 	if (node || !store || !store->fetch)
 		return node;
 	if (store->fetch(store->fetch_arg, hash, &bytes) != PL_OK ||
-		store_buffer(store, hash, bytes.data, bytes.len, true, &node) != PL_OK)
+		store_buffer(store, hash, bytes.data, bytes.len, true, true, &node) != PL_OK)
 		return NULL;
 	store->stats.fetched++;
 	return node;
@@ -341,13 +473,45 @@ pl_store_set_fetch(PLStore *store, PLFetchFn fetch, void *arg)
 	store->fetch_arg = arg;
 }
 
+/* The width of a directory offset for keys and values of these sizes. */
+static size_t
+offset_width(uint64_t key_bytes, uint64_t value_bytes)
+{
+	return key_bytes <= PL_NARROW_LIMIT && value_bytes <= PL_NARROW_LIMIT ? 2 : 4;
+}
+
+static uint32_t
+read_offset(const uint8_t *p, size_t width)
+{
+	return width == 2 ? ((uint32_t) p[0] << 8) | p[1] : pl_read32(p);
+}
+
+static void
+write_offset(uint8_t *p, size_t width, uint32_t v)
+{
+	if (width == 2)
+	{
+		p[0] = (uint8_t) (v >> 8);
+		p[1] = (uint8_t) v;
+	}
+	else
+		pl_write32(p, v);
+}
+
+static size_t
+directory_size(uint32_t count, size_t width)
+{
+	return 2 * width * ((size_t) count + 1);
+}
+
 PLSlice
 pl_node_key(const PLNode *node, uint32_t index)
 {
+	size_t		width = node->offset_width;
 	const uint8_t *offsets = node->data + PL_HEADER;
-	uint32_t	start = pl_read32(offsets + 4 * index);
-	PLSlice		result = {node->data + PL_HEADER + 8 * (node->count + 1) + start,
-	pl_read32(offsets + 4 * (index + 1)) - start};
+	uint32_t	start = read_offset(offsets + width * index, width);
+	PLSlice		result = {node->data + PL_HEADER + directory_size(node->count, width) + start,
+	read_offset(offsets + width * (index + 1), width) - start};
 
 	return result;
 }
@@ -355,12 +519,93 @@ pl_node_key(const PLNode *node, uint32_t index)
 PLSlice
 pl_node_value(const PLNode *node, uint32_t index)
 {
-	const uint8_t *offsets = node->data + PL_HEADER + 4 * (node->count + 1);
-	uint32_t	start = pl_read32(offsets + 4 * index);
-	PLSlice		result = {node->data + PL_HEADER + 8 * (node->count + 1) +
-	node->key_bytes + start, pl_read32(offsets + 4 * (index + 1)) - start};
+	size_t		width = node->offset_width;
+	const uint8_t *offsets = node->data + PL_HEADER + width * (node->count + 1);
+	uint32_t	start = read_offset(offsets + width * index, width);
+	PLSlice		result = {node->data + PL_HEADER + directory_size(node->count, width) +
+	node->key_bytes + start, read_offset(offsets + width * (index + 1), width) - start};
 
 	return result;
+}
+
+/* The address of node bytes: their hash, like any other content's. */
+bool
+pl_node_address(PLSlice bytes, PLHash *out)
+{
+	return pl_hash_bytes(bytes, out);
+}
+
+size_t
+pl_child_encode(uint8_t *out, PLHash hash, uint64_t rows)
+{
+	size_t		n = PL_HASH_SIZE;
+
+	memcpy(out, hash.bytes, PL_HASH_SIZE);
+	do
+	{
+		uint8_t		byte = rows & 0x7F;
+
+		rows >>= 7;
+		out[n++] = byte | (rows ? 0x80 : 0);
+	} while (rows);
+	return n;
+}
+
+bool
+pl_child_decode(PLSlice value, PLHash *hash, uint64_t *rows)
+{
+	uint64_t	count = 0;
+	size_t		n = PL_HASH_SIZE;
+	int			shift = 0;
+
+	if (value.len <= PL_HASH_SIZE || value.len > PL_CHILD_MAX)
+		return false;
+	if (hash)
+		memcpy(hash->bytes, value.data, PL_HASH_SIZE);
+	for (;;)
+	{
+		uint8_t		byte = value.data[n++];
+
+		count |= (uint64_t) (byte & 0x7F) << shift;
+		if (!(byte & 0x80))
+			break;
+		shift += 7;
+		if (n == value.len || shift > 63)
+			return false;
+	}
+	if (n != value.len)
+		return false;
+	if (rows)
+		*rows = count;
+	return true;
+}
+
+/*
+ * A child's address and row count, read without checks: a node's child
+ * references were validated by pl_child_decode when the node was parsed.
+ */
+PLHash
+pl_child_hash(const PLNode *node, uint32_t index)
+{
+	PLHash		hash;
+
+	memcpy(hash.bytes, pl_node_value(node, index).data, PL_HASH_SIZE);
+	return hash;
+}
+
+uint64_t
+pl_child_rows(const PLNode *node, uint32_t index)
+{
+	const uint8_t *p = pl_node_value(node, index).data + PL_HASH_SIZE;
+	uint64_t	rows = 0;
+	int			shift = 0;
+
+	do
+	{
+		rows |= (uint64_t) (*p & 0x7F) << shift;
+		shift += 7;
+	} while (*p++ & 0x80);
+	return rows;
 }
 
 uint64_t
@@ -372,8 +617,22 @@ pl_node_rows(const PLNode *node)
 	if (node->level == 0)
 		return node->count;
 	for (i = 0; i < node->count; i++)
-		rows += pl_read64(pl_node_value(node, i).data + PL_HASH_SIZE);
+		rows += pl_child_rows(node, i);
 	return rows;
+}
+
+/* Decode a node's header: all a node written by this library needs. */
+static PLStatus
+parse_header(PLNode *node)
+{
+	if (node->size < PL_HEADER)
+		return PL_CORRUPT;
+	node->level = pl_read32(node->data + 8);
+	node->count = pl_read32(node->data + 12);
+	node->key_bytes = pl_read32(node->data + 16);
+	node->value_bytes = pl_read32(node->data + 20);
+	node->offset_width = (uint8_t) offset_width(node->key_bytes, node->value_bytes);
+	return PL_OK;
 }
 
 /* Decode metadata only after all offsets have been checked against buffer bounds. */
@@ -382,35 +641,33 @@ parse_node(PLNode *node)
 {
 	uint32_t	i,
 				which;
-	size_t		directory;
+	size_t		directory,
+				width;
 	uint64_t	rows = 0;
 
-	if (node->size < PL_HEADER || memcmp(node->data, node_magic, 8) != 0)
+	if (parse_header(node) != PL_OK || memcmp(node->data, node_magic, 8) != 0)
 		return PL_CORRUPT;
-	node->level = pl_read32(node->data + 8);
-	node->count = pl_read32(node->data + 12);
-	node->key_bytes = pl_read32(node->data + 16);
-	node->value_bytes = pl_read32(node->data + 20);
 	if (node->level >= PL_MAX_DEPTH || node->count > PL_MAX_ENTRIES ||
 		(node->level && !node->count))
 		return PL_CORRUPT;
-	directory = PL_HEADER + 8 * ((size_t) node->count + 1);
+	width = node->offset_width;
+	directory = PL_HEADER + directory_size(node->count, width);
 	if (directory + (uint64_t) node->key_bytes + node->value_bytes != node->size)
 		return PL_CORRUPT;
 	for (which = 0; which < 2; which++)
 	{
-		const uint8_t *offsets = node->data + PL_HEADER + which * 4 * (node->count + 1);
+		const uint8_t *offsets = node->data + PL_HEADER + which * width * (node->count + 1);
 		uint32_t	limit = which ? node->value_bytes : node->key_bytes;
 
-		if (pl_read32(offsets) != 0 || pl_read32(offsets + 4 * node->count) != limit)
+		if (read_offset(offsets, width) != 0 || read_offset(offsets + width * node->count, width) != limit)
 			return PL_CORRUPT;
 		for (i = 0; i < node->count; i++)
 		{
-			uint32_t	start = pl_read32(offsets + 4 * i);
-			uint32_t	end = pl_read32(offsets + 4 * (i + 1));
+			uint32_t	start = read_offset(offsets + width * i, width);
+			uint32_t	end = read_offset(offsets + width * (i + 1), width);
 
 			if (end < start || end > limit || end - start > PL_MAX_ITEM ||
-				(which && node->level && end - start != PL_CHILD_SIZE))
+				(which && node->level && (end - start <= PL_HASH_SIZE || end - start > PL_CHILD_MAX)))
 				return PL_CORRUPT;
 		}
 	}
@@ -420,8 +677,10 @@ parse_node(PLNode *node)
 			return PL_CORRUPT;
 		if (node->level)
 		{
-			uint64_t	child_rows = pl_read64(pl_node_value(node, i).data + PL_HASH_SIZE);
+			uint64_t	child_rows;
 
+			if (!pl_child_decode(pl_node_value(node, i), NULL, &child_rows))
+				return PL_CORRUPT;
 			if (!child_rows || UINT64_MAX - rows < child_rows)
 				return PL_CORRUPT;
 			rows += child_rows;
@@ -430,8 +689,13 @@ parse_node(PLNode *node)
 	return PL_OK;
 }
 
+/*
+ * Add a node. Only bytes from outside are checked in full: those a backing
+ * store holds, or this library built, were written by this library.
+ */
 static PLStatus
-store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, bool backed, PLNode **out)
+store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, bool backed,
+			 bool trusted, PLNode **out)
 {
 	PLNode	   *node = pl_find_local(store, hash);
 	size_t		bucket;
@@ -460,41 +724,18 @@ store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, b
 	memcpy(node->data, bytes, length);
 	node->size = length;
 	node->hash = hash;
-	if (parse_node(node) != PL_OK)
+	if ((trusted ? parse_header(node) : parse_node(node)) != PL_OK)
 	{
 		free(node->data);
 		free(node);
 		return PL_CORRUPT;
 	}
-	if (store->stats.chunks >= store->capacity * 2)
+	if (store->stats.chunks >= store->capacity * 2 &&
+		store_resize(store, store->capacity * 2) != PL_OK)
 	{
-		size_t		capacity = store->capacity * 2,
-					i;
-		PLNode	  **buckets = calloc(capacity, sizeof(*buckets));
-
-		if (!buckets)
-		{
-			free(node->data);
-			free(node);
-			return PL_NOMEM;
-		}
-		for (i = 0; i < store->capacity; i++)
-		{
-			PLNode	   *current = store->buckets[i];
-
-			while (current)
-			{
-				PLNode	   *next = current->next;
-
-				bucket = pl_read64(current->hash.bytes) % capacity;
-				current->next = buckets[bucket];
-				buckets[bucket] = current;
-				current = next;
-			}
-		}
-		free(store->buckets);
-		store->buckets = buckets;
-		store->capacity = capacity;
+		free(node->data);
+		free(node);
+		return PL_NOMEM;
 	}
 	if (!backed && store->unbacked_count == store->unbacked_capacity)
 	{
@@ -559,9 +800,9 @@ pl_store_import(PLStore *store, PLHash hash, PLSlice bytes)
 
 	if (!store || !bytes.data || bytes.len > 2ULL * PL_MAX_ITEM * PL_MAX_ENTRIES + 2048)
 		return PL_INVALID;
-	if (!pl_hash_bytes(bytes, &actual) || !pl_hash_equal(hash, actual))
+	if (!pl_node_address(bytes, &actual) || !pl_hash_equal(hash, actual))
 		return PL_CORRUPT;
-	return store_buffer(store, hash, bytes.data, bytes.len, false, &node);
+	return store_buffer(store, hash, bytes.data, bytes.len, false, false, &node);
 }
 
 PLStatus
@@ -570,7 +811,8 @@ pl_save(PLStore *store, uint32_t level, const PLEntry *entries, uint32_t count, 
 	size_t		key_bytes = 0,
 				value_bytes = 0,
 				length,
-				start;
+				start,
+				width;
 	uint32_t	i;
 	uint8_t    *data;
 	PLHash		hash;
@@ -584,7 +826,8 @@ pl_save(PLStore *store, uint32_t level, const PLEntry *entries, uint32_t count, 
 	}
 	if (key_bytes > UINT32_MAX || value_bytes > UINT32_MAX)
 		return PL_INVALID;
-	length = PL_HEADER + 8 * ((size_t) count + 1) + key_bytes + value_bytes;
+	width = offset_width(key_bytes, value_bytes);
+	length = PL_HEADER + directory_size(count, width) + key_bytes + value_bytes;
 	data = calloc(1, length);
 	if (!data)
 		return PL_NOMEM;
@@ -593,31 +836,31 @@ pl_save(PLStore *store, uint32_t level, const PLEntry *entries, uint32_t count, 
 	pl_write32(data + 12, count);
 	pl_write32(data + 16, (uint32_t) key_bytes);
 	pl_write32(data + 20, (uint32_t) value_bytes);
-	start = PL_HEADER + 8 * (count + 1);
+	start = PL_HEADER + directory_size(count, width);
 	key_bytes = value_bytes = 0;
 	for (i = 0; i < count; i++)
 	{
 		if (entries[i].key.len)
 			memcpy(data + start + key_bytes, entries[i].key.data, entries[i].key.len);
 		key_bytes += entries[i].key.len;
-		pl_write32(data + PL_HEADER + 4 * (i + 1), (uint32_t) key_bytes);
+		write_offset(data + PL_HEADER + width * (i + 1), width, (uint32_t) key_bytes);
 	}
 	for (i = 0; i < count; i++)
 	{
 		if (entries[i].value.len)
 			memcpy(data + start + key_bytes + value_bytes, entries[i].value.data, entries[i].value.len);
 		value_bytes += entries[i].value.len;
-		pl_write32(data + PL_HEADER + 4 * (count + 1) + 4 * (i + 1), (uint32_t) value_bytes);
+		write_offset(data + PL_HEADER + width * (count + 1) + width * (i + 1), width, (uint32_t) value_bytes);
 	}
 	bytes.data = data;
 	bytes.len = length;
-	if (!pl_hash_bytes(bytes, &hash))
+	if (!pl_node_address(bytes, &hash))
 	{
 		free(data);
 		return PL_CORRUPT;
 	}
 	store->stats.writes++;
-	status = store_buffer(store, hash, data, length, false, out);
+	status = store_buffer(store, hash, data, length, false, true, out);
 	free(data);
 	return status;
 }

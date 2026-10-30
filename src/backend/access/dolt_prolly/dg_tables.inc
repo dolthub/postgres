@@ -22,7 +22,7 @@ empty_content(void)
 		dg_check(pl_build(store, NULL, 0, &tree));
 		SET_VARSIZE(raw, VARHDRSZ + PL_HASH_SIZE);
 		memcpy(VARDATA(raw), tree.root.bytes, PL_HASH_SIZE);
-		cached = MemoryContextStrdup(TopMemoryContext, hex(raw));
+		cached = MemoryContextStrdup(TopMemoryContext, hash_format(raw));
 		pl_store_free(store);
 	}
 	return cached;
@@ -73,7 +73,7 @@ dolt_branches(PG_FUNCTION_ARGS)
 		dirty = state_differs(working_state(), head_state());
 	run("WITH refs AS (SELECT substr(r.refname,7) AS name,r.reftarget AS h FROM pg_dolt_ref r WHERE r.refname LIKE 'heads/%'),"
 		"c AS (SELECT refs.name,refs.h,convert_from(o.objpayload,'UTF8')::jsonb AS m,o.objchildren[1] AS db FROM refs JOIN pg_dolt_object_visible o ON o.objhash=refs.h) "
-		"SELECT c.name,encode(c.h,'hex'),m->>'committer',m->>'email'," DG_DATE_SQL("m->>'date_us'") ",m->>'message',''::text,''::text,"
+		"SELECT c.name,pg_catalog.dolt_hash_encode(c.h),m->>'committer',m->>'email'," DG_DATE_SQL("m->>'date_us'") ",m->>'message',''::text,''::text,"
 		"CASE WHEN c.name=$1 THEN $2 ELSE coalesce(wo.objpayload<>dbo.objpayload,false) END,"
 		"m->>'author',m->>'author_email'," DG_DATE_SQL("m->>'author_date_us'") " "
 		"FROM c LEFT JOIN pg_dolt_ref w ON w.refname='working/' || c.name LEFT JOIN pg_dolt_object_visible wo ON wo.objhash=w.reftarget LEFT JOIN pg_dolt_object_visible dbo ON dbo.objhash=c.db ORDER BY c.name COLLATE \"C\"",
@@ -106,11 +106,11 @@ dolt_status(PG_FUNCTION_ARGS)
 		"conflicts AS (SELECT DISTINCT v->>'table' AS name FROM jsonb_array_elements($4::jsonb->'conflicts') v UNION SELECT DISTINCT v->>'table' FROM jsonb_array_elements(coalesce($4::jsonb->'violations','[]'::jsonb)) v UNION SELECT DISTINCT v->>'table' FROM jsonb_array_elements(coalesce($4::jsonb->'schema_conflicts','[]'::jsonb)) v),"
 		"tables AS ("
 		" SELECT 1 AS grp,coalesce(a.v->>'name',b.v->>'name') AS name,true AS staged,CASE WHEN a.v IS NULL THEN 'new table' WHEN b.v IS NULL THEN 'deleted' ELSE 'modified' END AS status"
-		" FROM (SELECT v FROM h WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence')) a FULL JOIN (SELECT v FROM s WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence')) b ON a.v->>'name'=b.v->>'name' AND a.v->>'kind'=b.v->>'kind'"
+		" FROM (SELECT v FROM h WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence','aggregate','operator','cast')) a FULL JOIN (SELECT v FROM s WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence','aggregate','operator','cast')) b ON a.v->>'name'=b.v->>'name' AND a.v->>'kind'=b.v->>'kind'"
 		" WHERE a.v IS NULL OR b.v IS NULL OR a.v->>'schema' IS DISTINCT FROM b.v->>'schema' OR a.v->>'content' IS DISTINCT FROM b.v->>'content'"
 		" UNION ALL"
 		" SELECT 2,coalesce(a.v->>'name',b.v->>'name'),false,CASE WHEN a.v IS NULL THEN 'new table' WHEN b.v IS NULL THEN 'deleted' ELSE 'modified' END"
-		" FROM (SELECT v FROM s WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence')) a FULL JOIN (SELECT v FROM w WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence')) b ON a.v->>'name'=b.v->>'name' AND a.v->>'kind'=b.v->>'kind'"
+		" FROM (SELECT v FROM s WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence','aggregate','operator','cast')) a FULL JOIN (SELECT v FROM w WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence','aggregate','operator','cast')) b ON a.v->>'name'=b.v->>'name' AND a.v->>'kind'=b.v->>'kind'"
 		" WHERE a.v IS NULL OR b.v IS NULL OR a.v->>'schema' IS DISTINCT FROM b.v->>'schema' OR a.v->>'content' IS DISTINCT FROM b.v->>'content'"
 		" UNION ALL"
 		" SELECT 3,coalesce(a.v->'definition'->>'name',b.v->'definition'->>'name'),true,CASE WHEN a.v IS NULL THEN 'new schema' ELSE 'deleted schema' END"
@@ -145,8 +145,8 @@ dolt_merge_status(PG_FUNCTION_ARGS)
 
 		run("SELECT coalesce(string_agg(name,', ' ORDER BY name COLLATE \"C\"),'') FROM (SELECT DISTINCT (parse_ident(t))[array_length(parse_ident(t),1)] AS name FROM (SELECT v->>'table' AS t FROM jsonb_array_elements($1::jsonb->'conflicts') v UNION SELECT v->>'table' FROM jsonb_array_elements(coalesce($1::jsonb->'violations','[]'::jsonb)) v) y) x", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
 		unmerged = strcell(0, 1);
-		values[1] = CStringGetTextDatum(source ? source : hex(child(pending.target, 2)));
-		values[2] = CStringGetTextDatum(hex(child(pending.target, 2)));
+		values[1] = CStringGetTextDatum(source ? source : hash_format(child(pending.target, 2)));
+		values[2] = CStringGetTextDatum(hash_format(child(pending.target, 2)));
 		values[3] = CStringGetTextDatum(psprintf("refs/heads/%s", dg_current_branch()));
 		values[4] = CStringGetTextDatum(unmerged);
 		memset(nulls, 0, sizeof(nulls));
@@ -173,7 +173,7 @@ dolt_diff_changes(PG_FUNCTION_ARGS)
 	}
 	run("WITH RECURSIVE walk(h) AS (SELECT $1::bytea UNION SELECT unnest(o.objchildren[2:]) FROM walk w JOIN pg_dolt_object_visible o ON o.objhash=w.h),"
 		"commits AS (SELECT o.objhash,convert_from(o.objpayload,'UTF8')::jsonb AS m,o.objchildren FROM walk w JOIN pg_dolt_object_visible o ON o.objhash=w.h WHERE o.objkind='commit'),"
-		"states AS (SELECT 2 AS grp,encode(c.objhash,'hex') AS commit_hash,c.m,convert_from(d.objpayload,'UTF8')::jsonb AS db,"
+		"states AS (SELECT 2 AS grp,pg_catalog.dolt_hash_encode(c.objhash) AS commit_hash,c.m,convert_from(d.objpayload,'UTF8')::jsonb AS db,"
 		" (SELECT convert_from(p.objpayload,'UTF8')::jsonb FROM pg_dolt_object_visible pc JOIN pg_dolt_object_visible p ON p.objhash=pc.objchildren[1] WHERE pc.objhash=c.objchildren[2]) AS pdb"
 		" FROM commits c JOIN pg_dolt_object_visible d ON d.objhash=c.objchildren[1]"
 		" UNION ALL SELECT 0,'STAGED',NULL,$3::jsonb,$2::jsonb WHERE $3::jsonb->'members' <> $2::jsonb->'members'"
@@ -247,7 +247,7 @@ Datum
 dolt_hashof(PG_FUNCTION_ARGS)
 {
 	int			nest = begin_api();
-	char	   *answer = hex(resolve(text_to_cstring(PG_GETARG_TEXT_PP(0))));
+	char	   *answer = hash_format(resolve(text_to_cstring(PG_GETARG_TEXT_PP(0))));
 
 	end_api(nest);
 	PG_RETURN_TEXT_P(cstring_to_text(answer));

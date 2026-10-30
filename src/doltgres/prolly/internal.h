@@ -5,14 +5,25 @@
 #include <string.h>
 
 #define PL_MAX_DEPTH 32
-#define PL_MAX_ENTRIES 128
 #define PL_MIN_BYTES 256
+
+#define PL_MAX_ENTRIES 128
 #ifndef PL_TARGET_BYTES
 #define PL_TARGET_BYTES 1024
 #endif
 #define PL_MAX_BYTES (4 * PL_TARGET_BYTES)
 #define PL_HEADER 24
-#define PL_CHILD_SIZE 40
+
+/*
+ * A node's directory offsets take two bytes when its keys and values each fit
+ * in 64 kB, as all but nodes holding very large values do, else four. Builders
+ * charge every entry the narrow width.
+ */
+#define PL_NARROW_LIMIT 0xFFFF
+#define PL_ENTRY_OVERHEAD 4
+
+/* A child reference in an interior node: the child's address, then its row count as a varint. */
+#define PL_CHILD_MAX (PL_HASH_SIZE + 10)
 
 typedef struct PLNode
 {
@@ -23,6 +34,7 @@ typedef struct PLNode
 	uint32_t	count;
 	uint32_t	key_bytes;
 	uint32_t	value_bytes;
+	uint8_t		offset_width;	/* bytes per directory offset, from the sizes above */
 	bool		backed;			/* known to be in the backing store */
 	bool		marked;			/* reachable, during pl_store_retain */
 	uint32_t	pins;			/* holders keeping it until written, across pl_store_drop_unbacked */
@@ -54,6 +66,11 @@ uint64_t	pl_read64(const uint8_t *p);
 void		pl_write32(uint8_t *p, uint32_t v);
 void		pl_write64(uint8_t *p, uint64_t v);
 bool		pl_hash_bytes(PLSlice bytes, PLHash *out);
+bool		pl_node_address(PLSlice bytes, PLHash *out);
+size_t		pl_child_encode(uint8_t *out, PLHash hash, uint64_t rows);
+bool		pl_child_decode(PLSlice value, PLHash *hash, uint64_t *rows);
+PLHash		pl_child_hash(const PLNode *node, uint32_t index);
+uint64_t	pl_child_rows(const PLNode *node, uint32_t index);
 PLNode	   *pl_find(PLStore *store, PLHash hash);
 PLNode	   *pl_find_local(PLStore *store, PLHash hash);
 void		pl_node_set_backed(PLNode *node);

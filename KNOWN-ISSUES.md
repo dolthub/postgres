@@ -27,3 +27,15 @@ The SQL reproductions are in /workspace/reports/rewrite-dolt-functions-*.sql.
   node hash the tree itself uses. History reads import those copies one SPI
   statement per chunk. See [chunk store plan](CHUNK-STORE-PLAN.md) milestone 6;
   the analysis is in /workspace/reports/catalog-bind-analysis/index.html.
+
+* **Schemas fingerprinted outside the hash namespace (2026-10-30):** a member
+  descriptor (table, index, routine, view, type, trigger, sequence) and the
+  database object's member list carry a `schema` field holding a hex SHA-256 of
+  the definition text, computed in SQL at about eight call sites. It is a second
+  hash of content the descriptor already names as a `schema` object child, and
+  it is part of the hashed payloads, so it fixes descriptor, database and commit
+  hashes. Diff, status and merge compare it to detect schema changes. A schema
+  should be a chunk like any other: stored in the chunk store and referred to
+  by the manifest by its chunk address, which those comparisons then use. Found
+  while moving content hashes to 20 bytes on zachmu/short-hashes, which leaves
+  these fingerprints at 32.

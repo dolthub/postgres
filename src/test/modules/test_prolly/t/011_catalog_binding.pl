@@ -67,7 +67,7 @@ $plans->query_safe(q{PREPARE moving_plan AS SELECT v FROM versions AS OF 'moving
 is($plans->query_safe('EXECUTE moving_plan'),'10','prepared named revision initial binding');
 $plans->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
 is($plans->query_safe('EXECUTE moving_plan'),'10','repeatable-read reference pinned');
-sql("SELECT dolt_manifest_cas('tags/moving',(SELECT reftoken FROM pg_dolt_ref WHERE refname='tags/moving'),decode('$second','hex'))");
+sql("SELECT dolt_manifest_cas('tags/moving',(SELECT reftoken FROM pg_dolt_ref WHERE refname='tags/moving'),dolt_hash_decode('$second'))");
 is($plans->query_safe('EXECUTE moving_plan'),'10','ref movement cannot escape old snapshot');
 $plans->query_safe('COMMIT');is($plans->query_safe('EXECUTE moving_plan'),'20','new transaction rebinds named revision');
 $plans->query_safe('DISCARD PLANS');is($plans->query_safe('EXECUTE moving_plan'),'20','discarded plans require no warming');

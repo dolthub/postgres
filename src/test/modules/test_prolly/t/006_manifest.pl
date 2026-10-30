@@ -32,7 +32,7 @@ is(sql(q{SELECT count(*) FROM pg_class c JOIN pg_am a ON a.oid=c.relam WHERE c.r
 my $schema = put('schema', 'test-schema-v1:id=int4,value=text');
 is(put('schema', 'test-schema-v1:id=int4,value=text'), $schema, 'immutable object deduplication');
 my $schema_payload = 'test-schema-v1:id=int4,value=text';
-is($schema, sha256_hex('DGMOBJ01' . pack('NNN', 1, 0, length($schema_payload)) . $schema_payload), 'object envelope matches independent SHA-256 encoding');
+is($schema, substr(sha256_hex('DGMOBJ01' . pack('NNN', 1, 0, length($schema_payload)) . $schema_payload), 0, 40), 'object envelope matches independent truncated SHA-256 encoding');
 my $empty = put('database', 'test-db-v1:empty');
 my $c1 = put('commit', 'author=test;message=initial', $empty);
 my $c2 = put('commit', 'author=test;message=second', $empty, $c1);
@@ -44,10 +44,10 @@ is(readref('heads/missing'), '', 'absent ref returns null fields');
 failure(cas('heads/probe', undef, $c1), qr/duplicate key/, 'concurrent-style duplicate creation rejected');
 failure(cas('heads/bad', undef, $empty), qr/requires commit/, 'HEAD requires commit object');
 failure(q{SELECT dolt_manifest_put('commit',''::bytea,ARRAY[]::bytea[])}, qr/child count/, 'commit needs database child');
-failure(q{SELECT dolt_manifest_put('table',''::bytea,ARRAY[decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex')])}, qr/not visible/, 'dangling children rejected');
+failure(q{SELECT dolt_manifest_put('table',''::bytea,ARRAY[decode(repeat('00',20),'hex'),decode(repeat('00',20),'hex')])}, qr/not visible/, 'dangling children rejected');
 failure(q{SELECT dolt_manifest_put('schema',''::bytea,ARRAY[NULL,NULL]::bytea[])}, qr/child count/, 'schema child count validated');
 failure(q{SELECT dolt_manifest_put('chunk',''::bytea,ARRAY[NULL]::bytea[])}, qr/cannot be null/, 'null children rejected');
-failure(q{SELECT dolt_manifest_get('\x00'::bytea)}, qr/32 bytes/, 'invalid hash size rejected');
+failure(q{SELECT dolt_manifest_get('\x00'::bytea)}, qr/20 bytes/, 'invalid hash size rejected');
 failure(cas('main', undef, $c1), qr/heads\//, 'ref namespace checked');
 failure("SELECT dolt_manifest_put('chunk',''::bytea,ARRAY[".hasharg($c1)."])", qr/invalid commit child/, 'typed DAG edges enforced');
 
@@ -89,7 +89,7 @@ $a->query_safe('BEGIN');
 $a->query_safe(cas('heads/probe', $t4, $c2));
 $b->query_until(qr/waiting/, "\\echo waiting\n" . cas('heads/probe', $t4, $c1) . ";\n");
 ok($node->poll_query_until('postgres', "SELECT wait_event_type='Lock' FROM pg_stat_activity WHERE pid=$pid"), 'competing HEAD writer waits on PostgreSQL lock');
-is(length(sql(cas('heads/independent', undef, $c1))), 64, 'different ref writer proceeds while HEAD locked');
+is(length(sql(cas('heads/independent', undef, $c1))), 40, 'different ref writer proceeds while HEAD locked');
 $a->query_safe('COMMIT');
 ($out, $error) = $b->query('SELECT 1');
 is($error, 1, 'waiting writer rejects changed token after winner commits');
@@ -144,15 +144,15 @@ INSERT INTO p SELECT g,repeat(md5(g::text),10) FROM generate_series(1,100) g;
 # Export uses the statement snapshot, even though object insertion does writes.
 $reader = $node->background_psql('postgres');
 $reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
-my $old_root = $reader->query_safe(q{SELECT dolt_prolly_root('p')});
+my $old_root = $reader->query_safe(q{SELECT encode(dolt_hash_decode(dolt_prolly_root('p')),'hex')});
 sql(q{UPDATE p SET value='changed after snapshot' WHERE id=1});
 my $old_chunk = $reader->query_safe(q{SELECT encode(dolt_manifest_export('p'),'hex')});
-is($reader->query_safe("SELECT encode(sha256(payload),'hex') FROM dolt_manifest_get(".hasharg($old_chunk).")"), $old_root, 'export excludes changes outside reader snapshot');
+is($reader->query_safe("SELECT encode(substr(sha256(payload),1,20),'hex') FROM dolt_manifest_get(".hasharg($old_chunk).")"), $old_root, 'export excludes changes outside reader snapshot');
 $reader->query_safe('COMMIT'); $reader->quit;
-my $root = sql(q{SELECT dolt_prolly_root('p')});
+my $root = sql(q{SELECT encode(dolt_hash_decode(dolt_prolly_root('p')),'hex')});
 my $chunk = sql(q{SELECT encode(dolt_manifest_export('p'),'hex')});
 my $indexchunk = sql(q{SELECT encode(dolt_manifest_export('p_pkey'),'hex')});
-is(sql("SELECT encode(sha256(payload),'hex') FROM dolt_manifest_get(".hasharg($chunk).")"), $root, 'export preserves canonical node bytes and original hash');
+is(sql("SELECT encode(substr(sha256(payload),1,20),'hex') FROM dolt_manifest_get(".hasharg($chunk).")"), $root, 'export preserves canonical node bytes and original hash');
 is(sql(q{SELECT encode(dolt_manifest_export('p'),'hex')}), $chunk, 'export deterministic and deduplicated');
 sql(q{CREATE TABLE same(LIKE p) USING dolt_prolly_table; INSERT INTO same SELECT * FROM p ORDER BY id DESC});
 is(sql(q{SELECT encode(dolt_manifest_export('same'),'hex')}), $chunk, 'export ignores relation identity and insertion history');
@@ -169,7 +169,7 @@ ok($reachable > 1, 'export includes reachable descendants, not just root');
 my $objects = sql('SELECT count(*) FROM pg_dolt_object');
 ok($objects > 10, 'multi-node tree exported as DAG');
 sql('TRUNCATE p; DROP TABLE p');
-is(sql("SELECT encode(sha256(payload),'hex') FROM dolt_manifest_get(".hasharg($chunk).")"), $root, 'historical content survives truncate/drop of original relation');
+is(sql("SELECT encode(substr(sha256(payload),1,20),'hex') FROM dolt_manifest_get(".hasharg($chunk).")"), $root, 'historical content survives truncate/drop of original relation');
 cmp_ok(sql('SELECT count(*) FROM pg_dolt_object'), '>=', $objects, 'all historical chunks retained; DROP only publishes a new schema');
 
 # Large opaque payloads exercise heap TOAST separately from prolly page storage.
@@ -221,7 +221,7 @@ $node->stop('immediate'); $node->start;
 sql(q{ROLLBACK PREPARED 'manifest_abort'});
 is(readref('tags/prepare_abort'), '', 'prepared abort remains invisible');
 is(sql('SELECT count(*) FROM h'), '1', 'prepared abort rolls back heap with ref');
-is(sql("SELECT encode(sha256(payload),'hex') FROM dolt_manifest_get(".hasharg($chunk).")"), $root, 'historical bytes survive repeated recovery');
+is(sql("SELECT encode(substr(sha256(payload),1,20),'hex') FROM dolt_manifest_get(".hasharg($chunk).")"), $root, 'historical bytes survive repeated recovery');
 is(sql("SELECT octet_length(payload) FROM dolt_manifest_get(".hasharg($large).")"), '64000', 'TOAST object survives recovery');
 
 
@@ -238,7 +238,7 @@ my $restore = PostgreSQL::Test::Cluster->new('manifest_restore');
 $restore->init_from_backup($node, 'history');
 $restore->start;
 is($restore->safe_psql('postgres', q{SELECT encode(target,'hex') FROM dolt_manifest_read('tags/captured')}), $commit, 'physical backup preserves history ref');
-is($restore->safe_psql('postgres', "SELECT encode(sha256(payload),'hex') FROM dolt_manifest_get(".hasharg($chunk).")"), $root, 'physical backup preserves historical chunks');
+is($restore->safe_psql('postgres', "SELECT encode(substr(sha256(payload),1,20),'hex') FROM dolt_manifest_get(".hasharg($chunk).")"), $root, 'physical backup preserves historical chunks');
 $restore->stop;
 $node->stop;
 done_testing();

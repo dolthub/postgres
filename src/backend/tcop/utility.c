@@ -621,7 +621,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			CommandCounterIncrement();
 			return;
 		}
-		if (dg_catalog_routine_ddl(pstate, parsetree))
+		if (dg_catalog_schema_object_ddl(pstate, parsetree) || dg_catalog_routine_ddl(pstate, parsetree))
 		{
 			free_parsestate(pstate);
 			CommandCounterIncrement();
