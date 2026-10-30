@@ -38,6 +38,24 @@ sql(q{CREATE TABLE p2(id int PRIMARY KEY); INSERT INTO p2 SELECT generate_series
 sql(q{INSERT INTO c2 VALUES (1, 3)});
 fails(q{INSERT INTO c2 VALUES (2, 11)}, qr/violates foreign key constraint/, 'a cross-type key is checked');
 
+# The equality operator may take a different representation from the child.
+# PostgreSQL's normal RI query inserts the required implicit casts.
+sql(q{CREATE TABLE pfloat(id double precision PRIMARY KEY);
+ INSERT INTO pfloat VALUES (1), (2);
+ CREATE TABLE cint(id int REFERENCES pfloat)});
+is(sql(q{INSERT INTO cint VALUES (1); SELECT id FROM cint}), '1',
+ 'an integer child is coerced for a double precision parent');
+fails(q{INSERT INTO cint VALUES (3)}, qr/violates foreign key constraint/,
+ 'coercion does not admit a missing parent');
+fails(q{DELETE FROM pfloat WHERE id=1}, qr/violates foreign key constraint/,
+ 'a cross-type reference prevents parent deletion');
+fails(q{UPDATE pfloat SET id=3 WHERE id=1}, qr/violates foreign key constraint/,
+ 'a cross-type reference prevents parent key changes');
+sql(q{CREATE TABLE pnumeric(id numeric PRIMARY KEY); INSERT INTO pnumeric VALUES (1);
+ CREATE TABLE cnumeric(id bigint REFERENCES pnumeric)});
+is(sql(q{INSERT INTO cnumeric VALUES (1); SELECT id FROM cnumeric}), '1',
+ 'a by-value integer is coerced to a by-reference numeric operator input');
+
 # Rows the transaction itself inserted are found; rows it deleted are not.
 is(sql(q{BEGIN; INSERT INTO p2 VALUES (20); INSERT INTO c2 VALUES (3, 20); COMMIT; SELECT pid FROM c2 WHERE id = 3}), '20',
 	'a parent inserted earlier in the transaction is found');
