@@ -653,6 +653,42 @@ test_ranges_and_shifted_boundaries(void)
 	CHECK(result.removes == 667 && result.updates == 1333 && result.inserts == 0);
 	OK(pl_scan(&before, &entries[100].key, &entries[200].key, scan_count, &count));
 	CHECK(count == 100);
+
+	/* A reverse cursor visits every entry below its bound, last first. */
+	{
+		PLCursor	cursor;
+		uint8_t		below[8];
+		size_t		seen = 0;
+
+		OK(pl_cursor_init_last(&cursor, &before, NULL));
+		while (cursor.valid)
+		{
+			CHECK(seen < 2000 && pl_compare(pl_cursor_entry(&cursor).key, entries[1999 - seen].key) == 0);
+			seen++;
+			OK(pl_cursor_prev(&cursor));
+		}
+		CHECK(seen == 2000);
+		OK(pl_cursor_init_last(&cursor, &before, &entries[100].key));
+		for (seen = 0; cursor.valid; seen++)
+		{
+			CHECK(pl_compare(pl_cursor_entry(&cursor).key, entries[99 - seen].key) == 0);
+			OK(pl_cursor_prev(&cursor));
+		}
+		CHECK(seen == 100);
+		pl_key_int64(-1, below);
+		OK(pl_cursor_init_last(&cursor, &before, &(PLSlice) {below, 8}));
+		CHECK(!cursor.valid);
+		pl_key_int64(5000, below);
+		OK(pl_cursor_init_last(&cursor, &before, &(PLSlice) {below, 8}));
+		CHECK(cursor.valid && pl_compare(pl_cursor_entry(&cursor).key, entries[1999].key) == 0);
+
+		/* Below a missing key, and across leaves whose entries were removed. */
+		OK(pl_cursor_init_last(&cursor, &after, &entries[100].key));
+		CHECK(cursor.valid && pl_compare(pl_cursor_entry(&cursor).key, entries[98].key) == 0);
+		for (seen = 0; cursor.valid; seen++)
+			OK(pl_cursor_prev(&cursor));
+		CHECK(seen == 66);
+	}
 	CHECK(pl_scan(&before, NULL, NULL, stop_scan, NULL) == PL_STOP);
 	CHECK(pl_diff(&before, &after, stop_diff, NULL) == PL_STOP);
 	OK(pl_build(store, NULL, 0, &empty));

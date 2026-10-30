@@ -32,14 +32,31 @@ typedef struct DGIndexEntry
 	size_t		prefix;
 	bool		nullkey;
 }			DGIndexEntry;
+/*
+ * A scan reads index entries one at a time, in the direction of its first
+ * fetch, and keeps what it has produced, so that it can step back over it or
+ * restore a mark. Each entry yields a TID per occurrence of its row.
+ */
 typedef struct DGIndexScan
 {
-	MemoryContext context;
+	MemoryContext context;		/* holds the states and items, until rescan */
 	Relation	bitmap_table;
+	DGState    *index;
+	DGState    *table;
+	TupleTableSlot *slot;
+	StringInfoData lower,
+				upper;
+	bool		has_lower,
+				has_upper;
+	PLCursor	cursor;
+	bool		started;		/* cursor positioned */
+	bool		backward;		/* direction items are produced in */
+	bool		exhausted;
 	ItemPointerData *tids;
 	HeapTuple  *tuples;
-	size_t		count;
-	int64		position,
+	size_t		count,
+				capacity;
+	int64		position,		/* in production order */
 				mark;
 }			DGIndexScan;
 static int
@@ -427,21 +444,6 @@ dg_index_entry_key(Relation index, PLSlice row, PLHash digest, StringInfo key)
 	bool		nullkey;
 
 	index_entry(index, row, (PLSlice) {digest.bytes, PL_HASH_SIZE}, key, &prefix, &nullkey);
-}
-
-static PLStatus
-collect(void *arg, PLSlice key, PLSlice value)
-{
-	DGRows	   *r = arg;
-
-	if (r->count == r->capacity)
-	{
-		r->capacity = r->capacity ? r->capacity * 2 : 64;
-		r->items = r->items ? repalloc(r->items, r->capacity * sizeof(PLEntry)) : palloc(r->capacity * sizeof(PLEntry));
-	}
-	r->items[r->count].key = key;
-	r->items[r->count++].value = value;
-	return PL_OK;
 }
 
 /* The smallest key greater than every key that starts with |prefix|. */
@@ -1010,22 +1012,18 @@ wait_for_reservation(IndexScanDesc scan)
 }
 
 static void
+drop_slot(DGIndexScan *s)
+{
+	if (s->slot)
+		ExecDropSingleTupleTableSlot(s->slot);
+	s->slot = NULL;
+}
+
+static void
 rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys)
 {
 	DGIndexScan *s = scan->opaque;
 	MemoryContext old;
-	DGState    *index,
-			   *table;
-	DGRows		rows = {0};
-	StringInfoData lower,
-				upper;
-	bool		has_lower,
-				has_upper;
-	PLSlice		lo,
-				hi;
-	size_t		capacity = 16;
-	TupleTableSlot *slot;
-	HandleList *lists = NULL;
 
 	/* Bitmap scans do not supply heapRelation; the parent holds its lock.
 	 * indrelid is the revision-bound relation handle, not a storage OID.
@@ -1037,99 +1035,142 @@ rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norder
 	}
 	if (keys && nkeys)
 		memcpy(scan->keyData, keys, sizeof(ScanKeyData) * nkeys);
+	drop_slot(s);
 	MemoryContextReset(s->context);
 	old = MemoryContextSwitchTo(s->context);
 	if (scan->xs_snapshot->snapshot_type == SNAPSHOT_DIRTY)
 		wait_for_reservation(scan);
-	index = dg_load(scan->indexRelation, scan->xs_snapshot);
-	table = dg_load(scan->heapRelation, scan->xs_snapshot);
-	initStringInfo(&lower);
-	initStringInfo(&upper);
+	s->index = dg_load(scan->indexRelation, scan->xs_snapshot);
+	s->table = dg_load(scan->heapRelation, scan->xs_snapshot);
 	pgstat_count_index_scan(scan->indexRelation);
 	if (scan->instrument)
 		scan->instrument->nsearches++;
-	scan_bounds(scan, &lower, &upper, &has_lower, &has_upper);
-	lo.data = (uint8 *) lower.data;
-	lo.len = lower.len;
-	hi.data = (uint8 *) upper.data;
-	hi.len = upper.len;
-	dg_check(pl_scan(&index->content, has_lower ? &lo : NULL, has_upper ? &hi : NULL, collect, &rows));
-	s->tids = palloc(capacity * sizeof(ItemPointerData));
-	s->tuples = palloc0(capacity * sizeof(HeapTuple));
+	initStringInfo(&s->lower);
+	initStringInfo(&s->upper);
+	scan_bounds(scan, &s->lower, &s->upper, &s->has_lower, &s->has_upper);
+	s->slot = table_slot_create(scan->heapRelation, NULL);
+	s->started = s->exhausted = false;
+	s->capacity = 16;
+	s->tids = palloc(s->capacity * sizeof(ItemPointerData));
+	s->tuples = palloc0(s->capacity * sizeof(HeapTuple));
 	s->count = 0;
 	s->position = -1;
 	s->mark = -1;
+	MemoryContextSwitchTo(old);
+}
 
-	/*
-	 * An index-only scan returns entries, not rows: it needs no handles,
-	 * only each entry's number of occurrences, and its TIDs are never
-	 * fetched. Other scans find the rows' handles, which name the TIDs:
-	 * derived from each entry's digest, plus any allocated ones the delta
-	 * holds for it.
-	 */
-	if (!scan->xs_want_itup && rows.count)
+/* Position the cursor on the next entry in the scan's direction, if any is in bounds. */
+static void
+step(DGIndexScan *s)
+{
+	PLSlice		lo = {(uint8 *) s->lower.data, s->lower.len},
+				hi = {(uint8 *) s->upper.data, s->upper.len};
+	PLEntry		entry;
+
+	if (!s->started)
 	{
-		lists = palloc0(rows.count * sizeof(HandleList));
-		for (size_t i = 0; i < rows.count; i++)
-		{
-			PLSlice		row = {rows.items[i].value.data + 8, rows.items[i].value.len - 8};
-			PLHash		digest;
-
-			if (!key_digest(scan->indexRelation, rows.items[i].key, &digest))
-				digest = dg_rowhash(row);
-			lists[i] = handles_of(table, digest, (int64) pl_read64(rows.items[i].value.data));
-		}
+		s->started = true;
+		if (s->backward)
+			dg_check(pl_cursor_init_last(&s->cursor, &s->index->content, s->has_upper ? &hi : NULL));
+		else
+			dg_check(pl_cursor_init(&s->cursor, &s->index->content, s->has_lower ? &lo : NULL));
 	}
-	slot = table_slot_create(scan->heapRelation, NULL);
-	for (size_t i = 0; i < rows.count; i++)
+	else if (s->backward)
+		dg_check(pl_cursor_prev(&s->cursor));
+	else
+		dg_check(pl_cursor_next(&s->cursor));
+	if (!s->cursor.valid)
 	{
-		PLSlice		row = {rows.items[i].value.data + 8, rows.items[i].value.len - 8};
+		s->exhausted = true;
+		return;
+	}
+	entry = pl_cursor_entry(&s->cursor);
+	if (s->backward ? s->has_lower && pl_compare(entry.key, lo) < 0 :
+		s->has_upper && pl_compare(entry.key, hi) >= 0)
+		s->exhausted = true;
+}
+
+static void
+add_item(DGIndexScan *s, ItemPointer tid, HeapTuple tuple)
+{
+	if (s->count == s->capacity)
+	{
+		s->capacity *= 2;
+		s->tids = repalloc(s->tids, s->capacity * sizeof(ItemPointerData));
+		s->tuples = repalloc0(s->tuples, s->count * sizeof(HeapTuple), s->capacity * sizeof(HeapTuple));
+	}
+	s->tids[s->count] = *tid;
+	s->tuples[s->count++] = tuple;
+}
+
+/*
+ * Read index entries until one yields items or the scan's bounds are
+ * reached. An index-only scan returns entries, not rows: it needs no
+ * handles, only each entry's number of occurrences, and its TIDs are never
+ * fetched. Other scans find the rows' handles, which name the TIDs: derived
+ * from each entry's digest, plus any allocated ones the delta holds for it.
+ */
+static void
+produce(IndexScanDesc scan)
+{
+	DGIndexScan *s = scan->opaque;
+	MemoryContext old = MemoryContextSwitchTo(s->context);
+	size_t		before = s->count;
+
+	while (s->count == before && !s->exhausted)
+	{
+		PLEntry		entry;
+		PLSlice		row;
 		HandleList	handles;
 		ItemPointerData first_tid;
 
+		CHECK_FOR_INTERRUPTS();
+		step(s);
+		if (s->exhausted)
+			break;
+		entry = pl_cursor_entry(&s->cursor);
+		row = (PLSlice) {entry.value.data + 8, entry.value.len - 8};
 		if (scan->xs_want_itup)
 		{
-			handles.count = (int) Min(pl_read64(rows.items[i].value.data), (uint64) INT_MAX);
+			handles.count = (int) Min(pl_read64(entry.value.data), (uint64) INT_MAX);
 			handles.items = NULL;
 		}
 		else
-			handles = lists[i];
+		{
+			PLHash		digest;
+
+			if (!key_digest(scan->indexRelation, entry.key, &digest))
+				digest = dg_rowhash(row);
+			handles = handles_of(s->table, digest, (int64) pl_read64(entry.value.data));
+		}
 
 		/* Duplicate occurrences share bytes and qualifications, not TIDs. */
 		if (handles.count == 0)
 			continue;
+
 		/* Bitmap bounds are conservative. Defer the qualification to the
 		 * table scan so that it decodes each candidate only once, even when
 		 * several index searches select the same occurrence.
 		 */
+		if (handles.items)
+			dg_tid(handles.items[0], &first_tid);
+		else
+			ItemPointerSet(&first_tid, 0, FirstOffsetNumber);
 		if (!s->bitmap_table)
 		{
-			if (handles.items)
-				dg_tid(handles.items[0], &first_tid);
-			else
-				ItemPointerSet(&first_tid, 0, FirstOffsetNumber);
-			dg_decode(scan->heapRelation, row, &first_tid, slot);
-			if (!matches(scan, slot))
+			dg_decode(scan->heapRelation, row, &first_tid, s->slot);
+			if (!matches(scan, s->slot))
 				continue;
 		}
-
 		for (int j = 0; j < handles.count; j++)
 		{
-			ItemPointerData tid;
+			ItemPointerData tid = first_tid;
+			HeapTuple	tuple = NULL;
 
-			CHECK_FOR_INTERRUPTS();
 			if (handles.items)
 			{
 				dg_tid(handles.items[j], &tid);
-				dg_stash_put(RelationGetRelid(scan->heapRelation), table, handles.items[j], row);
-			}
-			else
-				tid = first_tid;
-			if (s->count == capacity)
-			{
-				capacity *= 2;
-				s->tids = repalloc(s->tids, capacity * sizeof(ItemPointerData));
-				s->tuples = repalloc0(s->tuples, s->count * sizeof(HeapTuple), capacity * sizeof(HeapTuple));
+				dg_stash_put(RelationGetRelid(scan->heapRelation), s->table, handles.items[j], row);
 			}
 			if (scan->xs_want_itup)
 			{
@@ -1137,32 +1178,39 @@ rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norder
 				bool		nulls[INDEX_MAX_KEYS];
 
 				for (int k = 0; k < scan->indexRelation->rd_index->indnatts; k++)
-					values[k] = slot_getattr(slot, scan->indexRelation->rd_index->indkey.values[k], &nulls[k]);
-				s->tuples[s->count] = heap_form_tuple(RelationGetDescr(scan->indexRelation), values, nulls);
+					values[k] = slot_getattr(s->slot, scan->indexRelation->rd_index->indkey.values[k], &nulls[k]);
+				tuple = heap_form_tuple(RelationGetDescr(scan->indexRelation), values, nulls);
 			}
-			s->tids[s->count++] = tid;
+			add_item(s, &tid, tuple);
 		}
 	}
-	ExecDropSingleTupleTableSlot(slot);
-	dg_release(index);
-	dg_release(table);
 	MemoryContextSwitchTo(old);
 }
+
 static bool
 gettuple(IndexScanDesc scan, ScanDirection dir)
 {
 	DGIndexScan *s = scan->opaque;
+	bool		backward = ScanDirectionIsBackward(dir);
 
-	if (ScanDirectionIsBackward(dir))
+	if (!s->started)
+		s->backward = backward;
+	if (backward == s->backward)
 	{
-		if (s->position < 0)
-			s->position = s->count;
-		--s->position;
+		if (s->position < (int64) s->count)
+			s->position++;
+		while (s->position >= (int64) s->count && !s->exhausted)
+			produce(scan);
+		if (s->position >= (int64) s->count)
+			return false;
 	}
 	else
-		++s->position;
-	if (s->position < 0 || s->position >= (int64) s->count)
-		return false;
+	{
+		if (s->position >= 0)
+			s->position--;
+		if (s->position < 0)
+			return false;
+	}
 	scan->xs_heaptid = s->tids[s->position];
 	scan->xs_recheck = false;
 	scan->xs_hitup = s->tuples[s->position];
@@ -1175,6 +1223,8 @@ getbitmap(IndexScanDesc scan, TIDBitmap *bitmap)
 {
 	DGIndexScan *s = scan->opaque;
 
+	while (!s->exhausted)
+		produce(scan);
 	for (size_t i = 0; i < s->count; i++)
 	{
 		CHECK_FOR_INTERRUPTS();
@@ -1187,6 +1237,7 @@ endscan(IndexScanDesc scan)
 {
 	DGIndexScan *s = scan->opaque;
 
+	drop_slot(s);
 	if (s->bitmap_table)
 		table_close(s->bitmap_table, NoLock);
 	MemoryContextDelete(s->context);
