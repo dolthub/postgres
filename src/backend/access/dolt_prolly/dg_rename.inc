@@ -28,6 +28,7 @@ rename_encode(CatalogView *view, const char *kind, const char *name, const char 
 			if (!strcmp(kind, "table"))
 			{
 				result = mutation_constraints(view, relid, result);
+				result = mutation_inheritance(view, relid, result);
 				result = mutation_index_list(result, mutation_indexes(view, relid));
 				if (json_value(result, "matview"))
 				{

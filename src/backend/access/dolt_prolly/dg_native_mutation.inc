@@ -593,7 +593,7 @@ mutation_index_list(const char *definition, List *indexes)
 static bool
 identity_action(AlterTableCmd *action)
 {
-	return action->subtype == AT_AddInherit || type == AT_DropInherit || type == AT_AddIdentity || action->subtype == AT_SetIdentity ||
+	return action->subtype == AT_AddIdentity || action->subtype == AT_SetIdentity ||
 		action->subtype == AT_DropIdentity;
 }
 
