@@ -1520,6 +1520,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 				i,
 				j;
 
+	database_check_extensions(database);
 	provider_current_view = view;
 	provider_current_rows = &rows;
 	CatalogViewSetBase(view, provider_shared_base());

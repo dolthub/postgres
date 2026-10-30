@@ -12,6 +12,15 @@
  * argument types, which covers every overload; a table's row type is
  * referred to as "type:" and the table's name. Operators outside pg_catalog
  * are referred to as "operator:" and their qualified name.
+ *
+ * A root also lists the extensions whose objects its definitions use, by name
+ * and without version, so that a server reading it can say up front which it
+ * lacks:
+ *
+ *   "extensions": ["hstore", "postgis"]
+ *
+ * The list is derived from the references, so it too is independent of
+ * history, and absent when no definition uses an extension.
  */
 
 typedef struct ReferenceCacheEntry
@@ -320,6 +329,65 @@ schema_references(const char *kind, bytea *schema)
 	return entry->references;
 }
 
+/*
+ * Add to a database root's |json| the extensions owning any server object
+ * that |edges|, its dependency edges, refer to. Extension members are matched
+ * by the keys references use; an operator may be named with its name quoted
+ * or not.
+ */
+static const char *
+database_extensions(const char *json, const char *edges)
+{
+	run("WITH r AS (SELECT DISTINCT e->>0 k FROM jsonb_array_elements($2::jsonb) e),"
+		"m AS (SELECT x.extname,"
+		" CASE d.classid WHEN 'pg_proc'::regclass THEN ARRAY['routine:'||format('%I.%I',n.nspname,p.proname)]"
+		" WHEN 'pg_type'::regclass THEN ARRAY['type:'||format('%I.%I',tn.nspname,t.typname)]"
+		" WHEN 'pg_class'::regclass THEN ARRAY['table:'||format('%I.%I',cn.nspname,c.relname),'type:'||format('%I.%I',cn.nspname,c.relname)]"
+		" ELSE ARRAY['operator:'||format('%I.%I',o_n.nspname,o.oprname),'operator:'||format('%I.%s',o_n.nspname,o.oprname)] END keys"
+		" FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_extension x ON x.oid=d.refobjid"
+		" LEFT JOIN pg_catalog.pg_proc p ON d.classid='pg_proc'::regclass AND p.oid=d.objid LEFT JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace"
+		" LEFT JOIN pg_catalog.pg_type t ON d.classid='pg_type'::regclass AND t.oid=d.objid LEFT JOIN pg_catalog.pg_namespace tn ON tn.oid=t.typnamespace"
+		" LEFT JOIN pg_catalog.pg_class c ON d.classid='pg_class'::regclass AND c.oid=d.objid LEFT JOIN pg_catalog.pg_namespace cn ON cn.oid=c.relnamespace"
+		" LEFT JOIN pg_catalog.pg_operator o ON d.classid='pg_operator'::regclass AND o.oid=d.objid LEFT JOIN pg_catalog.pg_namespace o_n ON o_n.oid=o.oprnamespace"
+		" WHERE d.refclassid='pg_extension'::regclass AND d.deptype='e'"
+		" AND d.classid IN ('pg_proc'::regclass,'pg_type'::regclass,'pg_class'::regclass,'pg_operator'::regclass))"
+		"SELECT CASE WHEN count(*)=0 THEN $1 ELSE jsonb_set($1::jsonb,'{extensions}',jsonb_agg(extname ORDER BY extname COLLATE \"C\"))::text END"
+		" FROM (SELECT DISTINCT m.extname FROM m JOIN r ON r.k=ANY(m.keys)) used",
+		2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), CStringGetTextDatum(edges)), NULL, true);
+	return strcell(0, 1);
+}
+
+/*
+ * Refuse to read database root |database| on a server without an extension
+ * it uses: its definitions could not bind their extension objects.
+ */
+static void
+database_check_extensions(bytea *database)
+{
+	bytea	   *payload;
+	Jsonb	   *root;
+	JsonbValue	extensions;
+
+	if (!database || !dg_object_read(database, "database", NULL, &payload, NULL))
+		return;
+	root = DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(pnstrdup(VARDATA_ANY(payload), VARSIZE_ANY_EXHDR(payload)))));
+	if (!JB_ROOT_IS_OBJECT(root) ||
+		!getKeyJsonValueFromContainer(&root->root, "extensions", strlen("extensions"), &extensions) ||
+		extensions.type != jbvBinary)
+		return;
+	for (int i = 0; i < json_length(&extensions); i++)
+	{
+		char	   *name = json_item_text(&extensions, i);
+
+		if (!OidIsValid(get_extension_oid(name, true)))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("this revision of the database requires extension \"%s\", which is not installed", name),
+					 errdetail("Its definitions use objects of extension \"%s\".", name),
+					 errhint("Install it with CREATE EXTENSION %s.", quote_identifier(name))));
+	}
+}
+
 /* Add the dependency record of |members| to a database root's |json|. */
 static char *
 database_dependents(const char *json, Datum *members, int count)
@@ -362,6 +430,7 @@ database_dependents(const char *json, Datum *members, int count)
 		}
 	}
 	appendStringInfoChar(&edges, ']');
+	json = database_extensions(json, edges.data);
 	run("SELECT jsonb_set($1::jsonb,'{dependents}',COALESCE((SELECT jsonb_object_agg(r,d) FROM (SELECT e->>0 r,jsonb_agg(DISTINCT jsonb_build_array(e->>1,e->>2)) d FROM jsonb_array_elements($2::jsonb) e GROUP BY e->>0) g),'{}'::jsonb))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), CStringGetTextDatum(edges.data)), NULL, true);
 	return strcell(0, 1);
 }

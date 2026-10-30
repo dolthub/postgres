@@ -115,6 +115,10 @@ the enveloped schema and exported chunk objects. DGDB1 contains server encoding
 and members sorted by kind/name, including namespace definitions. Its children
 are a hash-sorted set of descriptors; member names come from payloads, not child
 position. Local OIDs, executor handles and XIDs do not enter these payloads.
+DGDB1 also lists, as `extensions`, the names (without versions) of the
+extensions whose objects its definitions use, derived from their references
+and omitted when there are none. A server without one of them refuses to read
+that root, naming the extension to install.
 
 DGCOMMIT1 contains author/committer metadata, microsecond timestamps and graph
 height; children are database state followed by ordered parents. Namespace and

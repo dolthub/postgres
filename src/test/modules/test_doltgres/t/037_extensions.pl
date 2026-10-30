@@ -61,6 +61,13 @@ fails(q{INSERT INTO attrs VALUES (2, 'a=>1')},qr/violates check constraint "attr
 is(sql(q{SELECT h -> 'a' FROM attrs}),'2','an extension type is stored and read back');
 sql(q{ALTER TABLE secrets ADD COLUMN salt text DEFAULT gen_salt('md5'); SELECT dolt_commit('-Am', 'extension uses')});
 is(sql(q{SELECT length(salt) FROM secrets}),'11','ALTER TABLE adds a column with an extension default');
+# A database root lists, by name, the extensions whose objects its definitions use.
+sub root_extensions {
+ my $ref=shift;
+ return sql(qq{SELECT convert_from(o.objpayload, 'UTF8')::jsonb->'extensions' FROM pg_dolt_ref r JOIN pg_dolt_object_visible o ON o.objhash = r.reftarget WHERE r.refname = '$ref'});
+}
+is(root_extensions('working/main'),'["hstore", "pgcrypto", "server_test_ext"]','a root lists the extensions its definitions use');
+is(root_extensions('working/other'),'','and a root whose definitions use none lists none');
 sql(q{SELECT dolt_branch('feature'); SELECT dolt_checkout('feature'); INSERT INTO secrets(id) VALUES (3); UPDATE attrs SET h = h || 'b=>3'; SELECT dolt_commit('-Am', 'feature')});
 is(sql(q{SELECT dolt_merge('feature')}) =~ /merge successful|Fast-forward|fast-forward/ ? 'merged' : 'not merged','merged','branches with extension uses merge');
 is(sql(q{SELECT count(*), sum(doubled) FROM secrets}),'2|84','the merged rows took their defaults');
@@ -78,7 +85,12 @@ for my $branch ('keeper', 'feature') {
 }
 sql(q{DROP EXTENSION pgcrypto});
 is(sql(q{SELECT count(*) FROM pg_extension WHERE extname = 'pgcrypto'}),'0','once no branch uses it, it can be dropped');
-fails(q{SELECT count(*) FROM secrets AS OF 'HEAD~1'},qr/does not exist/,'history that used it needs it to be read');
+is(root_extensions('working/main'),'["hstore"]','the root lists only the extensions still used');
+fails(q{SELECT count(*) FROM secrets AS OF 'HEAD~1'},qr/this revision of the database requires extension "pgcrypto", which is not installed/,'history that used it needs it to be read');
+fails(q{SELECT dolt_checkout('-b', 'old', 'HEAD~1')},qr/requires extension "pgcrypto"/,'nor can it be checked out');
+is(sql(q{SELECT count(*) FROM dolt_branches WHERE name = 'old'}),'0','and the checkout leaves no branch');
+sql(q{CREATE EXTENSION pgcrypto});
+is(sql(q{SELECT count(*) FROM secrets AS OF 'HEAD~1'}),'2','installing it again makes that history readable');
 is(sql(q{SELECT count(*) FROM attrs}),'1','other branches\' tables are unaffected');
 
 # PostGIS, where it is installed: geometry and geography values in versioned tables.
