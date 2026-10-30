@@ -1036,6 +1036,7 @@ store_xact(XactEvent event, void *arg)
 			 */
 			if (event == XACT_EVENT_COMMIT)
 				share_written();
+			dolt_node_cache_report();
 			if (working_store)
 			{
 				pl_store_drop_unbacked(working_store);

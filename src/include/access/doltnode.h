@@ -25,6 +25,8 @@ typedef struct DoltNodeCacheStats
 	uint64		rejected;		/* adds refused for want of space */
 	uint64		entries;
 	uint64		bytes;
+	uint64		total_hits;		/* all backends', reported at transaction end */
+	uint64		total_misses;
 } DoltNodeCacheStats;
 
 extern PGDLLIMPORT int dolt_node_cache_size;
@@ -34,6 +36,7 @@ extern void DoltNodeCacheShmemInit(void);
 
 extern const uint8 *dolt_node_cache_get(const uint8 *hash, Size *length);
 extern void dolt_node_cache_add(const uint8 *hash, const uint8 *data, Size length);
+extern void dolt_node_cache_report(void);
 extern void dolt_node_cache_stats(DoltNodeCacheStats *stats);
 
 #endif							/* DOLTNODE_H */

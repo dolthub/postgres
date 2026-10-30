@@ -32,7 +32,7 @@ my $expected = sql($count);
 # A committed transaction shares the nodes it wrote.
 my ($store, $hits, $misses) = reads($count);
 is($store, 0, 'a new session reads nothing from the chunk store after the writer commits');
-cmp_ok($hits, '>', 100, "the scan borrows from the shared cache ($hits nodes)");
+cmp_ok($hits, '>', 100, "the scan reads from the shared cache ($hits nodes)");
 is($misses, 0, 'and finds every node there');
 
 # After a restart, the first session reads the table from the store, and the next none of it.
@@ -40,9 +40,13 @@ $node->restart;
 ($store, $hits, $misses) = reads($count);
 cmp_ok($store, '>', 100, "after a restart, the first session reads the table from the chunk store ($store chunks)");
 is($misses, $store, 'one store read per node missing from the cache');
+my $first_misses = $misses;
 ($store, $hits, $misses) = reads($count);
 is($store, 0, 'the next session reads nothing from the chunk store');
-is($misses, 0, 'and borrows every node');
+is($misses, 0, 'and finds every node in the cache');
+my ($total_hits, $total_misses) = split /\|/, sql('SELECT total_hits, total_misses FROM dolt_node_cache_stats()');
+cmp_ok($total_hits, '>=', $hits, "the server counts every session's hits ($total_hits)");
+cmp_ok($total_misses, '>=', $first_misses, "and misses ($total_misses)");
 is(sql($count), $expected, 'results are unchanged');
 my ($entries, $bytes) = split /\|/, sql('SELECT entries, bytes FROM dolt_node_cache_stats()');
 cmp_ok($entries, '>=', $hits, "the cache holds the table ($entries nodes, $bytes bytes)");

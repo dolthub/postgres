@@ -85,6 +85,8 @@ typedef struct NodeCache
 	pg_atomic_uint64 added;
 	pg_atomic_uint64 evictions;
 	pg_atomic_uint64 rejected;
+	pg_atomic_uint64 hits;		/* as sessions report them */
+	pg_atomic_uint64 misses;
 	LWLockPadded locks[NODE_PARTITIONS];
 	NodeSlot	slots[FLEXIBLE_ARRAY_MEMBER];
 } NodeCache;
@@ -94,6 +96,8 @@ static HTAB *mapping;
 static dsa_area *area;
 static uint64 local_hits;
 static uint64 local_misses;
+static uint64 unreported_hits;
+static uint64 unreported_misses;
 static uint8 *copied;			/* the last node read, until the next */
 static Size copied_size;
 
@@ -166,6 +170,8 @@ DoltNodeCacheShmemInit(void)
 		pg_atomic_init_u64(&cache->added, 0);
 		pg_atomic_init_u64(&cache->evictions, 0);
 		pg_atomic_init_u64(&cache->rejected, 0);
+		pg_atomic_init_u64(&cache->hits, 0);
+		pg_atomic_init_u64(&cache->misses, 0);
 		for (int i = 0; i < NODE_PARTITIONS; i++)
 			LWLockInitialize(&cache->locks[i].lock, LWTRANCHE_DOLT_NODE_MAPPING);
 		for (int i = 0; i < cache->nslots; i++)
@@ -259,9 +265,11 @@ dolt_node_cache_get(const uint8 *hash, Size *length)
 	if (!entry)
 	{
 		local_misses++;
+		unreported_misses++;
 		return NULL;
 	}
 	local_hits++;
+	unreported_hits++;
 	return copied;
 }
 
@@ -405,12 +413,28 @@ dolt_node_cache_add(const uint8 *hash, const uint8 *data, Size length)
 		pg_atomic_fetch_add_u64(&cache->rejected, 1);
 }
 
+/* Add this session's hits and misses to the server's; once per transaction. */
+void
+dolt_node_cache_report(void)
+{
+	if (!cache || (unreported_hits == 0 && unreported_misses == 0))
+		return;
+	pg_atomic_fetch_add_u64(&cache->hits, unreported_hits);
+	pg_atomic_fetch_add_u64(&cache->misses, unreported_misses);
+	unreported_hits = unreported_misses = 0;
+}
+
 void
 dolt_node_cache_stats(DoltNodeCacheStats *stats)
 {
 	memset(stats, 0, sizeof(*stats));
 	stats->hits = local_hits;
 	stats->misses = local_misses;
+	if (cache)
+	{
+		stats->total_hits = pg_atomic_read_u64(&cache->hits) + unreported_hits;
+		stats->total_misses = pg_atomic_read_u64(&cache->misses) + unreported_misses;
+	}
 	if (!cache)
 		return;
 	stats->added = pg_atomic_read_u64(&cache->added);
@@ -427,14 +451,14 @@ dolt_node_cache_stats(DoltNodeCacheStats *stats)
 	}
 }
 
-/* SQL: dolt_node_cache_stats(); hits and misses are this session's. */
+/* SQL: dolt_node_cache_stats(); hits and misses are this session's, total_ the server's. */
 Datum
 dolt_node_cache_stats_sql(PG_FUNCTION_ARGS)
 {
 	DoltNodeCacheStats stats;
 	TupleDesc	desc;
-	Datum		values[7];
-	bool		nulls[7] = {false};
+	Datum		values[9];
+	bool		nulls[9] = {false};
 
 	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
@@ -446,5 +470,7 @@ dolt_node_cache_stats_sql(PG_FUNCTION_ARGS)
 	values[4] = Int64GetDatum(stats.rejected);
 	values[5] = Int64GetDatum(stats.entries);
 	values[6] = Int64GetDatum(stats.bytes);
+	values[7] = Int64GetDatum(stats.total_hits);
+	values[8] = Int64GetDatum(stats.total_misses);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls)));
 }
