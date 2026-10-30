@@ -445,7 +445,7 @@ dolt_constraint_violations_table(PG_FUNCTION_ARGS)
 		return (Datum) 0;
 	}
 	t = diff_table_schema("WORKING", name);
-	run("SELECT v->>'type',decode(v->>'row','hex'),format('{\"Columns\":%s,\"Name\":%s}',(v->'info'->'Columns')::text,to_json(v->'info'->>'Name')::text) FROM jsonb_array_elements($1::jsonb->'violations') v WHERE v->>'table'=$2", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), CStringGetTextDatum(name)), NULL, true);
+	run("SELECT v->>'type',decode(v->>'row','hex'),CASE WHEN v->>'type'='foreign key' THEN v->>'info_text' ELSE format('{\"Columns\":%s,\"Name\":%s}',(v->'info'->'Columns')::text,to_json(v->'info'->>'Name')::text) END FROM jsonb_array_elements($1::jsonb->'violations') v WHERE v->>'table'=$2", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), CStringGetTextDatum(name)), NULL, true);
 	for (i = 0; i < SPI_processed; i++)
 	{
 		SPITupleTable *tuptable = SPI_tuptable;

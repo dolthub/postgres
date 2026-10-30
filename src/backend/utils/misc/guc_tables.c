@@ -19,6 +19,7 @@
  *--------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/doltversion.h"
 #include "catalog/catalogview.h"
 
 #ifdef HAVE_COPYFILE_H
@@ -813,6 +814,27 @@ struct config_bool ConfigureNamesBool[] =
 		&dolt_chunk_verify_hashes,
 		false,
 		NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_transaction_commit", PGC_USERSET, COMPAT_OPTIONS_OTHER,
+			gettext_noop("Create a version-control commit at SQL transaction commit."), NULL},
+		&dolt_transaction_commit,
+		false, NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_force_transaction_commit", PGC_USERSET, COMPAT_OPTIONS_OTHER,
+			gettext_noop("Allow publication of recorded merge constraint violations."), NULL},
+		&dolt_force_transaction_commit,
+		false, NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_allow_commit_conflicts", PGC_USERSET, COMPAT_OPTIONS_OTHER,
+			gettext_noop("Allow publication of recorded merge conflicts."), NULL},
+		&dolt_allow_commit_conflicts,
+		false, NULL, NULL, NULL
 	},
 
 	{
@@ -4234,6 +4256,55 @@ struct config_real ConfigureNamesReal[] =
 
 struct config_string ConfigureNamesString[] =
 {
+	{
+		{"dolt_transaction_commit_message", PGC_USERSET, COMPAT_OPTIONS_OTHER,
+			gettext_noop("Overrides version-control commit metadata."), NULL},
+		&dolt_transaction_commit_message,
+		"", NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_author_name", PGC_USERSET, COMPAT_OPTIONS_OTHER,
+			gettext_noop("Overrides version-control commit metadata."), NULL},
+		&dolt_author_name,
+		"", NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_author_email", PGC_USERSET, COMPAT_OPTIONS_OTHER,
+			gettext_noop("Overrides version-control commit metadata."), NULL},
+		&dolt_author_email,
+		"", NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_author_date", PGC_USERSET, COMPAT_OPTIONS_OTHER,
+			gettext_noop("Overrides version-control commit metadata."), NULL},
+		&dolt_author_date,
+		"", NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_committer_name", PGC_USERSET, COMPAT_OPTIONS_OTHER,
+			gettext_noop("Overrides version-control commit metadata."), NULL},
+		&dolt_committer_name,
+		"", NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_committer_email", PGC_USERSET, COMPAT_OPTIONS_OTHER,
+			gettext_noop("Overrides version-control commit metadata."), NULL},
+		&dolt_committer_email,
+		"", NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_committer_date", PGC_USERSET, COMPAT_OPTIONS_OTHER,
+			gettext_noop("Overrides version-control commit metadata."), NULL},
+		&dolt_committer_date,
+		"", NULL, NULL, NULL
+	},
+
 	{
 		{"archive_command", PGC_SIGHUP, WAL_ARCHIVING,
 			gettext_noop("Sets the shell command that will be called to archive a WAL file."),

@@ -16,6 +16,7 @@
  */
 
 #include "postgres.h"
+#include "access/doltversion.h"
 #include "catalog/catalogview.h"
 
 #include <time.h>
@@ -2272,6 +2273,9 @@ CommitTransaction(void)
 			break;
 	}
 
+	if (!is_parallel_worker)
+		dg_version_pre_commit();
+
 	/*
 	 * The remaining actions cannot call any user-defined code, so it's safe
 	 * to start shutting down within-transaction services.  But note that most
@@ -2555,6 +2559,7 @@ PrepareTransaction(void)
 			break;
 	}
 
+	dg_version_pre_prepare();
 	CallXactCallbacks(XACT_EVENT_PRE_PREPARE);
 
 	/*
