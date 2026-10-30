@@ -660,8 +660,12 @@ pl_scan(const PLTree *tree, const PLSlice *lower, const PLSlice *upper,
 	return status;
 }
 
+/*
+ * Check the subtree under |node|, all of whose keys must exceed |lower|. With
+ * |trust_backed|, a backed child's subtree is taken as valid once it fits.
+ */
 static PLStatus
-validate_node(PLStore *store, PLNode *node, const PLSlice *lower, uint64_t *rows)
+validate_node(PLStore *store, PLNode *node, const PLSlice *lower, bool trust_backed, uint64_t *rows)
 {
 	uint32_t	i;
 
@@ -696,7 +700,14 @@ validate_node(PLStore *store, PLNode *node, const PLSlice *lower, uint64_t *rows
 		if (!child || child->level + 1 != node->level || !child->count ||
 			pl_compare(pl_node_key(child, child->count - 1), upper) != 0)
 			return PL_CORRUPT;
-		status = validate_node(store, child, child_lower, &child_rows);
+		if (trust_backed && child->backed)
+		{
+			status = child_lower && pl_compare(pl_node_key(child, 0), *child_lower) <= 0 ?
+				PL_CORRUPT : PL_OK;
+			child_rows = pl_node_rows(child);
+		}
+		else
+			status = validate_node(store, child, child_lower, trust_backed, &child_rows);
 		if (status != PL_OK || child_rows != expected_rows ||
 			UINT64_MAX - *rows < child_rows)
 			return PL_CORRUPT;
@@ -705,8 +716,8 @@ validate_node(PLStore *store, PLNode *node, const PLSlice *lower, uint64_t *rows
 	return PL_OK;
 }
 
-PLStatus
-pl_validate(const PLTree *tree)
+static PLStatus
+validate_tree(const PLTree *tree, bool trust_backed)
 {
 	PLNode	   *root;
 	uint64_t	rows;
@@ -716,21 +727,41 @@ pl_validate(const PLTree *tree)
 	root = pl_find(tree->store, tree->root);
 	if (!root)
 		return PL_CORRUPT;
-	return validate_node(tree->store, root, NULL, &rows);
+	if (trust_backed && root->backed)
+		return PL_OK;
+	return validate_node(tree->store, root, NULL, trust_backed, &rows);
 }
 
 PLStatus
-pl_open(PLStore *store, PLHash root, PLTree *out)
+pl_validate(const PLTree *tree)
+{
+	return validate_tree(tree, false);
+}
+
+static PLStatus
+open_tree(PLStore *store, PLHash root, bool trust_backed, PLTree *out)
 {
 	PLTree		candidate = {store, root};
 	PLStatus	status;
 
 	if (!out)
 		return PL_INVALID;
-	status = pl_validate(&candidate);
+	status = validate_tree(&candidate, trust_backed);
 	if (status == PL_OK)
 		*out = candidate;
 	return status;
+}
+
+PLStatus
+pl_open(PLStore *store, PLHash root, PLTree *out)
+{
+	return open_tree(store, root, false, out);
+}
+
+PLStatus
+pl_open_imported(PLStore *store, PLHash root, PLTree *out)
+{
+	return open_tree(store, root, true, out);
 }
 
 uint64_t

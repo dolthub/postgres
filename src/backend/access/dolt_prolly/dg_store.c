@@ -33,6 +33,7 @@
 #include "dg.h"
 #include "nodes/tidbitmap.h"
 #include "access/doltchunk.h"
+#include "access/doltnode.h"
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/parallel.h"
@@ -277,10 +278,20 @@ StaticAssertDecl(PL_HASH_SIZE == DOLT_CHUNK_HASH_SIZE, "prolly and chunk store h
 
 static uint64 store_epoch = 1;	/* moves when the working store is recreated */
 
-/* Parsed nodes kept across transactions, at most. */
+/* Nodes of the working store's own kept across transactions, at most. */
 #define DG_NODE_CACHE_BYTES ((size_t) 64 * 1024 * 1024)
 static DoltChunkStore *working_chunks;
 static DoltChunk working_fetched;
+
+/* Private stores borrowing nodes, whose loans transaction end returns. */
+static PLStore **private_stores;
+static int	private_count;
+static int	private_capacity;
+
+/* Nodes this transaction wrote, to share once it commits. */
+static PLHash *written;
+static int	written_count;
+static int	written_capacity;
 
 /* Open the read handle under the top transaction, so subtransaction rollback
  * cannot close it underneath the working store. */
@@ -336,6 +347,40 @@ fetch_chunk(void *arg, PLHash hash, PLSlice *bytes)
 	return PL_OK;
 }
 
+/*
+ * Lend node |hash| from the shared node cache, adding it from the chunk store
+ * on a miss. A node the cache cannot take is lent as transient bytes, which
+ * the store copies and checks.
+ */
+static PLStatus
+lend_node(void *arg, PLHash hash, PLLoan *loan)
+{
+	DoltNodeLoan cached;
+
+	if (!dolt_node_cache_borrow(hash.bytes, &cached))
+	{
+		PLSlice		bytes;
+
+		fetch_chunk(arg, hash, &bytes);
+		if (!pl_node_check(bytes) || !dolt_node_cache_add(hash.bytes, bytes.data, bytes.len, &cached))
+		{
+			loan->bytes = bytes;
+			loan->token = 0;
+			return PL_OK;
+		}
+	}
+	loan->bytes.data = cached.data;
+	loan->bytes.len = cached.length;
+	loan->token = cached.token;
+	return PL_OK;
+}
+
+static void
+return_node(void *arg, uintptr_t token)
+{
+	dolt_node_cache_return(token);
+}
+
 PLStore *
 dg_working_store(void)
 {
@@ -344,10 +389,61 @@ dg_working_store(void)
 		working_store = pl_store_create();
 		if (!working_store)
 			ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("out of memory creating prolly store")));
-		pl_store_set_fetch(working_store, fetch_chunk, NULL);
+		pl_store_set_lender(working_store, lend_node, return_node, NULL);
 		store_epoch++;
 	}
 	return working_store;
+}
+
+/*
+ * A store of the caller's own that reads nodes through the shared node cache,
+ * as the working store does. Its loans are returned when each transaction
+ * ends, so it may outlive one; free it with dg_private_store_free.
+ */
+PLStore *
+dg_private_store(void)
+{
+	PLStore    *store = pl_store_create();
+
+	if (!store)
+		ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("out of memory creating prolly store")));
+	if (private_count == private_capacity)
+	{
+		int			capacity = private_capacity ? private_capacity * 2 : 8;
+
+		private_stores = private_stores ?
+			repalloc(private_stores, capacity * sizeof(PLStore *)) :
+			MemoryContextAlloc(TopMemoryContext, capacity * sizeof(PLStore *));
+		private_capacity = capacity;
+	}
+	pl_store_set_lender(store, lend_node, return_node, NULL);
+	private_stores[private_count++] = store;
+	return store;
+}
+
+void
+dg_private_store_free(PLStore *store)
+{
+	for (int i = 0; i < private_count; i++)
+		if (private_stores[i] == store)
+		{
+			private_stores[i] = private_stores[--private_count];
+			break;
+		}
+	pl_store_free(store);
+}
+
+/* Share the nodes this transaction wrote, now that it has committed. */
+static void
+share_written(void)
+{
+	for (int i = 0; working_store && i < written_count; i++)
+	{
+		PLNode	   *node = pl_find_local(working_store, written[i]);
+
+		if (node && !node->loan)
+			dolt_node_cache_add(node->hash.bytes, node->data, node->size, NULL);
+	}
 }
 
 static void
@@ -464,6 +560,16 @@ persist_roots(const Roots *roots)
 		}
 		dolt_chunk_put_many(chunks, pending.count, hashes, data, lengths);
 		dolt_chunk_close(chunks);
+		if (written_count + pending.count > written_capacity)
+		{
+			int			capacity = Max(written_count + pending.count, written_capacity * 2);
+
+			written = written ? repalloc(written, capacity * sizeof(PLHash)) :
+				MemoryContextAlloc(TopTransactionContext, capacity * sizeof(PLHash));
+			written_capacity = capacity;
+		}
+		for (int i = 0; i < pending.count; i++)
+			written[written_count++] = pending.nodes[i]->hash;
 		pfree(hashes);
 		pfree(data);
 		pfree(lengths);
@@ -962,13 +1068,21 @@ store_xact(XactEvent event, void *arg)
 			live_states = NULL;
 			live_count = live_capacity = 0;
 			collect_threshold = DG_COLLECT_MINIMUM;
+
 			/*
-			 * Parsed nodes are content-addressed, so those the chunk store
-			 * holds stay valid for the next transaction: keep them, up to a
-			 * bound, and drop only this transaction's own unwritten nodes.
+			 * Borrowed nodes go back to the shared cache, so that no idle
+			 * session pins it. Parsed nodes are content-addressed, so those
+			 * the chunk store holds stay valid for the next transaction: keep
+			 * the store's own, up to a bound, and drop only this
+			 * transaction's unwritten nodes.
 			 */
+			if (event == XACT_EVENT_COMMIT)
+				share_written();
+			for (int i = 0; i < private_count; i++)
+				pl_store_return_loans(private_stores[i]);
 			if (working_store)
 			{
+				pl_store_return_loans(working_store);
 				pl_store_drop_unbacked(working_store);
 				if (pl_store_stats(working_store).bytes > DG_NODE_CACHE_BYTES)
 				{
@@ -976,6 +1090,8 @@ store_xact(XactEvent event, void *arg)
 					working_store = NULL;
 				}
 			}
+			written = NULL;		/* in TopTransactionContext */
+			written_count = written_capacity = 0;
 			break;
 		default:
 			break;

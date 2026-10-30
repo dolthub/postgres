@@ -52,5 +52,6 @@ tests += {
     't/042_trigger_record.pl',
     't/043_sequences.pl', 't/044_sequence_definitions.pl',
     't/044_branch_statistics.pl',
+    't/045_node_cache.pl',
   ]},
 }

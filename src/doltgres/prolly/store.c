@@ -159,6 +159,33 @@ pl_store_create(void)
 	return store;
 }
 
+/* Free a node unlinked from |store|, returning its data if lent. */
+static void
+free_node(PLStore *store, PLNode *node)
+{
+	if (node->loan)
+		store->give_back(store->lend_arg, node->loan);
+	else
+		free(node->data);
+	free(node);
+}
+
+/* Unlink |node| from its bucket and free it. */
+static void
+remove_node(PLStore *store, PLNode *node)
+{
+	PLNode	  **link = &store->buckets[pl_read64(node->hash.bytes) % store->capacity];
+
+	while (*link != node)
+		link = &(*link)->next;
+	*link = node->next;
+	store->stats.chunks--;
+	store->stats.bytes -= node->size;
+	if (node->loan)
+		store->stats.borrowed--;
+	free_node(store, node);
+}
+
 void
 pl_store_free(PLStore *store)
 {
@@ -174,8 +201,7 @@ pl_store_free(PLStore *store)
 		{
 			PLNode	   *next = node->next;
 
-			free(node->data);
-			free(node);
+			free_node(store, node);
 			node = next;
 		}
 	}
@@ -183,6 +209,7 @@ pl_store_free(PLStore *store)
 		close(store->fd);
 	free(store->buckets);
 	free(store->unbacked);
+	free(store->loaned);
 	free(store);
 }
 
@@ -197,18 +224,10 @@ pl_store_drop_unbacked(PLStore *store)
 	for (size_t i = 0; i < store->unbacked_count; i++)
 	{
 		PLNode	   *node = store->unbacked[i];
-		PLNode	  **link;
 
 		if (node->backed)
 			continue;
-		link = &store->buckets[pl_read64(node->hash.bytes) % store->capacity];
-		while (*link != node)
-			link = &(*link)->next;
-		*link = node->next;
-		store->stats.chunks--;
-		store->stats.bytes -= node->size;
-		free(node->data);
-		free(node);
+		remove_node(store, node);
 		freed++;
 	}
 	store->unbacked_count = 0;
@@ -275,6 +294,11 @@ pl_store_retain(PLStore *store, const PLHash *roots, size_t count)
 				store->unbacked[kept++] = store->unbacked[i];
 			}
 		store->unbacked_count = kept;
+		kept = 0;
+		for (size_t i = 0; i < store->loaned_count; i++)
+			if (store->loaned[i]->marked)
+				store->loaned[kept++] = store->loaned[i];
+		store->loaned_count = kept;
 	}
 	for (size_t i = 0; i < store->capacity; i++)
 	{
@@ -293,12 +317,33 @@ pl_store_retain(PLStore *store, const PLHash *roots, size_t count)
 			*link = node->next;
 			store->stats.chunks--;
 			store->stats.bytes -= node->size;
-			free(node->data);
-			free(node);
+			if (node->loan)
+				store->stats.borrowed--;
+			free_node(store, node);
 			freed++;
 		}
 	}
 	return freed;
+}
+
+size_t
+pl_store_return_loans(PLStore *store)
+{
+	size_t		returned;
+
+	if (!store)
+		return 0;
+	returned = store->loaned_count;
+	for (size_t i = 0; i < returned; i++)
+		remove_node(store, store->loaned[i]);
+	store->loaned_count = 0;
+	if (store->loaned_capacity > 4096)
+	{
+		free(store->loaned);
+		store->loaned = NULL;
+		store->loaned_capacity = 0;
+	}
+	return returned;
 }
 
 /*
@@ -373,6 +418,7 @@ pl_find_local(PLStore *store, PLHash hash)
 }
 
 static PLStatus store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, bool backed, PLNode **out);
+static PLStatus store_loan(PLStore *store, PLHash hash, PLLoan loan, PLNode **out);
 
 PLNode *
 pl_find(PLStore *store, PLHash hash)
@@ -380,8 +426,22 @@ pl_find(PLStore *store, PLHash hash)
 	PLNode	   *node = pl_find_local(store, hash);
 	PLSlice		bytes;
 
-	if (node || !store || !store->fetch)
+	if (node || !store)
 		return node;
+	if (store->lend)
+	{
+		PLLoan		loan = {{NULL, 0}, 0};
+
+		if (store->lend(store->lend_arg, hash, &loan) != PL_OK)
+			return NULL;
+		if (loan.token ? store_loan(store, hash, loan, &node) != PL_OK :
+			store_buffer(store, hash, loan.bytes.data, loan.bytes.len, true, &node) != PL_OK)
+			return NULL;
+		store->stats.fetched++;
+		return node;
+	}
+	if (!store->fetch)
+		return NULL;
 	if (store->fetch(store->fetch_arg, hash, &bytes) != PL_OK ||
 		store_buffer(store, hash, bytes.data, bytes.len, true, &node) != PL_OK)
 		return NULL;
@@ -394,6 +454,14 @@ pl_store_set_fetch(PLStore *store, PLFetchFn fetch, void *arg)
 {
 	store->fetch = fetch;
 	store->fetch_arg = arg;
+}
+
+void
+pl_store_set_lender(PLStore *store, PLLendFn lend, PLReturnFn give_back, void *arg)
+{
+	store->lend = lend;
+	store->give_back = give_back;
+	store->lend_arg = arg;
 }
 
 /* The width of a directory offset for keys and values of these sizes. */
@@ -544,6 +612,17 @@ pl_node_rows(const PLNode *node)
 	return rows;
 }
 
+/* Decode a node's header; enough to read a node whose encoding is known good. */
+static void
+parse_header(PLNode *node)
+{
+	node->level = pl_read32(node->data + 8);
+	node->count = pl_read32(node->data + 12);
+	node->key_bytes = pl_read32(node->data + 16);
+	node->value_bytes = pl_read32(node->data + 20);
+	node->offset_width = (uint8_t) offset_width(node->key_bytes, node->value_bytes);
+}
+
 /* Decode metadata only after all offsets have been checked against buffer bounds. */
 static PLStatus
 parse_node(PLNode *node)
@@ -556,15 +635,11 @@ parse_node(PLNode *node)
 
 	if (node->size < PL_HEADER || memcmp(node->data, node_magic, 8) != 0)
 		return PL_CORRUPT;
-	node->level = pl_read32(node->data + 8);
-	node->count = pl_read32(node->data + 12);
-	node->key_bytes = pl_read32(node->data + 16);
-	node->value_bytes = pl_read32(node->data + 20);
+	parse_header(node);
 	if (node->level >= PL_MAX_DEPTH || node->count > PL_MAX_ENTRIES ||
 		(node->level && !node->count))
 		return PL_CORRUPT;
-	width = offset_width(node->key_bytes, node->value_bytes);
-	node->offset_width = (uint8_t) width;
+	width = node->offset_width;
 	directory = PL_HEADER + directory_size(node->count, width);
 	if (directory + (uint64_t) node->key_bytes + node->value_bytes != node->size)
 		return PL_CORRUPT;
@@ -603,11 +678,122 @@ parse_node(PLNode *node)
 	return PL_OK;
 }
 
+bool
+pl_node_check(PLSlice bytes)
+{
+	PLNode		node = {0};
+
+	if (!bytes.data)
+		return false;
+	node.data = (uint8_t *) bytes.data;
+	node.size = bytes.len;
+	return parse_node(&node) == PL_OK;
+}
+
+/* Make room to add a node to |store|: buckets for it, and a list slot if unbacked. */
+static PLStatus
+store_reserve(PLStore *store, bool backed)
+{
+	if (store->stats.chunks >= store->capacity * 2)
+	{
+		size_t		capacity = store->capacity * 2,
+					bucket,
+					i;
+		PLNode	  **buckets = calloc(capacity, sizeof(*buckets));
+
+		if (!buckets)
+			return PL_NOMEM;
+		for (i = 0; i < store->capacity; i++)
+		{
+			PLNode	   *current = store->buckets[i];
+
+			while (current)
+			{
+				PLNode	   *next = current->next;
+
+				bucket = pl_read64(current->hash.bytes) % capacity;
+				current->next = buckets[bucket];
+				buckets[bucket] = current;
+				current = next;
+			}
+		}
+		free(store->buckets);
+		store->buckets = buckets;
+		store->capacity = capacity;
+	}
+	if (!backed && store->unbacked_count == store->unbacked_capacity)
+	{
+		size_t		capacity = store->unbacked_capacity ? store->unbacked_capacity * 2 : 64;
+		PLNode	  **grown = realloc(store->unbacked, capacity * sizeof(*grown));
+
+		if (!grown)
+			return PL_NOMEM;
+		store->unbacked = grown;
+		store->unbacked_capacity = capacity;
+	}
+	return PL_OK;
+}
+
+/* Add a node to |store|, after store_reserve. */
+static void
+store_link(PLStore *store, PLNode *node, bool backed)
+{
+	size_t		bucket = pl_read64(node->hash.bytes) % store->capacity;
+
+	node->next = store->buckets[bucket];
+	store->buckets[bucket] = node;
+	store->stats.chunks++;
+	store->stats.bytes += node->size;
+	node->backed = backed;
+	if (!backed)
+	{
+		node->unbacked_slot = store->unbacked_count;
+		store->unbacked[store->unbacked_count++] = node;
+	}
+}
+
+/* Add a node reading lent bytes in place; the loan is returned on failure. */
+static PLStatus
+store_loan(PLStore *store, PLHash hash, PLLoan loan, PLNode **out)
+{
+	PLNode	   *node = NULL;
+	PLStatus	status = PL_NOMEM;
+
+	if (store->loaned_count == store->loaned_capacity)
+	{
+		size_t		capacity = store->loaned_capacity ? store->loaned_capacity * 2 : 64;
+		PLNode	  **grown = realloc(store->loaned, capacity * sizeof(*grown));
+
+		if (!grown)
+			goto fail;
+		store->loaned = grown;
+		store->loaned_capacity = capacity;
+	}
+	node = calloc(1, sizeof(*node));
+	if (!node || (status = store_reserve(store, true)) != PL_OK)
+		goto fail;
+	node->data = (uint8_t *) loan.bytes.data;
+	node->size = loan.bytes.len;
+	node->hash = hash;
+	node->loan = loan.token;
+	parse_header(node);
+	store_link(store, node, true);
+	store->loaned[store->loaned_count++] = node;
+	store->stats.borrowed++;
+	*out = node;
+	return PL_OK;
+
+fail:
+	free(node);
+	store->give_back(store->lend_arg, loan.token);
+	return status;
+}
+
 static PLStatus
 store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, bool backed, PLNode **out)
 {
 	PLNode	   *node = pl_find_local(store, hash);
-	size_t		bucket;
+	PLStatus	status;
 
 	if (!store)
 		return PL_INVALID;
@@ -639,73 +825,20 @@ store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, b
 		free(node);
 		return PL_CORRUPT;
 	}
-	if (store->stats.chunks >= store->capacity * 2)
-	{
-		size_t		capacity = store->capacity * 2,
-					i;
-		PLNode	  **buckets = calloc(capacity, sizeof(*buckets));
-
-		if (!buckets)
-		{
-			free(node->data);
-			free(node);
-			return PL_NOMEM;
-		}
-		for (i = 0; i < store->capacity; i++)
-		{
-			PLNode	   *current = store->buckets[i];
-
-			while (current)
-			{
-				PLNode	   *next = current->next;
-
-				bucket = pl_read64(current->hash.bytes) % capacity;
-				current->next = buckets[bucket];
-				buckets[bucket] = current;
-				current = next;
-			}
-		}
-		free(store->buckets);
-		store->buckets = buckets;
-		store->capacity = capacity;
-	}
-	if (!backed && store->unbacked_count == store->unbacked_capacity)
-	{
-		size_t		capacity = store->unbacked_capacity ? store->unbacked_capacity * 2 : 64;
-		PLNode	  **grown = realloc(store->unbacked, capacity * sizeof(*grown));
-
-		if (!grown)
-		{
-			free(node->data);
-			free(node);
-			return PL_NOMEM;
-		}
-		store->unbacked = grown;
-		store->unbacked_capacity = capacity;
-	}
-	if (store->fd >= 0 && !store->loading)
+	status = store_reserve(store, backed);
+	if (status == PL_OK && store->fd >= 0 && !store->loading)
 	{
 		PLSlice		data = {bytes, length};
-		PLStatus	status = pl_file_append(store, hash, data);
 
-		if (status != PL_OK)
-		{
-			free(node->data);
-			free(node);
-			return status;
-		}
+		status = pl_file_append(store, hash, data);
 	}
-	bucket = pl_read64(hash.bytes) % store->capacity;
-	node->next = store->buckets[bucket];
-	store->buckets[bucket] = node;
-	store->stats.chunks++;
-	store->stats.bytes += length;
-	node->backed = backed;
-	if (!backed)
+	if (status != PL_OK)
 	{
-		node->unbacked_slot = store->unbacked_count;
-		store->unbacked[store->unbacked_count++] = node;
+		free(node->data);
+		free(node);
+		return status;
 	}
+	store_link(store, node, backed);
 	*out = node;
 	return PL_OK;
 }

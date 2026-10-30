@@ -28,7 +28,7 @@
 typedef struct PLNode
 {
 	PLHash		hash;
-	uint8_t    *data;
+	uint8_t    *data;			/* owned, unless lent */
 	size_t		size;
 	uint32_t	level;
 	uint32_t	count;
@@ -39,6 +39,7 @@ typedef struct PLNode
 	bool		marked;			/* reachable, during pl_store_retain */
 	uint32_t	pins;			/* holders keeping it until written, across pl_store_drop_unbacked */
 	size_t		unbacked_slot;	/* position in the store's unbacked list, while listed */
+	uintptr_t	loan;			/* token for lent data, else 0 */
 	struct PLNode *next;
 } PLNode;
 
@@ -58,6 +59,12 @@ struct PLStore
 	void	   *write_arg;
 	PLFetchFn	fetch;
 	void	   *fetch_arg;
+	PLLendFn	lend;
+	PLReturnFn	give_back;
+	void	   *lend_arg;
+	PLNode	  **loaned;			/* nodes reading lent data */
+	size_t		loaned_count;
+	size_t		loaned_capacity;
 };
 
 PLStatus	pl_file_append(PLStore *store, PLHash hash, PLSlice bytes);

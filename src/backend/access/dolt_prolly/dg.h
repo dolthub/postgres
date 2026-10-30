@@ -172,6 +172,8 @@ extern bool dg_batch_blocks_handle(DGBatch *batch, PLHash digest, uint64 handle)
 extern void dg_batch_finish(Relation rel);
 extern DGState *dg_batch_load(Relation rel);
 extern PLStore *dg_working_store(void);
+extern PLStore *dg_private_store(void);
+extern void dg_private_store_free(PLStore *store);
 extern void dg_collect(void);
 extern bool dg_version_call_active(void);
 extern bool dg_native_rewrite_active(void);

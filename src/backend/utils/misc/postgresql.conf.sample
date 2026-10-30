@@ -146,6 +146,8 @@
 #autovacuum_work_mem = -1		# min 64kB, or -1 to use maintenance_work_mem
 #logical_decoding_work_mem = 64MB	# min 64kB
 #dolt_chunk_cache_size = 256MB		# per-session prolly chunk cache, 0 disables
+#dolt_node_cache_size = 128MB		# prolly nodes shared by sessions, 0 disables
+					# (change requires restart)
 #dolt_schema_cache_size = 32MB		# per-session decoded schema cache
 #dolt_shared_schema_cache_size = 16MB	# decoded schemas shared by sessions, 0 disables
 #dolt_catalog_cache_entries = 16	# decoded revision catalog views retained per session

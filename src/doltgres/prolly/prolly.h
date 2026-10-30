@@ -67,6 +67,7 @@ typedef struct PLStats
 	uint64_t	reused;
 	uint64_t	skipped;
 	uint64_t	fetched;
+	size_t		borrowed;		/* nodes read in place from a lender */
 } PLStats;
 
 typedef PLStatus (*PLScanFn) (void *arg, PLSlice key, PLSlice value);
@@ -88,6 +89,23 @@ typedef PLStatus (*PLBeforeWriteFn) (void *arg, PLHash hash, PLSlice bytes);
  */
 typedef PLStatus (*PLFetchFn) (void *arg, PLHash hash, PLSlice *bytes);
 
+/*
+ * A node lent to a store by a cache outside it. With a nonzero token, the bytes
+ * stay valid and unchanged until the store returns the token, and the lender
+ * has checked their encoding (pl_node_check); the store reads them in place.
+ * With a zero token, they last only until the lender's next call, and the store
+ * copies and checks them, as it does fetched bytes.
+ */
+typedef struct PLLoan
+{
+	PLSlice		bytes;
+	uintptr_t	token;
+} PLLoan;
+
+/* Lend the node |hash| missing from a store; PL_NOT_FOUND if the backing store lacks it. */
+typedef PLStatus (*PLLendFn) (void *arg, PLHash hash, PLLoan *loan);
+typedef void (*PLReturnFn) (void *arg, uintptr_t token);
+
 /* File open loads all chunks, locks exclusively, and leaves out unchanged on error.
  * repair_tail permits truncating an incomplete final record for subsequent replay.
  * sync is explicit; free does not promise durability. Root refs are external.
@@ -102,6 +120,18 @@ void		pl_store_free(PLStore *store);
 
 /* Load missing nodes on demand. Fetched nodes are marked as backed. */
 void		pl_store_set_fetch(PLStore *store, PLFetchFn fetch, void *arg);
+
+/*
+ * Borrow missing nodes from a lender instead, as backed nodes; a store with a
+ * lender never fetches. Returning the loans drops every borrowed node, which
+ * later finds borrow again; freeing or retaining the store returns the loans
+ * of the nodes it frees.
+ */
+void		pl_store_set_lender(PLStore *store, PLLendFn lend, PLReturnFn give_back, void *arg);
+size_t		pl_store_return_loans(PLStore *store);
+
+/* Whether |bytes| are a well-formed node encoding, as a store checks fetched bytes. */
+bool		pl_node_check(PLSlice bytes);
 size_t		pl_store_drop_unbacked(PLStore *store);
 PLStats		pl_store_stats(const PLStore *store);
 
@@ -119,6 +149,12 @@ PLStatus	pl_store_export(PLStore *store, PLHash hash, PLSlice *bytes);
 /* Import checks hash and local encoding. pl_open also validates the whole DAG. */
 PLStatus	pl_store_import(PLStore *store, PLHash hash, PLSlice bytes);
 PLStatus	pl_open(PLStore *store, PLHash root, PLTree *out);
+
+/*
+ * As pl_open, for a tree imported in part over a backing store: the subtree
+ * of a node the backing store holds is trusted once it fits its parent.
+ */
+PLStatus	pl_open_imported(PLStore *store, PLHash root, PLTree *out);
 PLStatus	pl_validate(const PLTree *tree);
 
 /* Bulk input and edits must be strictly ordered by unsigned byte comparison. */
