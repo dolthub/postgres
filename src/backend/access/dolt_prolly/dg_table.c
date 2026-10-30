@@ -1268,14 +1268,6 @@ estimate(Relation rel, int32 *widths, BlockNumber *pages, double *tuples, double
 	*pages = (BlockNumber) Min((double) MaxBlockNumber,
 		Max(1.0, ceil(bytes / BLCKSZ)));
 
-	/*
-	 * A prolly table is never analyzed, so nothing corrects an estimate the
-	 * planner makes from a small table's exact size. Count a small table as
-	 * a thousand rows, as before exact counts, so that plans over small tables
-	 * keep using their indexes.
-	 */
-	*tuples = Max(*tuples, 1000);
-
 	/* Index entries are versioned with the rows: index-only scans fetch nothing. */
 	*allvis = 1;
 	release_state(rel, state);
@@ -1304,6 +1296,7 @@ validate_alter(Relation rel, struct AlterTableCmd *cmd)
 		(cmd->subtype == AT_AlterConstraint || cmd->subtype == AT_SetStatistics || cmd->subtype == AT_SetOptions ||
 		 cmd->subtype == AT_ResetOptions || cmd->subtype == AT_SetStorage || cmd->subtype == AT_SetCompression ||
 		 cmd->subtype == AT_SetNotNull || cmd->subtype == AT_DropNotNull || cmd->subtype == AT_AddColumn || cmd->subtype == AT_DropColumn || cmd->subtype == AT_ColumnDefault || cmd->subtype == AT_CookedColumnDefault || cmd->subtype == AT_AddConstraint || cmd->subtype == AT_DropConstraint || cmd->subtype == AT_ValidateConstraint || cmd->subtype == AT_AlterColumnType ||
+		 cmd->subtype == AT_AddInherit || cmd->subtype == AT_DropInherit ||
 		 cmd->subtype == AT_AddIdentity || cmd->subtype == AT_SetIdentity || cmd->subtype == AT_DropIdentity))
 		return;
 

@@ -15,6 +15,7 @@ extern bool dg_catalog_active(void);
 extern void dg_roots_published(void);
 extern bool dg_catalog_refs_current(List *refs);
 extern void dg_catalog_session_dependency(List **refs);
+extern bool dg_catalog_schema_object_ddl(struct ParseState *pstate, Node *statement);
 extern bool dg_catalog_routine_ddl(struct ParseState *pstate, Node *statement);
 extern bool dg_catalog_trigger_ddl(struct ParseState *pstate, Node *statement);
 extern bool dg_catalog_sequence_retained(Relation rel, int64 *last, bool *called);
@@ -63,6 +64,8 @@ extern Oid	dg_identity_storage(Oid oid);
 extern bytea *dg_catalog_durable_content(Oid oid);
 extern bytea *dg_catalog_revision_content(Oid handle);
 extern bool dg_relation_analyzable(Relation rel);
+extern void dg_store_relation_stats(Oid relid, double rows);
+extern void dg_remove_relation_stats(Oid relid);
 extern List *dg_identity_relations(const char *branch);
 extern int	dg_acquire_sample_rows(Relation rel, int elevel, HeapTuple *rows, int targrows,
 								   double *totalrows, double *totaldeadrows);

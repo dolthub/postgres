@@ -319,7 +319,7 @@ diff_object_revision(const char *revision, const char *name, bool rows)
 		db = read_ref(branch_ref("working")).target;
 	if (!db)
 		return diff_table_absent(name);
-	run("SELECT o.objkind,o.objchildren[1] FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible o ON o.objhash=ch WHERE d.objhash=$1 AND o.objkind IN ('table','routine','view','type','trigger','sequence') AND convert_from(o.objpayload,'UTF8')::jsonb->>'name'=$2", 2,
+	run("SELECT o.objkind,o.objchildren[1] FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible o ON o.objhash=ch WHERE d.objhash=$1 AND o.objkind IN ('table','routine','view','type','trigger','sequence','aggregate','operator','cast') AND convert_from(o.objpayload,'UTF8')::jsonb->>'name'=$2", 2,
 		VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
 	if (!SPI_processed)
 		return diff_table_absent(name);
@@ -1605,7 +1605,7 @@ changed_diff_objects(const char *a, const char *b, int *count)
 	char	  **names;
 	int			i;
 
-	run("WITH a AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence')), b AS (SELECT v FROM jsonb_array_elements($2::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence')) SELECT DISTINCT coalesce(a.v->>'name',b.v->>'name') COLLATE \"C\" FROM a FULL JOIN b ON a.v->>'name'=b.v->>'name' AND a.v->>'kind'=b.v->>'kind' WHERE a.v IS NULL OR b.v IS NULL OR a.v->>'content' IS DISTINCT FROM b.v->>'content' OR a.v->>'schema' IS DISTINCT FROM b.v->>'schema' ORDER BY 1", 2,
+	run("WITH a AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence','aggregate','operator','cast')), b AS (SELECT v FROM jsonb_array_elements($2::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence','aggregate','operator','cast')) SELECT DISTINCT coalesce(a.v->>'name',b.v->>'name') COLLATE \"C\" FROM a FULL JOIN b ON a.v->>'name'=b.v->>'name' AND a.v->>'kind'=b.v->>'kind' WHERE a.v IS NULL OR b.v IS NULL OR a.v->>'content' IS DISTINCT FROM b.v->>'content' OR a.v->>'schema' IS DISTINCT FROM b.v->>'schema' ORDER BY 1", 2,
 		VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(a), CStringGetTextDatum(b)), NULL, true);
 	*count = SPI_processed;
 	names = palloc(sizeof(char *) * Max(*count, 1));

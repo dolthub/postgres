@@ -1088,6 +1088,17 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 				appendStringInfoChar(&schema_remaining, ',');
 			appendStringInfoString(&schema_remaining, records[i]);
 		}
+		else if (theirs && json_value(records[i], "inheritance_group"))
+		{
+			JsonbValue document = json_document(records[i]), names;
+			List *group = NIL;
+			bytea *source = child((bytea *) DatumGetPointer(parents[1]), 1);
+
+			json_get(&document, "inheritance_group", &names);
+			for (int j = 0; j < json_length(&names); j++)
+				group = lappend(group, json_item_text(&names, j));
+			replace_working(dg_current_branch(), compose_database(capture(true).hash, source, group), group);
+		}
 		else if (theirs || !strcmp(json_value(records[i], "kind"), "sequence"))
 			restore_table(child((bytea *) DatumGetPointer(parents[theirs ? 1 : 0]), 1), name);
 	}

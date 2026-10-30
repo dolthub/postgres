@@ -1,5 +1,13 @@
 /* Native version-control command slice; see doc/doltgres/version-commands.md. */
 #include "dg.h"
+#include "access/dolttransport.h"
+#include "postmaster/bgworker.h"
+#include "storage/dsm.h"
+#include "storage/fd.h"
+#include "storage/ipc.h"
+#include "libpq/pqsignal.h"
+#include "common/file_perm.h"
+#include "catalog/pg_database_d.h"
 #include "utils/jsonb.h"
 #include "utils/numeric.h"
 #include "nodes/makefuncs.h"
@@ -66,6 +74,8 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_description.h"
 #include "catalog/pg_operator.h"
+#include "catalog/pg_aggregate.h"
+#include "commands/extension.h"
 #include "catalog/pg_range.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_type_d.h"
@@ -149,6 +159,7 @@ static bool canonical_drop(Node *statement);
 static void stage_tables(List *tables);
 static void stage_modified_tables(void);
 static void replace_working(const char *branch, bytea *database, List *tables);
+static bytea *compose_database(bytea *base, bytea *source, List *tables);
 static void merge_databases(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts, StringInfo violations,
 							StringInfo schema_conflicts);
 static PLTree remap_rows(Relation rel, PLTree content, const char *definition, List *dropped, bool *lacks);
@@ -706,6 +717,7 @@ static JsonbValue json_document(const char *json);
 static bool json_get(JsonbValue *object, const char *key, JsonbValue *result);
 static int	json_length(JsonbValue *array);
 static JsonbValue json_element(JsonbValue *array, int index);
+static char *json_item_text(JsonbValue *array, int index);
 static char *json_field_text(JsonbValue *object, const char *key);
 static Node **schema_defaults(const char *definition, int *count);
 static Constraint **schema_constraints(const char *definition, int *count);
@@ -736,6 +748,7 @@ canonical_database(const char *json, Datum *members, int count)
 #include "dg_expression_codec.inc"
 #include "dg_foreign_codec.inc"
 #include "dg_routine_codec.inc"
+#include "dg_schema_object_codec.inc"
 #include "dg_sequence_codec.inc"
 #include "dg_type_codec.inc"
 #include "dg_dependents.inc"
@@ -809,7 +822,7 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 			if (persist)
 				members[i] = PointerGetDatum(object_member("sequence", definition));
 		}
-		else if (!strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger") || !strcmp(kinds[i], "type") || !strcmp(kinds[i], "view"))
+		else if (schema_object_class(kinds[i]) || !strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger") || !strcmp(kinds[i], "type") || !strcmp(kinds[i], "view"))
 			appendStringInfoString(&json, payload);
 		else
 		{
@@ -1903,7 +1916,7 @@ dolt_diff_summary(PG_FUNCTION_ARGS)
 			table = "";
 	}
 
-	run("WITH a AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence')),b AS (SELECT v FROM jsonb_array_elements($2::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence')),d AS (SELECT a.v av,b.v bv FROM a FULL JOIN b ON a.v->>'name'=b.v->>'name' AND a.v->>'kind'=b.v->>'kind') SELECT coalesce(av->>'name',''),coalesce(bv->>'name',''),CASE WHEN av IS NULL THEN 'added' WHEN bv IS NULL THEN 'dropped' ELSE 'modified' END,CASE WHEN coalesce(av->>'kind',bv->>'kind')='table' THEN (av->>'content') IS DISTINCT FROM (bv->>'content') ELSE (av->>'schema') IS DISTINCT FROM (bv->>'schema') END,CASE WHEN coalesce(av->>'kind',bv->>'kind')='table' THEN (av->>'schema') IS DISTINCT FROM (bv->>'schema') ELSE av IS NULL OR bv IS NULL END FROM d WHERE ((av->>'content') IS DISTINCT FROM (bv->>'content') OR (av->>'schema') IS DISTINCT FROM (bv->>'schema')) AND ($3::text IS NULL OR coalesce(av->>'name',bv->>'name')=$3) ORDER BY coalesce(av->>'name',bv->>'name') COLLATE \"C\"", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(from), CStringGetTextDatum(to), table ? CStringGetTextDatum(table) : (Datum) 0), table ? NULL : "  n", true);
+	run("WITH a AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence','aggregate','operator','cast')),b AS (SELECT v FROM jsonb_array_elements($2::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence','aggregate','operator','cast')),d AS (SELECT a.v av,b.v bv FROM a FULL JOIN b ON a.v->>'name'=b.v->>'name' AND a.v->>'kind'=b.v->>'kind') SELECT coalesce(av->>'name',''),coalesce(bv->>'name',''),CASE WHEN av IS NULL THEN 'added' WHEN bv IS NULL THEN 'dropped' ELSE 'modified' END,CASE WHEN coalesce(av->>'kind',bv->>'kind')='table' THEN (av->>'content') IS DISTINCT FROM (bv->>'content') ELSE (av->>'schema') IS DISTINCT FROM (bv->>'schema') END,CASE WHEN coalesce(av->>'kind',bv->>'kind')='table' THEN (av->>'schema') IS DISTINCT FROM (bv->>'schema') ELSE av IS NULL OR bv IS NULL END FROM d WHERE ((av->>'content') IS DISTINCT FROM (bv->>'content') OR (av->>'schema') IS DISTINCT FROM (bv->>'schema')) AND ($3::text IS NULL OR coalesce(av->>'name',bv->>'name')=$3) ORDER BY coalesce(av->>'name',bv->>'name') COLLATE \"C\"", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(from), CStringGetTextDatum(to), table ? CStringGetTextDatum(table) : (Datum) 0), table ? NULL : "  n", true);
 	if (table && SPI_processed > 1)
 		ereport(ERROR, (errcode(ERRCODE_AMBIGUOUS_ALIAS), errmsg("ambiguous table name: %s", table)));
 	return_rows(fcinfo, nest);
@@ -1963,6 +1976,7 @@ static void validate_working_foreign_keys(const char *branch);
 #include "dg_catalog_ddl.inc"
 #include "dg_canonical_ddl.inc"
 #include "dg_routine_ddl.inc"
+#include "dg_schema_object_ddl.inc"
 #include "dg_sequence_ddl.inc"
 
 #include "dg_alter.inc"
@@ -1980,4 +1994,5 @@ static void validate_working_foreign_keys(const char *branch);
 #include "dg_schemas.inc"
 #include "dg_rebase.inc"
 #include "dg_tools.inc"
+#include "dg_transport.inc"
 #include "dg_compat.inc"

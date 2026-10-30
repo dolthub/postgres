@@ -38,11 +38,11 @@ schema_expression_check(Node *node, void *context)
 		case T_OpExpr:
 		case T_DistinctExpr:
 		case T_NullIfExpr:
-			if (((OpExpr *) node)->opno >= FirstNormalObjectId)
+			if (((OpExpr *) node)->opno >= FirstNormalObjectId && ((OpExpr *) node)->opno < FirstDurableObjectId)
 				unsupported("canonical expression user-defined operator");
 			break;
 		case T_ScalarArrayOpExpr:
-			if (((ScalarArrayOpExpr *) node)->opno >= FirstNormalObjectId)
+			if (((ScalarArrayOpExpr *) node)->opno >= FirstNormalObjectId && ((ScalarArrayOpExpr *) node)->opno < FirstDurableObjectId)
 				unsupported("canonical expression user-defined operator");
 			break;
 		case T_BoolExpr:
@@ -301,7 +301,7 @@ expression_calls_native(Node *node, void *context)
 	if (IsA(node, FuncExpr) && ((FuncExpr *) node)->funcid >= FirstNormalObjectId &&
 		((FuncExpr *) node)->funcid < FirstDurableObjectId)
 		return true;
-	if (IsA(node, OpExpr) && ((OpExpr *) node)->opno >= FirstNormalObjectId)
+	if (IsA(node, OpExpr) && ((OpExpr *) node)->opno >= FirstNormalObjectId && ((OpExpr *) node)->opno < FirstDurableObjectId)
 		return true;
 	return expression_tree_walker(node, expression_calls_native, context);
 }

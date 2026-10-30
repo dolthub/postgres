@@ -37,17 +37,17 @@ is(sql(q{SELECT dolt_stats_once(), dolt_stats_wait(), dolt_stats_flush()}),'stat
 is(sql(q{SELECT length(dolt_stats_stop()) > 0, length(dolt_stats_restart()) > 0, length(dolt_stats_gc()) > 0, length(dolt_stats_purge()) > 0, length(dolt_stats_timers('x')) > 0}),'t|t|t|t|t','control procedures are no-ops');
 is(sql(q{SELECT (dolt_stats_info()::json->>'active')::boolean, (dolt_stats_info()::json->>'statCnt')::int >= 3}),'t|t','stats info summarizes pg_stats');
 sql(q{DROP TABLE t, t2});
-# ---- backups: definitions only ----
+# ---- backup definitions and argument validation ----
 is(sql(q{SELECT * FROM dolt_backups}),'','no backups');
 is(sql(q{SELECT dolt_backup('add','backup_a','file:///tmp/a'), dolt_backup('add','backup_b','file:///tmp/b')}),'0|0','add backups');
 is(sql(q{SELECT name FROM dolt.dolt_backups ORDER BY name}),"backup_a\nbackup_b",'dolt.dolt_backups alias');
 is(sql(q{SELECT name,url FROM dolt.backups ORDER BY name}),"backup_a|file:///tmp/a\nbackup_b|file:///tmp/b",'backups listed');
-fails(q{SELECT dolt_backup('add','backup_a','file:///tmp/x')},qr/backup already exists: backup_a/,'duplicate backup');
-fails(q{SELECT dolt_backup('sync','backup_a')},qr/not supported: the server has no remote transport/,'sync is unsupported');
-fails(q{SELECT dolt_backup('restore','file:///tmp/a','db')},qr/not supported/,'restore is unsupported');
-fails(q{SELECT dolt_backup('bogus')},qr/unknown backup subcommand: bogus/,'unknown subcommand');
+fails(q{SELECT dolt_backup('add','backup_a','file:///tmp/x')},qr/backup 'backup_a' already exists/,'duplicate backup');
+fails(q{SELECT dolt_backup('sync','missing')},qr/backup 'missing' not found/,'missing named backup');
+fails(q{SELECT dolt_backup('restore','https://example.invalid/a','db')},qr/only absolute file/,'unsupported URL');
+fails(q{SELECT dolt_backup('bogus')},qr/unrecognized dolt_backup parameter 'bogus'/,'unknown subcommand');
 is(sql(q{SELECT dolt_backup('remove','backup_a')}),'0','remove');
-fails(q{SELECT dolt_backup('remove','backup_a')},qr/backup not found: backup_a/,'remove twice');
+fails(q{SELECT dolt_backup('remove','backup_a')},qr/backup 'backup_a' not found/,'remove twice');
 is(sql(q{SELECT name FROM dolt_backups}),'backup_b','remaining backup');
 # ---- remotes and clusters without transport ----
 sql(q{SELECT dolt_remote('add','origin','file:///tmp/origin')});
@@ -72,4 +72,5 @@ sql(q{SELECT dolt_commit('-Am','tables'); SELECT dolt_branch('side')});
 is(sql(q{SELECT branch, last_write IS NOT NULL, active_sessions, system_start_time = pg_postmaster_start_time() FROM dolt_branch_activity ORDER BY 1}),"main|t|0|t\nside|t|0|t",'branch activity from the reflog');
 is(sql(q{SELECT count(*) FROM dolt.dolt_stashes}),'0','prefixed names resolve inside the dolt schema');
 is(sql(q{SELECT has_table_privilege('public','dolt.statistics','SELECT')}),'f','views are superuser-only');
+is(sql(q{SELECT dolt_storage_format()}), 'PROLLY ( DGPTR001 )', 'format introspection describes the native codec');
 done_testing();

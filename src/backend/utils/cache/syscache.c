@@ -216,6 +216,10 @@ SelectCacheView(int cacheId, int nkeys, Datum *keys)
 	bool		bound = false;
 	int			i;
 
+	/* Casts between built-in types have no bound key to carry their branch. */
+	if (!view && cacheId == CASTSOURCETARGET)
+		view = dg_catalog_session_view();
+
 	/* Statistics are physical: a branch's tables keep theirs by durable OID. */
 	if (cache->cc_reloid == StatisticRelationId)
 		return NULL;
@@ -267,7 +271,7 @@ SelectCacheView(int cacheId, int nkeys, Datum *keys)
 		{
 			Oid			key = DatumGetObjectId(keys[i]);
 
-			if (TupleDescAttr(cache->cc_tupdesc, cache->cc_keyno[i] - 1)->atttypid == OIDOID &&
+			if (CatalogViewIsObjectIdType(TupleDescAttr(cache->cc_tupdesc, cache->cc_keyno[i] - 1)->atttypid) &&
 				((key >= FirstNormalObjectId && key < FirstDurableObjectId) || key == PG_PUBLIC_NAMESPACE))
 				return NULL;
 		}

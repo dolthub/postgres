@@ -17,6 +17,8 @@
 
 #include "access/htup_details.h"
 #include "catalog/pg_operator.h"
+#include "catalog/catalogview.h"
+#include "access/doltcatalog.h"
 #include "catalog/pg_type.h"
 #include "lib/stringinfo.h"
 #include "nodes/nodeFuncs.h"
@@ -54,6 +56,7 @@ typedef struct OprCacheKey
 	Oid			left_arg;		/* Left input OID, or 0 if prefix op */
 	Oid			right_arg;		/* Right input OID */
 	Oid			search_path[MAX_CACHED_PATH_LEN];
+	uint64 catalog_context;
 } OprCacheKey;
 
 typedef struct OprCacheEntry
@@ -972,6 +975,7 @@ make_oper_cache_key(ParseState *pstate, OprCacheKey *key, List *opname,
 	strlcpy(key->oprname, opername, NAMEDATALEN);
 	key->left_arg = ltypeId;
 	key->right_arg = rtypeId;
+	key->catalog_context = CatalogViewCacheId(dg_catalog_session_view());
 
 	if (schemaname)
 	{

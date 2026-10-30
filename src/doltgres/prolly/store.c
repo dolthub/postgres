@@ -9,7 +9,7 @@
 #include <limits.h>
 #include <unistd.h>
 
-static const uint8_t node_magic[8] = {'D', 'G', 'P', 'T', 'R', '0', '0', '1'};
+static const uint8_t node_magic[8] = PL_NODE_FORMAT;
 
 uint32_t
 pl_read32(const uint8_t *p)

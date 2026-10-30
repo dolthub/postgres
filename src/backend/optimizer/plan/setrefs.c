@@ -2079,6 +2079,14 @@ fix_expr_common(PlannerInfo *root, Node *node)
 	}
 	if (IsA(node, FuncExpr))
 		contextual |= CatalogViewObjectContext(((FuncExpr *) node)->funcid) != NULL;
+	if (IsA(node, Aggref))
+		contextual |= CatalogViewObjectContext(((Aggref *) node)->aggfnoid) != NULL;
+	else if (IsA(node, WindowFunc))
+		contextual |= CatalogViewObjectContext(((WindowFunc *) node)->winfnoid) != NULL;
+	else if (IsA(node, OpExpr) || IsA(node, DistinctExpr) || IsA(node, NullIfExpr))
+		contextual |= CatalogViewObjectContext(((OpExpr *) node)->opno) != NULL;
+	else if (IsA(node, ScalarArrayOpExpr))
+		contextual |= CatalogViewObjectContext(((ScalarArrayOpExpr *) node)->opno) != NULL;
 	if (contextual)
 	{
 		root->glob->relationOids = list_append_unique_oid(root->glob->relationOids, DoltRefRelationId);

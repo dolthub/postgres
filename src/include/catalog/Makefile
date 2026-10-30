@@ -98,6 +98,7 @@ CATALOG_HEADERS := \
 	pg_dolt_journal.h \
 	pg_dolt_handle.h \
 	pg_dolt_sequence.h \
+	pg_dolt_relation_stats.h \
 	pg_dolt_identity.h
 
 GENERATED_HEADERS := $(CATALOG_HEADERS:%.h=%_d.h)

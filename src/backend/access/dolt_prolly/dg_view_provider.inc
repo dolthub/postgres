@@ -7,7 +7,7 @@ static Oid
 provider_view_dependency(CatalogView *view, const char *kind, const char *name)
 {
 	Oid			classid = !strcmp(kind, "table") ? RelationRelationId :
-		!strcmp(kind, "routine") ? ProcedureRelationId : TypeRelationId;
+		!strcmp(kind, "routine") ? ProcedureRelationId : !strcmp(kind, "operator") ? OperatorRelationId : TypeRelationId;
 	Oid			oid;
 
 	if (classid == TypeRelationId)
@@ -124,7 +124,7 @@ provider_view_rule(DGProviderRows *rows, CatalogView *view, const char *name, Oi
 				}
 			}
 			provider_dependency(rows, RewriteRelationId, rule.oid, 0,
-								!strcmp(kinds[i], "table") ? RelationRelationId : !strcmp(kinds[i], "routine") ? ProcedureRelationId : TypeRelationId,
+								!strcmp(kinds[i], "table") ? RelationRelationId : !strcmp(kinds[i], "routine") ? ProcedureRelationId : !strcmp(kinds[i], "operator") ? OperatorRelationId : TypeRelationId,
 								target, column, DEPENDENCY_NORMAL);
 		}
 	}

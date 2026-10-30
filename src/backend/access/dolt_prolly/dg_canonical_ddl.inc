@@ -209,8 +209,8 @@ dg_catalog_create(Node *statement, const char *query)
 		PreventCommandIfReadOnly("CREATE TABLE");
 	if (stmt->relation->relpersistence != RELPERSISTENCE_PERMANENT)
 		unsupported("unlogged versioned tables");
-	if (stmt->inhRelations || stmt->partbound || stmt->partspec)
-		unsupported("partitioned and inherited versioned tables");
+	if (stmt->partbound || stmt->partspec)
+		unsupported("partitioned versioned tables");
 	if (stmt->ofTypename)
 		unsupported("typed versioned tables");
 	if (!ActiveSnapshotSet())

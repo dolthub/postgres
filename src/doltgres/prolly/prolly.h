@@ -10,6 +10,7 @@
  * Every content hash: SHA-256 truncated to this many bytes, as Dolt's
  * addresses are. Nodes, rows and version objects are all addressed by it.
  */
+#define PL_NODE_FORMAT "DGPTR001"
 #define PL_HASH_SIZE 20
 #define PL_HASH_TEXT_SIZE 32
 #define PL_SHA256_SIZE 32

@@ -171,7 +171,7 @@ provider_routine(DGProviderRows *rows, CatalogView *view, const char *definition
 
 			if (OidIsValid(referenced))
 				provider_dependency(rows, ProcedureRelationId, proc->oid, 0,
-									!strcmp(kinds[i], "table") ? RelationRelationId : !strcmp(kinds[i], "routine") ? ProcedureRelationId : TypeRelationId,
+									!strcmp(kinds[i], "table") ? RelationRelationId : !strcmp(kinds[i], "routine") ? ProcedureRelationId : !strcmp(kinds[i], "operator") ? OperatorRelationId : TypeRelationId,
 									referenced, 0, DEPENDENCY_NORMAL);
 		}
 	}
