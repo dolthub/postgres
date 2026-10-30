@@ -169,6 +169,7 @@ static PLTree fill_rows(Relation rel, PLTree content, const bool *fill);
 static List *merge_dropped_columns(Relation rel, const char *base);
 static PLTree check_violations(Relation rel, PLTree content, const char *name, StringInfo violations);
 static bytea *staged_capture(Capture * full);
+static void catalog_activate(void);
 static bool branch_management(char **args, int n);
 static void checkout_tables(char **args, int n);
 static char *resolve_object_argument(const char *arg, const char *json_a, const char *json_b, bool required);
@@ -1372,10 +1373,11 @@ ensure_repository(void)
 		return;
 
 	/*
-	 * The initial state records the namespaces that exist at initialization
-	 * (public for a fresh database), mirroring Doltgres's database creation.
+	 * Initialization is lazy. Only the default public namespace belongs to
+	 * the initial baseline: user-created namespaces must remain working-set
+	 * changes even when they predate the first version-control command.
 	 */
-	run(NAMESPACE_DEFINITIONS_SQL, 0, NULL, NULL, NULL, true);
+	run("SELECT definition FROM (" NAMESPACE_DEFINITIONS_SQL ") namespaces(definition) WHERE definition::jsonb->>'name'='public'", 0, NULL, NULL, NULL, true);
 	{
 		int			n = SPI_processed,
 					i;
@@ -1577,10 +1579,13 @@ dolt_add(PG_FUNCTION_ARGS)
 
 	standalone(fcinfo, false);
 	nest = begin_api();
+	/* Activation advances command visibility on our private API snapshot. */
+	if (!read_ref("views/enabled").target)
+		catalog_activate();
 	ensure_repository();
 	if (n == 0)
 		unsupported("dolt_add requires '.', '-A' or table names");
-	if (n != 1 || (strcmp(args[0], ".") && strcmp(args[0], "-A") && strcmp(args[0], "--all")))
+	if (n != 1 || (strcmp(args[0], ".") && strcmp(args[0], "-a") && strcmp(args[0], "-A") && strcmp(args[0], "--all")))
 	{
 		/* Stage only the named tables. */
 		List	   *tables = NIL;
@@ -1633,6 +1638,9 @@ dolt_commit(PG_FUNCTION_ARGS)
 
 	standalone(fcinfo, true);
 	nest = begin_api();
+	/* Activation advances command visibility on our private API snapshot. */
+	if (!read_ref("views/enabled").target)
+		catalog_activate();
 	for (i = 0; i < n; i++)
 	{
 		if (!strcmp(args[i], "-A") || !strcmp(args[i], "--ALL"))

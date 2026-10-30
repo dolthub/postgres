@@ -22,7 +22,7 @@ Dolt's string encoding, not necessarily its content hashing or object format. Un
 
 | Function | Implemented arguments and result |
 |---|---|
-| `dolt_add(...)` | `.`, `-A` or `--all`; stage all supported live objects; `status bigint` = 0. |
+| `dolt_add(...)` | `.`, `-a`, `-A` or `--all`; stage all supported live objects, including empty namespaces; `status bigint` = 0. |
 | `dolt_commit(...)` | Required `-m/--message`; optional `-A/--all` (also `-Am message` / `-am message`), `--author 'Name <email>'`, `--committer 'Name <email>'`, `--date`, `--allow-empty`, `--skip-empty`; `hash text`, NULL for skipped empty commit. |
 | `dolt_branch(...)` | `name [start-point]`; create only; `status bigint` = 0. |
 | `dolt_tag(...)` | `name [start-point]`, optional `-m/--message`, `--author`; create annotated tag; `status bigint` = 0. |
