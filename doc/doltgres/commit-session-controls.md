@@ -6,7 +6,8 @@ These are native PostgreSQL GUCs. Boolean settings accept `0`/`1` and
 
 | Setting | Default | Behavior |
 | --- | --- | --- |
-| `dolt_transaction_commit` | off | Create a version-control commit when a SQL transaction changes a single branch. |
+| `dolt_transaction_commit` | off | Create a version-control commit when a SQL transaction changes a branch. |
+| `dolt_multi_branch_commit` | off | Allow automatic version commits on every dirty branch in one SQL transaction. |
 | `dolt_transaction_commit_message` | empty | Automatic commit message; empty/space-only uses `Transaction commit`. |
 | `dolt_force_transaction_commit` | off | Retain foreign-key violations produced by a merge, recording offending rows for repair. |
 | `dolt_allow_commit_conflicts` | off | Accepted for compatibility. Both values preserve the fork's non-aborting merge conflict contract. |
@@ -39,6 +40,18 @@ unique/check merge violations is unchanged.
 
 `dolt_transactions_disabled` deliberately does not exist: SET rejects both 0
 and 1. PostgreSQL transaction machinery is never disabled.
-`dolt_multi_branch_commit` remains deferred; automatic publication rejects a
-transaction that has changed multiple branches. No compatibility setting is
-registered for that deferred feature.
+With `dolt_multi_branch_commit=on`, automatic publication visits every dirty
+branch in branch-name order, independently of the session's selected branch.
+Data and all HEAD updates share one transaction decision. A failure rolls back
+all branches; ordinary PostgreSQL serialization/deadlock errors require retrying
+the entire transaction. PREPARE preserves the same all-or-nothing boundary.
+Branches discarded by savepoint rollback are omitted. Pending merges remain
+working-set-only updates while other branches can receive version commits.
+
+Qualified INSERT, UPDATE and DELETE targets use the named branch's catalog,
+constraints, defaults and triggers. Historical targets remain read-only.
+Qualified `AS OF 'HEAD'` resolves HEAD on the named branch, not the session's.
+
+The explicit multi-branch `dolt_commit` / `dolt_commit_all` interface is not yet
+implemented. It requires deciding whether to lift the outside-BEGIN restriction
+and introduce Dolt's implicit SQL-commit behavior.
