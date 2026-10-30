@@ -18,6 +18,7 @@
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
+#include "access/doltcatalog.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
@@ -310,6 +311,7 @@ performDeletion(const ObjectAddress *object,
 						   behavior,
 						   flags,
 						   object);
+	dg_catalog_check_drop(targetObjects->refs, targetObjects->numrefs, object);
 
 	/* do the deed */
 	deleteObjectsInList(targetObjects, &depRel, flags);
@@ -386,6 +388,8 @@ performMultipleDeletions(const ObjectAddresses *objects,
 						   behavior,
 						   flags,
 						   (objects->numrefs == 1 ? objects->refs : NULL));
+	dg_catalog_check_drop(targetObjects->refs, targetObjects->numrefs,
+						  objects->numrefs == 1 ? objects->refs : NULL);
 
 	/* do the deed */
 	deleteObjectsInList(targetObjects, &depRel, flags);

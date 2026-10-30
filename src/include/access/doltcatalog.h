@@ -10,6 +10,7 @@
 #include "nodes/extensible.h"
 #include "storage/relfilelocator.h"
 struct ParseState;
+struct ObjectAddress;
 struct CatalogView;
 extern bool dg_catalog_active(void);
 extern void dg_roots_published(void);
@@ -22,6 +23,7 @@ extern void dg_catalog_sequence_check(Relation rel);
 extern void dg_catalog_sequence_refresh(Relation rel);
 extern bool dg_catalog_sequence_ddl(struct ParseState *pstate, Node *statement);
 extern bool dg_catalog_type_ddl(struct ParseState *pstate, Node *statement);
+extern void dg_catalog_check_drop(const struct ObjectAddress *objects, int count, const struct ObjectAddress *original);
 extern bool dg_catalog_rename(struct ParseState *pstate, Node *statement);
 extern bool dg_catalog_view_ddl(struct ParseState *pstate, Node *statement, int location, int length);
 extern List *dg_rule_actions(Oid relid, List *actions);
