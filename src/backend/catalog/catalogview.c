@@ -925,6 +925,19 @@ CatalogViewObjectContext(Oid handle)
 	return object ? object->view : NULL;
 }
 
+/*
+ * The view an OID value names, as data rather than as a binding: a value equal
+ * to a handle since released is only a number, and names none.
+ */
+CatalogView *
+CatalogViewValueContext(Oid value)
+{
+	if (value >= FirstCatalogViewObjectId && value < next_handle &&
+		!(objects && hash_search(objects, &value, HASH_FIND, NULL)))
+		return NULL;
+	return CatalogViewObjectContext(value);
+}
+
 Oid
 CatalogViewObjectStorage(Oid handle)
 {
@@ -1183,7 +1196,7 @@ CatalogViewCallContext(FunctionCallInfo fcinfo)
 		bound = CatalogViewObjectContext(type);
 		if (!fcinfo->args[i].isnull &&
 			CatalogViewIsObjectIdType(type))
-			bound = CatalogViewObjectContext(DatumGetObjectId(fcinfo->args[i].value));
+			bound = CatalogViewValueContext(DatumGetObjectId(fcinfo->args[i].value));
 		if (bound && view && view != bound)
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("SQL function arguments span incompatible catalog contexts")));
 		if (bound)

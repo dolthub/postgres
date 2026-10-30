@@ -64,6 +64,7 @@ extern void CatalogViewForgetDurable(void);
 extern Oid	CatalogViewFindObject(CatalogView *view, Oid objectclass, const char *identity);
 extern Oid	CatalogViewLookupObject(CatalogView *view, Oid objectclass, const char *identity);
 extern CatalogView *CatalogViewObjectContext(Oid handle);
+extern CatalogView *CatalogViewValueContext(Oid value);
 extern void CatalogViewMarkBranchHead(CatalogView *view);
 extern bool CatalogViewIsObjectIdType(Oid type);
 extern CatalogView *CatalogViewCallContext(FunctionCallInfo fcinfo);

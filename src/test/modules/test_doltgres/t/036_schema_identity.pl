@@ -83,6 +83,11 @@ sql(q{CREATE DATABASE fresh});
 $node->safe_psql('fresh',q{CREATE SCHEMA myschema});
 is($node->safe_psql('fresh',q{SELECT table_name, staged, status FROM dolt_status}),'myschema|f|new schema','an empty namespace is a change before a repository\'s first table');
 is($node->safe_psql('fresh',q{SELECT dolt_add('.')}) . $node->safe_psql('fresh',q{SELECT dolt_commit('-m', 'new schema') IS NOT NULL; SELECT message FROM dolt_log LIMIT 1}),"0t\nnew schema",'and is staged and committed');
+my $literals=join(', ',map {(3221225472+$_).'::oid'} 0..63);
+is($node->safe_psql('fresh',qq{CREATE TABLE t(id int PRIMARY KEY); SELECT $literals}) =~ tr/|//,63,'OID literals equal to released handles are only numbers');
+my $values=join(', ',map {"($_)"} split(/, /,$literals));
+is($node->safe_psql('fresh',qq{CREATE TABLE u(id int PRIMARY KEY); CREATE FUNCTION same(o oid) RETURNS oid LANGUAGE sql AS 'SELECT o';
+SELECT count(*) FROM (VALUES $values) v(o) WHERE same(o) = o AND same(3221225472::oid) = 3221225472}),'64','and so are such values passed to SQL functions');
 
 # A rename stays on its branch.
 sql(q{SELECT dolt_checkout('other'); ALTER SCHEMA app RENAME TO app2; SELECT dolt_commit('-Am', 'rename')});
