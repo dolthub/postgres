@@ -1580,7 +1580,7 @@ dolt_add(PG_FUNCTION_ARGS)
 	standalone(fcinfo, false);
 	nest = begin_api();
 	/* Activation advances command visibility on our private API snapshot. */
-	if (!dg_catalog_active())
+	if (!read_ref("views/enabled").target)
 		catalog_activate();
 	ensure_repository();
 	if (n == 0)
@@ -1639,7 +1639,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 	standalone(fcinfo, true);
 	nest = begin_api();
 	/* Activation advances command visibility on our private API snapshot. */
-	if (!dg_catalog_active())
+	if (!read_ref("views/enabled").target)
 		catalog_activate();
 	for (i = 0; i < n; i++)
 	{
