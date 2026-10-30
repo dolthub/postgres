@@ -80,6 +80,9 @@ struct CatalogView
 	List	   *caches;
 	List	   *handles;
 	List	   *durable;		/* CatalogViewObjects bound to durable OIDs */
+	List	   *shared;			/* CatalogViewObjects bound to OIDs other views share */
+	CatalogViewBaseFilter base_filter;	/* which base rows the view leaves out */
+	void	   *base_filter_arg;
 	List	   *indexes;		/* CatalogViewIndexes over the rows */
 	MemoryContext index_memory;
 	CatalogViewBase *base;		/* shared rows each catalog's rows begin with */
@@ -148,6 +151,7 @@ typedef struct CatalogViewObject
 } CatalogViewObject;
 static HTAB *objects;
 static Oid	next_handle = FirstCatalogViewObjectId;
+static CatalogView *routing_context(Oid oid);
 
 static uint64 next_view_serial = 1;
 static uint64 view_clock;
@@ -227,8 +231,14 @@ CatalogViewAddRows(CatalogView *view, Oid catalog, List *tuples)
 	{
 		foreach_ptr(CatalogViewRows, shared, view->base->catalogs)
 		{
-			if (shared->catalog == catalog)
+			if (shared->catalog != catalog)
+				continue;
+			if (!view->base_filter)
 				rows->tuples = list_copy(shared->tuples);
+			else
+				foreach_ptr(HeapTupleData, tuple, shared->tuples)
+					if (view->base_filter(catalog, tuple, view->base_filter_arg))
+						rows->tuples = lappend(rows->tuples, tuple);
 		}
 	}
 	foreach(lc, tuples)
@@ -285,6 +295,24 @@ CatalogViewBaseRelease(CatalogViewBase *base)
 	Assert(base->references > 0);
 	if (--base->references == 0)
 		MemoryContextDelete(base->memory);
+}
+
+/* The memory |view| lives in, for what its owner keeps with it. */
+MemoryContext
+CatalogViewMemory(CatalogView *view)
+{
+	return view->memory;
+}
+
+/*
+ * Leave out of |view| the base rows for which |filter| returns false. Set
+ * before the view's rows are added.
+ */
+void
+CatalogViewSetBaseFilter(CatalogView *view, CatalogViewBaseFilter filter, void *arg)
+{
+	view->base_filter = filter;
+	view->base_filter_arg = arg;
 }
 
 /* Begin each catalog |view| is given with |base|'s rows of it. */
@@ -478,7 +506,7 @@ CatalogViewBeginScanSnapshot(Relation relation, int nkeys, ScanKey keys, Snapsho
 		if (!(keys[i].sk_flags & (SK_ISNULL | SK_SEARCHARRAY | SK_ROW_HEADER)) && attr > 0 && TupleDescAttr(RelationGetDescr(relation), attr - 1)->atttypid == OIDOID &&
 			(!CatalogViewIsDurable(DatumGetObjectId(keys[i].sk_argument)) || dg_catalog_provides(RelationGetRelid(relation))))
 		{
-			CatalogView *bound = CatalogViewObjectContext(DatumGetObjectId(keys[i].sk_argument));
+			CatalogView *bound = routing_context(DatumGetObjectId(keys[i].sk_argument));
 
 			if (bound)
 			{
@@ -711,6 +739,51 @@ CatalogViewBindDurable(CatalogView *view, Oid objectclass, const char *identity,
 	MemoryContextSwitchTo(previous);
 }
 
+/*
+ * Bind |identity| to |oid| in |view|, an OID other views may bind too: it
+ * names one object everywhere, as a namespace's OID does, and no view owns
+ * it, so lookups by it use whichever view is current.
+ */
+void
+CatalogViewBindShared(CatalogView *view, Oid objectclass, const char *identity, Oid oid)
+{
+	CatalogViewObject *object;
+	MemoryContext previous;
+
+	foreach_ptr(CatalogViewObject, bound, view->shared)
+	{
+		if (bound->handle == oid || (bound->objectclass == objectclass && !strcmp(bound->identity, identity)))
+		{
+			if (bound->handle != oid || bound->objectclass != objectclass || strcmp(bound->identity, identity))
+				elog(ERROR, "shared object %u is bound twice in one catalog context", oid);
+			return;
+		}
+	}
+	previous = MemoryContextSwitchTo(view->memory);
+	object = palloc0(sizeof(*object));
+	object->handle = oid;
+	object->objectclass = objectclass;
+	object->view = view;
+	object->identity = pstrdup(identity);
+	view->shared = lappend(view->shared, object);
+	MemoryContextSwitchTo(previous);
+}
+
+/* Whether |view| binds |oid|: shared, durable, or a handle of its own. */
+bool
+CatalogViewBinds(CatalogView *view, Oid oid)
+{
+	CatalogView *previous;
+	bool		result;
+
+	if (!view || !OidIsValid(oid))
+		return false;
+	previous = CatalogViewSwitch(view);
+	result = CatalogViewObjectContext(oid) == view;
+	CatalogViewSwitch(previous);
+	return result;
+}
+
 void
 CatalogViewForgetDurable(void)
 {
@@ -782,12 +855,39 @@ lookup_object(Oid handle)
 	if (handle >= FirstCatalogViewObjectId && IsParallelWorker())
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("runtime catalog handles cannot be resolved in parallel workers")));
-	if (handle < FirstCatalogViewObjectId || handle >= next_handle)
+
+	/* An OID views share is the current view's object, if it binds it. */
+	if (handle < FirstCatalogViewObjectId)
+	{
+		CatalogView *view = CatalogViewCurrent();
+
+		if (view)
+			foreach_ptr(CatalogViewObject, object, view->shared)
+			{
+				if (object->handle == handle)
+					return object;
+			}
+		return NULL;
+	}
+	if (handle >= next_handle)
 		return NULL;
 	object = objects ? hash_search(objects, &handle, HASH_FIND, NULL) : NULL;
 	if (!object)
 		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("catalog object handle %u is no longer bound to a revision", handle)));
 	return object;
+}
+
+/*
+ * The view a key OID sends a lookup to: the one a durable OID or a handle
+ * belongs to. An OID views share is also a physical one, so it sends a
+ * lookup nowhere in particular.
+ */
+static CatalogView *
+routing_context(Oid oid)
+{
+	if (oid < FirstCatalogViewObjectId && !CatalogViewIsDurable(oid))
+		return NULL;
+	return CatalogViewObjectContext(oid);
 }
 
 /* Only these by-value SQL types can carry catalog object handles.  Never
@@ -879,7 +979,7 @@ CatalogViewSelectKeys(CatalogView *fallback, TupleDesc desc, int nkeys, const in
 	{
 		if (attributes[i] > 0 && TupleDescAttr(desc, attributes[i] - 1)->atttypid == OIDOID)
 		{
-			CatalogView *view = CatalogViewObjectContext(DatumGetObjectId(values[i]));
+			CatalogView *view = routing_context(DatumGetObjectId(values[i]));
 
 			if (view)
 				return view;
@@ -1005,6 +1105,11 @@ CatalogViewFindObject(CatalogView *view, Oid objectclass, const char *identity)
 {
 	ListCell   *lc;
 
+	foreach_ptr(CatalogViewObject, object, view->shared)
+	{
+		if (object->objectclass == objectclass && !strcmp(object->identity, identity))
+			return object->handle;
+	}
 	foreach(lc, view->durable)
 	{
 		CatalogViewObject *object = lfirst(lc);

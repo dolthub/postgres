@@ -66,6 +66,7 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_description.h"
 #include "catalog/pg_extension.h"
+#include "commands/extension.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_range.h"
 #include "catalog/pg_opclass.h"

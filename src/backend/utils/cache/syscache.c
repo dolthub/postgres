@@ -256,22 +256,10 @@ SelectCacheView(int cacheId, int nkeys, Datum *keys)
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("catalog %u does not support this revision-bound lookup", cache->cc_reloid)));
 		}
 	}
-	else if (view && cache->cc_tupdesc)
-	{
-		/*
-		 * Views hold built-in rows and branch objects only. A native user
-		 * object, unversioned, is always in the physical catalogs, and so is
-		 * the physical public schema, which a view replaces with its own.
-		 */
-		for (i = 0; i < nkeys; i++)
-		{
-			Oid			key = DatumGetObjectId(keys[i]);
-
-			if (TupleDescAttr(cache->cc_tupdesc, cache->cc_keyno[i] - 1)->atttypid == OIDOID &&
-				((key >= FirstNormalObjectId && key < FirstDurableObjectId) || key == PG_PUBLIC_NAMESPACE))
-				return NULL;
-		}
-	}
+	/*
+	 * Otherwise the current view answers: it holds built-in and server
+	 * objects as well as the branch's own, under one set of namespaces.
+	 */
 	return view;
 }
 

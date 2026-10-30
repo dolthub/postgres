@@ -420,7 +420,7 @@ collect_catalog_deletions(const ObjectAddresses *objects, DropBehavior behavior)
 	{
 		const ObjectAddress *object = &objects->refs[i];
 
-		if (CatalogViewObjectContext(object->objectId) != view)
+		if (!CatalogViewBinds(view, object->objectId))
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("deletion targets span incompatible catalog contexts")));
 		AcquireDeletionLock(object, PERFORM_DELETION_CATALOG_VIEW);
 		findDependentObjects(object, DEPFLAG_ORIGINAL, PERFORM_DELETION_CATALOG_VIEW,
@@ -887,6 +887,15 @@ findDependentObjects(const ObjectAddress *object,
 		if (otherObject.classId == object->classId &&
 			otherObject.objectId == object->objectId &&
 			object->objectSubId == 0)
+			continue;
+
+		/*
+		 * A branch removes only its own objects. A server object in one of
+		 * its namespaces belongs to every branch, and stays.
+		 */
+		if ((flags & PERFORM_DELETION_CATALOG_VIEW) &&
+			otherObject.objectId >= FirstNormalObjectId && otherObject.objectId < FirstDurableObjectId &&
+			!CatalogViewBinds(CatalogViewCurrent(), otherObject.objectId))
 			continue;
 
 		/*

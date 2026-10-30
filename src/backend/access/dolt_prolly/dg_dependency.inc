@@ -459,7 +459,7 @@ canonical_drop(Node *statement)
 			}
 			if (!OidIsValid(object.objectId))
 				continue;
-			if (CatalogViewObjectContext(object.objectId) != view)
+			if (!CatalogViewBinds(view, object.objectId))
 				unsupported("DROP of a noncanonical object");
 			if (!(OidIsValid(owning_table) ? object_ownercheck(RelationRelationId, owning_table, user) : object_ownercheck(object.classId, object.objectId, user)) &&
 				!(OidIsValid(namespaceid) && object_ownercheck(NamespaceRelationId, namespaceid, user)))

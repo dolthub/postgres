@@ -1288,40 +1288,14 @@ FuncnameGetCandidates(List *names, int nargs, List *argnames,
 {
 	CatalogView *previous = CatalogViewCurrent();
 	CatalogView *session = dg_catalog_session_view();
-	FuncCandidateList result,
-				native;
+	FuncCandidateList result;
 
+	/* The branch's view holds built-in, server and versioned routines alike. */
 	CatalogViewSwitch(session);
 	PG_TRY();
 	{
 		result = FuncnameGetCandidatesInContext(names, nargs, argnames, expand_variadic,
 												expand_defaults, include_out_arguments, missing_ok);
-
-		/*
-		 * The branch's view holds built-in and versioned routines; native
-		 * user routines, unversioned, are only in the physical catalogs.
-		 */
-		if (session)
-		{
-			CatalogViewSwitch(NULL);
-			native = FuncnameGetCandidatesInContext(names, nargs, argnames, expand_variadic,
-													expand_defaults, include_out_arguments, true);
-			while (native)
-			{
-				FuncCandidateList next = native->next;
-
-				FuncCandidateList seen = result;
-
-				while (seen && seen->oid != native->oid)
-					seen = seen->next;
-				if (!seen && native->oid >= FirstNormalObjectId && native->oid < FirstDurableObjectId)
-				{
-					native->next = result;
-					result = native;
-				}
-				native = next;
-			}
-		}
 	}
 	PG_FINALLY();
 	{
