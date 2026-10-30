@@ -1372,10 +1372,11 @@ ensure_repository(void)
 		return;
 
 	/*
-	 * The initial state records the namespaces that exist at initialization
-	 * (public for a fresh database), mirroring Doltgres's database creation.
+	 * Initialization is lazy. Only the default public namespace belongs to
+	 * the initial baseline: user-created namespaces must remain working-set
+	 * changes even when they predate the first version-control command.
 	 */
-	run(NAMESPACE_DEFINITIONS_SQL, 0, NULL, NULL, NULL, true);
+	run("SELECT definition FROM (" NAMESPACE_DEFINITIONS_SQL ") namespaces(definition) WHERE definition::jsonb->>'name'='public'", 0, NULL, NULL, NULL, true);
 	{
 		int			n = SPI_processed,
 					i;
@@ -1580,7 +1581,7 @@ dolt_add(PG_FUNCTION_ARGS)
 	ensure_repository();
 	if (n == 0)
 		unsupported("dolt_add requires '.', '-A' or table names");
-	if (n != 1 || (strcmp(args[0], ".") && strcmp(args[0], "-A") && strcmp(args[0], "--all")))
+	if (n != 1 || (strcmp(args[0], ".") && strcmp(args[0], "-a") && strcmp(args[0], "-A") && strcmp(args[0], "--all")))
 	{
 		/* Stage only the named tables. */
 		List	   *tables = NIL;
