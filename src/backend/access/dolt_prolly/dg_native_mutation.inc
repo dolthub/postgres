@@ -1149,7 +1149,7 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 					!strcmp(kinds[i], "cast") ? CastRelationId :
 					!strcmp(kinds[i], "type") ? TypeRelationId :
 					!strcmp(kinds[i], "trigger") ? TriggerRelationId : RelationRelationId;
-				Oid memberid = CatalogViewFindObject(view, classid, listed[i].name);
+				Oid memberid = listed[i].name ? CatalogViewFindObject(view, classid, listed[i].name) : InvalidOid;
 
 				if (OidIsValid(memberid) && CatalogViewTuplesWith(view, classid, 1, memberid) == NIL)
 					continue;
