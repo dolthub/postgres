@@ -133,6 +133,15 @@ ok($node->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_stat_activi
 $b->query_safe('COMMIT');
 $a->query('SELECT 1');
 like($a->{stderr}, qr/violates foreign key constraint/, 'and then fails on the new reference');
+# The coercion fallback must take the same parent lock as the direct check.
+$a->{stderr} = '';
+$b->query_safe('BEGIN; INSERT INTO cint VALUES (2)');
+$a->query_until(qr/started/, "\\echo started\nDELETE FROM pfloat WHERE id = 2;\n");
+ok($node->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock'}),
+ 'a coerced foreign key locks its parent until commit');
+$b->query_safe('COMMIT');
+$a->query('SELECT 1');
+like($a->{stderr}, qr/violates foreign key constraint/, 'the coerced reference prevents concurrent deletion');
 $a->quit;
 $b->quit;
 $node->stop;

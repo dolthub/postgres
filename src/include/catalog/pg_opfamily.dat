@@ -311,7 +311,8 @@
 { oid => '9009', opfmethod => 'dolt_prolly_index', opfname => 'dolt_text_ops' },
 { oid => '9010', opfmethod => 'dolt_prolly_index', opfname => 'dolt_bytea_ops' },
 
-# Prolly indexes order keys by their normalized canonical bytes; one family per type.
+# Prolly indexes order keys by normalized bytes. Native cross-type families
+# retain PostgreSQL comparison semantics; scans recheck incompatible encodings.
 { oid => '9011', opfmethod => 'dolt_prolly_index', opfname => 'dolt_float_ops' },
 { oid => '9013', opfmethod => 'dolt_prolly_index', opfname => 'dolt_numeric_ops' },
 { oid => '9014', opfmethod => 'dolt_prolly_index', opfname => 'dolt_datetime_ops' },
