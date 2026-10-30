@@ -151,8 +151,21 @@ compose_database(bytea *base, bytea *source, List *tables)
 			{
 				char *ns;
 
-				run("SELECT (parse_ident($1,false))[1]", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum((char *) lfirst(lc))), NULL, true);
-				ns = strcell(0, 1);
+				const char *selected = lfirst(lc);
+				Member *special = NULL;
+
+				for (int k = 0; k < nsource; k++)
+					if ((!strcmp(sm[k].kind, "cast") || !strcmp(sm[k].kind, "operator")) && !strcmp(sm[k].name, selected))
+						special = &sm[k];
+				if (special && !strcmp(special->kind, "cast"))
+					continue; /* Casts do not own a namespace. */
+				if (special)
+					ns = json_value(json_value(metadata(child(special->hash, 1), "schema"), "row"), "oprnamespace");
+				else
+				{
+					run("SELECT (parse_ident($1,false))[1]", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(selected)), NULL, true);
+					ns = strcell(0, 1);
+				}
 
 				if (!strcmp(ns, sm[i].name))
 					wanted = true;
@@ -550,6 +563,11 @@ resolve_object_argument(const char *arg, const char *json_a, const char *json_b,
 
 	if (!*arg)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("object name cannot be empty")));
+	/* Operator and cast identities are not SQL identifiers. Accept the exact
+	 * portable identity shown by dolt_status before parsing routine syntax. */
+	run("SELECT DISTINCT v->>'name' FROM (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v UNION ALL SELECT v FROM jsonb_array_elements($2::jsonb->'members') v) m WHERE v->>'kind' IN ('aggregate','operator','cast') AND v->>'name'=$3", 3,
+		VC_TYPES(TEXTOID,TEXTOID,TEXTOID), VC_ARGS(CStringGetTextDatum(json_a),CStringGetTextDatum(json_b),CStringGetTextDatum(arg)), NULL, true);
+	if (SPI_processed) return strcell(0, 1);
 	if (arg[strlen(arg) - 1] == ')')
 	{
 		List *parsed = raw_parser(psprintf("DROP ROUTINE %s", arg), RAW_PARSE_DEFAULT);
@@ -598,7 +616,7 @@ resolve_object_argument(const char *arg, const char *json_a, const char *json_b,
 
 	/* parse_ident(...,false) stops at the signature, retaining quoted names.
 	 * Compare the full suffix as well, so overloads never select each other. */
-	run("WITH members AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v UNION ALL SELECT v FROM jsonb_array_elements($2::jsonb->'members') v), names AS (SELECT DISTINCT v->>'name' AS name FROM members WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence')), path AS (SELECT s,ord FROM (SELECT CASE WHEN btrim(s)='\"$user\"' THEN current_user::text ELSE btrim(btrim(s),'\"') END AS s,ord FROM unnest(string_to_array($5,',')) WITH ORDINALITY p(s,ord)) x WHERE EXISTS (SELECT 1 FROM pg_namespace WHERE nspname=x.s)) SELECT name,path.ord IS NOT NULL FROM names LEFT JOIN path ON (parse_ident(name,false))[1]=path.s WHERE ($3::text IS NOT NULL AND name=$3) OR ($3::text IS NULL AND substr(name,length(quote_ident((parse_ident(name,false))[1]))+2)=$4) ORDER BY path.ord NULLS LAST,name COLLATE \"C\"", 5, VC_TYPES(TEXTOID,TEXTOID,TEXTOID,TEXTOID,TEXTOID), VC_ARGS(CStringGetTextDatum(json_a),CStringGetTextDatum(json_b),qualified ? CStringGetTextDatum(qualified) : (Datum) 0,CStringGetTextDatum(local),CStringGetTextDatum(api_search_path ? api_search_path : "public")), qualified ? NULL : "  n  ", true);
+	run("WITH members AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v UNION ALL SELECT v FROM jsonb_array_elements($2::jsonb->'members') v), names AS (SELECT DISTINCT v->>'name' AS name FROM members WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence','aggregate')), path AS (SELECT s,ord FROM (SELECT CASE WHEN btrim(s)='\"$user\"' THEN current_user::text ELSE btrim(btrim(s),'\"') END AS s,ord FROM unnest(string_to_array($5,',')) WITH ORDINALITY p(s,ord)) x WHERE EXISTS (SELECT 1 FROM pg_namespace WHERE nspname=x.s)) SELECT name,path.ord IS NOT NULL FROM names LEFT JOIN path ON (parse_ident(name,false))[1]=path.s WHERE ($3::text IS NOT NULL AND name=$3) OR ($3::text IS NULL AND substr(name,length(quote_ident((parse_ident(name,false))[1]))+2)=$4) ORDER BY path.ord NULLS LAST,name COLLATE \"C\"", 5, VC_TYPES(TEXTOID,TEXTOID,TEXTOID,TEXTOID,TEXTOID), VC_ARGS(CStringGetTextDatum(json_a),CStringGetTextDatum(json_b),qualified ? CStringGetTextDatum(qualified) : (Datum) 0,CStringGetTextDatum(local),CStringGetTextDatum(api_search_path ? api_search_path : "public")), qualified ? NULL : "  n  ", true);
 	if (!SPI_processed)
 	{
 		if (!required)
@@ -615,7 +633,7 @@ state_objects(const char *json)
 {
 	List *result = NIL;
 
-	run("SELECT v->>'name' FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence') ORDER BY v->>'name' COLLATE \"C\"", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
+	run("SELECT v->>'name' FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence','aggregate','operator','cast') ORDER BY v->>'name' COLLATE \"C\"", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
 	for (int i = 0; i < SPI_processed; i++)
 		result = lappend(result, strcell(i, 1));
 	return result;
