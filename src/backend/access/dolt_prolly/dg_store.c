@@ -945,6 +945,10 @@ publish_all(void)
 		}
 		merged = roots_merge(&top->base, &top->roots, &latest);
 
+		/* A pre-commit capture must see the same merged roots we publish.
+		 * Rebase the overlay so later pre-commit publication is idempotent. */
+		top->base = top->roots = merged;
+
 		if (!merged.present || roots_equal(&merged, &latest))
 			continue;
 		persist_roots(&merged);
@@ -2088,4 +2092,5 @@ void
 dg_flush_version_batches(void)
 {
 	batch_flush_all();
+	publish_all();
 }

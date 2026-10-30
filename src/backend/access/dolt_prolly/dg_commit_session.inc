@@ -108,6 +108,9 @@ dg_version_pre_commit(void)
 
 		dg_flush_version_batches();
 		CommandCounterIncrement();
+		/* Publication may have waited for a concurrent working-set writer. */
+		PopActiveSnapshot();
+		PushCopiedSnapshot(GetLatestSnapshot());
 		nest = begin_api();
 		UpdateActiveSnapshotCommandId();
 		head = read_ref(branch_ref("heads"));
