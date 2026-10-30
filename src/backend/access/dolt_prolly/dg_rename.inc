@@ -263,7 +263,7 @@ rename_reference_name(const char *kind, const char *name)
 {
 	char	   *result = pstrdup(name);
 
-	if (!strcmp(kind, "routine") && strchr(result, '('))
+	if ((!strcmp(kind, "routine") || !strcmp(kind, "operator")) && strchr(result, '('))
 		*strchr(result, '(') = '\0';
 	return result;
 }
@@ -495,7 +495,7 @@ rename_subject(Node *statement, char **kind, char **name, List **references)
 				if (!CatalogViewObjectContext(address.objectId)) return false;
 				*kind = "operator";
 				*name = (char *) CatalogViewObjectIdentity(address.objectId, address.classId);
-				*references = list_make1(list_make2("operator", *name));
+				*references = list_make1(list_make2("operator", rename_reference_name("operator", *name)));
 				return true;
 			}
 		case OBJECT_AGGREGATE:

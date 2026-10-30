@@ -49,6 +49,8 @@ view_dependency_name(Oid classid, Oid objid)
 	}
 	if (classid == TypeRelationId)
 		return routine_type_name(objid);
+	if (classid == OperatorRelationId && CatalogViewObjectContext(objid))
+		return schema_operator_name(objid);
 	unsupported("versioned view depending on this kind of object");
 	pg_unreachable();
 }
@@ -102,7 +104,7 @@ view_dependencies(Oid relid, Oid ruleid)
 			continue;
 		initStringInfo(&entry);
 		appendStringInfoChar(&entry, '[');
-		escape_json(&entry, dep->refclassid == RelationRelationId ? "table" : dep->refclassid == ProcedureRelationId ? "routine" : "type");
+		escape_json(&entry, dep->refclassid == RelationRelationId ? "table" : dep->refclassid == ProcedureRelationId ? "routine" : dep->refclassid == OperatorRelationId ? "operator" : "type");
 		appendStringInfoChar(&entry, ',');
 		escape_json(&entry, name);
 		appendStringInfoChar(&entry, ',');
@@ -422,7 +424,7 @@ query_dependency(QueryDependencies *found, Oid classid, Oid objid)
 		return;
 	initStringInfo(&entry);
 	appendStringInfoChar(&entry, '[');
-	escape_json(&entry, classid == RelationRelationId ? "table" : classid == ProcedureRelationId ? "routine" : "type");
+	escape_json(&entry, classid == RelationRelationId ? "table" : classid == ProcedureRelationId ? "routine" : classid == OperatorRelationId ? "operator" : "type");
 	appendStringInfoChar(&entry, ',');
 	escape_json(&entry, name);
 	appendStringInfoString(&entry, ",null]");
@@ -463,6 +465,14 @@ query_dependencies_walker(Node *node, QueryDependencies *found)
 	}
 	if (IsA(node, FuncExpr))
 		query_dependency(found, ProcedureRelationId, ((FuncExpr *) node)->funcid);
+	if (IsA(node, Aggref))
+		query_dependency(found, ProcedureRelationId, ((Aggref *) node)->aggfnoid);
+	if (IsA(node, WindowFunc))
+		query_dependency(found, ProcedureRelationId, ((WindowFunc *) node)->winfnoid);
+	if (IsA(node, OpExpr) || IsA(node, DistinctExpr) || IsA(node, NullIfExpr))
+		query_dependency(found, OperatorRelationId, ((OpExpr *) node)->opno);
+	if (IsA(node, ScalarArrayOpExpr))
+		query_dependency(found, OperatorRelationId, ((ScalarArrayOpExpr *) node)->opno);
 	if (IsA(node, Query))
 		return query_tree_walker((Query *) node, query_dependencies_walker, found, QTW_EXAMINE_RTES_BEFORE);
 	return expression_tree_walker(node, query_dependencies_walker, found);

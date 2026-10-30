@@ -672,6 +672,10 @@ provider_routine_references(Node *node, ProviderRoutineReferences *context)
 	if (IsA(node, FuncExpr) && ((FuncExpr *) node)->funcid >= FirstDurableObjectId)
 		provider_dependency(context->rows, context->classid, context->objid, 0, ProcedureRelationId,
 							((FuncExpr *) node)->funcid, 0, DEPENDENCY_NORMAL);
+	if ((IsA(node, OpExpr) || IsA(node, DistinctExpr) || IsA(node, NullIfExpr)) && ((OpExpr *) node)->opno >= FirstDurableObjectId)
+		provider_dependency(context->rows, context->classid, context->objid, 0, OperatorRelationId, ((OpExpr *) node)->opno, 0, DEPENDENCY_NORMAL);
+	if (IsA(node, ScalarArrayOpExpr) && ((ScalarArrayOpExpr *) node)->opno >= FirstDurableObjectId)
+		provider_dependency(context->rows, context->classid, context->objid, 0, OperatorRelationId, ((ScalarArrayOpExpr *) node)->opno, 0, DEPENDENCY_NORMAL);
 	if (IsA(node, Const) && ((Const *) node)->consttype == REGCLASSOID && !((Const *) node)->constisnull &&
 		DatumGetObjectId(((Const *) node)->constvalue) >= FirstDurableObjectId)
 		provider_dependency(context->rows, context->classid, context->objid, 0, RelationRelationId,

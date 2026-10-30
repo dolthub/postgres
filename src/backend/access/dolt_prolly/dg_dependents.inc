@@ -52,6 +52,12 @@ references_walker(Node *node, List **references)
 		return false;
 	if (IsA(node, FuncCall) && (name = references_name(((FuncCall *) node)->funcname)))
 		references_add(references, "routine", name);
+	if (IsA(node, A_Expr) && list_length(((A_Expr *) node)->name) == 2)
+	{
+		List *parts = ((A_Expr *) node)->name;
+
+		references_add(references, "operator", psprintf("%s.%s", quote_identifier(strVal(linitial(parts))), strVal(lsecond(parts))));
+	}
 	if (IsA(node, TypeName) && (name = references_name(((TypeName *) node)->names)))
 		references_add(references, "type", name);
 	if (IsA(node, TypeCast))
@@ -186,8 +192,8 @@ definition_references(const char *kind, const char *definition)
 			{
 				if (!strcmp(kinds[i], "type"))
 					references_type(&references, names[i]);
-				else if (!strcmp(kinds[i], "routine") && strchr(names[i], '('))
-					references_add(&references, "routine", pnstrdup(names[i], strchr(names[i], '(') - names[i]));
+				else if ((!strcmp(kinds[i], "routine") || !strcmp(kinds[i], "operator")) && strchr(names[i], '('))
+					references_add(&references, kinds[i], pnstrdup(names[i], strchr(names[i], '(') - names[i]));
 				else
 					references_add(&references, kinds[i], names[i]);
 			}
