@@ -9,6 +9,7 @@ typedef struct DGProvider
 	CatalogView *view;
 	uint64		generation;		/* identity generation a branch view binds */
 	uint64		extension_generation;	/* the extensions whose objects it binds */
+	uint64		base_generation;	/* the server objects it lists */
 	List	   *bindings;		/* the durable OIDs a branch view binds */
 	MemoryContext memory;		/* holds the entry */
 	struct DGProvider *next;
@@ -44,6 +45,13 @@ static bool identity_callback;
  */
 static uint64 extension_generation = 1;
 
+/*
+ * Native DDL changes the server objects every view lists, as built-in rows:
+ * views built before it are not used again. Ordinary writes and versioned DDL
+ * invalidate none of the caches that track them.
+ */
+static uint64 base_generation = 1;
+
 static void
 provider_identities_changed(Datum arg, Oid relid)
 {
@@ -72,7 +80,7 @@ provider_bindings_current(DGProvider *entry)
 static bool
 provider_current(DGProvider *entry, const char *branch)
 {
-	if (entry->extension_generation != extension_generation)
+	if (entry->extension_generation != extension_generation || entry->base_generation != base_generation)
 		return false;
 	if (!branch)
 		return !entry->branch;
@@ -287,6 +295,7 @@ provider_row_owner(Oid catalog, HeapTuple tuple, Oid object)
 static void
 provider_base_forget(Datum arg, int cacheid, uint32 hashvalue)
 {
+	base_generation++;
 	if (provider_base)
 		CatalogViewBaseRelease(provider_base);
 	provider_base = NULL;
@@ -1886,6 +1895,7 @@ provider_lookup(const char *branch, bytea *database)
 	entry->view = view;
 	entry->generation = identity_generation;
 	entry->extension_generation = extension_generation;
+	entry->base_generation = base_generation;
 	entry->next = providers;
 	providers = entry;
 	saved_entry = provider_current_entry;

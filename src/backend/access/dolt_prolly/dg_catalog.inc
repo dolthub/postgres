@@ -1365,7 +1365,12 @@ dg_catalog_session_view(void)
 {
 	CatalogView *result = CatalogViewCurrent();
 
-	if (result || !dg_catalog_active())
+	/*
+	 * An extension's script makes server objects and names only those and
+	 * built-in ones: it reads the physical catalogs, which hold the objects it
+	 * has just made. Branch views see them once the extension is complete.
+	 */
+	if (result || !dg_catalog_active() || creating_extension)
 		return result;
 
 	/* The session's branch schema is read as catalogs are, latest committed. */
