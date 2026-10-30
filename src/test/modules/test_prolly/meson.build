@@ -54,5 +54,6 @@ tests += {
     't/044_branch_statistics.pl',
     't/045_backups.pl',
     't/046_schema_objects.pl',
+    't/047_inheritance.pl',
   ]},
 }

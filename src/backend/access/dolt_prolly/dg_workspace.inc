@@ -488,12 +488,16 @@ merge_schemas(bytea *base, bytea *ours, bytea *theirs, List **row_merges, String
  * common |base|: the merged schema is installed, then the rows of tables
  * changed on both sides are merged.
  */
+#include "dg_inheritance_merge.inc"
+
 static void
 merge_databases(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts, StringInfo violations,
 				StringInfo schema_conflicts)
 {
 	List	   *row_merges;
 	bytea	   *merged = merge_schemas(base, ours, theirs, &row_merges, schema_conflicts);
+
+	merged = merge_inheritance(base, ours, theirs, merged, &row_merges, schema_conflicts);
 
 	replace_working(dg_current_branch(), merged, NIL);
 	if (row_merges)

@@ -248,44 +248,11 @@ canonical_drop(Node *statement)
 	 */
 	if (!IsUnderPostmaster || (!IsA(statement, DropStmt) && !IsA(statement, AlterTableStmt)))
 		return false;
-	if (IsA(statement, AlterTableStmt))
-	{
-		AlterTableStmt *alter = (AlterTableStmt *) statement;
-
-		AlterTableType subtype;
-
-		if (!alter->cmds)
-			return false;
-		subtype = linitial_node(AlterTableCmd, alter->cmds)->subtype;
-		foreach(lc, alter->cmds)
-			if (lfirst_node(AlterTableCmd, lc)->subtype != subtype)
-			return false;
-
-		/*
-		 * Columns are dropped here only with what depends on them; native
-		 * ALTER drops a column alone.
-		 */
-		if (subtype == AT_DropColumn)
-		{
-			bool		cascade = false;
-
-			foreach(lc, alter->cmds)
-				cascade |= lfirst_node(AlterTableCmd, lc)->behavior == DROP_CASCADE;
-			if (!cascade)
-				return false;
-		}
-		else if (subtype != AT_DropConstraint)
-			return false;
-		stmt = makeNode(DropStmt);
-		stmt->removeType = subtype == AT_DropColumn ? OBJECT_COLUMN : OBJECT_TABCONSTRAINT;
-		stmt->objects = alter->cmds;
-		stmt->behavior = linitial_node(AlterTableCmd, alter->cmds)->behavior;
-		constraint_table = alter->relation;
-	}
-	else if (IsA(statement, DropStmt))
-		stmt = (DropStmt *) statement;
-	else
+	/* ALTER must run native inheritance recursion, including CASCADE. */
+	if (!IsA(statement, DropStmt))
 		return false;
+	stmt = (DropStmt *) statement;
+
 	if (stmt->removeType != OBJECT_TABLE && stmt->removeType != OBJECT_INDEX &&
 		stmt->removeType != OBJECT_FUNCTION && stmt->removeType != OBJECT_ROUTINE &&
 		stmt->removeType != OBJECT_AGGREGATE && stmt->removeType != OBJECT_OPERATOR && stmt->removeType != OBJECT_CAST &&
@@ -311,7 +278,13 @@ canonical_drop(Node *statement)
 				branch = branch_relation(constraint_table);
 			else if (stmt->removeType == OBJECT_TABLE || stmt->removeType == OBJECT_INDEX ||
 					 stmt->removeType == OBJECT_VIEW || stmt->removeType == OBJECT_MATVIEW || stmt->removeType == OBJECT_SEQUENCE)
-				branch = branch_relation(makeRangeVarFromNameList(lfirst(lc)));
+			{
+				RangeVar *rv = makeRangeVarFromNameList(lfirst(lc));
+
+				if (stmt->missing_ok && !OidIsValid(RangeVarGetRelid(rv, NoLock, true)))
+					continue;
+				branch = branch_relation(rv);
+			}
 			else if (stmt->removeType == OBJECT_TRIGGER)
 				branch = branch_relation(makeRangeVarFromNameList(list_copy_head(lfirst(lc), list_length(lfirst(lc)) - 1)));
 			else if (stmt->removeType == OBJECT_SCHEMA)
@@ -422,6 +395,13 @@ canonical_drop(Node *statement)
 			{
 				RangeVar   *rv = makeRangeVarFromNameList(lfirst(lc));
 
+				if (stmt->missing_ok && !OidIsValid(RangeVarGetRelid(rv, NoLock, true)))
+				{
+					ereport(NOTICE, (errmsg("%s \"%s\" does not exist, skipping",
+						stmt->removeType == OBJECT_TABLE ? "table" : stmt->removeType == OBJECT_INDEX ? "index" :
+						stmt->removeType == OBJECT_SEQUENCE ? "sequence" : stmt->removeType == OBJECT_MATVIEW ? "materialized view" : "view", rv->relname)));
+					continue;
+				}
 				if (!dg_catalog_lookup_relation(rv, stmt->missing_ok, &object.objectId))
 					unsupported("DROP of a shared relation in an activated database");
 				object.classId = RelationRelationId;

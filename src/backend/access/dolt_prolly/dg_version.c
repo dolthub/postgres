@@ -159,6 +159,7 @@ static bool canonical_drop(Node *statement);
 static void stage_tables(List *tables);
 static void stage_modified_tables(void);
 static void replace_working(const char *branch, bytea *database, List *tables);
+static bytea *compose_database(bytea *base, bytea *source, List *tables);
 static void merge_databases(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts, StringInfo violations,
 							StringInfo schema_conflicts);
 static PLTree remap_rows(Relation rel, PLTree content, const char *definition, List *dropped, bool *lacks);
@@ -716,6 +717,7 @@ static JsonbValue json_document(const char *json);
 static bool json_get(JsonbValue *object, const char *key, JsonbValue *result);
 static int	json_length(JsonbValue *array);
 static JsonbValue json_element(JsonbValue *array, int index);
+static char *json_item_text(JsonbValue *array, int index);
 static char *json_field_text(JsonbValue *object, const char *key);
 static Node **schema_defaults(const char *definition, int *count);
 static Constraint **schema_constraints(const char *definition, int *count);

@@ -580,7 +580,14 @@ provider_decode_columns(const char *definition)
 			TupleDescAttr(desc, i)->attcollation = InvalidOid;
 		}
 		TupleDescAttr(desc, i)->attnotnull = notnull[i];
-		TupleDescAttr(desc, i)->attislocal = true;
+		{
+			JsonbValue column = json_element(&columns, i);
+			char *local = json_field_text(&column, "islocal");
+			char *inherited = json_field_text(&column, "inhcount");
+
+			TupleDescAttr(desc, i)->attislocal = !local || !strcmp(local, "true");
+			TupleDescAttr(desc, i)->attinhcount = inherited ? pg_strtoint32(inherited) : 0;
+		}
 		TupleDescAttr(desc, i)->atthasdef = hasdef[i];
 		if (generated[i])
 			TupleDescAttr(desc, i)->attgenerated = generated[i][0];
@@ -927,6 +934,16 @@ provider_constraints(DGProviderRows *rows, CatalogView *view, const char *defini
 		form.convalidated = !constraint->skip_validation;
 		form.conislocal = true;
 		form.connoinherit = form.contype == CONSTRAINT_FOREIGN || constraint->is_no_inherit;
+		if (metadata[i])
+		{
+			char *local = json_value(metadata[i], "islocal");
+			char *inherited = json_value(metadata[i], "inhcount");
+			char *noinherit = json_value(metadata[i], "noinherit");
+
+			form.conislocal = !local || !strcmp(local, "true");
+			form.coninhcount = inherited ? pg_strtoint32(inherited) : 0;
+			if (noinherit) form.connoinherit = !strcmp(noinherit, "true");
+		}
 		form.confupdtype = ' ';
 		form.confdeltype = ' ';
 		form.confmatchtype = ' ';
@@ -1418,6 +1435,17 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			form.relpersistence = RELPERSISTENCE_PERMANENT;
 			form.relnatts = desc->natts;
 			document = json_document(definition);
+			/* Derive this flag from the canonical child definitions. */
+			for (int c = 0; c < n; c++)
+				if (!strcmp(kinds[c], "table"))
+				{
+					JsonbValue childdef = json_document(definitions[c]), parents;
+
+					if (json_get(&childdef, "inherits", &parents))
+						for (int p = 0; p < json_length(&parents); p++)
+							if (!strcmp(json_item_text(&parents, p), name))
+								form.relhassubclass = true;
+				}
 			form.relchecks = 0;
 			if (json_get(&document, "constraints", &list))
 				for (j = 0; j < json_length(&list); j++)
@@ -1527,6 +1555,25 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 		{
 			provider_sequence(&rows, view, definitions[i]);
 			CatalogViewObjectSetRetained(view, CatalogViewFindObject(view, RelationRelationId, json_value(definitions[i], "name")), schemas[i], NULL);
+		}
+
+	for (i = 0; i < n; i++)
+		if (!strcmp(kinds[i], "table"))
+		{
+			JsonbValue document = json_document(definitions[i]), parents;
+			Oid childid = CatalogViewLookupObject(view, RelationRelationId, json_value(definitions[i], "name"));
+
+			if (json_get(&document, "inherits", &parents))
+				for (int p = 0; p < json_length(&parents); p++)
+				{
+					FormData_pg_inherits form = {0};
+
+					form.inhrelid = childid;
+					form.inhparent = CatalogViewLookupObject(view, RelationRelationId, json_item_text(&parents, p));
+					form.inhseqno = p + 1;
+					provider_add(&rows, InheritsRelationId, &form, sizeof(form), Natts_pg_inherits);
+					provider_dependency(&rows, RelationRelationId, childid, 0, RelationRelationId, form.inhparent, 0, DEPENDENCY_NORMAL);
+				}
 		}
 
 	/*

@@ -8,15 +8,36 @@ native_alter_action(AlterTableType type)
 {
 	return type == AT_AlterConstraint || type == AT_AddIndex || type == AT_SetStatistics || type == AT_SetOptions || type == AT_ResetOptions ||
 		type == AT_SetStorage || type == AT_SetCompression || type == AT_SetNotNull || type == AT_DropNotNull || type == AT_AddColumn || type == AT_DropColumn || type == AT_ColumnDefault || type == AT_AddConstraint || type == AT_DropConstraint || type == AT_ValidateConstraint || type == AT_AlterColumnType ||
-		type == AT_AddIdentity || type == AT_SetIdentity || type == AT_DropIdentity;
+		type == AT_AddInherit || type == AT_DropInherit || type == AT_AddIdentity || type == AT_SetIdentity || type == AT_DropIdentity;
 }
 
 static CatalogView *native_mutation_view;
-static DGState *native_mutation_source;
-static DGState *native_mutation_destination;
-static Oid	native_mutation_relation;
-static int	native_mutation_width;
-static bool native_mutation_rewritten;
+static Oid native_mutation_relation;
+
+typedef struct NativeMutationTable
+{
+	Oid id;
+	const char *name;
+	DGState *source;
+	DGState *destination;
+	int oldcount;
+	int width;
+	bool rewritten;
+	bool rewrite;
+	PLTree tree;
+	List *indexes;
+} NativeMutationTable;
+
+static List *native_mutation_tables;
+
+static NativeMutationTable *
+mutation_table(Oid id)
+{
+	foreach_ptr(NativeMutationTable, table, native_mutation_tables)
+		if (table->id == id)
+			return table;
+	return NULL;
+}
 
 
 static void
@@ -75,7 +96,7 @@ mutation_columns(CatalogView *view, Oid relation, const char *definition, int **
 		attr = (Form_pg_attribute) GETSTRUCT(tuple);
 		if (attr->attisdropped)
 			continue;
-		if (attr->atthasmissing && !native_mutation_destination)
+		if (attr->atthasmissing && (!mutation_table(relation) || !mutation_table(relation)->destination))
 			unsupported("canonical native column expression codec");
 		/* A built-in type by its name, a versioned one qualified. */
 		{
@@ -98,8 +119,8 @@ mutation_columns(CatalogView *view, Oid relation, const char *definition, int **
 		if (has_old)
 			old = json_element(&oldcolumns, ordinal);
 		{
-			static const char *const keys[] = {"name", "comment", "type", "typmod", "notnull", "collation"};
-			JsonbValue	values[6];
+			static const char *const keys[] = {"name", "comment", "type", "typmod", "notnull", "collation", "islocal", "inhcount"};
+			JsonbValue	values[8];
 			JsonbValue	comment;
 
 			values[0] = jv_string(NameStr(attr->attname));
@@ -109,6 +130,8 @@ mutation_columns(CatalogView *view, Oid relation, const char *definition, int **
 			values[3] = jv_int(attr->atttypmod);
 			values[4] = jv_bool(false);
 			values[5] = jv_null();
+			values[6] = jv_bool(attr->attislocal);
+			values[7] = jv_int(attr->attinhcount);
 			if (OidIsValid(attr->attcollation))
 			{
 				/* Collations are the database's own, as internal SQL reads them. */
@@ -145,7 +168,7 @@ mutation_columns(CatalogView *view, Oid relation, const char *definition, int **
 				CatalogViewSwitch(previous);
 			}
 			column = has_old ? JsonbValueToJsonb(&old) : jb_object(0, NULL, NULL, false);
-			column = jb_merge(column, jb_object(6, keys, values, false));
+			column = jb_merge(column, jb_object(8, keys, values, false));
 		}
 
 		{
@@ -260,24 +283,27 @@ mutation_columns(CatalogView *view, Oid relation, const char *definition, int **
 bool
 dg_native_rewrite_active(void)
 {
-	return native_mutation_destination != NULL;
+	foreach_ptr(NativeMutationTable, table, native_mutation_tables)
+		if (table->destination) return true;
+	return false;
 }
 
 bool
 dg_catalog_begin_rewrite(Relation definition)
 {
 	MemoryContext old;
+	NativeMutationTable *table = mutation_table(RelationGetRelid(definition));
 
 	if (!CatalogViewIsProvisional(definition->rd_catalogview))
 		return false;
-	if (definition->rd_catalogview != native_mutation_view || RelationGetRelid(definition) != native_mutation_relation || native_mutation_destination)
+	if (definition->rd_catalogview != native_mutation_view || !table || table->destination)
 		elog(ERROR, "invalid native catalog rewrite authority");
-	old = MemoryContextSwitchTo(GetMemoryChunkContext(native_mutation_source));
-	native_mutation_destination = palloc0(sizeof(DGState));
-	native_mutation_destination->store = native_mutation_source->store;
-	native_mutation_destination->nextid = 1;
-	native_mutation_width = RelationGetDescr(definition)->natts;
-	dg_check(pl_build(native_mutation_source->store, NULL, 0, &native_mutation_destination->content));
+	old = MemoryContextSwitchTo(GetMemoryChunkContext(table->source));
+	table->destination = palloc0(sizeof(DGState));
+	table->destination->store = table->source->store;
+	table->destination->nextid = 1;
+	table->width = RelationGetDescr(definition)->natts;
+	dg_check(pl_build(table->source->store, NULL, 0, &table->destination->content));
 	MemoryContextSwitchTo(old);
 	return true;
 }
@@ -285,17 +311,21 @@ dg_catalog_begin_rewrite(Relation definition)
 void
 dg_catalog_finish_rewrite(Relation definition)
 {
-	if (definition->rd_catalogview != native_mutation_view || RelationGetRelid(definition) != native_mutation_relation || !native_mutation_destination)
+	NativeMutationTable *table = mutation_table(RelationGetRelid(definition));
+
+	if (definition->rd_catalogview != native_mutation_view || !table || !table->destination)
 		elog(ERROR, "native rewrite completion has no storage authority");
-	native_mutation_rewritten = true;
+	table->rewritten = true;
 }
 
 DGState *
 dg_catalog_rewrite_state(Relation definition)
 {
-	if (definition->rd_catalogview != native_mutation_view || RelationGetRelid(definition) != native_mutation_relation || !native_mutation_destination)
+	NativeMutationTable *table = mutation_table(RelationGetRelid(definition));
+
+	if (definition->rd_catalogview != native_mutation_view || !table || !table->destination)
 		elog(ERROR, "native catalog rewrite has no insertion authority");
-	return native_mutation_destination;
+	return table->destination;
 }
 
 /* Native validation scans borrow the unchanged working-set data while catalog
@@ -303,6 +333,7 @@ dg_catalog_rewrite_state(Relation definition)
 DGState *
 dg_catalog_mutation_load(Relation definition, Snapshot snapshot)
 {
+	NativeMutationTable *table = mutation_table(RelationGetRelid(definition));
 	CatalogView *view = CatalogViewObjectContext(RelationGetRelid(definition));
 	CatalogView *previous;
 	Relation	source;
@@ -313,11 +344,11 @@ dg_catalog_mutation_load(Relation definition, Snapshot snapshot)
 
 	if (view != native_mutation_view || !CatalogViewIsProvisional(view))
 		elog(ERROR, "native catalog validation has no storage authority");
-	if (native_mutation_rewritten && RelationGetRelid(definition) == native_mutation_relation)
+	if (table && table->rewritten)
 	{
 		/* A reader's copy: releasing it must not free the shared store. */
 		state = palloc0(sizeof(DGState));
-		*state = *native_mutation_destination;
+		*state = *table->destination;
 		state->shared = true;
 		memset(&state->cleanup, 0, sizeof(state->cleanup));
 		return state;
@@ -348,8 +379,9 @@ dg_catalog_mutation_load(Relation definition, Snapshot snapshot)
 void
 dg_catalog_mutation_release(DGState *state)
 {
-	if (state != native_mutation_destination)
-		dg_release(state);
+	foreach_ptr(NativeMutationTable, table, native_mutation_tables)
+		if (state == table->destination) return;
+	dg_release(state);
 }
 
 /* A serialized constraint and its name. */
@@ -368,6 +400,39 @@ compare_constraint_entries(const void *a, const void *b)
 	if (!left->name || !right->name)
 		return (left->name == NULL) - (right->name == NULL);
 	return strcmp(left->name, right->name);
+}
+
+static int
+mutation_parent_compare(const ListCell *a, const ListCell *b)
+{
+	Form_pg_inherits left = (Form_pg_inherits) GETSTRUCT((HeapTuple) lfirst(a));
+	Form_pg_inherits right = (Form_pg_inherits) GETSTRUCT((HeapTuple) lfirst(b));
+
+	return (left->inhseqno > right->inhseqno) - (left->inhseqno < right->inhseqno);
+}
+
+static char *
+mutation_inheritance(CatalogView *view, Oid relation, const char *definition)
+{
+	List *tuples = CatalogViewTuplesWith(view, InheritsRelationId, Anum_pg_inherits_inhrelid, relation);
+	int n = list_length(tuples);
+	JsonbValue *parents = palloc_array(JsonbValue, Max(n, 1));
+	int ordinal = 0;
+
+	list_sort(tuples, mutation_parent_compare);
+	foreach_ptr(HeapTupleData, tuple, tuples)
+	{
+		Form_pg_inherits form = (Form_pg_inherits) GETSTRUCT(tuple);
+		CatalogView *previous = CatalogViewSwitch(view);
+		const char *name = dg_qualified_name(get_namespace_name(get_rel_namespace(form->inhparent)), get_rel_name(form->inhparent));
+
+		CatalogViewSwitch(previous);
+
+		if (!name || form->inhdetachpending)
+			unsupported("inheritance outside the branch catalog");
+		parents[ordinal++] = jv_string(name);
+	}
+	return json_set_jsonb(definition, "inherits", jb_array(n, parents));
 }
 
 static char *
@@ -423,10 +488,15 @@ mutation_constraints(CatalogView *view, Oid relation, const char *definition)
 			escape_json(&json, NameStr(constraint->conname));
 			appendStringInfoChar(&json, ',');
 			escape_json(&json, sql);
-			if (constraint->contype == CONSTRAINT_FOREIGN)
 			{
+				const char *keys[] = {"islocal", "inhcount", "noinherit"};
+				JsonbValue values[] = {jv_bool(constraint->conislocal), jv_int(constraint->coninhcount), jv_bool(constraint->connoinherit)};
+				Jsonb *meta = jb_object(3, keys, values, false);
+
+				if (constraint->contype == CONSTRAINT_FOREIGN)
+					meta = jb_merge(DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(foreign_metadata(tuple)))), meta);
 				appendStringInfoChar(&json, ',');
-				appendStringInfoString(&json, foreign_metadata(tuple));
+				appendStringInfoString(&json, JsonbToCString(NULL, &meta->root, VARSIZE(meta)));
 			}
 			appendStringInfoChar(&json, ']');
 		}
@@ -480,7 +550,7 @@ mutation_storage(Relation relation, CatalogViewStorageEffect effect)
 		relation->rd_rel->relkind != RELKIND_INDEX ||
 		relation->rd_rel->relam != DOLT_PROLLY_INDEX_AM_OID)
 		unsupported("native mutation storage effect outside prolly indexes");
-	if (effect != CATALOG_STORAGE_CREATE && IndexGetRelation(RelationGetRelid(relation), false) != native_mutation_relation)
+	if (effect != CATALOG_STORAGE_CREATE && !mutation_table(IndexGetRelation(RelationGetRelid(relation), false)))
 		unsupported("native mutation index belongs to another table");
 	native_mutation_indexes = true;
 }
@@ -858,10 +928,8 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 	CatalogView *view = CatalogViewCreate("provisional native ALTER");
 	CatalogView *previous = CatalogViewCurrent();
 	CatalogView *saved_mutation = native_mutation_view;
-	DGState    *saved_source = native_mutation_source;
-	DGState    *saved_destination = native_mutation_destination;
+	List *saved_tables = native_mutation_tables;
 	Oid			saved_relation = native_mutation_relation;
-	int			saved_width = native_mutation_width;
 	bytea	  **members;
 	char	  **kinds,
 			  **names,
@@ -873,9 +941,6 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 	List	   *indexes = NIL,
 			   *oldindexes = NIL;
 	bool		saved_indexes = native_mutation_indexes;
-	bool		saved_rewritten = native_mutation_rewritten;
-	bool		rewrite = false;
-	PLTree		tree = state->content;
 	HTAB	   *affected;
 	DGMember   *listed;
 
@@ -891,12 +956,29 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 		CatalogViewSetStorageHandler(view, mutation_storage);
 		native_mutation_indexes = false;
 		native_mutation_view = view;
-		native_mutation_source = state;
-		native_mutation_destination = NULL;
-		native_mutation_rewritten = false;
+		native_mutation_tables = NIL;
 		id = CatalogViewLookupObject(view, RelationRelationId, name);
 		native_mutation_relation = id;
 		CatalogViewSwitch(view);
+		/* Native ALTER may rewrite each descendant independently. Its source
+		 * must be the old branch tuple layout, never the parent's layout. */
+		foreach_oid(childid, find_all_inheritors(id, NoLock, NULL))
+		{
+			NativeMutationTable *table = palloc0(sizeof(*table));
+			CatalogView *outer;
+			Relation source;
+
+			table->id = childid;
+			table->name = pstrdup(CatalogViewObjectIdentity(childid, RelationRelationId));
+			outer = CatalogViewSwitch(NULL);
+			source = dg_catalog_write_table(dg_current_branch(), table->name, ACL_UPDATE);
+			table->oldcount = RelationGetDescr(source)->natts;
+			table->source = childid == id ? state : dg_load(source, GetActiveSnapshot());
+			table->tree = table->source->content;
+			dg_storage_close_relation(source);
+			CatalogViewSwitch(outer);
+			native_mutation_tables = lappend(native_mutation_tables, table);
+		}
 
 		foreach(lc, commands)
 		{
@@ -995,7 +1077,11 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 			PG_END_TRY(caller);
 		}
 		CommandCounterIncrement();
-		indexes = mutation_indexes(view, id);
+		foreach_ptr(NativeMutationTable, table, native_mutation_tables)
+		{
+			table->indexes = mutation_indexes(view, table->id);
+			indexes = list_concat(indexes, list_copy(table->indexes));
+		}
 		CatalogViewSwitch(NULL);
 		listed = dg_database_members(current.hash, &count);
 		members = palloc_array(bytea *, Max(count, 1));
@@ -1011,8 +1097,9 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 			names[i] = !strcmp(kinds[i], "table") || !strcmp(kinds[i], "index") ? (char *) listed[i].name : NULL;
 		}
 		for (int i = 0; i < count; i++)
-			if (names[i] && !strcmp(names[i], name))
-				oldindexes = table_index_names(metadata(child(members[i], 1), "schema"), name);
+			if (names[i] && !strcmp(kinds[i], "table") &&
+				mutation_table(CatalogViewLookupObject(view, RelationRelationId, names[i])))
+				oldindexes = list_concat(oldindexes, table_index_names(metadata(child(members[i], 1), "schema"), names[i]));
 
 		/*
 		 * Serialize all surviving indexes, including newly allocated native
@@ -1052,7 +1139,21 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 			bool		relation = !strcmp(kinds[i], "table") || !strcmp(kinds[i], "index");
 			Oid			object = relation ? CatalogViewLookupObject(view, RelationRelationId, names[i]) : InvalidOid;
 			bool		touched = relation && (!strcmp(names[i], name) || oid_set_contains(affected, object));
+			NativeMutationTable *table = relation ? mutation_table(object) : NULL;
 
+			/* CASCADE may remove schema objects as well as indexes. */
+			{
+				Oid classid = !strcmp(kinds[i], "namespace") ? NamespaceRelationId :
+					!strcmp(kinds[i], "routine") || !strcmp(kinds[i], "aggregate") ? ProcedureRelationId :
+					!strcmp(kinds[i], "operator") ? OperatorRelationId :
+					!strcmp(kinds[i], "cast") ? CastRelationId :
+					!strcmp(kinds[i], "type") ? TypeRelationId :
+					!strcmp(kinds[i], "trigger") ? TriggerRelationId : RelationRelationId;
+				Oid memberid = listed[i].name ? CatalogViewFindObject(view, classid, listed[i].name) : InvalidOid;
+
+				if (OidIsValid(memberid) && CatalogViewTuplesWith(view, classid, 1, memberid) == NIL)
+					continue;
+			}
 			payloads[i] = metadata(members[i], kinds[i]);
 			if (!strcmp(kinds[i], "sequence"))
 				continue;
@@ -1070,43 +1171,45 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 				int			attributes;
 				char	   *definition = mutation_columns(view, object, old, &mapping, &attributes);
 
-				if (!strcmp(names[i], name))
+				if (table)
 				{
-					rewrite = attributes != oldcount;
+					table->rewrite = attributes != table->oldcount;
 					for (int j = 0; j < attributes; j++)
-						if (mapping[j] != j)
-							rewrite = true;
-					if (native_mutation_destination)
+						if (mapping[j] != j) table->rewrite = true;
+					if (table->destination)
 					{
-						rewrite = true;
-						tree = alter_rows(native_mutation_destination, native_mutation_width, attributes, mapping, NULL, NULL);
+						table->rewrite = true;
+						table->tree = alter_rows(table->destination, table->width, attributes, mapping, NULL, NULL);
 					}
-					else if (rewrite)
-						tree = alter_rows(state, oldcount, attributes, mapping, NULL, NULL);
+					else if (table->rewrite)
+						table->tree = alter_rows(table->source, table->oldcount, attributes, mapping, NULL, NULL);
 				}
 
 				if (!strcmp(kinds[i], "table"))
+					{
 					definition = mutation_constraints(view, object, definition);
-				if (!strcmp(names[i], name))
-					definition = mutation_index_list(definition, indexes);
+					definition = mutation_inheritance(view, object, definition);
+				}
+				if (table)
+					definition = mutation_index_list(definition, table->indexes);
 				if (!touched && !json_same(definition, old))
 					elog(ERROR, "native ALTER changed %s, whose catalog rows it did not touch", names[i]);
 
 				if (!json_same(definition, old))
 				{
 					bytea	   *schema = put("schema", definition, NULL, 0);
-					bytea	   *content = rewrite && !strcmp(names[i], name) ? dg_history_export_tree(&tree) : child(members[i], 2);
+					bytea	   *content = table && table->rewrite ? dg_history_export_tree(&table->tree) : child(members[i], 2);
 					Oid			resource = binding_relation(dg_current_branch(), names[i], oldschema);
 
 					if (!OidIsValid(resource))
 						elog(ERROR, "native mutation storage binding is unavailable");
 					run("SELECT jsonb_set($1::jsonb,'{schema}',to_jsonb(encode(sha256(convert_to($2,'UTF8')),'hex')))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(payloads[i]), CStringGetTextDatum(definition)), NULL, true);
 					payloads[i] = strcell(0, 1);
-					if (rewrite && !strcmp(names[i], name))
+					if (table && table->rewrite)
 					{
 						char		root[PL_HASH_TEXT_SIZE + 1];
 
-						pl_hash_format(tree.root, root);
+						pl_hash_format(table->tree.root, root);
 						payloads[i] = json_set_string(payloads[i], "content", root);
 					}
 					members[i] = put(kinds[i], payloads[i], VC_ARGS(PointerGetDatum(schema), PointerGetDatum(content)), 2);
@@ -1157,27 +1260,28 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 			}
 			move_ref(branch_ref("working"), working, database);
 			advance_snapshot();
-			if (rewrite || indexes != NIL || native_mutation_indexes)
-			{
-				Relation	target = dg_catalog_write_table(dg_current_branch(), name, ACL_UPDATE);
+			foreach_ptr(NativeMutationTable, table, native_mutation_tables)
+				if (table->rewrite || table->indexes != NIL || native_mutation_indexes)
+				{
+					Relation target = dg_catalog_write_table(dg_current_branch(), table->name, ACL_UPDATE);
 
-				dg_history_install(target, state, tree);
-				dg_storage_close_relation(target);
-				UpdateActiveSnapshotCommandId();
-				move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture(true).hash);
-			}
+					dg_history_install(target, table->source, table->tree);
+					dg_storage_close_relation(target);
+					UpdateActiveSnapshotCommandId();
+				}
+			move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture(true).hash);
 		}
 	}
 	PG_FINALLY();
 	{
 		CatalogViewSwitch(previous);
 		native_mutation_view = saved_mutation;
-		native_mutation_source = saved_source;
-		native_mutation_destination = saved_destination;
+		if (native_mutation_tables != saved_tables)
+			foreach_ptr(NativeMutationTable, table, native_mutation_tables)
+				if (table->source != state) dg_release(table->source);
+		native_mutation_tables = saved_tables;
 		native_mutation_relation = saved_relation;
-		native_mutation_width = saved_width;
 		native_mutation_indexes = saved_indexes;
-		native_mutation_rewritten = saved_rewritten;
 		if (CatalogViewIsProvisional(view))
 			CatalogViewRetireMutation(view);
 		CatalogViewRelease(view);
@@ -1370,6 +1474,7 @@ native_create_definitions(Capture current, CreateStmt *statement, const char *qu
 		definition = canonical_definition(name, owner, acl, "[]", "[]", "[]", NULL);
 		definition = mutation_columns(view, id, definition, &mapping, &attributes);
 		definition = mutation_constraints(view, id, definition);
+		definition = mutation_inheritance(view, id, definition);
 		indexes = mutation_indexes(view, id);
 		foreach(lc, indexes)
 		{

@@ -139,6 +139,14 @@ definition_references(const char *kind, const char *definition)
 
 	if (!strcmp(kind, "sequence") && json_value(definition, "owned_table"))
 		references_add(&references, "table", json_value(definition, "owned_table"));
+	if (!strcmp(kind, "table"))
+	{
+		JsonbValue document = json_document(definition), parents;
+
+		if (json_get(&document, "inherits", &parents))
+			for (int i = 0; i < json_length(&parents); i++)
+				references_add(&references, "table", json_item_text(&parents, i));
+	}
 	/* An index's definition lists its key columns as a table's does. */
 	if (!strcmp(kind, "table") || !strcmp(kind, "index"))
 	{
