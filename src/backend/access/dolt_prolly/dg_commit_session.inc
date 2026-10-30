@@ -90,7 +90,6 @@ commit_branches(void)
 	foreach(lc, commit_dirty_branches)
 	{
 		CommitDirtyBranch *entry = lfirst(lc);
-
 		ListCell   *other;
 		bool		found = false;
 
@@ -114,6 +113,7 @@ dg_version_pre_commit(void)
 	List	   *branches;
 	const char *previous_branch;
 	ListCell   *lc;
+	TimestampTz commit_time = GetCurrentTimestamp();
 
 	if (!dolt_transaction_commit || !commit_dirty_branches || commit_publishing)
 		return;
@@ -160,7 +160,7 @@ dg_version_pre_commit(void)
 					run("SELECT COALESCE(NULLIF(btrim($1),''),'Transaction commit')", 1,
 						VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(dolt_transaction_commit_message)), NULL, true);
 					message = strcell(0, 1);
-					commit = commit_object(database, head.target, NULL, message, NULL, NULL, GetCurrentTimestamp());
+					commit = commit_object(database, head.target, NULL, message, NULL, NULL, commit_time);
 					move_ref(branch_ref("heads"), head, commit);
 					move_ref(branch_ref("staged"), staged, database);
 					move_ref(branch_ref("working"), working, full.hash);

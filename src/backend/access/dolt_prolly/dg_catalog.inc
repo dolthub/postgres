@@ -594,6 +594,8 @@ revision_selected:
 			/* An unversioned native relation exists only on the live database. */
 			if (OidIsValid(native) && !dg_system_namespace(ns))
 			{
+				if (target && sep)
+					unsupported("branch-qualified writes to unversioned relations");
 				if (!working)
 					ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("relation %s does not exist in revision %s", rv->relname, revision)));
 				goto binding_done;
