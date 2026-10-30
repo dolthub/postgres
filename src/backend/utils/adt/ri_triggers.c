@@ -327,6 +327,21 @@ ri_fast_check(const RI_ConstraintInfo *riinfo, Relation fk_rel, Relation pk_rel,
 			return false;
 		}
 		op_input_types(op, &lefttype, &righttype);
+		/*
+		 * The RI operator need not accept the columns' actual types.  For
+		 * example, an integer FK can use float8eq against a float8 PK.  The
+		 * normal query coerces its operands; passing the raw Datum here would
+		 * instead reinterpret its bits (or even a by-value Datum as a pointer).
+		 * Leave non-binary coercions to that query, including its EPQ recheck.
+		 */
+		if (!IsBinaryCoercible(TupleDescAttr(RelationGetDescr(pk_rel),
+										   riinfo->pk_attnums[i] - 1)->atttypid, lefttype) ||
+			!IsBinaryCoercible(TupleDescAttr(RelationGetDescr(fk_rel),
+										   riinfo->fk_attnums[i] - 1)->atttypid, righttype))
+		{
+			index_close(idxrel, AccessShareLock);
+			return false;
+		}
 		keycol[j] = i;
 		ScanKeyEntryInitialize(&skeys[j], 0, j + 1, BTEqualStrategyNumber, righttype,
 							   idxrel->rd_indcollation[j], get_opcode(op), vals[i]);

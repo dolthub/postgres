@@ -311,15 +311,13 @@
 { oid => '9009', opfmethod => 'dolt_prolly_index', opfname => 'dolt_text_ops' },
 { oid => '9010', opfmethod => 'dolt_prolly_index', opfname => 'dolt_bytea_ops' },
 
-# Prolly indexes order keys by their normalized canonical bytes; one family per type.
-{ oid => '9011', opfmethod => 'dolt_prolly_index', opfname => 'dolt_float4_ops' },
-{ oid => '9012', opfmethod => 'dolt_prolly_index', opfname => 'dolt_float8_ops' },
+# Prolly indexes order keys by normalized bytes. Native cross-type families
+# retain PostgreSQL comparison semantics; scans recheck incompatible encodings.
+{ oid => '9011', opfmethod => 'dolt_prolly_index', opfname => 'dolt_float_ops' },
 { oid => '9013', opfmethod => 'dolt_prolly_index', opfname => 'dolt_numeric_ops' },
-{ oid => '9014', opfmethod => 'dolt_prolly_index', opfname => 'dolt_date_ops' },
+{ oid => '9014', opfmethod => 'dolt_prolly_index', opfname => 'dolt_datetime_ops' },
 { oid => '9015', opfmethod => 'dolt_prolly_index', opfname => 'dolt_time_ops' },
 { oid => '9016', opfmethod => 'dolt_prolly_index', opfname => 'dolt_timetz_ops' },
-{ oid => '9017', opfmethod => 'dolt_prolly_index', opfname => 'dolt_timestamp_ops' },
-{ oid => '9018', opfmethod => 'dolt_prolly_index', opfname => 'dolt_timestamptz_ops' },
 { oid => '9019', opfmethod => 'dolt_prolly_index', opfname => 'dolt_interval_ops' },
 { oid => '9020', opfmethod => 'dolt_prolly_index', opfname => 'dolt_uuid_ops' },
 { oid => '9021', opfmethod => 'dolt_prolly_index', opfname => 'dolt_bpchar_ops' },
