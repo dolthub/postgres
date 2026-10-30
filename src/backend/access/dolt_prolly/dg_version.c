@@ -2029,7 +2029,7 @@ dolt_diff_summary_table(PG_FUNCTION_ARGS)
 
 #include "dg_binding.inc"
 
-static void validate_working_foreign_keys(const char *branch);
+static void validate_working_foreign_keys(const char *branch, StringInfo violations);
 
 #include "dg_merge.inc"
 

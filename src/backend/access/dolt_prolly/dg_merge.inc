@@ -795,7 +795,7 @@ install_database(bytea *base, bytea *ours, bytea *theirs, List *merges, StringIn
 		UpdateActiveSnapshotCommandId();
 	}
 	if (base)
-		validate_working_foreign_keys(dg_current_branch(), NULL);
+		validate_working_foreign_keys(dg_current_branch(), violations);
 }
 
 Datum

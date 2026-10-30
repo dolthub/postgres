@@ -1,6 +1,6 @@
 /* Use the FK's actual equality operators, including native input coercions. */
 static const char *
-foreign_action(char action)
+foreign_violation_action(char action)
 {
  switch (action)
  {
@@ -68,8 +68,8 @@ collect_foreign_violations(HeapTuple constraint, Relation fk, Relation pk, Strin
  appendStringInfo(&info,"{\"Columns\":%s,\"ForeignKey\":",columns.data);
  escape_json(&info,NameStr(con->conname));
  appendStringInfoString(&info,",\"Index\":"); escape_json(&info,index_name);
- appendStringInfoString(&info,",\"OnDelete\":"); escape_json(&info,foreign_action(con->confdeltype));
- appendStringInfoString(&info,",\"OnUpdate\":"); escape_json(&info,foreign_action(con->confupdtype));
+ appendStringInfoString(&info,",\"OnDelete\":"); escape_json(&info,foreign_violation_action(con->confdeltype));
+ appendStringInfoString(&info,",\"OnUpdate\":"); escape_json(&info,foreign_violation_action(con->confupdtype));
  appendStringInfo(&info,",\"ReferencedColumns\":%s,\"ReferencedIndex\":",referenced.data);
  escape_json(&info,get_rel_name(con->conindid));
  appendStringInfoString(&info,",\"ReferencedTable\":"); escape_json(&info,RelationGetRelationName(pk));
@@ -104,7 +104,7 @@ collect_foreign_violations(HeapTuple constraint, Relation fk, Relation pk, Strin
  * Until Dolt FK violation records are supported, violations abort publication;
  * this also conservatively checks pre-existing NOT VALID constraints. */
 static void
-validate_working_foreign_keys(const char *branch)
+validate_working_foreign_keys(const char *branch, StringInfo violations)
 {
 	bytea	   *database = read_ref(psprintf("working/%s", branch)).target;
 	CatalogView *view;
@@ -145,7 +145,9 @@ validate_working_foreign_keys(const char *branch)
 			trigger.tgconstrrelid = con->confrelid;
 			trigger.tgconstrindid = con->conindid;
 			trigger.tgname = NameStr(con->conname);
-			if (!RI_Initial_Check(&trigger, fk, pk))
+			if (violations)
+				collect_foreign_violations((HeapTuple) lfirst(lc), fk, pk, violations);
+			else if (!RI_Initial_Check(&trigger, fk, pk))
 				elog(ERROR, "cannot validate foreign key root publication");
 			dg_storage_close_relation(pk);
 			dg_storage_close_relation(fk);

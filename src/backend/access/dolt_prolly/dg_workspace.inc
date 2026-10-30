@@ -516,7 +516,7 @@ merge_databases(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts, S
 	if (row_merges)
 		install_database(base, ours, theirs, row_merges, conflicts, violations);
 	else
-		validate_working_foreign_keys(dg_current_branch(), NULL);
+		validate_working_foreign_keys(dg_current_branch(), violations);
 }
 
 /*
