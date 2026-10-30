@@ -444,6 +444,8 @@ canonical_drop(Node *statement)
 			{
 				object.classId = NamespaceRelationId;
 				object.objectId = get_namespace_oid(strVal(lfirst(lc)), stmt->missing_ok);
+				if (OidIsValid(object.objectId))
+					namespace_drop_check(strVal(lfirst(lc)));
 			}
 			else if (stmt->removeType == OBJECT_TYPE || stmt->removeType == OBJECT_DOMAIN)
 			{

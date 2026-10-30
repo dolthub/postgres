@@ -490,6 +490,50 @@ rename_storage(Relation relation, CatalogViewStorageEffect effect)
 	unsupported("storage effects of a rename");
 }
 
+/*
+ * Whether the server's schema |name| holds server objects, and one of them in
+ * |found|. Every object in a schema depends on it, and every physical object
+ * is the server's: versioned ones have no physical rows.
+ */
+static bool
+namespace_server_object(const char *name, ObjectAddress *found)
+{
+	CatalogView *previous = CatalogViewSwitch(NULL);
+	bool		result = false;
+
+	PG_TRY();
+	{
+		Oid			namespace = get_namespace_oid(name, true);
+
+		if (OidIsValid(namespace))
+		{
+			Relation	depend = table_open(DependRelationId, AccessShareLock);
+			ScanKeyData keys[2];
+			SysScanDesc scan;
+			HeapTuple	tuple;
+
+			ScanKeyInit(&keys[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(NamespaceRelationId));
+			ScanKeyInit(&keys[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(namespace));
+			scan = systable_beginscan(depend, DependReferenceIndexId, true, NULL, 2, keys);
+			if (HeapTupleIsValid(tuple = systable_getnext(scan)))
+			{
+				Form_pg_depend dep = (Form_pg_depend) GETSTRUCT(tuple);
+
+				ObjectAddressSet(*found, dep->classid, dep->objid);
+				result = true;
+			}
+			systable_endscan(scan);
+			table_close(depend, AccessShareLock);
+		}
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	return result;
+}
+
 bool
 dg_catalog_rename(ParseState *pstate, Node *statement)
 {
@@ -520,6 +564,28 @@ dg_catalog_rename(ParseState *pstate, Node *statement)
 		if (pushed)
 			PopActiveSnapshot();
 		return false;
+	}
+
+	/*
+	 * Server objects stay in their schema on every branch, so a branch cannot
+	 * take its schema elsewhere while it holds them.
+	 */
+	if (!strcmp(kind, "namespace") && IsA(statement, RenameStmt))
+	{
+		ObjectAddress server;
+
+		if (namespace_server_object(name, &server))
+		{
+			CatalogView *physical = CatalogViewSwitch(NULL);
+			char	   *description = getObjectDescription(&server, false);
+
+			CatalogViewSwitch(physical);
+			ereport(ERROR,
+					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+					 errmsg("cannot rename schema %s because server objects belong to it", name),
+					 errdetail("%s belongs to the server, and stays in schema %s on every branch.", description, name),
+					 errhint("Install extensions into a schema of their own to rename this one on a branch.")));
+		}
 	}
 	if (CatalogViewCurrent())
 		unsupported("rename in an immutable revision context");
