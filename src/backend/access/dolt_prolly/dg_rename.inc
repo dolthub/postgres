@@ -49,6 +49,24 @@ rename_encode(CatalogView *view, const char *kind, const char *name, const char 
 				VC_ARGS(CStringGetTextDatum(result), CStringGetTextDatum(dg_qualified_name(get_namespace_name(get_rel_namespace(relid)), get_rel_name(relid)))), NULL, true);
 			result = strcell(0, 1);
 		}
+		else if (schema_object_class(kind))
+		{
+			Oid classid = schema_object_class(kind);
+			Oid catalogid = classid == ProcedureRelationId ? AggregateRelationId : classid;
+			Oid id = CatalogViewLookupObject(view, classid, name);
+			Relation catalog = table_open(catalogid, AccessShareLock);
+			ScanKeyData key;
+			SysScanDesc scan;
+			HeapTuple tuple;
+
+			ScanKeyInit(&key, 1, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(id));
+			scan = systable_beginscan(catalog, InvalidOid, false, NULL, 1, &key);
+			tuple = systable_getnext(scan);
+			if (!HeapTupleIsValid(tuple)) elog(ERROR, "missing schema object %s", name);
+			result = schema_object_encode(catalogid, tuple, RelationGetDescr(catalog));
+			systable_endscan(scan);
+			table_close(catalog, AccessShareLock);
+		}
 		else if (!strcmp(kind, "sequence"))
 		{
 			char	   *state = sequence_capture(old);
@@ -224,7 +242,15 @@ static char *
 rename_member_schema(const char *kind, const char *name)
 {
 	char	   *prefix = pstrdup(name);
-	char	   *end = strpbrk(prefix, !strcmp(kind, "routine") ? "(" : !strcmp(kind, "trigger") ? "/" : "");
+	char	   *end = strpbrk(prefix, (!strcmp(kind, "routine") || !strcmp(kind, "aggregate") || !strcmp(kind, "operator")) ? "(" : !strcmp(kind, "trigger") ? "/" : "");
+
+	if (!strcmp(kind, "cast")) return pstrdup("");
+	if (!strcmp(kind, "operator"))
+	{
+		if (end) *end = '\0';
+		*strrchr(prefix, '.') = '\0';
+		return strVal(linitial(stringToQualifiedNameList(prefix, NULL)));
+	}
 
 	if (end)
 		*end = '\0';
@@ -283,6 +309,19 @@ comment_subject(CommentStmt *stmt, char **kind, char **name, List **references)
 	*references = NIL;
 	switch (stmt->objtype)
 	{
+		case OBJECT_AGGREGATE:
+		case OBJECT_OPERATOR:
+		case OBJECT_CAST:
+			{
+				Relation relation;
+				ObjectAddress address = get_object_address(stmt->objtype, stmt->object, &relation, AccessShareLock, false);
+
+				if (relation) relation_close(relation, NoLock);
+				if (!CatalogViewObjectContext(address.objectId)) return false;
+				*kind = stmt->objtype == OBJECT_AGGREGATE ? "aggregate" : stmt->objtype == OBJECT_OPERATOR ? "operator" : "cast";
+				*name = (char *) CatalogViewObjectIdentity(address.objectId, address.classId);
+				return true;
+			}
 		case OBJECT_FUNCTION:
 		case OBJECT_PROCEDURE:
 		case OBJECT_ROUTINE:
@@ -447,6 +486,19 @@ rename_subject(Node *statement, char **kind, char **name, List **references)
 								 ((RenameStmt *) statement)->subname);
 				return true;
 			}
+		case OBJECT_OPERATOR:
+			{
+				Relation relation;
+				ObjectAddress address = get_object_address(type, object, &relation, AccessShareLock, false);
+
+				if (relation) relation_close(relation, NoLock);
+				if (!CatalogViewObjectContext(address.objectId)) return false;
+				*kind = "operator";
+				*name = (char *) CatalogViewObjectIdentity(address.objectId, address.classId);
+				*references = list_make1(list_make2("operator", *name));
+				return true;
+			}
+		case OBJECT_AGGREGATE:
 		case OBJECT_FUNCTION:
 		case OBJECT_PROCEDURE:
 		case OBJECT_ROUTINE:
@@ -455,7 +507,7 @@ rename_subject(Node *statement, char **kind, char **name, List **references)
 
 				if (!OidIsValid(id) || id < FirstDurableObjectId)
 					return false;
-				*kind = "routine";
+				*kind = type == OBJECT_AGGREGATE ? "aggregate" : "routine";
 				*name = CatalogViewObjectIdentity(id, ProcedureRelationId);
 				*references = list_make1(list_make2("routine", dg_qualified_name(get_namespace_name(get_func_namespace(id)), get_func_name(id))));
 				return true;

@@ -34,7 +34,7 @@ is(sql(q{SELECT count(*) FROM pg_proc WHERE proname='total'}), '0', 'aggregate i
 is(sql(q{SELECT count(*) FROM pg_operator WHERE oprname='==='}), '0', 'operator is absent on main');
 is(sql(q{SELECT count(*) FROM pg_cast c JOIN pg_type t ON t.oid=c.castsource WHERE t.typname='source'}), '0', 'cast is absent on main');
 
-is(sql(q{SELECT has_conflicts FROM dolt_merge('feature'); SELECT total(v) FROM t}), "0\n6", 'merge publishes aggregate');
+is(sql(q{SELECT conflicts FROM dolt_merge('feature'); SELECT total(v) FROM t}), "0\n6", 'merge publishes aggregate');
 is(sql(q{SELECT 1 OPERATOR(public.===) 2, (ROW(4)::source::target).v}), 'f|5', 'merge publishes operator, cast and function dependencies');
 fails(q{DROP FUNCTION same_int(integer,integer)}, qr/depend/, 'operator protects its function');
 sql(q{BEGIN; DROP AGGREGATE total(integer); ROLLBACK});

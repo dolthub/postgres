@@ -262,6 +262,8 @@ definition_references(const char *kind, const char *definition)
 			}
 		}
 	}
+	if (!strcmp(kind, "aggregate"))
+		references = list_concat(references, definition_references("routine", json_value(definition, "routine")));
 	return references;
 }
 
