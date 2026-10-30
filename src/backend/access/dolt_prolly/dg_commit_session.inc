@@ -67,13 +67,11 @@ dg_version_mark_branch(const char *branch)
 	MemoryContextSwitchTo(old);
 }
 
+/* The ref and object writes stay invisible with the prepared SQL transaction. */
 void
 dg_version_pre_prepare(void)
 {
-	if (dolt_transaction_commit && commit_dirty_branches)
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("automatic version-control commits cannot be prepared"),
-						errhint("Use COMMIT, or disable dolt_transaction_commit before PREPARE TRANSACTION.")));
+	dg_version_pre_commit();
 }
 
 /* Runs before transaction shutdown, so SPI and user type codecs remain usable. */
