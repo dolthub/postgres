@@ -74,5 +74,12 @@ is(sql(q{SELECT renamed_a,b,d FROM grandchild}), '300|grand|1', 'recursive CASCA
 is(sql(q{SELECT count(*) FROM pg_class WHERE relname='inherited_view'}), '0', 'CASCADE removes dependent view from the root');
 sql(q{CREATE TABLE cleanup(a int); DROP TABLE IF EXISTS cleanup, cleanup_missing; CREATE TABLE cleanup(a int)});
 is(sql(q{SELECT count(*) FROM cleanup}), '0', 'DROP IF EXISTS handles missing siblings of versioned tables');
+sql(q{CREATE TABLE merge_parent(a int); SELECT dolt_commit('-Am','merge graph base'); SELECT dolt_branch('new_child');
+ SELECT dolt_checkout('new_child'); CREATE TABLE merge_child() INHERITS(merge_parent); INSERT INTO merge_child VALUES(1); SELECT dolt_commit('-Am','new child')});
+sql(q{ALTER TABLE merge_parent ADD COLUMN b int; SELECT dolt_commit('-Am','new parent column')});
+is(sql(q{SELECT conflicts FROM dolt_merge('new_child')}), '1', 'incompatible cross-table schema merge reports a conflict');
+is(sql(q{SELECT count(*) FROM merge_parent}), '0', 'schema conflict retains a usable target inheritance graph');
+sql(q{SELECT dolt_conflicts_resolve('--theirs','merge_child')});
+is(sql(q{SELECT a FROM merge_parent}), '1', 'schema conflict resolution publishes the whole source inheritance component');
 $node->stop;
 done_testing();
