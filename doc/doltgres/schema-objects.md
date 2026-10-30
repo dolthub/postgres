@@ -21,3 +21,12 @@ Validation: test_prolly/046_schema_objects; Doltgres TestCreateAggregate,
 TestCreateOperator, TestCasts, TestDoltBackup and
 TestPostgresForkVersionedSchemaObjects. The last test includes a reused prepared
 statement across branch changes and replacement of its implementation function.
+
+Status, named staging, checkout and diff interfaces include all three kinds.
+Aggregate selectors accept routine-style signatures and PostgreSQL type aliases.
+Operator and cast selectors accept the exact portable identity shown in
+`dolt_status.table_name`, for example
+`public.===(pg_catalog.int4,pg_catalog.int4)` or
+`(public.source AS public.target)`. Casts have no owning namespace; operator
+namespace selection comes from the canonical catalog field, not identifier
+parsing of the operator symbol.
