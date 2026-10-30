@@ -67,5 +67,8 @@ $left->query_safe('COMMIT');
 is($right->query_safe(q{SELECT right_value FROM grandchild}), '6', 'other branch DDL does not wait for uncommitted inherited DDL');
 is($left->query_safe(q{SELECT left_value FROM grandchild}), '5', 'both branches publish independent recursive changes');
 $left->quit; $right->quit;
+sql(q{CREATE VIEW inherited_view AS SELECT renamed_a FROM grandchild; ALTER TABLE renamed_parent DROP COLUMN renamed_a CASCADE});
+is(sql(q{SELECT b,d,left_value FROM grandchild}), 'grand|1|5', 'recursive CASCADE remaps child tuples');
+is(sql(q{SELECT count(*) FROM pg_class WHERE relname='inherited_view'}), '0', 'CASCADE removes dependent view from the root');
 $node->stop;
 done_testing();

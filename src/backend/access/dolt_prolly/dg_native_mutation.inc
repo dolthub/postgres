@@ -1141,6 +1141,19 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 			bool		touched = relation && (!strcmp(names[i], name) || oid_set_contains(affected, object));
 			NativeMutationTable *table = relation ? mutation_table(object) : NULL;
 
+			/* CASCADE may remove schema objects as well as indexes. */
+			{
+				Oid classid = !strcmp(kinds[i], "namespace") ? NamespaceRelationId :
+					!strcmp(kinds[i], "routine") || !strcmp(kinds[i], "aggregate") ? ProcedureRelationId :
+					!strcmp(kinds[i], "operator") ? OperatorRelationId :
+					!strcmp(kinds[i], "cast") ? CastRelationId :
+					!strcmp(kinds[i], "type") ? TypeRelationId :
+					!strcmp(kinds[i], "trigger") ? TriggerRelationId : RelationRelationId;
+				Oid memberid = CatalogViewFindObject(view, classid, listed[i].name);
+
+				if (OidIsValid(memberid) && CatalogViewTuplesWith(view, classid, 1, memberid) == NIL)
+					continue;
+			}
 			payloads[i] = metadata(members[i], kinds[i]);
 			if (!strcmp(kinds[i], "sequence"))
 				continue;
