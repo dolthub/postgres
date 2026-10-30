@@ -1,0 +1,4 @@
+# Objects of every kind an extension script makes, for 037_extensions.pl
+comment = 'objects an extension script creates on a branch-enabled database'
+default_version = '1.0'
+relocatable = false

@@ -67,6 +67,9 @@ is(sql(q{SELECT (h -> 'a') FROM t}),'1','an extension operator applies to a vers
 like(sql(q{\dt}),qr/heap_t.*\n.*\bt\b/s,'psql lists heap and versioned tables');
 like(sql(q{\df public.crypt}),qr/crypt/,'psql lists extension functions in public');
 
+# A server object made after a session built its catalogs is in them at once.
+is(sql(q{CREATE TABLE public.late_heap(id int) USING heap; INSERT INTO late_heap VALUES (1); SELECT count(*) FROM late_heap, t}),'1','a session sees the heap table it just made');
+
 # One namespace for uniqueness, across server and branch objects.
 fails(q{CREATE FUNCTION public.crypt(text, text) RETURNS text LANGUAGE sql AS $$ SELECT 'x' $$},qr/already exists/,'a versioned routine cannot duplicate an extension function');
 fails(q{CREATE TABLE heap_t(id int)},qr/already exists/,'a versioned table cannot take a heap table\'s name');

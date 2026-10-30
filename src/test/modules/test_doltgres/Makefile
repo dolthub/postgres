@@ -4,6 +4,8 @@ MODULES = storage_resource
 OBJS = $(WIN32RES) test_doltgres.o catalog_view.o
 PGFILEDESC = "test_doltgres - branch catalog projection experiment"
 REGRESS = branch_catalog
+EXTENSION = server_test_ext
+DATA = server_test_ext--1.0.sql
 TAP_TESTS = 1
 # 026_native_binding counts the internal statements binding runs; 036 uses
 # extensions' functions, types and operators.
