@@ -79,6 +79,10 @@ is(sql(q{SELECT dolt_checkout('other'); CREATE SCHEMA only_other; SELECT table_n
 sql(q{SELECT dolt_checkout('other'); SELECT dolt_commit('-Am', 'empty schema')});
 is(sql(q{SELECT count(*) FROM "postgres/other".pg_catalog.pg_namespace WHERE nspname = 'only_other'}),'1','an empty namespace exists on its branch');
 is(sql(q{SELECT count(*) FROM pg_namespace WHERE nspname = 'only_other'}),'0','and not on another');
+sql(q{CREATE DATABASE fresh});
+$node->safe_psql('fresh',q{CREATE SCHEMA myschema});
+is($node->safe_psql('fresh',q{SELECT table_name, staged, status FROM dolt_status}),'myschema|f|new schema','an empty namespace is a change before a repository\'s first table');
+is($node->safe_psql('fresh',q{SELECT dolt_add('.')}) . $node->safe_psql('fresh',q{SELECT dolt_commit('-m', 'new schema') IS NOT NULL; SELECT message FROM dolt_log LIMIT 1}),"0t\nnew schema",'and is staged and committed');
 
 # A rename stays on its branch.
 sql(q{SELECT dolt_checkout('other'); ALTER SCHEMA app RENAME TO app2; SELECT dolt_commit('-Am', 'rename')});
