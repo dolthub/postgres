@@ -402,13 +402,24 @@ compare_constraint_entries(const void *a, const void *b)
 	return strcmp(left->name, right->name);
 }
 
+static int
+mutation_parent_compare(const ListCell *a, const ListCell *b)
+{
+	Form_pg_inherits left = (Form_pg_inherits) GETSTRUCT((HeapTuple) lfirst(a));
+	Form_pg_inherits right = (Form_pg_inherits) GETSTRUCT((HeapTuple) lfirst(b));
+
+	return (left->inhseqno > right->inhseqno) - (left->inhseqno < right->inhseqno);
+}
+
 static char *
 mutation_inheritance(CatalogView *view, Oid relation, const char *definition)
 {
 	List *tuples = CatalogViewTuplesWith(view, InheritsRelationId, Anum_pg_inherits_inhrelid, relation);
 	int n = list_length(tuples);
 	JsonbValue *parents = palloc_array(JsonbValue, Max(n, 1));
+	int ordinal = 0;
 
+	list_sort(tuples, mutation_parent_compare);
 	foreach_ptr(HeapTupleData, tuple, tuples)
 	{
 		Form_pg_inherits form = (Form_pg_inherits) GETSTRUCT(tuple);
@@ -417,9 +428,9 @@ mutation_inheritance(CatalogView *view, Oid relation, const char *definition)
 
 		CatalogViewSwitch(previous);
 
-		if (!name || form->inhseqno < 1 || form->inhseqno > n || form->inhdetachpending)
+		if (!name || form->inhdetachpending)
 			unsupported("inheritance outside the branch catalog");
-		parents[form->inhseqno - 1] = jv_string(name);
+		parents[ordinal++] = jv_string(name);
 	}
 	return json_set_jsonb(definition, "inherits", jb_array(n, parents));
 }

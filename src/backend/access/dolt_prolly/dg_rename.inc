@@ -614,6 +614,24 @@ dg_catalog_rename(ParseState *pstate, Node *statement)
 				found = rename_referrers(found, root, linitial(reference), lsecond(reference));
 			}
 
+			if (!strcmp(kind, "table") && IsA(statement, RenameStmt) &&
+				((RenameStmt *) statement)->renameType == OBJECT_COLUMN)
+			{
+				CatalogView *outer = CatalogViewSwitch(view);
+				Oid parent = CatalogViewLookupObject(view, RelationRelationId, name);
+
+				foreach_oid(childid, find_all_inheritors(parent, NoLock, NULL))
+				{
+					const char *child = CatalogViewObjectIdentity(childid, RelationRelationId);
+
+					if (!rename_targeted(found, "table", child))
+						found = lappend(found, list_make2("table", pstrdup(child)));
+					found = rename_referrers(found, root, "table", child);
+					found = rename_referrers(found, root, "type", child);
+				}
+				CatalogViewSwitch(outer);
+			}
+
 			/* The targets outlive this API call. */
 			api_context = MemoryContextSwitchTo(caller_context);
 			foreach_ptr(List, target, found)

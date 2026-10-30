@@ -274,7 +274,8 @@ canonical_drop(Node *statement)
 			if (!cascade)
 				return false;
 		}
-		else if (subtype != AT_DropConstraint)
+		else
+			/* Native ALTER owns inherited constraint recursion and validation. */
 			return false;
 		stmt = makeNode(DropStmt);
 		stmt->removeType = subtype == AT_DropColumn ? OBJECT_COLUMN : OBJECT_TABCONSTRAINT;
