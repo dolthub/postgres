@@ -144,6 +144,7 @@ merge_inheritance(bytea *base, bytea *ours, bytea *theirs, bytea *merged,
 	Member	   *sides[4] = {database_members(base, &counts[0]), database_members(ours, &counts[1]),
 	database_members(theirs, &counts[2]), NULL};
 	const char *invalid;
+	bytea *roots[4] = {base, ours, theirs, merged};
 
 	sides[3] = database_members(merged, &counts[3]);
 	while ((invalid = inheritance_invalid(sides[3], counts[3])) != NULL)
@@ -180,6 +181,23 @@ merge_inheritance(bytea *base, bytea *ours, bytea *theirs, bytea *merged,
 						}
 					}
 				}
+			/* Incoming views/routines may depend on a child that is retained
+			 * from ours (or absent there). Keep those dependents with it. */
+			for (int side = 0; side < 4; side++)
+			{
+				char *root = metadata(roots[side], "database");
+				List *scan = list_copy(group);
+
+				foreach_ptr(char, name, scan)
+				{
+					const char *kinds[] = {"table", "type", "routine"};
+
+					for (int k = 0; k < lengthof(kinds); k++)
+						foreach_ptr(List, reference, database_referrers(root, kinds[k], name))
+							if (!name_selected(group, lsecond(reference)))
+								group = lappend(group, pstrdup(lsecond(reference)));
+				}
+			}
 		} while (previous != list_length(group));
 		record_schema_conflict(conflicts, "table", invalid,
 							   conflict_schema(merge_member(sides[0], counts[0], "table", invalid), "table", invalid),
@@ -198,6 +216,7 @@ merge_inheritance(bytea *base, bytea *ours, bytea *theirs, bytea *merged,
 		conflicts->data[--conflicts->len] = '\0';
 		appendStringInfo(conflicts, ",\"inheritance_group\":%s}", names.data);
 		merged = compose_database(merged, ours, group);
+		roots[3] = merged;
 		foreach_ptr(RowMerge, row, *row_merges)
 			if (name_selected(group, row->table))
 			*row_merges = foreach_delete_current(*row_merges, row);

@@ -75,12 +75,14 @@ is(sql(q{SELECT count(*) FROM pg_class WHERE relname='inherited_view'}), '0', 'C
 sql(q{CREATE TABLE cleanup(a int); DROP TABLE IF EXISTS cleanup, cleanup_missing; CREATE TABLE cleanup(a int)});
 is(sql(q{SELECT count(*) FROM cleanup}), '0', 'DROP IF EXISTS handles missing siblings of versioned tables');
 sql(q{CREATE TABLE merge_parent(a int); SELECT dolt_commit('-Am','merge graph base'); SELECT dolt_branch('new_child');
- SELECT dolt_checkout('new_child'); CREATE TABLE merge_child() INHERITS(merge_parent); INSERT INTO merge_child VALUES(1); SELECT dolt_commit('-Am','new child')});
+ SELECT dolt_checkout('new_child'); CREATE TABLE merge_child() INHERITS(merge_parent); INSERT INTO merge_child VALUES(1); CREATE VIEW merge_child_view AS SELECT a FROM merge_child; SELECT dolt_commit('-Am','new child')});
 sql(q{ALTER TABLE merge_parent ADD COLUMN b int; SELECT dolt_commit('-Am','new parent column')});
 is(sql(q{SELECT conflicts FROM dolt_merge('new_child')}), '1', 'incompatible cross-table schema merge reports a conflict');
 is(sql(q{SELECT count(*) FROM merge_parent}), '0', 'schema conflict retains a usable target inheritance graph');
+is(sql(q{SELECT count(*) FROM pg_class WHERE relname='merge_child_view'}), '0', 'incoming dependents stay with conflicted inheritance component');
 sql(q{SELECT dolt_conflicts_resolve('--theirs','merge_child')});
 is(sql(q{SELECT a FROM merge_parent}), '1', 'schema conflict resolution publishes the whole source inheritance component');
+is(sql(q{SELECT a FROM merge_child_view}), '1', 'component resolution restores dependent views');
 sql(q{SELECT dolt_commit('-Am','resolve inheritance'); CREATE TABLE cycle_a(v int); CREATE TABLE cycle_b(v int);
  SELECT dolt_commit('-Am','cycle base'); SELECT dolt_branch('cycle_source');
  SELECT dolt_checkout('cycle_source'); ALTER TABLE cycle_a INHERIT cycle_b; SELECT dolt_commit('-Am','one direction')});
