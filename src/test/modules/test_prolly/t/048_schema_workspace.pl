@@ -23,7 +23,7 @@ is(sql(q{SELECT count(*) FROM dolt_status}), '0', 'schema object commit clears s
 is(sql(q{SELECT count(*) FROM dolt_diff_summary('HEAD~1','HEAD')}), '3', 'diff summary lists schema objects');
 sql(q{DROP AGGREGATE total(int); DROP OPERATOR === (int,int); DROP CAST (source AS target)});
 is(sql(q{SELECT count(*) FROM dolt_status WHERE status='deleted'}), '3', 'status reports deleted schema objects');
-sql(q{SELECT dolt_checkout('HEAD','public.total(integer)','public.===(pg_catalog.int4,pg_catalog.int4)','(public.source AS public.target)')});
+sql(q{SELECT dolt_checkout('public.total(integer)','public.===(pg_catalog.int4,pg_catalog.int4)','(public.source AS public.target)')});
 is(sql(q{SELECT total(v), 1===1, (ROW(2)::source::target).v FROM (VALUES(1),(2)) t(v)}), '3|t|2', 'named checkout restores all schema object kinds');
 $node->stop;
 done_testing();
