@@ -8,6 +8,11 @@ $node->init(extra => ['--encoding=UTF8', '--locale=C']);
 $node->append_conf('postgresql.conf', "default_table_access_method='dolt_prolly_table'\nautovacuum=off\n");
 $node->start;
 sub sql { $node->safe_psql('postgres', $_[0]); }
+sub fails {
+ my ($query, $pattern, $name) = @_;
+ my ($status, $out, $err) = $node->psql('postgres', $query);
+ isnt($status, 0, $name); like($err, $pattern, "$name diagnostic");
+}
 sql(q{CREATE TABLE parent(a int CHECK(a>0)); INSERT INTO parent VALUES(1);
  CREATE TABLE child(b text) INHERITS(parent); INSERT INTO child VALUES(2,'child')});
 is(sql(q{SELECT a FROM parent ORDER BY a}), "1\n2", 'parent scans child storage');
@@ -45,5 +50,22 @@ is(sql(q{SELECT count(*) FROM child}), '0', 'inherited DELETE reaches child stor
 sql(q{CREATE TABLE other(a bigint CHECK(a>0)); CREATE TABLE diamond(c int) INHERITS(renamed_parent, other); INSERT INTO diamond VALUES(200,9)});
 is(sql(q{SELECT attinhcount FROM pg_attribute WHERE attrelid='diamond'::regclass AND attname='a'}), '2', 'multiple inheritance preserves counts');
 is(sql(q{SELECT a FROM renamed_parent ORDER BY a}), "111\n200", 'multiple inheritance contributes rows');
+fails(q{ALTER TABLE diamond DROP CONSTRAINT parent_a_check}, qr/inherited constraint/, 'cannot drop inherited check directly');
+sql(q{ALTER TABLE diamond NO INHERIT renamed_parent});
+is(sql(q{SELECT count(*) FROM pg_inherits WHERE inhrelid='diamond'::regclass}), '1', 'detach first of multiple parents');
+sql(q{CREATE TABLE grandchild(d int) INHERITS(child); INSERT INTO grandchild VALUES(300,'grand',1);
+ ALTER TABLE renamed_parent RENAME a TO renamed_a});
+is(sql(q{SELECT renamed_a,b,d FROM grandchild}), '300|grand|1', 'column rename reaches grandchild');
+is(sql(q{SELECT a FROM parent AS OF 'before_ddl' ORDER BY a}), "11\n12", 'historical parent expands historical child definitions');
+is(sql(q{SELECT p.a,c.renamed_a FROM parent AS OF 'before_ddl' p CROSS JOIN renamed_parent c ORDER BY 1,2}), "11|111\n11|300\n12|111\n12|300", 'one query combines old and current inheritance graphs');
+sql(q{SELECT dolt_commit('-Am','inherited DDL'); SELECT dolt_branch('parallel')});
+my $left = $node->background_psql('postgres');
+my $right = $node->background_psql('postgres');
+$left->query_safe(q{SELECT dolt_checkout('main'); BEGIN; ALTER TABLE renamed_parent ADD COLUMN left_value int DEFAULT 5});
+$right->query_safe(q{SELECT dolt_checkout('parallel'); SET lock_timeout='2s'; ALTER TABLE renamed_parent ADD COLUMN right_value int DEFAULT 6});
+$left->query_safe('COMMIT');
+is($right->query_safe(q{SELECT right_value FROM grandchild}), '6', 'other branch DDL does not wait for uncommitted inherited DDL');
+is($left->query_safe(q{SELECT left_value FROM grandchild}), '5', 'both branches publish independent recursive changes');
+$left->quit; $right->quit;
 $node->stop;
 done_testing();
