@@ -84,14 +84,23 @@ commit_branch_compare(const ListCell *a, const ListCell *b)
 static List *
 commit_branches(void)
 {
-	List *branches = NIL;
-	ListCell *lc;
+	List	   *branches = NIL;
+	ListCell   *lc;
 
 	foreach(lc, commit_dirty_branches)
 	{
 		CommitDirtyBranch *entry = lfirst(lc);
 
-		if (!list_member_string(branches, entry->branch))
+		ListCell   *other;
+		bool		found = false;
+
+		foreach(other, branches)
+			if (strcmp(lfirst(other), entry->branch) == 0)
+		{
+			found = true;
+			break;
+		}
+		if (!found)
 			branches = lappend(branches, entry->branch);
 	}
 	list_sort(branches, commit_branch_compare);
@@ -102,9 +111,9 @@ commit_branches(void)
 void
 dg_version_pre_commit(void)
 {
-	List *branches;
+	List	   *branches;
 	const char *previous_branch;
-	ListCell *lc;
+	ListCell   *lc;
 
 	if (!dolt_transaction_commit || !commit_dirty_branches || commit_publishing)
 		return;
@@ -125,11 +134,13 @@ dg_version_pre_commit(void)
 		PushCopiedSnapshot(GetLatestSnapshot());
 		foreach(lc, branches)
 		{
-			VersionRef head, staged, working;
-			Capture full;
-			bytea *database;
-			char *message;
-			int nest;
+			VersionRef	head,
+						staged,
+						working;
+			Capture		full;
+			bytea	   *database;
+			char	   *message;
+			int			nest;
 
 			dg_switch_execution_branch(lfirst(lc));
 			nest = begin_api();
@@ -144,7 +155,7 @@ dg_version_pre_commit(void)
 				database = staged_capture(&full);
 				if (!database_same(database, child(head.target, 1)))
 				{
-					bytea *commit;
+					bytea	   *commit;
 
 					run("SELECT COALESCE(NULLIF(btrim($1),''),'Transaction commit')", 1,
 						VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(dolt_transaction_commit_message)), NULL, true);
