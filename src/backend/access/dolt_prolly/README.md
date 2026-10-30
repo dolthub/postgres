@@ -132,7 +132,7 @@ test, not the complete phase 3 concurrency certification.
 ### Shared node cache
 
 Every backend reads prolly nodes through one cache in main shared memory,
-`dolt_node_cache_size` (128MB by default; 0 disables it; changing it requires a
+`dolt_node_cache_size` (1GB by default; 0 disables it; changing it requires a
 restart), laid out like the buffer pool: slots with pin and usage counts, a
 partitioned hash table from node hash to slot, and clock-sweep eviction. Node
 bytes live in a dynamic shared memory area created in place in that segment.

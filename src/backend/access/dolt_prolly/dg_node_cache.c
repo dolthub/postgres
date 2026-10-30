@@ -39,12 +39,12 @@
 #include "utils/fmgrprotos.h"
 #include "utils/memutils.h"
 
-int			dolt_node_cache_size = 128 * 1024; /* kB */
+int			dolt_node_cache_size = 1024 * 1024;	/* kB */
 
 #define NODE_PARTITIONS 128
 
-/* Slots per byte of cache: nodes average about twice this. */
-#define NODE_SLOT_BYTES 512
+/* Bytes of cache per slot: nodes average a little more. */
+#define NODE_SLOT_BYTES 1024
 
 /* The smallest cache, so that the area's own bookkeeping fits. */
 #define NODE_CACHE_MIN ((Size) 1024 * 1024)
