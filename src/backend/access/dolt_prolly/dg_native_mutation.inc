@@ -412,7 +412,10 @@ mutation_inheritance(CatalogView *view, Oid relation, const char *definition)
 	foreach_ptr(HeapTupleData, tuple, tuples)
 	{
 		Form_pg_inherits form = (Form_pg_inherits) GETSTRUCT(tuple);
-		const char *name = CatalogViewObjectIdentity(form->inhparent, RelationRelationId);
+		CatalogView *previous = CatalogViewSwitch(view);
+		const char *name = dg_qualified_name(get_namespace_name(get_rel_namespace(form->inhparent)), get_rel_name(form->inhparent));
+
+		CatalogViewSwitch(previous);
 
 		if (!name || form->inhseqno < 1 || form->inhseqno > n || form->inhdetachpending)
 			unsupported("inheritance outside the branch catalog");
