@@ -119,7 +119,7 @@ bundle_write(const char *url)
 	char *payload = bundle_capture();
 	PLHash hash;
 	PLSlice bytes = {(const uint8 *) payload, strlen(payload)};
-	FILE *file;
+	FILE *volatile file;
 
 	if (!pl_hash_bytes(bytes, &hash))
 		elog(ERROR, "bundle checksum failed");
@@ -134,9 +134,13 @@ bundle_write(const char *url)
 			fwrite(hash.bytes, 1, PL_HASH_SIZE, file) != PL_HASH_SIZE ||
 			fwrite(payload, 1, bytes.len, file) != bytes.len || fflush(file) || pg_fsync(fileno(file)))
 			ereport(ERROR, (errcode_for_file_access(), errmsg("could not write backup file: %m")));
-		if (FreeFile(file))
-			ereport(ERROR, (errcode_for_file_access(), errmsg("could not close backup file: %m")));
-		file = NULL;
+		{
+			int status = FreeFile(file);
+
+			file = NULL;
+			if (status)
+				ereport(ERROR, (errcode_for_file_access(), errmsg("could not close backup file: %m")));
+		}
 		durable_rename(temporary, path, ERROR);
 	}
 	PG_CATCH();
