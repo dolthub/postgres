@@ -278,7 +278,13 @@ canonical_drop(Node *statement)
 				branch = branch_relation(constraint_table);
 			else if (stmt->removeType == OBJECT_TABLE || stmt->removeType == OBJECT_INDEX ||
 					 stmt->removeType == OBJECT_VIEW || stmt->removeType == OBJECT_MATVIEW || stmt->removeType == OBJECT_SEQUENCE)
-				branch = branch_relation(makeRangeVarFromNameList(lfirst(lc)));
+			{
+				RangeVar *rv = makeRangeVarFromNameList(lfirst(lc));
+
+				if (stmt->missing_ok && !OidIsValid(RangeVarGetRelid(rv, NoLock, true)))
+					continue;
+				branch = branch_relation(rv);
+			}
 			else if (stmt->removeType == OBJECT_TRIGGER)
 				branch = branch_relation(makeRangeVarFromNameList(list_copy_head(lfirst(lc), list_length(lfirst(lc)) - 1)));
 			else if (stmt->removeType == OBJECT_SCHEMA)
@@ -389,6 +395,13 @@ canonical_drop(Node *statement)
 			{
 				RangeVar   *rv = makeRangeVarFromNameList(lfirst(lc));
 
+				if (stmt->missing_ok && !OidIsValid(RangeVarGetRelid(rv, NoLock, true)))
+				{
+					ereport(NOTICE, (errmsg("%s \"%s\" does not exist, skipping",
+						stmt->removeType == OBJECT_TABLE ? "table" : stmt->removeType == OBJECT_INDEX ? "index" :
+						stmt->removeType == OBJECT_SEQUENCE ? "sequence" : stmt->removeType == OBJECT_MATVIEW ? "materialized view" : "view", rv->relname)));
+					continue;
+				}
 				if (!dg_catalog_lookup_relation(rv, stmt->missing_ok, &object.objectId))
 					unsupported("DROP of a shared relation in an activated database");
 				object.classId = RelationRelationId;

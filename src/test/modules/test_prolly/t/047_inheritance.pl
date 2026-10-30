@@ -72,5 +72,7 @@ $left->quit; $right->quit;
 sql(q{CREATE VIEW inherited_view AS SELECT left_value FROM grandchild; ALTER TABLE renamed_parent DROP COLUMN left_value CASCADE});
 is(sql(q{SELECT renamed_a,b,d FROM grandchild}), '300|grand|1', 'recursive CASCADE remaps child tuples');
 is(sql(q{SELECT count(*) FROM pg_class WHERE relname='inherited_view'}), '0', 'CASCADE removes dependent view from the root');
+sql(q{CREATE TABLE cleanup(a int); DROP TABLE IF EXISTS cleanup, cleanup_missing; CREATE TABLE cleanup(a int)});
+is(sql(q{SELECT count(*) FROM cleanup}), '0', 'DROP IF EXISTS handles missing siblings of versioned tables');
 $node->stop;
 done_testing();
