@@ -74,6 +74,8 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_description.h"
 #include "catalog/pg_operator.h"
+#include "catalog/pg_aggregate.h"
+#include "commands/extension.h"
 #include "catalog/pg_range.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_type_d.h"
@@ -744,6 +746,7 @@ canonical_database(const char *json, Datum *members, int count)
 #include "dg_expression_codec.inc"
 #include "dg_foreign_codec.inc"
 #include "dg_routine_codec.inc"
+#include "dg_schema_object_codec.inc"
 #include "dg_sequence_codec.inc"
 #include "dg_type_codec.inc"
 #include "dg_dependents.inc"
@@ -817,7 +820,7 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 			if (persist)
 				members[i] = PointerGetDatum(object_member("sequence", definition));
 		}
-		else if (!strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger") || !strcmp(kinds[i], "type") || !strcmp(kinds[i], "view"))
+		else if (schema_object_class(kinds[i]) || !strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger") || !strcmp(kinds[i], "type") || !strcmp(kinds[i], "view"))
 			appendStringInfoString(&json, payload);
 		else
 		{
@@ -1971,6 +1974,7 @@ static void validate_working_foreign_keys(const char *branch);
 #include "dg_catalog_ddl.inc"
 #include "dg_canonical_ddl.inc"
 #include "dg_routine_ddl.inc"
+#include "dg_schema_object_ddl.inc"
 #include "dg_sequence_ddl.inc"
 
 #include "dg_alter.inc"

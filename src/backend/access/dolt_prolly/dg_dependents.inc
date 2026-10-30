@@ -52,6 +52,12 @@ references_walker(Node *node, List **references)
 		return false;
 	if (IsA(node, FuncCall) && (name = references_name(((FuncCall *) node)->funcname)))
 		references_add(references, "routine", name);
+	if (IsA(node, A_Expr) && list_length(((A_Expr *) node)->name) == 2)
+	{
+		List *parts = ((A_Expr *) node)->name;
+
+		references_add(references, "operator", psprintf("%s.%s", quote_identifier(strVal(linitial(parts))), strVal(lsecond(parts))));
+	}
 	if (IsA(node, TypeName) && (name = references_name(((TypeName *) node)->names)))
 		references_add(references, "type", name);
 	if (IsA(node, TypeCast))
@@ -168,7 +174,7 @@ definition_references(const char *kind, const char *definition)
 			references_add(&references, "table", dg_qualified_name(index->relation->schemaname, index->relation->relname));
 	}
 	if (!strcmp(kind, "view") || (!strcmp(kind, "table") && json_value(definition, "matview")) ||
-		(!strcmp(kind, "routine") && json_value(definition, "dependencies")))
+		((!strcmp(kind, "routine") || schema_object_class(kind)) && json_value(definition, "dependencies")))
 	{
 		/* A view's query, a materialized view's, or a SQL-standard body lists what it uses. */
 		run("SELECT v->>0,v->>1 FROM jsonb_array_elements(COALESCE($1::jsonb->'dependencies',$1::jsonb->'matview'->'dependencies','[]')) v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
@@ -186,8 +192,8 @@ definition_references(const char *kind, const char *definition)
 			{
 				if (!strcmp(kinds[i], "type"))
 					references_type(&references, names[i]);
-				else if (!strcmp(kinds[i], "routine") && strchr(names[i], '('))
-					references_add(&references, "routine", pnstrdup(names[i], strchr(names[i], '(') - names[i]));
+				else if ((!strcmp(kinds[i], "routine") || !strcmp(kinds[i], "operator")) && strchr(names[i], '('))
+					references_add(&references, kinds[i], pnstrdup(names[i], strchr(names[i], '(') - names[i]));
 				else
 					references_add(&references, kinds[i], names[i]);
 			}
@@ -262,6 +268,8 @@ definition_references(const char *kind, const char *definition)
 			}
 		}
 	}
+	if (!strcmp(kind, "aggregate"))
+		references = list_concat(references, definition_references("routine", json_value(definition, "routine")));
 	return references;
 }
 
@@ -309,7 +317,7 @@ database_dependents(const char *json, Datum *members, int count)
 	bytea	  **schemas;
 	char	  **kinds;
 
-	run("SELECT o.objkind,o.objchildren[1] FROM pg_catalog.pg_dolt_object_visible o WHERE o.objhash=ANY($1) AND o.objkind IN ('table','index','routine','trigger','type','view','sequence')", 1, VC_TYPES(BYTEAARRAYOID), VC_ARGS(PointerGetDatum(links(members, count))), NULL, true);
+	run("SELECT o.objkind,o.objchildren[1] FROM pg_catalog.pg_dolt_object_visible o WHERE o.objhash=ANY($1) AND o.objkind IN ('table','index','routine','trigger','type','view','sequence','aggregate','operator','cast')", 1, VC_TYPES(BYTEAARRAYOID), VC_ARGS(PointerGetDatum(links(members, count))), NULL, true);
 	n = SPI_processed;
 	schemas = palloc_array(bytea *, Max(n, 1));
 	kinds = palloc_array(char *, Max(n, 1));

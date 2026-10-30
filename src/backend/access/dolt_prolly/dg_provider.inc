@@ -80,7 +80,7 @@ provider_current(DGProvider *entry, const char *branch)
  * physically, under their durable OIDs, and a revision's tables have none.
  */
 static const Oid provider_catalogs[] = {
-	NamespaceRelationId, SequenceRelationId, RelationRelationId, AttributeRelationId, ProcedureRelationId, LanguageRelationId,
+	NamespaceRelationId, AggregateRelationId, SequenceRelationId, RelationRelationId, AttributeRelationId, ProcedureRelationId, LanguageRelationId,
 	TypeRelationId, EnumRelationId, OperatorRelationId, RangeRelationId, DescriptionRelationId, DependRelationId, IndexRelationId, ConstraintRelationId, CastRelationId, StatisticExtRelationId, StatisticExtDataRelationId, PublicationRelRelationId, PublicationNamespaceRelationId, InheritsRelationId, RewriteRelationId, TriggerRelationId, PolicyRelationId, AttrDefaultRelationId, SharedDependRelationId, SecLabelRelationId, InitPrivsRelationId
 };
 
@@ -207,7 +207,7 @@ provider_shared_base(void)
 
 	if (!registered)
 	{
-		const int	caches[] = {RELOID, PROCOID, TYPEOID, NAMESPACEOID, OPEROID, CONSTROID};
+		const int	caches[] = {RELOID, PROCOID, TYPEOID, NAMESPACEOID, OPEROID, CONSTROID, AGGFNOID, CASTSOURCETARGET};
 
 		for (int i = 0; i < lengthof(caches); i++)
 			CacheRegisterSyscacheCallback(caches[i], provider_base_forget, (Datum) 0);
@@ -672,6 +672,10 @@ provider_routine_references(Node *node, ProviderRoutineReferences *context)
 	if (IsA(node, FuncExpr) && ((FuncExpr *) node)->funcid >= FirstDurableObjectId)
 		provider_dependency(context->rows, context->classid, context->objid, 0, ProcedureRelationId,
 							((FuncExpr *) node)->funcid, 0, DEPENDENCY_NORMAL);
+	if ((IsA(node, OpExpr) || IsA(node, DistinctExpr) || IsA(node, NullIfExpr)) && ((OpExpr *) node)->opno >= FirstDurableObjectId)
+		provider_dependency(context->rows, context->classid, context->objid, 0, OperatorRelationId, ((OpExpr *) node)->opno, 0, DEPENDENCY_NORMAL);
+	if (IsA(node, ScalarArrayOpExpr) && ((ScalarArrayOpExpr *) node)->opno >= FirstDurableObjectId)
+		provider_dependency(context->rows, context->classid, context->objid, 0, OperatorRelationId, ((ScalarArrayOpExpr *) node)->opno, 0, DEPENDENCY_NORMAL);
 	if (IsA(node, Const) && ((Const *) node)->consttype == REGCLASSOID && !((Const *) node)->constisnull &&
 		DatumGetObjectId(((Const *) node)->constvalue) >= FirstDurableObjectId)
 		provider_dependency(context->rows, context->classid, context->objid, 0, RelationRelationId,
@@ -1073,6 +1077,7 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 }
 
 #include "dg_routine_provider.inc"
+#include "dg_schema_object_provider.inc"
 #include "dg_type_provider.inc"
 #include "dg_view_provider.inc"
 #include "dg_trigger_provider.inc"
@@ -1099,9 +1104,9 @@ provider_role_dependency(DGProviderRows *rows, Oid catalog, Oid object,
 static void
 provider_role_dependencies(DGProviderRows *rows)
 {
-	const Oid	catalogs[] = {NamespaceRelationId, RelationRelationId, TypeRelationId, ProcedureRelationId};
-	const int	owners[] = {Anum_pg_namespace_nspowner, Anum_pg_class_relowner, Anum_pg_type_typowner, Anum_pg_proc_proowner};
-	const int	acls[] = {Anum_pg_namespace_nspacl, Anum_pg_class_relacl, Anum_pg_type_typacl, Anum_pg_proc_proacl};
+	const Oid	catalogs[] = {NamespaceRelationId, RelationRelationId, TypeRelationId, ProcedureRelationId, OperatorRelationId};
+	const int	owners[] = {Anum_pg_namespace_nspowner, Anum_pg_class_relowner, Anum_pg_type_typowner, Anum_pg_proc_proowner, Anum_pg_operator_oprowner};
+	const int	acls[] = {Anum_pg_namespace_nspacl, Anum_pg_class_relacl, Anum_pg_type_typacl, Anum_pg_proc_proacl, 0};
 
 	for (int i = 0; i < lengthof(catalogs); i++)
 	{
@@ -1121,6 +1126,7 @@ provider_role_dependencies(DGProviderRows *rows)
 				continue;		/* bootstrap objects are shared */
 			owner = DatumGetObjectId(heap_getattr(tuple, owners[i], desc, &isnull));
 			provider_role_dependency(rows, catalogs[i], object, owner, SHARED_DEPENDENCY_OWNER);
+			if (!acls[i]) continue;
 			acl = heap_getattr(tuple, acls[i], desc, &isnull);
 			if (!isnull)
 			{
@@ -1305,7 +1311,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	{
 		if (!strcmp(kinds[i], "namespace"))
 			definitions[i] = metadata(addresses[i], "namespace");
-		else if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index") || !strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger") || !strcmp(kinds[i], "type") || !strcmp(kinds[i], "view") || !strcmp(kinds[i], "sequence"))
+		else if (schema_object_class(kinds[i]) || !strcmp(kinds[i], "table") || !strcmp(kinds[i], "index") || !strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger") || !strcmp(kinds[i], "type") || !strcmp(kinds[i], "view") || !strcmp(kinds[i], "sequence"))
 		{
 			schemas[i] = child(addresses[i], 1);
 			definitions[i] = metadata(schemas[i], "schema");
@@ -1336,6 +1342,13 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			rows.rows[slot] = lappend(rows.rows[slot], tuple);
 			provider_description(&rows, form.oid, NamespaceRelationId, 0, json_value(definitions[i], "comment"));
 		}
+	for (i = 0; i < n; i++)
+	{
+		Oid catalog = schema_object_class(kinds[i]);
+
+		if (!strcmp(kinds[i], "routine")) catalog = ProcedureRelationId;
+		if (catalog) CatalogViewBindObject(view, catalog, json_value(definitions[i], "name"), InvalidOid);
+	}
 	/* Bind all class identities before resolving cross-object edges. */
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index") || !strcmp(kinds[i], "sequence"))
@@ -1503,8 +1516,11 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 		if (!strcmp(kinds[i], "view"))
 			provider_view_member(&rows, view, definitions[i]);
 	for (i = 0; i < n; i++)
-		if (!strcmp(kinds[i], "routine"))
-			provider_routine(&rows, view, definitions[i]);
+		if (!strcmp(kinds[i], "routine") || !strcmp(kinds[i], "aggregate"))
+			provider_routine(&rows, view, !strcmp(kinds[i], "aggregate") ? json_value(definitions[i], "routine") : definitions[i]);
+	for (i = 0; i < n; i++)
+		if (schema_object_class(kinds[i]))
+			provider_schema_object(&rows, view, kinds[i], definitions[i]);
 
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "sequence"))
@@ -1519,6 +1535,9 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	 */
 	CatalogViewAddRows(view, NamespaceRelationId, rows.rows[provider_catalog_index(NamespaceRelationId)]);
 	CatalogViewAddRows(view, ProcedureRelationId, rows.rows[provider_catalog_index(ProcedureRelationId)]);
+	CatalogViewAddRows(view, AggregateRelationId, rows.rows[provider_catalog_index(AggregateRelationId)]);
+	CatalogViewAddRows(view, OperatorRelationId, rows.rows[provider_catalog_index(OperatorRelationId)]);
+	CatalogViewAddRows(view, CastRelationId, rows.rows[provider_catalog_index(CastRelationId)]);
 	CatalogViewAddRows(view, EnumRelationId, rows.rows[provider_catalog_index(EnumRelationId)]);
 	CatalogViewAddRows(view, TypeRelationId, rows.rows[provider_catalog_index(TypeRelationId)]);
 	/* Whole-row expressions also need the relation's row type and attributes. */

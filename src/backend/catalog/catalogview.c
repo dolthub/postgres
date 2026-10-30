@@ -475,7 +475,7 @@ CatalogViewBeginScanSnapshot(Relation relation, int nkeys, ScanKey keys, Snapsho
 	{
 		int			attr = keys[i].sk_attno;
 
-		if (!(keys[i].sk_flags & (SK_ISNULL | SK_SEARCHARRAY | SK_ROW_HEADER)) && attr > 0 && TupleDescAttr(RelationGetDescr(relation), attr - 1)->atttypid == OIDOID &&
+		if (!(keys[i].sk_flags & (SK_ISNULL | SK_SEARCHARRAY | SK_ROW_HEADER)) && attr > 0 && CatalogViewIsObjectIdType(TupleDescAttr(RelationGetDescr(relation), attr - 1)->atttypid) &&
 			(!CatalogViewIsDurable(DatumGetObjectId(keys[i].sk_argument)) || dg_catalog_provides(RelationGetRelid(relation))))
 		{
 			CatalogView *bound = CatalogViewObjectContext(DatumGetObjectId(keys[i].sk_argument));
@@ -528,7 +528,7 @@ CatalogViewBeginScanSnapshot(Relation relation, int nkeys, ScanKey keys, Snapsho
 
 		if (keys[i].sk_flags == 0 && keys[i].sk_strategy == BTEqualStrategyNumber &&
 			keys[i].sk_func.fn_oid == F_OIDEQ && attr > 0 &&
-			TupleDescAttr(RelationGetDescr(relation), attr - 1)->atttypid == OIDOID)
+			CatalogViewIsObjectIdType(TupleDescAttr(RelationGetDescr(relation), attr - 1)->atttypid))
 		{
 			scan->rows = CatalogViewTuplesWith(view, RelationGetRelid(relation), attr, DatumGetObjectId(keys[i].sk_argument));
 			scan->owns_rows = true;
@@ -877,7 +877,7 @@ CatalogViewSelectKeys(CatalogView *fallback, TupleDesc desc, int nkeys, const in
 
 	for (i = 0; i < nkeys; i++)
 	{
-		if (attributes[i] > 0 && TupleDescAttr(desc, attributes[i] - 1)->atttypid == OIDOID)
+		if (attributes[i] > 0 && CatalogViewIsObjectIdType(TupleDescAttr(desc, attributes[i] - 1)->atttypid))
 		{
 			CatalogView *view = CatalogViewObjectContext(DatumGetObjectId(values[i]));
 
@@ -986,7 +986,7 @@ CatalogViewRejectBranchWrite(Relation relation, ItemPointer tid, HeapTuple tuple
 		bool		isnull;
 		Datum		value;
 
-		if (TupleDescAttr(desc, i)->atttypid != OIDOID)
+		if (!CatalogViewIsObjectIdType(TupleDescAttr(desc, i)->atttypid))
 			continue;
 
 		/* A branch's table keeps its statistics under its durable OID. */
@@ -1629,7 +1629,7 @@ CatalogViewTuplesWith(CatalogView *view, Oid catalog, AttrNumber attribute, Oid 
 		TupleDesc	desc = RelationGetDescr(rel);
 		HASHCTL		ctl = {0};
 
-		if (TupleDescAttr(desc, attribute - 1)->atttypid != OIDOID)
+		if (!CatalogViewIsObjectIdType(TupleDescAttr(desc, attribute - 1)->atttypid))
 			elog(ERROR, "catalog view index requires an OID column");
 		index = palloc(sizeof(*index));
 		index->catalog = catalog;

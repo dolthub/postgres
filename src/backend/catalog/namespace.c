@@ -1933,8 +1933,37 @@ FunctionIsVisibleExt(Oid funcid, bool *is_missing)
  * namespace search path.  If the name is schema-qualified and the given
  * schema does not exist, InvalidOid is returned.
  */
+static Oid OpernameGetOpridInContext(List *names, Oid oprleft, Oid oprright);
+
 Oid
 OpernameGetOprid(List *names, Oid oprleft, Oid oprright)
+{
+	CatalogView *previous = CatalogViewCurrent();
+	CatalogView *view = CatalogViewObjectContext(oprleft);
+	Oid result;
+
+	if (!view) view = CatalogViewObjectContext(oprright);
+	if (!view) view = dg_catalog_session_view();
+	CatalogViewSwitch(view);
+	PG_TRY();
+	{
+		result = OpernameGetOpridInContext(names, oprleft, oprright);
+		if (!result && view)
+		{
+			CatalogViewSwitch(NULL);
+			result = OpernameGetOpridInContext(names, oprleft, oprright);
+		}
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static Oid
+OpernameGetOpridInContext(List *names, Oid oprleft, Oid oprright)
 {
 	char	   *schemaname;
 	char	   *opername;
@@ -1949,7 +1978,7 @@ OpernameGetOprid(List *names, Oid oprleft, Oid oprright)
 		/* search only in exact schema given */
 		Oid			namespaceId;
 
-		namespaceId = LookupExplicitNamespace(schemaname, true);
+		namespaceId = CatalogViewNamespace(CatalogViewCurrent(), LookupExplicitNamespace(schemaname, true));
 		if (OidIsValid(namespaceId))
 		{
 			HeapTuple	opertup;
@@ -1994,7 +2023,7 @@ OpernameGetOprid(List *names, Oid oprleft, Oid oprright)
 
 	foreach(l, activeSearchPath)
 	{
-		Oid			namespaceId = lfirst_oid(l);
+		Oid			namespaceId = CatalogViewNamespace(CatalogViewCurrent(), lfirst_oid(l));
 		int			i;
 
 		if (namespaceId == myTempNamespace)
@@ -2036,8 +2065,52 @@ OpernameGetOprid(List *names, Oid oprleft, Oid oprright)
  * The returned items always have two args[] entries --- the first will be
  * InvalidOid for a prefix oprkind.  nargs is always 2, too.
  */
+static FuncCandidateList OpernameGetCandidatesInContext(List *, char, bool);
+
 FuncCandidateList
 OpernameGetCandidates(List *names, char oprkind, bool missing_schema_ok)
+{
+	CatalogView *previous = CatalogViewCurrent();
+	CatalogView *view = dg_catalog_session_view();
+	FuncCandidateList result;
+
+	CatalogViewSwitch(view);
+	PG_TRY();
+	{
+		result = OpernameGetCandidatesInContext(names, oprkind, missing_schema_ok);
+		if (view)
+		{
+			FuncCandidateList native;
+
+			CatalogViewSwitch(NULL);
+			native = OpernameGetCandidatesInContext(names, oprkind, true);
+			while (native)
+			{
+				FuncCandidateList next = native->next;
+				FuncCandidateList seen = result;
+
+				while (seen && seen->oid != native->oid &&
+					!(seen->args[0] == native->args[0] && seen->args[1] == native->args[1] && seen->pathpos <= native->pathpos))
+					seen = seen->next;
+				if (!seen && native->oid >= FirstNormalObjectId && native->oid < FirstDurableObjectId)
+				{
+					native->next = result;
+					result = native;
+				}
+				native = next;
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static FuncCandidateList
+OpernameGetCandidatesInContext(List *names, char oprkind, bool missing_schema_ok)
 {
 	FuncCandidateList resultList = NULL;
 	char	   *resultSpace = NULL;
@@ -2054,7 +2127,7 @@ OpernameGetCandidates(List *names, char oprkind, bool missing_schema_ok)
 	if (schemaname)
 	{
 		/* use exact schema given */
-		namespaceId = LookupExplicitNamespace(schemaname, missing_schema_ok);
+		namespaceId = CatalogViewNamespace(CatalogViewCurrent(), LookupExplicitNamespace(schemaname, missing_schema_ok));
 		if (missing_schema_ok && !OidIsValid(namespaceId))
 			return NULL;
 	}
@@ -2111,7 +2184,7 @@ OpernameGetCandidates(List *names, char oprkind, bool missing_schema_ok)
 
 			foreach(nsp, activeSearchPath)
 			{
-				if (operform->oprnamespace == lfirst_oid(nsp) &&
+				if (operform->oprnamespace == CatalogViewNamespace(CatalogViewCurrent(), lfirst_oid(nsp)) &&
 					operform->oprnamespace != myTempNamespace)
 					break;
 				pathpos++;
@@ -2216,6 +2289,8 @@ OperatorIsVisibleExt(Oid oprid, bool *is_missing)
 	Form_pg_operator oprform;
 	Oid			oprnamespace;
 	bool		visible;
+	bool in_path = false;
+	ListCell *path;
 
 	oprtup = SearchSysCache1(OPEROID, ObjectIdGetDatum(oprid));
 	if (!HeapTupleIsValid(oprtup))
@@ -2237,8 +2312,10 @@ OperatorIsVisibleExt(Oid oprid, bool *is_missing)
 	 * list_member_oid() for them.
 	 */
 	oprnamespace = oprform->oprnamespace;
+	foreach(path, activeSearchPath)
+		in_path |= CatalogViewNamespace(CatalogViewObjectContext(oprid), lfirst_oid(path)) == oprnamespace;
 	if (oprnamespace != PG_CATALOG_NAMESPACE &&
-		!list_member_oid(activeSearchPath, oprnamespace))
+		!in_path)
 		visible = false;
 	else
 	{

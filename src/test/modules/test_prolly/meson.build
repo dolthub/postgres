@@ -53,5 +53,6 @@ tests += {
     't/043_sequences.pl', 't/044_sequence_definitions.pl',
     't/044_branch_statistics.pl',
     't/045_backups.pl',
+    't/046_schema_objects.pl',
   ]},
 }
