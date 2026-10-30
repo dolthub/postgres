@@ -58,13 +58,12 @@ is(sql(q{INSERT INTO cnumeric VALUES (1); SELECT id FROM cnumeric}), '1',
 
 # Datetime cross-type operators are exact comparisons, not lossy casts of the
 # referencing value. Exercise both directions and timezone-sensitive keys.
-sql(q{SET TIME ZONE 'America/New_York'; SET enable_seqscan=off});
 for my $parent ('date', 'timestamp', 'timestamptz')
 {
  for my $child ('date', 'timestamp', 'timestamptz')
  {
   next if $parent eq $child;
-  sql("CREATE TABLE dt_parent(k $parent PRIMARY KEY); " .
+  sql("SET TIME ZONE 'America/New_York'; CREATE TABLE dt_parent(k $parent PRIMARY KEY); " .
       "CREATE TABLE dt_child(k $child REFERENCES dt_parent ON UPDATE CASCADE); " .
       "CREATE INDEX ON dt_child(k); INSERT INTO dt_parent VALUES ('2020-01-01')");
   is(sql(q{SET TIME ZONE 'America/New_York'; INSERT INTO dt_child VALUES ('2020-01-01');
