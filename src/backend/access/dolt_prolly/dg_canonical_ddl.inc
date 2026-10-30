@@ -48,8 +48,9 @@ static void catalog_activate(void);
 /*
  * A schema created in a repository is versioned on the session's branch, as
  * Doltgres versions schemas. Its physical namespace is shared by all branches.
- * Where tables default to prolly storage, a schema is versioned even before
- * the first table, as routines and sequences are: it is a change of its own.
+ * Where tables default to prolly storage or commits are automatic, a schema
+ * is versioned even before the first table, as routines and sequences are: it
+ * is a change of its own.
  */
 void
 dg_catalog_schema_created(Oid schema)
@@ -61,7 +62,8 @@ dg_catalog_schema_created(Oid schema)
 		return;
 	if (!dg_catalog_active())
 	{
-		if (!default_table_access_method || strcmp(default_table_access_method, "dolt_prolly_table"))
+		if (!dolt_transaction_commit &&
+			(!default_table_access_method || strcmp(default_table_access_method, "dolt_prolly_table")))
 			return;
 		catalog_activate();
 	}
