@@ -308,6 +308,15 @@ dg_catalog_active(void)
 
 	if (!IsUnderPostmaster || catalog_api_depth || rangevar_projection_hook)
 		return false;
+
+	/*
+	 * An extension's script makes server objects and names only those and
+	 * built-in ones: it works on the physical catalogs, which hold the objects
+	 * it has just made, as if the database had no branches. Branch views list
+	 * its objects once the extension is complete.
+	 */
+	if (creating_extension)
+		return false;
 	if (active_committed)
 		return true;
 	/* A repository may contain routines or types before its first table.
@@ -1365,12 +1374,7 @@ dg_catalog_session_view(void)
 {
 	CatalogView *result = CatalogViewCurrent();
 
-	/*
-	 * An extension's script makes server objects and names only those and
-	 * built-in ones: it reads the physical catalogs, which hold the objects it
-	 * has just made. Branch views see them once the extension is complete.
-	 */
-	if (result || !dg_catalog_active() || creating_extension)
+	if (result || !dg_catalog_active())
 		return result;
 
 	/* The session's branch schema is read as catalogs are, latest committed. */
