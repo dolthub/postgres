@@ -28,7 +28,7 @@
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 
-int			dolt_chunk_cache_size = 256 * 1024; /* kB */
+int			dolt_chunk_cache_size = 0;	/* kB; prolly nodes are cached in dg_node_cache.c */
 bool		dolt_chunk_verify_hashes = false;
 
 typedef struct CacheEntry
