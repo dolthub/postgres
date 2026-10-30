@@ -147,12 +147,12 @@ typedef struct HelpEntry
 }			HelpEntry;
 
 static const HelpEntry help_entries[] = {
-	{"dolt_add", "procedure", "dolt_add('.' | '-A' | table...)", "Add working set changes to the staged set.", "{\"-A, --all\": \"Stage all tables\", \"table\": \"Table to stage\"}"},
+	{"dolt_add", "procedure", "dolt_add('.' | '-a' | '-A' | table...)", "Add working set changes to the staged set.", "{\"-A, --all\": \"Stage all supported objects, including empty namespaces\", \"table\": \"Table to stage\"}"},
 	{"dolt_branch", "procedure", "dolt_branch([-c | -m | -d | -D | -f] name [start-point])", "Create, copy, move or delete branches.", "{\"-c, --copy\": \"Copy a branch\", \"-m, --move\": \"Rename a branch\", \"-d, --delete\": \"Delete a merged branch\", \"-D\": \"Force delete\", \"-f, --force\": \"Reset an existing branch\"}"},
 	{"dolt_checkout", "procedure", "dolt_checkout([-b] branch [start-point] | table...)", "Switch branches or restore working tables.", "{\"-b\": \"Create and switch to a new branch\", \"table\": \"Restore the table from HEAD\"}"},
 	{"dolt_cherry_pick", "procedure", "dolt_cherry_pick(commit)", "Apply the changes of an existing commit.", "{\"commit\": \"Commit to apply\", \"--author\": \"Override the commit author\"}"},
 	{"dolt_clean", "procedure", "dolt_clean([--dry-run] [table...])", "Delete untracked tables from the working set.", "{\"--dry-run\": \"Report what would be deleted\"}"},
-	{"dolt_commit", "procedure", "dolt_commit([-a | -A] [-m message] [--author 'name <email>'] [--allow-empty] [--skip-empty])", "Record staged changes as a new commit.", "{\"-m, --message\": \"Commit message\", \"-a, --all\": \"Stage modified and deleted tracked tables\", \"-A, --ALL\": \"Stage all tables before committing\", \"--author\": \"Author name and email\", \"--allow-empty\": \"Allow an empty commit\", \"--skip-empty\": \"Do nothing when there are no changes\"}"},
+	{"dolt_commit", "procedure", "dolt_commit([-a | -A] [-m message] [--author 'name <email>'] [--allow-empty] [--skip-empty])", "Record staged changes as a new commit.", "{\"-m, --message\": \"Commit message\", \"-a, --all\": \"Stage modified and deleted tracked tables\", \"-A, --ALL\": \"Stage all supported objects, including empty namespaces before committing\", \"--author\": \"Author name and email\", \"--allow-empty\": \"Allow an empty commit\", \"--skip-empty\": \"Do nothing when there are no changes\"}"},
 	{"dolt_conflicts_resolve", "procedure", "dolt_conflicts_resolve(--ours | --theirs, table...)", "Resolve merge conflicts of tables.", "{\"--ours\": \"Keep the destination rows\", \"--theirs\": \"Take the merged rows\"}"},
 	{"dolt_fetch", "procedure", "dolt_fetch([remote])", "Fetch refs from a remote (unsupported: no remote transport).", "{}"},
 	{"dolt_gc", "procedure", "dolt_gc([--shallow | --full])", "Garbage collect unreferenced objects (no-op).", "{\"--shallow\": \"Quick collection\", \"--full\": \"Complete collection\"}"},
