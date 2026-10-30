@@ -81,5 +81,12 @@ is(sql(q{SELECT conflicts FROM dolt_merge('new_child')}), '1', 'incompatible cro
 is(sql(q{SELECT count(*) FROM merge_parent}), '0', 'schema conflict retains a usable target inheritance graph');
 sql(q{SELECT dolt_conflicts_resolve('--theirs','merge_child')});
 is(sql(q{SELECT a FROM merge_parent}), '1', 'schema conflict resolution publishes the whole source inheritance component');
+sql(q{SELECT dolt_commit('-Am','resolve inheritance'); CREATE TABLE cycle_a(v int); CREATE TABLE cycle_b(v int);
+ SELECT dolt_commit('-Am','cycle base'); SELECT dolt_branch('cycle_source');
+ SELECT dolt_checkout('cycle_source'); ALTER TABLE cycle_a INHERIT cycle_b; SELECT dolt_commit('-Am','one direction')});
+sql(q{ALTER TABLE cycle_b INHERIT cycle_a; SELECT dolt_commit('-Am','other direction')});
+is(sql(q{SELECT conflicts FROM dolt_merge('cycle_source')}), '1', 'merge cannot introduce an inheritance cycle');
+sql(q{SELECT dolt_conflicts_resolve('--theirs','.')});
+is(sql(q{SELECT inhrelid::regclass,inhparent::regclass FROM pg_inherits WHERE inhrelid IN ('cycle_a'::regclass,'cycle_b'::regclass)}), 'cycle_a|cycle_b', 'cycle conflict resolves as a complete component');
 $node->stop;
 done_testing();
