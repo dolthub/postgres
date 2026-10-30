@@ -63,6 +63,8 @@ extern Oid	dg_identity_storage(Oid oid);
 extern bytea *dg_catalog_durable_content(Oid oid);
 extern bytea *dg_catalog_revision_content(Oid handle);
 extern bool dg_relation_analyzable(Relation rel);
+extern void dg_store_relation_stats(Oid relid, double rows);
+extern void dg_remove_relation_stats(Oid relid);
 extern List *dg_identity_relations(const char *branch);
 extern int	dg_acquire_sample_rows(Relation rel, int elevel, HeapTuple *rows, int targrows,
 								   double *totalrows, double *totaldeadrows);

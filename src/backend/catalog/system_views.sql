@@ -1563,22 +1563,23 @@ CREATE VIEW dolt.statistics WITH (security_invoker=true) AS
     SELECT current_database()::text AS database_name,
            c.relname::text AS table_name,
            CASE WHEN i.indisprimary THEN 'primary' ELSE ic.relname::text END AS index_name,
-           greatest(c.reltuples, 0)::numeric AS row_count,
-           CASE WHEN s.n_distinct IS NULL THEN greatest(c.reltuples, 0)::numeric
-                WHEN s.n_distinct < 0 THEN round((-s.n_distinct * greatest(c.reltuples, 0))::numeric)
+           coalesce(rs.stattuples, greatest(c.reltuples, 0))::numeric AS row_count,
+           CASE WHEN s.n_distinct IS NULL THEN coalesce(rs.stattuples, greatest(c.reltuples, 0))::numeric
+                WHEN s.n_distinct < 0 THEN round((-s.n_distinct * coalesce(rs.stattuples, greatest(c.reltuples, 0)))::numeric)
                 ELSE s.n_distinct::numeric END AS distinct_count,
-           round((coalesce(s.null_frac, 0) * greatest(c.reltuples, 0))::numeric) AS null_count,
+           round((coalesce(s.null_frac, 0) * coalesce(rs.stattuples, greatest(c.reltuples, 0)))::numeric) AS null_count,
            k.columns, k.types,
            (s.histogram_bounds::text::text[])[array_length(s.histogram_bounds::text::text[], 1)] AS upper_bound,
            CASE WHEN s.histogram_bounds IS NULL THEN NULL ELSE 1::numeric END AS upper_bound_cnt,
-           coalesce(st.last_analyze, st.last_autoanalyze) AS created_at,
+           coalesce(rs.statanalyzed, st.last_analyze, st.last_autoanalyze) AS created_at,
            (s.most_common_vals::text::text[])[1] AS mcv1,
            (s.most_common_vals::text::text[])[2] AS mcv2,
            (s.most_common_vals::text::text[])[3] AS mcv3,
            (s.most_common_vals::text::text[])[4] AS mcv4,
-           (SELECT string_agg(round((f * greatest(c.reltuples, 0))::numeric)::text, ',')
+           (SELECT string_agg(round((f * coalesce(rs.stattuples, greatest(c.reltuples, 0)))::numeric)::text, ',')
             FROM unnest(s.most_common_freqs[1:4]) f) AS mcv_counts
     FROM pg_catalog.pg_class c
+    LEFT JOIN pg_catalog.pg_dolt_relation_stats rs ON rs.statrelid = c.oid
     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
     JOIN pg_catalog.pg_index i ON i.indrelid = c.oid
     JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
@@ -1589,7 +1590,7 @@ CREATE VIEW dolt.statistics WITH (security_invoker=true) AS
                         JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = x.attnum) k
     LEFT JOIN pg_catalog.pg_stats s ON s.schemaname = n.nspname AND s.tablename = c.relname AND s.attname = k.first_column
     LEFT JOIN pg_catalog.pg_stat_all_tables st ON st.relid = c.oid
-    WHERE c.relkind = 'r' AND c.reltuples >= 0
+    WHERE c.relkind = 'r' AND (rs.statrelid IS NOT NULL OR c.reltuples >= 0)
       AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'dolt') AND n.nspname NOT LIKE 'pg\_%'
     ORDER BY 2, 3;
 CREATE VIEW dolt.branch_activity WITH (security_invoker=true) AS

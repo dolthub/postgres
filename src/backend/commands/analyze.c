@@ -651,6 +651,9 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
 	 * A branch's table has no physical pg_class row to update; the planner
 	 * sizes it from its trees.
 	 */
+	if (!inh && dg_relation_analyzable(onerel))
+		dg_store_relation_stats(RelationGetRelid(onerel), totalrows);
+
 	if (!inh && !onerel->rd_catalogview)
 	{
 		BlockNumber relallvisible = 0;

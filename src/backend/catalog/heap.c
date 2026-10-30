@@ -38,6 +38,7 @@
 #include "catalog/catalog.h"
 #include "catalog/namespace.h"
 #include "catalog/catalogview.h"
+#include "access/doltcatalog.h"
 #include "catalog/heap.h"
 #include "catalog/index.h"
 #include "catalog/objectaccess.h"
@@ -3581,6 +3582,9 @@ RemoveStatistics(Oid relid, AttrNumber attnum)
 	systable_endscan(scan);
 
 	table_close(pgstatistic, RowExclusiveLock);
+
+	if (attnum == 0 && CatalogViewIsDurable(relid))
+		dg_remove_relation_stats(relid);
 }
 
 

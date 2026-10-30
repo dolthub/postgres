@@ -1268,14 +1268,6 @@ estimate(Relation rel, int32 *widths, BlockNumber *pages, double *tuples, double
 	*pages = (BlockNumber) Min((double) MaxBlockNumber,
 		Max(1.0, ceil(bytes / BLCKSZ)));
 
-	/*
-	 * A prolly table is never analyzed, so nothing corrects an estimate the
-	 * planner makes from a small table's exact size. Count a small table as
-	 * a thousand rows, as before exact counts, so that plans over small tables
-	 * keep using their indexes.
-	 */
-	*tuples = Max(*tuples, 1000);
-
 	/* Index entries are versioned with the rows: index-only scans fetch nothing. */
 	*allvis = 1;
 	release_state(rel, state);

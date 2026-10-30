@@ -13,6 +13,7 @@ backend_sources += files(
   'dg_store.c',
   'dg_lock.c',
   'dg_identity.c',
+  'dg_statistics.c',
   'dg_table.c',
   'pl_file.c',
   'pl_store.c',
