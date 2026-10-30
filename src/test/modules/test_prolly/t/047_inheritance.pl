@@ -61,8 +61,10 @@ is(sql(q{SELECT p.a,c.renamed_a FROM parent AS OF 'before_ddl' p CROSS JOIN rena
 sql(q{SELECT dolt_commit('-Am','inherited DDL'); SELECT dolt_branch('parallel')});
 my $left = $node->background_psql('postgres');
 my $right = $node->background_psql('postgres');
-$left->query_safe(q{SELECT dolt_checkout('main'); BEGIN; ALTER TABLE renamed_parent ADD COLUMN left_value int DEFAULT 5});
-$right->query_safe(q{SELECT dolt_checkout('parallel'); SET lock_timeout='2s'; ALTER TABLE renamed_parent ADD COLUMN right_value int DEFAULT 6});
+$left->query_safe(q{SELECT dolt_checkout('main')});
+$right->query_safe(q{SELECT dolt_checkout('parallel'); SET lock_timeout='2s'});
+$left->query_safe(q{BEGIN; ALTER TABLE renamed_parent ADD COLUMN left_value int DEFAULT 5});
+$right->query_safe(q{ALTER TABLE renamed_parent ADD COLUMN right_value int DEFAULT 6});
 $left->query_safe('COMMIT');
 is($right->query_safe(q{SELECT right_value FROM grandchild}), '6', 'other branch DDL does not wait for uncommitted inherited DDL');
 is($left->query_safe(q{SELECT left_value FROM grandchild}), '5', 'both branches publish independent recursive changes');
