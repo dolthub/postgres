@@ -1279,6 +1279,15 @@ execute_extension_script(Oid extensionOid, ExtensionControlFile *control,
 									 GUC_ACTION_SAVE, true, 0, false);
 
 	/*
+	 * An extension's objects belong to the server, not to a branch: its
+	 * tables are heap tables unless its script says otherwise, and its other
+	 * objects are created natively; see standard_ProcessUtility.
+	 */
+	(void) set_config_option("default_table_access_method", "heap",
+							 PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+
+	/*
 	 * Similarly disable check_function_bodies, to ensure that SQL functions
 	 * won't be parsed during creation.
 	 */
