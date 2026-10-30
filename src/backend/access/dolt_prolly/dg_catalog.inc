@@ -504,8 +504,8 @@ catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool ta
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("cross-database versioned queries are not supported")));
 	}
 revision_selected:
-	if (target && (rv->dolt_revision || (rv->catalogname && strpbrk(rv->catalogname, "@/"))))
-		unsupported("revision-qualified write targets");
+	if (target && rv->dolt_revision)
+		unsupported("historical write targets");
 	if (plain)
 	{
 		cached = bind_cache_find(bind_cache_key(rv, rte, revision, resolution_path, user, target), false);
@@ -564,7 +564,7 @@ revision_selected:
 		}
 		else if (working)
 		{
-			rte->dolt_ref = psprintf("%c:working/%s", context_branch ? 'c' : 's', revision);
+			rte->dolt_ref = psprintf("%c:working/%s", (context_branch || sep) ? 'c' : 's', revision);
 			rte->dolt_ref_target = hash_format(db);
 		}
 		rte->dolt_database = hash_format(db);
