@@ -74,70 +74,89 @@ dg_version_pre_prepare(void)
 	dg_version_pre_commit();
 }
 
-/* Runs before transaction shutdown, so SPI and user type codecs remain usable. */
-void
-dg_version_pre_commit(void)
+/* Sort branch publication independently of statement order. */
+static int
+commit_branch_compare(const ListCell *a, const ListCell *b)
 {
-	const char *branch = NULL;
-	const char *previous_branch;
-	int			nest;
-	ListCell   *lc;
+	return strcmp(lfirst(a), lfirst(b));
+}
 
-	if (!dolt_transaction_commit || !commit_dirty_branches || commit_publishing)
-		return;
+static List *
+commit_branches(void)
+{
+	List *branches = NIL;
+	ListCell *lc;
+
 	foreach(lc, commit_dirty_branches)
 	{
 		CommitDirtyBranch *entry = lfirst(lc);
 
-		if (branch && strcmp(branch, entry->branch))
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							errmsg("automatic version-control commit requires a single dirty branch")));
-		branch = entry->branch;
+		if (!list_member_string(branches, entry->branch))
+			branches = lappend(branches, entry->branch);
 	}
+	list_sort(branches, commit_branch_compare);
+	return branches;
+}
+
+/* Runs before transaction shutdown, so SPI and user type codecs remain usable. */
+void
+dg_version_pre_commit(void)
+{
+	List *branches;
+	const char *previous_branch;
+	ListCell *lc;
+
+	if (!dolt_transaction_commit || !commit_dirty_branches || commit_publishing)
+		return;
+	branches = commit_branches();
+	if (list_length(branches) > 1 && !dolt_multi_branch_commit)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("automatic version-control commit requires dolt_multi_branch_commit for multiple dirty branches")));
 	commit_publishing = true;
 	PushCopiedSnapshot(GetTransactionSnapshot());
-	previous_branch = dg_switch_execution_branch(branch);
+	previous_branch = dg_switch_execution_branch(linitial(branches));
 	PG_TRY();
 	{
-		VersionRef	head,
-					staged,
-					working;
-		Capture		full;
-		bytea	   *database;
-		char	   *message;
-
+		/* All roots and all refs are published by the same PostgreSQL XID. */
 		dg_flush_version_batches();
 		CommandCounterIncrement();
 		/* Publication may have waited for a concurrent working-set writer. */
 		PopActiveSnapshot();
 		PushCopiedSnapshot(GetLatestSnapshot());
-		nest = begin_api();
-		UpdateActiveSnapshotCommandId();
-		head = read_ref(branch_ref("heads"));
-
-		/*
-		 * Preserve the non-aborting merge contract; resolution stays
-		 * explicit.
-		 */
-		if (head.target && !read_ref(branch_ref("merge")).target)
+		foreach(lc, branches)
 		{
-			staged = read_ref(branch_ref("staged"));
-			working = read_ref(branch_ref("working"));
-			database = staged_capture(&full);
-			if (!database_same(database, child(head.target, 1)))
-			{
-				bytea	   *commit;
+			VersionRef head, staged, working;
+			Capture full;
+			bytea *database;
+			char *message;
+			int nest;
 
-				run("SELECT COALESCE(NULLIF(btrim($1),''),'Transaction commit')", 1,
-					VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(dolt_transaction_commit_message)), NULL, true);
-				message = strcell(0, 1);
-				commit = commit_object(database, head.target, NULL, message, NULL, NULL, GetCurrentTimestamp());
-				move_ref(branch_ref("heads"), head, commit);
-				move_ref(branch_ref("staged"), staged, database);
-				move_ref(branch_ref("working"), working, full.hash);
+			dg_switch_execution_branch(lfirst(lc));
+			nest = begin_api();
+			UpdateActiveSnapshotCommandId();
+			head = read_ref(branch_ref("heads"));
+
+			/* Pending merge resolution remains explicit on each branch. */
+			if (head.target && !read_ref(branch_ref("merge")).target)
+			{
+				staged = read_ref(branch_ref("staged"));
+				working = read_ref(branch_ref("working"));
+				database = staged_capture(&full);
+				if (!database_same(database, child(head.target, 1)))
+				{
+					bytea *commit;
+
+					run("SELECT COALESCE(NULLIF(btrim($1),''),'Transaction commit')", 1,
+						VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(dolt_transaction_commit_message)), NULL, true);
+					message = strcell(0, 1);
+					commit = commit_object(database, head.target, NULL, message, NULL, NULL, GetCurrentTimestamp());
+					move_ref(branch_ref("heads"), head, commit);
+					move_ref(branch_ref("staged"), staged, database);
+					move_ref(branch_ref("working"), working, full.hash);
+				}
 			}
+			end_api(nest);
 		}
-		end_api(nest);
 	}
 	PG_FINALLY();
 	{

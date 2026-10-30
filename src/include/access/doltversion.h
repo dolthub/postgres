@@ -3,6 +3,7 @@
 #define DOLTVERSION_H
 #include "postgres.h"
 extern PGDLLIMPORT bool dolt_transaction_commit;
+extern PGDLLIMPORT bool dolt_multi_branch_commit;
 extern PGDLLIMPORT bool dolt_force_transaction_commit;
 extern PGDLLIMPORT bool dolt_allow_commit_conflicts;
 extern PGDLLIMPORT char *dolt_transaction_commit_message;

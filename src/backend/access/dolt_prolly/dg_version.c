@@ -1321,6 +1321,7 @@ default_email(const char *name)
 
 /* An explicit --committer overrides the author-derived committer identity. */
 bool dolt_transaction_commit = false;
+bool dolt_multi_branch_commit = false;
 bool dolt_force_transaction_commit = false;
 bool dolt_allow_commit_conflicts = false;
 char *dolt_transaction_commit_message;
