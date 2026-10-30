@@ -53,8 +53,14 @@ dg_catalog_schema_created(Oid schema)
 	char	   *name = get_namespace_name(schema);
 
 	if (!IsUnderPostmaster || catalog_api_depth || isAnyTempNamespace(schema) ||
-		dg_system_namespace(name) || !dg_catalog_active())
+		dg_system_namespace(name))
 		return;
+	if (!dg_catalog_active())
+	{
+		if (!dolt_transaction_commit)
+			return;
+		catalog_activate();
+	}
 	adopt_schema(schema);
 }
 
