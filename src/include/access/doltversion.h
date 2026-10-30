@@ -12,4 +12,7 @@ extern PGDLLIMPORT char *dolt_author_date;
 extern PGDLLIMPORT char *dolt_committer_name;
 extern PGDLLIMPORT char *dolt_committer_email;
 extern PGDLLIMPORT char *dolt_committer_date;
+extern void dg_version_mark_branch(const char *branch);
+extern void dg_version_pre_commit(void);
+extern void dg_version_pre_prepare(void);
 #endif

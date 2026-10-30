@@ -596,6 +596,8 @@ move_ref(const char *name, VersionRef old, bytea *target)
 	if (!target)
 		nulls[2] = 'n';
 	run("SELECT pg_catalog.dolt_manifest_cas($1,$2,$3)", 3, types, args, nulls, false);
+	if (strncmp(name, "working/", 8) == 0)
+		dg_version_mark_branch(name + 8);
 }
 static ArrayType *
 links(Datum *hashes, int count)
@@ -2060,3 +2062,5 @@ static void validate_working_foreign_keys(const char *branch);
 #include "dg_tools.inc"
 #include "dg_transport.inc"
 #include "dg_compat.inc"
+
+#include "dg_commit_session.inc"

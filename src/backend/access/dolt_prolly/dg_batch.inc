@@ -664,6 +664,8 @@ dg_batch_insert(DGBatch *b, PLSlice row, uint64 handle)
 	PendingHandle *mapping;
 	bool		found;
 
+	dg_version_mark_branch(b->key.branch);
+
 	pending = hash_search(b->rows, &digest, HASH_ENTER, &found);
 	if (!found)
 	{
@@ -691,6 +693,8 @@ dg_batch_remove(DGBatch *b, PLSlice row, uint64 handle)
 	PendingRow *pending;
 	PendingHandle *mapping;
 	bool		found;
+
+	dg_version_mark_branch(b->key.branch);
 
 	pending = hash_search(b->rows, &digest, HASH_ENTER, &found);
 	if (!found)

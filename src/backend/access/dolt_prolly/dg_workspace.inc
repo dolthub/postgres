@@ -516,7 +516,7 @@ merge_databases(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts, S
 	if (row_merges)
 		install_database(base, ours, theirs, row_merges, conflicts, violations);
 	else
-		validate_working_foreign_keys(dg_current_branch());
+		validate_working_foreign_keys(dg_current_branch(), NULL);
 }
 
 /*
@@ -728,7 +728,7 @@ replace_working(const char *branch, bytea *database, List *tables)
 		UpdateActiveSnapshotCommandId();
 	}
 	if (tables)
-		validate_working_foreign_keys(branch);
+		validate_working_foreign_keys(branch, NULL);
 }
 
 static void
