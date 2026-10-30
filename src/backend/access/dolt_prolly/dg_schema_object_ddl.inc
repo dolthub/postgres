@@ -3,6 +3,7 @@
 bool
 dg_catalog_schema_object_ddl(ParseState *pstate, Node *statement)
 {
+	AlterOwnerStmt *owner = IsA(statement, AlterOwnerStmt) ? (AlterOwnerStmt *) statement : NULL;
 	DefineStmt *define = IsA(statement, DefineStmt) ? (DefineStmt *) statement : NULL;
 	CatalogView *previous;
 	CatalogView *view;
@@ -14,7 +15,8 @@ dg_catalog_schema_object_ddl(ParseState *pstate, Node *statement)
 	List *definitions[3] = {NIL, NIL, NIL};
 
 	if ((!define || (define->kind != OBJECT_AGGREGATE && define->kind != OBJECT_OPERATOR)) &&
-		!IsA(statement, CreateCastStmt) && !IsA(statement, AlterOperatorStmt))
+		!IsA(statement, CreateCastStmt) && !IsA(statement, AlterOperatorStmt) &&
+		(!owner || (owner->objectType != OBJECT_AGGREGATE && owner->objectType != OBJECT_OPERATOR)))
 		return false;
 	if (creating_extension)
 		return false;
@@ -71,6 +73,8 @@ dg_catalog_schema_object_ddl(ParseState *pstate, Node *statement)
 			DefineOperator(define->defnames, define->definition);
 		else if (IsA(statement, CreateCastStmt))
 			CreateCast((CreateCastStmt *) statement);
+		else if (owner)
+			ExecAlterOwnerStmt(owner);
 		else
 			AlterOperator((AlterOperatorStmt *) statement);
 		CommandCounterIncrement();

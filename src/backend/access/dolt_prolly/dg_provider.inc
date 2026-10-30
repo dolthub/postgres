@@ -1104,9 +1104,9 @@ provider_role_dependency(DGProviderRows *rows, Oid catalog, Oid object,
 static void
 provider_role_dependencies(DGProviderRows *rows)
 {
-	const Oid	catalogs[] = {NamespaceRelationId, RelationRelationId, TypeRelationId, ProcedureRelationId};
-	const int	owners[] = {Anum_pg_namespace_nspowner, Anum_pg_class_relowner, Anum_pg_type_typowner, Anum_pg_proc_proowner};
-	const int	acls[] = {Anum_pg_namespace_nspacl, Anum_pg_class_relacl, Anum_pg_type_typacl, Anum_pg_proc_proacl};
+	const Oid	catalogs[] = {NamespaceRelationId, RelationRelationId, TypeRelationId, ProcedureRelationId, OperatorRelationId};
+	const int	owners[] = {Anum_pg_namespace_nspowner, Anum_pg_class_relowner, Anum_pg_type_typowner, Anum_pg_proc_proowner, Anum_pg_operator_oprowner};
+	const int	acls[] = {Anum_pg_namespace_nspacl, Anum_pg_class_relacl, Anum_pg_type_typacl, Anum_pg_proc_proacl, 0};
 
 	for (int i = 0; i < lengthof(catalogs); i++)
 	{
@@ -1126,6 +1126,7 @@ provider_role_dependencies(DGProviderRows *rows)
 				continue;		/* bootstrap objects are shared */
 			owner = DatumGetObjectId(heap_getattr(tuple, owners[i], desc, &isnull));
 			provider_role_dependency(rows, catalogs[i], object, owner, SHARED_DEPENDENCY_OWNER);
+			if (!acls[i]) continue;
 			acl = heap_getattr(tuple, acls[i], desc, &isnull);
 			if (!isnull)
 			{
