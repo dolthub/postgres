@@ -240,6 +240,58 @@ pl_store_drop_unbacked(PLStore *store)
 	return freed;
 }
 
+static PLStatus store_resize(PLStore *store, size_t capacity);
+
+size_t
+pl_store_drop_backed(PLStore *store)
+{
+	size_t		freed = 0,
+				capacity;
+
+	if (!store)
+		return 0;
+
+	/* Nodes written since they were listed as unbacked are about to be freed: forget them. */
+	{
+		size_t		kept = 0;
+
+		for (size_t i = 0; i < store->unbacked_count; i++)
+			if (!store->unbacked[i]->backed)
+			{
+				store->unbacked[i]->unbacked_slot = kept;
+				store->unbacked[kept++] = store->unbacked[i];
+			}
+		store->unbacked_count = kept;
+	}
+	for (size_t i = 0; i < store->capacity; i++)
+	{
+		PLNode	  **link = &store->buckets[i];
+
+		while (*link)
+		{
+			PLNode	   *node = *link;
+
+			if (!node->backed || node->loan)
+			{
+				link = &node->next;
+				continue;
+			}
+			*link = node->next;
+			store->stats.chunks--;
+			store->stats.bytes -= node->size;
+			free_node(store, node);
+			freed++;
+		}
+	}
+
+	/* Shrink, so that later drops walk few buckets. */
+	for (capacity = store->capacity; capacity > 256 && store->stats.chunks < capacity / 8; capacity /= 2)
+		;
+	if (capacity < store->capacity)
+		store_resize(store, capacity);
+	return freed;
+}
+
 PLStats
 pl_store_stats(const PLStore *store)
 {
@@ -690,37 +742,41 @@ pl_node_check(PLSlice bytes)
 	return parse_node(&node) == PL_OK;
 }
 
+/* Rehash |store| into |capacity| buckets. */
+static PLStatus
+store_resize(PLStore *store, size_t capacity)
+{
+	PLNode	  **buckets = calloc(capacity, sizeof(*buckets));
+
+	if (!buckets)
+		return PL_NOMEM;
+	for (size_t i = 0; i < store->capacity; i++)
+	{
+		PLNode	   *current = store->buckets[i];
+
+		while (current)
+		{
+			PLNode	   *next = current->next;
+			size_t		bucket = pl_read64(current->hash.bytes) % capacity;
+
+			current->next = buckets[bucket];
+			buckets[bucket] = current;
+			current = next;
+		}
+	}
+	free(store->buckets);
+	store->buckets = buckets;
+	store->capacity = capacity;
+	return PL_OK;
+}
+
 /* Make room to add a node to |store|: buckets for it, and a list slot if unbacked. */
 static PLStatus
 store_reserve(PLStore *store, bool backed)
 {
-	if (store->stats.chunks >= store->capacity * 2)
-	{
-		size_t		capacity = store->capacity * 2,
-					bucket,
-					i;
-		PLNode	  **buckets = calloc(capacity, sizeof(*buckets));
-
-		if (!buckets)
-			return PL_NOMEM;
-		for (i = 0; i < store->capacity; i++)
-		{
-			PLNode	   *current = store->buckets[i];
-
-			while (current)
-			{
-				PLNode	   *next = current->next;
-
-				bucket = pl_read64(current->hash.bytes) % capacity;
-				current->next = buckets[bucket];
-				buckets[bucket] = current;
-				current = next;
-			}
-		}
-		free(store->buckets);
-		store->buckets = buckets;
-		store->capacity = capacity;
-	}
+	if (store->stats.chunks >= store->capacity * 2 &&
+		store_resize(store, store->capacity * 2) != PL_OK)
+		return PL_NOMEM;
 	if (!backed && store->unbacked_count == store->unbacked_capacity)
 	{
 		size_t		capacity = store->unbacked_capacity ? store->unbacked_capacity * 2 : 64;

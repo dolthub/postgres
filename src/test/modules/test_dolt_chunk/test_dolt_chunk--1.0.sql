@@ -26,12 +26,7 @@ CREATE FUNCTION test_chunk_max_size() RETURNS int4
 	AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION test_chunk_store_stats(OUT chunks float8, OUT bytes int8)
 	AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
-CREATE FUNCTION test_chunk_cache_stats(OUT hits int8, OUT misses int8, OUT evictions int8,
-									   OUT entries int8, OUT bytes int8, OUT pinned int8)
-	AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
-CREATE FUNCTION test_chunk_cache_reset() RETURNS void
-	AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
-CREATE FUNCTION test_chunk_pin_survives_eviction(hash bytea, count int4) RETURNS bool
+CREATE FUNCTION test_chunk_pin_survives_puts(hash bytea, count int4) RETURNS bool
 	AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- Benchmarks over synthetic chunks: chunk i of a seed has a pseudo-random

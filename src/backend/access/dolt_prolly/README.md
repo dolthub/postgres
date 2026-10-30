@@ -136,10 +136,14 @@ Every backend reads prolly nodes through one cache in main shared memory,
 restart), laid out like the buffer pool: slots with pin and usage counts, a
 partitioned hash table from node hash to slot, and clock-sweep eviction. Node
 bytes live in a dynamic shared memory area created in place in that segment.
-The working store borrows nodes and reads them in place; it returns every loan
-when the transaction ends, so idle sessions pin nothing. A miss reads the chunk
-store, checks the node's encoding once and adds it. A committing transaction
-adds the nodes it wrote. A node the cache cannot take, because it is full of
+There is no per-session node cache. The working store borrows nodes and reads
+them in place, and returns every loan when the transaction ends, so idle
+sessions pin nothing. It holds a transaction's unwritten nodes, so that only
+the nodes reachable from the roots a transaction publishes reach the chunk
+store, never its intermediate trees; at transaction end it keeps only pinned
+unwritten nodes, such as the empty tree. A miss reads the chunk store, checks
+the node's encoding once and adds it. A committing transaction adds the nodes
+it wrote. A node the cache cannot take, because it is full of
 pinned nodes, is copied privately instead. History imports leave subtrees the
 chunk store already holds to be read through the cache. `dolt_node_cache_stats()`
 reports the cache's use.

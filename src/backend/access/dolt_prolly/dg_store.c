@@ -278,8 +278,6 @@ StaticAssertDecl(PL_HASH_SIZE == DOLT_CHUNK_HASH_SIZE, "prolly and chunk store h
 
 static uint64 store_epoch = 1;	/* moves when the working store is recreated */
 
-/* Nodes of the working store's own kept across transactions, at most. */
-#define DG_NODE_CACHE_BYTES ((size_t) 64 * 1024 * 1024)
 static DoltChunkStore *working_chunks;
 static DoltChunk working_fetched;
 
@@ -347,6 +345,8 @@ fetch_chunk(void *arg, PLHash hash, PLSlice *bytes)
 	return PL_OK;
 }
 
+static void register_callbacks(void);
+
 /*
  * Lend node |hash| from the shared node cache, adding it from the chunk store
  * on a miss. A node the cache cannot take is lent as transient bytes, which
@@ -386,6 +386,7 @@ dg_working_store(void)
 {
 	if (!working_store)
 	{
+		register_callbacks();
 		working_store = pl_store_create();
 		if (!working_store)
 			ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("out of memory creating prolly store")));
@@ -403,8 +404,11 @@ dg_working_store(void)
 PLStore *
 dg_private_store(void)
 {
-	PLStore    *store = pl_store_create();
+	PLStore    *store;
 
+	/* Transaction end returns the loans, and closes the chunk store misses read. */
+	register_callbacks();
+	store = pl_store_create();
 	if (!store)
 		ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("out of memory creating prolly store")));
 	if (private_count == private_capacity)
@@ -1070,11 +1074,13 @@ store_xact(XactEvent event, void *arg)
 			collect_threshold = DG_COLLECT_MINIMUM;
 
 			/*
-			 * Borrowed nodes go back to the shared cache, so that no idle
-			 * session pins it. Parsed nodes are content-addressed, so those
-			 * the chunk store holds stay valid for the next transaction: keep
-			 * the store's own, up to a bound, and drop only this
-			 * transaction's unwritten nodes.
+			 * Nodes in the chunk store are read through the shared cache, so
+			 * the working store keeps none across transactions: borrowed
+			 * nodes go back, so that no idle session pins the cache, and
+			 * written ones are shared once committed, then dropped. Unwritten
+			 * nodes are dropped too, unless pinned, such as the empty tree
+			 * and journal folds; they are written only when a published root
+			 * reaches them.
 			 */
 			if (event == XACT_EVENT_COMMIT)
 				share_written();
@@ -1084,11 +1090,7 @@ store_xact(XactEvent event, void *arg)
 			{
 				pl_store_return_loans(working_store);
 				pl_store_drop_unbacked(working_store);
-				if (pl_store_stats(working_store).bytes > DG_NODE_CACHE_BYTES)
-				{
-					pl_store_free(working_store);
-					working_store = NULL;
-				}
+				pl_store_drop_backed(working_store);
 			}
 			written = NULL;		/* in TopTransactionContext */
 			written_count = written_capacity = 0;

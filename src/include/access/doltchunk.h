@@ -5,7 +5,7 @@
  *
  * Every consumer of prolly chunks goes through this API. Chunks are immutable
  * byte strings addressed by the SHA-256 of their contents, so the bytes for a
- * hash never change and cached copies never need invalidation.
+ * hash never change.
  *
  * Callers may rely on:
  *	- puts are idempotent;
@@ -56,17 +56,6 @@ typedef struct DoltChunkStoreStats
 	uint64		bytes;			/* storage used, including any index */
 } DoltChunkStoreStats;
 
-typedef struct DoltChunkCacheStats
-{
-	uint64		hits;
-	uint64		misses;
-	uint64		evictions;
-	uint64		entries;
-	uint64		bytes;
-	uint64		pinned;
-} DoltChunkCacheStats;
-
-extern PGDLLIMPORT int dolt_chunk_cache_size;
 extern PGDLLIMPORT bool dolt_chunk_verify_hashes;
 
 extern DoltChunkStore *dolt_chunk_open(DoltChunkIntent intent);
@@ -97,14 +86,12 @@ extern int	dolt_chunk_delete_many(DoltChunkStore *store, int n, const uint8 *has
 
 extern Size dolt_chunk_max_size(void);
 extern void dolt_chunk_store_stats(DoltChunkStoreStats *stats);
-extern void dolt_chunk_cache_stats(DoltChunkCacheStats *stats);
-extern void dolt_chunk_cache_reset(void);
 
 /*
  * Store implementations.
  *
- * The layer above an implementation supplies the node cache, pins, hash
- * verification and size checks. An implementation only stores and finds bytes.
+ * The layer above an implementation supplies pins, hash verification and
+ * size checks. An implementation only stores and finds bytes.
  * Its get passes each found chunk's bytes to the callback, valid only during
  * that call. Hashes are packed: hash i is at hashes + i * DOLT_CHUNK_HASH_SIZE.
  */
@@ -129,7 +116,7 @@ extern const DoltChunkStoreRoutine *dolt_chunk_heap_routine(void);
 
 /*
  * Install an implementation for this backend, or NULL for the built-in one;
- * returns the previous one. Resets the node cache. No store may be open.
+ * returns the previous one. No store may be open.
  */
 extern const DoltChunkStoreRoutine *dolt_chunk_set_routine(const DoltChunkStoreRoutine *routine);
 

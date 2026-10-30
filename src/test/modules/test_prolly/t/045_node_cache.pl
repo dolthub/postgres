@@ -59,6 +59,20 @@ is(sql(q{SELECT count(*) FROM t WHERE v = 'changed'}), 20, 'and sees the update'
 sql(q{SELECT dolt_commit('-Am', 'changed')});
 $expected = sql($count);
 
+# The working store keeps a transaction's intermediate trees out of the chunk
+# store: rewriting rows twenty times stores about what rewriting them once does.
+my $chunks = 'SELECT count(*) FROM pg_dolt_chunk';
+my $start = sql($chunks);
+sql(q{UPDATE t SET v = 'once' WHERE id % 500 = 0});
+my $once = sql($chunks) - $start;
+$start = sql($chunks);
+sql(join('', 'BEGIN;', (map { "UPDATE t SET v = 'pass $_' WHERE id % 500 = 0;" } 1 .. 20), 'COMMIT'));
+my $twenty = sql($chunks) - $start;
+cmp_ok($twenty, '<', 2 * $once + 10, "twenty rewrites in a transaction store $twenty chunks, one stores $once");
+is(sql(q{SELECT count(*) FROM t WHERE v = 'pass 20'}), 40, 'and the last rewrite is what is read');
+sql(q{SELECT dolt_commit('-Am', 'rewritten')});
+$expected = sql($count);
+
 # An aborted writer shares nothing, and the same rows written again are stored.
 sql(q{CREATE TABLE u(id int PRIMARY KEY, v int)});
 is(sql(q{BEGIN; INSERT INTO u SELECT g, 1 FROM generate_series(1, 5000) g; ROLLBACK;
@@ -75,8 +89,12 @@ my $diff = q{SELECT diff_type, from_v, to_v FROM dolt_diff('HEAD~1', 'HEAD', 't'
 is(sql($diff), 'modified|' . sql('SELECT repeat(md5(7::text), 3)') . '|later', 'a diff of one changed row');
 my @lines = split /\n/, sql("BEGIN; $diff; SELECT pg_stat_get_xact_numscans(9103); COMMIT");
 cmp_ok($lines[-1], '<', 1000, "the diff reads a fraction of the trees' history objects ($lines[-1])");
-is(sql(q{SELECT count(*) FROM dolt_diff('HEAD~2', 'HEAD', 't')}), 21, 'a diff across two commits');
-sql(q{SELECT dolt_branch('old', 'HEAD~2')});
+is(sql(q{SELECT count(*) FROM dolt_diff('HEAD~2', 'HEAD', 't')}), 41, 'a diff across two commits');
+$node->restart;
+my ($rc, $out, $err) = $node->psql('postgres', q{SELECT count(*) FROM dolt_diff('HEAD~2', 'HEAD', 't')});
+is("$out|$err", '41|', 'a new session diffing nodes missing from the cache leaks nothing');
+is(sql('SELECT pinned FROM dolt_node_cache_stats()'), 0, 'and leaves nothing pinned');
+sql(q{SELECT dolt_branch('old', 'HEAD~3')});
 is(sql(q{SELECT dolt_checkout('old'); SELECT count(*), sum(length(v)) FROM t}),
 	qq{(0,"Switched to branch 'old'")\n20000|1920000}, 'an old branch reads its own table');
 $expected = sql($count);

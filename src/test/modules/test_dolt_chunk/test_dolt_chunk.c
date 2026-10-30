@@ -44,9 +44,7 @@ PG_FUNCTION_INFO_V1(test_chunk_delete);
 PG_FUNCTION_INFO_V1(test_chunk_scan_count);
 PG_FUNCTION_INFO_V1(test_chunk_max_size);
 PG_FUNCTION_INFO_V1(test_chunk_store_stats);
-PG_FUNCTION_INFO_V1(test_chunk_cache_stats);
-PG_FUNCTION_INFO_V1(test_chunk_cache_reset);
-PG_FUNCTION_INFO_V1(test_chunk_pin_survives_eviction);
+PG_FUNCTION_INFO_V1(test_chunk_pin_survives_puts);
 PG_FUNCTION_INFO_V1(test_chunk_bench_put);
 PG_FUNCTION_INFO_V1(test_chunk_bench_get);
 PG_FUNCTION_INFO_V1(test_chunk_bench_get_spi);
@@ -407,33 +405,6 @@ test_chunk_store_stats(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls)));
 }
 
-Datum
-test_chunk_cache_stats(PG_FUNCTION_ARGS)
-{
-	DoltChunkCacheStats stats;
-	TupleDesc	desc;
-	Datum		values[6];
-	bool		nulls[6] = {false};
-
-	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
-		elog(ERROR, "return type must be a row type");
-	dolt_chunk_cache_stats(&stats);
-	values[0] = Int64GetDatum(stats.hits);
-	values[1] = Int64GetDatum(stats.misses);
-	values[2] = Int64GetDatum(stats.evictions);
-	values[3] = Int64GetDatum(stats.entries);
-	values[4] = Int64GetDatum(stats.bytes);
-	values[5] = Int64GetDatum(stats.pinned);
-	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls)));
-}
-
-Datum
-test_chunk_cache_reset(PG_FUNCTION_ARGS)
-{
-	dolt_chunk_cache_reset();
-	PG_RETURN_VOID();
-}
-
 static uint64
 splitmix64(uint64 *state)
 {
@@ -466,12 +437,12 @@ synthetic_chunk(int32 seed, int64 i, uint8 *hash, uint8 *data, Size size)
 }
 
 /*
- * Pin a chunk, then put |count| synthetic 4 KB chunks to force evictions.
- * Returns whether the pinned bytes stayed intact and pinned throughout, and
- * whether releasing unpinned them.
+ * Pin a chunk, then put |count| synthetic 4 KB chunks through the same handle.
+ * Returns whether the pinned bytes stayed intact throughout, and whether
+ * releasing them cleared the chunk.
  */
 Datum
-test_chunk_pin_survives_eviction(PG_FUNCTION_ARGS)
+test_chunk_pin_survives_puts(PG_FUNCTION_ARGS)
 {
 	bytea	   *hash = PG_GETARG_BYTEA_PP(0);
 	int32		count = PG_GETARG_INT32(1);
@@ -480,25 +451,19 @@ test_chunk_pin_survives_eviction(PG_FUNCTION_ARGS)
 	bytea	   *expected;
 	uint8		filler_hash[DOLT_CHUNK_HASH_SIZE];
 	uint8		filler[4096];
-	DoltChunkCacheStats before,
-				after;
 	bool		intact;
 
 	if (!dolt_chunk_get(store, hash_argument(hash), &chunk))
 		elog(ERROR, "chunk to pin is missing");
 	expected = chunk_bytea(&chunk);
-	dolt_chunk_cache_stats(&before);
 	for (int i = 0; i < count; i++)
 	{
 		synthetic_chunk(99, i, filler_hash, filler, sizeof(filler));
 		dolt_chunk_put(store, filler_hash, filler, sizeof(filler));
 	}
-	dolt_chunk_cache_stats(&after);
-	intact = memcmp(chunk.data, VARDATA(expected), chunk.length) == 0 &&
-		after.evictions > before.evictions && after.pinned == 1;
+	intact = memcmp(chunk.data, VARDATA(expected), chunk.length) == 0;
 	dolt_chunk_release(store, &chunk);
-	dolt_chunk_cache_stats(&after);
-	intact = intact && after.pinned == 0;
+	intact = intact && chunk.data == NULL && chunk.pin == 0;
 	dolt_chunk_close(store);
 	PG_RETURN_BOOL(intact);
 }

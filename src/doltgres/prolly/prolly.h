@@ -133,6 +133,12 @@ size_t		pl_store_return_loans(PLStore *store);
 /* Whether |bytes| are a well-formed node encoding, as a store checks fetched bytes. */
 bool		pl_node_check(PLSlice bytes);
 size_t		pl_store_drop_unbacked(PLStore *store);
+
+/*
+ * Free the nodes known to be in the backing store, except borrowed ones: what
+ * a store that borrows nodes need not keep, since it can borrow them again.
+ */
+size_t		pl_store_drop_backed(PLStore *store);
 PLStats		pl_store_stats(const PLStore *store);
 
 /*

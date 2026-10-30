@@ -1001,6 +1001,21 @@ test_apply_batches(void)
 		CHECK(pl_find_local(lending, edited.root) != NULL);
 		OK(pl_get(&remote, edit.key, &got));
 		CHECK(lender.outstanding > 0);
+
+		/* Dropping backed nodes keeps unwritten and borrowed ones. */
+		{
+			PLNode	   *written = pl_find_local(lending, edited.root);
+			size_t		chunks;
+
+			CHECK(written != NULL && !written->backed && !written->loan);
+			pl_node_set_backed(written);
+			chunks = pl_store_stats(lending).chunks;
+			CHECK(pl_store_drop_backed(lending) == 1);
+			CHECK(pl_store_stats(lending).chunks == chunks - 1);
+			CHECK(pl_find_local(lending, edited.root) == NULL);
+			CHECK(pl_store_stats(lending).borrowed == lender.outstanding);
+			CHECK(pl_store_drop_unbacked(lending) > 0);
+		}
 		pl_store_free(lending);
 		CHECK(lender.outstanding == 0);
 
