@@ -39,9 +39,9 @@ routine_encode(HeapTuple tuple, TupleDesc desc)
 	int			i;
 
 	ReleaseSysCache(language);
-	if (strcmp(lang, "sql") && strcmp(lang, "plpgsql"))
+	if (proc->prokind != PROKIND_AGGREGATE && strcmp(lang, "sql") && strcmp(lang, "plpgsql"))
 		unsupported("canonical routines require SQL or PL/pgSQL");
-	if ((proc->prokind != PROKIND_FUNCTION && proc->prokind != PROKIND_PROCEDURE) || proc->prosupport)
+	if ((proc->prokind != PROKIND_FUNCTION && proc->prokind != PROKIND_PROCEDURE && proc->prokind != PROKIND_AGGREGATE) || proc->prosupport)
 		unsupported("canonical routine kind or support function");
 	initStringInfo(&identity);
 	appendStringInfo(&identity, "%s(", dg_qualified_name(get_namespace_name(proc->pronamespace), NameStr(proc->proname)));
