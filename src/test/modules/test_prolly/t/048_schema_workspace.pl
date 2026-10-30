@@ -13,8 +13,8 @@ sub sql { $node->safe_psql('postgres', $_[0]); }
 sql(q{CREATE SCHEMA empty_first; SELECT dolt_add('-a'); SELECT dolt_commit('-m','empty schema')});
 is(sql(q{SELECT count(*) FROM pg_namespace WHERE nspname='empty_first'}), '1',
  'an empty schema can be staged and committed before any tables exist');
-sql(q{SELECT dolt_checkout('-b','before_schema','HEAD~1')});
-is(sql(q{SELECT count(*) FROM pg_namespace WHERE nspname='empty_first'}), '0',
+like(sql(q{SELECT dolt_checkout('-b','before_schema','HEAD~1');
+ SELECT count(*) FROM pg_namespace WHERE nspname='empty_first'}), qr/\n0$/,
  'initial history does not silently include the new schema');
 sql(q{SELECT dolt_checkout('main')});
 is(sql(q{SELECT count(*) FROM pg_namespace WHERE nspname='empty_first'}), '1',
@@ -23,8 +23,8 @@ sql(q{CREATE SCHEMA empty_second; SELECT dolt_commit('-Am','second empty schema'
 sql(q{DROP SCHEMA empty_second; SELECT dolt_add('-A'); SELECT dolt_commit('-m','drop empty schema')});
 is(sql(q{SELECT count(*) FROM pg_namespace WHERE nspname='empty_second'}), '0',
  'stage-all includes empty schema deletion');
-sql(q{SELECT dolt_checkout('-b','with_second','HEAD~1')});
-is(sql(q{SELECT count(*) FROM pg_namespace WHERE nspname='empty_second'}), '1',
+like(sql(q{SELECT dolt_checkout('-b','with_second','HEAD~1');
+ SELECT count(*) FROM pg_namespace WHERE nspname='empty_second'}), qr/\n1$/,
  'committed empty schema survives without tables');
 sql(q{SELECT dolt_checkout('main')});
 sql(q{CREATE TYPE source AS (v int); CREATE TYPE target AS (v int);
