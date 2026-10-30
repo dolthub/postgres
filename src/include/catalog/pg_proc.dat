@@ -12927,3 +12927,7 @@
  prorettype => 'text', proargtypes => 'bytea', prosrc => 'dolt_hash_encode' },
 { oid => '9246', descr => 'parse a Dolt content address', proname => 'dolt_hash_decode',
  prorettype => 'bytea', proargtypes => 'text', prosrc => 'dolt_hash_decode' },
+
+{ oid => '9247', descr => 'name of the native prolly storage format',
+ proname => 'dolt_storage_format', prorettype => 'text', proargtypes => '',
+ prosrc => 'dolt_storage_format' },

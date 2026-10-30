@@ -72,4 +72,5 @@ sql(q{SELECT dolt_commit('-Am','tables'); SELECT dolt_branch('side')});
 is(sql(q{SELECT branch, last_write IS NOT NULL, active_sessions, system_start_time = pg_postmaster_start_time() FROM dolt_branch_activity ORDER BY 1}),"main|t|0|t\nside|t|0|t",'branch activity from the reflog');
 is(sql(q{SELECT count(*) FROM dolt.dolt_stashes}),'0','prefixed names resolve inside the dolt schema');
 is(sql(q{SELECT has_table_privilege('public','dolt.statistics','SELECT')}),'f','views are superuser-only');
+is(sql(q{SELECT dolt_storage_format()}), 'PROLLY ( DGPTR001 )', 'format introspection describes the native codec');
 done_testing();

@@ -399,3 +399,10 @@ dolt_test_run_noargs(PG_FUNCTION_ARGS)
 {
 	return dolt_test_run(fcinfo);
 }
+
+/* Describe this engine's format, not Dolt's incompatible NBS serialization. */
+Datum
+dolt_storage_format(PG_FUNCTION_ARGS)
+{
+ PG_RETURN_TEXT_P(cstring_to_text("PROLLY ( " PL_NODE_FORMAT " )"));
+}
