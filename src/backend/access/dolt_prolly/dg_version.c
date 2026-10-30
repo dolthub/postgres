@@ -169,6 +169,7 @@ static PLTree fill_rows(Relation rel, PLTree content, const bool *fill);
 static List *merge_dropped_columns(Relation rel, const char *base);
 static PLTree check_violations(Relation rel, PLTree content, const char *name, StringInfo violations);
 static bytea *staged_capture(Capture * full);
+static void catalog_activate(void);
 static bool branch_management(char **args, int n);
 static void checkout_tables(char **args, int n);
 static char *resolve_object_argument(const char *arg, const char *json_a, const char *json_b, bool required);
@@ -1577,6 +1578,8 @@ dolt_add(PG_FUNCTION_ARGS)
 	int			nest;
 
 	standalone(fcinfo, false);
+	/* Import pre-repository namespaces into the branch before capturing it. */
+	catalog_activate();
 	nest = begin_api();
 	ensure_repository();
 	if (n == 0)
@@ -1633,6 +1636,8 @@ dolt_commit(PG_FUNCTION_ARGS)
 	int			nest;
 
 	standalone(fcinfo, true);
+	/* Import pre-repository namespaces into the branch before capturing it. */
+	catalog_activate();
 	nest = begin_api();
 	for (i = 0; i < n; i++)
 	{
