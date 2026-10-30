@@ -59,10 +59,12 @@ collect_foreign_violations(HeapTuple constraint, Relation fk, Relation pk, Strin
  indexes = RelationGetIndexList(fk);
  foreach(lc,indexes)
  {
-  Relation idx = dg_storage_index(fk,lfirst_oid(lc));
-  bool matches = idx->rd_index->indnkeyatts >= n;
-  for(int i=0; matches && i<n; i++) matches = idx->rd_index->indkey.values[i] == DatumGetInt16(fkcols[i]);
-  if(matches) index_name = pstrdup(RelationGetRelationName(idx));
+  HeapTuple index_tuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(lfirst_oid(lc)));
+  Form_pg_index index = (Form_pg_index) GETSTRUCT(index_tuple);
+  bool matches = index->indnkeyatts >= n;
+  for(int i=0; matches && i<n; i++) matches = index->indkey.values[i] == DatumGetInt16(fkcols[i]);
+  if(matches) index_name = pstrdup(get_rel_name(lfirst_oid(lc)));
+  ReleaseSysCache(index_tuple);
   if(matches) break;
  }
  appendStringInfo(&info,"{\"Columns\":%s,\"ForeignKey\":",columns.data);
