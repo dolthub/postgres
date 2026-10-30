@@ -1779,6 +1779,7 @@ dolt_commit_impl(FunctionCallInfo fcinfo, bool named_rows)
 	if (!multi || branches == NIL)
 		branches = list_make1(pstrdup(dg_current_branch()));
 	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC | MAT_SRF_BLESS);
+	PushCopiedSnapshot(GetLatestSnapshot());
 	previous_branch = dg_switch_execution_branch(linitial(branches));
 	commit_committer_name = committer;
 	commit_committer_email = committer_email;
@@ -1836,6 +1837,7 @@ dolt_commit_impl(FunctionCallInfo fcinfo, bool named_rows)
 	PG_FINALLY();
 	{
 		dg_switch_execution_branch(previous_branch);
+		PopActiveSnapshot();
 		commit_committer_name = NULL;
 		commit_committer_email = NULL;
 		commit_author_date_explicit = false;
