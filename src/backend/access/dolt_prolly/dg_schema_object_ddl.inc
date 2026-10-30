@@ -109,6 +109,9 @@ dg_catalog_schema_object_ddl(ParseState *pstate, Node *statement)
 	{
 		SetUserIdAndSecContext(caller, security);
 		CatalogViewSwitch(previous);
+		if (CatalogViewIsProvisional(view))
+			CatalogViewRetireMutation(view);
+		CatalogViewRelease(view);
 		if (pushed)
 			PopActiveSnapshot();
 	}
