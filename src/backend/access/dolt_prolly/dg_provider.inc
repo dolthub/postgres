@@ -8,6 +8,8 @@ typedef struct DGProvider
 	char	   *database;
 	CatalogView *view;
 	uint64		generation;		/* identity generation a branch view binds */
+	uint64		extension_generation;	/* the extensions whose objects it binds */
+	uint64		base_generation;	/* the server objects it lists */
 	List	   *bindings;		/* the durable OIDs a branch view binds */
 	MemoryContext memory;		/* holds the entry */
 	struct DGProvider *next;
@@ -36,11 +38,27 @@ static DGProvider *provider_current_entry;
 static uint64 identity_generation = 1;
 static bool identity_callback;
 
+/*
+ * A view binds extensions' objects, which definitions name, to their OIDs
+ * here. Creating, altering or dropping an extension replaces those and resets
+ * every relcache entry, so no view built before it is used again.
+ */
+static uint64 extension_generation = 1;
+
+/*
+ * Native DDL changes the server objects every view lists, as built-in rows:
+ * views built before it are not used again. Ordinary writes and versioned DDL
+ * invalidate none of the caches that track them.
+ */
+static uint64 base_generation = 1;
+
 static void
 provider_identities_changed(Datum arg, Oid relid)
 {
 	if (!OidIsValid(relid) || relid == DoltIdentityRelationId)
 		identity_generation++;
+	if (!OidIsValid(relid))
+		extension_generation++;
 }
 
 /* Whether every durable OID |entry|'s view binds is still bound so. */
@@ -62,6 +80,8 @@ provider_bindings_current(DGProvider *entry)
 static bool
 provider_current(DGProvider *entry, const char *branch)
 {
+	if (entry->extension_generation != extension_generation || entry->base_generation != base_generation)
+		return false;
 	if (!branch)
 		return !entry->branch;
 	if (!entry->branch || strcmp(entry->branch, branch))
@@ -189,9 +209,93 @@ provider_member(const char *name, const char *kind)
 static CatalogViewBase *provider_base;
 static bool provider_bootstrap(Oid catalog, HeapTuple tuple, TupleDesc desc);
 
+/*
+ * Every physical row other than a user schema's is a built-in object's or a
+ * server object's: an extension's member, a heap table, any object not under
+ * version control. Every branch lists them, as it lists built-in objects, in
+ * their namespaces; namespaces themselves come from each branch. The
+ * namespaces server objects live in are noted while the base is built, so
+ * a view that leaves one out can leave out its objects too.
+ */
+static List *provider_server_namespaces;
+
+/* Each server object with a namespace, as the base was built: object OIDs by namespace. */
+typedef struct ProviderServerObject
+{
+	Oid			namespace;
+	Oid			object;
+} ProviderServerObject;
+static ProviderServerObject *provider_server_objects;
+static int	provider_server_object_count,
+			provider_server_object_capacity;
+
+/* The namespace |tuple| of |catalog| names its object in, or InvalidOid. */
+static Oid
+provider_row_namespace(Oid catalog, HeapTuple tuple)
+{
+	switch (catalog)
+	{
+		case RelationRelationId:
+			return ((Form_pg_class) GETSTRUCT(tuple))->relnamespace;
+		case TypeRelationId:
+			return ((Form_pg_type) GETSTRUCT(tuple))->typnamespace;
+		case ProcedureRelationId:
+			return ((Form_pg_proc) GETSTRUCT(tuple))->pronamespace;
+		case OperatorRelationId:
+			return ((Form_pg_operator) GETSTRUCT(tuple))->oprnamespace;
+		case ConstraintRelationId:
+			return ((Form_pg_constraint) GETSTRUCT(tuple))->connamespace;
+		case StatisticExtRelationId:
+			return ((Form_pg_statistic_ext) GETSTRUCT(tuple))->stxnamespace;
+		default:
+			return InvalidOid;
+	}
+}
+
+/* Whether |namespace| is a user schema, one each branch defines for itself. */
+static bool
+provider_user_namespace(Oid namespace)
+{
+	return namespace == PG_PUBLIC_NAMESPACE || namespace >= FirstNormalObjectId;
+}
+
+/* The object a native catalog row describes, for rows that describe another's part. */
+static Oid
+provider_row_owner(Oid catalog, HeapTuple tuple, Oid object)
+{
+	switch (catalog)
+	{
+		case RewriteRelationId:
+			return ((Form_pg_rewrite) GETSTRUCT(tuple))->ev_class;
+		case ConstraintRelationId:
+			{
+				Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tuple);
+
+				return OidIsValid(con->conrelid) ? con->conrelid : con->contypid;
+			}
+		case AttrDefaultRelationId:
+			return ((Form_pg_attrdef) GETSTRUCT(tuple))->adrelid;
+		case TriggerRelationId:
+			return ((Form_pg_trigger) GETSTRUCT(tuple))->tgrelid;
+		case EnumRelationId:
+			return ((Form_pg_enum) GETSTRUCT(tuple))->enumtypid;
+		case PolicyRelationId:
+			return ((Form_pg_policy) GETSTRUCT(tuple))->polrelid;
+		case StatisticExtRelationId:
+			return ((Form_pg_statistic_ext) GETSTRUCT(tuple))->stxrelid;
+		case DependRelationId:
+			return ((Form_pg_depend) GETSTRUCT(tuple))->objid;
+		case SharedDependRelationId:
+			return ((Form_pg_shdepend) GETSTRUCT(tuple))->objid;
+		default:
+			return object;
+	}
+}
+
 static void
 provider_base_forget(Datum arg, int cacheid, uint32 hashvalue)
 {
+	base_generation++;
 	if (provider_base)
 		CatalogViewBaseRelease(provider_base);
 	provider_base = NULL;
@@ -220,6 +324,9 @@ provider_shared_base(void)
 	previous = MemoryContextSwitchTo(scratch);
 	PG_TRY();
 	{
+		list_free(provider_server_namespaces);
+		provider_server_namespaces = NIL;
+		provider_server_object_count = 0;
 		for (int i = 0; i < lengthof(provider_catalogs); i++)
 		{
 			Relation	rel = table_open(provider_catalogs[i], AccessShareLock);
@@ -229,7 +336,29 @@ provider_shared_base(void)
 
 			while ((tuple = heap_getnext(scan, ForwardScanDirection)))
 				if (provider_bootstrap(provider_catalogs[i], tuple, RelationGetDescr(rel)))
+				{
+					Oid			namespace = provider_row_namespace(provider_catalogs[i], tuple);
+
 					tuples = lappend(tuples, heap_copytuple(tuple));
+					if (provider_user_namespace(namespace))
+					{
+						MemoryContext saved = MemoryContextSwitchTo(TopMemoryContext);
+						bool		isnull;
+
+						provider_server_namespaces = list_append_unique_oid(provider_server_namespaces, namespace);
+						if (provider_server_object_count == provider_server_object_capacity)
+						{
+							provider_server_object_capacity = Max(1024, provider_server_object_capacity * 2);
+							provider_server_objects = provider_server_objects ?
+								repalloc_array(provider_server_objects, ProviderServerObject, provider_server_object_capacity) :
+								palloc_array(ProviderServerObject, provider_server_object_capacity);
+						}
+						provider_server_objects[provider_server_object_count].namespace = namespace;
+						provider_server_objects[provider_server_object_count++].object =
+							DatumGetObjectId(heap_getattr(tuple, 1, RelationGetDescr(rel), &isnull));
+						MemoryContextSwitchTo(saved);
+					}
+				}
 			table_endscan(scan);
 			table_close(rel, AccessShareLock);
 			CatalogViewBaseAddRows(base, provider_catalogs[i], tuples);
@@ -620,8 +749,10 @@ provider_decode_columns(const char *definition)
 	return desc;
 }
 
-/* Bootstrap rows are shared. All live user definitions are excluded, even when
- * their names happen to match a retained member. Public is supplied canonically.
+/*
+ * Whether a physical row belongs in the shared base: every built-in object's
+ * and server object's row, but not a user schema's, which each branch
+ * supplies.
  */
 static bool
 provider_bootstrap(Oid catalog, HeapTuple tuple, TupleDesc desc)
@@ -631,24 +762,16 @@ provider_bootstrap(Oid catalog, HeapTuple tuple, TupleDesc desc)
 
 	if (catalog == SharedDependRelationId)
 	{
-		Form_pg_shdepend dep = (Form_pg_shdepend) GETSTRUCT(tuple);
+		Oid			database = ((Form_pg_shdepend) GETSTRUCT(tuple))->dbid;
 
-		return dep->dbid == InvalidOid ||
-			(dep->dbid == MyDatabaseId && dep->objid < FirstNormalObjectId);
+		return database == InvalidOid || database == MyDatabaseId;
 	}
-	if (catalog == ProcedureRelationId)
-	{
-		Oid			ns = ((Form_pg_proc) GETSTRUCT(tuple))->pronamespace;
-
-		return ns == PG_CATALOG_NAMESPACE || !strcmp(get_namespace_name(ns), "information_schema");
-	}
-	if (catalog == DependRelationId)
-		object = ((Form_pg_depend) GETSTRUCT(tuple))->objid;
-	if (catalog == NamespaceRelationId && object == PG_PUBLIC_NAMESPACE)
-		return false;
-	if (catalog == DescriptionRelationId && ((Form_pg_description) GETSTRUCT(tuple))->classoid == NamespaceRelationId && object == PG_PUBLIC_NAMESPACE)
-		return false;
-	return object < FirstNormalObjectId;
+	/* Each branch defines its user schemas, and their comments. */
+	if (catalog == NamespaceRelationId)
+		return !provider_user_namespace(object);
+	if (catalog == DescriptionRelationId && ((Form_pg_description) GETSTRUCT(tuple))->classoid == NamespaceRelationId)
+		return !provider_user_namespace(object);
+	return true;
 }
 
 static int
@@ -822,7 +945,6 @@ provider_defaults(DGProviderRows *rows, CatalogView *view, const char *definitio
 		elog(ERROR, "canonical column count mismatch");
 	for (int i = 0; i < desc->natts; i++)
 	{
-		JsonbValue	column = json_element(&columns, i);
 		Node	   *expression;
 		FormData_pg_attrdef form = {0};
 		HeapTuple	tuple;
@@ -1180,6 +1302,96 @@ provider_has_type(DGProviderRows *rows, Oid namespaceid, const char *name)
  * durable OID and, for relations, its storage resource; a revision's objects
  * take backend-local handles.
  */
+/*
+ * Bind namespace |name| to the server's schema of that name, so that it has
+ * one OID on every branch, public 2200 among them, and server objects in it
+ * are in it on every branch that has it. A name no schema has here yet, as a
+ * clone's history may hold, takes a handle of its own.
+ */
+static Oid
+provider_namespace(CatalogView *view, const char *name)
+{
+	CatalogView *previous = CatalogViewSwitch(NULL);
+	Oid			oid = InvalidOid;
+
+	PG_TRY();
+	{
+		oid = get_namespace_oid(name, true);
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	if (!OidIsValid(oid))
+		return CatalogViewBindObject(view, NamespaceRelationId, name, InvalidOid);
+	CatalogViewBindShared(view, NamespaceRelationId, name, oid);
+	return oid;
+}
+
+/* The server objects a view leaves out: those in namespaces it does not have. */
+typedef struct ProviderHidden
+{
+	List	   *namespaces;
+	HTAB	   *objects;
+} ProviderHidden;
+
+static bool
+provider_server_row_visible(Oid catalog, HeapTuple tuple, void *arg)
+{
+	ProviderHidden *hidden = arg;
+	Oid			namespace = provider_row_namespace(catalog, tuple);
+	Oid			owner;
+
+	if (OidIsValid(namespace))
+		return !list_member_oid(hidden->namespaces, namespace);
+	/* Every catalog a view holds begins with a fixed OID column. */
+	owner = provider_row_owner(catalog, tuple, *(Oid *) GETSTRUCT(tuple));
+	return !hash_search(hidden->objects, &owner, HASH_FIND, NULL);
+}
+
+/*
+ * Leave out of |view| the server objects whose namespace it does not have,
+ * and the rows describing them. Only a branch that drops or renames such a
+ * namespace needs this; others take the base as it is.
+ */
+static void
+provider_filter_server_objects(CatalogView *view)
+{
+	ProviderHidden *hidden = NULL;
+	MemoryContext previous;
+	HASHCTL		ctl = {0};
+
+	foreach_oid(namespace, provider_server_namespaces)
+	{
+		bool		bound = false;
+
+		foreach_ptr(HeapTupleData, row, provider_current_rows->rows[provider_catalog_index(NamespaceRelationId)])
+			bound |= ((Form_pg_namespace) GETSTRUCT(row))->oid == namespace;
+		if (bound)
+			continue;
+		if (!hidden)
+		{
+			previous = MemoryContextSwitchTo(CatalogViewMemory(view));
+			hidden = palloc0(sizeof(*hidden));
+			ctl.keysize = sizeof(Oid);
+			ctl.entrysize = sizeof(Oid);
+			ctl.hcxt = CatalogViewMemory(view);
+			hidden->objects = hash_create("hidden server objects", 256, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+			MemoryContextSwitchTo(previous);
+		}
+		previous = MemoryContextSwitchTo(CatalogViewMemory(view));
+		hidden->namespaces = lappend_oid(hidden->namespaces, namespace);
+		MemoryContextSwitchTo(previous);
+	}
+	if (!hidden)
+		return;
+	for (int i = 0; i < provider_server_object_count; i++)
+		if (list_member_oid(hidden->namespaces, provider_server_objects[i].namespace))
+			(void) hash_search(hidden->objects, &provider_server_objects[i].object, HASH_ENTER, NULL);
+	CatalogViewSetBaseFilter(view, provider_server_row_visible, hidden);
+}
+
 static Oid
 provider_bind(CatalogView *view, const char *branch, Oid objectclass, char kind,
 			  const char *name, const char *identity)
@@ -1351,7 +1563,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			char	   *owner = json_value(definitions[i], "owner");
 			HeapTuple	tuple;
 
-			form.oid = CatalogViewBindObject(view, NamespaceRelationId, name, InvalidOid);
+			form.oid = provider_namespace(view, name);
 			namestrcpy(&form.nspname, name);
 			form.nspowner = get_role_oid(owner, false);
 			tuple = provider_fixed(rows.relations[slot], &form, sizeof(form), Anum_pg_namespace_nspowner);
@@ -1366,6 +1578,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 		if (!strcmp(kinds[i], "routine")) catalog = ProcedureRelationId;
 		if (catalog) CatalogViewBindObject(view, catalog, json_value(definitions[i], "name"), InvalidOid);
 	}
+	provider_filter_server_objects(view);
 	/* Bind all class identities before resolving cross-object edges. */
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index") || !strcmp(kinds[i], "sequence"))
@@ -1747,6 +1960,8 @@ provider_lookup(const char *branch, bytea *database)
 	entry->branch = branch ? MemoryContextStrdup(memory, branch) : NULL;
 	entry->view = view;
 	entry->generation = identity_generation;
+	entry->extension_generation = extension_generation;
+	entry->base_generation = base_generation;
 	entry->next = providers;
 	providers = entry;
 	saved_entry = provider_current_entry;
