@@ -29,9 +29,12 @@ static char *
 bundle_capture(void)
 {
 	StringInfoData refs;
+	StringInfoData sequences;
 	char **names;
 	bytea **targets;
 	char *objects;
+	char **definitions;
+	int definition_count;
 	int count;
 
 	ensure_repository();
@@ -77,7 +80,29 @@ bundle_capture(void)
 	 * JSON is a framing format only; payload bytes retain their native codec. */
 	run("SELECT COALESCE(jsonb_agg(jsonb_build_array(dolt_hash_encode(objhash),objkind,encode(objpayload,'base64'),ARRAY(SELECT dolt_hash_encode(h) FROM unnest(objchildren) h))),'[]'::jsonb)::text FROM pg_dolt_object_visible", 0, NULL, NULL, NULL, true);
 	objects = strcell(0, 1);
-	return psprintf("{\"format\":\"DGBUNDLE1\",\"encoding\":%d,\"refs\":%s,\"objects\":%s}", GetDatabaseEncoding(), refs.data, objects);
+	run("SELECT objhash FROM pg_dolt_object_visible WHERE objkind='sequence'", 0, NULL, NULL, NULL, true);
+	definition_count = SPI_processed;
+	{
+		bytea **hashes = palloc(sizeof(bytea *) * definition_count);
+
+		definitions = palloc(sizeof(char *) * definition_count);
+		for (int i = 0; i < definition_count; i++)
+			hashes[i] = DatumGetByteaPCopy(cell(i, 1));
+		for (int i = 0; i < definition_count; i++)
+			definitions[i] = metadata(child(hashes[i], 1), "schema");
+	}
+	initStringInfo(&sequences);
+	appendStringInfoChar(&sequences, '[');
+	for (int i = 0; i < definition_count; i++)
+	{
+		if (!OidIsValid(sequence_resource(definitions[i], false)))
+			continue;
+		if (sequences.len > 1)
+			appendStringInfoChar(&sequences, ',');
+		appendStringInfoString(&sequences, sequence_capture(definitions[i]));
+	}
+	appendStringInfoChar(&sequences, ']');
+	return psprintf("{\"format\":\"DGBUNDLE1\",\"encoding\":%d,\"refs\":%s,\"objects\":%s,\"sequences\":%s}", GetDatabaseEncoding(), refs.data, objects, sequences.data);
 }
 
 static void
@@ -219,6 +244,20 @@ bundle_import(const char *url)
 	while ((object = hash_seq_search(&scan)) != NULL)
 		bundle_import_object(objects, object);
 	advance_snapshot();
+	/* Allocation state is shared across branches and also survives when its
+	 * definition exists only in retained history. Install it before bindings. */
+	{
+		char **definitions;
+		int n;
+
+		run("SELECT v::text FROM jsonb_array_elements($1::jsonb->'sequences') v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(payload)), NULL, true);
+		n = SPI_processed;
+		definitions = palloc(sizeof(char *) * n);
+		for (int i = 0; i < n; i++)
+			definitions[i] = strcell(i, 1);
+		for (int i = 0; i < n; i++)
+			sequence_state(definitions[i], true, false);
+	}
 	run("SELECT v->>0,dolt_hash_decode(v->>1) FROM jsonb_array_elements($1::jsonb->'refs') v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(payload)), NULL, true);
 	count = SPI_processed;
 	names = palloc(sizeof(char *) * count);

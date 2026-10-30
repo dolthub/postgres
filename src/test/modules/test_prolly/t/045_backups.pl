@@ -36,7 +36,7 @@ is(sql("SELECT dolt_backup('restore','$url','restored')"), '0', 'restore into ne
 is(restored(q{SELECT dolt_hashof('HEAD')}), $head, 'commit identity is unchanged');
 is(restored(q{SELECT string_agg(id::text,',' ORDER BY id) FROM t}), '1,3,4', 'dirty working data survives');
 is(restored(q{SELECT string_agg(name,',' ORDER BY name) FROM dolt.branches}), 'feature,main', 'all branches survive');
-is(restored(q{SELECT dolt_checkout('feature'); SELECT string_agg(id::text,',' ORDER BY id) FROM t}), "0\n1,2", 'inactive branch dirty data survives');
+is(restored(q{SELECT status FROM dolt_checkout('feature'); SELECT string_agg(id::text,',' ORDER BY id) FROM t}), "0\n1,2", 'inactive branch dirty data survives');
 is(restored(q{SELECT nextval('s')}), '3', 'shared sequence allocation survives');
 is(restored(q{SELECT count(*) FROM t AS OF 'HEAD'}), '1', 'historical rows survive');
 my ($status, $stdout, $stderr) = $node->psql('postgres', "SELECT dolt_backup('restore','$url','restored')");
