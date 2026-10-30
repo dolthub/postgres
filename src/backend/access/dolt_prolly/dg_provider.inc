@@ -823,7 +823,6 @@ provider_defaults(DGProviderRows *rows, CatalogView *view, const char *definitio
 		elog(ERROR, "canonical column count mismatch");
 	for (int i = 0; i < desc->natts; i++)
 	{
-		JsonbValue	column = json_element(&columns, i);
 		Node	   *expression;
 		FormData_pg_attrdef form = {0};
 		HeapTuple	tuple;
