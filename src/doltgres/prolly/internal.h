@@ -92,6 +92,10 @@ typedef struct PLCursor
 } PLCursor;
 PLStatus	pl_cursor_init(PLCursor *cursor, const PLTree *tree, const PLSlice *lower);
 PLStatus	pl_cursor_next(PLCursor *cursor);
+
+/* Start at the last entry whose key is below |upper|, or the last entry; then step back. */
+PLStatus	pl_cursor_init_last(PLCursor *cursor, const PLTree *tree, const PLSlice *upper);
+PLStatus	pl_cursor_prev(PLCursor *cursor);
 PLStatus	pl_cursor_skip_leaf(PLCursor *cursor);
 bool		pl_cursor_at_subtree_start(const PLCursor *cursor, uint32_t depth);
 PLStatus	pl_cursor_skip_subtree(PLCursor *cursor, uint32_t depth);

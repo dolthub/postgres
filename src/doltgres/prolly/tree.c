@@ -163,6 +163,104 @@ pl_cursor_next(PLCursor *cursor)
 	return pl_cursor_skip_leaf(cursor);
 }
 
+/*
+ * Descend from |node| to the last entry of its subtree whose key is below
+ * |upper|, or its last entry if |upper| is NULL. An interior key is its
+ * child's last key, so the first child whose key reaches |upper| holds the
+ * last entries below it, if any do.
+ */
+static PLStatus
+cursor_descend_last(PLCursor *cursor, PLNode *node, const PLSlice *upper)
+{
+	while (true)
+	{
+		uint32_t	index = upper ? lower_bound(node, *upper) : node->count;
+
+		if (cursor->depth >= PL_MAX_DEPTH)
+			return PL_CORRUPT;
+		cursor->path[cursor->depth] = node;
+		if (!node->level)
+		{
+			/* index entries are below |upper|: step back from the first that is not. */
+			cursor->index[cursor->depth++] = index;
+			cursor->valid = true;
+			return pl_cursor_prev(cursor);
+		}
+		if (index == node->count)
+		{
+			index = node->count - 1;
+			upper = NULL;
+		}
+		cursor->index[cursor->depth++] = index;
+		{
+			PLHash		hash = pl_child_hash(node, index);
+			PLNode	   *child = pl_find(cursor->store, hash);
+
+			if (!child || child->level + 1 != node->level)
+				return PL_CORRUPT;
+			node = child;
+		}
+	}
+}
+
+PLStatus
+pl_cursor_init_last(PLCursor *cursor, const PLTree *tree, const PLSlice *upper)
+{
+	PLNode	   *root;
+
+	memset(cursor, 0, sizeof(*cursor));
+	if (!tree || !tree->store || (upper && !valid_slice(*upper)))
+		return PL_INVALID;
+	root = pl_find(tree->store, tree->root);
+	if (!root)
+		return PL_CORRUPT;
+	cursor->store = tree->store;
+	if (!root->count)
+		return PL_OK;
+	return cursor_descend_last(cursor, root, upper);
+}
+
+/*
+ * Move to the previous entry; past the first, the cursor is invalid. A leaf's
+ * index may be its count, just past its last entry, as cursor_descend_last
+ * leaves it.
+ */
+PLStatus
+pl_cursor_prev(PLCursor *cursor)
+{
+	uint32_t	depth;
+
+	if (!cursor->valid)
+		return PL_OK;
+	depth = cursor->depth - 1;
+	if (cursor->index[depth] > 0)
+	{
+		cursor->index[depth]--;
+		return PL_OK;
+	}
+	cursor->depth--;
+	while (cursor->depth)
+	{
+		uint32_t	parent_depth = cursor->depth - 1;
+		PLNode	   *parent = cursor->path[parent_depth];
+
+		if (cursor->index[parent_depth] > 0)
+		{
+			PLHash		hash;
+			PLNode	   *child;
+
+			hash = pl_child_hash(parent, --cursor->index[parent_depth]);
+			child = pl_find(cursor->store, hash);
+			if (!child || child->level + 1 != parent->level)
+				return PL_CORRUPT;
+			return cursor_descend_last(cursor, child, NULL);
+		}
+		cursor->depth--;
+	}
+	cursor->valid = false;
+	return PL_OK;
+}
+
 static PLStatus
 append_node(PLBuilder *builder, PLNode *node)
 {

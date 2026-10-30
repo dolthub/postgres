@@ -35,6 +35,35 @@ is(sql(q{SET enable_hashjoin=off; SET enable_mergejoin=off; SET enable_seqscan=o
 sql(q{UPDATE t SET k = k + 100 WHERE id <= 50});
 is(sql(q{SET enable_hashjoin=off; SET enable_mergejoin=off; SET enable_seqscan=off; SELECT count(*), sum(b.id) FROM t a JOIN t b ON b.k = a.k WHERE a.id <= 50}), '50|1275', 'and after the join keys change');
 
+# Scans read entries as they are fetched, in either direction, and can step
+# back over what they returned or restore a mark, as cursors and merge joins do.
+is(idx(q{SELECT string_agg(id::text, ',') FROM (SELECT id FROM t WHERE id BETWEEN 100 AND 110 ORDER BY id DESC) s}),
+	'110,109,108,107,106,105,104,103,102,101,100', 'a bounded backward scan');
+is(idx(q{SELECT string_agg(id::text, ',') FROM (SELECT id FROM t ORDER BY id DESC LIMIT 3) s}), '3000,2999,2998', 'a backward scan from the end');
+is(idx(q{BEGIN; DECLARE c SCROLL CURSOR FOR SELECT id FROM t WHERE id BETWEEN 10 AND 20 ORDER BY id;
+ FETCH 3 FROM c; FETCH BACKWARD 2 FROM c; FETCH LAST FROM c; FETCH PRIOR FROM c; FETCH ABSOLUTE 5 FROM c;
+ MOVE LAST FROM c; FETCH NEXT FROM c; FETCH PRIOR FROM c; COMMIT}),
+	"10\n11\n12\n11\n10\n20\n19\n14\n20", 'a scroll cursor moves both ways over an index scan');
+is(idx(q{BEGIN; DECLARE c SCROLL CURSOR FOR SELECT id FROM t WHERE id BETWEEN 10 AND 20 ORDER BY id DESC;
+ FETCH 2 FROM c; FETCH BACKWARD 1 FROM c; FETCH FORWARD 3 FROM c; COMMIT}), "20\n19\n20\n19\n18\n17", 'and over a backward one');
+is(sql(q{SET enable_hashjoin=off; SET enable_nestloop=off; SET enable_seqscan=off; SET enable_sort=off;
+ SELECT count(*), sum(a.id), sum(b.id) FROM t a JOIN t b ON a.k = b.k WHERE a.id <= 300}),
+	sql(q{SET enable_mergejoin=off; SELECT count(*), sum(a.id), sum(b.id) FROM t a JOIN t b ON a.k = b.k WHERE a.id <= 300}),
+	'a merge join restoring marks over duplicate keys matches a hash join');
+
+# Fetching a few entries reads a few nodes, not the index: a 50,000-row
+# index's first and last entries, as the planner's endpoint probes read them.
+sql(q{CREATE TABLE wide(id int PRIMARY KEY, v text); INSERT INTO wide SELECT g, repeat('w', 40) FROM generate_series(1, 50000) g});
+sub nodes_read {
+	my @lines = split /\n/, idx("BEGIN; $_[0]; SELECT hits + misses FROM dolt_node_cache_stats(); COMMIT");
+	return $lines[-1];
+}
+my $whole = nodes_read('SELECT count(*) FROM wide WHERE id > 0');
+cmp_ok(nodes_read('SELECT id FROM wide ORDER BY id LIMIT 1'), '<', 30, "the first entry reads a few nodes (the index and table read $whole)");
+cmp_ok(nodes_read('SELECT id FROM wide ORDER BY id DESC LIMIT 1'), '<', 30, 'and so does the last');
+cmp_ok(nodes_read('SELECT id FROM wide WHERE id > 25000 ORDER BY id LIMIT 1'), '<', 30, 'and the first above a bound');
+is(idx('SELECT min(id), max(id) FROM wide'), '1|50000', 'min and max read through the index');
+
 # Without statistics, an index's cost counts the rows its bounds select: a
 # unique index bound on every key column wins over an index sharing only its
 # leading columns, as a foreign key check needs, and an index bound on more
