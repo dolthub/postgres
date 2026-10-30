@@ -24,6 +24,7 @@ extern void dg_catalog_sequence_refresh(Relation rel);
 extern bool dg_catalog_sequence_ddl(struct ParseState *pstate, Node *statement);
 extern bool dg_catalog_type_ddl(struct ParseState *pstate, Node *statement);
 extern void dg_catalog_check_drop(const struct ObjectAddress *objects, int count, const struct ObjectAddress *original);
+extern Oid	dg_catalog_existing_schema(const char *name);
 extern bool dg_catalog_rename(struct ParseState *pstate, Node *statement);
 extern bool dg_catalog_view_ddl(struct ParseState *pstate, Node *statement, int location, int length);
 extern List *dg_rule_actions(Oid relid, List *actions);

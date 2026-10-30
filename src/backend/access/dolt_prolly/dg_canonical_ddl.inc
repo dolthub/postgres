@@ -59,6 +59,39 @@ dg_catalog_schema_created(Oid schema)
 }
 
 /*
+ * The server's schema named |name|, when the session's branch does not have
+ * one: another branch created it, and this branch's schema of that name is
+ * the same one. InvalidOid when CREATE SCHEMA makes a new schema, or when the
+ * branch already has |name|, which CREATE SCHEMA then reports.
+ */
+Oid
+dg_catalog_existing_schema(const char *name)
+{
+	CatalogView *branch;
+	CatalogView *previous;
+	Oid			existing = InvalidOid;
+
+	if (!dg_catalog_active() || creating_extension || catalog_api_depth ||
+		!(branch = dg_catalog_session_view()))
+		return InvalidOid;
+	previous = CatalogViewSwitch(branch);
+	PG_TRY();
+	{
+		if (!OidIsValid(get_namespace_oid(name, true)))
+		{
+			CatalogViewSwitch(NULL);
+			existing = get_namespace_oid(name, true);
+		}
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	return existing;
+}
+
+/*
  * Add physical schema |schema| to the session branch's working schema, unless
  * it is already there. A schema created before the database had prolly
  * storage joins the branch with its first versioned table.
