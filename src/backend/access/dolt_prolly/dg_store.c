@@ -2001,15 +2001,13 @@ dolt_prolly_root(PG_FUNCTION_ARGS)
 {
 	Relation	rel = relation_open(PG_GETARG_OID(0), AccessShareLock);
 	DGState    *s;
-	char		result[2 * PL_HASH_SIZE + 1];
-	int			i;
+	char		result[PL_HASH_TEXT_SIZE + 1];
 
 	if (rel->rd_tableam != dg_table_routine() &&
 		!(rel->rd_rel->relkind == RELKIND_INDEX && !strcmp(get_am_name(rel->rd_rel->relam), "dolt_prolly_index")))
 		dg_unsupported("root inspection of other AMs");
 	s = dg_load(rel, GetActiveSnapshot());
-	for (i = 0; i < PL_HASH_SIZE; i++)
-		sprintf(result + i * 2, "%02x", s->content.root.bytes[i]);
+	pl_hash_format(s->content.root, result);
 	dg_release(s);
 	relation_close(rel, AccessShareLock);
 	PG_RETURN_TEXT_P(cstring_to_text(result));

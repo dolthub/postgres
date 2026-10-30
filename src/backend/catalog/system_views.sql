@@ -1459,7 +1459,7 @@ CREATE VIEW dolt.branches WITH (security_invoker=true) AS
     SELECT * FROM pg_catalog.dolt_branches();
 CREATE VIEW dolt.remote_branches WITH (security_invoker=true) AS
     SELECT substr(r.refname,9) AS name,
-           encode(r.reftarget,'hex') AS hash,
+           pg_catalog.dolt_hash_encode(r.reftarget) AS hash,
            o.meta->>'committer' AS latest_committer,
            o.meta->>'email' AS latest_committer_email,
            timestamp '2000-01-01' + (o.meta->>'date_us')::bigint * interval '1 microsecond' AS latest_commit_date,
@@ -1470,7 +1470,7 @@ CREATE VIEW dolt.remote_branches WITH (security_invoker=true) AS
     FROM pg_catalog.pg_dolt_ref r JOIN pg_catalog.pg_dolt_commit_visible o ON o.objhash=r.reftarget
     WHERE r.refname LIKE 'remotes/%' ORDER BY 1;
 CREATE VIEW dolt.commits WITH (security_invoker=true) AS
-    SELECT encode(objhash,'hex') AS commit_hash,
+    SELECT pg_catalog.dolt_hash_encode(objhash) AS commit_hash,
            meta->>'committer' AS committer,
            meta->>'email' AS email,
            timestamp '2000-01-01' + (meta->>'date_us')::bigint * interval '1 microsecond' AS date,
@@ -1481,15 +1481,15 @@ CREATE VIEW dolt.commits WITH (security_invoker=true) AS
     FROM pg_catalog.pg_dolt_commit_visible
     ORDER BY (meta->>'height')::bigint DESC, (meta->>'date_us')::bigint DESC, objhash;
 CREATE VIEW dolt.commit_ancestors WITH (security_invoker=true) AS
-    SELECT encode(c.objhash,'hex') AS commit_hash,
-           encode(p.h,'hex') AS parent_hash,
+    SELECT pg_catalog.dolt_hash_encode(c.objhash) AS commit_hash,
+           pg_catalog.dolt_hash_encode(p.h) AS parent_hash,
            coalesce(p.ord - 1, 0)::int AS parent_index
     FROM pg_catalog.pg_dolt_commit_visible c
          LEFT JOIN LATERAL unnest(c.objchildren[2:]) WITH ORDINALITY AS p(h, ord) ON true
     ORDER BY (c.meta->>'height')::bigint DESC, (c.meta->>'date_us')::bigint DESC, c.objhash, p.ord;
 CREATE VIEW dolt.tags WITH (security_invoker=true) AS
     SELECT substr(r.refname,6) AS tag_name,
-           encode(o.objchildren[1],'hex') AS tag_hash,
+           pg_catalog.dolt_hash_encode(o.objchildren[1]) AS tag_hash,
            (convert_from(o.objpayload,'UTF8')::jsonb)->>'tagger' AS tagger,
            (convert_from(o.objpayload,'UTF8')::jsonb)->>'email' AS email,
            timestamp '2000-01-01' + ((convert_from(o.objpayload,'UTF8')::jsonb)->>'date_us')::bigint * interval '1 microsecond' AS date,

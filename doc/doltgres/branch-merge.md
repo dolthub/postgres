@@ -72,7 +72,7 @@ identify their target working set explicitly; retained commit views are read-onl
 Checkout and merge require a standalone SELECT outside explicit transactions,
 like commit. API authorization remains superuser-only. Mutation calls embedded
 in scalar expressions are deliberately rejected under the agreed SQL transaction
-contract. Commit hashes are SHA-256 hex, not Dolt's hash format.
+contract. Commit hashes use 20-byte addresses rendered with Dolt's 32-character base-32 encoding. The underlying object format remains specific to this engine.
 
 A merge requires clean working and staged contents. This conservative restriction
 avoids overwriting unstaged work; reconciling dirty working sets is deferred to

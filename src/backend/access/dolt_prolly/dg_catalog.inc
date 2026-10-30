@@ -108,7 +108,7 @@ dg_catalog_permission(const char *descriptor, Oid user)
 	PG_TRY();
 	{
 		nest = begin_api();
-		schema = metadata(child(unhex(descriptor), 1), "schema");
+		schema = metadata(child(hash_parse(descriptor), 1), "schema");
 		catalog_acl(schema, "SELECT", user);
 		end_api(nest);
 	} PG_FINALLY();
@@ -551,7 +551,7 @@ revision_selected:
 	{
 		working = (!rte->dolt_database || context_branch) && !rv->dolt_revision &&
 			read_ref(psprintf("heads/%s", revision)).target != NULL;
-		db = rte->dolt_database ? unhex(rte->dolt_database) :
+		db = rte->dolt_database ? hash_parse(rte->dolt_database) :
 			(working ? (bound_schema = catalog_working_schema(revision)) : NULL);
 		if (!db)
 		{
@@ -559,15 +559,15 @@ revision_selected:
 			if (resolved_ref)
 			{
 				rte->dolt_ref = psprintf("%c:%s", resolved_session ? 's' : 'r', resolved_ref);
-				rte->dolt_ref_target = hex(resolved_target);
+				rte->dolt_ref_target = hash_format(resolved_target);
 			}
 		}
 		else if (working)
 		{
 			rte->dolt_ref = psprintf("%c:working/%s", context_branch ? 'c' : 's', revision);
-			rte->dolt_ref_target = hex(db);
+			rte->dolt_ref_target = hash_format(db);
 		}
-		rte->dolt_database = hex(db);
+		rte->dolt_database = hash_format(db);
 		{
 			Oid			native;
 			char	   *ns = catalog_resolve_name(db, working ? revision : NULL, rv, user, &native, resolution_path, false, true);
@@ -632,7 +632,7 @@ revision_selected:
 				if (pushed)
 				{
 					PushActiveSnapshot(outer);
-					rte->dolt_database = hex(read_ref(psprintf("working/%s", revision)).target);
+					rte->dolt_database = hash_format(read_ref(psprintf("working/%s", revision)).target);
 					PopActiveSnapshot();
 				}
 			}
@@ -811,7 +811,7 @@ dg_catalog_refs_current(List *refs)
 					else
 					{
 						now = strncmp(name, "working/", 8) == 0 ? catalog_working_schema(branch) : read_ref(name).target;
-						current = now && !strcmp(hex(now), target);
+						current = now && !strcmp(hash_format(now), target);
 					}
 					if (current && OidIsValid(relid))
 					{
@@ -854,7 +854,7 @@ dg_catalog_session_dependency(List **refs)
 		if (i++ % 3 == 0 && !strcmp(strVal(lfirst(lc)), ref))
 			return;
 	*refs = lappend(*refs, makeString(ref));
-	*refs = lappend(*refs, makeString(hex(root)));
+	*refs = lappend(*refs, makeString(hash_format(root)));
 	*refs = lappend(*refs, makeInteger(0));
 }
 
@@ -1078,7 +1078,7 @@ dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result)
 		const char *branch;
 
 		branch = catalog_current_database() ? catalog_current_branch() : dg_current_branch();
-		db = catalog_current_database() ? unhex(catalog_current_database()) :
+		db = catalog_current_database() ? hash_parse(catalog_current_database()) :
 			catalog_working_schema(branch);
 		{
 			Oid			native;
@@ -1229,7 +1229,7 @@ dg_catalog_relation_visible(Oid id, const char *name, bool *visible)
 		Oid			native;
 		char	   *ns;
 
-		db = database ? unhex(database) : read_ref(branch_ref("working")).target;
+		db = database ? hash_parse(database) : read_ref(branch_ref("working")).target;
 		ns = catalog_resolve_name(db, branch, rv, user, &native, path, false, true);
 		*visible = ns && (OidIsValid(native) ? native == id :
 						  CatalogViewLookupObject(context_view(db, branch), RelationRelationId,
@@ -1316,7 +1316,7 @@ dg_catalog_lookup_type(const char *schema, const char *name, bool temp_ok, Oid *
 		const char *branch;
 
 		branch = catalog_current_database() ? catalog_current_branch() : dg_current_branch();
-		db = catalog_current_database() ? unhex(catalog_current_database()) :
+		db = catalog_current_database() ? hash_parse(catalog_current_database()) :
 			catalog_working_schema(branch);
 		{
 			Oid			native;

@@ -1255,7 +1255,7 @@ dolt_merge_base(PG_FUNCTION_ARGS)
 	int			nest = begin_api();
 	bytea	   *a = resolve(text_to_cstring(PG_GETARG_TEXT_PP(0))),
 			   *b = resolve(text_to_cstring(PG_GETARG_TEXT_PP(1)));
-	char	   *answer = hex(merge_base(a, b));
+	char	   *answer = hash_format(merge_base(a, b));
 
 	end_api(nest);
 	PG_RETURN_TEXT_P(cstring_to_text(answer));
@@ -1297,7 +1297,7 @@ dolt_hashof_db(PG_FUNCTION_ARGS)
 
 		db = revision_database(revision, &working);
 	}
-	answer = hex(db);
+	answer = hash_format(db);
 	end_api(nest);
 	PG_RETURN_TEXT_P(cstring_to_text(answer));
 }
@@ -1332,7 +1332,7 @@ dolt_reflog(PG_FUNCTION_ARGS)
 			filter = args[i];
 	}
 	nest = begin_api();
-	run("SELECT CASE WHEN l.reflogname LIKE 'heads/%' THEN 'refs/heads/' || substr(l.reflogname,7) WHEN l.reflogname LIKE 'tags/%' THEN 'refs/tags/' || substr(l.reflogname,6) ELSE 'refs/' || l.reflogname END,l.reflogtime,encode(CASE WHEN o.objkind='tag' THEN o.objchildren[1] ELSE l.reflogtarget END,'hex'),m.meta->>'message' FROM pg_catalog.pg_dolt_reflog l JOIN pg_dolt_object_visible o ON o.objhash=l.reflogtarget LEFT JOIN pg_dolt_commit_visible m ON m.objhash=CASE WHEN o.objkind='tag' THEN o.objchildren[1] ELSE l.reflogtarget END WHERE (l.reflogname LIKE 'heads/%' OR l.reflogname LIKE 'tags/%' OR $3) AND ($1::text IS NULL OR l.reflogname=$1 OR l.reflogname='heads/' || $1 OR l.reflogname='tags/' || $1 OR 'refs/' || l.reflogname=$1 OR $2) ORDER BY l.reflogtime DESC,l.reflogname", 3, VC_TYPES(TEXTOID, BOOLOID, BOOLOID), VC_ARGS(filter ? CStringGetTextDatum(filter) : (Datum) 0, BoolGetDatum(filter == NULL), BoolGetDatum(all)), filter ? NULL : "n  ", true);
+	run("SELECT CASE WHEN l.reflogname LIKE 'heads/%' THEN 'refs/heads/' || substr(l.reflogname,7) WHEN l.reflogname LIKE 'tags/%' THEN 'refs/tags/' || substr(l.reflogname,6) ELSE 'refs/' || l.reflogname END,l.reflogtime,pg_catalog.dolt_hash_encode(CASE WHEN o.objkind='tag' THEN o.objchildren[1] ELSE l.reflogtarget END),m.meta->>'message' FROM pg_catalog.pg_dolt_reflog l JOIN pg_dolt_object_visible o ON o.objhash=l.reflogtarget LEFT JOIN pg_dolt_commit_visible m ON m.objhash=CASE WHEN o.objkind='tag' THEN o.objchildren[1] ELSE l.reflogtarget END WHERE (l.reflogname LIKE 'heads/%' OR l.reflogname LIKE 'tags/%' OR $3) AND ($1::text IS NULL OR l.reflogname=$1 OR l.reflogname='heads/' || $1 OR l.reflogname='tags/' || $1 OR 'refs/' || l.reflogname=$1 OR $2) ORDER BY l.reflogtime DESC,l.reflogname", 3, VC_TYPES(TEXTOID, BOOLOID, BOOLOID), VC_ARGS(filter ? CStringGetTextDatum(filter) : (Datum) 0, BoolGetDatum(filter == NULL), BoolGetDatum(all)), filter ? NULL : "n  ", true);
 	return_rows(fcinfo, nest);
 	return (Datum) 0;
 }
@@ -1418,7 +1418,7 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 		move_ref(branch_ref("working"), read_ref(branch_ref("working")), database);
 		advance_snapshot();
 	}
-	values[0] = CStringGetTextDatum(hex(commit));
+	values[0] = CStringGetTextDatum(hash_format(commit));
 	values[1] = Int64GetDatum(0);
 	values[2] = Int64GetDatum(0);
 	values[3] = Int64GetDatum(0);

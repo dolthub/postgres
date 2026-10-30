@@ -122,12 +122,12 @@ typedef struct VersionRef
 {
 	bytea	   *target;
 	bytea	   *token;
-} VersionRef;
+}			VersionRef;
 typedef struct Capture
 {
 	char	   *json;
 	bytea	   *hash;
-} Capture;
+}			Capture;
 
 /* Only set while publishing a freshly created physical relation. */
 
@@ -157,7 +157,7 @@ static PLSlice fill_row(Relation rel, PLSlice row, const bool *fill);
 static PLTree fill_rows(Relation rel, PLTree content, const bool *fill);
 static List *merge_dropped_columns(Relation rel, const char *base);
 static PLTree check_violations(Relation rel, PLTree content, const char *name, StringInfo violations);
-static bytea *staged_capture(Capture *full);
+static bytea *staged_capture(Capture * full);
 static bool branch_management(char **args, int n);
 static void checkout_tables(char **args, int n);
 static char *resolve_object_argument(const char *arg, const char *json_a, const char *json_b, bool required);
@@ -205,6 +205,7 @@ strcell(int row, int col)
 static int	catalog_api_depth;
 static SubTransactionId catalog_api_subids[64];
 static bool catalog_api_registered;
+
 /*
  * Version-control calls in progress. Unlike catalog_api_depth, nested user SQL
  * does not reset this, and an error that a savepoint catches leaves it raised
@@ -428,24 +429,46 @@ unsupported(const char *arg)
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unsupported version-control option or operation: %s", arg)));
 }
 static char *
-hex(bytea *v)
+hash_format(bytea *v)
 {
-	return TextDatumGetCString(DirectFunctionCall2(binary_encode, PointerGetDatum(v), CStringGetTextDatum("hex")));
-}
-static bytea *
-unhex(const char *s)
-{
-	bytea	   *v = DatumGetByteaP(DirectFunctionCall2(binary_decode, CStringGetTextDatum(s), CStringGetTextDatum("hex")));
+	PLHash		hash;
+	char	   *result = palloc(PL_HASH_TEXT_SIZE + 1);
 
 	if (VARSIZE_ANY_EXHDR(v) != PL_HASH_SIZE)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid content hash length")));
+	memcpy(hash.bytes, VARDATA_ANY(v), PL_HASH_SIZE);
+	pl_hash_format(hash, result);
+	return result;
+}
+static bytea *
+hash_parse(const char *s)
+{
+	PLHash		hash;
+	bytea	   *v;
+
+	if (!pl_hash_parse(s, &hash))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid commit hash")));
+	v = palloc(VARHDRSZ + PL_HASH_SIZE);
+	SET_VARSIZE(v, VARHDRSZ + PL_HASH_SIZE);
+	memcpy(VARDATA(v), hash.bytes, PL_HASH_SIZE);
 	return v;
+}
+Datum
+dolt_hash_encode(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_TEXT_P(cstring_to_text(hash_format(PG_GETARG_BYTEA_PP(0))));
+}
+Datum
+dolt_hash_decode(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BYTEA_P(hash_parse(text_to_cstring(PG_GETARG_TEXT_PP(0))));
 }
 static bool
 same(bytea *a, bytea *b)
 {
 	return a && b && VARSIZE_ANY_EXHDR(a) == VARSIZE_ANY_EXHDR(b) && !memcmp(VARDATA_ANY(a), VARDATA_ANY(b), VARSIZE_ANY_EXHDR(a));
 }
+
 /*
  * Refs and retained objects are read natively, under the snapshot internal
  * SQL would use: the active one. Only the callers that need them pay for
@@ -596,6 +619,7 @@ metadata(bytea *hash, const char *kind)
 	if (!object_read(hash, kind, NULL, &payload, NULL))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("revision does not name a visible %s object", kind)));
 	text = pnstrdup(VARDATA_ANY(payload), VARSIZE_ANY_EXHDR(payload));
+
 	return pg_any_to_server(text, strlen(text), PG_UTF8);
 }
 static bytea *
@@ -648,13 +672,13 @@ catalog_contains(bytea *db, const char *name)
 		dg_database_member(db, "view", name) || dg_database_member(db, "sequence", name);
 }
 
-static CatalogView *provider_view(bytea *database);
+static CatalogView * provider_view(bytea *database);
 
 static int
 compare_members(const void *a, const void *b)
 {
-	const DGMember *left = a;
-	const DGMember *right = b;
+	const		DGMember *left = a;
+	const		DGMember *right = b;
 	int			kind = strcmp(left->kind, right->kind);
 	int			length = Min(VARSIZE_ANY_EXHDR(left->hash), VARSIZE_ANY_EXHDR(right->hash));
 	int			bytes;
@@ -676,7 +700,7 @@ sorted_members(bytea *database, int *count)
 	qsort(members, *count, sizeof(DGMember), compare_members);
 	return members;
 }
-static CatalogView *provider_branch_view(const char *branch, bytea *database);
+static CatalogView * provider_branch_view(const char *branch, bytea *database);
 static char *json_value(const char *json, const char *key);
 static JsonbValue json_document(const char *json);
 static bool json_get(JsonbValue *object, const char *key, JsonbValue *result);
@@ -690,7 +714,7 @@ static char *json_set_string(const char *json, const char *key, const char *valu
 
 static char *database_dependents(const char *json, Datum *members, int count);
 static char *routine_body_encode(HeapTuple tuple, char **dependencies);
-static Oid	provider_view_dependency(CatalogView *view, const char *kind, const char *name);
+static Oid	provider_view_dependency(CatalogView * view, const char *kind, const char *name);
 
 static bytea *
 canonical_database(const char *json, Datum *members, int count)
@@ -822,7 +846,7 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 
 					SET_VARSIZE(raw, VARHDRSZ + PL_HASH_SIZE);
 					memcpy(VARDATA(raw), content.bytes, PL_HASH_SIZE);
-					root = hex(raw);
+					root = hash_format(raw);
 
 					/*
 					 * A member that already records these contents is the
@@ -907,7 +931,7 @@ typedef struct ParsedJson
 	Size		len;
 	uint32		hash;
 	Jsonb	   *value;
-} ParsedJson;
+}			ParsedJson;
 static ParsedJson parsed_json[PARSED_JSON_ENTRIES];
 static int	parsed_json_next;
 
@@ -1118,7 +1142,7 @@ json_int(const char *text)
 static bool
 json_bool(const char *text)
 {
-	return text && DatumGetBool(DirectFunctionCall1(boolin, CStringGetDatum(text)));
+	return text &&DatumGetBool(DirectFunctionCall1(boolin, CStringGetDatum(text)));
 }
 
 /*
@@ -1389,6 +1413,41 @@ parent_count(bytea *commit)
 	n = ArrayGetNItems(ARR_NDIM(children), ARR_DIMS(children));
 	return Max(n, 1) - 1;
 }
+
+/* Resolve only retained commits: ordinary names also use base-32 letters. */
+static bytea *
+commit_prefix(const char *name)
+{
+	bytea	   *hash = NULL;
+	Oid			user;
+	int			security,
+				nest;
+
+	if (strlen(name) < 8 || strlen(name) > PL_HASH_TEXT_SIZE ||
+		strspn(name, "0123456789abcdefghijklmnopqrstuv") != strlen(name))
+		return NULL;
+
+	/* An abbreviated hash is searched by SQL, in its own scope. */
+	GetUserIdAndSecContext(&user, &security);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+	PG_TRY();
+	{
+		nest = begin_api();
+		run("SELECT objhash FROM pg_dolt_object_visible WHERE objkind='commit' AND pg_catalog.dolt_hash_encode(objhash) LIKE $1 LIMIT 2", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(psprintf("%s%%", name))), NULL, true);
+		if (SPI_processed > 1)
+			ereport(ERROR, (errcode(ERRCODE_AMBIGUOUS_PARAMETER), errmsg("ambiguous commit prefix: %s", name)));
+		if (SPI_processed)
+			hash = DatumGetByteaPCopy(cell(0, 1));
+		end_api(nest);
+	}
+	PG_FINALLY();
+	{
+		SetUserIdAndSecContext(user, security);
+	}
+	PG_END_TRY();
+	return hash;
+}
+
 /* The ref the last resolve() went through, if any, and what it pointed to. */
 static char *resolved_ref;
 static bytea *resolved_target;
@@ -1433,34 +1492,10 @@ resolve(const char *revision)
 		}
 		if (!hash)
 			resolved_ref = NULL;
-		if (!hash && strlen(base) == 2 * PL_HASH_SIZE)
-			hash = unhex(base);
-		else if (!hash && strlen(base) >= 8 && strlen(base) < 2 * PL_HASH_SIZE &&
-				 strspn(base, "0123456789abcdef") == strlen(base))
-		{
-			Oid			user;
-			int			security,
-						nest;
-
-			/* An abbreviated hash is searched by SQL, in its own scope. */
-			GetUserIdAndSecContext(&user, &security);
-			SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
-			PG_TRY();
-			{
-				nest = begin_api();
-				run("SELECT objhash FROM pg_dolt_object_visible WHERE objkind='commit' AND encode(objhash,'hex') LIKE $1 LIMIT 2", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(psprintf("%s%%", base))), NULL, true);
-				if (SPI_processed > 1)
-					ereport(ERROR, (errcode(ERRCODE_AMBIGUOUS_PARAMETER), errmsg("ambiguous commit prefix: %s", base)));
-				if (SPI_processed)
-					hash = DatumGetByteaPCopy(cell(0, 1));
-				end_api(nest);
-			}
-			PG_FINALLY();
-			{
-				SetUserIdAndSecContext(user, security);
-			}
-			PG_END_TRY();
-		}
+		if (!hash && strlen(base) == PL_HASH_TEXT_SIZE)
+			hash = hash_parse(base);
+		else if (!hash)
+			hash = commit_prefix(base);
 	}
 	if (!hash)
 		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("unknown revision: %s", revision)));
@@ -1659,7 +1694,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 	if (all)
 		move_ref(branch_ref("working"), working, full.hash);
 	finish_merge();
-	answer = hex(commit);
+	answer = hash_format(commit);
 	end_api(nest);
 	PG_RETURN_TEXT_P(cstring_to_text(answer));
 }
@@ -1829,7 +1864,7 @@ dolt_log(PG_FUNCTION_ARGS)
 		return (Datum) 0;
 	}
 	hash = resolve(revision);
-	run("WITH RECURSIVE walk(h) AS (SELECT $1::bytea UNION SELECT unnest(o.objchildren[2:]) FROM walk w JOIN pg_dolt_object_visible o ON o.objhash=w.h), commits AS (SELECT o.*,convert_from(o.objpayload,'UTF8')::jsonb m FROM walk w JOIN pg_dolt_object_visible o ON o.objhash=w.h WHERE o.objkind='commit'), refs AS (SELECT r.refname,CASE WHEN o.objkind='tag' THEN o.objchildren[1] ELSE r.reftarget END target FROM pg_dolt_ref r JOIN pg_dolt_object_visible o ON o.objhash=r.reftarget WHERE r.refname LIKE 'heads/%' OR r.refname LIKE 'tags/%') SELECT encode(c.objhash,'hex'),m->>'committer',m->>'email',timestamp '2000-01-01' + (m->>'date_us')::bigint * interval '1 microsecond',m->>'message',(m->>'height')::bigint,CASE WHEN $2 THEN COALESCE((SELECT string_agg(encode(h,'hex'),', ' ORDER BY ord) FROM unnest(c.objchildren[2:]) WITH ORDINALITY u(h,ord)),'') ELSE NULL END,COALESCE((SELECT CASE WHEN c.objhash=(SELECT reftarget FROM pg_dolt_ref WHERE refname='heads/' || pg_catalog.active_branch()) THEN 'HEAD -> ' ELSE '' END || string_agg(CASE WHEN r.refname LIKE 'tags/%' THEN 'tag: '||substr(r.refname,6) ELSE substr(r.refname,7) END,', ' ORDER BY r.refname COLLATE \"C\") FROM refs r WHERE r.target=c.objhash),''),CASE WHEN $3 THEN ''::text ELSE NULL END,m->>'author',m->>'author_email',timestamp '2000-01-01' + (m->>'author_date_us')::bigint * interval '1 microsecond' FROM commits c ORDER BY (m->>'height')::bigint DESC,(m->>'date_us')::bigint DESC,c.objhash LIMIT NULLIF($4,-1)", 4, VC_TYPES(BYTEAOID, BOOLOID, BOOLOID, INT4OID), VC_ARGS(PointerGetDatum(hash), BoolGetDatum(parents), BoolGetDatum(signature), Int32GetDatum(limit)), NULL, true);
+	run("WITH RECURSIVE walk(h) AS (SELECT $1::bytea UNION SELECT unnest(o.objchildren[2:]) FROM walk w JOIN pg_dolt_object_visible o ON o.objhash=w.h), commits AS (SELECT o.*,convert_from(o.objpayload,'UTF8')::jsonb m FROM walk w JOIN pg_dolt_object_visible o ON o.objhash=w.h WHERE o.objkind='commit'), refs AS (SELECT r.refname,CASE WHEN o.objkind='tag' THEN o.objchildren[1] ELSE r.reftarget END target FROM pg_dolt_ref r JOIN pg_dolt_object_visible o ON o.objhash=r.reftarget WHERE r.refname LIKE 'heads/%' OR r.refname LIKE 'tags/%') SELECT pg_catalog.dolt_hash_encode(c.objhash),m->>'committer',m->>'email',timestamp '2000-01-01' + (m->>'date_us')::bigint * interval '1 microsecond',m->>'message',(m->>'height')::bigint,CASE WHEN $2 THEN COALESCE((SELECT string_agg(pg_catalog.dolt_hash_encode(h),', ' ORDER BY ord) FROM unnest(c.objchildren[2:]) WITH ORDINALITY u(h,ord)),'') ELSE NULL END,COALESCE((SELECT CASE WHEN c.objhash=(SELECT reftarget FROM pg_dolt_ref WHERE refname='heads/' || pg_catalog.active_branch()) THEN 'HEAD -> ' ELSE '' END || string_agg(CASE WHEN r.refname LIKE 'tags/%' THEN 'tag: '||substr(r.refname,6) ELSE substr(r.refname,7) END,', ' ORDER BY r.refname COLLATE \"C\") FROM refs r WHERE r.target=c.objhash),''),CASE WHEN $3 THEN ''::text ELSE NULL END,m->>'author',m->>'author_email',timestamp '2000-01-01' + (m->>'author_date_us')::bigint * interval '1 microsecond' FROM commits c ORDER BY (m->>'height')::bigint DESC,(m->>'date_us')::bigint DESC,c.objhash LIMIT NULLIF($4,-1)", 4, VC_TYPES(BYTEAOID, BOOLOID, BOOLOID, INT4OID), VC_ARGS(PointerGetDatum(hash), BoolGetDatum(parents), BoolGetDatum(signature), Int32GetDatum(limit)), NULL, true);
 	return_rows(fcinfo, nest);
 	return (Datum) 0;
 }

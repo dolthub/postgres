@@ -1596,7 +1596,7 @@ provider_reload(CatalogView *view, void *arg)
 			pushed = true;
 		}
 		nest = begin_api();
-		database = unhex(entry->database);
+		database = hash_parse(entry->database);
 		if (!object_read(database, "database", NULL, NULL, NULL))
 			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("revision does not name a visible database object")));
 		/* The view keeps its durable OIDs, and so the bindings recorded. */
@@ -1636,7 +1636,7 @@ provider_creator(bytea *database)
 static CatalogView *
 provider_lookup(const char *branch, bytea *database)
 {
-	char	   *key = hex(database);
+	char	   *key = hash_format(database);
 	DGProvider *entry;
 	DGProvider *saved_entry;
 	CatalogView *view;
@@ -1832,7 +1832,7 @@ dg_catalog_view(const char *database, const char *branch)
 	PG_TRY();
 	{
 		nest = begin_api();
-		result = provider_lookup(branch, unhex(database));
+		result = provider_lookup(branch, hash_parse(database));
 		end_api(nest);
 	}
 	PG_FINALLY();

@@ -144,12 +144,12 @@ INSERT INTO p SELECT g,repeat(md5(g::text),10) FROM generate_series(1,100) g;
 # Export uses the statement snapshot, even though object insertion does writes.
 $reader = $node->background_psql('postgres');
 $reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
-my $old_root = $reader->query_safe(q{SELECT dolt_prolly_root('p')});
+my $old_root = $reader->query_safe(q{SELECT encode(dolt_hash_decode(dolt_prolly_root('p')),'hex')});
 sql(q{UPDATE p SET value='changed after snapshot' WHERE id=1});
 my $old_chunk = $reader->query_safe(q{SELECT encode(dolt_manifest_export('p'),'hex')});
 is($reader->query_safe("SELECT encode(substr(sha256(payload),1,20),'hex') FROM dolt_manifest_get(".hasharg($old_chunk).")"), $old_root, 'export excludes changes outside reader snapshot');
 $reader->query_safe('COMMIT'); $reader->quit;
-my $root = sql(q{SELECT dolt_prolly_root('p')});
+my $root = sql(q{SELECT encode(dolt_hash_decode(dolt_prolly_root('p')),'hex')});
 my $chunk = sql(q{SELECT encode(dolt_manifest_export('p'),'hex')});
 my $indexchunk = sql(q{SELECT encode(dolt_manifest_export('p_pkey'),'hex')});
 is(sql("SELECT encode(substr(sha256(payload),1,20),'hex') FROM dolt_manifest_get(".hasharg($chunk).")"), $root, 'export preserves canonical node bytes and original hash');

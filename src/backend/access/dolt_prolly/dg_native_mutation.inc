@@ -1104,10 +1104,9 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 					payloads[i] = strcell(0, 1);
 					if (rewrite && !strcmp(names[i], name))
 					{
-						char		root[PL_HASH_SIZE * 2 + 1];
+						char		root[PL_HASH_TEXT_SIZE + 1];
 
-						hex_encode((char *) tree.root.bytes, PL_HASH_SIZE, root);
-						root[PL_HASH_SIZE * 2] = 0;
+						pl_hash_format(tree.root, root);
 						payloads[i] = json_set_string(payloads[i], "content", root);
 					}
 					members[i] = put(kinds[i], payloads[i], VC_ARGS(PointerGetDatum(schema), PointerGetDatum(content)), 2);
