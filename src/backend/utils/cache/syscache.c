@@ -267,7 +267,7 @@ SelectCacheView(int cacheId, int nkeys, Datum *keys)
 		{
 			Oid			key = DatumGetObjectId(keys[i]);
 
-			if (TupleDescAttr(cache->cc_tupdesc, cache->cc_keyno[i] - 1)->atttypid == OIDOID &&
+			if (CatalogViewIsObjectIdType(TupleDescAttr(cache->cc_tupdesc, cache->cc_keyno[i] - 1)->atttypid) &&
 				((key >= FirstNormalObjectId && key < FirstDurableObjectId) || key == PG_PUBLIC_NAMESPACE))
 				return NULL;
 		}

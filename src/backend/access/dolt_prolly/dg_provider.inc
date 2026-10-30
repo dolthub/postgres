@@ -207,7 +207,7 @@ provider_shared_base(void)
 
 	if (!registered)
 	{
-		const int	caches[] = {RELOID, PROCOID, TYPEOID, NAMESPACEOID, OPEROID, CONSTROID};
+		const int	caches[] = {RELOID, PROCOID, TYPEOID, NAMESPACEOID, OPEROID, CONSTROID, AGGFNOID, CASTSOURCETARGET};
 
 		for (int i = 0; i < lengthof(caches); i++)
 			CacheRegisterSyscacheCallback(caches[i], provider_base_forget, (Datum) 0);
