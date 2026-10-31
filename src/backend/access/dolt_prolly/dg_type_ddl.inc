@@ -353,6 +353,13 @@ type_ddl(ParseState *pstate, Node *statement)
 		CatalogViewRelease(view);
 	}
 	PG_END_TRY();
+
+	/*
+	 * Read the branch as the next statement will. A change native DDL let
+	 * through that leaves a definition unreadable, such as a column type a
+	 * domain's check cannot compare, fails here, before it is committed.
+	 */
+	(void) dg_catalog_session_view();
 }
 
 bool
