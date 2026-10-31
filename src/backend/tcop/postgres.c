@@ -2283,7 +2283,10 @@ exec_execute_message(const char *portal_name, long max_rows)
 	/* A commit function closes this transaction and its portal. Deliver its
 	 * entire materialized result before closing, even with a fetch limit. */
 	if (!completed && dg_version_commit_requested())
+	{
 		completed = PortalRun(portal, FETCH_ALL, true, receiver, receiver, &qc);
+		qc.nprocessed = portal->portalPos;
+	}
 	dg_version_end_statement();
 
 	receiver->rDestroy(receiver);
