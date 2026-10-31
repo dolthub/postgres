@@ -584,10 +584,8 @@ mutation_indexes(CatalogView *view, Oid table)
 			if (index->indisexclusion || !index->indisvalid || !index->indisready)
 				unsupported("native index validity or exclusion constraint codec");
 			for (int i = 0; i < index->indnatts; i++)
-				if (index->indkey.values[i] <= 0)
-					unsupported("canonical expression index codec");
-			if (!heap_attisnull(tuple, Anum_pg_index_indpred, NULL))
-				unsupported("canonical partial index codec");
+				if (index->indkey.values[i] < 0)
+					unsupported("canonical system-column index codec");
 			item = palloc0(sizeof(*item));
 			item->id = index->indexrelid;
 			{
@@ -997,7 +995,7 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 				IndexStmt  *index = castNode(IndexStmt, action->def);
 				ListCell   *cc;
 
-				if (index->concurrent || index->whereClause || index->options || index->tableSpace ||
+				if (index->concurrent || index->options || index->tableSpace ||
 					(index->accessMethod && strcmp(index->accessMethod, "btree") && strcmp(index->accessMethod, "dolt_prolly_index")))
 					unsupported("canonical index storage properties");
 				index->accessMethod = pstrdup("dolt_prolly_index");

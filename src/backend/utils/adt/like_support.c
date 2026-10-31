@@ -299,7 +299,8 @@ match_pattern_prefix(Node *leftop,
 	switch (ldatatype)
 	{
 		case TEXTOID:
-			if (opfamily == TEXT_PATTERN_BTREE_FAM_OID)
+			if (opfamily == TEXT_PATTERN_BTREE_FAM_OID ||
+			opfamily == TEXT_PATTERN_PROLLY_FAM_OID)
 			{
 				eqopr = TextEqualOperator;
 				ltopr = TextPatternLessOperator;
@@ -337,7 +338,8 @@ match_pattern_prefix(Node *leftop,
 			rdatatype = TEXTOID;
 			break;
 		case BPCHAROID:
-			if (opfamily == BPCHAR_PATTERN_BTREE_FAM_OID)
+			if (opfamily == BPCHAR_PATTERN_BTREE_FAM_OID ||
+			opfamily == BPCHAR_PATTERN_PROLLY_FAM_OID)
 			{
 				eqopr = BpcharEqualOperator;
 				ltopr = BpcharPatternLessOperator;

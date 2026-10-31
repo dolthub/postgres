@@ -367,17 +367,13 @@ clear_merge_entries(const char *name, const char *array)
 	VersionRef	pending = read_ref(branch_ref("merge"));
 	char	   *json,
 			   *updated;
-	Datum		parents[3];
-	int			i;
 
 	if (!pending.target)
 		return;
 	json = metadata(pending.target, "merge");
-	for (i = 0; i < 3; i++)
-		parents[i] = PointerGetDatum(child(pending.target, i + 1));
 	run("SELECT jsonb_set($1::jsonb,ARRAY[$2],coalesce((SELECT jsonb_agg(v) FROM jsonb_array_elements($1::jsonb->$2) v WHERE v->>'table'<>$3),'[]'::jsonb))::text", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), CStringGetTextDatum(array), CStringGetTextDatum(name)), NULL, true);
 	updated = strcell(0, 1);
-	move_ref(branch_ref("merge"), pending, put("merge", updated, parents, 3));
+	move_ref(branch_ref("merge"), pending, updated_merge(pending.target, updated));
 	advance_snapshot();
 }
 

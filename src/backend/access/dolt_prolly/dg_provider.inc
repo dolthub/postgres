@@ -1196,6 +1196,9 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 				builtin = true;
 	ListCell   *lc;
 	List	   *elements;
+	List *expressions = NIL;
+	Node *predicate = NULL;
+	Bitmapset *inputs = NULL;
 	HeapTuple	tuple;
 	int			i,
 				k = 0,
@@ -1203,7 +1206,7 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 
 	if (!stmt)
 		elog(ERROR, "invalid canonical index definition");
-	if (stmt->whereClause || stmt->options || strcmp(stmt->accessMethod, "dolt_prolly_index"))
+	if (stmt->options || strcmp(stmt->accessMethod, "dolt_prolly_index"))
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unsupported canonical index properties")));
 	if (!stmt->relation->schemaname)
 		elog(ERROR, "unqualified canonical index table");
@@ -1241,29 +1244,46 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 	foreach(lc, elements)
 	{
 		IndexElem  *elem = lfirst_node(IndexElem, lc);
-		Form_pg_attribute attr;
+		Oid type, collation;
 
-		if (!elem->name || elem->expr || elem->opclassopts)
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("canonical expression indexes and opclass options are not supported")));
-		keys[k] = provider_attribute(desc, elem->name);
-		attr = TupleDescAttr(desc, keys[k] - 1);
+		if (elem->opclassopts)
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("canonical index opclass options are not supported")));
+		if (elem->expr)
+		{
+			Node *expression = schema_expression_bind(view, form.indrelid, stmt->relation->relname, desc, elem->expr, -2);
+
+			expressions = lappend(expressions, expression);
+			type = exprType(expression);
+			collation = exprCollation(expression);
+			pull_varattnos(expression, 1, &inputs);
+			provider_expression_dependencies(rows, RelationRelationId, form.indexrelid, expression);
+		}
+		else
+		{
+			Form_pg_attribute attr;
+
+			keys[k] = provider_attribute(desc, elem->name);
+			attr = TupleDescAttr(desc, keys[k] - 1);
+			type = attr->atttypid;
+			collation = attr->attcollation;
+		}
 		if (k < form.indnkeyatts)
 		{
 			/*
 			 * A built-in type's default operator class is kept with the
 			 * schema; a named one resolves through the search path.
 			 */
-			types[k] = attr->atttypid;
+			types[k] = type;
 			if (schema && (schema->parts & DG_SCHEMA_OPCLASSES) && schema->opclass_types[k] == types[k])
 				classes[k] = schema->opclasses[k];
 			else
 			{
-				classes[k] = ResolveOpClass(elem->opclass, attr->atttypid, "dolt_prolly_index", DOLT_PROLLY_INDEX_AM_OID);
+				classes[k] = ResolveOpClass(elem->opclass, type, "dolt_prolly_index", DOLT_PROLLY_INDEX_AM_OID);
 				resolved = true;
 			}
 			if (elem->opclass || types[k] >= FirstNormalObjectId || classes[k] >= FirstNormalObjectId)
 				builtin = false;
-			collations[k] = elem->collation ? get_collation_oid(elem->collation, false) : attr->attcollation;
+			collations[k] = elem->collation ? get_collation_oid(elem->collation, false) : collation;
 			if (elem->ordering == SORTBY_DESC)
 				options[k] |= INDOPTION_DESC;
 			if (elem->nulls_ordering == SORTBY_NULLS_FIRST || (elem->nulls_ordering == SORTBY_NULLS_DEFAULT && elem->ordering == SORTBY_DESC))
@@ -1272,6 +1292,15 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 		provider_dependency(rows, RelationRelationId, form.indexrelid, 0, RelationRelationId, form.indrelid, keys[k], DEPENDENCY_AUTO);
 		k++;
 	}
+	if (stmt->whereClause)
+	{
+		predicate = schema_expression_bind(view, form.indrelid, stmt->relation->relname, desc, stmt->whereClause, -3);
+		pull_varattnos(predicate, 1, &inputs);
+		provider_expression_dependencies(rows, RelationRelationId, form.indexrelid, predicate);
+	}
+	for (int input = bms_next_member(inputs, -1); input >= 0; input = bms_next_member(inputs, input))
+		provider_dependency(rows, RelationRelationId, form.indexrelid, 0, RelationRelationId, form.indrelid,
+							input + FirstLowInvalidHeapAttributeNumber, DEPENDENCY_AUTO);
 	if (schema && resolved && builtin)
 		dg_schema_set_opclasses(schema, form.indnkeyatts, types, classes);
 	tuple = provider_fixed(rows->relations[slot], &form, sizeof(form), Anum_pg_index_indisreplident);
@@ -1279,6 +1308,10 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 	tuple = provider_set(rows->relations[slot], tuple, Anum_pg_index_indclass, PointerGetDatum(buildoidvector(classes, form.indnkeyatts)));
 	tuple = provider_set(rows->relations[slot], tuple, Anum_pg_index_indcollation, PointerGetDatum(buildoidvector(collations, form.indnkeyatts)));
 	tuple = provider_set(rows->relations[slot], tuple, Anum_pg_index_indoption, PointerGetDatum(buildint2vector(options, form.indnkeyatts)));
+	if (expressions)
+		tuple = provider_set(rows->relations[slot], tuple, Anum_pg_index_indexprs, CStringGetTextDatum(nodeToString(expressions)));
+	if (predicate)
+		tuple = provider_set(rows->relations[slot], tuple, Anum_pg_index_indpred, CStringGetTextDatum(nodeToString(predicate)));
 	rows->rows[slot] = lappend(rows->rows[slot], tuple);
 }
 

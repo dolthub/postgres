@@ -3,6 +3,14 @@ tests += {
   'sd': meson.current_source_dir(),
   'bd': meson.current_build_dir(),
   'regress': {'sql': ['storage']},
+  'isolation': {
+    'specs': [
+      'prolly-fold-snapshot',
+      'prolly-fold-race',
+      'prolly-row-conflicts',
+      'prolly-row-conflicts-fold',
+    ],
+  },
   'tap': {'tests': [
     't/001_recovery.pl',
     't/002_differential.pl',
@@ -57,5 +65,7 @@ tests += {
     't/047_inheritance.pl',
     't/048_schema_workspace.pl',
     't/049_node_cache.pl',
+    't/050_concurrent_writes.pl',
+    't/051_log_ranges.pl',
   ]},
 }

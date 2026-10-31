@@ -8,6 +8,8 @@
 #include "access/table.h"
 #include "access/relscan.h"
 #include "catalog/index.h"
+#include "executor/executor.h"
+#include "utils/datum.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type_d.h"
 #include "catalog/pg_namespace_d.h"
@@ -123,34 +125,125 @@ key_digest(Relation index, PLSlice key, PLHash *digest)
 	return i + 2 == key.len;
 }
 
+/* Use the same expression evaluator as native index insertion. */
+static void
+index_values(Relation index, TupleTableSlot *slot, Datum *values, bool *nulls)
+{
+	if (heap_attisnull(index->rd_indextuple, Anum_pg_index_indexprs, NULL))
+	{
+		for (int j = 0; j < index->rd_index->indnatts; j++)
+			values[j] = slot_getattr(slot, index->rd_index->indkey.values[j], &nulls[j]);
+	}
+	else
+	{
+		EState *estate = CreateExecutorState();
+		MemoryContext old = MemoryContextSwitchTo(estate->es_query_cxt);
+		IndexInfo *info = BuildIndexInfo(index);
+
+		GetPerTupleExprContext(estate)->ecxt_scantuple = slot;
+		FormIndexDatum(info, slot, estate, values, nulls);
+		MemoryContextSwitchTo(old);
+		for (int j = 0; j < index->rd_index->indnatts; j++)
+			if (!nulls[j])
+			{
+				Form_pg_attribute attr = TupleDescAttr(RelationGetDescr(index), j);
+
+				values[j] = datumCopy(values[j], attr->attbyval, attr->attlen);
+			}
+		FreeExecutorState(estate);
+	}
+}
+
+static bool
+index_row_matches(Relation table, Relation index, PLSlice row)
+{
+	List *predicate;
+	EState *estate;
+	MemoryContext old;
+	TupleTableSlot *slot;
+	ItemPointerData tid;
+	bool result;
+
+	if (heap_attisnull(index->rd_indextuple, Anum_pg_index_indpred, NULL))
+		return true;
+	estate = CreateExecutorState();
+	old = MemoryContextSwitchTo(estate->es_query_cxt);
+	predicate = RelationGetIndexPredicate(index);
+	slot = table_slot_create(table, NULL);
+	ItemPointerSetInvalid(&tid);
+	dg_decode(table, row, &tid, slot);
+	GetPerTupleExprContext(estate)->ecxt_scantuple = slot;
+	result = ExecQual(ExecPrepareQual(predicate, estate), GetPerTupleExprContext(estate));
+	ExecDropSingleTupleTableSlot(slot);
+	MemoryContextSwitchTo(old);
+	FreeExecutorState(estate);
+	return result;
+}
+
+/* Keys and predicate membership are shared by writes, rebuilds and merges. */
+bool
+dg_index_row_key(Relation table, Relation index, PLSlice row, StringInfo key, bool *nullkey)
+{
+	TupleTableSlot *slot = NULL;
+	Datum values[INDEX_MAX_KEYS];
+	bool nulls[INDEX_MAX_KEYS];
+
+	if (!index_row_matches(table, index, row))
+		return false;
+	if (!heap_attisnull(index->rd_indextuple, Anum_pg_index_indexprs, NULL))
+	{
+		ItemPointerData tid;
+
+		slot = table_slot_create(table, NULL);
+		ItemPointerSetInvalid(&tid);
+		dg_decode(table, row, &tid, slot);
+		index_values(index, slot, values, nulls);
+	}
+	*nullkey = false;
+	for (int j = 0; j < index->rd_index->indnkeyatts; j++)
+	{
+		PLValue field;
+		Oid type = TupleDescAttr(RelationGetDescr(index), j)->atttypid;
+		bool desc = (index->rd_indoption[j] & INDOPTION_DESC) != 0;
+		bool nullfirst = (index->rd_indoption[j] & INDOPTION_NULLS_FIRST) != 0;
+
+		if (slot)
+		{
+			field.present = !nulls[j];
+			if (field.present)
+				field.bytes = dg_key_value(type, values[j]);
+		}
+		else
+		{
+			dg_check(pl_tuple_get(row, index->rd_index->indkey.values[j] - 1, &field));
+			if (field.present)
+				field.bytes = dg_key_field(type, field.bytes);
+		}
+		appendStringInfoChar(key, field.present ? 1 : (nullfirst ? 0 : 2));
+		if (field.present)
+			escaped(key, field.bytes, desc);
+		else
+			*nullkey = true;
+	}
+	if (slot)
+		ExecDropSingleTupleTableSlot(slot);
+	return true;
+}
+
 /*
  * The index entry key for table row |row| with digest |digest|: each key
  * column as a null tag and escaped canonical bytes, then the escaped digest.
  * *prefix receives the length of the key-column part, and *nullkey whether
  * any key column is null.
  */
-static void
-index_entry(Relation index, PLSlice row, PLSlice digest, StringInfo key, size_t *prefix, bool *nullkey)
+static bool
+index_entry(Relation table, Relation index, PLSlice row, PLSlice digest, StringInfo key, size_t *prefix, bool *nullkey)
 {
-	*nullkey = false;
-	for (int j = 0; j < index->rd_index->indnkeyatts; j++)
-	{
-		int			attribute = index->rd_index->indkey.values[j] - 1;
-		PLValue		field;
-		bool		desc = (index->rd_indoption[j] & INDOPTION_DESC) != 0;
-		bool		nullfirst = (index->rd_indoption[j] & INDOPTION_NULLS_FIRST) != 0;
-
-		if (attribute < 0)
-			dg_unsupported("system-column indexes");
-		dg_check(pl_tuple_get(row, attribute, &field));
-		appendStringInfoChar(key, field.present ? 1 : (nullfirst ? 0 : 2));
-		if (field.present)
-			escaped(key, dg_key_field(TupleDescAttr(RelationGetDescr(index), j)->atttypid, field.bytes), desc);
-		else
-			*nullkey = true;
-	}
+	if (!dg_index_row_key(table, index, row, key, nullkey))
+		return false;
 	*prefix = key->len;
 	escaped(key, digest, false);
+	return true;
 }
 
 /* The btree comparison function the key encoding of |type| orders as. */
@@ -237,8 +330,6 @@ dg_index_validate(Relation table, Relation index)
 {
 	if (table->rd_tableam != dg_table_routine())
 		dg_unsupported("prolly indexes on another table AM");
-	if (RelationGetIndexExpressions(index) != NIL || RelationGetIndexPredicate(index) != NIL)
-		dg_unsupported("expression and partial indexes");
 	if (index->rd_rel->relpersistence != RELPERSISTENCE_PERMANENT)
 		dg_unsupported("temporary or unlogged indexes");
 	for (int j = 0; j < index->rd_index->indnkeyatts; j++)
@@ -248,17 +339,29 @@ dg_index_validate(Relation table, Relation index)
 					function = index->rd_support[j];
 		const char *expected;
 		static const char *operators[] = {"<", "<=", "=", ">=", ">"};
+		static const char *pattern_operators[] = {"~<~", "~<=~", "=", "~>=~", "~>~"};
+		bool pattern = false;
 		int			strategy;
 
-		if (att <= 0)
+		if (att < 0)
 			dg_unsupported("system-column indexes");
-		type = getBaseType(TupleDescAttr(RelationGetDescr(table), att - 1)->atttypid);
+		type = getBaseType(TupleDescAttr(RelationGetDescr(index), j)->atttypid);
 		if (!dg_key_ordered(type))
 			dg_unsupported("ordered index keys of this type");
 		if (OidIsValid(index->rd_indcollation[j]) &&
 			!pg_newlocale_from_collation(index->rd_indcollation[j])->collate_is_c)
 			dg_unsupported("non-C index collations");
 		expected = index_comparator(type);
+		if ((type == TEXTOID || type == VARCHAROID) && !strcmp(get_func_name(function), "bttext_pattern_cmp"))
+		{
+			expected = "bttext_pattern_cmp";
+			pattern = true;
+		}
+		else if (type == BPCHAROID && !strcmp(get_func_name(function), "btbpchar_pattern_cmp"))
+		{
+			expected = "btbpchar_pattern_cmp";
+			pattern = true;
+		}
 		if (get_func_namespace(function) != PG_CATALOG_NAMESPACE || strcmp(get_func_name(function), expected))
 			dg_unsupported("custom index comparators");
 
@@ -280,7 +383,7 @@ dg_index_validate(Relation table, Relation index)
 		for (strategy = 1; strategy <= 5; strategy++)
 		{
 			Oid			actual = get_opfamily_member(index->rd_opfamily[j], type, type, strategy);
-			Oid			wanted = OpernameGetOprid(list_make2(makeString("pg_catalog"), makeString(pstrdup(operators[strategy - 1]))), type, type);
+			Oid			wanted = OpernameGetOprid(list_make2(makeString("pg_catalog"), makeString(pstrdup((pattern ? pattern_operators : operators)[strategy - 1]))), type, type);
 
 			if (!OidIsValid(actual) || actual != wanted)
 				dg_unsupported("custom index operators");
@@ -297,7 +400,7 @@ dg_index_rebuild(Relation table, Relation index)
 	DGRows		rows;
 	DGIndexEntry *sorted;
 	PLEntry    *entries;
-	size_t		i;
+	size_t		i, used = 0;
 
 	dg_index_validate(table, index);
 	source = dg_load(table, SnapshotSelf);
@@ -313,17 +416,22 @@ dg_index_rebuild(Relation table, Relation index)
 		uint8	   *value;
 
 		initStringInfo(&key);
-		index_entry(index, row, rows.items[i].key, &key, &sorted[i].prefix, &sorted[i].nullkey);
-		sorted[i].entry.key.data = (uint8 *) key.data;
-		sorted[i].entry.key.len = key.len;
+		if (!index_entry(table, index, row, rows.items[i].key, &key, &sorted[used].prefix, &sorted[used].nullkey))
+		{
+			pfree(key.data);
+			continue;
+		}
+		sorted[used].entry.key.data = (uint8 *) key.data;
+		sorted[used].entry.key.len = key.len;
 		value = palloc(8 + row.len);
 		pl_write64(value, count);
 		memcpy(value + 8, row.data, row.len);
-		sorted[i].entry.value.data = value;
-		sorted[i].entry.value.len = 8 + row.len;
+		sorted[used].entry.value.data = value;
+		sorted[used].entry.value.len = 8 + row.len;
+		used++;
 	}
-	qsort(sorted, rows.count, sizeof(*sorted), compare_entries);
-	for (i = 0; i < rows.count; i++)
+	qsort(sorted, used, sizeof(*sorted), compare_entries);
+	for (i = 0; i < used; i++)
 	{
 		if (index->rd_index->indisunique && (!sorted[i].nullkey || index->rd_index->indnullsnotdistinct))
 		{
@@ -336,7 +444,7 @@ dg_index_rebuild(Relation table, Relation index)
 		}
 		entries[i] = sorted[i].entry;
 	}
-	dg_check(pl_build(target->store, entries, rows.count, &target->content));
+	dg_check(pl_build(target->store, entries, used, &target->content));
 	dg_save(index, target, GetCurrentCommandId(true));
 	dg_release(source);
 	dg_release(target);
@@ -414,13 +522,18 @@ dg_index_apply(Relation table, PLSlice row, int64 delta, uint64 handle, CommandI
 	foreach(cell, indexes)
 	{
 		Relation	index = lfirst(cell);
-		DGBatch    *batch = dg_batch(index, cid);
+		DGBatch    *batch;
 		StringInfoData key;
 		size_t		prefix;
 		bool		nullkey;
 
 		initStringInfo(&key);
-		index_entry(index, row, digest_bytes, &key, &prefix, &nullkey);
+		if (!index_entry(table, index, row, digest_bytes, &key, &prefix, &nullkey))
+		{
+			pfree(key.data);
+			continue;
+		}
+		batch = dg_batch(index, cid);
 		dg_batch_index(batch, (PLSlice) {(uint8 *) key.data, key.len}, prefix, digest, row, delta);
 		/*
 		 * Writers of bound canonical storage may bypass the executor's index
@@ -437,13 +550,13 @@ dg_index_apply(Relation table, PLSlice row, int64 delta, uint64 handle, CommandI
 	close_indexes(indexes, opened);
 }
 
-void
-dg_index_entry_key(Relation index, PLSlice row, PLHash digest, StringInfo key)
+bool
+dg_index_entry_key(Relation table, Relation index, PLSlice row, PLHash digest, StringInfo key)
 {
 	size_t		prefix;
 	bool		nullkey;
 
-	index_entry(index, row, (PLSlice) {digest.bytes, PL_HASH_SIZE}, key, &prefix, &nullkey);
+	return index_entry(table, index, row, (PLSlice) {digest.bytes, PL_HASH_SIZE}, key, &prefix, &nullkey);
 }
 
 /* The smallest key greater than every key that starts with |prefix|. */
@@ -629,7 +742,8 @@ dg_index_check_unique(Relation table, Relation index, ItemPointer tid, Datum *va
 	if (batch ? !dg_batch_row(batch, digest, &row) : !row_of(rows, digest, &row))
 		elog(ERROR, "missing canonical row contents");
 	initStringInfo(&key);
-	index_entry(index, row, (PLSlice) {digest.bytes, PL_HASH_SIZE}, &key, &prefix, &nullkey);
+	if (!index_entry(table, index, row, (PLSlice) {digest.bytes, PL_HASH_SIZE}, &key, &prefix, &nullkey))
+		elog(ERROR, "unique check for row outside index predicate");
 	if (rows)
 		dg_release(rows);
 	if (nullkey && !index->rd_index->indnullsnotdistinct)
@@ -698,8 +812,7 @@ check_key(Relation table, Relation index, uint64 self, StringInfo key, PLSlice r
 			dg_decode(table, row, &tid, slot);
 		else
 			dg_decode(table, (PLSlice) {found.bytes.data + 8, found.bytes.len - 8}, &tid, slot);
-		for (int j = 0; j < index->rd_index->indnatts; j++)
-			values[j] = slot_getattr(slot, index->rd_index->indkey.values[j], &isnull[j]);
+		index_values(index, slot, values, isnull);
 		unique_violation(table, index, values, isnull);
 	}
 	return true;
@@ -851,13 +964,25 @@ static bool
 matches(IndexScanDesc scan, TupleTableSlot *slot)
 {
 	int			i;
+	Datum values[INDEX_MAX_KEYS];
+	bool nulls[INDEX_MAX_KEYS];
+	bool expressions = !heap_attisnull(scan->indexRelation->rd_indextuple, Anum_pg_index_indexprs, NULL);
 
+	if (expressions)
+		index_values(scan->indexRelation, slot, values, nulls);
 	for (i = 0; i < scan->numberOfKeys; i++)
 	{
 		ScanKey		key = &scan->keyData[i];
-		int			att = scan->indexRelation->rd_index->indkey.values[key->sk_attno - 1];
 		bool		null;
-		Datum		value = slot_getattr(slot, att, &null);
+		Datum		value;
+
+		if (expressions)
+		{
+			null = nulls[key->sk_attno - 1];
+			value = values[key->sk_attno - 1];
+		}
+		else
+			value = slot_getattr(slot, scan->indexRelation->rd_index->indkey.values[key->sk_attno - 1], &null);
 
 		if (key->sk_flags & SK_SEARCHNULL)
 		{
@@ -886,7 +1011,7 @@ append_key_value(IndexScanDesc scan, int j, ScanKey key, StringInfo out)
 	Relation	index = scan->indexRelation;
 	Oid			type = OidIsValid(key->sk_subtype) && key->sk_subtype != ANYENUMOID && key->sk_subtype != ANYARRAYOID &&
 		key->sk_subtype != RECORDOID && key->sk_subtype != ANYRANGEOID && key->sk_subtype != ANYMULTIRANGEOID ? key->sk_subtype :
-		TupleDescAttr(RelationGetDescr(scan->heapRelation), index->rd_index->indkey.values[j] - 1)->atttypid;
+		TupleDescAttr(RelationGetDescr(index), j)->atttypid;
 
 	appendStringInfoChar(out, 1);
 	escaped(out, dg_key_value(type, key->sk_argument), (index->rd_indoption[j] & INDOPTION_DESC) != 0);
@@ -901,8 +1026,7 @@ append_key_value(IndexScanDesc scan, int j, ScanKey key, StringInfo out)
 static bool
 key_has_compatible_encoding(IndexScanDesc scan, int j, ScanKey key)
 {
-	Oid			column = getBaseType(TupleDescAttr(RelationGetDescr(scan->heapRelation),
-											 scan->indexRelation->rd_index->indkey.values[j] - 1)->atttypid);
+	Oid			column = getBaseType(TupleDescAttr(RelationGetDescr(scan->indexRelation), j)->atttypid);
 	Oid			argument = OidIsValid(key->sk_subtype) ? getBaseType(key->sk_subtype) : column;
 
 	if (column != argument &&
@@ -1177,8 +1301,7 @@ produce(IndexScanDesc scan)
 				Datum		values[INDEX_MAX_KEYS];
 				bool		nulls[INDEX_MAX_KEYS];
 
-				for (int k = 0; k < scan->indexRelation->rd_index->indnatts; k++)
-					values[k] = slot_getattr(s->slot, scan->indexRelation->rd_index->indkey.values[k], &nulls[k]);
+				index_values(scan->indexRelation, s->slot, values, nulls);
 				tuple = heap_form_tuple(RelationGetDescr(scan->indexRelation), values, nulls);
 			}
 			add_item(s, &tid, tuple);

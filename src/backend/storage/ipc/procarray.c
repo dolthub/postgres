@@ -2926,6 +2926,49 @@ GetOldestActiveTransactionId(void)
 }
 
 /*
+ * GetOldestXminIgnoring -- the oldest xmin or xid of any process in this
+ * database whose status flags share no bit with |ignore|
+ *
+ * A horizon for state that only some kinds of process can still depend on:
+ * prolly's claims on derived row handles must outlast only transactions that
+ * may write rows, which autovacuum workers never do. Unlike the horizons
+ * ComputeXidHorizons computes, this one passes over such processes, however
+ * long they run. With no such process, nextXid is the result.
+ */
+TransactionId
+GetOldestXminIgnoring(uint8 ignore)
+{
+	ProcArrayStruct *arrayP = procArray;
+	TransactionId *other_xids = ProcGlobal->xids;
+	TransactionId oldest;
+
+	LWLockAcquire(XidGenLock, LW_SHARED);
+	oldest = XidFromFullTransactionId(TransamVariables->nextXid);
+	LWLockRelease(XidGenLock);
+
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+	for (int index = 0; index < arrayP->numProcs; index++)
+	{
+		PGPROC	   *proc = &allProcs[arrayP->pgprocnos[index]];
+		TransactionId xid;
+		TransactionId xmin;
+
+		if ((ProcGlobal->statusFlags[index] & ignore) || proc->databaseId != MyDatabaseId)
+			continue;
+
+		/* Fetch xid just once - see GetNewTransactionId */
+		xid = UINT32_ACCESS_ONCE(other_xids[index]);
+		xmin = UINT32_ACCESS_ONCE(proc->xmin);
+		xmin = TransactionIdOlder(xmin, xid);
+		if (TransactionIdIsNormal(xmin) && TransactionIdPrecedes(xmin, oldest))
+			oldest = xmin;
+	}
+	LWLockRelease(ProcArrayLock);
+
+	return oldest;
+}
+
+/*
  * GetOldestSafeDecodingTransactionId -- lowest xid not affected by vacuum
  *
  * Returns the oldest xid that we can guarantee not to have been affected by

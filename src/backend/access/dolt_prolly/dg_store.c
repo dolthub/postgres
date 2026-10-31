@@ -34,6 +34,7 @@
 #include "access/doltversion.h"
 #include "nodes/tidbitmap.h"
 #include "access/doltchunk.h"
+#include "access/doltjournal.h"
 #include "access/doltnode.h"
 #include "access/genam.h"
 #include "access/heapam.h"
@@ -651,6 +652,7 @@ static HTAB *journal_marks;		/* (relid, cid, subxid) of batches that were journa
 static bool journal_batch(DGBatch *b, bool forced);
 static bool batch_adds_handle(const RootKey *key, uint64 handle);
 static void journal_consume(const RootKey *key, const int64 *seqs, int count, CommandId cid);
+static void journal_consumed_abort(SubTransactionId subid);
 static DGState *journal_fold_loaded(Relation rel, const char *branch, Snapshot snapshot, DGState *s);
 static DGState *load_unfolded(Relation rel, Snapshot snap, bool *foldable);
 static void journal_fold_roots(PLHash **roots, int *count, int *capacity);
@@ -946,6 +948,19 @@ publish_all(void)
 		}
 		merged = roots_merge(&top->base, &top->roots, &latest);
 
+		/* A capture may publish a parent's edits inside a savepoint. Keep
+		 * its overlay intact: both the catalog publication and this rebase
+		 * must disappear if the child aborts. */
+		if (top->subxid != GetCurrentSubTransactionId())
+		{
+			Roots base = top->base;
+			Roots roots = top->roots;
+
+			overlay_push(&written[i]->key, GetCurrentCommandId(false),
+						 GetCurrentSubTransactionId(), &base, &roots);
+			top = &written[i]->entries[written[i]->count - 1];
+		}
+
 		/* A pre-commit capture must see the same merged roots we publish.
 		 * Rebase the overlay so later pre-commit publication is idempotent. */
 		top->base = top->roots = merged;
@@ -1073,6 +1088,7 @@ store_subxact(SubXactEvent event, SubTransactionId mySubid, SubTransactionId par
 	{
 		batch_discard(mySubid);
 		journal_local_invalidate();
+		journal_consumed_abort(mySubid);
 		handle_local_invalidate();
 	}
 	if (event != SUBXACT_EVENT_ABORT_SUB || !overlays)
@@ -1718,6 +1734,8 @@ load_state(Relation rel, Snapshot snap, const uint64 *wanted, const char *branch
 		batch_flush_key(&key);
 	s = new_state(rel);
 	overlay = overlay_find(&key, false);
+	s->roots_generation = roots_generation(&key);
+	s->roots_generation_known = true;
 	if (snap && IsMVCCSnapshot(snap))
 		committed = roots_read(&key, snap);
 	else
@@ -1825,13 +1843,45 @@ load_unfolded(Relation rel, Snapshot snap, bool *foldable)
 	return load_state(rel, snap, NULL, dg_relation_branch(rel), true, false);
 }
 
+/*
+ * A load of the latest state reads its roots, its journal and an index's
+ * table at different moments, and a fold another transaction persisted in
+ * between, which saves roots that include entries and deletes the entries,
+ * makes them disagree; the fold then reports it rather than apply anything.
+ * Load again, a few times, then fail as a concurrent update would.
+ */
+#define DG_FOLD_ATTEMPTS 10
+
+static bool journal_fold_moved;
+
+/* Whether the fold that produced |s| found its reads disagree: then |s| is released. */
+static bool
+fold_again(DGState *s, int attempt)
+{
+	if (!journal_fold_moved)
+		return false;
+	dg_release(s);
+	if (attempt >= DG_FOLD_ATTEMPTS)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not serialize access due to concurrent update")));
+	return true;
+}
+
 DGState *
 dg_load(Relation rel, Snapshot snap)
 {
-	bool		foldable;
-	DGState    *s = load_unfolded(rel, snap, &foldable);
+	for (int attempt = 1;; attempt++)
+	{
+		bool		foldable;
+		DGState    *s = load_unfolded(rel, snap, &foldable);
 
-	return foldable ? journal_fold_loaded(rel, dg_relation_branch(rel), snap, s) : s;
+		if (!foldable)
+			return s;
+		s = journal_fold_loaded(rel, dg_relation_branch(rel), snap, s);
+		if (!fold_again(s, attempt))
+			return s;
+	}
 }
 DGState *
 dg_load_branch(Relation rel, Snapshot snap, const char *branch)
@@ -1844,18 +1894,27 @@ dg_load_branch(Relation rel, Snapshot snap, const char *branch)
 DGState *
 dg_load_tid(Relation rel, uint64 id)
 {
+	bool		durable;
+
 	if (dg_storage_bound(rel))
 		return dg_storage_am_load_tid(rel, id);
-	if (CatalogViewIsDurable(RelationGetRelid(rel)))
-		return journal_fold_loaded(rel, dg_relation_branch(rel), SnapshotSelf,
-								   durable_base(rel, load_state(rel, SnapshotSelf, &id, dg_relation_branch(rel), false, true)));
-	if (revision_relation(rel))
+	durable = CatalogViewIsDurable(RelationGetRelid(rel));
+	if (!durable && revision_relation(rel))
 		return revision_state(rel);
-	if (CatalogViewObjectContext(RelationGetRelid(rel)))
+	if (!durable && CatalogViewObjectContext(RelationGetRelid(rel)))
 		return dg_storage_am_load_tid(rel, id);
+	for (int attempt = 1;; attempt++)
+	{
+		DGState    *s;
 
-	return journal_fold_loaded(rel, dg_relation_branch(rel), SnapshotSelf,
-							   load_state(rel, SnapshotSelf, &id, dg_relation_branch(rel), true, false));
+		if (durable)
+			s = durable_base(rel, load_state(rel, SnapshotSelf, &id, dg_relation_branch(rel), false, true));
+		else
+			s = load_state(rel, SnapshotSelf, &id, dg_relation_branch(rel), true, false);
+		s = journal_fold_loaded(rel, dg_relation_branch(rel), SnapshotSelf, s);
+		if (!fold_again(s, attempt))
+			return s;
+	}
 }
 
 /* Internal page-reader entrypoint; only dg_resource.c supplies this descriptor. */
@@ -1864,13 +1923,25 @@ dg_load_bound(Relation rel, Snapshot snap, const char *branch)
 {
 	Assert(RelFileNumberIsValid(rel->rd_locator.relNumber));
 	Assert(rel->rd_lockInfo.lockRelId.relId < FirstCatalogViewObjectId);
-	return journal_fold_loaded(rel, branch, snap, load_state(rel, snap, NULL, branch, false, true));
+	for (int attempt = 1;; attempt++)
+	{
+		DGState    *s = journal_fold_loaded(rel, branch, snap, load_state(rel, snap, NULL, branch, false, true));
+
+		if (!fold_again(s, attempt))
+			return s;
+	}
 }
 
 DGState *
 dg_load_bound_tid(Relation rel, uint64 id, const char *branch)
 {
-	return journal_fold_loaded(rel, branch, SnapshotSelf, load_state(rel, SnapshotSelf, &id, branch, false, true));
+	for (int attempt = 1;; attempt++)
+	{
+		DGState    *s = journal_fold_loaded(rel, branch, SnapshotSelf, load_state(rel, SnapshotSelf, &id, branch, false, true));
+
+		if (!fold_again(s, attempt))
+			return s;
+	}
 }
 
 static void

@@ -1,0 +1,64 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_read s2_upd s1_fold s1_point s1_scan s1_upd s1_c s2_check
+step s1_read: SELECT count(*), sum(v) FROM fs;
+count|  sum
+-----+-----
+  200|20100
+(1 row)
+
+step s2_upd: UPDATE fs SET v = v + 1000 WHERE id = 1;
+step s1_fold: UPDATE fs SET v = v + 1 WHERE id > 100;
+step s1_point: SELECT v FROM fs WHERE id = 1;
+v
+-
+1
+(1 row)
+
+step s1_scan: SELECT count(*), sum(v) FROM fs;
+count|  sum
+-----+-----
+  200|20200
+(1 row)
+
+step s1_upd: UPDATE fs SET v = 0 WHERE id = 1;
+ERROR:  could not serialize access due to concurrent update
+step s1_c: COMMIT;
+step s2_check: SELECT v FROM fs WHERE id IN (1, 150) ORDER BY id;
+   v
+----
+1001
+ 150
+(2 rows)
+
+
+starting permutation: s1_read s2_upd s1_fold s1_upd_own s1_own s1_scan s1_c s2_check
+step s1_read: SELECT count(*), sum(v) FROM fs;
+count|  sum
+-----+-----
+  200|20100
+(1 row)
+
+step s2_upd: UPDATE fs SET v = v + 1000 WHERE id = 1;
+step s1_fold: UPDATE fs SET v = v + 1 WHERE id > 100;
+step s1_upd_own: UPDATE fs SET v = v * 2 WHERE id = 150;
+step s1_own: SELECT v FROM fs WHERE id = 150;
+  v
+---
+302
+(1 row)
+
+step s1_scan: SELECT count(*), sum(v) FROM fs;
+count|  sum
+-----+-----
+  200|20351
+(1 row)
+
+step s1_c: COMMIT;
+step s2_check: SELECT v FROM fs WHERE id IN (1, 150) ORDER BY id;
+   v
+----
+1001
+ 302
+(2 rows)
+

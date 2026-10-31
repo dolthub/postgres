@@ -548,7 +548,11 @@ dg_system_user_target(RangeVar *rv)
 		return;
 	if (rv->dolt_revision || rv->catalogname)
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("revision-qualified metadata writes are not supported")));
-	dg_ensure_user_table(name);
+	/* The initializer inserts the default document through this same path.
+	 * Its CREATE has completed, but the enclosing statement's catalog view
+	 * need not yet contain it. Do not recursively initialize the table. */
+	if (!dg_internal_system_ddl)
+		dg_ensure_user_table(name);
 	rv->schemaname = pstrdup("public");
 	rv->relname = pstrdup(name);
 }

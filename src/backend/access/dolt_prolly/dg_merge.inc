@@ -580,19 +580,13 @@ unique_contents(Relation rel, const PLTree * contents)
 		keys = palloc(sizeof(*keys) * Max(rows.count, 1));
 		for (i = 0; i < rows.count; i++)
 		{
-			int			j,
-						n = idx->rd_index->indnkeyatts;
-			bool		hasnull = false;
-			PLValue    *fields = palloc(sizeof(*fields) * n);
-			PLSlice		row = {rows.items[i].value.data + 8, rows.items[i].value.len - 8};
+			bool hasnull;
+			StringInfoData key;
+			PLSlice row = {rows.items[i].value.data + 8, rows.items[i].value.len - 8};
 
-			for (j = 0; j < n; j++)
-			{
-				dg_check(pl_tuple_get(row, idx->rd_index->indkey.values[j] - 1, &fields[j]));
-				if (!fields[j].present)
-					hasnull = true;
-			}
-			if (hasnull && !idx->rd_index->indnullsnotdistinct)
+			initStringInfo(&key);
+			if (!dg_index_row_key(rel, idx, row, &key, &hasnull) ||
+				(hasnull && !idx->rd_index->indnullsnotdistinct))
 				continue;
 			if (pl_read64(rows.items[i].value.data) > 1)
 			{
@@ -600,7 +594,7 @@ unique_contents(Relation rel, const PLTree * contents)
 					index_close(idx, AccessShareLock);
 				return false;
 			}
-			keys[used++].key = pack_merge_fields(fields, n);
+			keys[used++].key = DG_SLICE(key.data, key.len);
 		}
 		qsort(keys, used, sizeof(*keys), entry_compare);
 		for (i = 1; i < used; i++)
@@ -646,30 +640,27 @@ unique_violations(Relation rel, const PLTree * contents, const char *name, Strin
 		{
 			if (j)
 				appendStringInfoChar(&info, ',');
-			escape_json(&info, NameStr(TupleDescAttr(RelationGetDescr(rel), idx->rd_index->indkey.values[j] - 1)->attname));
+			escape_json(&info, NameStr(TupleDescAttr(RelationGetDescr(idx), j)->attname));
 		}
 		appendStringInfoString(&info, "],\"Name\":");
 		escape_json(&info, RelationGetRelationName(idx));
 		appendStringInfoChar(&info, '}');
-		keys = palloc(sizeof(*keys) * Max(rows.count, 1));
+		keys = palloc0(sizeof(*keys) * Max(rows.count, 1));
 		for (i = 0; i < rows.count; i++)
 		{
-			PLValue    *fields = palloc(sizeof(*fields) * n);
-			PLSlice		row = {rows.items[i].value.data + 8, rows.items[i].value.len - 8};
-			bool		hasnull = false;
+			PLSlice row = {rows.items[i].value.data + 8, rows.items[i].value.len - 8};
+			bool hasnull;
+			StringInfoData key;
 
-			for (j = 0; j < n; j++)
-			{
-				dg_check(pl_tuple_get(row, idx->rd_index->indkey.values[j] - 1, &fields[j]));
-				if (!fields[j].present)
-					hasnull = true;
-			}
-			keys[i].key = (hasnull && !idx->rd_index->indnullsnotdistinct) ? DG_SLICE(NULL, 0) : pack_merge_fields(fields, n);
+			initStringInfo(&key);
+			if (dg_index_row_key(rel, idx, row, &key, &hasnull) &&
+				(!hasnull || idx->rd_index->indnullsnotdistinct))
+				keys[i].key = DG_SLICE(key.data, key.len);
 			keys[i].value = row;
 		}
 		for (i = 0; i < rows.count; i++)
 		{
-			bool		duplicate = pl_read64(rows.items[i].value.data) > 1;
+			bool		duplicate = keys[i].key.data && pl_read64(rows.items[i].value.data) > 1;
 
 			if (keys[i].key.data)
 				for (j = 0; j < rows.count && !duplicate; j++)
@@ -798,6 +789,21 @@ install_database(bytea *base, bytea *ours, bytea *theirs, List *merges, StringIn
 		validate_working_foreign_keys(dg_current_branch(), violations);
 }
 
+/* Preserve retained pre-merge workspaces when conflict metadata is edited. */
+static bytea *
+updated_merge(bytea *previous, const char *json)
+{
+	ArrayType *array;
+	Datum *children;
+	bool *nulls;
+	int count;
+
+	if (!object_read(previous, "merge", NULL, NULL, &array))
+		elog(ERROR, "merge object is not visible");
+	deconstruct_array(array, BYTEAOID, -1, false, TYPALIGN_INT, &children, &nulls, &count);
+	return put("merge", json, children, count);
+}
+
 Datum
 dolt_merge(PG_FUNCTION_ARGS)
 {
@@ -820,7 +826,10 @@ dolt_merge(PG_FUNCTION_ARGS)
 			   *oursdb,
 			   *their_db,
 			   *database,
-			   *commit = NULL;
+			   *commit = NULL,
+			   *oldstaged,
+			   *newworking,
+			   *newstaged;
 	StringInfoData conflicts,
 				violations,
 				schema_conflicts,
@@ -866,11 +875,16 @@ dolt_merge(PG_FUNCTION_ARGS)
 	{
 		if (revision || !pending.target)
 			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("no merge to abort")));
-		database = child(child(pending.target, 1), 1);
+		database = object_child(pending.target, 4);
+		oldstaged = object_child(pending.target, 5);
+		if (!database)
+			database = child(child(pending.target, 1), 1);
+		if (!oldstaged)
+			oldstaged = database;
 		replace_working(dg_current_branch(), database, NIL);
 		finish_merge();
 		move_ref(branch_ref("working"), read_ref(branch_ref("working")), database);
-		move_ref(branch_ref("staged"), read_ref(branch_ref("staged")), database);
+		move_ref(branch_ref("staged"), read_ref(branch_ref("staged")), oldstaged);
 		result_message = "merge aborted";
 		goto done;
 	}
@@ -888,8 +902,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 	oursdb = child(head.target, 1);
 	their_db = child(theirs, 1);
 	live = capture(true);
-	if (!database_same(live.hash, oursdb) || !database_same(read_ref(branch_ref("staged")).target, oursdb))
-		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("error: local changes would be stomped by merge"), errhint("Commit or discard working and staged changes before merging.")));
+	oldstaged = read_ref(branch_ref("staged")).target;
 	if (ffonly && !same(base, head.target))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("not possible to fast-forward")));
 	initStringInfo(&conflicts);
@@ -897,6 +910,8 @@ dolt_merge(PG_FUNCTION_ARGS)
 	initStringInfo(&schema_conflicts);
 	merge_databases(child(base, 1), oursdb, their_db, &conflicts, &violations, &schema_conflicts);
 	database = capture(true).hash;
+	newworking = carry_workspace_changes(oursdb, live.hash, database);
+	newstaged = carry_workspace_changes(oursdb, oldstaged, database);
 
 	/*
 	 * --no-commit cannot stop a fast-forward (there is no new commit to
@@ -916,7 +931,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 		appendStringInfo(&json, "{\"format\":\"DGMERGE1\",\"squash\":%s,\"source\":", squash ? "true" : "false");
 		escape_json(&json, revision);
 		appendStringInfo(&json, ",\"conflicts\":[%s],\"violations\":[%s],\"schema_conflicts\":[%s]}", conflicts.data, violations.data, schema_conflicts.data);
-		move_ref(branch_ref("merge"), pending, put("merge", json.data, VC_ARGS(PointerGetDatum(head.target), PointerGetDatum(theirs), PointerGetDatum(base)), 3));
+		move_ref(branch_ref("merge"), pending, put("merge", json.data, VC_ARGS(PointerGetDatum(head.target), PointerGetDatum(theirs), PointerGetDatum(base), PointerGetDatum(live.hash), PointerGetDatum(oldstaged)), 5));
 		conflicted = (conflicts.len || violations.len || schema_conflicts.len) ? 1 : 0;
 		result_message = conflicted ? "conflicts found" : "merge successful";
 	}
@@ -928,17 +943,25 @@ dolt_merge(PG_FUNCTION_ARGS)
 			ff = 1;
 		}
 		else
-			commit = commit_object(database, head.target, theirs, message ? message : psprintf("Merge branch '%s'", revision), NULL, NULL, GetCurrentTimestamp());
+			commit = commit_object(database, head.target, theirs, message ? message : psprintf("Merge branch '%s' into %s", revision, dg_current_branch()), NULL, NULL, GetCurrentTimestamp());
 		move_ref(branch_ref("heads"), head, commit);
 	}
-	move_ref(branch_ref("working"), read_ref(branch_ref("working")), database);
+	if (!database_same(newworking, database))
+	{
+		replace_working(dg_current_branch(), newworking, NIL);
+		/* Disjoint object names can still meet through foreign keys. A
+		 * clean merge must not silently invalidate retained local rows. */
+		if (!conflicted)
+			validate_working_foreign_keys(dg_current_branch(), NULL);
+	}
+	move_ref(branch_ref("working"), read_ref(branch_ref("working")), newworking);
 
 	/*
 	 * A conflict must be explicitly resolved before staging/committing its
 	 * rows.
 	 */
 	if (!conflicted)
-		move_ref(branch_ref("staged"), read_ref(branch_ref("staged")), database);
+		move_ref(branch_ref("staged"), read_ref(branch_ref("staged")), newstaged);
 done:
 	nulls[0] = commit == NULL;
 	values[0] = commit ? CStringGetTextDatum(hash_format(commit)) : (Datum) 0;
@@ -1107,7 +1130,7 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 	escape_json(&updated, json_value(json, "source") ? json_value(json, "source") : "");
 	run("SELECT coalesce(($1::jsonb->'violations')::text,'[]')", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
 	appendStringInfo(&updated, ",\"conflicts\":[%s],\"violations\":%s,\"schema_conflicts\":[%s]}", remaining.data, strcell(0, 1), schema_remaining.data);
-	move_ref(branch_ref("merge"), pending, put("merge", updated.data, parents, 3));
+	move_ref(branch_ref("merge"), pending, updated_merge(pending.target, updated.data));
 	move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture(true).hash);
 	end_api(nest);
 	PG_RETURN_INT64(0);

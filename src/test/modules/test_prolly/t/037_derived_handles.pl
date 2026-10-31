@@ -71,6 +71,30 @@ my @lines = split /\n/, sql(join(' ', 'BEGIN;', (map { "UPDATE child SET v = v +
 cmp_ok($lines[-1], '<', 10, "twenty foreign-keyed updates read the handle catalog $lines[-1] times");
 is(sql(q{SELECT sum(v) FROM child}), '20', 'and change twenty rows');
 
+# Across transactions, a delta read while no commit was under way stands
+# until a commit to the storage moves its word: reading a table with
+# allocated handles in many transactions reads the catalog once.
+sql(q{CREATE TABLE dup3(x int, y text); INSERT INTO dup3 VALUES (1, 'a'), (1, 'a'), (1, 'a'), (2, 'b')});
+my $session = $node->background_psql('postgres');
+$session->query_safe(q{SELECT count(DISTINCT ctid) FROM dup3});
+my $scans = $session->query_safe(q{SELECT idx_scan FROM pg_stat_sys_indexes WHERE indexrelname = 'pg_dolt_handle_key_index'});
+$session->query_safe(q{SELECT count(DISTINCT ctid) FROM dup3}) for 1 .. 10;
+$session->query_safe(q{SELECT pg_stat_clear_snapshot()});
+sleep(1);
+cmp_ok($session->query_safe(q{SELECT idx_scan FROM pg_stat_sys_indexes WHERE indexrelname = 'pg_dolt_handle_key_index'}) - $scans, '<=', 2,
+	'ten transactions reading a table with allocated handles read the catalog at most twice');
+my $older = $node->background_psql('postgres');
+$older->query_safe(q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM dup3});
+sql(q{INSERT INTO dup3 VALUES (1, 'a'), (2, 'b')});
+is($session->query_safe(q{SELECT count(DISTINCT ctid) || ' ' || count(*) FROM dup3}), '6 6', "a session sees another's committed duplicates, each with its handle");
+is($older->query_safe(q{SELECT count(DISTINCT ctid) || ' ' || count(*) FROM dup3}), '4 4', 'an older snapshot does not');
+$older->query_safe('COMMIT');
+$session->query_safe(q{BEGIN; INSERT INTO dup3 VALUES (1, 'a'); ROLLBACK});
+is($session->query_safe(q{SELECT count(DISTINCT ctid) || ' ' || count(*) FROM dup3}), '6 6', 'a rolled back duplicate leaves no handle behind');
+is(sql(q{DELETE FROM dup3 WHERE x = 1; SELECT count(*) FROM dup3}), '2', 'and every occurrence can be deleted');
+$session->quit;
+$older->quit;
+
 # A branch inherits derived handles for free and allocates for the duplicates it meets.
 sql(q{SELECT dolt_commit('-Am', 'dup')});
 sql(q{SELECT dolt_branch('dups')});
@@ -151,6 +175,40 @@ is(sql(q{SET enable_seqscan=off; SET enable_indexscan=off; SET work_mem='64kB'; 
 	$expected, 'a lossy bitmap scan finds every row once');
 is(sql(q{SET enable_seqscan=off; SET enable_indexscan=off; SET work_mem='64kB'; SELECT count(*) FROM big WHERE k BETWEEN 10 AND 60 AND id % 7 = 0}),
 	sql(q{SET enable_bitmapscan=off; SELECT count(*) FROM big WHERE k BETWEEN 10 AND 60 AND id % 7 = 0}), 'and rechecks its qualification');
+
+# A claim outlives its transaction while a transaction that could still
+# write holds an older snapshot: a row removed and inserted again then takes
+# an allocated handle. An autovacuum worker's snapshot does not count, since
+# it writes no rows: an ANALYZE of a large table would otherwise keep every
+# claim made while it reads. This ANALYZE holds its snapshot while it
+# evaluates an expensive index expression for each row it samples.
+sql(q{CREATE TABLE reclaim(id int, v int) WITH (autovacuum_enabled = off)});
+sub reinserted_handle {
+	sql(q{INSERT INTO reclaim VALUES (1, 1)});
+	sql(q{DELETE FROM reclaim WHERE id = 1});
+	sql(q{INSERT INTO reclaim VALUES (1, 1)});
+	my $allocated = sql(qq{SELECT $handle >= $derived FROM reclaim WHERE id = 1});
+	sql(q{DELETE FROM reclaim WHERE id = 1});
+	return $allocated eq 't' ? 'allocated' : 'derived';
+}
+my $reader = $node->background_psql('postgres');
+$reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM t');
+is(reinserted_handle(), 'allocated', 'an open snapshot keeps the claim of a row it may not see');
+$reader->query_safe('COMMIT');
+$reader->quit;
+is(reinserted_handle(), 'derived', 'and once it ends, the row takes its derived handle again');
+sql(q{CREATE TABLE slow(x int) USING heap WITH (autovacuum_analyze_threshold = 0, autovacuum_analyze_scale_factor = 0)});
+sql(q{INSERT INTO slow SELECT generate_series(1, 120)});
+sql(q{CREATE INDEX slow_md5 ON slow (md5(repeat(x::text, 20000000)))});
+sql(q{ALTER SYSTEM SET autovacuum_naptime = '1s'});
+sql(q{SELECT pg_reload_conf()});
+ok($node->poll_query_until('postgres',
+	q{SELECT count(*) > 0 FROM pg_stat_activity WHERE backend_type = 'autovacuum worker' AND query LIKE '%ANALYZE%slow%'}),
+	'an autovacuum worker is analyzing');
+is(reinserted_handle(), 'derived', "an autovacuum worker's older snapshot does not keep the claim");
+ok(sql(q{SELECT count(*) > 0 FROM pg_stat_activity WHERE backend_type = 'autovacuum worker' AND query LIKE '%ANALYZE%slow%'}) eq 't',
+	'while the worker was still analyzing');
+sql(q{ALTER SYSTEM RESET autovacuum_naptime; SELECT pg_reload_conf(); DROP TABLE slow});
 
 # Allocated handles continue past the committed ones after a crash.
 sql(q{INSERT INTO dup VALUES (1, 'a')});

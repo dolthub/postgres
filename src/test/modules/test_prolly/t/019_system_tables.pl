@@ -13,6 +13,15 @@ sub fails {
  my($q,$pat,$label)=@_;my($status,$out,$err)=$node->psql('postgres',$q);
  isnt($status,0,$label);like($err,$pat,"$label diagnostic");
 }
+# Metadata can be the first user data written, before any version API call.
+sql(q{CREATE DATABASE docs_first});
+my $docs = $node->background_psql('docs_first');
+$docs->query_safe(q{INSERT INTO dolt.docs VALUES('README.md','first')});
+is($docs->query_safe(q{SELECT doc_name FROM dolt.docs ORDER BY 1}), "AGENT.md\nREADME.md", 'first metadata write is captured in the branch');
+$docs->query_safe(q{UPDATE dolt.docs SET doc_text='second' WHERE doc_name='README.md'});
+is($docs->query_safe(q{SELECT doc_text FROM dolt.docs WHERE doc_name='README.md'}), 'second', 'subsequent metadata writes find the existing table');
+$docs->quit;
+sql(q{DROP DATABASE docs_first});
 # Every database starts with an initialized repository whose initial commit records the public schema.
 is(sql(q{SELECT name,dirty,latest_commit_message FROM dolt.branches}),'main|f|Initialize data repository','fresh database has main');
 is(sql(q{SELECT count(*) FROM dolt.commits}),'1','initial commit visible');
@@ -109,6 +118,7 @@ is(sql(q{SELECT dolt_remote('remove','origin')}),'0','remote removed');
 is(sql(q{SELECT count(*) FROM dolt.remotes}),'0','remote gone');
 is(sql(q{SELECT doc_name,length(doc_text)>100 FROM dolt.docs}),'AGENT.md|t','default agent document');
 sql(q{INSERT INTO dolt.docs VALUES('README.md','testing')});
+is(sql(q{SELECT count(*) FROM dolt.docs WHERE doc_name='AGENT.md'}),'1','lazy initialization creates default document exactly once');
 is(sql(q{SELECT doc_name FROM dolt_docs ORDER BY 1}),"AGENT.md\nREADME.md",'inserted document through alias');
 sql(q{UPDATE dolt_docs SET doc_text='updated' WHERE doc_name='README.md'});
 is(sql(q{SELECT doc_text FROM public.dolt_docs WHERE doc_name='README.md'}),'updated','document updated');

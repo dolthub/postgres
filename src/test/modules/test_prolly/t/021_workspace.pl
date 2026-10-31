@@ -80,6 +80,11 @@ is($err,1,'cherry-pick requires a clean working set');
 $s->{stderr} = '';
 $s->query_safe(q{SELECT dolt_checkout('t')});
 $s->quit;
+# A serial column owns its sequence. Cleaning the table already removes that
+# sequence; the remaining captured object list must tolerate that removal.
+sql(q{CREATE TABLE untracked_serial(id serial PRIMARY KEY, v text) USING dolt_prolly_table});
+is(sql(q{SELECT dolt_clean()}),'0','clean table and its owned sequence together');
+is(sql(q{SELECT count(*) FROM pg_class WHERE relname IN ('untracked_serial','untracked_serial_id_seq')}),'0','clean removes owned sequence and table');
 # Branch management and commit-graph helpers.
 is(sql(q{SELECT dolt_branch('-c','main','copy')}),'0','copy branch');
 is(sql(q{SELECT dolt_branch('-c','-f','side','copy')}),'0','force copy over existing branch');
@@ -92,6 +97,19 @@ is(sql(q{SELECT dolt_branch('-d','renamed')}),'0','delete branch');
 is(sql(q{SELECT dolt_branch('-D','side')}),'0','force delete branch');
 is(sql(q{SELECT string_agg(name,',' ORDER BY name) FROM dolt.branches}),'main','deleted branches gone');
 fails(q{SELECT dolt_checkout('side')},qr/did not match any table/,'deleted branch is unknown');
+# Forced recreation must discard both persisted and dirty roots of the old branch.
+sql(q{SELECT dolt_branch('reset_side','HEAD~1')});
+my $reset=$node->background_psql('postgres',on_error_stop=>1);
+$reset->query_safe(q{SELECT dolt_checkout('reset_side')});
+$reset->query_safe(q{INSERT INTO t VALUES(99,'discard')});
+$reset->query_safe(q{SELECT dolt_add('-A')});
+$reset->quit;
+is(sql(q{SELECT dolt_branch('-f','reset_side','HEAD')}),'0','force reset an existing branch');
+is(sql(q{SELECT count(*) FROM "postgres/reset_side".public.t WHERE pk=99}),'0','forced reset discards old branch roots');
+is(sql(q{SELECT dolt_hashof('reset_side')=dolt_hashof('HEAD')}),'t','forced reset moves head');
+is(sql(q{SELECT dolt_branch('-cf','reset_side','reset_copy')}),'0','combined force copy flags');
+is(sql(q{SELECT dolt_branch('-mf','reset_copy','reset_side')}),'0','combined force rename flags');
+is(sql(q{SELECT dolt_branch('-df','reset_side')}),'0','combined force delete flags');
 sql(q{SELECT dolt_branch('b1','HEAD~1')});
 is(sql(q{SELECT * FROM dolt_branch_status('main','b1')}),'b1|0|1','branch status behind');
 is(sql(q{SELECT * FROM dolt_branch_status('b1','main')}),'main|1|0','branch status ahead');

@@ -2134,4 +2134,12 @@
 { amprocfamily => 'dolt_prolly_index/dolt_float_ops', amproclefttype => 'float8',
   amprocrighttype => 'float4', amprocnum => '1', amproc => 'btfloat84cmp' },
 
+
+# Prolly pattern keys reuse native byte-order operators and comparators.
+{ amprocfamily => 'dolt_prolly_index/text_pattern_ops', amproclefttype => 'text',
+  amprocrighttype => 'text', amprocnum => '1', amproc => 'bttext_pattern_cmp' },
+{ amprocfamily => 'dolt_prolly_index/bpchar_pattern_ops', amproclefttype => 'bpchar',
+  amprocrighttype => 'bpchar', amprocnum => '1',
+  amproc => 'btbpchar_pattern_cmp' },
+
 ]
