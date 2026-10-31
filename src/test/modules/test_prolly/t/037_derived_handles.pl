@@ -71,6 +71,30 @@ my @lines = split /\n/, sql(join(' ', 'BEGIN;', (map { "UPDATE child SET v = v +
 cmp_ok($lines[-1], '<', 10, "twenty foreign-keyed updates read the handle catalog $lines[-1] times");
 is(sql(q{SELECT sum(v) FROM child}), '20', 'and change twenty rows');
 
+# Across transactions, a delta read while no commit was under way stands
+# until a commit to the storage moves its word: reading a table with
+# allocated handles in many transactions reads the catalog once.
+sql(q{CREATE TABLE dup3(x int, y text); INSERT INTO dup3 VALUES (1, 'a'), (1, 'a'), (1, 'a'), (2, 'b')});
+my $session = $node->background_psql('postgres');
+$session->query_safe(q{SELECT count(DISTINCT ctid) FROM dup3});
+my $scans = $session->query_safe(q{SELECT idx_scan FROM pg_stat_sys_indexes WHERE indexrelname = 'pg_dolt_handle_key_index'});
+$session->query_safe(q{SELECT count(DISTINCT ctid) FROM dup3}) for 1 .. 10;
+$session->query_safe(q{SELECT pg_stat_clear_snapshot()});
+sleep(1);
+cmp_ok($session->query_safe(q{SELECT idx_scan FROM pg_stat_sys_indexes WHERE indexrelname = 'pg_dolt_handle_key_index'}) - $scans, '<=', 2,
+	'ten transactions reading a table with allocated handles read the catalog at most twice');
+my $older = $node->background_psql('postgres');
+$older->query_safe(q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM dup3});
+sql(q{INSERT INTO dup3 VALUES (1, 'a'), (2, 'b')});
+is($session->query_safe(q{SELECT count(DISTINCT ctid) || ' ' || count(*) FROM dup3}), '6 6', "a session sees another's committed duplicates, each with its handle");
+is($older->query_safe(q{SELECT count(DISTINCT ctid) || ' ' || count(*) FROM dup3}), '4 4', 'an older snapshot does not');
+$older->query_safe('COMMIT');
+$session->query_safe(q{BEGIN; INSERT INTO dup3 VALUES (1, 'a'); ROLLBACK});
+is($session->query_safe(q{SELECT count(DISTINCT ctid) || ' ' || count(*) FROM dup3}), '6 6', 'a rolled back duplicate leaves no handle behind');
+is(sql(q{DELETE FROM dup3 WHERE x = 1; SELECT count(*) FROM dup3}), '2', 'and every occurrence can be deleted');
+$session->quit;
+$older->quit;
+
 # A branch inherits derived handles for free and allocates for the duplicates it meets.
 sql(q{SELECT dolt_commit('-Am', 'dup')});
 sql(q{SELECT dolt_branch('dups')});

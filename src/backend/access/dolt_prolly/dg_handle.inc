@@ -24,8 +24,11 @@
  * the journal's folds are: the same visibility identity and no local writes
  * to the storage's handles since, or the same snapshot but for a later
  * command when this transaction wrote none of them since the delta was read.
- * States that do not read the catalog, revisions and private rewrites, carry
- * a private delta of their own.
+ * Across transactions, a delta read under the latest snapshot while no
+ * commit to its storage was under way stands, as the journal's stream caches
+ * do, while the storage's journal word does not move: every handle write
+ * touches the word as a journal write does. States that do not read the
+ * catalog, revisions and private rewrites, carry a private delta of their own.
  *
  * Nothing canonical depends on a handle: the content and index trees hold
  * rows and digests only.
@@ -62,6 +65,11 @@ struct HandleDelta
 	bool		loaded;
 	Visibility	seen;
 	uint64		local_version;	/* handle_local_version_of its storage, when read */
+	bool		streamed;		/* read as handle_stream_build reads, and unchanged since */
+	uint64		word;			/* the storage's journal word then */
+	TransactionId xmax;			/* the snapshot read under, to tell what other snapshots see */
+	uint32		xcnt;
+	TransactionId *xip;
 	MemoryContext memory;
 	HTAB	   *by_handle;		/* HandleMapping */
 	HTAB	   *by_digest;		/* HandleDigest */
@@ -288,6 +296,23 @@ handle_local_write(const RootKey *key, CommandId cid)
 {
 	HandleVersion *entry = handle_version_entry(key->space, key->file, true);
 
+	/*
+	 * Readers of other backends notice the commit by the storage's word, and
+	 * this backend's deltas of the storage, which note the write, no longer
+	 * hold only what a snapshot read.
+	 */
+	journal_touch(MyDatabaseId, key->space, key->file, cid);
+	if (handle_deltas)
+	{
+		HASH_SEQ_STATUS status;
+		HandleDelta *delta;
+
+		hash_seq_init(&status, handle_deltas);
+		while ((delta = hash_seq_search(&status)) != NULL)
+			if (delta->key.key.space == key->space && delta->key.key.file == key->file)
+				delta->streamed = false;
+	}
+
 	if (entry->space != key->space || entry->file != key->file || entry->version == 0)
 	{
 		entry->space = key->space;
@@ -329,6 +354,82 @@ handle_same_view(const HandleDelta *delta, const Visibility *now, const RootKey 
 	return !entry || entry->version == 0 || entry->last_cid < delta->seen.cid;
 }
 
+/* Whether this transaction changed |key|'s storage's journal or handles. */
+static bool
+handle_storage_touched(const RootKey *key)
+{
+	for (int i = 0; i < journal_touched_count; i++)
+		if (journal_touched[i].space == key->space && journal_touched[i].file == key->file)
+			return true;
+	return false;
+}
+
+/*
+ * Read |key|'s delta under the latest snapshot, as journal_stream_build reads
+ * a stream: false when a commit to the storage is under way, or this
+ * transaction changed it, so that the delta would hold uncommitted rows.
+ */
+static bool
+handle_stream_build(HandleDelta *delta, const RootKey *key)
+{
+	uint64		word = pg_atomic_read_u64(journal_word(key->space, key->file));
+	Snapshot	latest;
+	uint32		n;
+
+	if ((word & JOURNAL_WORD_COMMITTERS) || handle_storage_touched(key))
+		return false;
+	pg_memory_barrier();
+	latest = RegisterSnapshot(GetLatestSnapshot());
+	if (latest->suboverflowed)
+	{
+		UnregisterSnapshot(latest);
+		return false;
+	}
+	handle_delta_load(delta, latest);
+	n = latest->xcnt + latest->subxcnt;
+	delta->xip = MemoryContextAlloc(delta->memory, Max(n, 1) * sizeof(TransactionId));
+	memcpy(delta->xip, latest->xip, latest->xcnt * sizeof(TransactionId));
+	memcpy(delta->xip + latest->xcnt, latest->subxip, latest->subxcnt * sizeof(TransactionId));
+	delta->xcnt = n;
+	delta->xmax = latest->xmax;
+	UnregisterSnapshot(latest);
+	delta->word = word;
+	delta->streamed = true;
+	return true;
+}
+
+/*
+ * Whether |delta|, as handle_stream_build read it, holds what |snapshot|
+ * sees: no handle of the storage committed since, and this transaction
+ * changed none; and an MVCC snapshot sees every transaction the read saw
+ * committed, as journal_stream_covers decides. The latest state sees them all.
+ */
+static bool
+handle_stream_serves(const HandleDelta *delta, const RootKey *key, Snapshot snapshot)
+{
+	if (!delta->loaded || !delta->streamed || handle_storage_touched(key) ||
+		pg_atomic_read_u64(journal_word(key->space, key->file)) != delta->word)
+		return false;
+	if (!snapshot || !IsMVCCSnapshot(snapshot))
+		return true;
+	if (snapshot->snapshot_type != SNAPSHOT_MVCC || snapshot->suboverflowed ||
+		TransactionIdPrecedes(snapshot->xmax, delta->xmax))
+		return false;
+	for (uint32 i = 0; i < snapshot->xcnt + snapshot->subxcnt; i++)
+	{
+		TransactionId xid = i < snapshot->xcnt ? snapshot->xip[i] : snapshot->subxip[i - snapshot->xcnt];
+		bool		running = false;
+
+		if (!TransactionIdPrecedes(xid, delta->xmax))
+			continue;
+		for (uint32 j = 0; j < delta->xcnt && !running; j++)
+			running = TransactionIdEquals(delta->xip[j], xid);
+		if (!running)
+			return false;
+	}
+	return true;
+}
+
 /* The cached delta of |key| as |snapshot| sees it, reloaded if anything moved. */
 static struct HandleDelta *
 handle_delta_get(const RootKey *key, Snapshot snapshot)
@@ -355,12 +456,18 @@ handle_delta_get(const RootKey *key, Snapshot snapshot)
 		memset(((char *) delta) + sizeof(HandleDeltaKey), 0, sizeof(*delta) - sizeof(HandleDeltaKey));
 		delta->memory = AllocSetContextCreate(CacheMemoryContext, "prolly handle delta", ALLOCSET_SMALL_SIZES);
 	}
+	if (handle_stream_serves(delta, key, snapshot))
+		return delta;
 	visibility_capture(snapshot, &seen);
 	if (delta->loaded &&
 		((delta->local_version == handle_local_version_of(key) && visibility_equal(&delta->seen, &seen)) ||
 		 handle_same_view(delta, &seen, key)))
 		return delta;
-	handle_delta_load(delta, snapshot);
+	if (!handle_stream_build(delta, key) || !handle_stream_serves(delta, key, snapshot))
+	{
+		handle_delta_load(delta, snapshot);
+		delta->streamed = false;
+	}
 	delta->seen = seen;
 	delta->local_version = handle_local_version_of(key);
 	return delta;
