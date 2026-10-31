@@ -1146,7 +1146,7 @@ compare_edit_order(const void *a, const void *b)
  * stream (|all|), else from the table's content as it was before the stream.
  */
 static void
-journal_apply_index(Relation index, PLStore *store, PLTree *tree, const JournalEntries *entries,
+journal_apply_index(Relation table, Relation index, PLStore *store, PLTree *tree, const JournalEntries *entries,
 					const JournalEntries *all, const PLTree *content)
 {
 	PLEdit	   *edits = palloc(Max(entries->count, 1) * sizeof(PLEdit));
@@ -1180,7 +1180,11 @@ journal_apply_index(Relation index, PLStore *store, PLTree *tree, const JournalE
 			}
 		}
 		initStringInfo(&key);
-		dg_index_entry_key(index, row, entry->digest, &key);
+		if (!dg_index_entry_key(table, index, row, entry->digest, &key))
+		{
+			pfree(key.data);
+			continue;
+		}
 		edits[n].key = (PLSlice) {(uint8 *) key.data, key.len};
 		deltas[n] = entry->added ? 1 : -1;
 		rows[n] = row;
@@ -1491,7 +1495,7 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 						dg_release(table_state);
 					return;
 				}
-				journal_apply_index(rel, s->store, &tree, &rest, &entries, &content);
+				journal_apply_index(table, rel, s->store, &tree, &rest, &entries, &content);
 				if (table_state)
 					dg_release(table_state);
 			}
@@ -1517,7 +1521,7 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 					dg_release(table_state);
 				return;
 			}
-			journal_apply_index(rel, s->store, &tree, &entries, &entries, &content);
+			journal_apply_index(table, rel, s->store, &tree, &entries, &entries, &content);
 			if (table_state)
 				dg_release(table_state);
 		}

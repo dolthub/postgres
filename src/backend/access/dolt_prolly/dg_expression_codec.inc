@@ -207,7 +207,7 @@ schema_expression_bind(CatalogView *view, Oid relation, const char *name,
 		 * definition's view.
 		 */
 		CatalogViewSwitch(view);
-		if (attribute >= 0)
+		if (attribute != -1)
 			schema_expression_gucs();
 		if (attribute > 0)
 		{
@@ -230,6 +230,13 @@ schema_expression_bind(CatalogView *view, Oid relation, const char *name,
 			else
 				result = cookDefault(pstate, raw, attr->atttypid, attr->atttypmod, NameStr(attr->attname), 0);
 		}
+		else if (attribute == -2 || attribute == -3)
+		{
+			result = transformExpr(pstate, copyObject(raw), attribute == -2 ? EXPR_KIND_INDEX_EXPRESSION : EXPR_KIND_INDEX_PREDICATE);
+			if (attribute == -3)
+				result = coerce_to_boolean(pstate, result, "WHERE");
+			assign_expr_collations(pstate, result);
+		}
 		else if (attribute < 0)
 		{
 			result = transformExpr(pstate, copyObject(raw), EXPR_KIND_ALTER_COL_TRANSFORM);
@@ -241,7 +248,7 @@ schema_expression_bind(CatalogView *view, Oid relation, const char *name,
 			result = coerce_to_boolean(pstate, result, "CHECK");
 			assign_expr_collations(pstate, result);
 		}
-		(void) schema_expression_check(result, attribute < 0 ? (void *) pstate : NULL);
+		(void) schema_expression_check(result, attribute == -1 ? (void *) pstate : NULL);
 	}
 	PG_FINALLY();
 	{
