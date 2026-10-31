@@ -2189,10 +2189,16 @@ state_json(const char *revision)
 	}
 	return metadata(child(resolve(revision), 1), "database");
 }
+static bool diff_table_data_changed(const char *from, const char *to,
+                                    const char *name, bool explicit_table);
+
 Datum
 dolt_diff_summary(PG_FUNCTION_ARGS)
 {
 	char *from, *to, *fromrev, *torev, *table;
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	SPITupleTable *result;
+	uint64 count, row;
 	int			nest = begin_api();
 
 	diff_revision_arguments(fcinfo, &fromrev, &torev, &table);
@@ -2206,10 +2212,34 @@ dolt_diff_summary(PG_FUNCTION_ARGS)
 			table = "";
 	}
 
-	run("WITH a AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence','aggregate','operator','cast')),b AS (SELECT v FROM jsonb_array_elements($2::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence','aggregate','operator','cast')),d AS (SELECT a.v av,b.v bv FROM a FULL JOIN b ON a.v->>'name'=b.v->>'name' AND a.v->>'kind'=b.v->>'kind') SELECT coalesce(av->>'name',''),coalesce(bv->>'name',''),CASE WHEN av IS NULL THEN 'added' WHEN bv IS NULL THEN 'dropped' ELSE 'modified' END,CASE WHEN coalesce(av->>'kind',bv->>'kind')='table' THEN (av->>'content') IS DISTINCT FROM (bv->>'content') ELSE (av->>'schema') IS DISTINCT FROM (bv->>'schema') END,CASE WHEN coalesce(av->>'kind',bv->>'kind')='table' THEN (av->>'schema') IS DISTINCT FROM (bv->>'schema') ELSE av IS NULL OR bv IS NULL END FROM d WHERE ((av->>'content') IS DISTINCT FROM (bv->>'content') OR (av->>'schema') IS DISTINCT FROM (bv->>'schema')) AND ($3::text IS NULL OR coalesce(av->>'name',bv->>'name')=$3) ORDER BY coalesce(av->>'name',bv->>'name') COLLATE \"C\"", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(from), CStringGetTextDatum(to), table ? CStringGetTextDatum(table) : (Datum) 0), table ? NULL : "  n", true);
+	run("WITH a AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence','aggregate','operator','cast')),b AS (SELECT v FROM jsonb_array_elements($2::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence','aggregate','operator','cast')),d AS (SELECT a.v av,b.v bv FROM a FULL JOIN b ON a.v->>'name'=b.v->>'name' AND a.v->>'kind'=b.v->>'kind') SELECT coalesce(av->>'name',''),coalesce(bv->>'name',''),CASE WHEN av IS NULL THEN 'added' WHEN bv IS NULL THEN 'dropped' ELSE 'modified' END,CASE WHEN coalesce(av->>'kind',bv->>'kind')='table' THEN (av->>'content') IS DISTINCT FROM (bv->>'content') ELSE (av->>'schema') IS DISTINCT FROM (bv->>'schema') END,CASE WHEN coalesce(av->>'kind',bv->>'kind')='table' THEN (av->>'schema') IS DISTINCT FROM (bv->>'schema') ELSE av IS NULL OR bv IS NULL END,coalesce(av->>'kind',bv->>'kind') FROM d WHERE ((av->>'content') IS DISTINCT FROM (bv->>'content') OR (av->>'schema') IS DISTINCT FROM (bv->>'schema')) AND ($3::text IS NULL OR coalesce(av->>'name',bv->>'name')=$3) ORDER BY coalesce(av->>'name',bv->>'name') COLLATE \"C\"", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(from), CStringGetTextDatum(to), table ? CStringGetTextDatum(table) : (Datum) 0), table ? NULL : "  n", true);
 	if (table && SPI_processed > 1)
 		ereport(ERROR, (errcode(ERRCODE_AMBIGUOUS_ALIAS), errmsg("ambiguous table name: %s", table)));
-	return_rows(fcinfo, nest);
+	result = SPI_tuptable;
+	count = SPI_processed;
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+	for (row = 0; row < count; row++)
+	{
+		Datum values[5];
+		bool nulls[5];
+		char *kind = SPI_getvalue(result->vals[row], result->tupdesc, 6);
+		int column;
+
+		for (column = 0; column < 5; column++)
+			values[column] = SPI_getbinval(result->vals[row], result->tupdesc, column + 1, &nulls[column]);
+
+		if (!strcmp(kind, "table"))
+		{
+			char *name = TextDatumGetCString(values[0]);
+
+			if (!*name)
+				name = TextDatumGetCString(values[1]);
+			values[3] = BoolGetDatum(diff_table_data_changed(fromrev, torev, name, table != NULL));
+		}
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	end_api(nest);
 	return (Datum) 0;
 }
 
