@@ -144,7 +144,6 @@ extern TM_Result dg_record_delete(Relation rel, const char *branch, int64 id, Co
 								  bool changing_part, TM_FailureData *tmfd, int64 *next);
 
 /* An index entry's key for |row|, as the index AM encodes it. */
-extern bool dg_index_row_matches(Relation table, Relation index, PLSlice row);
 extern bool dg_index_row_key(Relation table, Relation index, PLSlice row, StringInfo key, bool *nullkey);
 extern bool dg_index_entry_key(Relation table, Relation index, PLSlice row, PLHash digest, StringInfo key);
 

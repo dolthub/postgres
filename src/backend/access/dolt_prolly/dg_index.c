@@ -125,12 +125,6 @@ key_digest(Relation index, PLSlice key, PLHash *digest)
 	return i + 2 == key.len;
 }
 
-/*
- * The index entry key for table row |row| with digest |digest|: each key
- * column as a null tag and escaped canonical bytes, then the escaped digest.
- * *prefix receives the length of the key-column part, and *nullkey whether
- * any key column is null.
- */
 /* Use the same expression evaluator as native index insertion. */
 static void
 index_values(Relation index, TupleTableSlot *slot, Datum *values, bool *nulls)
@@ -160,8 +154,8 @@ index_values(Relation index, TupleTableSlot *slot, Datum *values, bool *nulls)
 	}
 }
 
-bool
-dg_index_row_matches(Relation table, Relation index, PLSlice row)
+static bool
+index_row_matches(Relation table, Relation index, PLSlice row)
 {
 	List *predicate;
 	EState *estate;
@@ -194,7 +188,7 @@ dg_index_row_key(Relation table, Relation index, PLSlice row, StringInfo key, bo
 	Datum values[INDEX_MAX_KEYS];
 	bool nulls[INDEX_MAX_KEYS];
 
-	if (!dg_index_row_matches(table, index, row))
+	if (!index_row_matches(table, index, row))
 		return false;
 	if (!heap_attisnull(index->rd_indextuple, Anum_pg_index_indexprs, NULL))
 	{
@@ -236,6 +230,12 @@ dg_index_row_key(Relation table, Relation index, PLSlice row, StringInfo key, bo
 	return true;
 }
 
+/*
+ * The index entry key for table row |row| with digest |digest|: each key
+ * column as a null tag and escaped canonical bytes, then the escaped digest.
+ * *prefix receives the length of the key-column part, and *nullkey whether
+ * any key column is null.
+ */
 static bool
 index_entry(Relation table, Relation index, PLSlice row, PLSlice digest, StringInfo key, size_t *prefix, bool *nullkey)
 {
@@ -966,13 +966,23 @@ matches(IndexScanDesc scan, TupleTableSlot *slot)
 	int			i;
 	Datum values[INDEX_MAX_KEYS];
 	bool nulls[INDEX_MAX_KEYS];
+	bool expressions = !heap_attisnull(scan->indexRelation->rd_indextuple, Anum_pg_index_indexprs, NULL);
 
-	index_values(scan->indexRelation, slot, values, nulls);
+	if (expressions)
+		index_values(scan->indexRelation, slot, values, nulls);
 	for (i = 0; i < scan->numberOfKeys; i++)
 	{
 		ScanKey		key = &scan->keyData[i];
-		bool		null = nulls[key->sk_attno - 1];
-		Datum		value = values[key->sk_attno - 1];
+		bool		null;
+		Datum		value;
+
+		if (expressions)
+		{
+			null = nulls[key->sk_attno - 1];
+			value = values[key->sk_attno - 1];
+		}
+		else
+			value = slot_getattr(slot, scan->indexRelation->rd_index->indkey.values[key->sk_attno - 1], &null);
 
 		if (key->sk_flags & SK_SEARCHNULL)
 		{

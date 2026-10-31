@@ -33,6 +33,7 @@ for my $journal ('off', 'on') {
  is(sql(q{SET enable_seqscan=off; SET enable_bitmapscan=off; SELECT id FROM t WHERE live AND lower(label)='alpha'}), '3', "$journal updates remove and add membership");
  is(sql(q{SET enable_seqscan=off; SET enable_indexscan=off; SELECT id FROM t WHERE a+b IN (5,9) ORDER BY id}), "1\n2\n3", "$journal bitmap expression qualification");
  sql(q{DELETE FROM t WHERE id=3; INSERT INTO t VALUES (5,2,3,'ALpha',true); SELECT dolt_commit('-Am','indexed base'); SELECT dolt_branch('feature')});
+ $node->restart;
  is(sql(q{SET enable_seqscan=off; SELECT b FROM t WHERE live AND lower(label)='alpha'}), '3', "$journal included column after catalog rebinding");
  sql(q{SELECT dolt_checkout('feature'); INSERT INTO t VALUES (6,7,8,'Gamma',true); SELECT dolt_commit('-Am','feature')});
  sql(q{INSERT INTO t VALUES (7,8,9,'Delta',true); SELECT dolt_commit('-Am','main'); SELECT dolt_merge('feature')});
