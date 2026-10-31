@@ -254,10 +254,17 @@ provider_row_namespace(Oid catalog, HeapTuple tuple)
 }
 
 /* Whether |namespace| is a user schema, one each branch defines for itself. */
+/*
+ * Sessions' temporary namespaces, as of the shared base. They belong to the
+ * server, as built-in namespaces do: no branch defines them.
+ */
+static List *provider_temp_namespaces;
+
 static bool
 provider_user_namespace(Oid namespace)
 {
-	return namespace == PG_PUBLIC_NAMESPACE || namespace >= FirstNormalObjectId;
+	return namespace == PG_PUBLIC_NAMESPACE ||
+		(namespace >= FirstNormalObjectId && !list_member_oid(provider_temp_namespaces, namespace));
 }
 
 /* The object a native catalog row describes, for rows that describe another's part. */
@@ -359,6 +366,29 @@ provider_shared_base(void)
 		list_free(provider_server_namespaces);
 		provider_server_namespaces = NIL;
 		provider_server_object_count = 0;
+		list_free(provider_temp_namespaces);
+		provider_temp_namespaces = NIL;
+		{
+			Relation	rel = table_open(NamespaceRelationId, AccessShareLock);
+			TableScanDesc scan = table_beginscan_catalog(rel, 0, NULL);
+			HeapTuple	tuple;
+
+			while ((tuple = heap_getnext(scan, ForwardScanDirection)))
+			{
+				Form_pg_namespace form = (Form_pg_namespace) GETSTRUCT(tuple);
+
+				if (!strncmp(NameStr(form->nspname), "pg_temp_", strlen("pg_temp_")) ||
+					!strncmp(NameStr(form->nspname), "pg_toast_temp_", strlen("pg_toast_temp_")))
+				{
+					MemoryContext saved = MemoryContextSwitchTo(TopMemoryContext);
+
+					provider_temp_namespaces = lappend_oid(provider_temp_namespaces, form->oid);
+					MemoryContextSwitchTo(saved);
+				}
+			}
+			table_endscan(scan);
+			table_close(rel, AccessShareLock);
+		}
 		for (int i = 0; i < lengthof(provider_catalogs); i++)
 		{
 			Relation	rel = table_open(provider_catalogs[i], AccessShareLock);

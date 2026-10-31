@@ -1057,6 +1057,15 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 
 		if (RELKIND_HAS_TABLE_AM(relkind) && !OidIsValid(accessMethodId))
 			accessMethodId = get_table_am_oid(default_table_access_method, false);
+
+		/*
+		 * A temporary table belongs to its session, not to a branch, and so
+		 * is never versioned: where tables default to prolly storage, it
+		 * defaults to heap.
+		 */
+		if (stmt->relation->relpersistence == RELPERSISTENCE_TEMP &&
+			accessMethodId == DOLT_PROLLY_TABLE_AM_OID)
+			accessMethodId = HEAP_TABLE_AM_OID;
 	}
 
 	/*

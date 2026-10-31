@@ -121,5 +121,10 @@ sql(q{DROP VIEW IF EXISTS seq_view});
 
 # ---- not versioned ----
 is(sql(q{CREATE TEMP VIEW tv AS SELECT 1 AS one; SELECT one FROM tv}),'1','temporary views stay native');
+is(sql(q{CREATE TEMP TABLE tt(x int); INSERT INTO tt VALUES (1); CREATE TEMP TABLE tt2 AS SELECT x + 1 AS y FROM tt;
+SELECT string_agg(c.relname || ':' || a.amname, ',' ORDER BY c.relname) FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.relname IN ('tt', 'tt2')}),
+  'tt:heap,tt2:heap','temporary tables default to heap where tables default to prolly storage');
+is(sql(q{SELECT count(*) FROM dolt_status WHERE table_name LIKE 'tt%'}),'0','and are no branch change');
+fails(q{CREATE TEMP TABLE tt3(x int) USING dolt_prolly_table},qr/temporary\/unlogged tables/,'a temporary prolly table is still refused');
 $node->stop;
 done_testing();
