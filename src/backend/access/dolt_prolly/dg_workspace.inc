@@ -1634,7 +1634,7 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 	}
 	if (pending.target)
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						errmsg("a merge or cherry-pick is already in progress")));
+						errmsg("a merge, cherry-pick or revert is already in progress")));
 	if (!revisions)
 		unsupported(revert ? "dolt_revert requires a revision" : "dolt_cherry_pick requires a revision");
 	if (!revert && list_length(revisions) != 1)
@@ -1703,8 +1703,9 @@ apply_targets:
 			children[5] = PointerGetDatum(series_head);
 			for_each_from(queued, targets, foreach_current_index(lc) + 1)
 				children[next++] = PointerGetDatum(lfirst(queued));
-			/* Retain the same conflict graph used by merge. Squash suppresses
-			 * a second commit parent after resolution: this is a cherry-pick. */
+			/* Reuse merge conflict resolution without a second commit parent.
+			 * Retain the series origin and queue as graph links so restart,
+			 * conflict edits and object retention cannot lose them. */
 			initStringInfo(&state);
 			appendStringInfoString(&state, "{\"format\":\"DGMERGE1\",\"squash\":true,\"operation\":");
 			escape_json(&state, operation_name);
