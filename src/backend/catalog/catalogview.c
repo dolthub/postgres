@@ -971,10 +971,10 @@ lookup_object(Oid handle)
 		CatalogView *view = CatalogViewCurrent();
 
 		if (view)
-			foreach_ptr(CatalogViewObject, object, view->shared)
+			foreach_ptr(CatalogViewObject, bound, view->shared)
 			{
-				if (object->handle == handle)
-					return object;
+				if (bound->handle == handle)
+					return bound;
 			}
 		return NULL;
 	}
@@ -1502,6 +1502,76 @@ typedef struct CatalogChange
 	bool		aborted;
 } CatalogChange;
 
+/* A row's state after a view's changes: its last tuple, or NULL if deleted. */
+typedef struct ChangedRow
+{
+	ItemPointerData tid;
+	HeapTuple	tuple;
+	bool		existing;		/* replaces a row of the rows changed */
+} ChangedRow;
+
+/*
+ * |tuples|, rows of |catalog|, with |changes| applied in order: those that
+ * apply, which are not aborted and, unless |limit| is invalid, made before
+ * command |limit|. A changed row keeps its place; a new one is added after the
+ * rest, in the order rows were first made. One pass over the rows, whatever
+ * the number of changes.
+ */
+static List *
+apply_changes(List *tuples, List *changes, Oid catalog, CommandId limit)
+{
+	HTAB	   *rows = NULL;
+	List	   *added = NIL;
+	List	   *result = NIL;
+
+	foreach_ptr(CatalogChange, change, changes)
+	{
+		ChangedRow *row;
+		bool		found;
+
+		if (change->aborted || change->catalog != catalog ||
+			(limit != InvalidCommandId && change->command >= limit))
+			continue;
+		if (!rows)
+		{
+			HASHCTL		ctl = {0};
+
+			ctl.keysize = sizeof(ItemPointerData);
+			ctl.entrysize = sizeof(ChangedRow);
+			ctl.hcxt = CurrentMemoryContext;
+			rows = hash_create("catalog view changed rows", 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		}
+		row = hash_search(rows, &change->tid, HASH_ENTER, &found);
+		if (!found)
+		{
+			row->existing = false;
+			added = lappend(added, row);
+		}
+		row->tuple = change->tuple;
+	}
+	if (!rows)
+		return list_copy(tuples);
+	foreach_ptr(HeapTupleData, tuple, tuples)
+	{
+		ChangedRow *row = hash_search(rows, &tuple->t_self, HASH_FIND, NULL);
+
+		if (!row)
+			result = lappend(result, tuple);
+		else
+		{
+			row->existing = true;
+			if (row->tuple)
+				result = lappend(result, row->tuple);
+		}
+	}
+	foreach_ptr(ChangedRow, row, added)
+		if (!row->existing && row->tuple)
+			result = lappend(result, row->tuple);
+	hash_destroy(rows);
+	list_free(added);
+	return result;
+}
+
 static void
 mutation_subxact(SubXactEvent event, SubTransactionId id, SubTransactionId parent, void *arg)
 {
@@ -1570,44 +1640,12 @@ CatalogViewSetMutationValidator(CatalogView *view, void (*validator) (Relation, 
 static List *
 mutation_self_rows(CatalogView *view, Oid catalog)
 {
-	ListCell   *lc;
-	List	   *effective = NIL;
-
-	foreach(lc, view->baseline)
+	foreach_ptr(CatalogViewRows, rows, view->baseline)
 	{
-		CatalogViewRows *rows = lfirst(lc);
-
 		if (rows->catalog == catalog)
-			effective = list_copy(rows->tuples);
+			return apply_changes(rows->tuples, view->changes, catalog, InvalidCommandId);
 	}
-	foreach(lc, view->changes)
-	{
-		CatalogChange *change = lfirst(lc);
-		List	   *next = NIL;
-		ListCell   *tc;
-		bool		found = false;
-
-		if (change->aborted || change->catalog != catalog)
-			continue;
-		foreach(tc, effective)
-		{
-			HeapTuple	tuple = lfirst(tc);
-
-			if (ItemPointerEquals(&tuple->t_self, &change->tid))
-			{
-				found = true;
-				if (change->tuple)
-					next = lappend(next, change->tuple);
-			}
-			else
-				next = lappend(next, tuple);
-		}
-		if (!found && change->tuple)
-			next = lappend(next, change->tuple);
-		list_free(effective);
-		effective = next;
-	}
-	return effective;
+	return apply_changes(NIL, view->changes, catalog, InvalidCommandId);
 }
 
 
@@ -1740,36 +1778,9 @@ refresh_mutation(CatalogView *view)
 	{
 		CatalogViewRows *base = lfirst(lc);
 		CatalogViewRows *rows = palloc(sizeof(*rows));
-		ListCell   *change_cell;
 
 		*rows = *base;
-		rows->tuples = list_copy(base->tuples);
-		foreach(change_cell, view->changes)
-		{
-			CatalogChange *change = lfirst(change_cell);
-			List	   *updated = NIL;
-			ListCell   *tuple_cell;
-			bool		found = false;
-
-			if (change->aborted || change->catalog != rows->catalog || change->command >= GetCurrentCommandId(false))
-				continue;
-			foreach(tuple_cell, rows->tuples)
-			{
-				HeapTuple	tuple = lfirst(tuple_cell);
-
-				if (ItemPointerEquals(&tuple->t_self, &change->tid))
-				{
-					found = true;
-					if (change->tuple)
-						updated = lappend(updated, change->tuple);
-				}
-				else
-					updated = lappend(updated, tuple);
-			}
-			if (!found && change->tuple)
-				updated = lappend(updated, change->tuple);
-			rows->tuples = updated;
-		}
+		rows->tuples = apply_changes(base->tuples, view->changes, base->catalog, GetCurrentCommandId(false));
 		catalogs = lappend(catalogs, rows);
 	}
 	view->catalogs = catalogs;
