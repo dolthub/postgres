@@ -1998,19 +1998,58 @@ return_rows(FunctionCallInfo fcinfo, int nest)
 	}
 	end_api(nest);
 }
+/* A merge changed a table only if its result differs from every parent.
+ * A table carried unchanged from either side is not a new table edit. */
+static bool
+log_tables_changed(bytea *commit, List *tables)
+{
+	bytea *parent = object_child(commit, 2);
+	char *current;
+	ListCell *lc;
+
+	if (!parent)
+		return false;
+	current = metadata(child(commit, 1), "database");
+	foreach(lc, tables)
+	{
+		bool changed = true;
+
+		for (int p = 2; (parent = object_child(commit, p)) != NULL; p++)
+		{
+			char *previous = metadata(child(parent, 1), "database");
+			char *name = resolve_object_argument(lfirst(lc), current, previous, false);
+
+			if (!name)
+			{
+				changed = false;
+				break;
+			}
+			run("SELECT (SELECT jsonb_build_array(v->'schema',v->'content') FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind'='table' AND v->>'name'=$3) IS DISTINCT FROM (SELECT jsonb_build_array(v->'schema',v->'content') FROM jsonb_array_elements($2::jsonb->'members') v WHERE v->>'kind'='table' AND v->>'name'=$3)", 3, VC_TYPES(TEXTOID,TEXTOID,TEXTOID), VC_ARGS(CStringGetTextDatum(current),CStringGetTextDatum(previous),CStringGetTextDatum(name)), NULL, true);
+			if (!DatumGetBool(cell(0, 1)))
+			{
+				changed = false;
+				break;
+			}
+		}
+		if (changed)
+			return true;
+	}
+	return false;
+}
+
 Datum
 dolt_log(PG_FUNCTION_ARGS)
 {
-	int			n,
-				i,
-				limit = -1;
-	char	  **args = arguments(fcinfo, &n),
-			   *revision = "HEAD";
-	bool		parents = false,
-				signature = false,
-				revset = false;
-	bytea	   *hash;
-	int			nest = begin_api();
+	int n, i, limit = -1, minparents = 0, ni = 0, ne = 0;
+	char **args = arguments(fcinfo, &n);
+	char *decoration = "short";
+	List *revisions = NIL, *omitted = NIL, *tables = NIL;
+	ListCell *lc;
+	bool parents = false, signature = false, merges = false;
+	bool negate = false, symmetric = false;
+	Datum *included = palloc(sizeof(Datum) * (n + 2));
+	Datum *excluded = palloc(sizeof(Datum) * (n + 2));
+	int nest = begin_api();
 
 	for (i = 0; i < n; i++)
 	{
@@ -2018,31 +2057,121 @@ dolt_log(PG_FUNCTION_ARGS)
 			parents = true;
 		else if (!strcmp(args[i], "--show-signature"))
 			signature = true;
-		else if (!strcmp(args[i], "-n") || !strcmp(args[i], "--max-count"))
+		else if (!strcmp(args[i], "--merges"))
+			merges = true;
+		else if (!strcmp(args[i], "--tables"))
 		{
+			char *raw, *name, *save;
+
 			if (++i == n)
-				unsupported("missing log count");
-			limit = pg_strtoint32(args[i]);
-			if (limit < 0)
+				unsupported("missing log table names");
+			raw = pstrdup(args[i]);
+			for (name = strtok_r(raw, ",", &save); name; name = strtok_r(NULL, ",", &save))
+				tables = lappend(tables, name);
+			if (!tables)
+				unsupported("empty log table names");
+		}
+		else if (!strcmp(args[i], "--not"))
+		{
+			if (i + 1 == n || args[i + 1][0] == '-')
+				unsupported("missing excluded log revision");
+			negate = true;
+		}
+		else if (!strcmp(args[i], "-n") || !strcmp(args[i], "--max-count") ||
+				 !strcmp(args[i], "--min-parents") || !strcmp(args[i], "--decorate"))
+		{
+			char *option = args[i];
+
+			if (++i == n)
+				unsupported("missing log option value");
+			if (!strcmp(option, "--decorate"))
+				decoration = args[i];
+			else if (!strcmp(option, "--min-parents"))
+				minparents = pg_strtoint32(args[i]);
+			else
+				limit = pg_strtoint32(args[i]);
+			if (minparents < 0 || (strcmp(option, "--min-parents") && strcmp(option, "--decorate") && limit < 0))
 				unsupported("negative log count");
 		}
-		else if (args[i][0] == '-' || revset)
+		else if (args[i][0] == '-')
 			unsupported(args[i]);
-		else
+		else if (negate || args[i][0] == '^')
 		{
-			revision = args[i];
-			revset = true;
+			char *rev = args[i] + (!negate && args[i][0] == '^');
+
+			if (rev[0] == '^' || strstr(rev, ".."))
+				unsupported("invalid excluded log revision");
+			omitted = lappend(omitted, rev);
 		}
+		else
+			revisions = lappend(revisions, args[i]);
 	}
-	if (!read_ref(branch_ref("heads")).target && !strcmp(revision, "HEAD"))
+	if (strcmp(decoration, "short") && strcmp(decoration, "full") &&
+		strcmp(decoration, "no") && strcmp(decoration, "auto"))
+		unsupported("invalid log decoration");
+
+	/* A range is a complete revision set, not another starting point. */
+	foreach(lc, revisions)
 	{
-		run("SELECT NULL::text WHERE false", 0, NULL, NULL, NULL, true);
-		return_rows(fcinfo, nest);
-		return (Datum) 0;
+		char *rev = lfirst(lc);
+		char *dots = strstr(rev, "..");
+
+		if (dots)
+		{
+			char *left = pnstrdup(rev, dots - rev);
+			char *right = dots + (dots[2] == '.' ? 3 : 2);
+
+			if (list_length(revisions) != 1 || omitted || strstr(right, ".."))
+				unsupported("log range cannot be combined with other revisions");
+			symmetric = dots[2] == '.';
+			if (symmetric)
+				included[ni++] = PointerGetDatum(resolve(*left ? left : "HEAD"));
+			else
+				excluded[ne++] = PointerGetDatum(resolve(*left ? left : "HEAD"));
+			included[ni++] = PointerGetDatum(resolve(*right ? right : "HEAD"));
+		}
+		else
+			included[ni++] = PointerGetDatum(resolve(rev));
 	}
-	hash = resolve(revision);
-	run("WITH RECURSIVE walk(h) AS (SELECT $1::bytea UNION SELECT unnest(o.objchildren[2:]) FROM walk w JOIN pg_dolt_object_visible o ON o.objhash=w.h), commits AS (SELECT o.*,convert_from(o.objpayload,'UTF8')::jsonb m FROM walk w JOIN pg_dolt_object_visible o ON o.objhash=w.h WHERE o.objkind='commit'), refs AS (SELECT r.refname,CASE WHEN o.objkind='tag' THEN o.objchildren[1] ELSE r.reftarget END target FROM pg_dolt_ref r JOIN pg_dolt_object_visible o ON o.objhash=r.reftarget WHERE r.refname LIKE 'heads/%' OR r.refname LIKE 'tags/%') SELECT pg_catalog.dolt_hash_encode(c.objhash),m->>'committer',m->>'email',timestamp '2000-01-01' + (m->>'date_us')::bigint * interval '1 microsecond',m->>'message',(m->>'height')::bigint,CASE WHEN $2 THEN COALESCE((SELECT string_agg(pg_catalog.dolt_hash_encode(h),', ' ORDER BY ord) FROM unnest(c.objchildren[2:]) WITH ORDINALITY u(h,ord)),'') ELSE NULL END,COALESCE((SELECT CASE WHEN c.objhash=(SELECT reftarget FROM pg_dolt_ref WHERE refname='heads/' || pg_catalog.active_branch()) THEN 'HEAD -> ' ELSE '' END || string_agg(CASE WHEN r.refname LIKE 'tags/%' THEN 'tag: '||substr(r.refname,6) ELSE substr(r.refname,7) END,', ' ORDER BY r.refname COLLATE \"C\") FROM refs r WHERE r.target=c.objhash),''),CASE WHEN $3 THEN ''::text ELSE NULL END,m->>'author',m->>'author_email',timestamp '2000-01-01' + (m->>'author_date_us')::bigint * interval '1 microsecond' FROM commits c ORDER BY (m->>'height')::bigint DESC,(m->>'date_us')::bigint DESC,c.objhash LIMIT NULLIF($4,-1)", 4, VC_TYPES(BYTEAOID, BOOLOID, BOOLOID, INT4OID), VC_ARGS(PointerGetDatum(hash), BoolGetDatum(parents), BoolGetDatum(signature), Int32GetDatum(limit)), NULL, true);
-	return_rows(fcinfo, nest);
+	foreach(lc, omitted)
+		excluded[ne++] = PointerGetDatum(resolve(lfirst(lc)));
+
+	if (!revisions && !omitted)
+	{
+		if (!read_ref(branch_ref("heads")).target)
+		{
+			run("SELECT NULL::text WHERE false", 0, NULL, NULL, NULL, true);
+			return_rows(fcinfo, nest);
+			return (Datum) 0;
+		}
+		included[ni++] = PointerGetDatum(resolve("HEAD"));
+	}
+	run("WITH RECURSIVE walk(h,side) AS (SELECT h,ord FROM unnest($1::bytea[]) WITH ORDINALITY u(h,ord) UNION SELECT unnest(o.objchildren[2:]),w.side FROM walk w JOIN pg_dolt_object_visible o ON o.objhash=w.h), excluded(h) AS (SELECT unnest($5::bytea[]) UNION SELECT unnest(o.objchildren[2:]) FROM excluded w JOIN pg_dolt_object_visible o ON o.objhash=w.h), selected AS (SELECT h FROM walk GROUP BY h HAVING NOT $6 OR count(DISTINCT side)=1), commits AS (SELECT o.*,convert_from(o.objpayload,'UTF8')::jsonb m FROM selected w JOIN pg_dolt_object_visible o ON o.objhash=w.h WHERE o.objkind='commit' AND NOT EXISTS (SELECT FROM excluded e WHERE e.h=w.h) AND cardinality(o.objchildren)-1 >= $7), refs AS (SELECT r.refname,CASE WHEN o.objkind='tag' THEN o.objchildren[1] ELSE r.reftarget END target FROM pg_dolt_ref r JOIN pg_dolt_object_visible o ON o.objhash=r.reftarget WHERE r.refname LIKE 'heads/%' OR r.refname LIKE 'tags/%') SELECT pg_catalog.dolt_hash_encode(c.objhash),m->>'committer',m->>'email',timestamp '2000-01-01' + (m->>'date_us')::bigint * interval '1 microsecond',m->>'message',(m->>'height')::bigint,CASE WHEN $2 THEN COALESCE((SELECT string_agg(pg_catalog.dolt_hash_encode(h),', ' ORDER BY ord) FROM unnest(c.objchildren[2:]) WITH ORDINALITY u(h,ord)),'') ELSE NULL END,CASE WHEN $8='no' THEN '' ELSE COALESCE((SELECT CASE WHEN c.objhash=($1::bytea[])[1] THEN 'HEAD -> ' ELSE '' END || string_agg(CASE WHEN r.refname LIKE 'tags/%' THEN 'tag: '||CASE WHEN $8='full' THEN 'refs/'||r.refname ELSE substr(r.refname,6) END ELSE CASE WHEN $8='full' THEN 'refs/'||r.refname ELSE substr(r.refname,7) END END,', ' ORDER BY r.refname COLLATE \"C\") FROM refs r WHERE r.target=c.objhash),'') END,CASE WHEN $3 THEN ''::text ELSE NULL END,m->>'author',m->>'author_email',timestamp '2000-01-01' + (m->>'author_date_us')::bigint * interval '1 microsecond' FROM commits c ORDER BY (m->>'height')::bigint DESC,(m->>'date_us')::bigint DESC,c.objhash LIMIT NULLIF($4,-1)", 8, VC_TYPES(BYTEAARRAYOID, BOOLOID, BOOLOID, INT4OID, BYTEAARRAYOID, BOOLOID, INT4OID, TEXTOID), VC_ARGS(PointerGetDatum(links(included, ni)), BoolGetDatum(parents), BoolGetDatum(signature), Int32GetDatum(tables ? -1 : limit), PointerGetDatum(links(excluded, ne)), BoolGetDatum(symmetric), Int32GetDatum(merges ? 2 : minparents), CStringGetTextDatum(decoration)), NULL, true);
+	if (tables)
+	{
+		SPITupleTable *rows = SPI_tuptable;
+		uint64 count = SPI_processed;
+		int emitted = 0;
+		ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+		InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+		for (uint64 r = 0; r < count && (limit < 0 || emitted < limit); r++)
+		{
+			Datum values[12];
+			bool nulls[12];
+			char *hash = SPI_getvalue(rows->vals[r], rows->tupdesc, 1);
+
+			if (!log_tables_changed(resolve(hash), tables))
+				continue;
+			for (int c = 0; c < 12; c++)
+				values[c] = SPI_getbinval(rows->vals[r], rows->tupdesc, c + 1, &nulls[c]);
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+			emitted++;
+		}
+		end_api(nest);
+	}
+	else
+		return_rows(fcinfo, nest);
 	return (Datum) 0;
 }
 static char *

@@ -1454,7 +1454,7 @@ CREATE VIEW pg_dolt_commit_visible AS
 REVOKE ALL ON pg_dolt_commit_visible FROM PUBLIC;
 
 CREATE VIEW dolt.log WITH (security_invoker=true) AS
-    SELECT * FROM pg_catalog.dolt_log();
+    SELECT * FROM pg_catalog.dolt_log('--parents', '--show-signature');
 CREATE VIEW dolt.branches WITH (security_invoker=true) AS
     SELECT * FROM pg_catalog.dolt_branches();
 CREATE VIEW dolt.remote_branches WITH (security_invoker=true) AS

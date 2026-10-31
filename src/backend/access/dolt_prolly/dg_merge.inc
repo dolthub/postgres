@@ -943,7 +943,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 			ff = 1;
 		}
 		else
-			commit = commit_object(database, head.target, theirs, message ? message : psprintf("Merge branch '%s'", revision), NULL, NULL, GetCurrentTimestamp());
+			commit = commit_object(database, head.target, theirs, message ? message : psprintf("Merge branch '%s' into %s", revision, dg_current_branch()), NULL, NULL, GetCurrentTimestamp());
 		move_ref(branch_ref("heads"), head, commit);
 	}
 	if (!database_same(newworking, database))
