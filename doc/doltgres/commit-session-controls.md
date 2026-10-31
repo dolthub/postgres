@@ -52,6 +52,23 @@ Qualified INSERT, UPDATE and DELETE targets use the named branch's catalog,
 constraints, defaults and triggers. Historical targets remain read-only.
 Qualified `AS OF 'HEAD'` resolves HEAD on the named branch, not the session's.
 
-The explicit multi-branch `dolt_commit` / `dolt_commit_all` interface is not yet
-implemented. It requires deciding whether to lift the outside-BEGIN restriction
-and introduce Dolt's implicit SQL-commit behavior.
+`dolt_commit()` and `dolt_commit_all()` commit the current SQL transaction,
+including when called inside BEGIN. Both require a standalone SELECT (or a
+supported scalar wrapper), never a per-row or nested invocation. Commit finishes
+through PostgreSQL's normal transaction path after delivering the result, before
+CommandComplete, without waiting for protocol Sync. A commit command delivers its
+whole result even if an extended-protocol Execute requests a limited fetch.
+
+`dolt_commit_all()` returns `(branch, hash)` rows in branch-name order for every
+dirty branch. `dolt_multi_branch_commit=on` makes `dolt_commit()` use the same set,
+returning only hash rows. Otherwise `dolt_commit()` rejects transactions with more
+than one dirty branch. With no dirty branches, the selected branch is used.
+`--skip-empty` returns no rows for unchanged branches; `--allow-empty` creates
+commits even there. Staged-only commits preserve unstaged working data and do not
+trigger an extra automatic version commit.
+
+Deferred constraints and holdable-cursor execution finish before root capture.
+Ref publication remains atomic: an error preparing any branch aborts the SQL
+transaction and leaves all HEADs unchanged. Native failed-transaction recovery
+requires ROLLBACK (or a suitable savepoint), unlike Dolt's retry-in-place behavior.
+Existing unsupported commit options such as `--amend` remain unsupported.
