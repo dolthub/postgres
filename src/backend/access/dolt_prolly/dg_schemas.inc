@@ -254,7 +254,9 @@ dolt_procedures_table(PG_FUNCTION_ARGS)
 
 /* ---- Administrative procedures ---- */
 
-/* Manifest objects are retained for history; there is nothing to collect. */
+/* Expire reflog observations as Dolt GC does. Manifest/chunk reclamation
+ * remains deferred: live revision handles and retained roots must be accounted
+ * for before deleting their objects. PostgreSQL keeps the session usable. */
 Datum
 dolt_gc(PG_FUNCTION_ARGS)
 {
@@ -265,13 +267,20 @@ dolt_gc(PG_FUNCTION_ARGS)
 	for (i = 0; i < n; i++)
 		if (strcmp(args[i], "--shallow") && strcmp(args[i], "-s") && strcmp(args[i], "--full") && strcmp(args[i], "--archive-level") && strcmp(args[i], "0") && strcmp(args[i], "1"))
 			unsupported(args[i]);
+	{
+		int nest = begin_api();
+
+		lock_workspace();
+		run("DELETE FROM pg_catalog.pg_dolt_reflog", 0, NULL, NULL, NULL, false);
+		end_api(nest);
+	}
 	PG_RETURN_INT64(0);
 }
 
 Datum
 dolt_gc_noargs(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_INT64(0);
+	return dolt_gc(fcinfo);
 }
 
 /* Dropped databases are removed by PostgreSQL immediately. */
