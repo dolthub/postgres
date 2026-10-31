@@ -947,7 +947,13 @@ dolt_merge(PG_FUNCTION_ARGS)
 		move_ref(branch_ref("heads"), head, commit);
 	}
 	if (!database_same(newworking, database))
+	{
 		replace_working(dg_current_branch(), newworking, NIL);
+		/* Disjoint object names can still meet through foreign keys. A
+		 * clean merge must not silently invalidate retained local rows. */
+		if (!conflicted)
+			validate_working_foreign_keys(dg_current_branch(), NULL);
+	}
 	move_ref(branch_ref("working"), read_ref(branch_ref("working")), newworking);
 
 	/*
