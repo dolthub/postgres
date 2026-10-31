@@ -99,12 +99,15 @@ is(sql(q{SELECT id,message FROM dolt_blame_test WHERE id=1}),'1|commit 3','main 
 sql(q{CREATE TABLE stat_schema(id int PRIMARY KEY,v int) USING dolt_prolly_table});
 sql(q{SELECT dolt_commit('-Am','empty statistics table')});
 is(sql(q{SELECT count(*) FROM dolt_diff_stat('HEAD~1','HEAD','stat_schema')}),'0','empty creation has no data statistics');
+is(sql(q{SELECT data_change,schema_change FROM dolt_diff_summary('HEAD~1','HEAD','stat_schema')}),'f|t','empty creation changes schema only');
 sql(q{INSERT INTO stat_schema VALUES(1,10),(2,20)});
 sql(q{SELECT dolt_commit('-Am','statistics rows')});
 sql(q{ALTER TABLE stat_schema ADD COLUMN extra int});
 is(sql(q{SELECT rows_unmodified,rows_modified,cells_added FROM dolt_diff_stat('HEAD','WORKING','stat_schema')}),'2|0|2','adding NULL column changes cells but not rows');
+is(sql(q{SELECT data_change,schema_change FROM dolt_diff_summary('HEAD','WORKING','stat_schema')}),'f|t','NULL column changes schema only');
 sql(q{UPDATE stat_schema SET extra=7 WHERE id=1});
 is(sql(q{SELECT rows_unmodified,rows_modified,cells_added,cells_modified FROM dolt_diff_stat('HEAD','WORKING','stat_schema')}),'1|1|2|1','non-NULL added value modifies one row and counts structural cells');
+is(sql(q{SELECT data_change,schema_change FROM dolt_diff_summary('HEAD','WORKING','stat_schema')}),'t|t','non-NULL new column changes data and schema');
 sql(q{SELECT dolt_commit('-Am','statistics new column')});
 sql(q{UPDATE stat_schema SET extra=NULL WHERE id=1});
 sql(q{SELECT dolt_commit('-Am','clear added column')});
@@ -114,6 +117,7 @@ sql(q{CREATE TABLE stat_empty(id int PRIMARY KEY) USING dolt_prolly_table});
 sql(q{SELECT dolt_commit('-Am','empty to drop')});
 sql(q{DROP TABLE stat_empty});
 is(sql(q{SELECT count(*) FROM dolt_diff_stat('HEAD','WORKING','stat_empty')}),'0','empty deletion has no data statistics');
+is(sql(q{SELECT data_change,schema_change FROM dolt_diff_summary('HEAD','WORKING','stat_empty')}),'f|t','empty deletion changes schema only');
 
 sql(q{ALTER TABLE stat_schema DROP CONSTRAINT stat_schema_pkey; ALTER TABLE stat_schema ADD PRIMARY KEY(id,v)});
 my ($stat_status,$stat_out,$stat_err)=$node->psql('postgres',q{SELECT * FROM dolt_diff_stat('HEAD','WORKING','stat_schema')});
@@ -124,5 +128,12 @@ is($stat_status,0,'all-table statistics continue after key change');
 is($stat_out,'0|0','unavailable key-change statistics use zero row');
 like($stat_err,qr/WARNING:.*primary key set changed/,'all-table key change emits warning');
 
+($stat_status,$stat_out,$stat_err)=$node->psql('postgres',q{SELECT * FROM dolt_diff_summary('HEAD','WORKING','stat_schema')});
+isnt($stat_status,0,'named summary rejects changed primary key');
+like($stat_err,qr/primary key set changed/,'summary key diagnostic');
+($stat_status,$stat_out,$stat_err)=$node->psql('postgres',q{SELECT count(*) FROM dolt_diff_summary('HEAD','WORKING') WHERE to_table_name='public.stat_schema'});
+is($stat_status,0,'all-table summary continues after key change');
+is($stat_out,'0','all-table summary omits incompatible key change');
+like($stat_err,qr/WARNING:.*primary key set changed/,'all-table summary warns on key change');
 $node->stop;
 done_testing();
