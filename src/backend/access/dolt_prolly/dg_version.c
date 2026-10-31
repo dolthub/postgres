@@ -2002,7 +2002,7 @@ return_rows(FunctionCallInfo fcinfo, int nest)
 static bool
 log_tables_changed(bytea *commit, List *tables)
 {
- bytea *parent = child(commit, 2);
+ bytea *parent = object_child(commit, 2);
  char *current;
  ListCell *lc;
 
@@ -2013,7 +2013,7 @@ log_tables_changed(bytea *commit, List *tables)
  {
   bool changed = true;
 
-  for (int p = 2; (parent = child(commit, p)) != NULL; p++)
+  for (int p = 2; (parent = object_child(commit, p)) != NULL; p++)
   {
    char *previous = metadata(child(parent, 1), "database");
    char *name = resolve_object_argument(lfirst(lc), current, previous, false);
