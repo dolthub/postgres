@@ -76,6 +76,9 @@ $churn->query_safe(q{SELECT count(*) FROM t});
 my $before=$churn->query_safe($memory);
 $churn->query_safe(qq{CREATE TEMP TABLE churn_$_(x int) USING heap; SELECT count(*) FROM t}) for 1..20;
 cmp_ok($churn->query_safe($memory)-$before,'<',20*1024*1024,'replaced catalogs do not accumulate in a session');
+$before=$churn->query_safe($memory);
+$churn->query_safe(qq{CREATE TABLE versioned_churn_$_(x int PRIMARY KEY)}) for 1..40;
+cmp_ok($churn->query_safe($memory)-$before,'<',20*1024*1024,'nor do the catalogs of the roots versioned DDL replaces');
 $churn->quit;
 
 # One namespace for uniqueness, across server and branch objects.

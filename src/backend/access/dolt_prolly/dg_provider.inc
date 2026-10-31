@@ -1979,9 +1979,13 @@ provider_lookup(const char *branch, bytea *database)
 			return entry->view;
 		}
 	}
+	/*
+	 * A branch's newer view replaces its views of earlier roots; a revision's
+	 * view is only ever replaced by one of the same revision.
+	 */
 	for (entry = providers; entry; entry = entry->next)
-		if (!strcmp(entry->database, key) &&
-			(branch ? entry->branch && !strcmp(entry->branch, branch) : !entry->branch))
+		if (branch ? entry->branch && !strcmp(entry->branch, branch) :
+			!entry->branch && !strcmp(entry->database, key))
 			entry->superseded = true;
 	view = CatalogViewCreate(branch ? psprintf("%s@%s", key, branch) : key);
 	if (branch)
