@@ -572,4 +572,7 @@
   opcfamily => 'dolt_prolly_index/dolt_integer_ops', opcintype => 'int4', opcdefault => 'f' },
 { opcmethod => 'dolt_prolly_index', opcname => 'text_ops',
   opcfamily => 'dolt_prolly_index/dolt_text_ops', opcintype => 'text', opcdefault => 'f' },
+
+{ opcmethod => 'dolt_prolly_index', opcname => 'varchar_ops',
+  opcfamily => 'dolt_prolly_index/dolt_text_ops', opcintype => 'text', opcdefault => 'f' },
 ]

@@ -1153,6 +1153,15 @@ journal_apply_index(Relation table, Relation index, PLStore *store, PLTree *tree
 	int64	   *deltas = palloc(Max(entries->count, 1) * sizeof(int64));
 	PLSlice    *rows = palloc(Max(entries->count, 1) * sizeof(PLSlice));
 	int			n = 0;
+	bool opened = false;
+
+	/* Bound index folds normally need only the table locator. Expressions
+	 * additionally need its canonical descriptor to decode journal rows. */
+	if (!table && (RelationGetIndexExpressions(index) != NIL || RelationGetIndexPredicate(index) != NIL))
+	{
+		table = relation_open(index->rd_index->indrelid, NoLock);
+		opened = true;
+	}
 
 	for (int i = 0; i < entries->count; i++)
 	{
@@ -1228,6 +1237,8 @@ journal_apply_index(Relation table, Relation index, PLStore *store, PLTree *tree
 	pfree(edits);
 	pfree(deltas);
 	pfree(rows);
+	if (opened)
+		relation_close(table, NoLock);
 }
 
 /* ---------------------------------------------------------------------------
