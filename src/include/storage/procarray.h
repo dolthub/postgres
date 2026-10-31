@@ -57,6 +57,7 @@ extern bool TransactionIdIsActive(TransactionId xid);
 extern TransactionId GetOldestNonRemovableTransactionId(Relation rel);
 extern TransactionId GetOldestTransactionIdConsideredRunning(void);
 extern TransactionId GetOldestActiveTransactionId(void);
+extern TransactionId GetOldestXminIgnoring(uint8 ignore);
 extern TransactionId GetOldestSafeDecodingTransactionId(bool catalogOnly);
 extern void GetReplicationHorizons(TransactionId *xmin, TransactionId *catalog_xmin);
 
