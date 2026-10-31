@@ -766,6 +766,9 @@ dg_catalog_rename(ParseState *pstate, Node *statement)
 		native_mutation_view = saved_mutation;
 		SetUserIdAndSecContext(caller, security);
 		CatalogViewSwitch(previous);
+		if (CatalogViewIsProvisional(view))
+			CatalogViewRetireMutation(view);
+		CatalogViewRelease(view);
 		if (pushed)
 			PopActiveSnapshot();
 	}

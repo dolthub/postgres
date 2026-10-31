@@ -79,6 +79,12 @@ cmp_ok($churn->query_safe($memory)-$before,'<',20*1024*1024,'replaced catalogs d
 $before=$churn->query_safe($memory);
 $churn->query_safe(qq{CREATE TABLE versioned_churn_$_(x int PRIMARY KEY)}) for 1..40;
 cmp_ok($churn->query_safe($memory)-$before,'<',20*1024*1024,'nor do the catalogs of the roots versioned DDL replaces');
+$churn->query_safe(q{CREATE FUNCTION churn_trigger() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'; CREATE FUNCTION churn_f() RETURNS int LANGUAGE sql AS 'SELECT 1'});
+$before=$churn->query_safe($memory);
+$churn->query_safe(qq{CREATE VIEW churn_view_$_ AS SELECT 1 AS x; CREATE TYPE churn_type_$_ AS (a int);
+CREATE TRIGGER churn_trigger_$_ BEFORE INSERT ON versioned_churn_$_ FOR EACH ROW EXECUTE FUNCTION churn_trigger();
+ALTER FUNCTION churn_f() COST $_; ALTER TABLE versioned_churn_$_ RENAME COLUMN x TO y}) for 1..20;
+cmp_ok($churn->query_safe($memory)-$before,'<',20*1024*1024,'nor do the catalogs view, type, trigger, routine and rename DDL works in');
 $churn->quit;
 
 # One namespace for uniqueness, across server and branch objects.

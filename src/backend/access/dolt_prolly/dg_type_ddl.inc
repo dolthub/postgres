@@ -52,11 +52,14 @@ alters_versioned_type(Node *statement)
 	return type >= FirstDurableObjectId;
 }
 
-/* Whether a pg_type row is a user type of its own, not a derived array or row type. */
+/*
+ * Whether a pg_type row is a versioned type of its own, not a derived array or
+ * row type, nor a server type listed beside the branch's.
+ */
 static bool
 type_versioned_row(Form_pg_type type)
 {
-	if (type->oid < FirstNormalObjectId)
+	if (type->oid < FirstDurableObjectId)
 		return false;
 	if (type->typtype == TYPTYPE_ENUM || type->typtype == TYPTYPE_DOMAIN || type->typtype == TYPTYPE_RANGE)
 		return true;
@@ -345,6 +348,9 @@ type_ddl(ParseState *pstate, Node *statement)
 		native_mutation_view = saved_mutation;
 		SetUserIdAndSecContext(caller, security);
 		CatalogViewSwitch(previous);
+		if (CatalogViewIsProvisional(view))
+			CatalogViewRetireMutation(view);
+		CatalogViewRelease(view);
 	}
 	PG_END_TRY();
 }
