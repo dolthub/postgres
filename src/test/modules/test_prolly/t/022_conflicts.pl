@@ -50,7 +50,7 @@ is(sql(q{SELECT from_root_ish=dolt_hashof('b2'),base_id,base_col1,our_id,our_col
 is(sql(q{SELECT our_v,base_cardinality,our_cardinality,their_cardinality FROM public.dolt_conflicts_bag}),'1|1|2|2','keyless conflict rows');
 is(sql(q{SELECT * FROM dolt.constraint_violations}),'cv|2','unique collision reported as violations');
 is(sql(q{SELECT violation_type,pk,col1,violation_info::text FROM dolt_constraint_violations_cv ORDER BY pk}),"unique index|1|1|{\"Columns\":[\"col1\"],\"Name\":\"cv_col1_key\"}\nunique index|2|1|{\"Columns\":[\"col1\"],\"Name\":\"cv_col1_key\"}",'typed violation rows');
-is(sql(q{SELECT * FROM dolt.status ORDER BY 1}),"public.bag|f|conflict\npublic.cv|f|constraint violation\npublic.test|f|conflict",'status shows conflicts and violations');
+is(sql(q{SELECT * FROM dolt.status ORDER BY 1,3}),"public.bag|f|conflict\npublic.cv|f|constraint violation\npublic.test|f|conflict\npublic.test|f|modified",'status includes working edits alongside conflicts and violations');
 is(sql(q{SELECT unmerged_tables FROM dolt.merge_status}),'bag, cv, test','merge status lists unmerged tables');
 is(sql(q{SELECT * FROM cv ORDER BY pk}),'1|1','violating table keeps the destination rows');
 fails(q{SELECT dolt_commit('-m','blocked')},qr/unresolved merge conflicts/,'conflicts block commit');
@@ -62,7 +62,7 @@ fails(q{DELETE FROM dolt_conflicts_test WHERE our_id=1},qr/WHERE clause is not s
 fails(q{SELECT dolt_commit('-m','blocked')},qr/unresolved constraint violations/,'violations block commit');
 sql(q{DELETE FROM public.dolt_constraint_violations_cv});
 is(sql(q{SELECT count(*) FROM dolt_constraint_violations}),'0','deleting violation rows clears them');
-is(sql(q{SELECT * FROM dolt.status ORDER BY 1}),"public.test|f|modified",'resolved rows are working changes to stage');
+is(sql(q{SELECT * FROM dolt.status ORDER BY 1,3}),"public.test|f|modified",'resolved rows are working changes to stage');
 sql(q{SELECT dolt_commit('-Am','merged')});
 is(sql(q{SELECT is_merging FROM dolt.merge_status}),'f','merge finished');
 is(sql(q{SELECT count(*) FROM dolt_conflicts_test}),'0','no conflicts after merge');
