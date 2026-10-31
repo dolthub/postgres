@@ -1162,13 +1162,26 @@ branch_management(char **args, int n)
 		if (!strcmp(args[i], "-d") || !strcmp(args[i], "--delete"))
 			del = true;
 		else if (!strcmp(args[i], "-D"))
-			del = true;
+			del = force = true;
 		else if (!strcmp(args[i], "-m") || !strcmp(args[i], "--move"))
 			rename = true;
 		else if (!strcmp(args[i], "-c") || !strcmp(args[i], "--copy"))
 			copy = true;
 		else if (!strcmp(args[i], "-f") || !strcmp(args[i], "--force"))
 			force = true;
+		else if (args[i][0] == '-' && args[i][1] && args[i][1] != '-')
+		{
+			for (const char *flag = args[i] + 1; *flag; flag++)
+				switch (*flag)
+				{
+					case 'd': del = true; break;
+					case 'D': del = force = true; break;
+					case 'm': rename = true; break;
+					case 'c': copy = true; break;
+					case 'f': force = true; break;
+					default: unsupported(args[i]);
+				}
+		}
 		else if (args[i][0] == '-')
 			unsupported(args[i]);
 		else
@@ -1176,9 +1189,25 @@ branch_management(char **args, int n)
 	}
 	if (!del && !rename && !copy)
 	{
-		if (force)
-			unsupported("-f without -d, -m or -c");
-		return false;
+		if (!force)
+			return false;
+		if (list_length(names) < 1 || list_length(names) > 2)
+			unsupported("-f requires a branch name and optional start point");
+		lock_workspace();
+		ensure_repository();
+		{
+			char *name = linitial(names);
+			bytea *start;
+
+			valid_name(name);
+			start = resolve(list_length(names) == 2 ? lsecond(names) : "HEAD");
+			/* Reset both workspace refs and local root bindings. Old roots
+			 * tagged with this branch name must not survive its replacement. */
+			delete_branch_refs(name);
+			advance_snapshot();
+			create_branch_refs(name, start, NULL);
+		}
+		return true;
 	}
 	if ((del ? 1 : 0) + (rename ? 1 : 0) + (copy ? 1 : 0) > 1)
 		unsupported("combining -d, -m and -c");
