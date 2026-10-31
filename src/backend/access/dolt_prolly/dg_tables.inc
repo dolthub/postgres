@@ -84,8 +84,8 @@ dolt_branches(PG_FUNCTION_ARGS)
 
 /* dolt_status: staged (HEAD vs STAGED) and unstaged (STAGED vs WORKING)
  * table and schema changes, preceded by tables with unresolved conflicts. */
-Datum
-dolt_status(PG_FUNCTION_ARGS)
+static Datum
+dolt_status_impl(FunctionCallInfo fcinfo, bool include_ignored)
 {
 	int			nest = begin_api();
 	char	   *head,
@@ -93,10 +93,12 @@ dolt_status(PG_FUNCTION_ARGS)
 			   *working,
 			   *merge = "{\"conflicts\":[]}";
 	VersionRef	pending;
+	List *ignored;
 
 	head = head_state();
 	staged = staged_state();
 	working = working_state();
+	ignored = ignored_untracked_tables(working, staged);
 	pending = read_ref(branch_ref("merge"));
 	if (pending.target)
 		merge = metadata(pending.target, "merge");
@@ -123,8 +125,41 @@ dolt_status(PG_FUNCTION_ARGS)
 		"SELECT name,staged,status FROM (SELECT 0 AS grp,name,false AS staged,CASE WHEN name IN (SELECT v->>'table' FROM jsonb_array_elements(coalesce($4::jsonb->'schema_conflicts','[]'::jsonb)) v) THEN 'schema conflict' WHEN name IN (SELECT v->>'table' FROM jsonb_array_elements($4::jsonb->'conflicts') v) THEN 'conflict' ELSE 'constraint violation' END::text AS status FROM conflicts"
 		" UNION ALL SELECT grp,name,staged,status FROM tables) x ORDER BY grp,name COLLATE \"C\"",
 		4, VC_TYPES(TEXTOID, TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(head), CStringGetTextDatum(staged), CStringGetTextDatum(working), CStringGetTextDatum(merge)), NULL, true);
-	return_rows(fcinfo, nest);
+	{
+		ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+		uint64 row;
+
+		InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+		for (row = 0; row < SPI_processed; row++)
+		{
+			Datum values[4];
+			bool nulls[4] = {false, false, false, false};
+			bool is_ignored = name_selected(ignored, strcell(row, 1));
+			int col;
+
+			if (is_ignored && !include_ignored)
+				continue;
+			for (col = 0; col < 3; col++)
+				values[col] = SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc,
+										 col + 1, &nulls[col]);
+			values[3] = BoolGetDatum(is_ignored);
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+		}
+	}
+	end_api(nest);
 	return (Datum) 0;
+}
+
+Datum
+dolt_status(PG_FUNCTION_ARGS)
+{
+	return dolt_status_impl(fcinfo, false);
+}
+
+Datum
+dolt_status_ignored(PG_FUNCTION_ARGS)
+{
+	return dolt_status_impl(fcinfo, true);
 }
 
 /* dolt_merge_status: the pending merge of the session branch. */

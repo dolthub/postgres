@@ -1497,6 +1497,7 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 	bool abort_pick = false, continue_pick = false;
 	int64 conflict_counts[3] = {0, 0, 0};
 	bytea	   *commit = NULL;
+	Capture live;
 	Datum		values[4];
 	bool		nulls[4] = {false, false, false, false};
 
@@ -1535,14 +1536,14 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 			goto done;
 
 		validate_working_foreign_keys(dg_current_branch(), NULL);
-		database = capture_visible().hash;
+		database = staged_capture(&live);
 		head = read_ref(branch_ref("heads"));
 		commit = cherry_pick_commit(database, head.target, child(pending.target, 2),
 				author ? author : json_value(json, "author_override"),
 				email ? email : json_value(json, "email_override"));
 		move_ref(branch_ref("heads"), head, commit);
 		move_ref(branch_ref("staged"), read_ref(branch_ref("staged")), database);
-		move_ref(branch_ref("working"), read_ref(branch_ref("working")), database);
+		move_ref(branch_ref("working"), read_ref(branch_ref("working")), live.hash);
 		finish_merge();
 		advance_snapshot();
 		goto done;
@@ -1557,6 +1558,15 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 							errmsg("no cherry-pick to abort")));
 		working = child(pending.target, 4);
 		staged = child(pending.target, 5);
+		live = capture_visible();
+		/* Ignored untracked data is outside the operation. Preserve edits
+		 * and deletions made even after the conflict was published. */
+		{
+			List *ignored = ignored_untracked_tables(metadata(working, "database"), metadata(staged, "database"));
+			List *now_ignored = ignored_untracked_tables(live.json, metadata(staged, "database"));
+
+			working = compose_database(working, live.hash, list_concat(ignored, now_ignored));
+		}
 		replace_working(dg_current_branch(), working, NIL);
 		move_ref(branch_ref("working"), read_ref(branch_ref("working")), working);
 		move_ref(branch_ref("staged"), read_ref(branch_ref("staged")), staged);
@@ -1571,7 +1581,7 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 	if (!revert && list_length(revisions) != 1)
 		unsupported("cherry-picking more than one commit");
 	head = read_ref(branch_ref("heads"));
-	if (!database_same(capture_visible().hash, child(head.target, 1)) || !database_same(read_ref(branch_ref("staged")).target, child(head.target, 1)))
+	if (!database_same(staged_capture(&live), child(head.target, 1)) || !database_same(read_ref(branch_ref("staged")).target, child(head.target, 1)))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("cannot %s with uncommitted changes", revert ? "revert" : "cherry-pick")));
 	foreach(lc, revisions)
 	{
@@ -1579,7 +1589,8 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 				   *parent,
 				   *targetdb,
 				   *parentdb,
-				   *database;
+				   *database,
+				   *newworking;
 		char	   *meta = metadata(target, "commit"),
 				   *message;
 		StringInfoData conflicts,
@@ -1594,6 +1605,7 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 		targetdb = child(target, 1);
 		parentdb = child(parent, 1);
 		head = read_ref(branch_ref("heads"));
+		live = capture_visible();
 		initStringInfo(&conflicts);
 		initStringInfo(&violations);
 		initStringInfo(&schema_conflicts);
@@ -1601,10 +1613,14 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 			merge_databases(targetdb, child(head.target, 1), parentdb, &conflicts, &violations, &schema_conflicts);
 		else
 			merge_databases(parentdb, child(head.target, 1), targetdb, &conflicts, &violations, &schema_conflicts);
+		database = capture_visible().hash;
+		newworking = carry_workspace_changes(child(head.target, 1), live.hash, database);
+		if (!database_same(newworking, database))
+			replace_working(dg_current_branch(), newworking, NIL);
 		if (conflicts.len || violations.len || schema_conflicts.len)
 		{
 			StringInfoData state;
-			bytea *before = child(head.target, 1);
+			bytea *before = live.hash;
 
 			if (revert)
 				ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -1622,17 +1638,16 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 			appendStringInfo(&state, ",\"conflicts\":[%s],\"violations\":[%s],\"schema_conflicts\":[%s]}", conflicts.data, violations.data, schema_conflicts.data);
 			move_ref(branch_ref("merge"), pending,
 					 put("merge", state.data, VC_ARGS(PointerGetDatum(head.target), PointerGetDatum(target), PointerGetDatum(parent), PointerGetDatum(before), PointerGetDatum(read_ref(branch_ref("staged")).target)), 5));
-			move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture_visible().hash);
+			move_ref(branch_ref("working"), read_ref(branch_ref("working")), newworking);
 			cherry_pick_conflict_counts(state.data, conflict_counts);
 			goto done;
 		}
-		database = capture_visible().hash;
 		message = revert ? psprintf("Revert \"%s\"", json_value(meta, "message")) : json_value(meta, "message");
 		commit = revert ? commit_object(database, head.target, NULL, message, author, email, GetCurrentTimestamp()) :
 			cherry_pick_commit(database, head.target, target, author, email);
 		move_ref(branch_ref("heads"), head, commit);
 		move_ref(branch_ref("staged"), read_ref(branch_ref("staged")), database);
-		move_ref(branch_ref("working"), read_ref(branch_ref("working")), database);
+		move_ref(branch_ref("working"), read_ref(branch_ref("working")), newworking);
 		advance_snapshot();
 	}
 done:
