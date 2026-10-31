@@ -68,5 +68,6 @@ tests += {
     't/050_concurrent_writes.pl',
     't/051_log_ranges.pl',
     't/052_diff_ranges.pl',
+      't/053_diff_views.pl',
   ]},
 }
