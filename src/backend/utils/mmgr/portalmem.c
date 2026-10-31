@@ -673,8 +673,24 @@ HoldPortal(Portal portal)
  * Returns true if any portals changed state (possibly causing user-defined
  * code to be run), false if not.
  */
+static bool PreCommit_PortalsInternal(bool isPrepare, bool keep_active);
+
 bool
 PreCommit_Portals(bool isPrepare)
+{
+	return PreCommit_PortalsInternal(isPrepare, false);
+}
+
+/* A standalone version-commit SELECT is still executing. Finish other cursors
+ * before capturing its database root, but retain the active executor's owners. */
+bool
+PreCommit_PortalsForVersionCommit(void)
+{
+	return PreCommit_PortalsInternal(false, true);
+}
+
+static bool
+PreCommit_PortalsInternal(bool isPrepare, bool keep_active)
 {
 	bool		result = false;
 	HASH_SEQ_STATUS status;
@@ -685,6 +701,9 @@ PreCommit_Portals(bool isPrepare)
 	while ((hentry = (PortalHashEnt *) hash_seq_search(&status)) != NULL)
 	{
 		Portal		portal = hentry->portal;
+
+		if (keep_active && portal->status == PORTAL_ACTIVE)
+			continue;
 
 		/*
 		 * There should be no pinned portals anymore. Complain if someone

@@ -13,7 +13,7 @@ dg_catalog_routine_namespace(Oid namespaceid)
 	if (!routine_creating)
 		return namespaceid;
 	namespaceid = CatalogViewNamespace(CatalogViewCurrent(), namespaceid);
-	if (!CatalogViewObjectContext(namespaceid))
+	if (!CatalogViewBinds(CatalogViewCurrent(), namespaceid))
 		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_SCHEMA),
 						errmsg("routine target schema is not present in the selected revision")));
 	return namespaceid;

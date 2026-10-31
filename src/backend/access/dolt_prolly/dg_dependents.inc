@@ -10,7 +10,17 @@
  * independent of history; they are cached by definition hash, as
  * definitions are immutable. Routines are referred to by name without their
  * argument types, which covers every overload; a table's row type is
- * referred to as "type:" and the table's name.
+ * referred to as "type:" and the table's name. Operators outside pg_catalog
+ * are referred to as "operator:" and their qualified name.
+ *
+ * A root also lists the extensions whose objects its definitions use, by name
+ * and without version, so that a server reading it can say up front which it
+ * lacks:
+ *
+ *   "extensions": ["hstore", "postgis"]
+ *
+ * The list is derived from the references, so it too is independent of
+ * history, and absent when no definition uses an extension.
  */
 
 typedef struct ReferenceCacheEntry
@@ -60,6 +70,9 @@ references_walker(Node *node, List **references)
 	}
 	if (IsA(node, TypeName) && (name = references_name(((TypeName *) node)->names)))
 		references_add(references, "type", name);
+	/* An operator outside pg_catalog is written OPERATOR(schema.op). */
+	if (IsA(node, A_Expr) && (name = references_name(((A_Expr *) node)->name)))
+		references_add(references, "operator", name);
 	if (IsA(node, TypeCast))
 	{
 		TypeCast   *cast = (TypeCast *) node;
@@ -316,6 +329,65 @@ schema_references(const char *kind, bytea *schema)
 	return entry->references;
 }
 
+/*
+ * Add to a database root's |json| the extensions owning any server object
+ * that |edges|, its dependency edges, refer to. Extension members are matched
+ * by the keys references use; an operator may be named with its name quoted
+ * or not.
+ */
+static const char *
+database_extensions(const char *json, const char *edges)
+{
+	run("WITH r AS (SELECT DISTINCT e->>0 k FROM jsonb_array_elements($2::jsonb) e),"
+		"m AS (SELECT x.extname,"
+		" CASE d.classid WHEN 'pg_proc'::regclass THEN ARRAY['routine:'||format('%I.%I',n.nspname,p.proname)]"
+		" WHEN 'pg_type'::regclass THEN ARRAY['type:'||format('%I.%I',tn.nspname,t.typname)]"
+		" WHEN 'pg_class'::regclass THEN ARRAY['table:'||format('%I.%I',cn.nspname,c.relname),'type:'||format('%I.%I',cn.nspname,c.relname)]"
+		" ELSE ARRAY['operator:'||format('%I.%I',o_n.nspname,o.oprname),'operator:'||format('%I.%s',o_n.nspname,o.oprname)] END keys"
+		" FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_extension x ON x.oid=d.refobjid"
+		" LEFT JOIN pg_catalog.pg_proc p ON d.classid='pg_proc'::regclass AND p.oid=d.objid LEFT JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace"
+		" LEFT JOIN pg_catalog.pg_type t ON d.classid='pg_type'::regclass AND t.oid=d.objid LEFT JOIN pg_catalog.pg_namespace tn ON tn.oid=t.typnamespace"
+		" LEFT JOIN pg_catalog.pg_class c ON d.classid='pg_class'::regclass AND c.oid=d.objid LEFT JOIN pg_catalog.pg_namespace cn ON cn.oid=c.relnamespace"
+		" LEFT JOIN pg_catalog.pg_operator o ON d.classid='pg_operator'::regclass AND o.oid=d.objid LEFT JOIN pg_catalog.pg_namespace o_n ON o_n.oid=o.oprnamespace"
+		" WHERE d.refclassid='pg_extension'::regclass AND d.deptype='e'"
+		" AND d.classid IN ('pg_proc'::regclass,'pg_type'::regclass,'pg_class'::regclass,'pg_operator'::regclass))"
+		"SELECT CASE WHEN count(*)=0 THEN $1 ELSE jsonb_set($1::jsonb,'{extensions}',jsonb_agg(extname ORDER BY extname COLLATE \"C\"))::text END"
+		" FROM (SELECT DISTINCT m.extname FROM m JOIN r ON r.k=ANY(m.keys)) used",
+		2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), CStringGetTextDatum(edges)), NULL, true);
+	return strcell(0, 1);
+}
+
+/*
+ * Refuse to read database root |database| on a server without an extension
+ * it uses: its definitions could not bind their extension objects.
+ */
+static void
+database_check_extensions(bytea *database)
+{
+	bytea	   *payload;
+	Jsonb	   *root;
+	JsonbValue	extensions;
+
+	if (!database || !dg_object_read(database, "database", NULL, &payload, NULL))
+		return;
+	root = DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(pnstrdup(VARDATA_ANY(payload), VARSIZE_ANY_EXHDR(payload)))));
+	if (!JB_ROOT_IS_OBJECT(root) ||
+		!getKeyJsonValueFromContainer(&root->root, "extensions", strlen("extensions"), &extensions) ||
+		extensions.type != jbvBinary)
+		return;
+	for (int i = 0; i < json_length(&extensions); i++)
+	{
+		char	   *name = json_item_text(&extensions, i);
+
+		if (!OidIsValid(get_extension_oid(name, true)))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("this revision of the database requires extension \"%s\", which is not installed", name),
+					 errdetail("Its definitions use objects of extension \"%s\".", name),
+					 errhint("Install it with CREATE EXTENSION %s.", quote_identifier(name))));
+	}
+}
+
 /* Add the dependency record of |members| to a database root's |json|. */
 static char *
 database_dependents(const char *json, Datum *members, int count)
@@ -358,6 +430,7 @@ database_dependents(const char *json, Datum *members, int count)
 		}
 	}
 	appendStringInfoChar(&edges, ']');
+	json = database_extensions(json, edges.data);
 	run("SELECT jsonb_set($1::jsonb,'{dependents}',COALESCE((SELECT jsonb_object_agg(r,d) FROM (SELECT e->>0 r,jsonb_agg(DISTINCT jsonb_build_array(e->>1,e->>2)) d FROM jsonb_array_elements($2::jsonb) e GROUP BY e->>0) g),'{}'::jsonb))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), CStringGetTextDatum(edges.data)), NULL, true);
 	return strcell(0, 1);
 }
@@ -372,4 +445,229 @@ database_referrers(const char *json, const char *kind, const char *name)
 	for (uint64 i = 0; i < SPI_processed; i++)
 		result = lappend(result, list_make2(strcell(i, 1), strcell(i, 2)));
 	return result;
+}
+
+/*
+ * The dependency-record key of server object |object|, such as
+ * "routine:public.crypt", or NULL for any other object. Definitions name a
+ * server's functions, operators and types, an extension's among them, as
+ * they name built-in ones, by qualified name.
+ */
+static char *
+server_object_reference(const ObjectAddress *object)
+{
+	CatalogView *previous;
+	char	   *result = NULL;
+
+	if (object->objectId < FirstNormalObjectId || object->objectId >= FirstDurableObjectId ||
+		(object->classId != ProcedureRelationId && object->classId != TypeRelationId &&
+		 object->classId != OperatorRelationId))
+		return NULL;
+	previous = CatalogViewSwitch(NULL);
+	PG_TRY();
+	{
+		if (object->classId == ProcedureRelationId)
+			result = psprintf("routine:%s", dg_qualified_name(get_namespace_name(get_func_namespace(object->objectId)),
+															  get_func_name(object->objectId)));
+		else if (object->classId == TypeRelationId)
+		{
+			HeapTuple	tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(object->objectId));
+
+			if (HeapTupleIsValid(tuple))
+			{
+				Form_pg_type type = (Form_pg_type) GETSTRUCT(tuple);
+
+				result = psprintf("type:%s", dg_qualified_name(get_namespace_name(type->typnamespace), NameStr(type->typname)));
+				ReleaseSysCache(tuple);
+			}
+		}
+		else
+		{
+			HeapTuple	tuple = SearchSysCache1(OPEROID, ObjectIdGetDatum(object->objectId));
+
+			if (HeapTupleIsValid(tuple))
+			{
+				Form_pg_operator op = (Form_pg_operator) GETSTRUCT(tuple);
+
+				result = psprintf("operator:%s", dg_qualified_name(get_namespace_name(op->oprnamespace), NameStr(op->oprname)));
+				ReleaseSysCache(tuple);
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+/* The target of ref |name|, read natively, or NULL. */
+static bytea *
+native_ref_target(const char *name)
+{
+	Relation	refs = table_open(DoltRefRelationId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	bytea	   *target = NULL;
+
+	ScanKeyInit(&key, Anum_pg_dolt_ref_refname, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(name));
+	scan = systable_beginscan(refs, DoltRefKeyIndexId, true, NULL, 1, &key);
+	if (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		bool		isnull;
+
+		target = DatumGetByteaPCopy(heap_getattr(tuple, Anum_pg_dolt_ref_reftarget, RelationGetDescr(refs), &isnull));
+	}
+	systable_endscan(scan);
+	table_close(refs, AccessShareLock);
+	return target;
+}
+
+/*
+ * The first referrer, as "kind name", of any of |references| in database
+ * object |database|, skipping referrers in namespace |except|; NULL if there
+ * is none.
+ */
+static char *
+database_referrer(bytea *database, char **references, int count, const char *except)
+{
+	bytea	   *payload;
+	Jsonb	   *root;
+	JsonbValue	dependents;
+	JsonbValue *found;
+
+	if (!database || !dg_object_read(database, "database", NULL, &payload, NULL))
+		return NULL;
+	root = DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(pnstrdup(VARDATA_ANY(payload), VARSIZE_ANY_EXHDR(payload)))));
+	found = JB_ROOT_IS_OBJECT(root) ? getKeyJsonValueFromContainer(&root->root, "dependents", strlen("dependents"), &dependents) : NULL;
+	if (!found || found->type != jbvBinary)
+		return NULL;
+	for (int i = 0; i < count; i++)
+	{
+		JsonbValue	referrers;
+
+		if (!references[i] ||
+			!getKeyJsonValueFromContainer(found->val.binary.data, references[i], strlen(references[i]), &referrers) ||
+			referrers.type != jbvBinary || !JsonContainerIsArray(referrers.val.binary.data))
+			continue;
+		for (int j = 0; j < json_length(&referrers); j++)
+		{
+			JsonbValue	referrer = json_element(&referrers, j);
+			char	   *name = json_item_text(&referrer, 1);
+
+			if (except && !strcmp(strVal(linitial(stringToQualifiedNameList(name, NULL))), except))
+				continue;
+			return psprintf("%s %s", json_item_text(&referrer, 0), name);
+		}
+	}
+	return NULL;
+}
+
+/*
+ * Refuse to drop namespace |name| on the session's branch while the branch's
+ * definitions outside it use server objects in it: those stay in it on every
+ * branch, and this branch would no longer have it.
+ */
+static void
+namespace_drop_check(const char *name)
+{
+	CatalogView *previous = CatalogViewSwitch(NULL);
+	List	   *objects = NIL;
+	char	  **references;
+	int			count = 0;
+	char	   *referrer;
+
+	PG_TRY();
+	{
+		Oid			namespace = get_namespace_oid(name, true);
+
+		if (OidIsValid(namespace))
+		{
+			Relation	depend = table_open(DependRelationId, AccessShareLock);
+			ScanKeyData keys[2];
+			SysScanDesc scan;
+			HeapTuple	tuple;
+
+			ScanKeyInit(&keys[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(NamespaceRelationId));
+			ScanKeyInit(&keys[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(namespace));
+			scan = systable_beginscan(depend, DependReferenceIndexId, true, NULL, 2, keys);
+			while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+			{
+				ObjectAddress *object = palloc(sizeof(*object));
+
+				ObjectAddressSet(*object, ((Form_pg_depend) GETSTRUCT(tuple))->classid, ((Form_pg_depend) GETSTRUCT(tuple))->objid);
+				objects = lappend(objects, object);
+			}
+			systable_endscan(scan);
+			table_close(depend, AccessShareLock);
+		}
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	if (!objects)
+		return;
+	references = palloc0_array(char *, list_length(objects));
+	foreach_ptr(ObjectAddress, object, objects)
+		references[count++] = server_object_reference(object);
+	if ((referrer = database_referrer(native_ref_target(psprintf("working/%s", dg_current_branch())), references, count, name)) != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+				 errmsg("cannot drop schema %s because other objects depend on it", name),
+				 errdetail("%s uses server objects in schema %s, which stay in it on every branch.", referrer, name),
+				 errhint("Change or drop the dependent objects on this branch first.")));
+}
+
+/*
+ * Refuse to drop an extension's function, operator or type while any
+ * branch's working schema names it: those definitions would bind nothing.
+ * Dropping an extension drops its members, so it is refused too. History may
+ * still name a dropped member; reading it then requires the extension, as
+ * reading a clone does. Versioned definitions on other branches cannot be
+ * dropped with it, so CASCADE does not help.
+ */
+void
+dg_catalog_check_drop(const ObjectAddress *objects, int count, const ObjectAddress *original)
+{
+	char	  **references = palloc0_array(char *, Max(count, 1));
+	int			n = 0;
+	Relation	refs;
+	SysScanDesc scan;
+	HeapTuple	tuple;
+
+	for (int i = 0; i < count; i++)
+		n += (references[i] = server_object_reference(&objects[i])) != NULL;
+	if (n == 0)
+		return;
+	refs = table_open(DoltRefRelationId, AccessShareLock);
+	scan = systable_beginscan(refs, InvalidOid, false, NULL, 0, NULL);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		bool		isnull;
+		char	   *name = TextDatumGetCString(heap_getattr(tuple, Anum_pg_dolt_ref_refname, RelationGetDescr(refs), &isnull));
+		char	   *referrer;
+
+		if (strncmp(name, "working/", strlen("working/")))
+			continue;
+		for (int i = 0; i < count; i++)
+		{
+			if (!references[i] ||
+				!(referrer = database_referrer(DatumGetByteaPCopy(heap_getattr(tuple, Anum_pg_dolt_ref_reftarget, RelationGetDescr(refs), &isnull)),
+											   &references[i], 1, NULL)))
+				continue;
+			ereport(ERROR,
+					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+					 original ? errmsg("cannot drop %s because other objects depend on it", getObjectDescription(original, false)) :
+					 errmsg("cannot drop desired object(s) because other objects depend on them"),
+					 errdetail("%s on branch \"%s\" depends on %s.", referrer, name + strlen("working/"),
+							   getObjectDescription(&objects[i], false)),
+					 errhint("Change or drop the dependent objects on every branch first.")));
+		}
+	}
+	systable_endscan(scan);
+	table_close(refs, AccessShareLock);
 }

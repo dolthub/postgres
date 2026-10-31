@@ -59,13 +59,15 @@ user-created history independently. Existing history is not rewritten.
 
 ## Transaction and staging contract
 
-Commit, branch and tag calls must be standalone SELECT commands outside explicit
-transaction blocks. The approved first-slice contract uses PostgreSQL's normal
-statement commit rather than attempting implicit commit of an already-open SQL
-transaction. A single call may be wrapped in scalar expressions (casts,
-`substring`, `length`); joins, subqueries and per-row invocation are rejected. dolt_add
-also requires a standalone SELECT, but can run inside BEGIN and rolls back with
-its transaction. Argument arrays and prepared-statement parameters are supported.
+Commit calls must be standalone SELECT commands and commit the current SQL
+transaction, including an explicit BEGIN block. Branch and tag commands still
+require execution outside explicit transaction blocks. A single call may be
+wrapped in supported scalar expressions (casts, substring, length); joins,
+subqueries, volatile wrappers and per-row invocation are rejected. dolt_add also
+requires a standalone SELECT, but can run inside BEGIN and rolls back with its
+transaction. Argument arrays and prepared-statement parameters are supported.
+See [commit session controls](commit-session-controls.md) for multi-branch results,
+automatic commits, and transaction/protocol semantics.
 
 Commit without -A records the staged snapshot. -A stages and commits all live
 supported contents. Later unstaged edits survive a staged commit. WORKING in diff
@@ -115,6 +117,10 @@ the enveloped schema and exported chunk objects. DGDB1 contains server encoding
 and members sorted by kind/name, including namespace definitions. Its children
 are a hash-sorted set of descriptors; member names come from payloads, not child
 position. Local OIDs, executor handles and XIDs do not enter these payloads.
+DGDB1 also lists, as `extensions`, the names (without versions) of the
+extensions whose objects its definitions use, derived from their references
+and omitted when there are none. A server without one of them refuses to read
+that root, naming the extension to install.
 
 DGCOMMIT1 contains author/committer metadata, microsecond timestamps and graph
 height; children are database state followed by ordered parents. Namespace and

@@ -262,4 +262,5 @@ extern pg_noreturn void dg_unsupported(const char *operation);
  */
 extern const char *dg_quote_identifier(const char *ident);
 extern char *dg_qualified_name(const char *qualifier, const char *ident);
+extern void dg_flush_version_batches(void);
 #endif

@@ -31,6 +31,7 @@
  *-------------------------------------------------------------------------
  */
 #include "dg.h"
+#include "access/doltversion.h"
 #include "nodes/tidbitmap.h"
 #include "access/doltchunk.h"
 #include "access/doltnode.h"
@@ -944,6 +945,10 @@ publish_all(void)
 			latest = roots_lock(catalog, &written[i]->key, &tid);
 		}
 		merged = roots_merge(&top->base, &top->roots, &latest);
+
+		/* A pre-commit capture must see the same merged roots we publish.
+		 * Rebase the overlay so later pre-commit publication is idempotent. */
+		top->base = top->roots = merged;
 
 		if (!merged.present || roots_equal(&merged, &latest))
 			continue;
@@ -1902,6 +1907,7 @@ save_state(Relation rel, DGState *s, CommandId cid, const char *branch)
 void
 dg_save(Relation rel, DGState *s, CommandId cid)
 {
+	dg_version_mark_branch(dg_relation_branch(rel));
 	if (dg_storage_bound(rel) || CatalogViewIsLeased(RelationGetRelid(rel)))
 		dg_storage_require_write(rel);
 	save_state(rel, s, cid, dg_relation_branch(rel));
@@ -2082,4 +2088,12 @@ dolt_prolly_root(PG_FUNCTION_ARGS)
 	dg_release(s);
 	relation_close(rel, AccessShareLock);
 	PG_RETURN_TEXT_P(cstring_to_text(result));
+}
+
+/* Make this transaction's batched changes visible to canonical capture. */
+void
+dg_flush_version_batches(void)
+{
+	batch_flush_all();
+	publish_all();
 }

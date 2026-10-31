@@ -884,7 +884,7 @@ max_parallel_hazard_walker(Node *node, max_parallel_hazard_context *context)
 		Const	   *value = (Const *) node;
 
 		if (!value->constisnull && CatalogViewIsObjectIdType(value->consttype) &&
-			CatalogViewObjectContext(DatumGetObjectId(value->constvalue)))
+			CatalogViewValueContext(DatumGetObjectId(value->constvalue)))
 			return max_parallel_hazard_test(PROPARALLEL_UNSAFE, context);
 	}
 	if (IsA(node, Param) && CatalogViewIsObjectIdType(((Param *) node)->paramtype))
@@ -4708,7 +4708,7 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 
 			if (CatalogViewCurrent() || CatalogViewObjectContext(exprType(value)) || IsA(value, Param) ||
 				(context->root && has_catalog_context((Node *) context->root->parse, NULL)) ||
-				(IsA(value, Const) && !((Const *) value)->constisnull && CatalogViewObjectContext(DatumGetObjectId(((Const *) value)->constvalue))))
+				(IsA(value, Const) && !((Const *) value)->constisnull && CatalogViewValueContext(DatumGetObjectId(((Const *) value)->constvalue))))
 				return NULL;
 		}
 
@@ -5305,7 +5305,7 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
 			if (CatalogViewCurrent() || CatalogViewObjectContext(exprType(value)) || IsA(value, Param) ||
 				has_catalog_context((Node *) root->parse, NULL) ||
 				(IsA(value, Const) && !((Const *) value)->constisnull &&
-				 CatalogViewObjectContext(DatumGetObjectId(((Const *) value)->constvalue))))
+				 CatalogViewValueContext(DatumGetObjectId(((Const *) value)->constvalue))))
 			{
 				ReleaseSysCache(func_tuple);
 				return NULL;

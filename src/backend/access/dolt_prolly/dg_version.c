@@ -1,5 +1,6 @@
 /* Native version-control command slice; see doc/doltgres/version-commands.md. */
 #include "dg.h"
+#include "access/doltversion.h"
 #include "access/dolttransport.h"
 #include "postmaster/bgworker.h"
 #include "storage/dsm.h"
@@ -73,6 +74,8 @@
 #include "access/reloptions.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_description.h"
+#include "catalog/pg_extension.h"
+#include "commands/extension.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_aggregate.h"
 #include "commands/extension.h"
@@ -352,6 +355,11 @@ standalone_walker(Node *node, StandaloneCall * found)
 		found->count++;
 		return false;
 	}
+	if (IsA(node, FuncExpr) && func_volatile(((FuncExpr *) node)->funcid) == PROVOLATILE_VOLATILE)
+	{
+		found->count += 2;
+		return true;
+	}
 	if (IsA(node, SubPlan) || IsA(node, SubLink) || IsA(node, Var))
 	{
 		found->count += 2;		/* disqualify */
@@ -373,9 +381,20 @@ standalone(FunctionCallInfo fcinfo, bool commits)
 	if (stmt->commandType != CMD_SELECT)
 		goto bad;
 	plan = stmt->planTree;
-	if (plan->qual || plan->initPlan || outerPlan(plan) || innerPlan(plan))
+	/* A target-list SRF is represented by ProjectSet over a dummy Result. */
+	if (IsA(plan, Result) && outerPlan(plan) && IsA(outerPlan(plan), ProjectSet) &&
+		!plan->qual && !plan->initPlan && !innerPlan(plan))
+	{
+		if (contain_volatile_functions((Node *) plan->targetlist))
+			goto bad;
+		plan = outerPlan(plan);
+	}
+	if (plan->qual || plan->initPlan || innerPlan(plan) ||
+		(outerPlan(plan) && !(IsA(plan, ProjectSet) && IsA(outerPlan(plan), Result) &&
+			!outerPlan(plan)->qual && !outerPlan(plan)->initPlan &&
+			!outerPlan(outerPlan(plan)) && !innerPlan(outerPlan(plan)))))
 		goto bad;
-	if (IsA(plan, Result) && list_length(plan->targetlist) == 1)
+	if ((IsA(plan, Result) || IsA(plan, ProjectSet)) && list_length(plan->targetlist) == 1)
 	{
 		Node	   *expr = (Node *) linitial_node(TargetEntry, plan->targetlist)->expr;
 		StandaloneCall found = {fcinfo->flinfo->fn_oid, NULL, 0};
@@ -595,6 +614,8 @@ move_ref(const char *name, VersionRef old, bytea *target)
 	if (!target)
 		nulls[2] = 'n';
 	run("SELECT pg_catalog.dolt_manifest_cas($1,$2,$3)", 3, types, args, nulls, false);
+	if (strncmp(name, "working/", 8) == 0)
+		dg_version_mark_branch(name + 8);
 }
 static ArrayType *
 links(Datum *hashes, int count)
@@ -1317,28 +1338,76 @@ default_email(const char *name)
 }
 
 /* An explicit --committer overrides the author-derived committer identity. */
+bool dolt_transaction_commit = false;
+bool dolt_multi_branch_commit = false;
+bool dolt_force_transaction_commit = false;
+bool dolt_allow_commit_conflicts = false;
+char *dolt_transaction_commit_message;
+char *dolt_author_name;
+char *dolt_author_email;
+char *dolt_author_date;
+char *dolt_committer_name;
+char *dolt_committer_email;
+char *dolt_committer_date;
+static bool commit_author_date_explicit;
+
+static bool
+setting_present(const char *value)
+{
+	return value && *value;
+}
+
+static TimestampTz
+commit_date_setting(const char *value)
+{
+	return DatumGetTimestampTz(DirectFunctionCall3(timestamptz_in,
+		CStringGetDatum(value), ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1)));
+}
+
 static char *commit_committer_name;
 static char *commit_committer_email;
 
 static bytea *
-commit_object(bytea *database, bytea *parent, bytea *second, const char *message, const char *author, const char *author_email, TimestampTz author_date)
+commit_object_at(bytea *database, bytea *parent, bytea *second, const char *message, const char *author, const char *author_email, TimestampTz author_date, TimestampTz committer_date)
 {
 	StringInfoData json;
 	const char *name = GetUserNameFromId(GetUserId(), false);
 	char	   *email = default_email(name);
 	int64		height = 1;
 
-	/* Dolt treats --author as the committer too unless --committer is given. */
+	bool explicit_author = author != NULL;
+	bool committer_set = (setting_present(dolt_committer_name) || setting_present(dolt_committer_email)) &&
+		(strcmp(setting_present(dolt_committer_name) ? dolt_committer_name : name,
+				setting_present(dolt_author_name) ? dolt_author_name : name) ||
+		 strcmp(setting_present(dolt_committer_email) ? dolt_committer_email : email,
+				setting_present(dolt_author_email) ? dolt_author_email : email));
+
+	if (!author)
+	{
+		author = setting_present(dolt_author_name) ? dolt_author_name : name;
+		author_email = setting_present(dolt_author_email) ? dolt_author_email : email;
+	}
+	if (setting_present(dolt_committer_name))
+		name = dolt_committer_name;
+	if (setting_present(dolt_committer_email))
+		email = dolt_committer_email;
+	/* Explicit author historically supplies the committer unless overridden. */
 	if (commit_committer_name)
 	{
 		name = commit_committer_name;
 		email = commit_committer_email;
 	}
-	else if (author)
+	else if (explicit_author && !committer_set)
 	{
 		name = author;
 		email = (char *) author_email;
 	}
+	if (!commit_author_date_explicit && setting_present(dolt_author_date))
+		author_date = commit_date_setting(dolt_author_date);
+	if (setting_present(dolt_committer_date))
+		committer_date = commit_date_setting(dolt_committer_date);
+	else if (commit_author_date_explicit)
+		committer_date = author_date;
 
 	if (parent)
 	{
@@ -1359,9 +1428,16 @@ commit_object(bytea *database, bytea *parent, bytea *second, const char *message
 	json_field(&json, "author", author ? author : name, true);
 	json_field(&json, "author_email", author_email ? author_email : email, true);
 	json_field(&json, "message", message, true);
-	appendStringInfo(&json, ",\"date_us\":%lld,\"author_date_us\":%lld,\"height\":%lld}", (long long) GetCurrentTimestamp(), (long long) author_date, (long long) height);
+	appendStringInfo(&json, ",\"date_us\":%lld,\"author_date_us\":%lld,\"height\":%lld}", (long long) committer_date, (long long) author_date, (long long) height);
 	return put("commit", json.data, VC_ARGS(PointerGetDatum(database), PointerGetDatum(parent), PointerGetDatum(second)), second ? 3 : parent ? 2 : 1);
 }
+static bytea *
+commit_object(bytea *database, bytea *parent, bytea *second, const char *message, const char *author, const char *author_email, TimestampTz author_date)
+{
+	return commit_object_at(database, parent, second, message, author, author_email,
+							author_date, GetCurrentTimestamp());
+}
+
 static void
 ensure_repository(void)
 {
@@ -1610,8 +1686,11 @@ dolt_add(PG_FUNCTION_ARGS)
 	end_api(nest);
 	PG_RETURN_INT64(0);
 }
-Datum
-dolt_commit(PG_FUNCTION_ARGS)
+static List *commit_branches(void);
+static void commit_request_sql_end(void);
+
+static Datum
+dolt_commit_impl(FunctionCallInfo fcinfo, bool named_rows)
 {
 	int			n,
 				i;
@@ -1621,26 +1700,20 @@ dolt_commit(PG_FUNCTION_ARGS)
 			   *email = NULL,
 			   *committer = NULL,
 			   *committer_email = NULL;
-	bool		all = false,
+	bool		date_explicit = false,
+				all = false,
 				modified = false,
 				allow_empty = false,
 				skip_empty = false;
 	TimestampTz author_date = GetCurrentTimestamp();
-	VersionRef	head,
-				staged,
-				working;
-	Capture		full;
-	bytea	   *database,
-			   *parentdb,
-			   *commit;
-	char	   *answer;
-	int			nest;
+	List	   *branches;
+	ListCell   *lc;
+	const char *previous_branch;
+	TimestampTz commit_time = GetCurrentTimestamp();
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	bool		multi = named_rows || dolt_multi_branch_commit;
 
-	standalone(fcinfo, true);
-	nest = begin_api();
-	/* Activation advances command visibility on our private API snapshot. */
-	if (!read_ref("views/enabled").target)
-		catalog_activate();
+	standalone(fcinfo, false);
 	for (i = 0; i < n; i++)
 	{
 		if (!strcmp(args[i], "-A") || !strcmp(args[i], "--ALL"))
@@ -1677,7 +1750,8 @@ dolt_commit(PG_FUNCTION_ARGS)
 		{
 			if (++i == n)
 				unsupported("missing date");
-			author_date = DatumGetTimestampTz(DirectFunctionCall3(timestamptz_in, CStringGetDatum(args[i]), ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1)));
+			author_date = commit_date_setting(args[i]);
+			date_explicit = true;
 		}
 		else
 			unsupported(args[i]);
@@ -1686,38 +1760,111 @@ dolt_commit(PG_FUNCTION_ARGS)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("commit message is required (-m)")));
 	if (allow_empty && skip_empty)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("--allow-empty and --skip-empty are incompatible")));
-	ensure_repository();
-	if (modified && !all)
-		stage_modified_tables();
-	head = read_ref(branch_ref("heads"));
-	staged = read_ref(branch_ref("staged"));
-	working = read_ref(branch_ref("working"));
-	parentdb = child(head.target, 1);
-	database = all ? staged_capture(&full) : staged.target;
-	if (!database)
-		database = parentdb;
-	if (database_same(database, parentdb) && !allow_empty && !merge_parent())
+
+	/*
+	 * Apply deferred constraints under the caller's normal catalog context.
+	 * The transaction ends after the standalone result has been consumed.
+	 */
+	do
 	{
-		if (skip_empty)
-		{
-			end_api(nest);
-			PG_RETURN_NULL();
-		}
-		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("nothing to commit")));
-	}
+		if (SPI_connect() != SPI_OK_CONNECT)
+			elog(ERROR, "cannot connect commit constraint SPI");
+		if (SPI_execute("SET CONSTRAINTS ALL IMMEDIATE", false, 0) != SPI_OK_UTILITY)
+			elog(ERROR, "cannot fire deferred commit constraints");
+		SPI_finish();
+	} while (PreCommit_PortalsForVersionCommit());
+	CommandCounterIncrement();
+	dg_flush_version_batches();
+	CommandCounterIncrement();
+	branches = commit_branches();
+	if (list_length(branches) > 1 && !multi)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot commit multiple dirty branches without dolt_multi_branch_commit")));
+	if (!multi || branches == NIL)
+		branches = list_make1(pstrdup(dg_current_branch()));
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC | MAT_SRF_BLESS);
+	PushCopiedSnapshot(GetLatestSnapshot());
+	previous_branch = dg_switch_execution_branch(linitial(branches));
 	commit_committer_name = committer;
 	commit_committer_email = committer_email;
-	commit = commit_object(database, head.target, merge_parent(), message, author, email, author_date);
-	commit_committer_name = NULL;
-	commit_committer_email = NULL;
-	move_ref(branch_ref("heads"), head, commit);
-	move_ref(branch_ref("staged"), staged, database);
-	if (all)
-		move_ref(branch_ref("working"), working, full.hash);
-	finish_merge();
-	answer = hash_format(commit);
-	end_api(nest);
-	PG_RETURN_TEXT_P(cstring_to_text(answer));
+	commit_author_date_explicit = date_explicit;
+	PG_TRY();
+	{
+		foreach(lc, branches)
+		{
+			const char *branch = lfirst(lc);
+			VersionRef	head,
+						staged,
+						working;
+			Capture		full;
+			bytea	   *database,
+					   *parentdb,
+					   *commit;
+			Datum		values[2];
+			bool		nulls[2] = {false, false};
+			int			nest;
+
+			dg_switch_execution_branch(branch);
+			nest = begin_api();
+			if (!read_ref("views/enabled").target)
+				catalog_activate();
+			ensure_repository();
+			if (modified && !all)
+				stage_modified_tables();
+			head = read_ref(branch_ref("heads"));
+			staged = read_ref(branch_ref("staged"));
+			working = read_ref(branch_ref("working"));
+			parentdb = child(head.target, 1);
+			database = all ? staged_capture(&full) : staged.target;
+			if (!database)
+				database = parentdb;
+			if (database_same(database, parentdb) && !allow_empty && !merge_parent())
+			{
+				if (skip_empty)
+				{
+					end_api(nest);
+					continue;
+				}
+				ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+								errmsg("nothing to commit on branch %s", branch)));
+			}
+			commit = commit_object_at(database, head.target, merge_parent(), message,
+									  author, email, author_date, commit_time);
+			move_ref(branch_ref("heads"), head, commit);
+			move_ref(branch_ref("staged"), staged, database);
+			if (all)
+				move_ref(branch_ref("working"), working, full.hash);
+			finish_merge();
+			values[0] = CStringGetTextDatum(named_rows ? branch : hash_format(commit));
+			if (named_rows)
+				values[1] = CStringGetTextDatum(hash_format(commit));
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+			end_api(nest);
+		}
+	}
+	PG_FINALLY();
+	{
+		dg_switch_execution_branch(previous_branch);
+		PopActiveSnapshot();
+		commit_committer_name = NULL;
+		commit_committer_email = NULL;
+		commit_author_date_explicit = false;
+	}
+	PG_END_TRY();
+	commit_request_sql_end();
+	return (Datum) 0;
+}
+
+Datum
+dolt_commit(PG_FUNCTION_ARGS)
+{
+	return dolt_commit_impl(fcinfo, false);
+}
+
+Datum
+dolt_commit_all(PG_FUNCTION_ARGS)
+{
+	return dolt_commit_impl(fcinfo, true);
 }
 Datum
 dolt_branch(PG_FUNCTION_ARGS)
@@ -1946,6 +2093,12 @@ dolt_commit_noargs(PG_FUNCTION_ARGS)
 }
 
 Datum
+dolt_commit_all_noargs(PG_FUNCTION_ARGS)
+{
+	return dolt_commit_all(fcinfo);
+}
+
+Datum
 dolt_branch_noargs(PG_FUNCTION_ARGS)
 {
 	return dolt_branch(fcinfo);
@@ -1971,7 +2124,7 @@ dolt_diff_summary_table(PG_FUNCTION_ARGS)
 
 #include "dg_binding.inc"
 
-static void validate_working_foreign_keys(const char *branch);
+static void validate_working_foreign_keys(const char *branch, StringInfo violations);
 
 #include "dg_merge.inc"
 
@@ -2004,3 +2157,5 @@ static void validate_working_foreign_keys(const char *branch);
 #include "dg_tools.inc"
 #include "dg_transport.inc"
 #include "dg_compat.inc"
+
+#include "dg_commit_session.inc"

@@ -603,70 +603,77 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 	pstate->p_sourcetext = queryString;
 	pstate->p_queryEnv = queryEnv;
 
-	if (dg_catalog_view_ddl(pstate, parsetree, pstmt->stmt_location, pstmt->stmt_len))
+	/*
+	 * Versioned definitions belong to a branch. An extension's script creates
+	 * server objects instead, as the extension itself is one.
+	 */
+	if (!creating_extension)
 	{
-		free_parsestate(pstate);
-		CommandCounterIncrement();
-		return;
-	}
-	if (dg_catalog_rename(pstate, parsetree))
-	{
-		free_parsestate(pstate);
-		CommandCounterIncrement();
-		return;
-	}
-	if (dg_catalog_schema_object_ddl(pstate, parsetree) || dg_catalog_routine_ddl(pstate, parsetree))
-	{
-		free_parsestate(pstate);
-		CommandCounterIncrement();
-		return;
-	}
-	if (dg_catalog_trigger_ddl(pstate, parsetree))
-	{
-		free_parsestate(pstate);
-		CommandCounterIncrement();
-		return;
-	}
-	if (dg_catalog_sequence_ddl(pstate, parsetree))
-	{
-		free_parsestate(pstate);
-		CommandCounterIncrement();
-		return;
-	}
-	if (dg_catalog_type_ddl(pstate, parsetree))
-	{
-		free_parsestate(pstate);
-		CommandCounterIncrement();
-		return;
-	}
-	if (dg_catalog_grant(parsetree))
-	{
-		if (qc)
-			SetQueryCompletion(qc, CreateCommandTag(parsetree), 0);
-		free_parsestate(pstate);
-		CommandCounterIncrement();
-		return;
-	}
-	if (dg_catalog_drop(parsetree))
-	{
-		if (qc)
-			SetQueryCompletion(qc, CreateCommandTag(parsetree), 0);
-		free_parsestate(pstate);
-		return;
-	}
-	if (dg_catalog_alter(parsetree))
-	{
-		if (qc)
-			SetQueryCompletion(qc, CreateCommandTag(parsetree), 0);
-		free_parsestate(pstate);
-		CommandCounterIncrement();
-		return;
-	}
-	if (dg_catalog_create(parsetree, queryString))
-	{
-		free_parsestate(pstate);
-		CommandCounterIncrement();
-		return;
+		if (dg_catalog_view_ddl(pstate, parsetree, pstmt->stmt_location, pstmt->stmt_len))
+		{
+			free_parsestate(pstate);
+			CommandCounterIncrement();
+			return;
+		}
+		if (dg_catalog_rename(pstate, parsetree))
+		{
+			free_parsestate(pstate);
+			CommandCounterIncrement();
+			return;
+		}
+		if (dg_catalog_schema_object_ddl(pstate, parsetree) || dg_catalog_routine_ddl(pstate, parsetree))
+		{
+			free_parsestate(pstate);
+			CommandCounterIncrement();
+			return;
+		}
+		if (dg_catalog_trigger_ddl(pstate, parsetree))
+		{
+			free_parsestate(pstate);
+			CommandCounterIncrement();
+			return;
+		}
+		if (dg_catalog_sequence_ddl(pstate, parsetree))
+		{
+			free_parsestate(pstate);
+			CommandCounterIncrement();
+			return;
+		}
+		if (dg_catalog_type_ddl(pstate, parsetree))
+		{
+			free_parsestate(pstate);
+			CommandCounterIncrement();
+			return;
+		}
+		if (dg_catalog_grant(parsetree))
+		{
+			if (qc)
+				SetQueryCompletion(qc, CreateCommandTag(parsetree), 0);
+			free_parsestate(pstate);
+			CommandCounterIncrement();
+			return;
+		}
+		if (dg_catalog_drop(parsetree))
+		{
+			if (qc)
+				SetQueryCompletion(qc, CreateCommandTag(parsetree), 0);
+			free_parsestate(pstate);
+			return;
+		}
+		if (dg_catalog_alter(parsetree))
+		{
+			if (qc)
+				SetQueryCompletion(qc, CreateCommandTag(parsetree), 0);
+			free_parsestate(pstate);
+			CommandCounterIncrement();
+			return;
+		}
+		if (dg_catalog_create(parsetree, queryString))
+		{
+			free_parsestate(pstate);
+			CommandCounterIncrement();
+			return;
+		}
 	}
 
 	switch (nodeTag(parsetree))

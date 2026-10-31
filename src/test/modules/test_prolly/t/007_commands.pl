@@ -64,7 +64,7 @@ is(sql(q{SELECT dolt_commit('--skip-empty','-m','skipped')}),'','skip empty retu
 my $empty=sql(q{SELECT dolt_commit('--allow-empty','-m','empty allowed')});
 isnt($empty,$third,'allow empty creates history node');
 is(sql(q{SELECT count(*) FROM dolt_diff_summary('HEAD~1','HEAD')}),'0','empty commit has identical state');
-fails(q{BEGIN; SELECT dolt_commit('-Am','invalid'); COMMIT},qr/transaction block/,'commit rejects explicit transaction');
+like(sql(q{BEGIN; SELECT dolt_commit('--allow-empty','-m','explicit transaction')}),qr/[0-9a-v]{32}/,'commit completes explicit transaction');
 is(sql(q{SELECT length(upper(dolt_commit('--allow-empty','-m','wrapped')))}),'32','scalar-wrapped command accepted');
 fails(q{SELECT dolt_commit('-Am','invalid') WHERE (SELECT true)},qr/standalone SELECT/,'subquery-wrapped command rejected');
 fails(q{SELECT dolt_commit('-Am','invalid') FROM t},qr/standalone SELECT/,'per-row invocation rejected');
