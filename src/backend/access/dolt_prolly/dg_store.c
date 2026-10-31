@@ -34,6 +34,7 @@
 #include "access/doltversion.h"
 #include "nodes/tidbitmap.h"
 #include "access/doltchunk.h"
+#include "access/doltjournal.h"
 #include "access/doltnode.h"
 #include "access/genam.h"
 #include "access/heapam.h"

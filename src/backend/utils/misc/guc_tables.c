@@ -39,6 +39,7 @@
 #include "access/xlog_internal.h"
 #include "access/xlogprefetcher.h"
 #include "access/doltchunk.h"
+#include "access/doltjournal.h"
 #include "access/doltnode.h"
 #include "access/doltschema.h"
 #include "access/doltsystem.h"
@@ -805,6 +806,17 @@ StaticAssertDecl(lengthof(config_type_names) == (PGC_ENUM + 1),
 
 struct config_bool ConfigureNamesBool[] =
 {
+	{
+		{"dolt_row_journal", PGC_SUSET, DEVELOPER_OPTIONS,
+			gettext_noop("Journals small prolly table changes instead of rewriting the tables' trees."),
+			gettext_noop("Not yet safe with concurrent writers."),
+			GUC_NOT_IN_SAMPLE
+		},
+		&dolt_row_journal,
+		false,
+		NULL, NULL, NULL
+	},
+
 	{
 		{"dolt_chunk_verify_hashes", PGC_SUSET, DEVELOPER_OPTIONS,
 			gettext_noop("Verifies that prolly chunk contents match their hashes."),

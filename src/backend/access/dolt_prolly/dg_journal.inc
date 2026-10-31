@@ -30,6 +30,17 @@
  * key trees alone.
  */
 
+/*
+ * Whether small batches are journaled at all. Off by default: a writer folds
+ * other transactions' entries into roots it saves and deletes them, and
+ * concurrent transactions' snapshots, its own included, cannot yet reconcile
+ * those roots with the entries they still see. Concurrent writers then lose
+ * updates or find rows missing. Folding needs separating from writers before
+ * the journal can be on by default; until then every batch is applied to the
+ * trees directly.
+ */
+bool		dolt_row_journal = false;
+
 /* Rows in a batch above which the batch is applied to the trees directly. */
 #define DG_JOURNAL_BATCH_MAX 64
 
@@ -910,6 +921,8 @@ journal_append_entry(Relation catalog, Relation index, IndexInfo *info, Relation
  * batch adds or removes. Returns false, leaving the batch untouched, when the
  * stream would grow past its bound and the batch should fold instead.
  */
+static bool journal_fold_visible(DGBatch *b);
+
 static bool
 journal_batch(DGBatch *b, bool forced)
 {
@@ -930,12 +943,17 @@ journal_batch(DGBatch *b, bool forced)
 	 */
 	if (b->subxid != GetCurrentSubTransactionId())
 		return false;
+	if (!dolt_row_journal && !forced)
+		return false;
 
 	/*
 	 * A command that already journaled this table journals the rest too:
 	 * rows it wrote cannot be deleted by the same command, so it cannot fold.
+	 * Nor does a batch fold entries its transaction's snapshot does not see;
+	 * a later transaction that sees them folds them instead.
 	 */
-	if (!forced && (n > DG_JOURNAL_BATCH_MAX || n + b->state->journal_count > DG_JOURNAL_STREAM_MAX))
+	if (!forced && (n > DG_JOURNAL_BATCH_MAX || n + b->state->journal_count > DG_JOURNAL_STREAM_MAX) &&
+		journal_fold_visible(b))
 		return false;
 	if (XactReadOnly)
 		ereport(ERROR, (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION), errmsg("cannot journal prolly rows in a read-only transaction")));
@@ -973,6 +991,35 @@ journal_batch(DGBatch *b, bool forced)
 		PopActiveSnapshot();
 	handle_delta_write(&b->key, b->handles, b->cid);
 	journal_touch(MyDatabaseId, b->key.space, b->key.file, b->cid);
+	return true;
+}
+
+/*
+ * Whether |b|'s table state folded only entries the transaction's snapshot
+ * sees. Its writes apply to the latest state, so a batch applied to the
+ * trees saves roots that include every entry the latest state folded; the
+ * transaction's later reads merge those roots into its snapshot's view as its
+ * own changes. An entry another transaction committed after the snapshot
+ * would then show through, and the versions it replaced would vanish.
+ */
+static bool
+journal_fold_visible(DGBatch *b)
+{
+	Snapshot	snapshot = IsolationUsesXactSnapshot() || !ActiveSnapshotSet() ?
+		GetTransactionSnapshot() : GetActiveSnapshot();
+	JournalEntries seen;
+	int			j = 0;
+
+	if (!b->state->journal_count)
+		return true;
+	seen = journal_entries(&b->key, snapshot);
+	for (int i = 0; i < b->state->journal_count; i++)
+	{
+		while (j < seen.count && seen.items[j].seq < b->state->journal_seqs[i])
+			j++;
+		if (j == seen.count || seen.items[j].seq != b->state->journal_seqs[i])
+			return false;
+	}
 	return true;
 }
 

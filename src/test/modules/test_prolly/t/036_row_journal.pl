@@ -1,6 +1,7 @@
-# Small writes are journaled rather than folded into the trees; readers fold
-# the journal in memory. What every reader sees, across commands, sessions,
-# aborts, folds, commits, branches, resets and restarts, must not change.
+# With dolt_row_journal on, small writes are journaled rather than folded into
+# the trees; readers fold the journal in memory. What every reader sees,
+# across commands, sessions, aborts, folds, commits, branches, resets and
+# restarts, must not change.
 use strict;
 use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
@@ -8,7 +9,7 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 my $node = PostgreSQL::Test::Cluster->new('journal');
 $node->init;
-$node->append_conf('postgresql.conf', "default_table_access_method='dolt_prolly_table'\nmax_parallel_workers_per_gather=0\n");
+$node->append_conf('postgresql.conf', "default_table_access_method='dolt_prolly_table'\nmax_parallel_workers_per_gather=0\ndolt_row_journal=on\n");
 $node->start;
 sub sql { $node->safe_psql('postgres', $_[0]); }
 sub fails { my ($q, $re, $label) = @_; my ($code, $out, $err) = $node->psql('postgres', $q); isnt($code, 0, $label); like($err, $re, "$label diagnostic"); }
