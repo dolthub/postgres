@@ -1498,6 +1498,8 @@ CREATE VIEW dolt.tags WITH (security_invoker=true) AS
     WHERE r.refname LIKE 'tags/%' AND o.objkind='tag' ORDER BY 1;
 CREATE VIEW dolt.status WITH (security_invoker=true) AS
     SELECT * FROM pg_catalog.dolt_status();
+CREATE VIEW dolt.status_ignored WITH (security_invoker=true) AS
+    SELECT * FROM pg_catalog.dolt_status_ignored();
 CREATE VIEW dolt.merge_status WITH (security_invoker=true) AS
     SELECT * FROM pg_catalog.dolt_merge_status();
 CREATE VIEW dolt.diff WITH (security_invoker=true) AS
@@ -1606,6 +1608,7 @@ CREATE VIEW dolt_commits WITH (security_invoker=true) AS SELECT * FROM dolt.comm
 CREATE VIEW dolt_commit_ancestors WITH (security_invoker=true) AS SELECT * FROM dolt.commit_ancestors;
 CREATE VIEW dolt_tags WITH (security_invoker=true) AS SELECT * FROM dolt.tags;
 CREATE VIEW dolt_status WITH (security_invoker=true) AS SELECT * FROM dolt.status;
+CREATE VIEW dolt_status_ignored WITH (security_invoker=true) AS SELECT * FROM dolt.status_ignored;
 CREATE VIEW dolt_merge_status WITH (security_invoker=true) AS SELECT * FROM dolt.merge_status;
 CREATE VIEW dolt_diff WITH (security_invoker=true) AS SELECT * FROM dolt.diff;
 CREATE VIEW dolt_column_diff WITH (security_invoker=true) AS SELECT * FROM dolt.column_diff;
@@ -1626,6 +1629,6 @@ CREATE VIEW dolt_statistics WITH (security_invoker=true) AS SELECT * FROM dolt.s
 CREATE VIEW dolt_branch_activity WITH (security_invoker=true) AS SELECT * FROM dolt.branch_activity;
 REVOKE ALL ON ALL TABLES IN SCHEMA dolt FROM PUBLIC;
 REVOKE ALL ON dolt_log, dolt_branches, dolt_remote_branches, dolt_commits, dolt_commit_ancestors, dolt_tags,
-    dolt_status, dolt_merge_status, dolt_diff, dolt_column_diff, dolt_conflicts, dolt_constraint_violations,
+    dolt_status, dolt_status_ignored, dolt_merge_status, dolt_diff, dolt_column_diff, dolt_conflicts, dolt_constraint_violations,
     dolt_schema_conflicts, dolt_remotes, dolt_docs, dolt_rebase, dolt_stashes, dolt_help, dolt_tests, dolt_backups,
     dolt_query_catalog, dolt_branch_control, dolt_branch_namespace_control, dolt_statistics, dolt_branch_activity FROM PUBLIC;

@@ -178,8 +178,11 @@ ignored_untracked_tables(const char *working, const char *tracked)
 {
 	List *known = list_concat(state_tables(head_state()), state_tables(tracked));
 	List *candidates = NIL;
+	VersionRef pending = read_ref(branch_ref("merge"));
 	ListCell *lc;
 
+	if (pending.target)
+		known = list_concat(known, state_tables(metadata(child(child(pending.target, 2), 1), "database")));
 	foreach(lc, state_tables(working))
 		if (!name_selected(known, lfirst(lc)))
 			candidates = lappend(candidates, lfirst(lc));
@@ -194,16 +197,10 @@ staged_capture(Capture *full)
 {
 	VersionRef	staged = read_ref(branch_ref("staged"));
 	bytea	   *base = staged.target ? staged.target : child(read_ref(branch_ref("heads")).target, 1);
-	List	   *tracked = list_concat(state_tables(head_state()), state_tables(staged_state())),
-			   *candidates = NIL,
-			   *ignored;
-	ListCell   *lc;
+	List *ignored;
 
 	*full = capture_visible();
-	foreach(lc, state_tables(metadata(full->hash, "database")))
-		if (!name_selected(tracked, (char *) lfirst(lc)))
-		candidates = lappend(candidates, lfirst(lc));
-	ignored = ignored_tables(candidates);
+	ignored = ignored_untracked_tables(full->json, staged_state());
 	if (ignored == NIL)
 		return full->hash;
 	return compose_database(full->hash, base, ignored);
