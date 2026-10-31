@@ -242,7 +242,15 @@ definition_references(const char *kind, const char *definition)
 				if (!strcmp(kinds[i], "type"))
 					references_type(&references, names[i]);
 				else if ((!strcmp(kinds[i], "routine") || !strcmp(kinds[i], "operator")) && strchr(names[i], '('))
-					references_add(&references, kinds[i], pnstrdup(names[i], strchr(names[i], '(') - names[i]));
+				{
+					char	   *name = pnstrdup(names[i], strchr(names[i], '(') - names[i]);
+					char	   *dot = strrchr(name, '.');
+
+					references_add(&references, kinds[i], name);
+					/* An operator's name is also referred to quoted, as a qualified name. */
+					if (!strcmp(kinds[i], "operator") && dot)
+						references_add(&references, kinds[i], psprintf("%.*s.%s", (int) (dot - name), name, quote_identifier(dot + 1)));
+				}
 				else
 					references_add(&references, kinds[i], names[i]);
 			}

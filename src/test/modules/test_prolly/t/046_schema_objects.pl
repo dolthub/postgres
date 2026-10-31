@@ -41,6 +41,13 @@ sql(q{CREATE TABLE main_only(v int); SELECT dolt_commit('-Am','main diverges')})
 is(sql(q{SELECT conflicts FROM dolt_merge('feature'); SELECT total(v) FROM t}), "0\n6", 'merge publishes aggregate');
 is(sql(q{SELECT 1 OPERATOR(public.===) 2, (ROW(4)::source::target).v}), 'f|5', 'merge publishes operator, cast and function dependencies');
 fails(q{DROP FUNCTION same_int(integer,integer)}, qr/depend/, 'operator protects its function');
+sql(q{CREATE FUNCTION custom_sel(internal, oid, internal, integer) RETURNS float8 AS 'contsel' LANGUAGE internal STABLE STRICT;
+ CREATE OPERATOR public.=!= (LEFTARG=integer, RIGHTARG=integer, FUNCTION=public.same_int, NEGATOR=OPERATOR(public.<=!>), RESTRICT=custom_sel)});
+fails(q{DROP FUNCTION custom_sel(internal, oid, internal, integer)}, qr/operator public\.=!=\(\S+\) on branch "main" depends on function custom_sel/, 'operator protects its server estimator function');
+sql(q{DROP OPERATOR public.=!= (integer,integer)});
+is(sql(q{SELECT oprname, oprcode::oid, oprnegate FROM pg_operator WHERE oprname IN ('=!=', '<=!>')}), '<=!>|0|0', 'dropping an operator clears its negator shell\'s link, as natively');
+sql(q{DROP FUNCTION custom_sel(internal, oid, internal, integer)});
+is(sql(q{SELECT count(*) FROM pg_operator WHERE oprname = '<=!>'}), '1', 'and its estimator can then be dropped');
 sql(q{BEGIN; DROP AGGREGATE total(integer) CASCADE; ROLLBACK});
 is(sql(q{SELECT total(v) FROM t}), '6', 'aggregate DROP rolls back');
 is(sql(q{SELECT value FROM totals}), '6', 'merged view binds its aggregate');

@@ -5,6 +5,7 @@ dg_catalog_schema_object_ddl(ParseState *pstate, Node *statement)
 {
 	AlterOwnerStmt *owner = IsA(statement, AlterOwnerStmt) ? (AlterOwnerStmt *) statement : NULL;
 	DefineStmt *define = IsA(statement, DefineStmt) ? (DefineStmt *) statement : NULL;
+	DropStmt   *drop = IsA(statement, DropStmt) ? (DropStmt *) statement : NULL;
 	CatalogView *previous;
 	CatalogView *view;
 	Oid caller;
@@ -14,8 +15,15 @@ dg_catalog_schema_object_ddl(ParseState *pstate, Node *statement)
 	const char *kinds[] = {"aggregate", "operator", "cast"};
 	List *definitions[3] = {NIL, NIL, NIL};
 
+	/*
+	 * Dropping an operator clears its commutator's and negator's links to it,
+	 * which rewrites their definitions too. A cascade reaches other kinds of
+	 * objects and takes the general path.
+	 */
+	if (drop && (drop->removeType != OBJECT_OPERATOR || drop->behavior == DROP_CASCADE))
+		drop = NULL;
 	if ((!define || (define->kind != OBJECT_AGGREGATE && define->kind != OBJECT_OPERATOR)) &&
-		!IsA(statement, CreateCastStmt) && !IsA(statement, AlterOperatorStmt) &&
+		!IsA(statement, CreateCastStmt) && !IsA(statement, AlterOperatorStmt) && !drop &&
 		(!owner || (owner->objectType != OBJECT_AGGREGATE && owner->objectType != OBJECT_OPERATOR)))
 		return false;
 	if (creating_extension)
@@ -75,6 +83,8 @@ dg_catalog_schema_object_ddl(ParseState *pstate, Node *statement)
 			CreateCast((CreateCastStmt *) statement);
 		else if (owner)
 			ExecAlterOwnerStmt(owner);
+		else if (drop)
+			RemoveObjects(drop);
 		else
 			AlterOperator((AlterOperatorStmt *) statement);
 		CommandCounterIncrement();
