@@ -1542,6 +1542,7 @@ static void
 provider_populate(CatalogView *view, bytea *database, const char *branch)
 {
 	DGProviderRows rows = {0};
+	List	   *inherited = NIL;
 	DGMember   *listed;
 	bytea	  **addresses,
 			  **schemas,
@@ -1645,6 +1646,18 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "type"))
 			provider_type_relation(&rows, view, definitions[i]);
+
+	/* The tables some table inherits from, which have subclasses. */
+	for (i = 0; i < n; i++)
+		if (!strcmp(kinds[i], "table"))
+		{
+			JsonbValue	document = json_document(definitions[i]),
+						parents;
+
+			if (json_get(&document, "inherits", &parents))
+				for (int p = 0; p < json_length(&parents); p++)
+					inherited = lappend(inherited, json_item_text(&parents, p));
+		}
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index"))
 		{
@@ -1681,17 +1694,9 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			form.relpersistence = RELPERSISTENCE_PERMANENT;
 			form.relnatts = desc->natts;
 			document = json_document(definition);
-			/* Derive this flag from the canonical child definitions. */
-			for (int c = 0; c < n; c++)
-				if (!strcmp(kinds[c], "table"))
-				{
-					JsonbValue childdef = json_document(definitions[c]), parents;
-
-					if (json_get(&childdef, "inherits", &parents))
-						for (int p = 0; p < json_length(&parents); p++)
-							if (!strcmp(json_item_text(&parents, p), name))
-								form.relhassubclass = true;
-				}
+			foreach_ptr(char, parent, inherited)
+				if (!strcmp(parent, name))
+					form.relhassubclass = true;
 			form.relchecks = 0;
 			if (json_get(&document, "constraints", &list))
 				for (j = 0; j < json_length(&list); j++)
