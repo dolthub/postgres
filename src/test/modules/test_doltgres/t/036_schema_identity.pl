@@ -158,6 +158,14 @@ like($coll_err,qr/table public\.u uses server objects in schema ct/,'nor can the
 $node->safe_psql('coll',q{DROP TABLE public.u; DROP SCHEMA ct CASCADE});
 is($node->safe_psql('coll',q{SELECT count(*) FROM pg_namespace WHERE nspname = 'ct'}),'0','once nothing outside uses it, the schema drops with its tables');
 
+# A namespace's owner and privileges are its server row's, which GRANT changes, on every branch.
+$node->safe_psql('coll',q{CREATE ROLE schema_creator; CREATE ROLE schema_bystander; GRANT CREATE ON SCHEMA public TO schema_creator;
+SELECT dolt_commit('-Am', 'grant'); SELECT dolt_branch('granted')});
+is($node->safe_psql('coll',q{SET ROLE schema_creator; CREATE TABLE created(a int); INSERT INTO created VALUES (1); SELECT a FROM created}),'1','a role granted CREATE on a schema creates versioned tables in it');
+is($node->safe_psql('coll',q{SELECT dolt_checkout('granted'); SET ROLE schema_creator; CREATE TABLE created_there(a int); SELECT count(*) FROM created_there}) =~ s/.*\n//sr,'0','on any branch');
+my ($grant_rc,$grant_out,$grant_err)=$node->psql('coll',q{SET ROLE schema_bystander; CREATE TABLE refused(a int)});
+like($grant_err,qr/permission denied for schema public/,'and a role without it is refused');
+
 # Roles are server objects too: a definition naming a dropped role stays readable, as its owner's.
 $node->safe_psql('coll',q{CREATE ROLE schema_owner_r; GRANT CREATE ON DATABASE coll TO schema_owner_r;
 SET SESSION AUTHORIZATION schema_owner_r; CREATE SCHEMA owned_schema; RESET SESSION AUTHORIZATION;

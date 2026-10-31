@@ -287,12 +287,11 @@ dg_catalog_create(Node *statement, const char *query)
 
 		/*
 		 * A schema created since the repository was initialized joins the
-		 * branch with its first versioned object. The physical schema has
-		 * already passed the CREATE privilege check.
+		 * branch with its first versioned object. The schema's own row, which
+		 * GRANT and REVOKE change, has already passed the CREATE privilege
+		 * check.
 		 */
-		if (nsdef)
-			catalog_acl(nsdef, "CREATE", user);
-		else
+		if (!nsdef)
 			adopt = true;
 		skip = catalog_contains(read_ref(branch_ref("working")).target, name);
 		if (skip && !stmt->if_not_exists)

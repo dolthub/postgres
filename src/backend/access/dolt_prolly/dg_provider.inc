@@ -1409,6 +1409,39 @@ provider_namespace(CatalogView *view, const char *name)
 	return oid;
 }
 
+/*
+ * The owner and ACL of the server's namespace |oid|, which GRANT, REVOKE and
+ * ALTER SCHEMA OWNER change: ownership and privileges are not versioned. False
+ * if the server has no such namespace.
+ */
+static bool
+provider_namespace_privileges(Oid oid, Oid *owner, Datum *acl, bool *aclnull)
+{
+	CatalogView *previous = CatalogViewSwitch(NULL);
+	bool		found = false;
+
+	PG_TRY();
+	{
+		HeapTuple	tuple = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(oid));
+
+		if (HeapTupleIsValid(tuple))
+		{
+			Datum		value = SysCacheGetAttr(NAMESPACEOID, tuple, Anum_pg_namespace_nspacl, aclnull);
+
+			*owner = ((Form_pg_namespace) GETSTRUCT(tuple))->nspowner;
+			*acl = *aclnull ? (Datum) 0 : PointerGetDatum(DatumGetArrayTypePCopy(value));
+			found = true;
+			ReleaseSysCache(tuple);
+		}
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	return found;
+}
+
 /* The server objects a view leaves out: those in namespaces it does not have. */
 typedef struct ProviderHidden
 {
@@ -1644,12 +1677,21 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			char	   *name = json_value(definitions[i], "name");
 			char	   *owner = json_value(definitions[i], "owner");
 			HeapTuple	tuple;
+			Datum		acl;
+			bool		aclnull;
 
 			form.oid = provider_namespace(view, name);
 			namestrcpy(&form.nspname, name);
-			form.nspowner = provider_role(owner);
+			if (form.oid >= FirstDurableObjectId ||
+				!provider_namespace_privileges(form.oid, &form.nspowner, &acl, &aclnull))
+			{
+				form.nspowner = provider_role(owner);
+				acl = PointerGetDatum(provider_acl(definitions[i]));
+				aclnull = false;
+			}
 			tuple = provider_fixed(rows.relations[slot], &form, sizeof(form), Anum_pg_namespace_nspowner);
-			tuple = provider_set(rows.relations[slot], tuple, Anum_pg_namespace_nspacl, PointerGetDatum(provider_acl(definitions[i])));
+			if (!aclnull)
+				tuple = provider_set(rows.relations[slot], tuple, Anum_pg_namespace_nspacl, acl);
 			rows.rows[slot] = lappend(rows.rows[slot], tuple);
 			provider_description(&rows, form.oid, NamespaceRelationId, 0, json_value(definitions[i], "comment"));
 		}
