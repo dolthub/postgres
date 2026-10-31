@@ -1443,6 +1443,45 @@ dolt_reflog_noargs(PG_FUNCTION_ARGS)
 /* ---- dolt_revert and dolt_cherry_pick: three-way application of one
  * commit's changes (or their inverse) onto the branch head ---- */
 
+/* A cherry-pick preserves source authorship but records the current committer. */
+static bytea *
+cherry_pick_commit(bytea *database, bytea *head, bytea *source,
+                   const char *author, const char *email)
+{
+	char *meta = metadata(source, "commit");
+	char *saved_name = commit_committer_name;
+	char *saved_email = commit_committer_email;
+	bytea *result = NULL;
+	const char *user = GetUserNameFromId(GetUserId(), false);
+
+	PG_TRY();
+	{
+		commit_committer_name = setting_present(dolt_committer_name) ? dolt_committer_name : (char *) user;
+		commit_committer_email = setting_present(dolt_committer_email) ? dolt_committer_email : default_email(user);
+		result = commit_object(database, head, NULL, json_value(meta, "message"),
+				author ? author : json_value(meta, "author"),
+				email ? email : json_value(meta, "author_email"),
+				pg_strtoint64(json_value(meta, "author_date_us")));
+	}
+	PG_FINALLY();
+	{
+		commit_committer_name = saved_name;
+		commit_committer_email = saved_email;
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static void
+cherry_pick_conflict_counts(const char *json, int64 counts[3])
+{
+	int i;
+
+	run("SELECT (SELECT count(DISTINCT v->>'table') FROM jsonb_array_elements($1::jsonb->'conflicts') v), (SELECT count(DISTINCT v->>'table') FROM jsonb_array_elements($1::jsonb->'schema_conflicts') v), (SELECT count(DISTINCT v->>'table') FROM jsonb_array_elements($1::jsonb->'violations') v)", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
+	for (i = 0; i < 3; i++)
+		counts[i] = DatumGetInt64(cell(0, i + 1));
+}
+
 static Datum
 apply_commit(FunctionCallInfo fcinfo, bool revert)
 {
@@ -1455,7 +1494,7 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 	List	   *revisions = NIL;
 	ListCell   *lc;
 	VersionRef	head, pending;
-	bool abort_pick = false;
+	bool abort_pick = false, continue_pick = false;
 	int64 conflict_counts[3] = {0, 0, 0};
 	bytea	   *commit = NULL;
 	Datum		values[4];
@@ -1471,12 +1510,43 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 			author_option(args[++i], &author, &email);
 		else if (!revert && !strcmp(args[i], "--abort"))
 			abort_pick = true;
+		else if (!revert && !strcmp(args[i], "--continue"))
+			continue_pick = true;
 		else if (args[i][0] == '-')
 			unsupported(args[i]);
 		else
 			revisions = lappend(revisions, args[i]);
 	}
 	pending = read_ref(branch_ref("merge"));
+	if (abort_pick && continue_pick)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("--continue and --abort are mutually exclusive")));
+	if (continue_pick)
+	{
+		char *json = pending.target ? metadata(pending.target, "merge") : NULL;
+		char *operation = json ? json_value(json, "operation") : NULL;
+		bytea *database;
+
+		if (revisions || !operation || strcmp(operation, "cherry-pick"))
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("no cherry-pick to continue")));
+		cherry_pick_conflict_counts(json, conflict_counts);
+		if (conflict_counts[0] || conflict_counts[1] || conflict_counts[2])
+			goto done;
+
+		validate_working_foreign_keys(dg_current_branch(), NULL);
+		database = capture_visible().hash;
+		head = read_ref(branch_ref("heads"));
+		commit = cherry_pick_commit(database, head.target, child(pending.target, 2),
+				author ? author : json_value(json, "author_override"),
+				email ? email : json_value(json, "email_override"));
+		move_ref(branch_ref("heads"), head, commit);
+		move_ref(branch_ref("staged"), read_ref(branch_ref("staged")), database);
+		move_ref(branch_ref("working"), read_ref(branch_ref("working")), database);
+		finish_merge();
+		advance_snapshot();
+		goto done;
+	}
 	if (abort_pick)
 	{
 		char *operation = pending.target ? json_value(metadata(pending.target, "merge"), "operation") : NULL;
@@ -1544,18 +1614,22 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 			initStringInfo(&state);
 			appendStringInfoString(&state, "{\"format\":\"DGMERGE1\",\"squash\":true,\"operation\":\"cherry-pick\",\"source\":");
 			escape_json(&state, (char *) lfirst(lc));
+			if (author)
+			{
+				json_field(&state, "author_override", author, true);
+				json_field(&state, "email_override", email, true);
+			}
 			appendStringInfo(&state, ",\"conflicts\":[%s],\"violations\":[%s],\"schema_conflicts\":[%s]}", conflicts.data, violations.data, schema_conflicts.data);
 			move_ref(branch_ref("merge"), pending,
 					 put("merge", state.data, VC_ARGS(PointerGetDatum(head.target), PointerGetDatum(target), PointerGetDatum(parent), PointerGetDatum(before), PointerGetDatum(read_ref(branch_ref("staged")).target)), 5));
 			move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture_visible().hash);
-			run("SELECT (SELECT count(DISTINCT v->>'table') FROM jsonb_array_elements($1::jsonb->'conflicts') v), (SELECT count(DISTINCT v->>'table') FROM jsonb_array_elements($1::jsonb->'schema_conflicts') v), (SELECT count(DISTINCT v->>'table') FROM jsonb_array_elements($1::jsonb->'violations') v)", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(state.data)), NULL, true);
-			for (i = 0; i < 3; i++)
-				conflict_counts[i] = DatumGetInt64(cell(0, i + 1));
+			cherry_pick_conflict_counts(state.data, conflict_counts);
 			goto done;
 		}
 		database = capture_visible().hash;
 		message = revert ? psprintf("Revert \"%s\"", json_value(meta, "message")) : json_value(meta, "message");
-		commit = commit_object(database, head.target, NULL, message, author, email, GetCurrentTimestamp());
+		commit = revert ? commit_object(database, head.target, NULL, message, author, email, GetCurrentTimestamp()) :
+			cherry_pick_commit(database, head.target, target, author, email);
 		move_ref(branch_ref("heads"), head, commit);
 		move_ref(branch_ref("staged"), read_ref(branch_ref("staged")), database);
 		move_ref(branch_ref("working"), read_ref(branch_ref("working")), database);

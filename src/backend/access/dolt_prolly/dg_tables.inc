@@ -121,7 +121,7 @@ dolt_status(PG_FUNCTION_ARGS)
 		" FROM (SELECT v FROM s WHERE v->>'kind'='namespace') a FULL JOIN (SELECT v FROM w WHERE v->>'kind'='namespace') b ON a.v->'definition'->>'name'=b.v->'definition'->>'name'"
 		" WHERE a.v IS NULL OR b.v IS NULL) "
 		"SELECT name,staged,status FROM (SELECT 0 AS grp,name,false AS staged,CASE WHEN name IN (SELECT v->>'table' FROM jsonb_array_elements(coalesce($4::jsonb->'schema_conflicts','[]'::jsonb)) v) THEN 'schema conflict' WHEN name IN (SELECT v->>'table' FROM jsonb_array_elements($4::jsonb->'conflicts') v) THEN 'conflict' ELSE 'constraint violation' END::text AS status FROM conflicts"
-		" UNION ALL SELECT grp,name,staged,status FROM tables WHERE name NOT IN (SELECT name FROM conflicts)) x ORDER BY grp,name COLLATE \"C\"",
+		" UNION ALL SELECT grp,name,staged,status FROM tables) x ORDER BY grp,name COLLATE \"C\"",
 		4, VC_TYPES(TEXTOID, TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(head), CStringGetTextDatum(staged), CStringGetTextDatum(working), CStringGetTextDatum(merge)), NULL, true);
 	return_rows(fcinfo, nest);
 	return (Datum) 0;
