@@ -175,6 +175,7 @@ static bytea *staged_capture(Capture * full);
 static void catalog_activate(void);
 static bool branch_management(char **args, int n);
 static void checkout_tables(char **args, int n);
+static void diff_revision_arguments(FunctionCallInfo fcinfo, char **from, char **to, char **table);
 static char *resolve_object_argument(const char *arg, const char *json_a, const char *json_b, bool required);
 static char *resolve_table_argument(const char *arg, const char *json_a, const char *json_b, bool required);
 static char *staged_state(void);
@@ -2062,15 +2063,12 @@ state_json(const char *revision)
 Datum
 dolt_diff_summary(PG_FUNCTION_ARGS)
 {
-	char	   *from,
-			   *to,
-			   *table = NULL;
+	char *from, *to, *fromrev, *torev, *table;
 	int			nest = begin_api();
 
-	from = state_json(text_to_cstring(PG_GETARG_TEXT_PP(0)));
-	to = !strcmp(text_to_cstring(PG_GETARG_TEXT_PP(0)), text_to_cstring(PG_GETARG_TEXT_PP(1))) ? from : state_json(text_to_cstring(PG_GETARG_TEXT_PP(1)));
-	if (PG_NARGS() > 2)
-		table = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	diff_revision_arguments(fcinfo, &fromrev, &torev, &table);
+	from = state_json(fromrev);
+	to = !strcmp(fromrev, torev) ? from : state_json(torev);
 	if (table)
 	{
 		/* As in Dolt, a name that names nothing has no changes. */
@@ -2168,3 +2166,9 @@ static bytea *carry_workspace_changes(bytea *base, bytea *local, bytea *merged);
 #include "dg_compat.inc"
 
 #include "dg_commit_session.inc"
+
+Datum
+dolt_diff_summary_range(PG_FUNCTION_ARGS)
+{
+ return dolt_diff_summary(fcinfo);
+}
