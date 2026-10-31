@@ -40,6 +40,26 @@ The SQL reproductions are in /workspace/reports/rewrite-dolt-functions-*.sql.
   while moving content hashes to 20 bytes on zachmu/short-hashes, which leaves
   these fingerprints at 32.
 
+* **Row journal disabled: unsafe with concurrent writers (2026-10-31):** small
+  batches can be journaled to `pg_dolt_journal` instead of rewriting a table's
+  trees, but `dolt_row_journal` is now off by default. A writer folds the
+  journal into the latest state, then persists that fold mid-transaction:
+  it saves roots that include other transactions' entries and deletes them.
+  Its own later snapshot reads merge those roots in as if they were its own
+  changes, and concurrent folders race to consume the same entries. Under
+  concurrent TPC-C this lost updates (duplicate order numbers, money and stock
+  created or lost), showed repeatable read transactions rows committed after
+  their snapshot, and failed with "prolly journal removes a missing index
+  entry" and "failed to fetch tuple being updated". Partial fixes are merged
+  (fold only entries the snapshot sees, never refold consumed entries, reload a
+  latest state whose roots moved), but other interleavings remain. Folding
+  needs separating from writers, for example compaction by something whose
+  snapshot sees everything it folds, before the journal can be on by default.
+  Its single-threaded TPC-C gain was roughly 5-10% at scale 1.
+  `test_prolly/t/050_concurrent_writes.pl` fails with the journal on and is
+  the gate for re-enabling it, with the isolation specs in
+  `test_prolly/specs`.
+
 * **No spatial indexes on prolly tables (2026-10-30):** GiST, SP-GiST and BRIN
   are rejected on prolly tables, and PostGIS `geometry` and `geography` have no
   ordered key encoding for a prolly index. Spatial values are stored, versioned,
