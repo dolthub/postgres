@@ -1482,6 +1482,34 @@ cherry_pick_conflict_counts(const char *json, int64 counts[3])
 		counts[i] = DatumGetInt64(cell(0, i + 1));
 }
 
+/* A revert may retain unrelated working edits, but must never absorb a
+ * user's edits to a member changed by the source commit. Check the source
+ * delta even when its inverse would happen to equal the local result. */
+static void
+revert_check_local_changes(bytea *head, bytea *working, bytea *source, bytea *parent)
+{
+	int nh, nw, ns, np;
+	Member *hm = database_members(head, &nh);
+	Member *wm = database_members(working, &nw);
+	Member *sm = database_members(source, &ns);
+	Member *pm = database_members(parent, &np);
+	int i;
+
+	for (i = 0; i < ns + np; i++)
+	{
+		Member *key = i < ns ? &sm[i] : &pm[i - ns];
+		Member *before = merge_member(pm, np, key->kind, key->name);
+		Member *after = merge_member(sm, ns, key->kind, key->name);
+
+		if (!merge_same(before, after) &&
+			!merge_same(merge_member(hm, nh, key->kind, key->name),
+						merge_member(wm, nw, key->kind, key->name)))
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("local changes would be overwritten by revert"),
+							errdetail("Uncommitted changes overlap at %s %s.", key->kind, key->name)));
+	}
+}
+
 static Datum
 apply_commit(FunctionCallInfo fcinfo, bool revert)
 {
@@ -1537,6 +1565,11 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 		if (conflict_counts[0] || conflict_counts[1] || conflict_counts[2])
 			goto done;
 
+		if (!author)
+		{
+			author = json_value(json, "author_override");
+			email = json_value(json, "email_override");
+		}
 		validate_working_foreign_keys(dg_current_branch(), NULL);
 		database = staged_capture(&live);
 		head = read_ref(branch_ref("heads"));
@@ -1640,6 +1673,8 @@ apply_targets:
 		parentdb = child(parent, 1);
 		head = read_ref(branch_ref("heads"));
 		live = capture_visible();
+		if (revert)
+			revert_check_local_changes(child(head.target, 1), live.hash, targetdb, parentdb);
 		initStringInfo(&conflicts);
 		initStringInfo(&violations);
 		initStringInfo(&schema_conflicts);
