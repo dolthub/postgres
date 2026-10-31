@@ -155,7 +155,8 @@ schema_object_encode(Oid catalog, HeapTuple tuple, TupleDesc desc)
 				reference == ProcedureRelationId ? schema_proc_name(referenced) :
 				reference == OperatorRelationId ? schema_operator_name(referenced) :
 				reference == NamespaceRelationId ? get_namespace_name(referenced) : GetUserNameFromId(referenced, false);
-			if (referenced >= FirstDurableObjectId && referenced != id && reference != AuthIdRelationId)
+			/* Versioned and server objects alike: dropping either is guarded by it. */
+			if (referenced >= FirstNormalObjectId && referenced != id && reference != AuthIdRelationId)
 			{
 				if (dependencies.len > 1) appendStringInfoChar(&dependencies, ',');
 				appendStringInfoChar(&dependencies, '[');

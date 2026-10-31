@@ -381,6 +381,9 @@ view_create(ParseState *pstate, ViewStmt *stmt, int location, int length)
 		native_mutation_view = saved_mutation;
 		SetUserIdAndSecContext(caller, security);
 		CatalogViewSwitch(previous);
+		if (CatalogViewIsProvisional(view))
+			CatalogViewRetireMutation(view);
+		CatalogViewRelease(view);
 	}
 	PG_END_TRY();
 }

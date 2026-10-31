@@ -150,7 +150,7 @@ provider_view_member(DGProviderRows *rows, CatalogView *view, const char *defini
 	form.oid = CatalogViewBindObject(view, RelationRelationId, name, InvalidOid);
 	form.relnamespace = CatalogViewLookupObject(view, NamespaceRelationId, strVal(linitial(parts)));
 	namestrcpy(&form.relname, strVal(lsecond(parts)));
-	form.relowner = get_role_oid(json_value(definition, "owner"), false);
+	form.relowner = provider_role(json_value(definition, "owner"));
 	form.reltype = CatalogViewBindObject(view, TypeRelationId, name, InvalidOid);
 	form.relkind = RELKIND_VIEW;
 	form.relpersistence = RELPERSISTENCE_PERMANENT;

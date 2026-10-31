@@ -620,6 +620,17 @@ dg_catalog_rename(ParseState *pstate, Node *statement)
 	}
 
 	/*
+	 * System schemas belong to the server, as built-in objects do: no branch
+	 * defines them, so a versioned object cannot move into one.
+	 */
+	if (IsA(statement, AlterObjectSchemaStmt) &&
+		dg_system_namespace(((AlterObjectSchemaStmt *) statement)->newschema))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot move versioned object %s into system schema %s", name,
+						((AlterObjectSchemaStmt *) statement)->newschema)));
+
+	/*
 	 * Server objects stay in their schema on every branch, so a branch cannot
 	 * take its schema elsewhere while it holds them.
 	 */
@@ -766,6 +777,9 @@ dg_catalog_rename(ParseState *pstate, Node *statement)
 		native_mutation_view = saved_mutation;
 		SetUserIdAndSecContext(caller, security);
 		CatalogViewSwitch(previous);
+		if (CatalogViewIsProvisional(view))
+			CatalogViewRetireMutation(view);
+		CatalogViewRelease(view);
 		if (pushed)
 			PopActiveSnapshot();
 	}

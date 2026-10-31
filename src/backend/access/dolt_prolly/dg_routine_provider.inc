@@ -97,7 +97,7 @@ provider_routine(DGProviderRows *rows, CatalogView *view, const char *definition
 				values[i] = ObjectIdGetDatum(CatalogViewLookupObject(view, NamespaceRelationId, encoded));
 				break;
 			case Anum_pg_proc_proowner:
-				values[i] = ObjectIdGetDatum(get_role_oid(encoded, false));
+				values[i] = ObjectIdGetDatum(provider_role(encoded));
 				break;
 			case Anum_pg_proc_prolang:
 				values[i] = ObjectIdGetDatum(get_language_oid(encoded, false));

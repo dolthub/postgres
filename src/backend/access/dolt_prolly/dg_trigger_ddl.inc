@@ -208,6 +208,9 @@ trigger_ddl(ParseState *pstate, Node *statement, RangeVar *relation)
 	{
 		SetUserIdAndSecContext(caller, security);
 		CatalogViewSwitch(previous);
+		if (CatalogViewIsProvisional(view))
+			CatalogViewRetireMutation(view);
+		CatalogViewRelease(view);
 	}
 	PG_END_TRY();
 }

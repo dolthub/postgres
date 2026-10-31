@@ -299,7 +299,7 @@ provider_type(DGProviderRows *rows, CatalogView *view, const char *definition)
 				values[i] = ObjectIdGetDatum(CatalogViewLookupObject(view, NamespaceRelationId, encoded));
 				break;
 			case Anum_pg_type_typowner:
-				values[i] = ObjectIdGetDatum(get_role_oid(encoded, false));
+				values[i] = ObjectIdGetDatum(provider_role(encoded));
 				break;
 			case Anum_pg_type_typelem:
 			case Anum_pg_type_typbasetype:
