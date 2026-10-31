@@ -35,9 +35,24 @@ for my $journal ('off', 'on') {
  sql(q{INSERT INTO t VALUES (7,8,9,'Delta',true); SELECT dolt_commit('-Am','main'); SELECT dolt_merge('feature')});
  is(sql(q{SET enable_seqscan=off; SELECT id FROM t WHERE live AND lower(label) IN ('gamma','delta') ORDER BY id}), "6\n7", "$journal merged expression keys");
  is(sql(q{SET enable_seqscan=off; SELECT id FROM t AS OF 'feature' WHERE live AND lower(label)='alpha'}), '5', "$journal revision expression binding");
+ sql(q{SELECT dolt_branch('collision')});
+ sql(q{SELECT dolt_checkout('collision'); INSERT INTO t VALUES (8,10,10,'Same',true); SELECT dolt_commit('-Am','collision')});
+ sql(q{INSERT INTO t VALUES (9,10,10,'SAME',true); SELECT dolt_commit('-Am','ours')});
+ is(sql(q{SELECT conflicts FROM dolt_merge('collision')}), '1', "$journal merge detects expression uniqueness collision");
+ is(sql(q{SELECT count(*) FROM dolt_constraint_violations_t}), '2', "$journal reports both colliding rows");
+ sql(q{SELECT dolt_merge('--abort'); SELECT dolt_branch('-D','collision')});
  sql(q{ALTER TABLE t RENAME COLUMN label TO name});
  is(sql(q{SET enable_seqscan=off; SELECT id FROM t WHERE live AND lower(name)='alpha'}), '5', "$journal renamed expression dependency");
  sql(q{DROP TABLE t; SELECT dolt_branch('-D','feature'); SELECT dolt_commit('-Am','cleanup')});
+}
+sql(q{CREATE TABLE patterns(id int PRIMARY KEY, t text, v varchar(20), b char(10));
+ INSERT INTO patterns VALUES (1,'alpha','alpha','alpha'),(2,'beta','beta','beta'),(3,'alphabet','alphabet','alphabet');
+ CREATE INDEX tp ON patterns(t text_pattern_ops);
+ CREATE INDEX vp ON patterns(v varchar_pattern_ops);
+ CREATE INDEX bp ON patterns(b bpchar_pattern_ops)});
+for my $column ('t','v','b') {
+ is(sql("SET enable_seqscan=off; SELECT id FROM patterns WHERE $column LIKE 'alph%' ORDER BY id"), "1\n3", "$column pattern index results");
+ like(sql("SET enable_seqscan=off; EXPLAIN (COSTS OFF) SELECT id FROM patterns WHERE $column LIKE 'alph%'"), qr/Index Cond:.*~>=~.*~<~/s, "$column prefix becomes index range");
 }
 $node->stop;
 done_testing();

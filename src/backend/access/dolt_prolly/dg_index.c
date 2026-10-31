@@ -135,18 +135,20 @@ key_digest(Relation index, PLSlice key, PLHash *digest)
 static void
 index_values(Relation index, TupleTableSlot *slot, Datum *values, bool *nulls)
 {
-	if (RelationGetIndexExpressions(index) == NIL)
+	if (heap_attisnull(index->rd_indextuple, Anum_pg_index_indexprs, NULL))
 	{
 		for (int j = 0; j < index->rd_index->indnatts; j++)
 			values[j] = slot_getattr(slot, index->rd_index->indkey.values[j], &nulls[j]);
 	}
 	else
 	{
-		IndexInfo *info = BuildIndexInfo(index);
 		EState *estate = CreateExecutorState();
+		MemoryContext old = MemoryContextSwitchTo(estate->es_query_cxt);
+		IndexInfo *info = BuildIndexInfo(index);
 
 		GetPerTupleExprContext(estate)->ecxt_scantuple = slot;
 		FormIndexDatum(info, slot, estate, values, nulls);
+		MemoryContextSwitchTo(old);
 		for (int j = 0; j < index->rd_index->indnatts; j++)
 			if (!nulls[j])
 			{
@@ -161,21 +163,25 @@ index_values(Relation index, TupleTableSlot *slot, Datum *values, bool *nulls)
 bool
 dg_index_row_matches(Relation table, Relation index, PLSlice row)
 {
-	List *predicate = RelationGetIndexPredicate(index);
+	List *predicate;
 	EState *estate;
+	MemoryContext old;
 	TupleTableSlot *slot;
 	ItemPointerData tid;
 	bool result;
 
-	if (predicate == NIL)
+	if (heap_attisnull(index->rd_indextuple, Anum_pg_index_indpred, NULL))
 		return true;
 	estate = CreateExecutorState();
+	old = MemoryContextSwitchTo(estate->es_query_cxt);
+	predicate = RelationGetIndexPredicate(index);
 	slot = table_slot_create(table, NULL);
 	ItemPointerSetInvalid(&tid);
 	dg_decode(table, row, &tid, slot);
 	GetPerTupleExprContext(estate)->ecxt_scantuple = slot;
 	result = ExecQual(ExecPrepareQual(predicate, estate), GetPerTupleExprContext(estate));
 	ExecDropSingleTupleTableSlot(slot);
+	MemoryContextSwitchTo(old);
 	FreeExecutorState(estate);
 	return result;
 }
@@ -190,7 +196,7 @@ dg_index_row_key(Relation table, Relation index, PLSlice row, StringInfo key, bo
 
 	if (!dg_index_row_matches(table, index, row))
 		return false;
-	if (RelationGetIndexExpressions(index) != NIL)
+	if (!heap_attisnull(index->rd_indextuple, Anum_pg_index_indexprs, NULL))
 	{
 		ItemPointerData tid;
 

@@ -176,6 +176,9 @@ schema_expression_sql(Node *expression, Oid relation)
 	return result;
 }
 
+/* attribute: positive = default/generated column, zero = CHECK, -1 =
+ * ALTER USING, -2 = index expression, -3 = index predicate. Index trees are
+ * bound from canonical SQL and contain runtime identities only. */
 static Node *
 schema_expression_bind(CatalogView *view, Oid relation, const char *name,
 					   TupleDesc desc, Node *raw, int attribute)
