@@ -74,5 +74,6 @@ tests += {
       't/056_revert_workflows.pl',
       't/057_diff_history.pl',
       't/058_diff_ignore.pl',
+      't/059_query_diff.pl',
   ]},
 }

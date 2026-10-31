@@ -1,0 +1,25 @@
+use strict;
+use warnings FATAL => 'all';
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
+my $node=PostgreSQL::Test::Cluster->new('query_diff');
+$node->init(extra=>['--encoding=UTF8','--locale=C']);
+$node->start;
+sub sql { $node->safe_psql('postgres',$_[0]); }
+sql(q{CREATE TABLE t(a int,b int,v text,PRIMARY KEY(a,b)) USING dolt_prolly_table;
+INSERT INTO t VALUES(1,1,'old'),(1,2,'same');
+CREATE TABLE other(LIKE t INCLUDING ALL) USING dolt_prolly_table;
+INSERT INTO other SELECT * FROM t});
+sql(q{SELECT dolt_commit('-Am','base')});
+sql(q{UPDATE t SET v='new' WHERE b=1});
+is(sql(q{SELECT * FROM dolt_query_diff($q$SELECT * FROM t AS OF 'HEAD'$q$,$q$SELECT * FROM t$q$)}), '1|1|old|1|1|new|modified', 'historical complete composite primary key identifies modified rows');
+is(sql(q{SELECT * FROM dolt_query_diff($q$SELECT v,b,a FROM t AS OF 'HEAD'$q$,$q$SELECT v,b,a FROM t$q$)}), 'old|1|1|new|1|1|modified', 'projected primary key need not precede values');
+is(sql(q{SELECT diff_type,count(*) FROM dolt_query_diff($q$SELECT * FROM t AS OF 'HEAD'$q$,$q$SELECT * FROM other$q$) GROUP BY diff_type ORDER BY diff_type}), "added|2\ndeleted|2", 'identical values from distinct tables are not matched');
+is(sql(q{SELECT diff_type,count(*) FROM dolt_query_diff($q$SELECT v FROM t AS OF 'HEAD'$q$,$q$SELECT v FROM t$q$) GROUP BY diff_type ORDER BY diff_type}), "added|1\ndeleted|1", 'incomplete key projection uses multiset comparison');
+is(sql(q{SELECT count(*) FROM dolt_query_diff($q$SELECT E'a\x1eb'::text AS x,'c'::text AS y$q$,$q$SELECT 'a'::text AS x,E'b\x1ec'::text AS y$q$)}), '2', 'embedded delimiter cannot collide across column boundaries');
+is(sql(q{SELECT count(*) FROM dolt_query_diff($q$SELECT NULL::text AS x$q$,$q$SELECT ''::text AS x$q$)}), '2', 'NULL is distinct from empty string');
+is(sql(q{SELECT diff_type,count(*) FROM dolt_query_diff($q$SELECT 1 AS x UNION ALL SELECT 1$q$,$q$SELECT 1 AS x$q$) GROUP BY diff_type}), 'deleted|1', 'keyless duplicate multiplicity is retained');
+is(sql(q{SELECT count(*) FROM dolt_query_diff($q$SELECT * FROM t$q$,$q$SELECT * FROM t$q$)}), '0', 'identical keyed result is empty');
+$node->stop;
+done_testing();
