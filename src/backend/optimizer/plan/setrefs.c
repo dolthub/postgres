@@ -2059,7 +2059,7 @@ fix_expr_common(PlannerInfo *root, Node *node)
 				Const	   *con = (Const *) node;
 
 				if (!con->constisnull && CatalogViewIsObjectIdType(con->consttype))
-					contextual = CatalogViewObjectContext(DatumGetObjectId(con->constvalue)) != NULL;
+					contextual = CatalogViewValueContext(DatumGetObjectId(con->constvalue)) != NULL;
 				contextual |= CatalogViewObjectContext(con->consttype) != NULL;
 				break;
 			}

@@ -43,25 +43,64 @@ namespace_definition(const char *name)
 
 static void adopt_schema(Oid schema);
 
+static void catalog_activate(void);
+
 /*
  * A schema created in a repository is versioned on the session's branch, as
  * Doltgres versions schemas. Its physical namespace is shared by all branches.
+ * Where tables default to prolly storage or commits are automatic, a schema
+ * is versioned even before the first table, as routines and sequences are: it
+ * is a change of its own.
  */
 void
 dg_catalog_schema_created(Oid schema)
 {
 	char	   *name = get_namespace_name(schema);
 
-	if (!IsUnderPostmaster || catalog_api_depth || isAnyTempNamespace(schema) ||
-		dg_system_namespace(name))
+	if (!IsUnderPostmaster || catalog_api_depth || creating_extension ||
+		isAnyTempNamespace(schema) || dg_system_namespace(name))
 		return;
 	if (!dg_catalog_active())
 	{
-		if (!dolt_transaction_commit)
+		if (!dolt_transaction_commit &&
+			(!default_table_access_method || strcmp(default_table_access_method, "dolt_prolly_table")))
 			return;
 		catalog_activate();
 	}
 	adopt_schema(schema);
+}
+
+/*
+ * The server's schema named |name|, when the session's branch does not have
+ * one: another branch created it, and this branch's schema of that name is
+ * the same one. InvalidOid when CREATE SCHEMA makes a new schema, or when the
+ * branch already has |name|, which CREATE SCHEMA then reports.
+ */
+Oid
+dg_catalog_existing_schema(const char *name)
+{
+	CatalogView *branch;
+	CatalogView *previous;
+	Oid			existing = InvalidOid;
+
+	if (!dg_catalog_active() || creating_extension || catalog_api_depth ||
+		!(branch = dg_catalog_session_view()))
+		return InvalidOid;
+	previous = CatalogViewSwitch(branch);
+	PG_TRY();
+	{
+		if (!OidIsValid(get_namespace_oid(name, true)))
+		{
+			CatalogViewSwitch(NULL);
+			existing = get_namespace_oid(name, true);
+		}
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	return existing;
 }
 
 /*

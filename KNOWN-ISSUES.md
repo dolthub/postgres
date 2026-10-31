@@ -39,3 +39,12 @@ The SQL reproductions are in /workspace/reports/rewrite-dolt-functions-*.sql.
   by the manifest by its chunk address, which those comparisons then use. Found
   while moving content hashes to 20 bytes on zachmu/short-hashes, which leaves
   these fingerprints at 32.
+
+* **No spatial indexes on prolly tables (2026-10-30):** GiST, SP-GiST and BRIN
+  are rejected on prolly tables, and PostGIS `geometry` and `geography` have no
+  ordered key encoding for a prolly index. Spatial values are stored, versioned,
+  diffed and merged, but every spatial predicate scans the whole table, which
+  rules out real spatial workloads. Accepted for now. The long-term answer is a
+  versioned spatial index built from prolly trees, for example over a
+  space-filling-curve key (geohash or Hilbert cell) with an exact recheck, rather
+  than a native GiST rebuilt per branch, which would not be history-independent.

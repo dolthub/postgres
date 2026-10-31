@@ -1,3 +1,34 @@
+/*
+ * Whether native object |objid| of |classid| belongs to an extension. Such an
+ * object is named, like a built-in one, by its qualified name: a server with
+ * the extension installed binds it again.
+ */
+static bool
+schema_extension_member(Oid classid, Oid objid)
+{
+	CatalogView *previous = CatalogViewSwitch(NULL);
+	Oid			extension = InvalidOid;
+
+	PG_TRY();
+	{
+		extension = getExtensionOfObject(classid, objid);
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	return OidIsValid(extension);
+}
+
+/* Whether |objid| is a native object local to this server, outside any extension. */
+static bool
+schema_expression_local(Oid classid, Oid objid)
+{
+	return objid >= FirstNormalObjectId && objid < FirstDurableObjectId &&
+		!schema_extension_member(classid, objid);
+}
+
 /* Expression payloads contain SQL and symbolic column names, never serialized
  * executor nodes or local OIDs. Rebinding uses native expression transformation.
  * The first codec deliberately admits only built-in scalar expression families;
@@ -28,21 +59,21 @@ schema_expression_check(Node *node, void *context)
 		case T_FuncExpr:
 
 			/*
-			 * A versioned routine is deparsed by qualified name and rebound
-			 * by name; a native user function is local to this server.
+			 * A versioned routine or an extension's function is deparsed by
+			 * qualified name and rebound by name; any other native user
+			 * function is local to this server.
 			 */
-			if (((FuncExpr *) node)->funcid >= FirstNormalObjectId &&
-				((FuncExpr *) node)->funcid < FirstDurableObjectId)
+			if (schema_expression_local(ProcedureRelationId, ((FuncExpr *) node)->funcid))
 				unsupported("canonical expression user-defined function");
 			break;
 		case T_OpExpr:
 		case T_DistinctExpr:
 		case T_NullIfExpr:
-			if (((OpExpr *) node)->opno >= FirstNormalObjectId && ((OpExpr *) node)->opno < FirstDurableObjectId)
+			if (schema_expression_local(OperatorRelationId, ((OpExpr *) node)->opno))
 				unsupported("canonical expression user-defined operator");
 			break;
 		case T_ScalarArrayOpExpr:
-			if (((ScalarArrayOpExpr *) node)->opno >= FirstNormalObjectId && ((ScalarArrayOpExpr *) node)->opno < FirstDurableObjectId)
+			if (schema_expression_local(OperatorRelationId, ((ScalarArrayOpExpr *) node)->opno))
 				unsupported("canonical expression user-defined operator");
 			break;
 		case T_BoolExpr:
@@ -62,7 +93,7 @@ schema_expression_check(Node *node, void *context)
 		default:
 			unsupported("canonical scalar expression node codec");
 	}
-	if (exprType(node) >= FirstNormalObjectId && exprType(node) < FirstDurableObjectId)
+	if (schema_expression_local(TypeRelationId, exprType(node)))
 		unsupported("canonical expression user-defined result type");
 	if (!context || exprType(node) != VOIDOID)
 	{

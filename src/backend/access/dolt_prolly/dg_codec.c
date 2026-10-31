@@ -8,7 +8,7 @@
 #include <netinet/in.h>
 #include "access/htup_details.h"
 #include "catalog/pg_enum.h"
-#include "catalog/pg_type_d.h"
+#include "catalog/pg_type.h"
 #include "common/int128.h"
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
@@ -42,6 +42,9 @@
 #include "utils/xml.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
+#include "catalog/catalogview.h"
+#include "catalog/dependency.h"
+#include "commands/extension.h"
 #include "utils/memutils.h"
 #include "common/hashfn.h"
 
@@ -69,6 +72,54 @@ pack_fields(PLValue * fields, int count)
  * audited built-in binary formats and enum labels may reach that fallback.
  * Do not cache this check: ALTER TYPE can change a nested composite descriptor.
  */
+/*
+ * Extension types whose binary send output has been reviewed: a value's own
+ * contents, with no local identifier, so a server with the extension reads
+ * it back. PostGIS sends geometry and geography as extended well-known
+ * binary, whose spatial reference is an SRID, a value the data defines.
+ * hstore sends its pairs, which it keeps sorted, as lengths and bytes.
+ */
+static const struct
+{
+	const char *extension;
+	const char *type;
+}			reviewed_extension_types[] = {
+	{"postgis", "geometry"},
+	{"postgis", "geography"},
+	{"hstore", "hstore"},
+};
+
+/* Whether |type| is an extension's type listed in reviewed_extension_types. */
+static bool
+reviewed_extension_type(Oid type)
+{
+	CatalogView *previous = CatalogViewSwitch(NULL);
+	bool		reviewed = false;
+
+	PG_TRY();
+	{
+		Oid			extension = getExtensionOfObject(TypeRelationId, type);
+		char	   *extname = OidIsValid(extension) ? get_extension_name(extension) : NULL;
+		HeapTuple	tuple = extname ? SearchSysCache1(TYPEOID, ObjectIdGetDatum(type)) : NULL;
+
+		if (HeapTupleIsValid(tuple))
+		{
+			const char *typname = NameStr(((Form_pg_type) GETSTRUCT(tuple))->typname);
+
+			for (int i = 0; i < lengthof(reviewed_extension_types); i++)
+				reviewed |= !strcmp(reviewed_extension_types[i].extension, extname) &&
+					!strcmp(reviewed_extension_types[i].type, typname);
+			ReleaseSysCache(tuple);
+		}
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	return reviewed;
+}
+
 static void
 check_type_recursive(Oid type, List *ancestors)
 {
@@ -186,6 +237,8 @@ check_type_recursive(Oid type, List *ancestors)
 			case TSQUERYOID:
 				break;
 			default:
+				if (type >= FirstNormalObjectId && reviewed_extension_type(type))
+					break;
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("prolly storage rejects type %s", format_type_be(type)),

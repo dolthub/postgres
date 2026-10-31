@@ -14,6 +14,7 @@
  */
 #include "postgres.h"
 
+#include "access/doltcatalog.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
@@ -149,8 +150,10 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString,
 		SetUserIdAndSecContext(owner_uid,
 							   save_sec_context | SECURITY_LOCAL_USERID_CHANGE);
 
-	/* Create the schema's namespace */
-	namespaceId = NamespaceCreate(schemaName, owner_uid, false);
+	/* Create the schema's namespace, unless another branch already made it. */
+	namespaceId = dg_catalog_existing_schema(schemaName);
+	if (!OidIsValid(namespaceId))
+		namespaceId = NamespaceCreate(schemaName, owner_uid, false);
 
 	/* Advance cmd counter to make the namespace visible */
 	CommandCounterIncrement();

@@ -32,6 +32,7 @@
 #include "catalog/namespace.h"
 #include "catalog/toasting.h"
 #include "commands/createas.h"
+#include "commands/extension.h"
 #include "commands/matview.h"
 #include "commands/prepare.h"
 #include "commands/tablecmds.h"
@@ -112,7 +113,8 @@ create_ctas_internal(List *attrList, IntoClause *into)
 	 * A versioned table is created in its branch's schema, like any other
 	 * CREATE TABLE; its rows are then inserted as usual.
 	 */
-	if (is_matview ? dg_catalog_create_matview(create, into->viewQuery) : dg_catalog_create((Node *) create, NULL))
+	if (!creating_extension &&
+		(is_matview ? dg_catalog_create_matview(create, into->viewQuery) : dg_catalog_create((Node *) create, NULL)))
 	{
 		CommandCounterIncrement();
 		ObjectAddressSet(intoRelationAddr, RelationRelationId,
