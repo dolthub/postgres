@@ -205,6 +205,7 @@ dg_ensure_ignore_table(const char *schema)
 	PG_TRY();
 	{
 		dg_internal_system_ddl = true;
+		ensure_repository();
 		if (!schema_has_ignore_table(schema))
 		{
 			run_context(psprintf("CREATE TABLE %s.dolt_ignore (pattern text PRIMARY KEY, ignored boolean NOT NULL) USING dolt_prolly_table", dg_quote_identifier(schema)), 0, NULL, NULL, NULL, false);
