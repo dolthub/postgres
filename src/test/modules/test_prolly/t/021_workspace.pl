@@ -80,6 +80,11 @@ is($err,1,'cherry-pick requires a clean working set');
 $s->{stderr} = '';
 $s->query_safe(q{SELECT dolt_checkout('t')});
 $s->quit;
+# A serial column owns its sequence. Cleaning the table already removes that
+# sequence; the remaining captured object list must tolerate that removal.
+sql(q{CREATE TABLE untracked_serial(id serial PRIMARY KEY, v text) USING dolt_prolly_table});
+is(sql(q{SELECT dolt_clean()}),'0','clean table and its owned sequence together');
+is(sql(q{SELECT count(*) FROM pg_class WHERE relname IN ('untracked_serial','untracked_serial_id_seq')}),'0','clean removes owned sequence and table');
 # Branch management and commit-graph helpers.
 is(sql(q{SELECT dolt_branch('-c','main','copy')}),'0','copy branch');
 is(sql(q{SELECT dolt_branch('-c','-f','side','copy')}),'0','force copy over existing branch');

@@ -781,7 +781,9 @@ drop_objects(List *names)
 		bool found = false;
 
 		initStringInfo(&command);
-		appendStringInfo(&command, "DROP %s ", commands[kind]);
+		/* Dropping a table also drops its owned sequences. The selection
+		 * was captured before those dependency removals. */
+		appendStringInfo(&command, "DROP %s IF EXISTS ", commands[kind]);
 		foreach_ptr(char, name, names)
 		{
 			run("SELECT 1 FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'name'=$2 AND v->>'kind'=$3", 3, VC_TYPES(TEXTOID,TEXTOID,TEXTOID), VC_ARGS(CStringGetTextDatum(json),CStringGetTextDatum(name),CStringGetTextDatum(kinds[kind])), NULL, true);

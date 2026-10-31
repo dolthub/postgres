@@ -325,7 +325,15 @@ run_context(const char *sql, int nargs, Oid *types, Datum *args,
 		catalog_api_depth = 0;
 		set_config_option("search_path", path, PGC_USERSET, PGC_S_SESSION,
 						  GUC_ACTION_SAVE, true, 0, false);
-		run(sql, nargs, types, args, nulls, readonly);
+		/* User SQL binds to the current branch schema. The manifest cache is
+		 * keyed only by SQL text and is for context-free internal statements;
+		 * keeping a plan here can retain an earlier branch's catalog rows. */
+		{
+			MemoryContext caller = CurrentMemoryContext;
+
+			SPI_execute_with_args(sql, nargs, types, args, nulls, readonly, 0);
+			MemoryContextSwitchTo(caller);
+		}
 	}
 	PG_FINALLY();
 	{
