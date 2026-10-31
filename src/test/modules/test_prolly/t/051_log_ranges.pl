@@ -31,6 +31,7 @@ sql(q{SELECT dolt_merge('side','--no-ff','-m','merge')});
 is(messages(q{'--merges'}),'merge','merge filter');
 is(messages(q{'--min-parents','1','--merges'}),'merge','merges overrides parent count');
 is(sql(q{SELECT count(*) FROM dolt_log('--parents','--merges') WHERE cardinality(string_to_array(parents,', '))=2}),'1','merge has two parents');
+is(sql(q{SELECT parents IS NOT NULL AND signature='' FROM dolt_log WHERE message='merge'}),'t','system table always populates parents and signature');
 is(sql(q{SELECT refs FROM dolt_log('--decorate','full','-n','1')}),'HEAD -> refs/heads/main','full ref decoration');
 is(sql(q{SELECT refs FROM dolt_log('--decorate','no','-n','1')}),'','no ref decoration');
 is(sql(q{SELECT count(*) FROM dolt_log('main..side')}),'0','merge makes side reachable');
