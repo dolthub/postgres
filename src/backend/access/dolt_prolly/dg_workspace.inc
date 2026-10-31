@@ -220,6 +220,50 @@ merge_same(Member * a, Member * b)
 		  json_same(a->payload, b->payload))));
 }
 
+/* Carry unrelated staged/working edits across a committed merge. Compare
+ * canonical members, including namespaces and table-owned objects, so a schema
+ * change cannot silently overwrite a dirty definition or content root. */
+static bytea *
+carry_workspace_changes(bytea *base, bytea *local, bytea *merged)
+{
+	int nb, nl, nm, used = 0;
+	Member *bm = database_members(base, &nb);
+	Member *lm = database_members(local, &nl);
+	Member *mm = database_members(merged, &nm);
+	Datum *hashes = palloc(sizeof(Datum) * (nb + nl + nm + 1));
+	StringInfoData json;
+
+	initStringInfo(&json);
+	appendStringInfoString(&json, "{\"format\":\"DGDB1\",\"members\":[");
+	for (int i = 0; i < nb + nl + nm; i++)
+	{
+		Member *key = i < nb ? &bm[i] : i < nb + nl ? &lm[i-nb] : &mm[i-nb-nl];
+		Member *b = merge_member(bm, nb, key->kind, key->name);
+		Member *l = merge_member(lm, nl, key->kind, key->name);
+		Member *m = merge_member(mm, nm, key->kind, key->name);
+		Member *chosen;
+
+		if ((i >= nb && b) || (i >= nb + nl && l))
+			continue;
+		if (!merge_same(b, l) && !merge_same(b, m) && !merge_same(l, m))
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("error: local changes would be stomped by merge"),
+							errdetail("Local and merged changes overlap at %s %s.", key->kind, key->name)));
+		chosen = merge_same(b, l) ? m : l;
+		if (!chosen)
+			continue;
+		if (used)
+			appendStringInfoChar(&json, ',');
+		if (!strcmp(chosen->kind, "namespace"))
+			appendStringInfo(&json, "{\"kind\":\"namespace\",\"definition\":%s}", chosen->payload);
+		else
+			appendStringInfoString(&json, chosen->payload);
+		hashes[used++] = PointerGetDatum(chosen->hash);
+	}
+	appendStringInfoString(&json, "]}");
+	return canonical_database(json.data, hashes, used);
+}
+
 static char *
 member_definition(Member * member)
 {

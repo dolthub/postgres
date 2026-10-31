@@ -789,6 +789,21 @@ install_database(bytea *base, bytea *ours, bytea *theirs, List *merges, StringIn
 		validate_working_foreign_keys(dg_current_branch(), violations);
 }
 
+/* Preserve retained pre-merge workspaces when conflict metadata is edited. */
+static bytea *
+updated_merge(bytea *previous, const char *json)
+{
+	ArrayType *array;
+	Datum *children;
+	bool *nulls;
+	int count;
+
+	if (!object_read(previous, "merge", NULL, NULL, &array))
+		elog(ERROR, "merge object is not visible");
+	deconstruct_array(array, BYTEAOID, -1, false, TYPALIGN_INT, &children, &nulls, &count);
+	return put("merge", json, children, count);
+}
+
 Datum
 dolt_merge(PG_FUNCTION_ARGS)
 {
@@ -811,7 +826,10 @@ dolt_merge(PG_FUNCTION_ARGS)
 			   *oursdb,
 			   *their_db,
 			   *database,
-			   *commit = NULL;
+			   *commit = NULL,
+			   *oldstaged,
+			   *newworking,
+			   *newstaged;
 	StringInfoData conflicts,
 				violations,
 				schema_conflicts,
@@ -857,11 +875,16 @@ dolt_merge(PG_FUNCTION_ARGS)
 	{
 		if (revision || !pending.target)
 			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("no merge to abort")));
-		database = child(child(pending.target, 1), 1);
+		database = object_child(pending.target, 4);
+		oldstaged = object_child(pending.target, 5);
+		if (!database)
+			database = child(child(pending.target, 1), 1);
+		if (!oldstaged)
+			oldstaged = database;
 		replace_working(dg_current_branch(), database, NIL);
 		finish_merge();
 		move_ref(branch_ref("working"), read_ref(branch_ref("working")), database);
-		move_ref(branch_ref("staged"), read_ref(branch_ref("staged")), database);
+		move_ref(branch_ref("staged"), read_ref(branch_ref("staged")), oldstaged);
 		result_message = "merge aborted";
 		goto done;
 	}
@@ -879,8 +902,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 	oursdb = child(head.target, 1);
 	their_db = child(theirs, 1);
 	live = capture(true);
-	if (!database_same(live.hash, oursdb) || !database_same(read_ref(branch_ref("staged")).target, oursdb))
-		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("error: local changes would be stomped by merge"), errhint("Commit or discard working and staged changes before merging.")));
+	oldstaged = read_ref(branch_ref("staged")).target;
 	if (ffonly && !same(base, head.target))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("not possible to fast-forward")));
 	initStringInfo(&conflicts);
@@ -888,6 +910,8 @@ dolt_merge(PG_FUNCTION_ARGS)
 	initStringInfo(&schema_conflicts);
 	merge_databases(child(base, 1), oursdb, their_db, &conflicts, &violations, &schema_conflicts);
 	database = capture(true).hash;
+	newworking = carry_workspace_changes(oursdb, live.hash, database);
+	newstaged = carry_workspace_changes(oursdb, oldstaged, database);
 
 	/*
 	 * --no-commit cannot stop a fast-forward (there is no new commit to
@@ -907,7 +931,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 		appendStringInfo(&json, "{\"format\":\"DGMERGE1\",\"squash\":%s,\"source\":", squash ? "true" : "false");
 		escape_json(&json, revision);
 		appendStringInfo(&json, ",\"conflicts\":[%s],\"violations\":[%s],\"schema_conflicts\":[%s]}", conflicts.data, violations.data, schema_conflicts.data);
-		move_ref(branch_ref("merge"), pending, put("merge", json.data, VC_ARGS(PointerGetDatum(head.target), PointerGetDatum(theirs), PointerGetDatum(base)), 3));
+		move_ref(branch_ref("merge"), pending, put("merge", json.data, VC_ARGS(PointerGetDatum(head.target), PointerGetDatum(theirs), PointerGetDatum(base), PointerGetDatum(live.hash), PointerGetDatum(oldstaged)), 5));
 		conflicted = (conflicts.len || violations.len || schema_conflicts.len) ? 1 : 0;
 		result_message = conflicted ? "conflicts found" : "merge successful";
 	}
@@ -922,14 +946,22 @@ dolt_merge(PG_FUNCTION_ARGS)
 			commit = commit_object(database, head.target, theirs, message ? message : psprintf("Merge branch '%s'", revision), NULL, NULL, GetCurrentTimestamp());
 		move_ref(branch_ref("heads"), head, commit);
 	}
-	move_ref(branch_ref("working"), read_ref(branch_ref("working")), database);
+	if (!database_same(newworking, database))
+	{
+		replace_working(dg_current_branch(), newworking, NIL);
+		/* Disjoint object names can still meet through foreign keys. A
+		 * clean merge must not silently invalidate retained local rows. */
+		if (!conflicted)
+			validate_working_foreign_keys(dg_current_branch(), NULL);
+	}
+	move_ref(branch_ref("working"), read_ref(branch_ref("working")), newworking);
 
 	/*
 	 * A conflict must be explicitly resolved before staging/committing its
 	 * rows.
 	 */
 	if (!conflicted)
-		move_ref(branch_ref("staged"), read_ref(branch_ref("staged")), database);
+		move_ref(branch_ref("staged"), read_ref(branch_ref("staged")), newstaged);
 done:
 	nulls[0] = commit == NULL;
 	values[0] = commit ? CStringGetTextDatum(hash_format(commit)) : (Datum) 0;
@@ -1098,7 +1130,7 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 	escape_json(&updated, json_value(json, "source") ? json_value(json, "source") : "");
 	run("SELECT coalesce(($1::jsonb->'violations')::text,'[]')", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
 	appendStringInfo(&updated, ",\"conflicts\":[%s],\"violations\":%s,\"schema_conflicts\":[%s]}", remaining.data, strcell(0, 1), schema_remaining.data);
-	move_ref(branch_ref("merge"), pending, put("merge", updated.data, parents, 3));
+	move_ref(branch_ref("merge"), pending, updated_merge(pending.target, updated.data));
 	move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture(true).hash);
 	end_api(nest);
 	PG_RETURN_INT64(0);

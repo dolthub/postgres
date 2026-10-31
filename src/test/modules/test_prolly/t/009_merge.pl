@@ -125,6 +125,27 @@ is(sql(q{SELECT conflicts FROM dolt_merge('squashed','--squash')}),'0','clean sq
 is(sql('SELECT is_merging FROM dolt_merge_status'),'f','clean squash has no pending second parent');
 sql(q{SELECT dolt_commit('-m','squash commit')});
 is(sql(q{SELECT array_length(string_to_array(parents,', '),1) FROM dolt_log('--parents','-n','1')}),'1','squash commit has one parent');
+# Unrelated working and staged edits are not part of a merge commit.
+sql(q{CREATE TABLE dirty_local(id int PRIMARY KEY,v int) USING dolt_prolly_table;
+      CREATE TABLE dirty_remote(id int PRIMARY KEY,v int) USING dolt_prolly_table;
+      INSERT INTO dirty_local VALUES(1,10); INSERT INTO dirty_remote VALUES(1,1)});
+sql(q{SELECT dolt_commit('-Am','dirty base'); SELECT dolt_branch('dirty_side')});
+$other->query_safe(q{SELECT dolt_checkout('dirty_side'); UPDATE dirty_remote SET v=2});
+$other->query_safe(q{SELECT dolt_commit('-am','remote two')});
+sql(q{UPDATE dirty_local SET v=20; SELECT dolt_add('dirty_local'); UPDATE dirty_local SET v=30});
+is(sql(q{SELECT conflicts FROM dolt_merge('dirty_side')}), '0', 'merge preserves unrelated dirty objects');
+is(sql(q{SELECT v FROM dirty_local}), '30', 'unstaged rows survive merge');
+is(sql(q{SELECT to_v FROM dolt_diff('HEAD','STAGED','dirty_local')}), '20', 'staged rows survive merge separately');
+is(sql(q{SELECT v FROM dirty_local AS OF 'HEAD'}), '10', 'local edits excluded from merge commit');
+is(sql(q{SELECT v FROM dirty_remote AS OF 'HEAD'}), '2', 'remote change committed');
+$other->query_safe(q{UPDATE dirty_remote SET v=3});
+$other->query_safe(q{SELECT dolt_commit('-am','remote three')});
+is(sql(q{SELECT conflicts FROM dolt_merge('dirty_side','--no-ff','--no-commit')}), '0', 'pending merge retains dirty workspaces');
+is(sql(q{SELECT v FROM dirty_remote}), '3', 'pending merged row visible');
+sql(q{SELECT dolt_merge('--abort')});
+is(sql(q{SELECT v FROM dirty_remote}), '2', 'abort restores pre-merge remote rows');
+is(sql(q{SELECT v FROM dirty_local}), '30', 'abort preserves pre-existing unstaged rows');
+is(sql(q{SELECT to_v FROM dolt_diff('HEAD','STAGED','dirty_local')}), '20', 'abort preserves pre-existing staged rows');
 $other->quit;
 $node->stop;
 done_testing();
