@@ -1,0 +1,193 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_rr s2_rr s1_lock s2_lock s1_next s1_c s2_c s3_check s3_rest
+step s1_rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s2_rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_lock: SELECT next FROM hot WHERE id = 1 FOR UPDATE;
+next
+----
+   1
+(1 row)
+
+step s2_lock: SELECT next FROM hot WHERE id = 1 FOR UPDATE; <waiting ...>
+step s1_next: UPDATE hot SET next = next + 1 WHERE id = 1;
+step s1_c: COMMIT;
+step s2_lock: <... completed>
+ERROR:  could not serialize access due to concurrent update
+step s2_c: COMMIT;
+step s3_check: SELECT id, next, ytd FROM hot WHERE id IN (1, 2) ORDER BY id;
+id|next|ytd
+--+----+---
+ 1|   2|  0
+ 2|   1|  0
+(2 rows)
+
+step s3_rest: SELECT sum(ytd) FROM hot WHERE id > 2;
+sum
+---
+127
+(1 row)
+
+
+starting permutation: s1_rc s2_rc s1_lock s2_lock s1_next s1_c s2_next s2_c s3_check s3_rest
+step s1_rc: BEGIN ISOLATION LEVEL READ COMMITTED;
+step s2_rc: BEGIN ISOLATION LEVEL READ COMMITTED;
+step s1_lock: SELECT next FROM hot WHERE id = 1 FOR UPDATE;
+next
+----
+   1
+(1 row)
+
+step s2_lock: SELECT next FROM hot WHERE id = 1 FOR UPDATE; <waiting ...>
+step s1_next: UPDATE hot SET next = next + 1 WHERE id = 1;
+step s1_c: COMMIT;
+step s2_lock: <... completed>
+next
+----
+   2
+(1 row)
+
+step s2_next: UPDATE hot SET next = next + 1 WHERE id = 1;
+step s2_c: COMMIT;
+step s3_check: SELECT id, next, ytd FROM hot WHERE id IN (1, 2) ORDER BY id;
+id|next|ytd
+--+----+---
+ 1|   3|  0
+ 2|   1|  0
+(2 rows)
+
+step s3_rest: SELECT sum(ytd) FROM hot WHERE id > 2;
+sum
+---
+127
+(1 row)
+
+
+starting permutation: s1_rr s2_rr s1_ytd s2_ytd s1_c s2_c s3_check s3_rest
+step s1_rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s2_rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_ytd: UPDATE hot SET ytd = ytd + 10 WHERE id = 1;
+step s2_ytd: UPDATE hot SET ytd = ytd + 1 WHERE id = 1; <waiting ...>
+step s1_c: COMMIT;
+step s2_ytd: <... completed>
+ERROR:  could not serialize access due to concurrent update
+step s2_c: COMMIT;
+step s3_check: SELECT id, next, ytd FROM hot WHERE id IN (1, 2) ORDER BY id;
+id|next|ytd
+--+----+---
+ 1|   1| 10
+ 2|   1|  0
+(2 rows)
+
+step s3_rest: SELECT sum(ytd) FROM hot WHERE id > 2;
+sum
+---
+127
+(1 row)
+
+
+starting permutation: s1_rc s2_rc s1_ytd s2_ytd s1_c s2_c s3_check s3_rest
+step s1_rc: BEGIN ISOLATION LEVEL READ COMMITTED;
+step s2_rc: BEGIN ISOLATION LEVEL READ COMMITTED;
+step s1_ytd: UPDATE hot SET ytd = ytd + 10 WHERE id = 1;
+step s2_ytd: UPDATE hot SET ytd = ytd + 1 WHERE id = 1; <waiting ...>
+step s1_c: COMMIT;
+step s2_ytd: <... completed>
+step s2_c: COMMIT;
+step s3_check: SELECT id, next, ytd FROM hot WHERE id IN (1, 2) ORDER BY id;
+id|next|ytd
+--+----+---
+ 1|   1| 11
+ 2|   1|  0
+(2 rows)
+
+step s3_rest: SELECT sum(ytd) FROM hot WHERE id > 2;
+sum
+---
+127
+(1 row)
+
+
+starting permutation: s2_rr s2_read s1_rr s1_ytd s1_c s2_ytd s2_c s3_check s3_rest
+step s2_rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s2_read: SELECT count(*) FROM hot;
+count
+-----
+   10
+(1 row)
+
+step s1_rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_ytd: UPDATE hot SET ytd = ytd + 10 WHERE id = 1;
+step s1_c: COMMIT;
+step s2_ytd: UPDATE hot SET ytd = ytd + 1 WHERE id = 1;
+ERROR:  could not serialize access due to concurrent update
+step s2_c: COMMIT;
+step s3_check: SELECT id, next, ytd FROM hot WHERE id IN (1, 2) ORDER BY id;
+id|next|ytd
+--+----+---
+ 1|   1| 10
+ 2|   1|  0
+(2 rows)
+
+step s3_rest: SELECT sum(ytd) FROM hot WHERE id > 2;
+sum
+---
+127
+(1 row)
+
+
+starting permutation: s1_rr s2_rr s1_ytd s2_other s1_c s2_c s3_check s3_rest
+step s1_rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s2_rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_ytd: UPDATE hot SET ytd = ytd + 10 WHERE id = 1;
+step s2_other: UPDATE hot SET ytd = ytd + 1 WHERE id = 2;
+step s1_c: COMMIT;
+step s2_c: COMMIT;
+step s3_check: SELECT id, next, ytd FROM hot WHERE id IN (1, 2) ORDER BY id;
+id|next|ytd
+--+----+---
+ 1|   1| 10
+ 2|   1|  1
+(2 rows)
+
+step s3_rest: SELECT sum(ytd) FROM hot WHERE id > 2;
+sum
+---
+127
+(1 row)
+
+
+starting permutation: s1_rr s1_lock s1_next s1_ytd s1_c s2_rr s2_lock s2_next s2_ytd s2_c s3_check s3_rest
+step s1_rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_lock: SELECT next FROM hot WHERE id = 1 FOR UPDATE;
+next
+----
+   1
+(1 row)
+
+step s1_next: UPDATE hot SET next = next + 1 WHERE id = 1;
+step s1_ytd: UPDATE hot SET ytd = ytd + 10 WHERE id = 1;
+step s1_c: COMMIT;
+step s2_rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s2_lock: SELECT next FROM hot WHERE id = 1 FOR UPDATE;
+next
+----
+   2
+(1 row)
+
+step s2_next: UPDATE hot SET next = next + 1 WHERE id = 1;
+step s2_ytd: UPDATE hot SET ytd = ytd + 1 WHERE id = 1;
+step s2_c: COMMIT;
+step s3_check: SELECT id, next, ytd FROM hot WHERE id IN (1, 2) ORDER BY id;
+id|next|ytd
+--+----+---
+ 1|   3| 11
+ 2|   1|  0
+(2 rows)
+
+step s3_rest: SELECT sum(ytd) FROM hot WHERE id > 2;
+sum
+---
+127
+(1 row)
+
