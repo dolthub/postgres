@@ -56,7 +56,8 @@ query_identity(const char *sql)
 		return result;
 	}
 
-	index = rel->rd_catalogview ? dg_storage_index(rel, pk) : index_open(pk, AccessShareLock);
+	/* Catalog metadata suffices; historical indexes need no storage binding. */
+	index = index_open(pk, AccessShareLock);
 	result.nkeys = index->rd_index->indnkeyatts;
 	result.columns = palloc(sizeof(int) * result.nkeys);
 	initStringInfo(&signature);
@@ -93,8 +94,7 @@ query_identity(const char *sql)
 	}
 	if (result.nkeys)
 		result.signature = signature.data;
-	if (!rel->rd_catalogview)
-		index_close(index, AccessShareLock);
+	index_close(index, AccessShareLock);
 	relation_close(rel, AccessShareLock);
 	return result;
 }
