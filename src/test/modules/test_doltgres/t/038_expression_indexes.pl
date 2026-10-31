@@ -22,6 +22,9 @@ for my $journal ('off', 'on') {
  INSERT INTO t VALUES (1, 2, 3, 'Alpha', true), (2, 4, 5, 'Beta', false), (3, 2, 3, 'ALPHA', false), (4, NULL, 2, NULL, true);
  CREATE UNIQUE INDEX expr ON t(lower(label), (a+b) DESC) INCLUDE(b) WHERE live;
  CREATE INDEX sums ON t((a+b), id);
+ CREATE TABLE nullable(v int);
+ CREATE UNIQUE INDEX nullable_expr ON nullable((v+1)) WHERE v IS NULL;
+ INSERT INTO nullable VALUES(NULL),(NULL);
  });
  is(sql(q{SET enable_seqscan=off; SET enable_bitmapscan=off; SELECT id FROM t WHERE live AND lower(label)='alpha' AND a+b=5}), '1', "$journal expression lookup");
  like(sql(q{SET enable_seqscan=off; EXPLAIN (COSTS OFF) SELECT id FROM t WHERE live AND lower(label)='alpha'}), qr/Index.*expr/, "$journal uses partial expression index");
@@ -43,7 +46,7 @@ for my $journal ('off', 'on') {
  sql(q{SELECT dolt_merge('--abort'); SELECT dolt_branch('-D','collision')});
  sql(q{ALTER TABLE t RENAME COLUMN label TO name});
  is(sql(q{SET enable_seqscan=off; SELECT id FROM t WHERE live AND lower(name)='alpha'}), '5', "$journal renamed expression dependency");
- sql(q{DROP TABLE t; SELECT dolt_branch('-D','feature'); SELECT dolt_commit('-Am','cleanup')});
+ sql(q{DROP TABLE t, nullable; SELECT dolt_branch('-D','feature'); SELECT dolt_commit('-Am','cleanup')});
 }
 sql(q{CREATE TABLE patterns(id int PRIMARY KEY, t text, v varchar(20), b char(10));
  INSERT INTO patterns VALUES (1,'alpha','alpha','alpha'),(2,'beta','beta','beta'),(3,'alphabet','alphabet','alphabet');

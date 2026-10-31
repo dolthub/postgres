@@ -522,7 +522,7 @@ dg_index_apply(Relation table, PLSlice row, int64 delta, uint64 handle, CommandI
 	foreach(cell, indexes)
 	{
 		Relation	index = lfirst(cell);
-		DGBatch    *batch = dg_batch(index, cid);
+		DGBatch    *batch;
 		StringInfoData key;
 		size_t		prefix;
 		bool		nullkey;
@@ -533,6 +533,7 @@ dg_index_apply(Relation table, PLSlice row, int64 delta, uint64 handle, CommandI
 			pfree(key.data);
 			continue;
 		}
+		batch = dg_batch(index, cid);
 		dg_batch_index(batch, (PLSlice) {(uint8 *) key.data, key.len}, prefix, digest, row, delta);
 		/*
 		 * Writers of bound canonical storage may bypass the executor's index
