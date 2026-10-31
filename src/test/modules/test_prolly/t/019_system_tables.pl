@@ -109,6 +109,7 @@ is(sql(q{SELECT dolt_remote('remove','origin')}),'0','remote removed');
 is(sql(q{SELECT count(*) FROM dolt.remotes}),'0','remote gone');
 is(sql(q{SELECT doc_name,length(doc_text)>100 FROM dolt.docs}),'AGENT.md|t','default agent document');
 sql(q{INSERT INTO dolt.docs VALUES('README.md','testing')});
+is(sql(q{SELECT count(*) FROM dolt.docs WHERE doc_name='AGENT.md'}),'1','lazy initialization creates default document exactly once');
 is(sql(q{SELECT doc_name FROM dolt_docs ORDER BY 1}),"AGENT.md\nREADME.md",'inserted document through alias');
 sql(q{UPDATE dolt_docs SET doc_text='updated' WHERE doc_name='README.md'});
 is(sql(q{SELECT doc_text FROM public.dolt_docs WHERE doc_name='README.md'}),'updated','document updated');
