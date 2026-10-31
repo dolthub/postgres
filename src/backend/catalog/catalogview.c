@@ -49,6 +49,7 @@ typedef struct CatalogViewRows
 {
 	Oid			catalog;
 	List	   *tuples;
+	int			changes;		/* of a provisional view's, applied to these */
 } CatalogViewRows;
 
 struct CatalogView
@@ -108,6 +109,7 @@ typedef struct CatalogViewIndex
 {
 	Oid			catalog;
 	AttrNumber	attribute;
+	MemoryContext memory;		/* holds the entries */
 	HTAB	   *entries;		/* CatalogViewIndexEntry */
 } CatalogViewIndex;
 
@@ -122,6 +124,19 @@ forget_indexes(CatalogView *view)
 {
 	view->indexes = NIL;
 	MemoryContextReset(view->index_memory);
+}
+
+/* Forget |view|'s indexes over the rows of |catalog|, which have changed. */
+static void
+forget_catalog_indexes(CatalogView *view, Oid catalog)
+{
+	foreach_ptr(CatalogViewIndex, index, view->indexes)
+	{
+		if (index->catalog != catalog)
+			continue;
+		MemoryContextDelete(index->memory);
+		view->indexes = foreach_delete_current(view->indexes, index);
+	}
 }
 typedef struct CatalogViewPin
 {
@@ -1518,11 +1533,14 @@ typedef struct ChangedRow
  * the number of changes.
  */
 static List *
-apply_changes(List *tuples, List *changes, Oid catalog, CommandId limit)
+apply_changes(List *tuples, List *changes, Oid catalog, CommandId limit, int *applied)
 {
 	HTAB	   *rows = NULL;
 	List	   *added = NIL;
 	List	   *result = NIL;
+	ItemPointerData lowest,
+				highest;
+	int			count = 0;
 
 	foreach_ptr(CatalogChange, change, changes)
 	{
@@ -1548,12 +1566,24 @@ apply_changes(List *tuples, List *changes, Oid catalog, CommandId limit)
 			added = lappend(added, row);
 		}
 		row->tuple = change->tuple;
+		if (count == 0 || ItemPointerCompare(&change->tid, &lowest) < 0)
+			lowest = change->tid;
+		if (count == 0 || ItemPointerCompare(&change->tid, &highest) > 0)
+			highest = change->tid;
+		count++;
 	}
+	if (applied)
+		*applied = count;
 	if (!rows)
 		return list_copy(tuples);
 	foreach_ptr(HeapTupleData, tuple, tuples)
 	{
-		ChangedRow *row = hash_search(rows, &tuple->t_self, HASH_FIND, NULL);
+		ChangedRow *row = NULL;
+
+		/* Most rows lie outside the changed ones' range: skip the lookup. */
+		if (ItemPointerCompare(&tuple->t_self, &lowest) >= 0 &&
+			ItemPointerCompare(&tuple->t_self, &highest) <= 0)
+			row = hash_search(rows, &tuple->t_self, HASH_FIND, NULL);
 
 		if (!row)
 			result = lappend(result, tuple);
@@ -1643,9 +1673,9 @@ mutation_self_rows(CatalogView *view, Oid catalog)
 	foreach_ptr(CatalogViewRows, rows, view->baseline)
 	{
 		if (rows->catalog == catalog)
-			return apply_changes(rows->tuples, view->changes, catalog, InvalidCommandId);
+			return apply_changes(rows->tuples, view->changes, catalog, InvalidCommandId, NULL);
 	}
-	return apply_changes(NIL, view->changes, catalog, InvalidCommandId);
+	return apply_changes(NIL, view->changes, catalog, InvalidCommandId, NULL);
 }
 
 
@@ -1780,12 +1810,16 @@ refresh_mutation(CatalogView *view)
 		CatalogViewRows *rows = palloc(sizeof(*rows));
 
 		*rows = *base;
-		rows->tuples = apply_changes(base->tuples, view->changes, base->catalog, GetCurrentCommandId(false));
+		rows->tuples = apply_changes(base->tuples, view->changes, base->catalog, GetCurrentCommandId(false), &rows->changes);
+
+		/* Keep the indexes of catalogs no change since the last refresh reached. */
+		foreach_ptr(CatalogViewRows, before, view->catalogs)
+			if (before->catalog == rows->catalog && before->changes != rows->changes)
+				forget_catalog_indexes(view, rows->catalog);
 		catalogs = lappend(catalogs, rows);
 	}
 	view->catalogs = catalogs;
 	view->dirty = false;
-	forget_indexes(view);
 	MemoryContextSwitchTo(previous);
 	foreach(lc, view->caches)
 		ResetCatalogCache(lfirst(lc), false);
@@ -1859,9 +1893,10 @@ CatalogViewTuplesWith(CatalogView *view, Oid catalog, AttrNumber attribute, Oid 
 		index = palloc(sizeof(*index));
 		index->catalog = catalog;
 		index->attribute = attribute;
+		index->memory = AllocSetContextCreate(view->index_memory, "catalog view index", ALLOCSET_DEFAULT_SIZES);
 		ctl.keysize = sizeof(Oid);
 		ctl.entrysize = sizeof(CatalogViewIndexEntry);
-		ctl.hcxt = view->index_memory;
+		ctl.hcxt = index->memory;
 		index->entries = hash_create("catalog view index", 256, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 		foreach_ptr(HeapTupleData, tuple, CatalogViewTuples(view, catalog))
 		{
@@ -1873,7 +1908,9 @@ CatalogViewTuplesWith(CatalogView *view, Oid catalog, AttrNumber attribute, Oid 
 			entry = hash_search(index->entries, &oid, HASH_ENTER, &found);
 			if (!found)
 				entry->tuples = NIL;
+			MemoryContextSwitchTo(index->memory);
 			entry->tuples = lappend(entry->tuples, tuple);
+			MemoryContextSwitchTo(view->index_memory);
 		}
 		RelationClose(rel);
 		view->indexes = lappend(view->indexes, index);
