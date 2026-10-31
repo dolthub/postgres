@@ -1518,6 +1518,8 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 
 		if (parent_count(target) < 1)
 			unsupported("reverting or cherry-picking a root commit");
+		if (!revert && parent_count(target) > 1)
+			unsupported("cherry-picking a merge commit is not supported");
 		parent = child(target, 2);
 		targetdb = child(target, 1);
 		parentdb = child(parent, 1);

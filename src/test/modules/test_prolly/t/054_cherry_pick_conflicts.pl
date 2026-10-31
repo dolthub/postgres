@@ -9,10 +9,12 @@ $node->start;
 sub sql { $node->safe_psql('postgres',$_[0]); }
 sql(q{CREATE TABLE t(id int PRIMARY KEY,v text) USING dolt_prolly_table; INSERT INTO t VALUES(1,'base'),(2,'base')});
 sql(q{SELECT dolt_commit('-Am','base')});
-sql(q{SELECT dolt_checkout('-b','side')});
-sql(q{UPDATE t SET v='theirs'});
-sql(q{SELECT dolt_commit('-Am','source edits')});
-sql(q{SELECT dolt_checkout('main')});
+sql(q{SELECT dolt_branch('side')});
+my $side=$node->background_psql('postgres');
+$side->query_safe(q{SELECT dolt_checkout('side')});
+$side->query_safe(q{UPDATE t SET v='theirs'});
+$side->query_safe(q{SELECT dolt_commit('-Am','source edits')});
+$side->quit;
 sql(q{UPDATE t SET v='ours' WHERE id=1});
 sql(q{SELECT dolt_commit('-Am','target edit')});
 my $head=sql(q{SELECT dolt_hashof('HEAD')});
