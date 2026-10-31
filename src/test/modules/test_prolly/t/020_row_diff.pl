@@ -131,9 +131,9 @@ like($stat_err,qr/WARNING:.*primary key set changed/,'all-table key change emits
 ($stat_status,$stat_out,$stat_err)=$node->psql('postgres',q{SELECT * FROM dolt_diff_summary('HEAD','WORKING','stat_schema')});
 isnt($stat_status,0,'named summary rejects changed primary key');
 like($stat_err,qr/primary key set changed/,'summary key diagnostic');
-($stat_status,$stat_out,$stat_err)=$node->psql('postgres',q{SELECT data_change,schema_change FROM dolt_diff_summary('HEAD','WORKING') WHERE to_table_name='public.stat_schema'});
+($stat_status,$stat_out,$stat_err)=$node->psql('postgres',q{SELECT count(*) FROM dolt_diff_summary('HEAD','WORKING') WHERE to_table_name='public.stat_schema'});
 is($stat_status,0,'all-table summary continues after key change');
-is($stat_out,'f|t','key change has schema flag and unavailable data flag');
+is($stat_out,'0','all-table summary omits incompatible key change');
 like($stat_err,qr/WARNING:.*primary key set changed/,'all-table summary warns on key change');
 $node->stop;
 done_testing();

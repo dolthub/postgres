@@ -1632,13 +1632,14 @@ row_count(DiffTable *t)
  * Root hashes alone cannot distinguish those cases in our tuple encoding. */
 static bool
 diff_table_data_changed(const char *from, const char *to, const char *name,
-                        bool explicit_table)
+                        bool explicit_table, bool *key_changed)
 {
 	DiffTable *a = diff_table_revision(from, name);
 	DiffTable *b = diff_table_revision(to, name);
 	DiffStat stats = {0};
 	bool changed;
 
+	*key_changed = false;
 	if (!a->present || !b->present)
 		changed = row_count(a) != 0 || row_count(b) != 0;
 	else if (a->keyed != b->keyed || (a->keyed && !same_key_columns(a, b)))
@@ -1646,6 +1647,7 @@ diff_table_data_changed(const char *from, const char *to, const char *name,
 		ereport(explicit_table ? ERROR : WARNING,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("failed to compute diff summary for table %s: primary key set changed", name)));
+		*key_changed = true;
 		changed = false;
 	}
 	else

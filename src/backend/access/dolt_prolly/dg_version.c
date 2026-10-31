@@ -2190,7 +2190,7 @@ state_json(const char *revision)
 	return metadata(child(resolve(revision), 1), "database");
 }
 static bool diff_table_data_changed(const char *from, const char *to,
-                                    const char *name, bool explicit_table);
+                                    const char *name, bool explicit_table, bool *key_changed);
 
 Datum
 dolt_diff_summary(PG_FUNCTION_ARGS)
@@ -2231,10 +2231,13 @@ dolt_diff_summary(PG_FUNCTION_ARGS)
 		if (!strcmp(kind, "table"))
 		{
 			char *name = TextDatumGetCString(values[0]);
+			bool key_changed;
 
 			if (!*name)
 				name = TextDatumGetCString(values[1]);
-			values[3] = BoolGetDatum(diff_table_data_changed(fromrev, torev, name, table != NULL));
+			values[3] = BoolGetDatum(diff_table_data_changed(fromrev, torev, name, table != NULL, &key_changed));
+			if (key_changed)
+				continue;
 		}
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
