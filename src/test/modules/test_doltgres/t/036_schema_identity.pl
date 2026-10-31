@@ -158,6 +158,12 @@ like($coll_err,qr/table public\.u uses server objects in schema ct/,'nor can the
 $node->safe_psql('coll',q{DROP TABLE public.u; DROP SCHEMA ct CASCADE});
 is($node->safe_psql('coll',q{SELECT count(*) FROM pg_namespace WHERE nspname = 'ct'}),'0','once nothing outside uses it, the schema drops with its tables');
 
+# Roles are server objects too: a definition naming a dropped role stays readable, as its owner's.
+$node->safe_psql('coll',q{CREATE ROLE schema_owner_r; GRANT CREATE ON DATABASE coll TO schema_owner_r;
+SET SESSION AUTHORIZATION schema_owner_r; CREATE SCHEMA owned_schema; RESET SESSION AUTHORIZATION;
+DROP OWNED BY schema_owner_r; DROP ROLE schema_owner_r});
+is($node->safe_psql('coll',q{SELECT count(*) > 0 FROM pg_class}),'t','a branch stays readable after a role its definitions name is dropped');
+
 # Without server objects in it, public can be renamed on a branch like any schema.
 sql(q{CREATE DATABASE plain});
 $node->safe_psql('plain',q{CREATE TABLE t(id int PRIMARY KEY); INSERT INTO t VALUES (1); SELECT dolt_commit('-Am', 'base'); SELECT dolt_branch('renamed')});

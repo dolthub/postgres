@@ -38,7 +38,7 @@ provider_schema_object(DGProviderRows *rows, CatalogView *view, const char *kind
 				if (reference == TypeRelationId)
 					target = routine_type_oid(rows, view, encoded);
 				else if (reference == AuthIdRelationId)
-					target = get_role_oid(encoded, false);
+					target = provider_role(encoded);
 				else
 				{
 					target = CatalogViewFindObject(view, reference, encoded);

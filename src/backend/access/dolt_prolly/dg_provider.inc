@@ -484,11 +484,25 @@ provider_add(DGProviderRows *rows, Oid catalog, const void *data, Size size, int
 	rows->rows[i] = lappend(rows->rows[i], provider_fixed(rows->relations[i], data, size, nfixed));
 }
 
+/*
+ * The role a definition names. Definitions name roles, which belong to the
+ * server; one dropped since is the bootstrap superuser's, as a dropped role's
+ * objects pass to it, so that no branch or revision becomes unreadable.
+ */
+static Oid
+provider_role(const char *name)
+{
+	Oid			role = get_role_oid(name, true);
+
+	return OidIsValid(role) ? role : BOOTSTRAP_SUPERUSERID;
+}
+
 static ArrayType *
 provider_acl(const char *definition)
 {
 	int			i,
-				n;
+				n,
+				kept = 0;
 	Datum	   *items;
 	static const char *names[] = {"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "USAGE", "CREATE", "MAINTAIN"};
 	static const AclMode modes[] = {ACL_SELECT, ACL_INSERT, ACL_UPDATE, ACL_DELETE, ACL_TRUNCATE, ACL_REFERENCES, ACL_TRIGGER, ACL_USAGE, ACL_CREATE, ACL_MAINTAIN};
@@ -515,15 +529,19 @@ provider_acl(const char *definition)
 				mode = modes[j];
 		if (!mode)
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unsupported canonical privilege %s", priv)));
+		/* A privilege granted to or by a role since dropped is gone with it. */
+		if ((strcmp(grantee, "PUBLIC") && !OidIsValid(get_role_oid(grantee, true))) ||
+			!OidIsValid(get_role_oid(grantor, true)))
+			continue;
 		item->ai_grantor = get_role_oid(grantor, false);
 		item->ai_grantee = !strcmp(grantee, "PUBLIC") ? ACL_ID_PUBLIC : get_role_oid(grantee, false);
 		ACLITEM_SET_PRIVS_GOPTIONS(*item, mode, grant ? mode : 0);
-		items[i] = PointerGetDatum(item);
+		items[kept++] = PointerGetDatum(item);
 	}
 	/* ACLs require a one-dimensional header even when there are no items. */
-	if (!n)
+	if (!kept)
 		return (ArrayType *) make_empty_acl();
-	return construct_array(items, n, ACLITEMOID, sizeof(AclItem), false, TYPALIGN_INT);
+	return construct_array(items, kept, ACLITEMOID, sizeof(AclItem), false, TYPALIGN_INT);
 }
 
 static void
@@ -1479,7 +1497,7 @@ provider_table_type(DGProviderRows *rows, CatalogView *view, bytea *database,
 	form.oid = CatalogViewFindObject(view, RelationRelationId, name);
 	form.reltype = CatalogViewFindObject(view, TypeRelationId, name);
 	form.relnamespace = CatalogViewLookupObject(view, NamespaceRelationId, strVal(linitial(parts)));
-	form.relowner = get_role_oid(json_value(definition, "owner"), false);
+	form.relowner = provider_role(json_value(definition, "owner"));
 	namestrcpy(&form.relname, strVal(lsecond(parts)));
 	arrayname = makeObjectName("", NameStr(form.relname), NULL);
 
@@ -1599,7 +1617,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 
 			form.oid = provider_namespace(view, name);
 			namestrcpy(&form.nspname, name);
-			form.nspowner = get_role_oid(owner, false);
+			form.nspowner = provider_role(owner);
 			tuple = provider_fixed(rows.relations[slot], &form, sizeof(form), Anum_pg_namespace_nspowner);
 			tuple = provider_set(rows.relations[slot], tuple, Anum_pg_namespace_nspacl, PointerGetDatum(provider_acl(definitions[i])));
 			rows.rows[slot] = lappend(rows.rows[slot], tuple);
@@ -1680,7 +1698,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			CatalogViewObjectSetRetained(view, form.oid, schemas[i], contents[i]);
 			form.relnamespace = CatalogViewLookupObject(view, NamespaceRelationId, strVal(linitial(parts)));
 			namestrcpy(&form.relname, strVal(lsecond(parts)));
-			form.relowner = get_role_oid(owner, false);
+			form.relowner = provider_role(owner);
 			form.reltype = index ? InvalidOid : provider_bind(view, branch, TypeRelationId, DOLT_IDENTITY_ROWTYPE, name, name);
 			form.relam = index ? DOLT_PROLLY_INDEX_AM_OID : DOLT_PROLLY_TABLE_AM_OID;
 			form.relkind = index ? RELKIND_INDEX : RELKIND_RELATION;
