@@ -824,6 +824,13 @@ struct config_bool ConfigureNamesBool[] =
 	},
 
 	{
+		{"dolt_multi_branch_commit", PGC_USERSET, COMPAT_OPTIONS_OTHER,
+			gettext_noop("Create version-control commits on all dirty branches atomically."), NULL},
+		&dolt_multi_branch_commit,
+		false, NULL, NULL, NULL
+	},
+
+	{
 		{"dolt_force_transaction_commit", PGC_USERSET, COMPAT_OPTIONS_OTHER,
 			gettext_noop("Allow publication of recorded merge constraint violations."), NULL},
 		&dolt_force_transaction_commit,

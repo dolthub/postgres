@@ -509,12 +509,21 @@ catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool ta
 		if (!IsA(expression, Const) || ((Const *) expression)->constisnull)
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("AS OF requires a non-null constant revision expression")));
 		revision = TextDatumGetCString(((Const *) expression)->constvalue);
-		if (rv->catalogname && strcmp(rv->catalogname, get_database_name(MyDatabaseId)))
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("cross-database versioned queries are not supported")));
+		if (rv->catalogname)
+		{
+			sep = strpbrk(rv->catalogname, "@/");
+			dbname = sep ? pnstrdup(rv->catalogname, sep - rv->catalogname) : rv->catalogname;
+			if (strcmp(dbname, get_database_name(MyDatabaseId)))
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("cross-database versioned queries are not supported")));
+			/* HEAD in a qualified relation belongs to that branch, not the session. */
+			if (sep && pg_strncasecmp(revision, "HEAD", 4) == 0 &&
+				(revision[4] == '\0' || revision[4] == '~' || revision[4] == '^'))
+				revision = psprintf("%s%s", sep + 1, revision + 4);
+		}
 	}
 revision_selected:
-	if (target && (rv->dolt_revision || (rv->catalogname && strpbrk(rv->catalogname, "@/"))))
-		unsupported("revision-qualified write targets");
+	if (target && rv->dolt_revision)
+		unsupported("historical write targets");
 	if (plain)
 	{
 		cached = bind_cache_find(bind_cache_key(rv, rte, revision, resolution_path, user, target), false);
@@ -573,7 +582,7 @@ revision_selected:
 		}
 		else if (working)
 		{
-			rte->dolt_ref = psprintf("%c:working/%s", context_branch ? 'c' : 's', revision);
+			rte->dolt_ref = psprintf("%c:working/%s", (context_branch || sep) ? 'c' : 's', revision);
 			rte->dolt_ref_target = hash_format(db);
 		}
 		rte->dolt_database = hash_format(db);
@@ -594,6 +603,8 @@ revision_selected:
 			/* An unversioned native relation exists only on the live database. */
 			if (OidIsValid(native) && !dg_system_namespace(ns))
 			{
+				if (target && sep)
+					unsupported("branch-qualified writes to unversioned relations");
 				if (!working)
 					ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("relation %s does not exist in revision %s", rv->relname, revision)));
 				goto binding_done;
