@@ -12,12 +12,13 @@
  * checksums, log a full-page image per page. A row whose inserter or deleter is
  * still running is waited on.
  *
- * Puts never wait. A put that finds no committed copy of a chunk (or one of
- * its own) inserts its own copy, keyed by its transaction ID, so concurrent
- * puts of one chunk never conflict; they may leave duplicate copies. Waiting
- * instead could deadlock two committing transactions that each wait for a
- * chunk the other is inserting. Puts are transactional here; aborted rows
- * become dead tuples for VACUUM. Callers must not depend on that.
+ * Puts never wait and never probe: every put inserts its own copy, keyed by
+ * its transaction ID, so concurrent puts of one chunk never conflict. Callers
+ * put only chunks they built, which are almost always new; a chunk already
+ * stored gains a duplicate copy, which readers ignore. Waiting for another
+ * inserter instead could deadlock two committing transactions that each wait
+ * for a chunk the other is inserting. Puts are transactional here; aborted
+ * rows become dead tuples for VACUUM. Callers must not depend on that.
  *
  * A chunk longer than one heap tuple holds is stored as consecutive parts of
  * DG_CHUNK_PART bytes. Because a part's bytes follow from the chunk and its
@@ -316,7 +317,7 @@ typedef struct PutBatch
 } PutBatch;
 
 /*
- * Form the parts of one chunk unless a usable copy exists; true if it is new.
+ * Form the parts of one chunk; true, since every put adds a copy.
  * A copy is keyed by this transaction's ID, so it never conflicts with
  * another's.
  */
@@ -326,8 +327,6 @@ put_one(HeapChunkState *state, PutBatch *batch, const uint8 *hash, const uint8 *
 	bytea	   *hashvalue;
 	int32		parts = length ? (int32) ((length + DG_CHUNK_PART - 1) / DG_CHUNK_PART) : 1;
 
-	if (find_live(state, hash, 0))
-		return false;
 	hashvalue = palloc(VARHDRSZ + DOLT_CHUNK_HASH_SIZE);
 	SET_VARSIZE(hashvalue, VARHDRSZ + DOLT_CHUNK_HASH_SIZE);
 	memcpy(VARDATA(hashvalue), hash, DOLT_CHUNK_HASH_SIZE);
@@ -411,8 +410,12 @@ heap_put(void *arg, int n, const uint8 *hashes, const uint8 *const *data, const 
 	for (int i = 0; i < n; i++)
 	{
 		int			j = order[i];
+		const uint8 *hash = hashes + (Size) j * DOLT_CHUNK_HASH_SIZE;
 
-		if (put_one(state, &batch, hashes + (Size) j * DOLT_CHUNK_HASH_SIZE, data[j], lengths[j]))
+		/* A batch's repeats of one chunk are adjacent in hash order. */
+		if (i > 0 && memcmp(hash, hashes + (Size) order[i - 1] * DOLT_CHUNK_HASH_SIZE, DOLT_CHUNK_HASH_SIZE) == 0)
+			continue;
+		if (put_one(state, &batch, hash, data[j], lengths[j]))
 			stored++;
 	}
 	put_flush(state, &batch);

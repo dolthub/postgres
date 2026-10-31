@@ -74,7 +74,9 @@ extern bool dolt_chunk_exists(DoltChunkStore *store, const uint8 *hash);
 
 /*
  * Put n chunks, given hashes and contents; returns how many this call stored.
- * The store may reorder the batch. Requires DOLT_CHUNK_WRITE.
+ * A store may store another copy of a chunk it already holds rather than
+ * look for it first. The store may reorder the batch. Requires
+ * DOLT_CHUNK_WRITE.
  */
 extern int	dolt_chunk_put_many(DoltChunkStore *store, int n, const uint8 *hashes,
 								const uint8 *const *data, const Size *lengths);
