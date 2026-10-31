@@ -473,9 +473,12 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			 */
 			if (indexRelation->rd_rel->relkind != RELKIND_PARTITIONED_INDEX)
 			{
-				if (info->indpred == NIL)
+				if (info->indpred == NIL ||
+					!RelFileNumberIsValid(indexRelation->rd_locator.relNumber))
 				{
-					/* A revision's index has content but no file of its own. */
+					/* A revision's index has content but no file of its own.
+					 * Until predicate statistics exist, its table count is a
+					 * conservative upper bound for partial indexes too. */
 					info->pages = RelFileNumberIsValid(indexRelation->rd_locator.relNumber) ?
 						RelationGetNumberOfBlocks(indexRelation) : 1;
 					info->tuples = rel->tuples;

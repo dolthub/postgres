@@ -580,19 +580,13 @@ unique_contents(Relation rel, const PLTree * contents)
 		keys = palloc(sizeof(*keys) * Max(rows.count, 1));
 		for (i = 0; i < rows.count; i++)
 		{
-			int			j,
-						n = idx->rd_index->indnkeyatts;
-			bool		hasnull = false;
-			PLValue    *fields = palloc(sizeof(*fields) * n);
-			PLSlice		row = {rows.items[i].value.data + 8, rows.items[i].value.len - 8};
+			bool hasnull;
+			StringInfoData key;
+			PLSlice row = {rows.items[i].value.data + 8, rows.items[i].value.len - 8};
 
-			for (j = 0; j < n; j++)
-			{
-				dg_check(pl_tuple_get(row, idx->rd_index->indkey.values[j] - 1, &fields[j]));
-				if (!fields[j].present)
-					hasnull = true;
-			}
-			if (hasnull && !idx->rd_index->indnullsnotdistinct)
+			initStringInfo(&key);
+			if (!dg_index_row_key(rel, idx, row, &key, &hasnull) ||
+				(hasnull && !idx->rd_index->indnullsnotdistinct))
 				continue;
 			if (pl_read64(rows.items[i].value.data) > 1)
 			{
@@ -600,7 +594,7 @@ unique_contents(Relation rel, const PLTree * contents)
 					index_close(idx, AccessShareLock);
 				return false;
 			}
-			keys[used++].key = pack_merge_fields(fields, n);
+			keys[used++].key = DG_SLICE(key.data, key.len);
 		}
 		qsort(keys, used, sizeof(*keys), entry_compare);
 		for (i = 1; i < used; i++)
@@ -646,30 +640,27 @@ unique_violations(Relation rel, const PLTree * contents, const char *name, Strin
 		{
 			if (j)
 				appendStringInfoChar(&info, ',');
-			escape_json(&info, NameStr(TupleDescAttr(RelationGetDescr(rel), idx->rd_index->indkey.values[j] - 1)->attname));
+			escape_json(&info, NameStr(TupleDescAttr(RelationGetDescr(idx), j)->attname));
 		}
 		appendStringInfoString(&info, "],\"Name\":");
 		escape_json(&info, RelationGetRelationName(idx));
 		appendStringInfoChar(&info, '}');
-		keys = palloc(sizeof(*keys) * Max(rows.count, 1));
+		keys = palloc0(sizeof(*keys) * Max(rows.count, 1));
 		for (i = 0; i < rows.count; i++)
 		{
-			PLValue    *fields = palloc(sizeof(*fields) * n);
-			PLSlice		row = {rows.items[i].value.data + 8, rows.items[i].value.len - 8};
-			bool		hasnull = false;
+			PLSlice row = {rows.items[i].value.data + 8, rows.items[i].value.len - 8};
+			bool hasnull;
+			StringInfoData key;
 
-			for (j = 0; j < n; j++)
-			{
-				dg_check(pl_tuple_get(row, idx->rd_index->indkey.values[j] - 1, &fields[j]));
-				if (!fields[j].present)
-					hasnull = true;
-			}
-			keys[i].key = (hasnull && !idx->rd_index->indnullsnotdistinct) ? DG_SLICE(NULL, 0) : pack_merge_fields(fields, n);
+			initStringInfo(&key);
+			if (dg_index_row_key(rel, idx, row, &key, &hasnull) &&
+				(!hasnull || idx->rd_index->indnullsnotdistinct))
+				keys[i].key = DG_SLICE(key.data, key.len);
 			keys[i].value = row;
 		}
 		for (i = 0; i < rows.count; i++)
 		{
-			bool		duplicate = pl_read64(rows.items[i].value.data) > 1;
+			bool		duplicate = keys[i].key.data && pl_read64(rows.items[i].value.data) > 1;
 
 			if (keys[i].key.data)
 				for (j = 0; j < rows.count && !duplicate; j++)

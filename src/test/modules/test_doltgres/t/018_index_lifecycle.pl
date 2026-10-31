@@ -58,8 +58,10 @@ my $index_member=q{SELECT encode(o.objhash,'hex') FROM pg_dolt_ref r JOIN pg_dol
 my $member=sql($index_member);
 sql(q{CREATE TABLE unrelated(a int); ALTER TABLE unrelated ADD COLUMN b int; DROP TABLE unrelated});
 is(sql($index_member),$member,'other tables\' DDL keeps an index member byte-identical');
-rejects(q{CREATE INDEX partial_idx ON t(x) WHERE x>0},'partial index remains explicitly unsupported');
-rejects(q{CREATE INDEX expression_idx ON t((x+1))},'expression index remains explicitly unsupported');
+sql(q{CREATE INDEX partial_idx ON t(x) WHERE x>0});
+is(sql(q{SELECT indpred IS NOT NULL FROM pg_index WHERE indexrelid='partial_idx'::regclass}),'t','partial predicate is published');
+sql(q{CREATE INDEX expression_idx ON t((x+1))});
+is(sql(q{SELECT indexprs IS NOT NULL FROM pg_index WHERE indexrelid='expression_idx'::regclass}),'t','index expression is published');
 rejects(q{CREATE INDEX CONCURRENTLY concurrent_idx ON t(x)},'concurrent index publication remains explicitly unsupported');
 my $peer=$node->background_psql('postgres',on_error_stop=>0);
 $peer->query_safe(q{SET statement_timeout='3s'; SET client_min_messages=warning; PREPARE stable AS SELECT id,x,v FROM t ORDER BY id; BEGIN; CREATE INDEX x_idx ON t(v)});
