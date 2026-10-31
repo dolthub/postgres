@@ -699,6 +699,12 @@ name_match(const void *a, const void *b, Size keysize)
 	return x->objectclass != y->objectclass || strcmp(x->identity, y->identity);
 }
 
+static void view_name_object(CatalogView *view, CatalogViewObject *object,
+							 CatalogViewObject **(*kind) (CatalogViewName *));
+static CatalogViewObject **shared_slot(CatalogViewName *name);
+static CatalogViewObject **durable_slot(CatalogViewName *name);
+static CatalogViewObject **handle_slot(CatalogViewName *name);
+
 /* |view|'s entry for |identity| of |objectclass|, made if |create|. */
 static CatalogViewName *
 view_name(CatalogView *view, Oid objectclass, const char *identity, bool create)
@@ -711,7 +717,7 @@ view_name(CatalogView *view, Oid objectclass, const char *identity, bool create)
 	{
 		HASHCTL		ctl = {0};
 
-		if (!create)
+		if (!create && !view->handles && !view->durable && !view->shared)
 			return NULL;
 		ctl.keysize = sizeof(CatalogViewNameKey);
 		ctl.entrysize = sizeof(CatalogViewName);
@@ -720,6 +726,14 @@ view_name(CatalogView *view, Oid objectclass, const char *identity, bool create)
 		ctl.hcxt = view->memory;
 		view->names = hash_create("catalog view names", 256, &ctl,
 								  HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
+
+		/* Unloading dropped the index; the objects it indexes are still bound. */
+		foreach_ptr(CatalogViewObject, object, view->shared)
+			view_name_object(view, object, shared_slot);
+		foreach_ptr(CatalogViewObject, object, view->durable)
+			view_name_object(view, object, durable_slot);
+		foreach_oid(handle, view->handles)
+			view_name_object(view, hash_search(objects, &handle, HASH_FIND, NULL), handle_slot);
 	}
 	name = hash_search(view->names, &key, create ? HASH_ENTER : HASH_FIND, &found);
 	if (name && !found)
@@ -1424,6 +1438,70 @@ CatalogViewEnsureLoaded(CatalogView *view)
 
 static void forget_descriptors(CatalogView *view);
 
+/*
+ * Drop |view|'s rows, indexes, caches and shared rows. Its objects stay bound,
+ * so OIDs clients hold still name them, and its loader reads it again when
+ * one is used.
+ */
+static void
+unload_view(CatalogView *view)
+{
+	MemoryContext previous;
+	ListCell   *lc;
+	List	   *kept = NIL;
+
+	previous = MemoryContextSwitchTo(view->memory);
+	foreach(lc, view->caches)
+	{
+		CatCache   *cache = lfirst(lc);
+
+		/*
+		 * Referenced cache tuples own their bytes. They remain valid but
+		 * dead until their native resource owner releases them.
+		 */
+		if (!TryDestroyCatCache(cache))
+			kept = lappend(kept, cache);
+	}
+	list_free(view->caches);
+	view->caches = kept;
+	view->catalogs = NIL;
+	view->loaded = false;
+	MemoryContextReset(view->rows_memory);
+	forget_indexes(view);
+
+	/*
+	 * Its shared rows go too: a reload begins from the base current then,
+	 * and server-side DDL replaces the base, so unloaded views would
+	 * otherwise keep every base they were built on.
+	 */
+	if (view->base)
+	{
+		CatalogViewBaseRelease(view->base);
+		view->base = NULL;
+	}
+
+	/* The name index is rebuilt from the bound objects when next needed. */
+	if (view->names)
+	{
+		hash_destroy(view->names);
+		view->names = NULL;
+	}
+	MemoryContextSwitchTo(previous);
+}
+
+/*
+ * Unload |view| now, if nothing is using it: one no lookup will return again
+ * until a client names one of its objects. False if it is in use.
+ */
+bool
+CatalogViewUnload(CatalogView *view)
+{
+	if (!view->loader || !view->loaded || view == current_view || view->scan_references || view->loading)
+		return false;
+	unload_view(view);
+	return true;
+}
+
 static void
 prune_catalog_views(XactEvent event, void *arg)
 {
@@ -1449,9 +1527,6 @@ prune_catalog_views(XactEvent event, void *arg)
 		dlist_iter	it;
 		CatalogView *oldest = NULL;
 		int			count = 0;
-		ListCell   *lc;
-		List	   *kept = NIL;
-		MemoryContext previous;
 
 		dlist_foreach(it, &views)
 		{
@@ -1467,25 +1542,7 @@ prune_catalog_views(XactEvent event, void *arg)
 		}
 		if (count <= catalog_view_cache_entries || !oldest)
 			break;
-		previous = MemoryContextSwitchTo(oldest->memory);
-		foreach(lc, oldest->caches)
-		{
-			CatCache   *cache = lfirst(lc);
-
-			/*
-			 * Referenced cache tuples own their bytes. They remain valid but
-			 * dead until their native resource owner releases them.
-			 */
-			if (!TryDestroyCatCache(cache))
-				kept = lappend(kept, cache);
-		}
-		list_free(oldest->caches);
-		oldest->caches = kept;
-		oldest->catalogs = NIL;
-		oldest->loaded = false;
-		MemoryContextReset(oldest->rows_memory);
-		forget_indexes(oldest);
-		MemoryContextSwitchTo(previous);
+		unload_view(oldest);
 	}
 }
 

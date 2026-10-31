@@ -11,7 +11,7 @@ typedef struct DGProvider
 	uint64		extension_generation;	/* the extensions whose objects it binds */
 	uint64		base_generation;	/* the server objects it lists */
 	List	   *bindings;		/* the durable OIDs a branch view binds */
-	bool		superseded;		/* a later view of the same revision replaced it */
+	bool		superseded;		/* a later view of the same branch or revision replaced it */
 	MemoryContext memory;		/* holds the entry */
 	struct DGProvider *next;
 } DGProvider;
@@ -301,34 +301,21 @@ provider_row_owner(Oid catalog, HeapTuple tuple, Oid object)
 }
 
 /*
- * Release the views no statement can use again: those a later view replaced,
- * and those built before an extension or server object changed. A view still
- * referenced elsewhere, such as by a cached plan, is kept until it is not.
- * Callers hold views without references during a statement, so this waits
- * for the end of the transaction.
+ * Unload the views no lookup will return again: those a later view replaced,
+ * and those built before an extension or server object changed. Clients may
+ * still hold their objects' OIDs, so they stay bound, and are read again if
+ * one is used. Callers hold views without references during a statement, so
+ * this waits for the end of the transaction.
  */
 static void
 provider_xact(XactEvent event, void *arg)
 {
-	DGProvider **link = &providers;
-
 	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT && event != XACT_EVENT_PREPARE)
 		return;
-	while (*link)
-	{
-		DGProvider *entry = *link;
-
-		if ((entry->superseded || entry->extension_generation != extension_generation ||
-			 entry->base_generation != base_generation) &&
-			CatalogViewReferences(entry->view) == 1 && CatalogViewCurrent() != entry->view)
-		{
-			*link = entry->next;
-			CatalogViewRelease(entry->view);
-			MemoryContextDelete(entry->memory);
-			continue;
-		}
-		link = &entry->next;
-	}
+	for (DGProvider *entry = providers; entry; entry = entry->next)
+		if (entry->superseded || entry->extension_generation != extension_generation ||
+			entry->base_generation != base_generation)
+			(void) CatalogViewUnload(entry->view);
 }
 
 static void
