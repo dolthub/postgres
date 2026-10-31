@@ -71,5 +71,6 @@ tests += {
       't/053_diff_views.pl',
       't/054_cherry_pick_conflicts.pl',
       't/055_ignored_workspaces.pl',
+      't/056_revert_workflows.pl',
   ]},
 }

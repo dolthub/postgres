@@ -1491,7 +1491,7 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 	char	  **args = arguments(fcinfo, &n),
 			   *author = NULL,
 			   *email = NULL;
-	List	   *revisions = NIL;
+	List	   *revisions = NIL, *targets = NIL;
 	ListCell   *lc;
 	VersionRef	head, pending;
 	bool abort_pick = false, continue_pick = false;
@@ -1583,9 +1583,13 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 	head = read_ref(branch_ref("heads"));
 	if (!database_same(staged_capture(&live), child(head.target, 1)) || !database_same(read_ref(branch_ref("staged")).target, child(head.target, 1)))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("cannot %s with uncommitted changes", revert ? "revert" : "cherry-pick")));
+	/* Resolve every input against the same starting HEAD. Publishing an
+	 * earlier revert must not change the meaning of a later HEAD~N. */
 	foreach(lc, revisions)
+		targets = lappend(targets, resolve(lfirst(lc)));
+	foreach(lc, targets)
 	{
-		bytea	   *target = resolve((char *) lfirst(lc)),
+		bytea	   *target = lfirst(lc),
 				   *parent,
 				   *targetdb,
 				   *parentdb,
@@ -1629,7 +1633,7 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 			 * a second commit parent after resolution: this is a cherry-pick. */
 			initStringInfo(&state);
 			appendStringInfoString(&state, "{\"format\":\"DGMERGE1\",\"squash\":true,\"operation\":\"cherry-pick\",\"source\":");
-			escape_json(&state, (char *) lfirst(lc));
+			escape_json(&state, (char *) linitial(revisions));
 			if (author)
 			{
 				json_field(&state, "author_override", author, true);

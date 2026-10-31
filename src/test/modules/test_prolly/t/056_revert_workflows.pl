@@ -1,0 +1,20 @@
+use strict;
+use warnings FATAL => 'all';
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
+my $node = PostgreSQL::Test::Cluster->new('revert_workflows');
+$node->init(extra => ['--encoding=UTF8','--locale=C']);
+$node->start;
+sub sql { $node->safe_psql('postgres',$_[0]); }
+sql(q{CREATE TABLE t(id int PRIMARY KEY,v int) USING dolt_prolly_table; INSERT INTO t VALUES(1,1)});
+sql(q{SELECT dolt_commit('-Am','seed')});
+sql(q{INSERT INTO t VALUES(2,2)});
+sql(q{SELECT dolt_commit('-Am','insert two')});
+sql(q{INSERT INTO t VALUES(3,3)});
+sql(q{SELECT dolt_commit('-Am','insert three')});
+sql(q{SELECT dolt_revert('HEAD','HEAD~1')});
+is(sql(q{SELECT id FROM t ORDER BY id}), '1', 'multi-revert binds relative revisions before publishing');
+is(sql(q{SELECT message FROM dolt_log LIMIT 2}), "Revert \"insert two\"\nRevert \"insert three\"", 'each requested revision receives one revert commit');
+$node->stop;
+done_testing();
