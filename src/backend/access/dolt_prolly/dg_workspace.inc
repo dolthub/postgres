@@ -1454,7 +1454,9 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 			   *email = NULL;
 	List	   *revisions = NIL;
 	ListCell   *lc;
-	VersionRef	head;
+	VersionRef	head, pending;
+	bool abort_pick = false;
+	int64 conflict_counts[3] = {0, 0, 0};
 	bytea	   *commit = NULL;
 	Datum		values[4];
 	bool		nulls[4] = {false, false, false, false};
@@ -1467,11 +1469,33 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 	{
 		if (!strcmp(args[i], "--author") && i + 1 < n)
 			author_option(args[++i], &author, &email);
+		else if (!revert && !strcmp(args[i], "--abort"))
+			abort_pick = true;
 		else if (args[i][0] == '-')
 			unsupported(args[i]);
 		else
 			revisions = lappend(revisions, args[i]);
 	}
+	pending = read_ref(branch_ref("merge"));
+	if (abort_pick)
+	{
+		char *operation = pending.target ? json_value(metadata(pending.target, "merge"), "operation") : NULL;
+		bytea *working, *staged;
+
+		if (revisions || !operation || strcmp(operation, "cherry-pick"))
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("no cherry-pick to abort")));
+		working = child(pending.target, 4);
+		staged = child(pending.target, 5);
+		replace_working(dg_current_branch(), working, NIL);
+		move_ref(branch_ref("working"), read_ref(branch_ref("working")), working);
+		move_ref(branch_ref("staged"), read_ref(branch_ref("staged")), staged);
+		finish_merge();
+		goto done;
+	}
+	if (pending.target)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("a merge or cherry-pick is already in progress")));
 	if (!revisions)
 		unsupported(revert ? "dolt_revert requires a revision" : "dolt_cherry_pick requires a revision");
 	if (!revert && list_length(revisions) != 1)
@@ -1506,7 +1530,27 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 		else
 			merge_databases(parentdb, child(head.target, 1), targetdb, &conflicts, &violations, &schema_conflicts);
 		if (conflicts.len || violations.len || schema_conflicts.len)
-			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("%s resulted in conflicts; resolve them with dolt_merge", revert ? "revert" : "cherry-pick")));
+		{
+			StringInfoData state;
+			bytea *before = child(head.target, 1);
+
+			if (revert)
+				ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+								errmsg("revert resulted in conflicts")));
+			/* Retain the same conflict graph used by merge. Squash suppresses
+			 * a second commit parent after resolution: this is a cherry-pick. */
+			initStringInfo(&state);
+			appendStringInfoString(&state, "{\"format\":\"DGMERGE1\",\"squash\":true,\"operation\":\"cherry-pick\",\"source\":");
+			escape_json(&state, (char *) lfirst(lc));
+			appendStringInfo(&state, ",\"conflicts\":[%s],\"violations\":[%s],\"schema_conflicts\":[%s]}", conflicts.data, violations.data, schema_conflicts.data);
+			move_ref(branch_ref("merge"), pending,
+					 put("merge", state.data, VC_ARGS(PointerGetDatum(head.target), PointerGetDatum(target), PointerGetDatum(parent), PointerGetDatum(before), PointerGetDatum(read_ref(branch_ref("staged")).target)), 5));
+			move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture_visible().hash);
+			run("SELECT (SELECT count(DISTINCT v->>'table') FROM jsonb_array_elements($1::jsonb->'conflicts') v), (SELECT count(DISTINCT v->>'table') FROM jsonb_array_elements($1::jsonb->'schema_conflicts') v), (SELECT count(DISTINCT v->>'table') FROM jsonb_array_elements($1::jsonb->'violations') v)", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(state.data)), NULL, true);
+			for (i = 0; i < 3; i++)
+				conflict_counts[i] = DatumGetInt64(cell(0, i + 1));
+			goto done;
+		}
 		database = capture_visible().hash;
 		message = revert ? psprintf("Revert \"%s\"", json_value(meta, "message")) : json_value(meta, "message");
 		commit = commit_object(database, head.target, NULL, message, author, email, GetCurrentTimestamp());
@@ -1515,10 +1559,10 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 		move_ref(branch_ref("working"), read_ref(branch_ref("working")), database);
 		advance_snapshot();
 	}
-	values[0] = CStringGetTextDatum(hash_format(commit));
-	values[1] = Int64GetDatum(0);
-	values[2] = Int64GetDatum(0);
-	values[3] = Int64GetDatum(0);
+done:
+	values[0] = CStringGetTextDatum(commit ? hash_format(commit) : "");
+	for (i = 0; i < 3; i++)
+		values[i + 1] = Int64GetDatum(conflict_counts[i]);
 	end_api(nest);
 	return command_record(fcinfo, values, nulls);
 }
