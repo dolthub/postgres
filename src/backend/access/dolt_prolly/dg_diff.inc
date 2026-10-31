@@ -1387,7 +1387,19 @@ column_diff_partition(ReturnSetInfo *rsinfo, const char *label, CommitInfo *c, D
 		return;
 	cc.changed = palloc0(sizeof(bool) * (to->present ? to->desc->natts : 0));
 	if (from->present && to->present)
-		diff_rows(from, to, column_change_row, &cc);
+	{
+		if (from->keyed != to->keyed || (from->keyed && !same_key_columns(from, to)))
+		{
+			/* Incompatible keys make rows removals/additions rather than
+			 * pairs. Every retained column participates when rows exist;
+			 * an empty table still has no changed column values. */
+			if (from->rows.count || to->rows.count)
+				for (i = 0; i < to->desc->natts; i++)
+					cc.changed[i] = true;
+		}
+		else
+			diff_rows(from, to, column_change_row, &cc);
+	}
 	for (i = 0; i < (to->present ? to->desc->natts : 0) + (from->present ? from->desc->natts : 0); i++)
 	{
 		const char *column,
@@ -1426,7 +1438,7 @@ column_diff_partition(ReturnSetInfo *rsinfo, const char *label, CommitInfo *c, D
 				if (j < to->desc->natts)
 					continue;	/* reported from the to side */
 			}
-			type = "dropped";
+			type = "removed";
 		}
 		if (!type)
 			continue;
