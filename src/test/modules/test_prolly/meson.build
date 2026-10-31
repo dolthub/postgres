@@ -72,5 +72,6 @@ tests += {
       't/054_cherry_pick_conflicts.pl',
       't/055_ignored_workspaces.pl',
       't/056_revert_workflows.pl',
+      't/057_diff_history.pl',
   ]},
 }

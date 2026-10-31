@@ -1426,7 +1426,7 @@ column_diff_partition(ReturnSetInfo *rsinfo, const char *label, CommitInfo *c, D
 				if (j < to->desc->natts)
 					continue;	/* reported from the to side */
 			}
-			type = "dropped";
+			type = "removed";
 		}
 		if (!type)
 			continue;

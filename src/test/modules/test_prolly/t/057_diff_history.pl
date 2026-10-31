@@ -1,0 +1,20 @@
+use strict;
+use warnings FATAL => 'all';
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
+my $node=PostgreSQL::Test::Cluster->new('diff_history');
+$node->init(extra=>['--encoding=UTF8','--locale=C']);
+$node->start;
+sub sql { $node->safe_psql('postgres',$_[0]); }
+sql(q{CREATE TABLE t(id int PRIMARY KEY,v int) USING dolt_prolly_table; INSERT INTO t VALUES(1,1)});
+sql(q{SELECT dolt_commit('-Am','base')});
+sql(q{ALTER TABLE t DROP COLUMN v});
+sql(q{SELECT dolt_commit('-Am','drop column')});
+is(sql(q{SELECT table_name,column_name,diff_type FROM dolt_column_diff WHERE message='drop column'}), 'public.t|v|removed', 'column deletion uses public removed status');
+sql(q{ALTER TABLE t RENAME TO u});
+sql(q{SELECT dolt_commit('-Am','rename table')});
+is(sql(q{SELECT table_name,column_name,diff_type FROM dolt_column_diff WHERE message='rename table' ORDER BY table_name,column_name}), "public.t|id|removed\npublic.u|id|added", 'table rename is a name-based drop and add');
+is(sql(q{SELECT table_name,data_change,schema_change FROM dolt_diff WHERE message='rename table' ORDER BY table_name}), "public.t|t|t\npublic.u|t|t", 'unscoped rename diff accounts for both old and new rows');
+$node->stop;
+done_testing();
