@@ -11,7 +11,8 @@
  * definitions are immutable. Routines are referred to by name without their
  * argument types, which covers every overload; a table's row type is
  * referred to as "type:" and the table's name. Operators outside pg_catalog
- * are referred to as "operator:" and their qualified name.
+ * are referred to as "operator:" and their qualified name, and collations
+ * outside pg_catalog as "collation:" and theirs.
  *
  * A root also lists the extensions whose objects its definitions use, by name
  * and without version, so that a server reading it can say up front which it
@@ -70,6 +71,8 @@ references_walker(Node *node, List **references)
 	}
 	if (IsA(node, TypeName) && (name = references_name(((TypeName *) node)->names)))
 		references_add(references, "type", name);
+	if (IsA(node, CollateClause) && (name = references_name(((CollateClause *) node)->collname)))
+		references_add(references, "collation", name);
 	/* An operator outside pg_catalog is written OPERATOR(schema.op). */
 	if (IsA(node, A_Expr) && (name = references_name(((A_Expr *) node)->name)))
 		references_add(references, "operator", name);
@@ -133,6 +136,21 @@ references_type_array(List **references, const char *array)
 			references_type(references, TextDatumGetCString(names[i]));
 }
 
+/* A column's collation, as a table definition lists it: [schema, name, ...]. */
+static void
+references_collation(List **references, const char *collation)
+{
+	JsonbValue	value;
+	char	   *schema;
+
+	if (!collation)
+		return;
+	value = json_document(collation);
+	schema = json_item_text(&value, 0);
+	if (schema && strcmp(schema, "pg_catalog"))
+		references_add(references, "collation", dg_qualified_name(schema, json_item_text(&value, 1)));
+}
+
 /* The statement a constraint definition is parsed in. */
 static Constraint *
 references_constraint(const char *prefix, const char *name, const char *definition)
@@ -177,6 +195,7 @@ definition_references(const char *kind, const char *definition)
 			JsonbValue	column = json_element(&columns, i);
 
 			references_type(&references, json_field_text(&column, "type"));
+			references_collation(&references, json_field_text(&column, "collation"));
 			(void) references_walker(defaults[i], &references);
 		}
 		for (int i = 0; i < nconstraints; i++)
@@ -193,6 +212,15 @@ definition_references(const char *kind, const char *definition)
 
 		if (index && index->relation->schemaname)
 			references_add(&references, "table", dg_qualified_name(index->relation->schemaname, index->relation->relname));
+		if (index)
+			foreach_node(IndexElem, element, index->indexParams)
+			{
+				char	   *name;
+
+				if (element->collation && (name = references_name(element->collation)))
+					references_add(&references, "collation", name);
+				(void) references_walker(element->expr, &references);
+			}
 	}
 	if (!strcmp(kind, "view") || (!strcmp(kind, "table") && json_value(definition, "matview")) ||
 		((!strcmp(kind, "routine") || schema_object_class(kind)) && json_value(definition, "dependencies")))
@@ -450,8 +478,8 @@ database_referrers(const char *json, const char *kind, const char *name)
 /*
  * The dependency-record key of server object |object|, such as
  * "routine:public.crypt", or NULL for any other object. Definitions name a
- * server's functions, operators and types, an extension's among them, as
- * they name built-in ones, by qualified name.
+ * server's functions, operators, types and collations, an extension's among
+ * them, as they name built-in ones, by qualified name.
  */
 static char *
 server_object_reference(const ObjectAddress *object)
@@ -461,7 +489,7 @@ server_object_reference(const ObjectAddress *object)
 
 	if (object->objectId < FirstNormalObjectId || object->objectId >= FirstDurableObjectId ||
 		(object->classId != ProcedureRelationId && object->classId != TypeRelationId &&
-		 object->classId != OperatorRelationId))
+		 object->classId != OperatorRelationId && object->classId != CollationRelationId))
 		return NULL;
 	previous = CatalogViewSwitch(NULL);
 	PG_TRY();
@@ -478,6 +506,18 @@ server_object_reference(const ObjectAddress *object)
 				Form_pg_type type = (Form_pg_type) GETSTRUCT(tuple);
 
 				result = psprintf("type:%s", dg_qualified_name(get_namespace_name(type->typnamespace), NameStr(type->typname)));
+				ReleaseSysCache(tuple);
+			}
+		}
+		else if (object->classId == CollationRelationId)
+		{
+			HeapTuple	tuple = SearchSysCache1(COLLOID, ObjectIdGetDatum(object->objectId));
+
+			if (HeapTupleIsValid(tuple))
+			{
+				Form_pg_collation collation = (Form_pg_collation) GETSTRUCT(tuple);
+
+				result = psprintf("collation:%s", dg_qualified_name(get_namespace_name(collation->collnamespace), NameStr(collation->collname)));
 				ReleaseSysCache(tuple);
 			}
 		}

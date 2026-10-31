@@ -128,6 +128,25 @@ $session->query_safe(q{SELECT dolt_checkout('main')});
 $session->quit;
 is(sql(q{SELECT crypt('a', gen_salt('md5')) IS NOT NULL}),'t','server objects are untouched on main');
 
+# Collations are server objects: one a branch's definitions use cannot be dropped.
+sql(q{CREATE DATABASE coll});
+$node->safe_psql('coll',q{CREATE TABLE anchor(id int PRIMARY KEY); CREATE SCHEMA ct;
+CREATE COLLATION ct.c_column (LC_COLLATE = "POSIX", LC_CTYPE = "POSIX");
+CREATE COLLATION ct.c_index (LC_COLLATE = "POSIX", LC_CTYPE = "POSIX");
+CREATE COLLATION ct.c_default (LC_COLLATE = "POSIX", LC_CTYPE = "POSIX");
+CREATE TABLE ct.t(f1 text COLLATE ct.c_column, f2 text DEFAULT ('a' COLLATE ct.c_default));
+CREATE INDEX ON ct.t (f2 COLLATE ct.c_index);
+CREATE TABLE public.u(f text COLLATE ct.c_column)});
+for my $case (['c_column','table ct.t'],['c_index','index ct.t_f2_idx'],['c_default','table ct.t']) {
+ my ($rc,$out,$err)=$node->psql('coll',"DROP COLLATION ct.$case->[0] CASCADE");
+ like($err,qr/cannot drop collation ct\.$case->[0] because other objects depend on it.*\Q$case->[1]\E on branch "main"/s,"a collation a branch's $case->[1] uses cannot be dropped ($case->[0])");
+}
+is($node->safe_psql('coll',q{SELECT count(*) FROM pg_class WHERE relname = 't'}),'1','and every session still reads the branch');
+my ($coll_rc,$coll_out,$coll_err)=$node->psql('coll',q{DROP SCHEMA ct CASCADE});
+like($coll_err,qr/table public\.u uses server objects in schema ct/,'nor can the schema of a collation another schema\'s table uses');
+$node->safe_psql('coll',q{DROP TABLE public.u; DROP SCHEMA ct CASCADE});
+is($node->safe_psql('coll',q{SELECT count(*) FROM pg_namespace WHERE nspname = 'ct'}),'0','once nothing outside uses it, the schema drops with its tables');
+
 # Without server objects in it, public can be renamed on a branch like any schema.
 sql(q{CREATE DATABASE plain});
 $node->safe_psql('plain',q{CREATE TABLE t(id int PRIMARY KEY); INSERT INTO t VALUES (1); SELECT dolt_commit('-Am', 'base'); SELECT dolt_branch('renamed')});
