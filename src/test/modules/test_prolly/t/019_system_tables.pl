@@ -15,10 +15,12 @@ sub fails {
 }
 # Metadata can be the first user data written, before any version API call.
 sql(q{CREATE DATABASE docs_first});
-$node->safe_psql('docs_first', q{INSERT INTO dolt.docs VALUES('README.md','first')});
-is($node->safe_psql('docs_first', q{SELECT doc_name FROM dolt.docs ORDER BY 1}), "AGENT.md\nREADME.md", 'first metadata write is captured in the branch');
-$node->safe_psql('docs_first', q{UPDATE dolt.docs SET doc_text='second' WHERE doc_name='README.md'});
-is($node->safe_psql('docs_first', q{SELECT doc_text FROM dolt.docs WHERE doc_name='README.md'}), 'second', 'subsequent metadata writes find the existing table');
+my $docs = $node->background_psql('docs_first');
+$docs->query_safe(q{INSERT INTO dolt.docs VALUES('README.md','first')});
+is($docs->query_safe(q{SELECT doc_name FROM dolt.docs ORDER BY 1}), "AGENT.md\nREADME.md", 'first metadata write is captured in the branch');
+$docs->query_safe(q{UPDATE dolt.docs SET doc_text='second' WHERE doc_name='README.md'});
+is($docs->query_safe(q{SELECT doc_text FROM dolt.docs WHERE doc_name='README.md'}), 'second', 'subsequent metadata writes find the existing table');
+$docs->quit;
 sql(q{DROP DATABASE docs_first});
 # Every database starts with an initialized repository whose initial commit records the public schema.
 is(sql(q{SELECT name,dirty,latest_commit_message FROM dolt.branches}),'main|f|Initialize data repository','fresh database has main');
