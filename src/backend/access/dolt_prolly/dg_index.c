@@ -723,7 +723,8 @@ dg_index_check_unique(Relation table, Relation index, ItemPointer tid, Datum *va
 	if (batch ? !dg_batch_row(batch, digest, &row) : !row_of(rows, digest, &row))
 		elog(ERROR, "missing canonical row contents");
 	initStringInfo(&key);
-	return index_entry(table, index, row, (PLSlice) {digest.bytes, PL_HASH_SIZE}, &key, &prefix, &nullkey);
+	if (!index_entry(table, index, row, (PLSlice) {digest.bytes, PL_HASH_SIZE}, &key, &prefix, &nullkey))
+		elog(ERROR, "unique check for row outside index predicate");
 	if (rows)
 		dg_release(rows);
 	if (nullkey && !index->rd_index->indnullsnotdistinct)

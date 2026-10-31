@@ -1244,7 +1244,7 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 	if (expressions)
 		tuple = provider_set(rows->relations[slot], tuple, Anum_pg_index_indexprs, CStringGetTextDatum(nodeToString(expressions)));
 	if (predicate)
-		tuple = provider_set(rows->relations[slot], tuple, Anum_pg_index_indpred, CStringGetTextDatum(nodeToString(make_ands_implicit((Expr *) predicate))));
+		tuple = provider_set(rows->relations[slot], tuple, Anum_pg_index_indpred, CStringGetTextDatum(nodeToString(predicate)));
 	rows->rows[slot] = lappend(rows->rows[slot], tuple);
 }
 
