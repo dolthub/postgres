@@ -69,6 +69,11 @@ like(sql(q{\df public.crypt}),qr/crypt/,'psql lists extension functions in publi
 
 # A server object made after a session built its catalogs is in them at once.
 is(sql(q{CREATE TABLE public.late_heap(id int) USING heap; INSERT INTO late_heap VALUES (1); SELECT count(*) FROM late_heap, t}),'1','a session sees the heap table it just made');
+# Each such change rebuilds the session's catalogs: versioned objects named
+# before it are still the branch's after it.
+is(sql(q{CREATE TABLE droppable(a int); SELECT count(*) FROM droppable; CREATE TEMP TABLE rebuild(b int) USING heap;
+SELECT count(*) FROM droppable; DROP TABLE droppable; SELECT count(*) FROM pg_class WHERE relname = 'droppable'}) =~ s/.*\n//sr,'0','a versioned table looked up before server-side DDL can be dropped after it');
+
 # Each such change rebuilds the session's catalogs; the ones it replaces are freed.
 my $memory=q{SELECT sum(total_bytes) FROM pg_backend_memory_contexts};
 my $churn=$node->background_psql('postgres');

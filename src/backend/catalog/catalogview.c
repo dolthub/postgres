@@ -916,6 +916,13 @@ CatalogViewBinds(CatalogView *view, Oid oid)
 
 	if (!view || !OidIsValid(oid))
 		return false;
+
+	/*
+	 * A durable OID is bound by every view of its branch; the session's cache
+	 * of which view answers for it may name an earlier one.
+	 */
+	if (CatalogViewIsDurable(oid))
+		return view_durable(view, oid) != NULL;
 	previous = CatalogViewSwitch(view);
 	result = CatalogViewObjectContext(oid) == view;
 	CatalogViewSwitch(previous);
@@ -985,8 +992,16 @@ lookup_object(Oid handle)
 
 	if (CatalogViewIsDurable(handle))
 	{
-		CatalogView *view = durable_context(handle);
+		CatalogView *view = CatalogViewCurrent();
 
+		/*
+		 * Every view of a branch binds its durable OIDs alike. The statement's
+		 * own view answers when it binds one; the session's cache of where a
+		 * durable OID lives may name a view server-side DDL has replaced.
+		 */
+		if (view && (object = view_durable(view, handle)) != NULL)
+			return object;
+		view = durable_context(handle);
 		return view ? view_durable(view, handle) : NULL;
 	}
 
