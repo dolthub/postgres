@@ -1559,52 +1559,57 @@ typedef struct DiffStat
 static void
 stat_row(DiffTable *from, DiffTable *to, DiffRow *row, void *arg)
 {
-	DiffStat   *s = (DiffStat *) arg;
-	int			i,
-				j;
+	DiffStat *s = (DiffStat *) arg;
+	int i, j;
+	bool modified = false;
 
 	if (!strcmp(row->type, "added"))
-	{
 		s->rows_added++;
-		s->cells_added += to->desc->natts;
-	}
 	else if (!strcmp(row->type, "removed"))
-	{
 		s->rows_deleted++;
-		s->cells_deleted += from->desc->natts;
-	}
 	else
 	{
-		s->rows_modified++;
+		/* Missing columns compare as NULL. A schema rewrite alone must not
+		 * turn every unchanged row into a data modification. */
 		for (i = 0; i < to->desc->natts; i++)
 		{
 			const char *name = NameStr(TupleDescAttr(to->desc, i)->attname);
-			PLValue		a,
-						b;
+			PLValue a = {0}, b;
 
 			for (j = 0; j < from->desc->natts; j++)
 				if (!strcmp(NameStr(TupleDescAttr(from->desc, j)->attname), name))
 					break;
-			if (j == from->desc->natts)
-			{
-				s->cells_added++;
-				continue;
-			}
+
 			dg_check(pl_tuple_get(row->to.bytes, i, &b));
-			dg_check(pl_tuple_get(row->from.bytes, j, &a));
+			if (j < from->desc->natts)
+				dg_check(pl_tuple_get(row->from.bytes, j, &a));
+
 			if (!equal_value(a, b))
+			{
 				s->cells_modified++;
+				modified = true;
+			}
 		}
+
 		for (j = 0; j < from->desc->natts; j++)
 		{
 			const char *name = NameStr(TupleDescAttr(from->desc, j)->attname);
+			PLValue a;
 
 			for (i = 0; i < to->desc->natts; i++)
 				if (!strcmp(NameStr(TupleDescAttr(to->desc, i)->attname), name))
 					break;
+
 			if (i == to->desc->natts)
-				s->cells_deleted++;
+			{
+				dg_check(pl_tuple_get(row->from.bytes, j, &a));
+				if (a.present)
+					modified = true;
+			}
 		}
+
+		if (modified)
+			s->rows_modified++;
 	}
 }
 
@@ -1695,6 +1700,25 @@ dolt_diff_stat(PG_FUNCTION_ARGS)
 			s.new_rows = row_count(b);
 			s.old_cells = a->present ? s.old_rows * a->desc->natts : 0;
 			s.new_cells = b->present ? s.new_rows * b->desc->natts : 0;
+			/* Dolt derives structural cell additions/deletions from the total
+			 * sizes, including schema changes on otherwise unchanged rows. */
+			{
+				int width = b->present ? b->desc->natts : 0;
+				int64 delta = s.new_cells - s.old_cells;
+
+				if (delta > 0)
+				{
+					s.cells_deleted = s.rows_deleted * width;
+					s.cells_added = delta + s.cells_deleted;
+				}
+				else if (delta < 0)
+				{
+					s.cells_added = s.rows_added * width;
+					s.cells_deleted = -delta + s.cells_added;
+				}
+				else
+					s.cells_added = s.cells_deleted = Max(s.rows_added, s.rows_deleted) * width;
+			}
 		}
 		s.rows_unmodified = s.old_rows - s.rows_deleted - s.rows_modified;
 		memset(nulls, false, sizeof(nulls));
@@ -1710,8 +1734,19 @@ dolt_diff_stat(PG_FUNCTION_ARGS)
 		values[9] = Int64GetDatum(s.new_rows);
 		values[10] = Int64GetDatum(s.old_cells);
 		values[11] = Int64GetDatum(s.new_cells);
-		/* Unchanged tables produce no row, even when named explicitly. */
-		if (s.rows_added || s.rows_deleted || s.rows_modified || !a->present || !b->present || !same_schema_definition(a->schema, b->schema))
+		/* Keyless rows have no stable identity for modified-row statistics.
+		 * Match Dolt's public contract: only additions/deletions are known. */
+		if (!a->object_kind && !b->object_kind &&
+			((a->present && !a->keyed) || (b->present && !b->keyed)))
+		{
+			int j;
+
+			for (j = 1; j < 12; j++)
+				nulls[j] = j != 2 && j != 3;
+		}
+
+		/* Empty and schema-only changes have no data statistics row. */
+		if (s.rows_added || s.rows_deleted || s.rows_modified)
 			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 		diff_table_close(a);
 		diff_table_close(b);

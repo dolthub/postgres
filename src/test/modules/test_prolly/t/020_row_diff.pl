@@ -82,7 +82,7 @@ sql(q{CREATE TABLE kl(v int) USING dolt_prolly_table; INSERT INTO kl VALUES(1),(
 sql(q{SELECT dolt_commit('-Am','keyless')});
 sql(q{DELETE FROM kl WHERE v=1; INSERT INTO kl VALUES(3)});
 is(sql(q{SELECT diff_type,from_v,to_v FROM dolt_diff('HEAD','WORKING','kl') ORDER BY 1,2,3}),"added||3\nremoved|1|\nremoved|1|",'keyless occurrences');
-is(sql(q{SELECT rows_added,rows_deleted,old_row_count,new_row_count FROM dolt_diff_stat('HEAD','WORKING','kl')}),'1|2|3|2','keyless stat');
+is(sql(q{SELECT rows_added,rows_deleted,old_row_count,new_row_count FROM dolt_diff_stat('HEAD','WORKING','kl')}),'1|2||','keyless stat uses Dolt unknown-total contract');
 fails(q{SELECT * FROM dolt_blame_kl},qr/requires a primary key/,'blame requires a key');
 # Branch views keep generated tables working.
 sql(q{SELECT dolt_commit('-Am','before branch')});
@@ -95,5 +95,25 @@ $s->query_safe(q{SELECT dolt_commit('-Am','feature change')});
 is($s->query_safe(q{SELECT id,message FROM dolt_blame_test WHERE id=1}),'1|feature change','blame on a branch');
 $s->quit;
 is(sql(q{SELECT id,message FROM dolt_blame_test WHERE id=1}),'1|commit 3','main blame unchanged');
+# Schema rewrites should not manufacture logical row modifications.
+sql(q{CREATE TABLE stat_schema(id int PRIMARY KEY,v int) USING dolt_prolly_table});
+sql(q{SELECT dolt_commit('-Am','empty statistics table')});
+is(sql(q{SELECT count(*) FROM dolt_diff_stat('HEAD~1','HEAD','stat_schema')}),'0','empty creation has no data statistics');
+sql(q{INSERT INTO stat_schema VALUES(1,10),(2,20)});
+sql(q{SELECT dolt_commit('-Am','statistics rows')});
+sql(q{ALTER TABLE stat_schema ADD COLUMN extra int});
+is(sql(q{SELECT count(*) FROM dolt_diff_stat('HEAD','WORKING','stat_schema')}),'0','adding NULL column does not modify rows');
+sql(q{UPDATE stat_schema SET extra=7 WHERE id=1});
+is(sql(q{SELECT rows_unmodified,rows_modified,cells_added,cells_modified FROM dolt_diff_stat('HEAD','WORKING','stat_schema')}),'1|1|2|1','non-NULL added value modifies one row and counts structural cells');
+sql(q{SELECT dolt_commit('-Am','statistics new column')});
+sql(q{UPDATE stat_schema SET extra=NULL WHERE id=1});
+sql(q{SELECT dolt_commit('-Am','clear added column')});
+sql(q{ALTER TABLE stat_schema DROP COLUMN extra});
+is(sql(q{SELECT count(*) FROM dolt_diff_stat('HEAD','WORKING','stat_schema')}),'0','dropping NULL column does not modify rows');
+sql(q{CREATE TABLE stat_empty(id int PRIMARY KEY) USING dolt_prolly_table});
+sql(q{SELECT dolt_commit('-Am','empty to drop')});
+sql(q{DROP TABLE stat_empty});
+is(sql(q{SELECT count(*) FROM dolt_diff_stat('HEAD','WORKING','stat_empty')}),'0','empty deletion has no data statistics');
+
 $node->stop;
 done_testing();
