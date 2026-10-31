@@ -1498,6 +1498,8 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 	int64 conflict_counts[3] = {0, 0, 0};
 	bytea	   *commit = NULL;
 	Capture live;
+	const char *operation_name = revert ? "revert" : "cherry-pick";
+	bytea *series_head = NULL, *series_working = NULL, *series_staged = NULL;
 	Datum		values[4];
 	bool		nulls[4] = {false, false, false, false};
 
@@ -1509,9 +1511,9 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 	{
 		if (!strcmp(args[i], "--author") && i + 1 < n)
 			author_option(args[++i], &author, &email);
-		else if (!revert && !strcmp(args[i], "--abort"))
+		else if (!strcmp(args[i], "--abort"))
 			abort_pick = true;
-		else if (!revert && !strcmp(args[i], "--continue"))
+		else if (!strcmp(args[i], "--continue"))
 			continue_pick = true;
 		else if (args[i][0] == '-')
 			unsupported(args[i]);
@@ -1528,9 +1530,9 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 		char *operation = json ? json_value(json, "operation") : NULL;
 		bytea *database;
 
-		if (revisions || !operation || strcmp(operation, "cherry-pick"))
+		if (revisions || !operation || strcmp(operation, operation_name))
 			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-							errmsg("no cherry-pick to continue")));
+							errmsg("no %s to continue", operation_name)));
 		cherry_pick_conflict_counts(json, conflict_counts);
 		if (conflict_counts[0] || conflict_counts[1] || conflict_counts[2])
 			goto done;
@@ -1538,14 +1540,36 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 		validate_working_foreign_keys(dg_current_branch(), NULL);
 		database = staged_capture(&live);
 		head = read_ref(branch_ref("heads"));
-		commit = cherry_pick_commit(database, head.target, child(pending.target, 2),
-				author ? author : json_value(json, "author_override"),
-				email ? email : json_value(json, "email_override"));
+		if (revert)
+		{
+			char *remaining = json_value(json, "remaining");
+			int count = remaining ? pg_strtoint32(remaining) : 0;
+
+			if (!database_same(database, read_ref(branch_ref("staged")).target))
+				ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+								errmsg("all resolved changes must be staged before continuing revert")));
+			series_head = child(pending.target, 6);
+			series_working = child(pending.target, 4);
+			series_staged = child(pending.target, 5);
+			for (i = 0; i < count; i++)
+				targets = lappend(targets, child(pending.target, 7 + i));
+			commit = commit_object(database, head.target, NULL,
+					psprintf("Revert \"%s\"", json_value(metadata(child(pending.target, 3), "commit"), "message")),
+					author ? author : json_value(json, "author_override"),
+					email ? email : json_value(json, "email_override"), GetCurrentTimestamp());
+		}
+		else
+			commit = cherry_pick_commit(database, head.target, child(pending.target, 2),
+					author ? author : json_value(json, "author_override"),
+					email ? email : json_value(json, "email_override"));
 		move_ref(branch_ref("heads"), head, commit);
 		move_ref(branch_ref("staged"), read_ref(branch_ref("staged")), database);
 		move_ref(branch_ref("working"), read_ref(branch_ref("working")), live.hash);
 		finish_merge();
 		advance_snapshot();
+		pending = empty_ref;
+		if (targets)
+			goto apply_targets;
 		goto done;
 	}
 	if (abort_pick)
@@ -1553,9 +1577,9 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 		char *operation = pending.target ? json_value(metadata(pending.target, "merge"), "operation") : NULL;
 		bytea *working, *staged;
 
-		if (revisions || !operation || strcmp(operation, "cherry-pick"))
+		if (revisions || !operation || strcmp(operation, operation_name))
 			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-							errmsg("no cherry-pick to abort")));
+							errmsg("no %s to abort", operation_name)));
 		working = child(pending.target, 4);
 		staged = child(pending.target, 5);
 		live = capture_visible();
@@ -1570,6 +1594,8 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 		replace_working(dg_current_branch(), working, NIL);
 		move_ref(branch_ref("working"), read_ref(branch_ref("working")), working);
 		move_ref(branch_ref("staged"), read_ref(branch_ref("staged")), staged);
+		if (revert)
+			move_ref(branch_ref("heads"), read_ref(branch_ref("heads")), child(pending.target, 6));
 		finish_merge();
 		goto done;
 	}
@@ -1581,12 +1607,16 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 	if (!revert && list_length(revisions) != 1)
 		unsupported("cherry-picking more than one commit");
 	head = read_ref(branch_ref("heads"));
-	if (!database_same(staged_capture(&live), child(head.target, 1)) || !database_same(read_ref(branch_ref("staged")).target, child(head.target, 1)))
+	if ((!revert && !database_same(staged_capture(&live), child(head.target, 1))) || !database_same(read_ref(branch_ref("staged")).target, child(head.target, 1)))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("cannot %s with uncommitted changes", revert ? "revert" : "cherry-pick")));
 	/* Resolve every input against the same starting HEAD. Publishing an
 	 * earlier revert must not change the meaning of a later HEAD~N. */
 	foreach(lc, revisions)
 		targets = lappend(targets, resolve(lfirst(lc)));
+	series_head = head.target;
+	series_working = capture_visible().hash;
+	series_staged = read_ref(branch_ref("staged")).target;
+apply_targets:
 	foreach(lc, targets)
 	{
 		bytea	   *target = lfirst(lc),
@@ -1624,16 +1654,27 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 		if (conflicts.len || violations.len || schema_conflicts.len)
 		{
 			StringInfoData state;
-			bytea *before = live.hash;
+			int remaining = list_length(targets) - foreach_current_index(lc) - 1;
+			int children_count = 6 + remaining, next = 6;
+			Datum *children = palloc(sizeof(Datum) * children_count);
+			ListCell *queued;
 
-			if (revert)
-				ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-								errmsg("revert resulted in conflicts")));
+			commit = NULL;
+			children[0] = PointerGetDatum(head.target);
+			children[1] = PointerGetDatum(revert ? parent : target);
+			children[2] = PointerGetDatum(revert ? target : parent);
+			children[3] = PointerGetDatum(series_working);
+			children[4] = PointerGetDatum(series_staged);
+			children[5] = PointerGetDatum(series_head);
+			for_each_from(queued, targets, foreach_current_index(lc) + 1)
+				children[next++] = PointerGetDatum(lfirst(queued));
 			/* Retain the same conflict graph used by merge. Squash suppresses
 			 * a second commit parent after resolution: this is a cherry-pick. */
 			initStringInfo(&state);
-			appendStringInfoString(&state, "{\"format\":\"DGMERGE1\",\"squash\":true,\"operation\":\"cherry-pick\",\"source\":");
-			escape_json(&state, (char *) linitial(revisions));
+			appendStringInfoString(&state, "{\"format\":\"DGMERGE1\",\"squash\":true,\"operation\":");
+			escape_json(&state, operation_name);
+			appendStringInfo(&state, ",\"remaining\":%d,\"source\":", remaining);
+			escape_json(&state, revert ? hash_format(target) : (char *) linitial(revisions));
 			if (author)
 			{
 				json_field(&state, "author_override", author, true);
@@ -1641,7 +1682,7 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 			}
 			appendStringInfo(&state, ",\"conflicts\":[%s],\"violations\":[%s],\"schema_conflicts\":[%s]}", conflicts.data, violations.data, schema_conflicts.data);
 			move_ref(branch_ref("merge"), pending,
-					 put("merge", state.data, VC_ARGS(PointerGetDatum(head.target), PointerGetDatum(target), PointerGetDatum(parent), PointerGetDatum(before), PointerGetDatum(read_ref(branch_ref("staged")).target)), 5));
+					 put("merge", state.data, children, children_count));
 			move_ref(branch_ref("working"), read_ref(branch_ref("working")), newworking);
 			cherry_pick_conflict_counts(state.data, conflict_counts);
 			goto done;
