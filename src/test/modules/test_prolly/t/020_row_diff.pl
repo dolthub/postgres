@@ -102,14 +102,14 @@ is(sql(q{SELECT count(*) FROM dolt_diff_stat('HEAD~1','HEAD','stat_schema')}),'0
 sql(q{INSERT INTO stat_schema VALUES(1,10),(2,20)});
 sql(q{SELECT dolt_commit('-Am','statistics rows')});
 sql(q{ALTER TABLE stat_schema ADD COLUMN extra int});
-is(sql(q{SELECT count(*) FROM dolt_diff_stat('HEAD','WORKING','stat_schema')}),'0','adding NULL column does not modify rows');
+is(sql(q{SELECT rows_unmodified,rows_modified,cells_added FROM dolt_diff_stat('HEAD','WORKING','stat_schema')}),'2|0|2','adding NULL column changes cells but not rows');
 sql(q{UPDATE stat_schema SET extra=7 WHERE id=1});
 is(sql(q{SELECT rows_unmodified,rows_modified,cells_added,cells_modified FROM dolt_diff_stat('HEAD','WORKING','stat_schema')}),'1|1|2|1','non-NULL added value modifies one row and counts structural cells');
 sql(q{SELECT dolt_commit('-Am','statistics new column')});
 sql(q{UPDATE stat_schema SET extra=NULL WHERE id=1});
 sql(q{SELECT dolt_commit('-Am','clear added column')});
 sql(q{ALTER TABLE stat_schema DROP COLUMN extra});
-is(sql(q{SELECT count(*) FROM dolt_diff_stat('HEAD','WORKING','stat_schema')}),'0','dropping NULL column does not modify rows');
+is(sql(q{SELECT rows_unmodified,rows_modified,cells_deleted FROM dolt_diff_stat('HEAD','WORKING','stat_schema')}),'2|0|2','dropping NULL column changes cells but not rows');
 sql(q{CREATE TABLE stat_empty(id int PRIMARY KEY) USING dolt_prolly_table});
 sql(q{SELECT dolt_commit('-Am','empty to drop')});
 sql(q{DROP TABLE stat_empty});

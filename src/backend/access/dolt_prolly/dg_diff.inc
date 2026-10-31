@@ -1672,6 +1672,7 @@ dolt_diff_stat(PG_FUNCTION_ARGS)
 		DiffTable  *a = diff_object_revision(from, names[i], true),
 				   *b = diff_object_revision(to, names[i], true);
 		DiffStat	s = {0};
+		bool key_changed = false;
 		Datum		values[12];
 		bool		nulls[12];
 
@@ -1695,6 +1696,18 @@ dolt_diff_stat(PG_FUNCTION_ARGS)
 		}
 		else
 		{
+			key_changed = a->present && b->present &&
+				(a->keyed != b->keyed || (a->keyed && !same_key_columns(a, b)));
+			if (key_changed)
+			{
+				ereport(table ? ERROR : WARNING,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("failed to compute diff stat for table %s: primary key set changed", names[i])));
+				/* The all-table form reports an unavailable zero row and
+				 * continues with tables whose keys can be aligned. */
+				goto stat_values;
+			}
+
 			diff_rows(a, b, stat_row, &s);
 			s.old_rows = row_count(a);
 			s.new_rows = row_count(b);
@@ -1720,6 +1733,7 @@ dolt_diff_stat(PG_FUNCTION_ARGS)
 					s.cells_added = s.cells_deleted = Max(s.rows_added, s.rows_deleted) * width;
 			}
 		}
+stat_values:
 		s.rows_unmodified = s.old_rows - s.rows_deleted - s.rows_modified;
 		memset(nulls, false, sizeof(nulls));
 		values[0] = CStringGetTextDatum(b->present ? b->name : a->name);
@@ -1745,8 +1759,9 @@ dolt_diff_stat(PG_FUNCTION_ARGS)
 				nulls[j] = j != 2 && j != 3;
 		}
 
-		/* Empty and schema-only changes have no data statistics row. */
-		if (s.rows_added || s.rows_deleted || s.rows_modified)
+		/* Empty changes have no row; structural cell changes still do. */
+		if (key_changed || s.rows_added || s.rows_deleted || s.rows_modified ||
+			s.cells_added || s.cells_deleted)
 			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 		diff_table_close(a);
 		diff_table_close(b);
