@@ -41,6 +41,18 @@ namespace_definition(const char *name)
 	return strcell(0, 1);
 }
 
+/*
+ * Let the active snapshot see this command's changes. One registered
+ * elsewhere, such as the snapshot a CREATE TABLE AS executes under, cannot
+ * change; what it would read here is read through catalog snapshots anyway.
+ */
+static void
+refresh_active_snapshot(void)
+{
+	if (ActiveSnapshotSet() && GetActiveSnapshot()->regd_count == 0)
+		UpdateActiveSnapshotCommandId();
+}
+
 static void adopt_schema(Oid schema);
 
 static void catalog_activate(void);
@@ -153,8 +165,7 @@ adopt_schema(Oid schema)
 	}
 	PG_END_TRY();
 	/* Adoption may replace working membership; refresh the caller too. */
-	if (ActiveSnapshotSet())
-		UpdateActiveSnapshotCommandId();
+	refresh_active_snapshot();
 }
 
 /* Whether CREATE TABLE makes a prolly table rather than a native one. */
@@ -218,8 +229,7 @@ catalog_activate(void)
 	}
 	PG_END_TRY();
 	CommandCounterIncrement();
-	if (ActiveSnapshotSet())
-		UpdateActiveSnapshotCommandId();
+	refresh_active_snapshot();
 	foreach(lc, namespaces)
 		adopt_schema(lfirst_oid(lc));
 }
@@ -315,7 +325,7 @@ dg_catalog_create(Node *statement, const char *query)
 	if (adopt)
 	{
 		adopt_schema(namespaceid);
-		UpdateActiveSnapshotCommandId();
+		refresh_active_snapshot();
 	}
 	stmt->if_not_exists = false;
 	stmt->accessMethod = pstrdup("dolt_prolly_table");

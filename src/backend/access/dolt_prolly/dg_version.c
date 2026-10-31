@@ -63,6 +63,7 @@
 #include "parser/parse_collate.h"
 #include "optimizer/optimizer.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "access/doltbranch.h"
 #include "access/doltsystem.h"
 #include "catalog/pg_dolt_ref.h"
