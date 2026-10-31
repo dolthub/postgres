@@ -39,6 +39,7 @@ typedef struct DiffRow
 typedef void (*DiffRowFn) (DiffTable *from, DiffTable *to, DiffRow *row, void *arg);
 static void split_dots(const char *spec, char **from, char **to);
 static DiffTable *diff_table_schema(const char *revision, const char *name);
+static char *optional_text_arg(FunctionCallInfo fcinfo, int n);
 
 static char *
 strip_identifier(const char *ident)
