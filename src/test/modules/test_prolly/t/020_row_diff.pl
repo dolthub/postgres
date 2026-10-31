@@ -115,5 +115,14 @@ sql(q{SELECT dolt_commit('-Am','empty to drop')});
 sql(q{DROP TABLE stat_empty});
 is(sql(q{SELECT count(*) FROM dolt_diff_stat('HEAD','WORKING','stat_empty')}),'0','empty deletion has no data statistics');
 
+sql(q{ALTER TABLE stat_schema DROP CONSTRAINT stat_schema_pkey; ALTER TABLE stat_schema ADD PRIMARY KEY(id,v)});
+my ($stat_status,$stat_out,$stat_err)=$node->psql('postgres',q{SELECT * FROM dolt_diff_stat('HEAD','WORKING','stat_schema')});
+isnt($stat_status,0,'named table rejects changed primary key');
+like($stat_err,qr/primary key set changed/,'primary key diagnostic');
+($stat_status,$stat_out,$stat_err)=$node->psql('postgres',q{SELECT rows_added,rows_modified FROM dolt_diff_stat('HEAD','WORKING') WHERE table_name='public.stat_schema'});
+is($stat_status,0,'all-table statistics continue after key change');
+is($stat_out,'0|0','unavailable key-change statistics use zero row');
+like($stat_err,qr/WARNING:.*primary key set changed/,'all-table key change emits warning');
+
 $node->stop;
 done_testing();
