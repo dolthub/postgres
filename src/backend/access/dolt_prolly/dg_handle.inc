@@ -22,8 +22,10 @@
  * The delta is read through a per-backend cache of a (storage, branch)
  * stream, keyed by the snapshot kind it was read under and validated the way
  * the journal's folds are: the same visibility identity and no local writes
- * since. States that do not read the catalog, revisions and private
- * rewrites, carry a private delta of their own.
+ * to the storage's handles since, or the same snapshot but for a later
+ * command when this transaction wrote none of them since the delta was read.
+ * States that do not read the catalog, revisions and private rewrites, carry
+ * a private delta of their own.
  *
  * Nothing canonical depends on a handle: the content and index trees hold
  * rows and digests only.
@@ -59,7 +61,7 @@ struct HandleDelta
 	HandleDeltaKey key;			/* hash key, for cached deltas */
 	bool		loaded;
 	Visibility	seen;
-	uint64		local_version;
+	uint64		local_version;	/* handle_local_version_of its storage, when read */
 	MemoryContext memory;
 	HTAB	   *by_handle;		/* HandleMapping */
 	HTAB	   *by_digest;		/* HandleDigest */
@@ -67,7 +69,25 @@ struct HandleDelta
 };
 
 static HTAB *handle_deltas;
-static uint64 handle_local_version = 1;	/* moves with this backend's own delta writes */
+
+/*
+ * What this backend wrote to the catalog, as delta validity sees it: an epoch
+ * that moves when a transaction or subtransaction ends, which may discard or
+ * reveal writes to any storage, and a version per storage that moves with
+ * each write to that storage's handles. A write to one table leaves the
+ * deltas of the others valid.
+ */
+static uint64 handle_local_epoch = 1;
+
+typedef struct HandleVersion
+{
+	Oid			space;			/* hash key */
+	RelFileNumber file;
+	uint64		version;
+	CommandId	last_cid;		/* the command of this transaction's last write */
+} HandleVersion;
+
+static HTAB *handle_versions;
 
 static void handle_delta_tables(HandleDelta *delta);
 static HandleDelta *private_delta(void);
@@ -230,6 +250,85 @@ handle_delta_load(HandleDelta *delta, Snapshot snapshot)
 	delta->loaded = true;
 }
 
+static HandleVersion *
+handle_version_entry(Oid space, RelFileNumber file, bool enter)
+{
+	struct
+	{
+		Oid			space;
+		RelFileNumber file;
+	}			key = {space, file};
+
+	if (!handle_versions)
+	{
+		HASHCTL		ctl = {0};
+
+		if (!enter)
+			return NULL;
+		ctl.keysize = sizeof(key);
+		ctl.entrysize = sizeof(HandleVersion);
+		ctl.hcxt = TopMemoryContext;
+		handle_versions = hash_create("prolly handle versions", 32, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	return hash_search(handle_versions, &key, enter ? HASH_ENTER : HASH_FIND, NULL);
+}
+
+/* The version a delta of |key|'s storage must have been read at to stand. */
+static uint64
+handle_local_version_of(const RootKey *key)
+{
+	HandleVersion *entry = handle_version_entry(key->space, key->file, false);
+
+	return (handle_local_epoch << 32) + (entry ? entry->version : 0);
+}
+
+/* This backend changed |key|'s storage's handles in command |cid|. */
+static void
+handle_local_write(const RootKey *key, CommandId cid)
+{
+	HandleVersion *entry = handle_version_entry(key->space, key->file, true);
+
+	if (entry->space != key->space || entry->file != key->file || entry->version == 0)
+	{
+		entry->space = key->space;
+		entry->file = key->file;
+		entry->version = 0;
+	}
+	entry->version++;
+	entry->last_cid = cid;
+}
+
+/* A transaction or subtransaction ended: its writes may have gone or become visible. */
+static void
+handle_local_invalidate(void)
+{
+	handle_local_epoch++;
+}
+
+/*
+ * Whether a delta read under |built| sees the same rows as a load under
+ * |now|: the same snapshot but for a later command, in the same epoch, when
+ * this transaction wrote none of the storage's handles in or after the
+ * command the delta was read in. A later command sees more of the
+ * transaction's own writes and nothing else.
+ */
+static bool
+handle_same_view(const HandleDelta *delta, const Visibility *now, const RootKey *key)
+{
+	Visibility	a = delta->seen,
+				b = *now;
+	HandleVersion *entry;
+
+	if (a.overflow || b.overflow || a.cid == InvalidCommandId || b.cid == InvalidCommandId ||
+		b.cid < a.cid || (delta->local_version >> 32) != handle_local_epoch)
+		return false;
+	a.cid = b.cid = 0;
+	if (memcmp(&a, &b, sizeof(a)) != 0)
+		return false;
+	entry = handle_version_entry(key->space, key->file, false);
+	return !entry || entry->version == 0 || entry->last_cid < delta->seen.cid;
+}
+
 /* The cached delta of |key| as |snapshot| sees it, reloaded if anything moved. */
 static struct HandleDelta *
 handle_delta_get(const RootKey *key, Snapshot snapshot)
@@ -257,11 +356,13 @@ handle_delta_get(const RootKey *key, Snapshot snapshot)
 		delta->memory = AllocSetContextCreate(CacheMemoryContext, "prolly handle delta", ALLOCSET_SMALL_SIZES);
 	}
 	visibility_capture(snapshot, &seen);
-	if (delta->loaded && delta->local_version == handle_local_version && visibility_equal(&delta->seen, &seen))
+	if (delta->loaded &&
+		((delta->local_version == handle_local_version_of(key) && visibility_equal(&delta->seen, &seen)) ||
+		 handle_same_view(delta, &seen, key)))
 		return delta;
 	handle_delta_load(delta, snapshot);
 	delta->seen = seen;
-	delta->local_version = handle_local_version;
+	delta->local_version = handle_local_version_of(key);
 	return delta;
 }
 
@@ -731,7 +832,7 @@ handle_delta_write(const RootKey *key, HTAB *mappings, CommandId cid)
 		handle_catalog_close(catalog, indexes);
 		if (pushed)
 			PopActiveSnapshot();
-		handle_local_version++;
+		handle_local_write(key, cid);
 	}
 }
 
@@ -755,7 +856,7 @@ handle_delta_edit(DGState *s, const RootKey *key, uint64 handle, PLHash digest, 
 	else
 		handle_catalog_delete(catalog, key, handle, cid);
 	handle_catalog_close(catalog, indexes);
-	handle_local_version++;
+	handle_local_write(key, cid);
 
 	/* The state keeps using its cached delta: let it see the edit too. */
 	handle_delta_note(state_delta(s), handle, digest, present);

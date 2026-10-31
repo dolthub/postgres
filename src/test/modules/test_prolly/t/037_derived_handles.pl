@@ -53,6 +53,24 @@ is(sql(q{SELECT count(*) FROM pg_dolt_handle}), '0', 'and their catalog rows');
 sql(q{INSERT INTO dup VALUES (1, 'a'), (1, 'a')});
 is(sql(q{SELECT count(*) FROM pg_dolt_handle}), '1', 'reinserted duplicates take the derived handle again, and one allocated one');
 
+# Within a transaction, each command sees the handles earlier ones allocated,
+# and a rolled back savepoint's handles are gone, while a session reads the
+# catalog once per storage rather than once per command.
+sql(q{CREATE TABLE dup2(x int, y text)});
+is(sql(q{BEGIN; INSERT INTO dup2 VALUES (1, 'a'), (1, 'a'); INSERT INTO dup2 VALUES (1, 'a');
+ SAVEPOINT s; INSERT INTO dup2 VALUES (1, 'a'), (1, 'a'); ROLLBACK TO s;
+ SELECT count(DISTINCT ctid) || ' ' || count(*) FROM dup2;
+ DELETE FROM dup2 WHERE ctid = (SELECT max(ctid) FROM dup2);
+ INSERT INTO dup2 VALUES (1, 'a'), (1, 'a');
+ SELECT count(DISTINCT ctid) || ' ' || count(*) FROM dup2; COMMIT}), "3 3\n4 4", 'commands see earlier commands\' handles, not a rolled back savepoint\'s');
+is(sql(qq{SELECT count(*) FROM dup2 WHERE $handle >= $derived}), '3', 'every occurrence but one keeps an allocated handle');
+sql(q{CREATE TABLE parent(id int PRIMARY KEY); CREATE TABLE child(id int PRIMARY KEY, p int REFERENCES parent, v int);
+ INSERT INTO parent SELECT generate_series(1, 100); INSERT INTO child SELECT g, g % 100 + 1, 0 FROM generate_series(1, 1000) g});
+my @lines = split /\n/, sql(join(' ', 'BEGIN;', (map { "UPDATE child SET v = v + 1, p = " . ($_ % 100 + 1) . " WHERE id = " . ($_ * 37) . ';' } 1 .. 20),
+	'SELECT pg_stat_get_xact_numscans(9140); COMMIT'));
+cmp_ok($lines[-1], '<', 10, "twenty foreign-keyed updates read the handle catalog $lines[-1] times");
+is(sql(q{SELECT sum(v) FROM child}), '20', 'and change twenty rows');
+
 # A branch inherits derived handles for free and allocates for the duplicates it meets.
 sql(q{SELECT dolt_commit('-Am', 'dup')});
 sql(q{SELECT dolt_branch('dups')});

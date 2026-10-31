@@ -662,6 +662,7 @@ static bool journal_handle_committed(const RootKey *key, uint64 handle);
 static RootKey journal_index_table(Relation index, const char *branch, Relation *table);
 struct HandleDelta;
 static struct HandleDelta *handle_delta_get(const RootKey *key, Snapshot snapshot);
+static void handle_local_invalidate(void);
 static void handle_delta_write(const RootKey *key, HTAB *mappings, CommandId cid);
 static uint64 handle_delta_max(Oid space, RelFileNumber file);
 static bool handle_delta_committed(const RootKey *key, uint64 handle);
@@ -1018,6 +1019,7 @@ store_xact(XactEvent event, void *arg)
 			 */
 			working_close(event != XACT_EVENT_ABORT && event != XACT_EVENT_PARALLEL_ABORT);
 			journal_xact_end(event == XACT_EVENT_COMMIT || event == XACT_EVENT_PARALLEL_COMMIT);
+			handle_local_invalidate();
 			overlays = NULL;	/* in TopTransactionContext */
 			batches = NULL;
 			journal_marks = NULL;
@@ -1071,6 +1073,7 @@ store_subxact(SubXactEvent event, SubTransactionId mySubid, SubTransactionId par
 	{
 		batch_discard(mySubid);
 		journal_local_invalidate();
+		handle_local_invalidate();
 	}
 	if (event != SUBXACT_EVENT_ABORT_SUB || !overlays)
 		return;
