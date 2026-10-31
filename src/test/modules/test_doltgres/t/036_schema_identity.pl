@@ -69,6 +69,14 @@ like(sql(q{\df public.crypt}),qr/crypt/,'psql lists extension functions in publi
 
 # A server object made after a session built its catalogs is in them at once.
 is(sql(q{CREATE TABLE public.late_heap(id int) USING heap; INSERT INTO late_heap VALUES (1); SELECT count(*) FROM late_heap, t}),'1','a session sees the heap table it just made');
+# Each such change rebuilds the session's catalogs; the ones it replaces are freed.
+my $memory=q{SELECT sum(total_bytes) FROM pg_backend_memory_contexts};
+my $churn=$node->background_psql('postgres');
+$churn->query_safe(q{SELECT count(*) FROM t});
+my $before=$churn->query_safe($memory);
+$churn->query_safe(qq{CREATE TEMP TABLE churn_$_(x int) USING heap; SELECT count(*) FROM t}) for 1..20;
+cmp_ok($churn->query_safe($memory)-$before,'<',20*1024*1024,'replaced catalogs do not accumulate in a session');
+$churn->quit;
 
 # One namespace for uniqueness, across server and branch objects.
 fails(q{CREATE FUNCTION public.crypt(text, text) RETURNS text LANGUAGE sql AS $$ SELECT 'x' $$},qr/already exists/,'a versioned routine cannot duplicate an extension function');
