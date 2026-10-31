@@ -9,6 +9,7 @@ static bool commit_callbacks_registered;
 static bool commit_publishing;
 static bool commit_sql_requested;
 static bool commit_explicit;
+static SubTransactionId commit_sql_subid;
 
 static void
 commit_session_xact(XactEvent event, void *arg)
@@ -26,6 +27,18 @@ static void
 commit_session_subxact(SubXactEvent event, SubTransactionId id, SubTransactionId parent, void *arg)
 {
 	ListCell   *lc;
+
+	if (commit_explicit && commit_sql_subid == id)
+	{
+		if (event == SUBXACT_EVENT_ABORT_SUB)
+		{
+			commit_sql_requested = false;
+			commit_explicit = false;
+			MyXactFlags &= ~XACT_FLAGS_NEEDIMMEDIATECOMMIT;
+		}
+		else if (event == SUBXACT_EVENT_COMMIT_SUB)
+			commit_sql_subid = parent;
+	}
 
 	foreach(lc, commit_dirty_branches)
 	{
@@ -57,6 +70,7 @@ commit_request_sql_end(void)
 	commit_session_register();
 	commit_sql_requested = true;
 	commit_explicit = true;
+	commit_sql_subid = GetCurrentSubTransactionId();
 	MyXactFlags |= XACT_FLAGS_NEEDIMMEDIATECOMMIT;
 }
 
