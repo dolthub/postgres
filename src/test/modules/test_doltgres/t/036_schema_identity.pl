@@ -172,6 +172,11 @@ is($node->safe_psql('coll',q{SELECT dolt_checkout('granted'); SET ROLE schema_cr
 my ($grant_rc,$grant_out,$grant_err)=$node->psql('coll',q{SET ROLE schema_bystander; CREATE TABLE refused(a int)});
 like($grant_err,qr/permission denied for schema public/,'and a role without it is refused');
 
+# System schemas belong to the server: a versioned object cannot move into one.
+my ($sys_rc,$sys_out,$sys_err)=$node->psql('coll',q{CREATE TABLE to_system(id int PRIMARY KEY); ALTER TABLE to_system SET SCHEMA pg_catalog});
+like($sys_err,qr/cannot move versioned object public\.to_system into system schema pg_catalog/,'a versioned table cannot move into pg_catalog');
+is($node->safe_psql('coll',q{SELECT count(*) FROM pg_class WHERE relname = 'to_system'}),'1','and the branch stays readable');
+
 # Roles are server objects too: a definition naming a dropped role stays readable, as its owner's.
 $node->safe_psql('coll',q{CREATE ROLE schema_owner_r; GRANT CREATE ON DATABASE coll TO schema_owner_r;
 SET SESSION AUTHORIZATION schema_owner_r; CREATE SCHEMA owned_schema; RESET SESSION AUTHORIZATION;
