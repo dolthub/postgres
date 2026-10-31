@@ -570,8 +570,9 @@ dg_handle_count(DGState *s)
  * different row with the same prefix, or an identical row, the same handle.
  * A claim must outlast its transaction: another writer may have loaded its
  * state before the claimant committed, and then cannot see the claimant's
- * row. It may be forgotten once the claimant precedes every running
- * transaction's xmin, since every state loaded since includes its rows.
+ * row. It may be forgotten once the claimant precedes the xmin of every
+ * running transaction that may write rows, since every state loaded since
+ * includes its rows.
  *
  * Claims are a fixed array of transaction IDs, found by hashing (storage,
  * branch, handle). Handles that share a slot share its claim: a transaction
@@ -603,15 +604,18 @@ handle_claims_init(void *ptr)
 }
 
 /*
- * The oldest xmin of any running transaction, computed once per command: an
- * older value only keeps claims longer.
+ * The oldest xmin of any running transaction that may write rows, computed
+ * once per command: an older value only keeps claims longer. Autovacuum
+ * workers write no rows, and an ANALYZE of a large table holds its snapshot
+ * for as long as it reads the table, which would keep every claim made
+ * meanwhile, so that new rows sharing a claim slot take allocated handles.
  */
 static TransactionId
 handle_claim_horizon(void)
 {
 	if (claim_horizon_lxid != MyProc->vxid.lxid || claim_horizon_cid != GetCurrentCommandId(false))
 	{
-		claim_horizon = GetOldestNonRemovableTransactionId(NULL);
+		claim_horizon = GetOldestXminIgnoring(PROC_IS_AUTOVACUUM);
 		claim_horizon_lxid = MyProc->vxid.lxid;
 		claim_horizon_cid = GetCurrentCommandId(false);
 	}
@@ -678,22 +682,28 @@ dg_handle_choose(Relation rel, DGState *s, DGBatch *b, PLHash digest)
 {
 	uint64		handle = handle_derived(digest);
 	bool		taken = b && dg_batch_blocks_handle(b, digest, handle);
+	int			status = DG_RECORD_NONE;
 
 	if (!taken)
 		taken = prefix_rows(&s->content, handle).count > 0;
 	if (!taken && !s->delta_private && handle_records_exist(rel->rd_locator.dbOid, rel->rd_locator.spcOid, rel->rd_locator.relNumber))
 	{
-		int			status = dg_record_status(&rel->rd_locator, dg_relation_branch(rel), (int64) handle);
-
+		status = dg_record_status(&rel->rd_locator, dg_relation_branch(rel), (int64) handle);
 		taken = status == DG_RECORD_LIVE;
-		if (status == DG_RECORD_DEAD)
-			dg_record_renew(&rel->rd_locator, dg_relation_branch(rel), (int64) handle);
 	}
 	if (!taken && !s->delta_private)
 		taken = !handle_claim(rel, dg_relation_branch(rel), handle);
-	if (!taken)
-		return handle;
-	return handle_allocate(rel, s);
+	if (taken)
+		return handle_allocate(rel, s);
+
+	/*
+	 * Only now is the handle the row's: renewing a dead record of an old row
+	 * for a row that then took an allocated handle would leave a live record
+	 * naming the derived handle, and every later occurrence would allocate.
+	 */
+	if (status == DG_RECORD_DEAD)
+		dg_record_renew(&rel->rd_locator, dg_relation_branch(rel), (int64) handle);
+	return handle;
 }
 
 /* Give a private state's occurrence of |digest| the handle |handle|, or take it away. */

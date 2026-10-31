@@ -152,6 +152,40 @@ is(sql(q{SET enable_seqscan=off; SET enable_indexscan=off; SET work_mem='64kB'; 
 is(sql(q{SET enable_seqscan=off; SET enable_indexscan=off; SET work_mem='64kB'; SELECT count(*) FROM big WHERE k BETWEEN 10 AND 60 AND id % 7 = 0}),
 	sql(q{SET enable_bitmapscan=off; SELECT count(*) FROM big WHERE k BETWEEN 10 AND 60 AND id % 7 = 0}), 'and rechecks its qualification');
 
+# A claim outlives its transaction while a transaction that could still
+# write holds an older snapshot: a row removed and inserted again then takes
+# an allocated handle. An autovacuum worker's snapshot does not count, since
+# it writes no rows: an ANALYZE of a large table would otherwise keep every
+# claim made while it reads. This ANALYZE holds its snapshot while it
+# evaluates an expensive index expression for each row it samples.
+sql(q{CREATE TABLE reclaim(id int, v int) WITH (autovacuum_enabled = off)});
+sub reinserted_handle {
+	sql(q{INSERT INTO reclaim VALUES (1, 1)});
+	sql(q{DELETE FROM reclaim WHERE id = 1});
+	sql(q{INSERT INTO reclaim VALUES (1, 1)});
+	my $allocated = sql(qq{SELECT $handle >= $derived FROM reclaim WHERE id = 1});
+	sql(q{DELETE FROM reclaim WHERE id = 1});
+	return $allocated eq 't' ? 'allocated' : 'derived';
+}
+my $reader = $node->background_psql('postgres');
+$reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM t');
+is(reinserted_handle(), 'allocated', 'an open snapshot keeps the claim of a row it may not see');
+$reader->query_safe('COMMIT');
+$reader->quit;
+is(reinserted_handle(), 'derived', 'and once it ends, the row takes its derived handle again');
+sql(q{CREATE TABLE slow(x int) USING heap WITH (autovacuum_analyze_threshold = 0, autovacuum_analyze_scale_factor = 0)});
+sql(q{INSERT INTO slow SELECT generate_series(1, 120)});
+sql(q{CREATE INDEX slow_md5 ON slow (md5(repeat(x::text, 20000000)))});
+sql(q{ALTER SYSTEM SET autovacuum_naptime = '1s'});
+sql(q{SELECT pg_reload_conf()});
+ok($node->poll_query_until('postgres',
+	q{SELECT count(*) > 0 FROM pg_stat_activity WHERE backend_type = 'autovacuum worker' AND query LIKE '%ANALYZE%slow%'}),
+	'an autovacuum worker is analyzing');
+is(reinserted_handle(), 'derived', "an autovacuum worker's older snapshot does not keep the claim");
+ok(sql(q{SELECT count(*) > 0 FROM pg_stat_activity WHERE backend_type = 'autovacuum worker' AND query LIKE '%ANALYZE%slow%'}) eq 't',
+	'while the worker was still analyzing');
+sql(q{ALTER SYSTEM RESET autovacuum_naptime; SELECT pg_reload_conf(); DROP TABLE slow});
+
 # Allocated handles continue past the committed ones after a crash.
 sql(q{INSERT INTO dup VALUES (1, 'a')});
 my $max = sql(qq{SELECT max($handle) FROM dup});
