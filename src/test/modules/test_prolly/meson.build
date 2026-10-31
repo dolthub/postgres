@@ -73,5 +73,6 @@ tests += {
       't/055_ignored_workspaces.pl',
       't/056_revert_workflows.pl',
       't/057_diff_history.pl',
+      't/058_diff_ignore.pl',
   ]},
 }
