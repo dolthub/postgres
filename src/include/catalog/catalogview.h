@@ -65,6 +65,7 @@ extern Oid	CatalogViewFindObject(CatalogView *view, Oid objectclass, const char 
 extern Oid	CatalogViewLookupObject(CatalogView *view, Oid objectclass, const char *identity);
 extern CatalogView *CatalogViewObjectContext(Oid handle);
 extern CatalogView *CatalogViewValueContext(Oid value);
+extern bool CatalogViewUnload(CatalogView *view);
 extern void CatalogViewMarkBranchHead(CatalogView *view);
 extern bool CatalogViewIsObjectIdType(Oid type);
 extern CatalogView *CatalogViewCallContext(FunctionCallInfo fcinfo);

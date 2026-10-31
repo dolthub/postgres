@@ -43,7 +43,9 @@ CREATE TABLE large_text(t text COLLATE "C") USING dolt_prolly_table;
 INSERT INTO large_text VALUES(repeat('x',20000));
 SELECT length(t) FROM large_text;
 CREATE INDEX bad_hash ON p USING hash(id);
-CREATE INDEX bad_expr ON p((id+1));
+-- Expression indexes are supported; this one would block the type change below.
+CREATE INDEX expr_idx ON p((id+1));
+DROP INDEX expr_idx;
 CREATE OPERATOR CLASS misleading_ops FOR TYPE int USING dolt_prolly_index AS
   OPERATOR 3 <>, FUNCTION 1 btint4cmp(int,int);
 CREATE INDEX bad_operators ON p(id misleading_ops);

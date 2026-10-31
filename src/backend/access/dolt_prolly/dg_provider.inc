@@ -11,6 +11,7 @@ typedef struct DGProvider
 	uint64		extension_generation;	/* the extensions whose objects it binds */
 	uint64		base_generation;	/* the server objects it lists */
 	List	   *bindings;		/* the durable OIDs a branch view binds */
+	bool		superseded;		/* a later view of the same branch or revision replaced it */
 	MemoryContext memory;		/* holds the entry */
 	struct DGProvider *next;
 } DGProvider;
@@ -253,10 +254,17 @@ provider_row_namespace(Oid catalog, HeapTuple tuple)
 }
 
 /* Whether |namespace| is a user schema, one each branch defines for itself. */
+/*
+ * Sessions' temporary namespaces, as of the shared base. They belong to the
+ * server, as built-in namespaces do: no branch defines them.
+ */
+static List *provider_temp_namespaces;
+
 static bool
 provider_user_namespace(Oid namespace)
 {
-	return namespace == PG_PUBLIC_NAMESPACE || namespace >= FirstNormalObjectId;
+	return namespace == PG_PUBLIC_NAMESPACE ||
+		(namespace >= FirstNormalObjectId && !list_member_oid(provider_temp_namespaces, namespace));
 }
 
 /* The object a native catalog row describes, for rows that describe another's part. */
@@ -290,6 +298,24 @@ provider_row_owner(Oid catalog, HeapTuple tuple, Oid object)
 		default:
 			return object;
 	}
+}
+
+/*
+ * Unload the views no lookup will return again: those a later view replaced,
+ * and those built before an extension or server object changed. Clients may
+ * still hold their objects' OIDs, so they stay bound, and are read again if
+ * one is used. Callers hold views without references during a statement, so
+ * this waits for the end of the transaction.
+ */
+static void
+provider_xact(XactEvent event, void *arg)
+{
+	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT && event != XACT_EVENT_PREPARE)
+		return;
+	for (DGProvider *entry = providers; entry; entry = entry->next)
+		if (entry->superseded || entry->extension_generation != extension_generation ||
+			entry->base_generation != base_generation)
+			(void) CatalogViewUnload(entry->view);
 }
 
 static void
@@ -327,6 +353,29 @@ provider_shared_base(void)
 		list_free(provider_server_namespaces);
 		provider_server_namespaces = NIL;
 		provider_server_object_count = 0;
+		list_free(provider_temp_namespaces);
+		provider_temp_namespaces = NIL;
+		{
+			Relation	rel = table_open(NamespaceRelationId, AccessShareLock);
+			TableScanDesc scan = table_beginscan_catalog(rel, 0, NULL);
+			HeapTuple	tuple;
+
+			while ((tuple = heap_getnext(scan, ForwardScanDirection)))
+			{
+				Form_pg_namespace form = (Form_pg_namespace) GETSTRUCT(tuple);
+
+				if (!strncmp(NameStr(form->nspname), "pg_temp_", strlen("pg_temp_")) ||
+					!strncmp(NameStr(form->nspname), "pg_toast_temp_", strlen("pg_toast_temp_")))
+				{
+					MemoryContext saved = MemoryContextSwitchTo(TopMemoryContext);
+
+					provider_temp_namespaces = lappend_oid(provider_temp_namespaces, form->oid);
+					MemoryContextSwitchTo(saved);
+				}
+			}
+			table_endscan(scan);
+			table_close(rel, AccessShareLock);
+		}
 		for (int i = 0; i < lengthof(provider_catalogs); i++)
 		{
 			Relation	rel = table_open(provider_catalogs[i], AccessShareLock);
@@ -452,11 +501,25 @@ provider_add(DGProviderRows *rows, Oid catalog, const void *data, Size size, int
 	rows->rows[i] = lappend(rows->rows[i], provider_fixed(rows->relations[i], data, size, nfixed));
 }
 
+/*
+ * The role a definition names. Definitions name roles, which belong to the
+ * server; one dropped since is the bootstrap superuser's, as a dropped role's
+ * objects pass to it, so that no branch or revision becomes unreadable.
+ */
+static Oid
+provider_role(const char *name)
+{
+	Oid			role = get_role_oid(name, true);
+
+	return OidIsValid(role) ? role : BOOTSTRAP_SUPERUSERID;
+}
+
 static ArrayType *
 provider_acl(const char *definition)
 {
 	int			i,
-				n;
+				n,
+				kept = 0;
 	Datum	   *items;
 	static const char *names[] = {"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "USAGE", "CREATE", "MAINTAIN"};
 	static const AclMode modes[] = {ACL_SELECT, ACL_INSERT, ACL_UPDATE, ACL_DELETE, ACL_TRUNCATE, ACL_REFERENCES, ACL_TRIGGER, ACL_USAGE, ACL_CREATE, ACL_MAINTAIN};
@@ -483,15 +546,19 @@ provider_acl(const char *definition)
 				mode = modes[j];
 		if (!mode)
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unsupported canonical privilege %s", priv)));
+		/* A privilege granted to or by a role since dropped is gone with it. */
+		if ((strcmp(grantee, "PUBLIC") && !OidIsValid(get_role_oid(grantee, true))) ||
+			!OidIsValid(get_role_oid(grantor, true)))
+			continue;
 		item->ai_grantor = get_role_oid(grantor, false);
 		item->ai_grantee = !strcmp(grantee, "PUBLIC") ? ACL_ID_PUBLIC : get_role_oid(grantee, false);
 		ACLITEM_SET_PRIVS_GOPTIONS(*item, mode, grant ? mode : 0);
-		items[i] = PointerGetDatum(item);
+		items[kept++] = PointerGetDatum(item);
 	}
 	/* ACLs require a one-dimensional header even when there are no items. */
-	if (!n)
+	if (!kept)
 		return (ArrayType *) make_empty_acl();
-	return construct_array(items, n, ACLITEMOID, sizeof(AclItem), false, TYPALIGN_INT);
+	return construct_array(items, kept, ACLITEMOID, sizeof(AclItem), false, TYPALIGN_INT);
 }
 
 static void
@@ -1362,6 +1429,39 @@ provider_namespace(CatalogView *view, const char *name)
 	return oid;
 }
 
+/*
+ * The owner and ACL of the server's namespace |oid|, which GRANT, REVOKE and
+ * ALTER SCHEMA OWNER change: ownership and privileges are not versioned. False
+ * if the server has no such namespace.
+ */
+static bool
+provider_namespace_privileges(Oid oid, Oid *owner, Datum *acl, bool *aclnull)
+{
+	CatalogView *previous = CatalogViewSwitch(NULL);
+	bool		found = false;
+
+	PG_TRY();
+	{
+		HeapTuple	tuple = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(oid));
+
+		if (HeapTupleIsValid(tuple))
+		{
+			Datum		value = SysCacheGetAttr(NAMESPACEOID, tuple, Anum_pg_namespace_nspacl, aclnull);
+
+			*owner = ((Form_pg_namespace) GETSTRUCT(tuple))->nspowner;
+			*acl = *aclnull ? (Datum) 0 : PointerGetDatum(DatumGetArrayTypePCopy(value));
+			found = true;
+			ReleaseSysCache(tuple);
+		}
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	return found;
+}
+
 /* The server objects a view leaves out: those in namespaces it does not have. */
 typedef struct ProviderHidden
 {
@@ -1480,7 +1580,7 @@ provider_table_type(DGProviderRows *rows, CatalogView *view, bytea *database,
 	form.oid = CatalogViewFindObject(view, RelationRelationId, name);
 	form.reltype = CatalogViewFindObject(view, TypeRelationId, name);
 	form.relnamespace = CatalogViewLookupObject(view, NamespaceRelationId, strVal(linitial(parts)));
-	form.relowner = get_role_oid(json_value(definition, "owner"), false);
+	form.relowner = provider_role(json_value(definition, "owner"));
 	namestrcpy(&form.relname, strVal(lsecond(parts)));
 	arrayname = makeObjectName("", NameStr(form.relname), NULL);
 
@@ -1543,6 +1643,7 @@ static void
 provider_populate(CatalogView *view, bytea *database, const char *branch)
 {
 	DGProviderRows rows = {0};
+	List	   *inherited = NIL;
 	DGMember   *listed;
 	bytea	  **addresses,
 			  **schemas,
@@ -1596,12 +1697,21 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			char	   *name = json_value(definitions[i], "name");
 			char	   *owner = json_value(definitions[i], "owner");
 			HeapTuple	tuple;
+			Datum		acl;
+			bool		aclnull;
 
 			form.oid = provider_namespace(view, name);
 			namestrcpy(&form.nspname, name);
-			form.nspowner = get_role_oid(owner, false);
+			if (form.oid >= FirstDurableObjectId ||
+				!provider_namespace_privileges(form.oid, &form.nspowner, &acl, &aclnull))
+			{
+				form.nspowner = provider_role(owner);
+				acl = PointerGetDatum(provider_acl(definitions[i]));
+				aclnull = false;
+			}
 			tuple = provider_fixed(rows.relations[slot], &form, sizeof(form), Anum_pg_namespace_nspowner);
-			tuple = provider_set(rows.relations[slot], tuple, Anum_pg_namespace_nspacl, PointerGetDatum(provider_acl(definitions[i])));
+			if (!aclnull)
+				tuple = provider_set(rows.relations[slot], tuple, Anum_pg_namespace_nspacl, acl);
 			rows.rows[slot] = lappend(rows.rows[slot], tuple);
 			provider_description(&rows, form.oid, NamespaceRelationId, 0, json_value(definitions[i], "comment"));
 		}
@@ -1646,6 +1756,18 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "type"))
 			provider_type_relation(&rows, view, definitions[i]);
+
+	/* The tables some table inherits from, which have subclasses. */
+	for (i = 0; i < n; i++)
+		if (!strcmp(kinds[i], "table"))
+		{
+			JsonbValue	document = json_document(definitions[i]),
+						parents;
+
+			if (json_get(&document, "inherits", &parents))
+				for (int p = 0; p < json_length(&parents); p++)
+					inherited = lappend(inherited, json_item_text(&parents, p));
+		}
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index"))
 		{
@@ -1668,7 +1790,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			CatalogViewObjectSetRetained(view, form.oid, schemas[i], contents[i]);
 			form.relnamespace = CatalogViewLookupObject(view, NamespaceRelationId, strVal(linitial(parts)));
 			namestrcpy(&form.relname, strVal(lsecond(parts)));
-			form.relowner = get_role_oid(owner, false);
+			form.relowner = provider_role(owner);
 			form.reltype = index ? InvalidOid : provider_bind(view, branch, TypeRelationId, DOLT_IDENTITY_ROWTYPE, name, name);
 			form.relam = index ? DOLT_PROLLY_INDEX_AM_OID : DOLT_PROLLY_TABLE_AM_OID;
 			form.relkind = index ? RELKIND_INDEX : RELKIND_RELATION;
@@ -1682,17 +1804,9 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			form.relpersistence = RELPERSISTENCE_PERMANENT;
 			form.relnatts = desc->natts;
 			document = json_document(definition);
-			/* Derive this flag from the canonical child definitions. */
-			for (int c = 0; c < n; c++)
-				if (!strcmp(kinds[c], "table"))
-				{
-					JsonbValue childdef = json_document(definitions[c]), parents;
-
-					if (json_get(&childdef, "inherits", &parents))
-						for (int p = 0; p < json_length(&parents); p++)
-							if (!strcmp(json_item_text(&parents, p), name))
-								form.relhassubclass = true;
-				}
+			foreach_ptr(char, parent, inherited)
+				if (!strcmp(parent, name))
+					form.relhassubclass = true;
 			form.relchecks = 0;
 			if (json_get(&document, "constraints", &list))
 				for (j = 0; j < json_length(&list); j++)
@@ -1967,6 +2081,7 @@ provider_lookup(const char *branch, bytea *database)
 	if (!identity_callback)
 	{
 		CacheRegisterRelcacheCallback(provider_identities_changed, (Datum) 0);
+		RegisterXactCallback(provider_xact, NULL);
 		identity_callback = true;
 	}
 	for (entry = providers; entry; entry = entry->next)
@@ -1979,6 +2094,14 @@ provider_lookup(const char *branch, bytea *database)
 			return entry->view;
 		}
 	}
+	/*
+	 * A branch's newer view replaces its views of earlier roots; a revision's
+	 * view is only ever replaced by one of the same revision.
+	 */
+	for (entry = providers; entry; entry = entry->next)
+		if (branch ? entry->branch && !strcmp(entry->branch, branch) :
+			!entry->branch && !strcmp(entry->database, key))
+			entry->superseded = true;
 	view = CatalogViewCreate(branch ? psprintf("%s@%s", key, branch) : key);
 	if (branch)
 		CatalogViewMarkBranchHead(view);

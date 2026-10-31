@@ -69,6 +69,31 @@ like(sql(q{\df public.crypt}),qr/crypt/,'psql lists extension functions in publi
 
 # A server object made after a session built its catalogs is in them at once.
 is(sql(q{CREATE TABLE public.late_heap(id int) USING heap; INSERT INTO late_heap VALUES (1); SELECT count(*) FROM late_heap, t}),'1','a session sees the heap table it just made');
+# Each such change rebuilds the session's catalogs: versioned objects named
+# before it are still the branch's after it.
+is(sql(q{CREATE TABLE droppable(a int); SELECT count(*) FROM droppable; CREATE TEMP TABLE rebuild(b int) USING heap;
+SELECT count(*) FROM droppable; DROP TABLE droppable; SELECT count(*) FROM pg_class WHERE relname = 'droppable'}) =~ s/.*\n//sr,'0','a versioned table looked up before server-side DDL can be dropped after it');
+
+# Each such change rebuilds the session's catalogs; the ones it replaces are freed.
+my $memory=q{SELECT sum(total_bytes) FROM pg_backend_memory_contexts};
+my $churn=$node->background_psql('postgres');
+$churn->query_safe(q{SELECT count(*) FROM t});
+my $before=$churn->query_safe($memory);
+$churn->query_safe(qq{CREATE TEMP TABLE churn_$_(x int) USING heap; SELECT count(*) FROM t}) for 1..20;
+cmp_ok($churn->query_safe($memory)-$before,'<',20*1024*1024,'replaced catalogs do not accumulate in a session');
+$before=$churn->query_safe($memory);
+$churn->query_safe(qq{CREATE TABLE versioned_churn_$_(x int PRIMARY KEY)}) for 1..40;
+cmp_ok($churn->query_safe($memory)-$before,'<',20*1024*1024,'nor do the catalogs of the roots versioned DDL replaces');
+$churn->query_safe(q{CREATE FUNCTION churn_trigger() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'; CREATE FUNCTION churn_f() RETURNS int LANGUAGE sql AS 'SELECT 1'});
+# Views a session no longer uses keep their objects bound, since clients hold
+# their OIDs, but none of their rows.
+my $loaded=q{SELECT sum(total_bytes) FROM pg_backend_memory_contexts WHERE name IN ('catalog view rows', 'catalog view base', 'catalog view indexes', 'catalog view index')};
+$before=$churn->query_safe($loaded);
+$churn->query_safe(qq{CREATE VIEW churn_view_$_ AS SELECT 1 AS x; CREATE TYPE churn_type_$_ AS (a int);
+CREATE TRIGGER churn_trigger_$_ BEFORE INSERT ON versioned_churn_$_ FOR EACH ROW EXECUTE FUNCTION churn_trigger();
+ALTER FUNCTION churn_f() COST $_; ALTER TABLE versioned_churn_$_ RENAME COLUMN x TO y}) for 1..20;
+cmp_ok($churn->query_safe($loaded)-$before,'<',20*1024*1024,'nor do the catalogs view, type, trigger, routine and rename DDL works in');
+$churn->quit;
 
 # One namespace for uniqueness, across server and branch objects.
 fails(q{CREATE FUNCTION public.crypt(text, text) RETURNS text LANGUAGE sql AS $$ SELECT 'x' $$},qr/already exists/,'a versioned routine cannot duplicate an extension function');
@@ -127,6 +152,44 @@ $session->{stderr}='';
 $session->query_safe(q{SELECT dolt_checkout('main')});
 $session->quit;
 is(sql(q{SELECT crypt('a', gen_salt('md5')) IS NOT NULL}),'t','server objects are untouched on main');
+
+# Collations are server objects: one a branch's definitions use cannot be dropped.
+sql(q{CREATE DATABASE coll});
+$node->safe_psql('coll',q{CREATE TABLE anchor(id int PRIMARY KEY); CREATE SCHEMA ct;
+CREATE COLLATION ct.c_column (LC_COLLATE = "POSIX", LC_CTYPE = "POSIX");
+CREATE COLLATION ct.c_index (LC_COLLATE = "POSIX", LC_CTYPE = "POSIX");
+CREATE COLLATION ct.c_default (LC_COLLATE = "POSIX", LC_CTYPE = "POSIX");
+CREATE TABLE ct.t(f1 text COLLATE ct.c_column, f2 text DEFAULT ('a' COLLATE ct.c_default));
+CREATE INDEX ON ct.t (f2 COLLATE ct.c_index);
+CREATE TABLE public.u(f text COLLATE ct.c_column)});
+for my $case (['c_column','table ct.t'],['c_index','index ct.t_f2_idx'],['c_default','table ct.t']) {
+ my ($rc,$out,$err)=$node->psql('coll',"DROP COLLATION ct.$case->[0] CASCADE");
+ like($err,qr/cannot drop collation ct\.$case->[0] because other objects depend on it.*\Q$case->[1]\E on branch "main"/s,"a collation a branch's $case->[1] uses cannot be dropped ($case->[0])");
+}
+is($node->safe_psql('coll',q{SELECT count(*) FROM pg_class WHERE relname = 't'}),'1','and every session still reads the branch');
+my ($coll_rc,$coll_out,$coll_err)=$node->psql('coll',q{DROP SCHEMA ct CASCADE});
+like($coll_err,qr/table public\.u uses server objects in schema ct/,'nor can the schema of a collation another schema\'s table uses');
+$node->safe_psql('coll',q{DROP TABLE public.u; DROP SCHEMA ct CASCADE});
+is($node->safe_psql('coll',q{SELECT count(*) FROM pg_namespace WHERE nspname = 'ct'}),'0','once nothing outside uses it, the schema drops with its tables');
+
+# A namespace's owner and privileges are its server row's, which GRANT changes, on every branch.
+$node->safe_psql('coll',q{CREATE ROLE schema_creator; CREATE ROLE schema_bystander; GRANT CREATE ON SCHEMA public TO schema_creator;
+SELECT dolt_commit('-Am', 'grant'); SELECT dolt_branch('granted')});
+is($node->safe_psql('coll',q{SET ROLE schema_creator; CREATE TABLE created(a int); INSERT INTO created VALUES (1); SELECT a FROM created}),'1','a role granted CREATE on a schema creates versioned tables in it');
+is($node->safe_psql('coll',q{SELECT dolt_checkout('granted'); SET ROLE schema_creator; CREATE TABLE created_there(a int); SELECT count(*) FROM created_there}) =~ s/.*\n//sr,'0','on any branch');
+my ($grant_rc,$grant_out,$grant_err)=$node->psql('coll',q{SET ROLE schema_bystander; CREATE TABLE refused(a int)});
+like($grant_err,qr/permission denied for schema public/,'and a role without it is refused');
+
+# System schemas belong to the server: a versioned object cannot move into one.
+my ($sys_rc,$sys_out,$sys_err)=$node->psql('coll',q{CREATE TABLE to_system(id int PRIMARY KEY); ALTER TABLE to_system SET SCHEMA pg_catalog});
+like($sys_err,qr/cannot move versioned object public\.to_system into system schema pg_catalog/,'a versioned table cannot move into pg_catalog');
+is($node->safe_psql('coll',q{SELECT count(*) FROM pg_class WHERE relname = 'to_system'}),'1','and the branch stays readable');
+
+# Roles are server objects too: a definition naming a dropped role stays readable, as its owner's.
+$node->safe_psql('coll',q{CREATE ROLE schema_owner_r; GRANT CREATE ON DATABASE coll TO schema_owner_r;
+SET SESSION AUTHORIZATION schema_owner_r; CREATE SCHEMA owned_schema; RESET SESSION AUTHORIZATION;
+DROP OWNED BY schema_owner_r; DROP ROLE schema_owner_r});
+is($node->safe_psql('coll',q{SELECT count(*) > 0 FROM pg_class}),'t','a branch stays readable after a role its definitions name is dropped');
 
 # Without server objects in it, public can be renamed on a branch like any schema.
 sql(q{CREATE DATABASE plain});

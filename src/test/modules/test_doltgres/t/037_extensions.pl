@@ -28,7 +28,10 @@ is(sql(q{SELECT string_agg(c.relname || ':' || coalesce(a.amname, '-'), ',' ORDE
   'xt_config:heap,xt_copy:heap,xt_matview:heap','its tables are heap tables, CREATE TABLE AS and materialized views too');
 is(sql(q{SELECT k || v FROM xt_copy}),'greetinghello','CREATE TABLE AS in a script fills a server table');
 is(sql(q{SELECT doubled, xt_next(1), (ROW(1, 2)::xt_pair).b FROM xt_view}),'10|2|2','its SQL and PL/pgSQL functions, composite type and view work');
-sql(q{SELECT dolt_branch('other')});
+is(sql(q{CREATE TYPE branch_pair AS (a int); ALTER TYPE branch_pair ADD ATTRIBUTE b int;
+CREATE FUNCTION branch_f() RETURNS int LANGUAGE sql AS 'SELECT 1'; ALTER FUNCTION branch_f() STABLE;
+SELECT (ROW(1, 2)::branch_pair).b, (ROW(3, 4)::xt_pair).b, branch_f()}),'2|4|1','type and routine DDL on a branch leave an extension\'s types and functions alone');
+sql(q{DROP FUNCTION branch_f(); DROP TYPE branch_pair; SELECT dolt_branch('other')});
 is(sql(q{SELECT dolt_checkout('other'); SELECT count(*) FROM pg_proc WHERE proname IN ('xt_double', 'xt_next')}) =~ s/.*\n//sr,'2','every branch lists them');
 
 # An extension installed into a branch's schema is in that schema wherever the branch has it.

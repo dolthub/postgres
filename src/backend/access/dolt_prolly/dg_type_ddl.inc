@@ -52,11 +52,14 @@ alters_versioned_type(Node *statement)
 	return type >= FirstDurableObjectId;
 }
 
-/* Whether a pg_type row is a user type of its own, not a derived array or row type. */
+/*
+ * Whether a pg_type row is a versioned type of its own, not a derived array or
+ * row type, nor a server type listed beside the branch's.
+ */
 static bool
 type_versioned_row(Form_pg_type type)
 {
-	if (type->oid < FirstNormalObjectId)
+	if (type->oid < FirstDurableObjectId)
 		return false;
 	if (type->typtype == TYPTYPE_ENUM || type->typtype == TYPTYPE_DOMAIN || type->typtype == TYPTYPE_RANGE)
 		return true;
@@ -345,8 +348,18 @@ type_ddl(ParseState *pstate, Node *statement)
 		native_mutation_view = saved_mutation;
 		SetUserIdAndSecContext(caller, security);
 		CatalogViewSwitch(previous);
+		if (CatalogViewIsProvisional(view))
+			CatalogViewRetireMutation(view);
+		CatalogViewRelease(view);
 	}
 	PG_END_TRY();
+
+	/*
+	 * Read the branch as the next statement will. A change native DDL let
+	 * through that leaves a definition unreadable, such as a column type a
+	 * domain's check cannot compare, fails here, before it is committed.
+	 */
+	(void) dg_catalog_session_view();
 }
 
 bool

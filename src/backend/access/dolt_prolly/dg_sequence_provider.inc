@@ -11,7 +11,7 @@ provider_sequence(DGProviderRows *rows, CatalogView *view, const char *definitio
 	form.oid = CatalogViewFindObject(view, RelationRelationId, name);
 	namestrcpy(&form.relname, strVal(lsecond(parts)));
 	form.relnamespace = CatalogViewLookupObject(view, NamespaceRelationId, strVal(linitial(parts)));
-	form.relowner = get_role_oid(json_value(definition, "owner"), false);
+	form.relowner = provider_role(json_value(definition, "owner"));
 	form.relkind = RELKIND_SEQUENCE;
 	form.relpersistence = RELPERSISTENCE_PERMANENT;
 	form.relnatts = 3;

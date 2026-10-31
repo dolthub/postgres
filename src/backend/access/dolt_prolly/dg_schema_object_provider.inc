@@ -38,7 +38,7 @@ provider_schema_object(DGProviderRows *rows, CatalogView *view, const char *kind
 				if (reference == TypeRelationId)
 					target = routine_type_oid(rows, view, encoded);
 				else if (reference == AuthIdRelationId)
-					target = get_role_oid(encoded, false);
+					target = provider_role(encoded);
 				else
 				{
 					target = CatalogViewFindObject(view, reference, encoded);
@@ -51,7 +51,10 @@ provider_schema_object(DGProviderRows *rows, CatalogView *view, const char *kind
 				}
 			}
 			values[i] = ObjectIdGetDatum(target);
-			if (target && target != id && reference != AuthIdRelationId)
+
+			/* As natively, an operator does not depend on its commutator or negator. */
+			if (target && target != id && reference != AuthIdRelationId &&
+				strcmp(field, "oprcom") && strcmp(field, "oprnegate"))
 				provider_dependency(rows, objectclass, id, 0, reference, target, 0, DEPENDENCY_NORMAL);
 		}
 		else

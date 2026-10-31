@@ -49,6 +49,9 @@ fails(q{INSERT INTO d VALUES (3,500,'ok')},qr/violates check constraint "small"/
 sql(q{INSERT INTO d(id, u) VALUES (4,'ok')});
 is(sql(q{SELECT p FROM d WHERE id=4}),'7','changed domain default');
 is(sql(q{SELECT string_agg(pg_get_constraintdef(oid), ' / ' ORDER BY conname) FROM pg_constraint WHERE contypid='posint'::regtype}),'CHECK ((VALUE > 0)) / NOT NULL / CHECK ((VALUE < 100))','domain constraints deparse as native');
+sql(q{CREATE TYPE fieldpair AS (r float8, i float8); CREATE DOMAIN positive_pair AS fieldpair CHECK ((VALUE).r > 0)});
+fails(q{ALTER TYPE fieldpair ALTER ATTRIBUTE r TYPE varchar},qr/operator does not exist: character varying > double precision/,'a type change a domain check cannot use is refused');
+is(sql(q{ALTER TYPE fieldpair ALTER ATTRIBUTE r TYPE bigint; SELECT (ROW(1, 2)::positive_pair).r}),'1','one it can use is made, and the branch stays readable');
 
 # ---- composite types ----
 sql(q{CREATE TYPE pair AS (a int, b mood); CREATE TABLE c(id int PRIMARY KEY, p pair, ps pair[]); INSERT INTO c VALUES (1, ROW(1,'glad'), ARRAY[ROW(2,'ok')::pair])});
