@@ -1,0 +1,25 @@
+use strict;
+use warnings FATAL => 'all';
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
+my $node=PostgreSQL::Test::Cluster->new('diff_views');
+$node->init(extra=>['--encoding=UTF8','--locale=C']);
+$node->start;
+sub sql { $node->safe_psql('postgres',$_[0]); }
+sql(q{CREATE TABLE t(i int PRIMARY KEY) USING dolt_prolly_table});
+sql(q{SELECT dolt_commit('-Am','created table')});
+sql(q{INSERT INTO t VALUES(1),(2),(3)});
+sql(q{SELECT dolt_commit('-Am','rows')});
+sql(q{CREATE VIEW v AS SELECT to_i,to_commit,from_i,from_commit,diff_type FROM dolt_diff('HEAD','HEAD~1','t')});
+is(sql(q{SELECT from_i,diff_type FROM v ORDER BY from_i}),"1|removed\n2|removed\n3|removed",'canonical view reparse preserves function descriptor');
+sql(q{INSERT INTO t VALUES(4),(5),(6)});
+sql(q{SELECT dolt_commit('-Am','more rows')});
+is(sql(q{SELECT from_i,diff_type FROM v ORDER BY from_i}),"4|removed\n5|removed\n6|removed",'view evaluates current revision arguments');
+sql(q{SELECT dolt_branch('view_branch')});
+sql(q{SELECT dolt_checkout('view_branch')});
+is(sql(q{SELECT from_i,diff_type FROM v ORDER BY from_i}),"4|removed\n5|removed\n6|removed",'view reconstructs on another branch');
+$node->restart;
+is(sql(q{SELECT count(*) FROM v}),'3','view survives server restart');
+$node->stop;
+done_testing();
