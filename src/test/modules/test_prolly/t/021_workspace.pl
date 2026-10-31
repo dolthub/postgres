@@ -129,5 +129,15 @@ is(sql(q{SELECT ref,commit_message FROM dolt_reflog('main') LIMIT 1}),'refs/head
 is(sql(q{SELECT count(*)>=7 FROM dolt_reflog('main')}),'t','reflog records every head move');
 is(sql(q{SELECT count(*)>0 FROM dolt_reflog() WHERE ref='refs/tags/v1'}),'t','reflog keeps tag history');
 is(sql(q{SELECT ref FROM dolt_reflog('b1')}),'refs/heads/b1','reflog of another branch');
+sql(q{SELECT dolt_branch('reflog-orphan')});
+my $orphan=$node->background_psql('postgres');
+$orphan->query_safe(q{SELECT dolt_checkout('reflog-orphan')});
+$orphan->query_safe(q{SELECT dolt_commit('--allow-empty','-m','retained orphan message')});
+$orphan->query_safe(q{SELECT dolt_tag('orphan-tag')});
+$orphan->quit;
+sql(q{SELECT dolt_branch('-d','reflog-orphan')});
+sql(q{SELECT dolt_tag('-d','orphan-tag')});
+is(sql(q{SELECT commit_message FROM dolt_reflog('reFS/Tags/ORPHAN-TAG') LIMIT 1}),'retained orphan message','reflog retains commit metadata after deleting the final ref');
+is(sql(q{SELECT commit_message FROM dolt_reflog('REFLOG-ORPHAN') LIMIT 1}),'retained orphan message','reflog lookup is case insensitive');
 $node->stop;
 done_testing();
