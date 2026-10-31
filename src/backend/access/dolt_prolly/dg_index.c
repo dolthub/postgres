@@ -333,6 +333,8 @@ dg_index_validate(Relation table, Relation index)
 					function = index->rd_support[j];
 		const char *expected;
 		static const char *operators[] = {"<", "<=", "=", ">=", ">"};
+		static const char *pattern_operators[] = {"~<~", "~<=~", "=", "~>=~", "~>~"};
+		bool pattern = false;
 		int			strategy;
 
 		if (att < 0)
@@ -344,6 +346,16 @@ dg_index_validate(Relation table, Relation index)
 			!pg_newlocale_from_collation(index->rd_indcollation[j])->collate_is_c)
 			dg_unsupported("non-C index collations");
 		expected = index_comparator(type);
+		if ((type == TEXTOID || type == VARCHAROID) && !strcmp(get_func_name(function), "bttext_pattern_cmp"))
+		{
+			expected = "bttext_pattern_cmp";
+			pattern = true;
+		}
+		else if (type == BPCHAROID && !strcmp(get_func_name(function), "btbpchar_pattern_cmp"))
+		{
+			expected = "btbpchar_pattern_cmp";
+			pattern = true;
+		}
 		if (get_func_namespace(function) != PG_CATALOG_NAMESPACE || strcmp(get_func_name(function), expected))
 			dg_unsupported("custom index comparators");
 
@@ -365,7 +377,7 @@ dg_index_validate(Relation table, Relation index)
 		for (strategy = 1; strategy <= 5; strategy++)
 		{
 			Oid			actual = get_opfamily_member(index->rd_opfamily[j], type, type, strategy);
-			Oid			wanted = OpernameGetOprid(list_make2(makeString("pg_catalog"), makeString(pstrdup(operators[strategy - 1]))), type, type);
+			Oid			wanted = OpernameGetOprid(list_make2(makeString("pg_catalog"), makeString(pstrdup((pattern ? pattern_operators : operators)[strategy - 1]))), type, type);
 
 			if (!OidIsValid(actual) || actual != wanted)
 				dg_unsupported("custom index operators");

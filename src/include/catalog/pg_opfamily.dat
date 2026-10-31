@@ -341,4 +341,7 @@
 { oid => '9036', opfmethod => 'dolt_prolly_index', opfname => 'dolt_range_ops' },
 { oid => '9037', opfmethod => 'dolt_prolly_index', opfname => 'dolt_multirange_ops' },
 
+
+{ opfmethod => 'dolt_prolly_index', opfname => 'text_pattern_ops' },
+{ opfmethod => 'dolt_prolly_index', opfname => 'bpchar_pattern_ops' },
 ]
