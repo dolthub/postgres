@@ -1706,12 +1706,12 @@ dolt_commit_impl(FunctionCallInfo fcinfo, bool named_rows)
 				allow_empty = false,
 				skip_empty = false;
 	TimestampTz author_date = GetCurrentTimestamp();
-	List *branches;
-	ListCell *lc;
+	List	   *branches;
+	ListCell   *lc;
 	const char *previous_branch;
 	TimestampTz commit_time = GetCurrentTimestamp();
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	bool multi = named_rows || dolt_multi_branch_commit;
+	bool		multi = named_rows || dolt_multi_branch_commit;
 
 	standalone(fcinfo, false);
 	for (i = 0; i < n; i++)
@@ -1761,8 +1761,10 @@ dolt_commit_impl(FunctionCallInfo fcinfo, bool named_rows)
 	if (allow_empty && skip_empty)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("--allow-empty and --skip-empty are incompatible")));
 
-	/* Apply deferred constraints under the caller's normal catalog context.
-	 * The transaction ends after the standalone result has been consumed. */
+	/*
+	 * Apply deferred constraints under the caller's normal catalog context.
+	 * The transaction ends after the standalone result has been consumed.
+	 */
 	do
 	{
 		if (SPI_connect() != SPI_OK_CONNECT)
@@ -1791,12 +1793,16 @@ dolt_commit_impl(FunctionCallInfo fcinfo, bool named_rows)
 		foreach(lc, branches)
 		{
 			const char *branch = lfirst(lc);
-			VersionRef head, staged, working;
-			Capture full;
-			bytea *database, *parentdb, *commit;
-			Datum values[2];
-			bool nulls[2] = {false, false};
-			int nest;
+			VersionRef	head,
+						staged,
+						working;
+			Capture		full;
+			bytea	   *database,
+					   *parentdb,
+					   *commit;
+			Datum		values[2];
+			bool		nulls[2] = {false, false};
+			int			nest;
 
 			dg_switch_execution_branch(branch);
 			nest = begin_api();
@@ -1860,7 +1866,6 @@ dolt_commit_all(PG_FUNCTION_ARGS)
 {
 	return dolt_commit_impl(fcinfo, true);
 }
-
 Datum
 dolt_branch(PG_FUNCTION_ARGS)
 {
