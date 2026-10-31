@@ -70,5 +70,6 @@ tests += {
     't/052_diff_ranges.pl',
       't/053_diff_views.pl',
       't/054_cherry_pick_conflicts.pl',
+      't/055_ignored_workspaces.pl',
   ]},
 }

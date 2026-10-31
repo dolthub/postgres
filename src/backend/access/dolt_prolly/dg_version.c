@@ -171,7 +171,10 @@ static PLSlice fill_row(Relation rel, PLSlice row, const bool *fill);
 static PLTree fill_rows(Relation rel, PLTree content, const bool *fill);
 static List *merge_dropped_columns(Relation rel, const char *base);
 static PLTree check_violations(Relation rel, PLTree content, const char *name, StringInfo violations);
+static bool name_selected(List *names, const char *name);
+static Capture capture_visible(void);
 static bytea *staged_capture(Capture * full);
+static List *ignored_untracked_tables(const char *working, const char *tracked);
 static void catalog_activate(void);
 static bool branch_management(char **args, int n);
 static void checkout_tables(char **args, int n);
@@ -1655,46 +1658,68 @@ dolt_init(PG_FUNCTION_ARGS)
 Datum
 dolt_add(PG_FUNCTION_ARGS)
 {
-	int			n;
-	char	  **args = arguments(fcinfo, &n);
-	Capture		current;
-	VersionRef	staged,
-				working;
-	int			nest;
+	int n, i;
+	char **args = arguments(fcinfo, &n);
+	bool force = false, all = false;
+	List *names = NIL;
+	Capture current;
+	VersionRef staged, working;
+	int nest;
 
 	standalone(fcinfo, false);
+	for (i = 0; i < n; i++)
+	{
+		if (!strcmp(args[i], "--force") || !strcmp(args[i], "-f"))
+			force = true;
+		else if (!strcmp(args[i], ".") || !strcmp(args[i], "-a") ||
+				 !strcmp(args[i], "-A") || !strcmp(args[i], "--all"))
+			all = true;
+		else if (args[i][0] == '-')
+			unsupported(args[i]);
+		else
+			names = lappend(names, args[i]);
+	}
+	if (!all && names == NIL)
+		unsupported("dolt_add requires '.', '-A' or table names");
+
 	nest = begin_api();
 	/* Activation advances command visibility on our private API snapshot. */
 	if (!read_ref("views/enabled").target)
 		catalog_activate();
 	ensure_repository();
-	if (n == 0)
-		unsupported("dolt_add requires '.', '-A' or table names");
-	if (n != 1 || (strcmp(args[0], ".") && strcmp(args[0], "-a") && strcmp(args[0], "-A") && strcmp(args[0], "--all")))
+	if (!all)
 	{
-		/* Stage only the named tables. */
-		List	   *tables = NIL;
-		int			i;
-		char	   *stagedjson = staged_state(),
-				   *workingjson = working_state();
+		List *tables = NIL;
+		char *stagedjson = staged_state(), *workingjson = working_state();
+		List *ignored = force ? NIL : ignored_untracked_tables(workingjson, stagedjson);
+		ListCell *lc;
 
-		for (i = 0; i < n; i++)
+		foreach(lc, names)
 		{
-			if (args[i][0] == '-')
-				unsupported(args[i]);
-			tables = lappend(tables, resolve_object_argument(args[i], stagedjson, workingjson, true));
+			char *name = resolve_object_argument(lfirst(lc), stagedjson, workingjson, true);
+
+			if (!name_selected(ignored, name))
+				tables = lappend(tables, name);
 		}
-		stage_tables(tables);
+		if (tables)
+			stage_tables(tables);
 		end_api(nest);
 		PG_RETURN_INT64(0);
 	}
 	staged = read_ref(branch_ref("staged"));
 	working = read_ref(branch_ref("working"));
-	move_ref(branch_ref("staged"), staged, staged_capture(&current));
+	if (force)
+	{
+		current = capture_visible();
+		move_ref(branch_ref("staged"), staged, current.hash);
+	}
+	else
+		move_ref(branch_ref("staged"), staged, staged_capture(&current));
 	move_ref(branch_ref("working"), working, current.hash);
 	end_api(nest);
 	PG_RETURN_INT64(0);
 }
+
 static List *commit_branches(void);
 static void commit_request_sql_end(void);
 

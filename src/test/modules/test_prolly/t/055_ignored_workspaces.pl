@@ -1,0 +1,28 @@
+use strict;
+use warnings FATAL => 'all';
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
+my $node = PostgreSQL::Test::Cluster->new('ignored_workspaces');
+$node->init(extra => ['--encoding=UTF8', '--locale=C']);
+$node->start;
+sub sql { $node->safe_psql('postgres', $_[0]); }
+sql(q{INSERT INTO dolt_ignore VALUES ('generated_*',true);
+CREATE TABLE generated_foo(id int PRIMARY KEY) USING dolt_prolly_table;
+CREATE TABLE generated_bar(id int PRIMARY KEY) USING dolt_prolly_table;
+INSERT INTO generated_foo VALUES(1); INSERT INTO generated_bar VALUES(1)});
+sql(q{SELECT dolt_add('generated_foo')});
+is(sql(q{SELECT count(*) FROM dolt_status WHERE staged AND table_name='public.generated_foo'}), '0', 'ordinary named add respects ignore rules');
+sql(q{SELECT dolt_add('--force','generated_bar')});
+is(sql(q{SELECT count(*) FROM dolt_status WHERE staged AND table_name='public.generated_bar'}), '1', 'force adds ignored table');
+sql(q{SELECT dolt_commit('-Am','tracked generated table')});
+sql(q{INSERT INTO generated_bar VALUES(2); SELECT dolt_add('-A')});
+is(sql(q{SELECT count(*) FROM dolt_status WHERE staged AND table_name='public.generated_bar'}), '1', 'subsequent ordinary add stages tracked ignored-name table');
+is(sql(q{SELECT count(*) FROM dolt_status WHERE staged AND table_name='public.generated_foo'}), '0', 'add all leaves untracked ignored table unstaged');
+sql(q{SELECT dolt_add('-f','--all')});
+is(sql(q{SELECT count(*) FROM dolt_status WHERE staged AND table_name='public.generated_foo'}), '1', 'force all stages ignored tables');
+my ($status,$out,$err) = $node->psql('postgres',q{SELECT dolt_add('--force')});
+isnt($status,0,'force requires targets');
+like($err,qr/requires/, 'missing target diagnostic');
+$node->stop;
+done_testing();

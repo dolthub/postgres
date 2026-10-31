@@ -171,6 +171,21 @@ ignored_tables(List *tables)
 	return result;
 }
 
+/* Ignore rules apply only to tables absent from both HEAD and the supplied
+ * tracked snapshot. Explicitly force-added tables subsequently stay tracked. */
+static List *
+ignored_untracked_tables(const char *working, const char *tracked)
+{
+	List *known = list_concat(state_tables(head_state()), state_tables(tracked));
+	List *candidates = NIL;
+	ListCell *lc;
+
+	foreach(lc, state_tables(working))
+		if (!name_selected(known, lfirst(lc)))
+			candidates = lappend(candidates, lfirst(lc));
+	return ignored_tables(candidates);
+}
+
 /* Capture the working set and drop ignored untracked tables from it: the
  * state that dolt_add -A and dolt_commit -A stage. |full| receives the
  * complete capture for the working ref. */
