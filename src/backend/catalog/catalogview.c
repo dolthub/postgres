@@ -25,6 +25,7 @@
 #include "utils/sortsupport.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_class_d.h"
+#include "common/hashfn.h"
 #include "catalog/pg_statistic.h"
 #include "utils/inval.h"
 #include "utils/fmgroids.h"
@@ -81,6 +82,8 @@ struct CatalogView
 	List	   *handles;
 	List	   *durable;		/* CatalogViewObjects bound to durable OIDs */
 	List	   *shared;			/* CatalogViewObjects bound to OIDs other views share */
+	HTAB	   *names;			/* CatalogViewNames by class and identity */
+	HTAB	   *durable_oids;	/* CatalogViewObject pointers by durable OID */
 	CatalogViewBaseFilter base_filter;	/* which base rows the view leaves out */
 	void	   *base_filter_arg;
 	List	   *indexes;		/* CatalogViewIndexes over the rows */
@@ -645,12 +648,113 @@ CatalogViewEndScan(CatalogViewScan *scan)
 	pfree(scan);
 }
 
+/*
+ * The objects a view binds to one identity of one class, by kind of binding.
+ * A view finds its objects by identity through these rather than its lists,
+ * which a view of a large schema makes long.
+ */
+typedef struct CatalogViewNameKey
+{
+	Oid			objectclass;
+	const char *identity;		/* kept by the bound object */
+} CatalogViewNameKey;
+
+typedef struct CatalogViewName
+{
+	CatalogViewNameKey key;
+	CatalogViewObject *shared;
+	CatalogViewObject *durable;
+	CatalogViewObject *handle;
+} CatalogViewName;
+
+static uint32
+name_hash(const void *key, Size keysize)
+{
+	const CatalogViewNameKey *name = key;
+
+	return hash_combine(murmurhash32(name->objectclass), string_hash(name->identity, 0));
+}
+
+static int
+name_match(const void *a, const void *b, Size keysize)
+{
+	const CatalogViewNameKey *x = a;
+	const CatalogViewNameKey *y = b;
+
+	return x->objectclass != y->objectclass || strcmp(x->identity, y->identity);
+}
+
+/* |view|'s entry for |identity| of |objectclass|, made if |create|. */
+static CatalogViewName *
+view_name(CatalogView *view, Oid objectclass, const char *identity, bool create)
+{
+	CatalogViewNameKey key = {objectclass, identity};
+	CatalogViewName *name;
+	bool		found;
+
+	if (!view->names)
+	{
+		HASHCTL		ctl = {0};
+
+		if (!create)
+			return NULL;
+		ctl.keysize = sizeof(CatalogViewNameKey);
+		ctl.entrysize = sizeof(CatalogViewName);
+		ctl.hash = name_hash;
+		ctl.match = name_match;
+		ctl.hcxt = view->memory;
+		view->names = hash_create("catalog view names", 256, &ctl,
+								  HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
+	}
+	name = hash_search(view->names, &key, create ? HASH_ENTER : HASH_FIND, &found);
+	if (name && !found)
+		name->shared = name->durable = name->handle = NULL;
+	return name;
+}
+
+/* Index |object|, bound in |view| as |kind| of binding, by its identity. */
+static void
+view_name_object(CatalogView *view, CatalogViewObject *object, CatalogViewObject **(*kind) (CatalogViewName *))
+{
+	CatalogViewName *name = view_name(view, object->objectclass, object->identity, true);
+	CatalogViewObject **slot = kind(name);
+
+	/* As a scan of the binding lists would, the first binding wins. */
+	if (!*slot)
+		*slot = object;
+	name->key.identity = (*slot)->identity;
+}
+
+static CatalogViewObject **
+shared_slot(CatalogViewName *name)
+{
+	return &name->shared;
+}
+
+static CatalogViewObject **
+durable_slot(CatalogViewName *name)
+{
+	return &name->durable;
+}
+
+static CatalogViewObject **
+handle_slot(CatalogViewName *name)
+{
+	return &name->handle;
+}
+
+typedef struct CatalogViewDurable
+{
+	Oid			oid;
+	CatalogViewObject *object;
+} CatalogViewDurable;
+
 Oid
 CatalogViewBindObject(CatalogView *view, Oid objectclass, const char *identity, Oid storage)
 {
 	CatalogViewObject *object;
+	CatalogViewName *name;
 	MemoryContext previous;
-	ListCell   *lc;
 	bool		found;
 
 	if (!objects)
@@ -662,17 +766,12 @@ CatalogViewBindObject(CatalogView *view, Oid objectclass, const char *identity, 
 		ctl.hcxt = TopMemoryContext;
 		objects = hash_create("catalog context handles", 128, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
-	foreach(lc, view->handles)
+	name = view_name(view, objectclass, identity, false);
+	if (name && name->handle)
 	{
-		Oid			handle = lfirst_oid(lc);
-
-		object = hash_search(objects, &handle, HASH_FIND, NULL);
-		if (object->objectclass == objectclass && !strcmp(object->identity, identity))
-		{
-			if (object->storage != storage)
-				elog(ERROR, "catalog handle storage changed within immutable context");
-			return handle;
-		}
+		if (name->handle->storage != storage)
+			elog(ERROR, "catalog handle storage changed within immutable context");
+		return name->handle->handle;
 	}
 	if (view->sealed && !view->provisional)
 		elog(ERROR, "cannot bind a new object in a published catalog context");
@@ -690,43 +789,41 @@ CatalogViewBindObject(CatalogView *view, Oid objectclass, const char *identity, 
 	object->storage = storage;
 	previous = MemoryContextSwitchTo(view->memory);
 	object->identity = pstrdup(identity);
+	object->handle = next_handle;
 	view->handles = lappend_oid(view->handles, next_handle);
 	MemoryContextSwitchTo(previous);
+	view_name_object(view, object, handle_slot);
 	return next_handle++;
 }
 
 static CatalogViewObject *
 view_durable(CatalogView *view, Oid oid)
 {
-	ListCell   *lc;
+	CatalogViewDurable *found;
 
-	foreach(lc, view->durable)
-	{
-		CatalogViewObject *object = lfirst(lc);
-
-		if (object->handle == oid)
-			return object;
-	}
-	return NULL;
+	if (!view->durable_oids)
+		return NULL;
+	found = hash_search(view->durable_oids, &oid, HASH_FIND, NULL);
+	return found ? found->object : NULL;
 }
 
 void
 CatalogViewBindDurable(CatalogView *view, Oid objectclass, const char *identity, Oid oid, Oid storage)
 {
 	CatalogViewObject *object;
+	CatalogViewName *name;
 	MemoryContext previous;
-	ListCell   *lc;
 
 	Assert(CatalogViewIsDurable(oid));
-	foreach(lc, view->durable)
+	name = view_name(view, objectclass, identity, false);
+	object = view_durable(view, oid);
+	if (!object && name)
+		object = name->durable;
+	if (object)
 	{
-		object = lfirst(lc);
-		if (object->handle == oid || (object->objectclass == objectclass && !strcmp(object->identity, identity)))
-		{
-			if (object->handle != oid || object->objectclass != objectclass || strcmp(object->identity, identity) || object->storage != storage)
-				elog(ERROR, "durable object %u is bound twice in one catalog context", oid);
-			return;
-		}
+		if (object->handle != oid || object->objectclass != objectclass || strcmp(object->identity, identity) || object->storage != storage)
+			elog(ERROR, "durable object %u is bound twice in one catalog context", oid);
+		return;
 	}
 	previous = MemoryContextSwitchTo(view->memory);
 	object = palloc0(sizeof(*object));
@@ -736,7 +833,18 @@ CatalogViewBindDurable(CatalogView *view, Oid objectclass, const char *identity,
 	object->view = view;
 	object->identity = pstrdup(identity);
 	view->durable = lappend(view->durable, object);
+	if (!view->durable_oids)
+	{
+		HASHCTL		ctl = {0};
+
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(CatalogViewDurable);
+		ctl.hcxt = view->memory;
+		view->durable_oids = hash_create("catalog view durable objects", 256, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	((CatalogViewDurable *) hash_search(view->durable_oids, &oid, HASH_ENTER, NULL))->object = object;
 	MemoryContextSwitchTo(previous);
+	view_name_object(view, object, durable_slot);
 }
 
 /*
@@ -767,6 +875,7 @@ CatalogViewBindShared(CatalogView *view, Oid objectclass, const char *identity, 
 	object->identity = pstrdup(identity);
 	view->shared = lappend(view->shared, object);
 	MemoryContextSwitchTo(previous);
+	view_name_object(view, object, shared_slot);
 }
 
 /* Whether |view| binds |oid|: shared, durable, or a handle of its own. */
@@ -1116,29 +1225,16 @@ CatalogViewRejectBranchWrite(Relation relation, ItemPointer tid, HeapTuple tuple
 Oid
 CatalogViewFindObject(CatalogView *view, Oid objectclass, const char *identity)
 {
-	ListCell   *lc;
+	CatalogViewName *name = view_name(view, objectclass, identity, false);
 
-	foreach_ptr(CatalogViewObject, object, view->shared)
-	{
-		if (object->objectclass == objectclass && !strcmp(object->identity, identity))
-			return object->handle;
-	}
-	foreach(lc, view->durable)
-	{
-		CatalogViewObject *object = lfirst(lc);
-
-		if (object->objectclass == objectclass && !strcmp(object->identity, identity))
-			return object->handle;
-	}
-
-	foreach(lc, view->handles)
-	{
-		Oid			handle = lfirst_oid(lc);
-		CatalogViewObject *object = hash_search(objects, &handle, HASH_FIND, NULL);
-
-		if (object->objectclass == objectclass && !strcmp(object->identity, identity))
-			return handle;
-	}
+	if (!name)
+		return InvalidOid;
+	if (name->shared)
+		return name->shared->handle;
+	if (name->durable)
+		return name->durable->handle;
+	if (name->handle)
+		return name->handle->handle;
 	return InvalidOid;
 }
 
@@ -1856,11 +1952,21 @@ CatalogViewNameObject(Oid handle, const char *identity)
 	CatalogViewObject *object = lookup_object(handle);
 	MemoryContext previous;
 
+	CatalogViewName *name;
+
 	if (!object || !CatalogViewIsProvisional(object->view))
 		elog(ERROR, "only provisional catalog objects can be named");
+	name = view_name(object->view, object->objectclass, object->identity, false);
+	if (name && name->handle == object)
+	{
+		name->handle = NULL;
+		if (!name->shared && !name->durable)
+			hash_search(object->view->names, &name->key, HASH_REMOVE, NULL);
+	}
 	previous = MemoryContextSwitchTo(object->view->memory);
 	object->identity = pstrdup(identity);
 	MemoryContextSwitchTo(previous);
+	view_name_object(object->view, object, handle_slot);
 }
 
 Oid
