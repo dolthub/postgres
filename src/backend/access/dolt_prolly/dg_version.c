@@ -2133,6 +2133,7 @@ dolt_diff_summary_table(PG_FUNCTION_ARGS)
 #include "dg_binding.inc"
 
 static void validate_working_foreign_keys(const char *branch, StringInfo violations);
+static bytea *carry_workspace_changes(bytea *base, bytea *local, bytea *merged);
 
 #include "dg_merge.inc"
 
