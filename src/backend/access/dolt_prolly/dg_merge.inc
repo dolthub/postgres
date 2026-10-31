@@ -37,6 +37,7 @@ lock_workspace(void)
 	int			n,
 				i;
 
+	require_writable();
 	LockDatabaseObject(DoltRefRelationId, 0, 0, ExclusiveLock);
 	run("SELECT DISTINCT bindrelid FROM pg_dolt_binding WHERE bindbranch=$1 ORDER BY bindrelid", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(dg_current_branch())), NULL, true);
 	n = SPI_processed;
@@ -79,8 +80,16 @@ dolt_checkout(PG_FUNCTION_ARGS)
 
 	standalone(fcinfo, true);
 	nest = begin_api();
-	lock_workspace();
-	ensure_repository();
+
+	/*
+	 * Switching to an existing branch only changes the session's state: a
+	 * read-only transaction, such as any on a hot standby, can do it.
+	 */
+	if (!XactReadOnly || (n >= 1 && args[0][0] == '-'))
+	{
+		lock_workspace();
+		ensure_repository();
+	}
 	if (n >= 2 && n <= 3 && !strcmp(args[0], "-b"))
 	{
 		name = args[1];

@@ -236,6 +236,21 @@ dg_version_call_active(void)
 	return version_calls > 0;
 }
 
+/* The version-control function being called, for errors that name it. */
+static Oid	version_function = InvalidOid;
+
+/*
+ * Refuse a version-control write in a read-only transaction, as every
+ * transaction on a hot standby is, as PostgreSQL refuses other writes there.
+ */
+static void
+require_writable(void)
+{
+	if (XactReadOnly)
+		PreventCommandIfReadOnly(OidIsValid(version_function) ?
+								 psprintf("%s()", get_func_name(version_function)) : "a version-control write");
+}
+
 static void
 catalog_api_xact(XactEvent event, void *arg)
 {
@@ -243,6 +258,7 @@ catalog_api_xact(XactEvent event, void *arg)
 	{
 		catalog_api_depth = 0;
 		version_calls = 0;
+		version_function = InvalidOid;
 	}
 }
 static void
@@ -384,6 +400,7 @@ standalone(FunctionCallInfo fcinfo, bool commits)
 	Plan	   *plan;
 	FuncExpr   *call = NULL;
 
+	version_function = fcinfo->flinfo->fn_oid;
 	if (!ActivePortal || list_length(ActivePortal->stmts) != 1)
 		goto bad;
 	stmt = linitial_node(PlannedStmt, ActivePortal->stmts);
@@ -446,6 +463,7 @@ arguments(FunctionCallInfo fcinfo, int *count)
 	char	  **args;
 	int			i;
 
+	version_function = fcinfo->flinfo->fn_oid;
 	if (PG_NARGS() == 0)
 	{
 		*count = 0;
@@ -618,6 +636,7 @@ move_ref(const char *name, VersionRef old, bytea *target)
 	Datum		args[] = {CStringGetTextDatum(name), PointerGetDatum(old.token), PointerGetDatum(target)};
 	char		nulls[] = "   ";
 
+	require_writable();
 	if (!old.token)
 		nulls[1] = 'n';
 	if (!target)
@@ -636,6 +655,7 @@ put(const char *kind, const char *json, Datum *hashes, int count)
 {
 	bytea	   *result;
 
+	require_writable();
 	if ((!strcmp(kind, "schema") || !strcmp(kind, "namespace")) && count == 0)
 		result = dg_schema_store(kind, json);
 	else
@@ -1663,6 +1683,7 @@ dolt_add(PG_FUNCTION_ARGS)
 	int			nest;
 
 	standalone(fcinfo, false);
+	require_writable();
 	nest = begin_api();
 	/* Activation advances command visibility on our private API snapshot. */
 	if (!read_ref("views/enabled").target)
