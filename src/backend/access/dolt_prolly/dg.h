@@ -35,6 +35,8 @@ typedef struct DGState
 	MemoryContextCallback cleanup;
 	int64	   *journal_seqs;	/* journal entries folded into the tree, ascending */
 	int			journal_count;
+	uint64		roots_generation;	/* of its roots' storage, just before they were read */
+	bool		roots_generation_known;
 	struct HandleDelta *delta;	/* allocated handles, by handle and by digest */
 	bool		delta_private;	/* the delta belongs to this state, not the catalog */
 	struct HandleDelta *extra;	/* occurrences the delta does not name, numbered for this state */

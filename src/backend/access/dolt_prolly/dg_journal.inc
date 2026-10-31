@@ -193,6 +193,7 @@ typedef struct JournalTouched
 } JournalTouched;
 
 static JournalTouched *journal_touched;
+static HTAB *journal_consumed;	/* JournalConsumed: entries this transaction folded into roots it saved */
 static int	journal_touched_count,
 			journal_touched_capacity;
 static bool journal_committing;	/* past pre-commit: a new touch counts at once */
@@ -301,6 +302,7 @@ journal_xact_end(bool committed)
 	}
 	journal_touched = NULL;
 	journal_touched_count = journal_touched_capacity = 0;
+	journal_consumed = NULL;	/* in TopTransactionContext */
 	journal_committing = false;
 	journal_local_epoch++;
 	foreach(lc, journal_retired)
@@ -606,12 +608,131 @@ journal_stream_build(JournalStream *stream, const RootKey *key)
 }
 
 /*
+ * Entries this transaction folded into roots it saved. Saving deletes them,
+ * but another transaction may have deleted one first, folding it into its
+ * own roots, and committed after this transaction's snapshot: the entry then
+ * stays visible here, though the saved roots already include it. A later
+ * command of this transaction must not fold it again.
+ */
+typedef struct JournalConsumed
+{
+	RootKey		key;			/* hash key */
+	int64	   *seqs;
+	CommandId  *cids;
+	SubTransactionId *subids;
+	int			count,
+				capacity;
+} JournalConsumed;
+
+static void
+journal_consumed_note(const RootKey *key, const int64 *seqs, int count, CommandId cid)
+{
+	JournalConsumed *consumed;
+	MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
+	bool		found;
+
+	if (!journal_consumed)
+	{
+		HASHCTL		ctl = {0};
+
+		ctl.keysize = sizeof(RootKey);
+		ctl.entrysize = sizeof(JournalConsumed);
+		ctl.hcxt = TopTransactionContext;
+		journal_consumed = hash_create("prolly journal consumed", 16, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	consumed = hash_search(journal_consumed, key, HASH_ENTER, &found);
+	if (!found)
+		consumed->count = consumed->capacity = 0;
+	if (consumed->count + count > consumed->capacity)
+	{
+		consumed->capacity = Max(consumed->capacity * 2, consumed->count + count);
+		consumed->seqs = found && consumed->seqs ? repalloc(consumed->seqs, consumed->capacity * sizeof(int64)) :
+			palloc(consumed->capacity * sizeof(int64));
+		consumed->cids = found && consumed->cids ? repalloc(consumed->cids, consumed->capacity * sizeof(CommandId)) :
+			palloc(consumed->capacity * sizeof(CommandId));
+		consumed->subids = found && consumed->subids ? repalloc(consumed->subids, consumed->capacity * sizeof(SubTransactionId)) :
+			palloc(consumed->capacity * sizeof(SubTransactionId));
+	}
+	for (int i = 0; i < count; i++)
+	{
+		consumed->seqs[consumed->count] = seqs[i];
+		consumed->cids[consumed->count] = cid;
+		consumed->subids[consumed->count++] = GetCurrentSubTransactionId();
+	}
+	MemoryContextSwitchTo(old);
+}
+
+/* Subtransaction |subid| rolled back: so did its saves, and its descendants'. */
+static void
+journal_consumed_abort(SubTransactionId subid)
+{
+	HASH_SEQ_STATUS status;
+	JournalConsumed *consumed;
+
+	if (!journal_consumed)
+		return;
+	hash_seq_init(&status, journal_consumed);
+	while ((consumed = hash_seq_search(&status)) != NULL)
+	{
+		int			kept = 0;
+
+		for (int i = 0; i < consumed->count; i++)
+			if (consumed->subids[i] < subid)
+			{
+				consumed->seqs[kept] = consumed->seqs[i];
+				consumed->cids[kept] = consumed->cids[i];
+				consumed->subids[kept++] = consumed->subids[i];
+			}
+		consumed->count = kept;
+	}
+}
+
+/* Drop from |entries| those this transaction folded into roots it saved before |snapshot|'s command. */
+static void
+journal_consumed_filter(const RootKey *key, Snapshot snapshot, JournalEntries *entries)
+{
+	JournalConsumed *consumed;
+	CommandId	cid = snapshot && IsMVCCSnapshot(snapshot) ? snapshot->curcid : InvalidCommandId;
+	int			kept = 0;
+
+	if (!journal_consumed || !entries->count ||
+		!(consumed = hash_search(journal_consumed, key, HASH_FIND, NULL)) || !consumed->count)
+		return;
+	for (int i = 0; i < entries->count; i++)
+	{
+		bool		folded = false;
+
+		for (int j = 0; j < consumed->count && !folded; j++)
+			folded = consumed->seqs[j] == entries->items[i].seq &&
+				(cid == InvalidCommandId || consumed->cids[j] < cid);
+		if (folded)
+			continue;
+		entries->items[kept] = entries->items[i];
+		if (entries->tids)
+			entries->tids[kept] = entries->tids[i];
+		kept++;
+	}
+	entries->count = kept;
+}
+
+/*
  * The entries of |key|'s stream that |snapshot| sees, in sequence order:
  * from the cache when it is current and the snapshot sees all its read did,
  * else from the catalog. The rows stay valid until transaction end.
  */
+static JournalEntries journal_entries_seen(const RootKey *key, Snapshot snapshot);
+
 static JournalEntries
 journal_entries(const RootKey *key, Snapshot snapshot)
+{
+	JournalEntries entries = journal_entries_seen(key, snapshot);
+
+	journal_consumed_filter(key, snapshot, &entries);
+	return entries;
+}
+
+static JournalEntries
+journal_entries_seen(const RootKey *key, Snapshot snapshot)
 {
 	JournalStream *stream;
 	JournalEntries result = {0};
@@ -902,6 +1023,7 @@ journal_consume(const RootKey *key, const int64 *seqs, int count, CommandId cid)
 	table_close(catalog, RowExclusiveLock);
 	if (pushed)
 		PopActiveSnapshot();
+	journal_consumed_note(key, seqs, count, cid);
 	journal_touch(MyDatabaseId, key->space, key->file, cid);
 }
 
@@ -1186,6 +1308,24 @@ journal_fold_covered(const JournalFold *fold, const JournalEntries *entries)
  * replaced by the folded ones, and the entries folded are recorded in it, so
  * that saving the state deletes them.
  */
+/*
+ * Whether a load of the latest state read roots and a journal that may
+ * disagree: the roots of |s|'s storage, or of the table whose journal it
+ * folds, moved since they were read, as when another transaction persisted
+ * a fold in between. Snapshot loads read all of them under one snapshot.
+ */
+static bool
+journal_fold_stale(const DGState *s, const RootKey *key, const RootKey *table_key, uint64 table_generation, bool latest)
+{
+	if (!latest)
+		return false;
+	if ((!s->roots_generation_known || roots_generation(key) == s->roots_generation) &&
+		roots_generation(table_key) == table_generation)
+		return false;
+	journal_fold_moved = true;
+	return true;
+}
+
 static void
 journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, const char *branch, Snapshot snapshot, DGState *s)
 {
@@ -1200,6 +1340,7 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 	JournalEntries entries;
 	MemoryContext old;
 	JournalFold *sibling;
+	uint64		table_generation = roots_generation(&table_key);
 
 	if (s->store != dg_working_store())
 		return;
@@ -1217,6 +1358,8 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 	}
 
 	entries = journal_entries(&table_key, snapshot ? snapshot : SnapshotSelf);
+	if (journal_fold_stale(s, &key, &table_key, table_generation, latest))
+		return;
 	if (!fold)
 	{
 		fold = journal_fold_find(&key, latest, true);
@@ -1295,6 +1438,12 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 				DGState    *table_state;
 				PLTree		content = journal_table_base(table, &table_key, snapshot, branch, &table_state);
 
+				if (journal_fold_stale(s, &key, &table_key, table_generation, latest))
+				{
+					if (table_state)
+						dg_release(table_state);
+					return;
+				}
 				journal_apply_index(rel, s->store, &tree, &rest, &entries, &content);
 				if (table_state)
 					dg_release(table_state);
@@ -1315,6 +1464,12 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 			DGState    *table_state;
 			PLTree		content = journal_table_base(table, &table_key, snapshot, branch, &table_state);
 
+			if (journal_fold_stale(s, &key, &table_key, table_generation, latest))
+			{
+				if (table_state)
+					dg_release(table_state);
+				return;
+			}
 			journal_apply_index(rel, s->store, &tree, &entries, &entries, &content);
 			if (table_state)
 				dg_release(table_state);
@@ -1413,6 +1568,7 @@ journal_fold_loaded(Relation rel, const char *branch, Snapshot snapshot, DGState
 		table_key = root_key(rel, branch);
 	if (batch_group_snapshot && loading_for_batch)
 		snapshot = batch_group_snapshot;
+	journal_fold_moved = false;
 	journal_fold_state(rel, &table_key, table, branch, snapshot, s);
 	if (table)
 		relation_close(table, NoLock);
