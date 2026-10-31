@@ -85,5 +85,20 @@ is(sql(q{SELECT count(*) FROM dolt_diff_summary('HEAD','STAGED')}), '0', 'captur
 my ($status, $stdout, $stderr) = $node->psql('postgres', '', extra_params => ['-c', q{SELECT dolt_commit('--allow-empty','-m','implicit block'); SELECT 1}]);
 is($status, 0, 'commit ends multi-statement implicit transaction');
 like($stdout, qr/[0-9a-v]{32}\n1/, 'subsequent statement runs after commit');
+# Publishing parent edits in a savepoint must not rebase the parent's overlay
+# permanently: an error while returning the commit result aborts that publish.
+sql(q{CREATE TABLE result_rows(id int PRIMARY KEY) USING dolt_prolly_table});
+sql(q{SELECT dolt_commit('-Am','result base')});
+$session = $node->background_psql('postgres', on_error_stop => 0);
+$session->query_safe(q{SET dolt_transaction_commit=1; BEGIN; INSERT INTO result_rows VALUES(1); SAVEPOINT result_failure});
+($out, $err) = $session->query(q{SELECT dolt_commit('-Am','bad result')::integer});
+is($err, 1, 'commit result conversion fails');
+$session->{stderr} = '';
+$session->query_safe('ROLLBACK TO result_failure');
+is($session->query_safe('TABLE result_rows'), '1', 'parent insert survives rollback of publication');
+$session->query_safe(q{INSERT INTO result_rows VALUES(2); COMMIT});
+$session->quit;
+is(sql(q{SELECT id FROM result_rows AS OF 'HEAD' ORDER BY id}), "1\n2", 'automatic commit retains both parent and later inserts');
+is(sql(q{SELECT count(*) FROM dolt_log WHERE message='bad result'}), '0', 'failed commit leaves no history');
 $node->stop;
 done_testing();

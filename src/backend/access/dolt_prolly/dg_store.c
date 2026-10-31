@@ -948,6 +948,19 @@ publish_all(void)
 		}
 		merged = roots_merge(&top->base, &top->roots, &latest);
 
+		/* A capture may publish a parent's edits inside a savepoint. Keep
+		 * its overlay intact: both the catalog publication and this rebase
+		 * must disappear if the child aborts. */
+		if (top->subxid != GetCurrentSubTransactionId())
+		{
+			Roots base = top->base;
+			Roots roots = top->roots;
+
+			overlay_push(&written[i]->key, GetCurrentCommandId(false),
+						 GetCurrentSubTransactionId(), &base, &roots);
+			top = &written[i]->entries[written[i]->count - 1];
+		}
+
 		/* A pre-commit capture must see the same merged roots we publish.
 		 * Rebase the overlay so later pre-commit publication is idempotent. */
 		top->base = top->roots = merged;
