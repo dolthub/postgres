@@ -337,17 +337,17 @@ dolt_patch_table(PG_FUNCTION_ARGS)
 Datum
 dolt_schema_diff(PG_FUNCTION_ARGS)
 {
-	char	   *from = text_to_cstring(PG_GETARG_TEXT_PP(0)),
-			   *to = text_to_cstring(PG_GETARG_TEXT_PP(1)),
-			   *table = optional_text_arg(fcinfo, 2);
+	char *from, *to, *table;
 	int			nest = begin_api();
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	char	   *fromjson = state_json(from),
-			   *tojson = !strcmp(from, to) ? fromjson : state_json(to);
+	char *fromjson, *tojson;
 	char	  **names;
 	int			n,
 				i;
 
+	diff_revision_arguments(fcinfo, &from, &to, &table);
+	fromjson = state_json(from);
+	tojson = !strcmp(from, to) ? fromjson : state_json(to);
 	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
 	if (table)
 	{
@@ -380,4 +380,10 @@ Datum
 dolt_schema_diff_table(PG_FUNCTION_ARGS)
 {
 	return dolt_schema_diff(fcinfo);
+}
+
+Datum
+dolt_schema_diff_range(PG_FUNCTION_ARGS)
+{
+ return dolt_schema_diff(fcinfo);
 }

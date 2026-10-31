@@ -39,6 +39,7 @@ typedef struct DiffRow
 typedef void (*DiffRowFn) (DiffTable *from, DiffTable *to, DiffRow *row, void *arg);
 static void split_dots(const char *spec, char **from, char **to);
 static DiffTable *diff_table_schema(const char *revision, const char *name);
+static char *optional_text_arg(FunctionCallInfo fcinfo, int n);
 
 static char *
 strip_identifier(const char *ident)
@@ -897,6 +898,30 @@ split_dots(const char *spec, char **from, char **to)
 	}
 }
 
+/* Summary, statistics and schema diffs accept either two revisions, or a
+ * two/three-dot range, followed by an optional object name. */
+static void
+diff_revision_arguments(FunctionCallInfo fcinfo, char **from, char **to, char **table)
+{
+ char *first = text_to_cstring(PG_GETARG_TEXT_PP(0));
+
+ if (strstr(first, ".."))
+ {
+  if (PG_NARGS() > 2)
+   ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("a diff revision range accepts only an optional table name")));
+  split_dots(first, from, to);
+  *table = optional_text_arg(fcinfo, 1);
+ }
+ else
+ {
+  if (PG_NARGS() < 2)
+   ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("a diff requires two revisions or a from..to revision range")));
+  *from = first;
+  *to = text_to_cstring(PG_GETARG_TEXT_PP(1));
+  *table = optional_text_arg(fcinfo, 2);
+ }
+}
+
 Datum
 dolt_diff_rows(PG_FUNCTION_ARGS)
 {
@@ -1617,17 +1642,17 @@ changed_diff_objects(const char *a, const char *b, int *count)
 Datum
 dolt_diff_stat(PG_FUNCTION_ARGS)
 {
-	char	   *from = text_to_cstring(PG_GETARG_TEXT_PP(0)),
-			   *to = text_to_cstring(PG_GETARG_TEXT_PP(1)),
-			   *table = optional_text_arg(fcinfo, 2);
+	char *from, *to, *table;
 	int			nest = begin_api();
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	char	   *fromjson = state_json(from),
-			   *tojson = !strcmp(from, to) ? fromjson : state_json(to);
+	char *fromjson, *tojson;
 	char	  **names;
 	int			n,
 				i;
 
+	diff_revision_arguments(fcinfo, &from, &to, &table);
+	fromjson = state_json(from);
+	tojson = !strcmp(from, to) ? fromjson : state_json(to);
 	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
 	if (table)
 	{
@@ -1699,4 +1724,10 @@ Datum
 dolt_diff_stat_table(PG_FUNCTION_ARGS)
 {
 	return dolt_diff_stat(fcinfo);
+}
+
+Datum
+dolt_diff_stat_range(PG_FUNCTION_ARGS)
+{
+ return dolt_diff_stat(fcinfo);
 }

@@ -67,5 +67,6 @@ tests += {
     't/049_node_cache.pl',
     't/050_concurrent_writes.pl',
     't/051_log_ranges.pl',
+    't/052_diff_ranges.pl',
   ]},
 }
