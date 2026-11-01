@@ -1138,6 +1138,12 @@ dolt_rm(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(0);
 }
 
+Datum
+dolt_rm_noargs(PG_FUNCTION_ARGS)
+{
+	return dolt_rm(fcinfo);
+}
+
 /* ---- Table checkout: restore working tables from HEAD ---- */
 
 static void

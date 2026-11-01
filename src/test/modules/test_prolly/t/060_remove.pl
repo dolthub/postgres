@@ -35,4 +35,13 @@ is($failed,1,'read-only removal rejected');like($readonly->{stderr},qr/read-only
 is(sql(q{SELECT count(*) FROM parent}), '0','read-only rejection preserves table');
 sql(q{SELECT dolt_rm('parent')});
 is(sql(q{SELECT status FROM dolt_status WHERE table_name='public.parent'}), 'deleted','clean removal stages deletion');
+sql(q{SELECT dolt_reset('--hard'); CREATE TABLE child(id int REFERENCES parent) USING dolt_prolly_table; SELECT dolt_commit('-Am','child')});
+sql(q{UPDATE t SET v='dirty'});
+fails(q{SELECT dolt_rm('parent','t')},qr/unstaged changes/,'mixed removal preflights all arguments');
+is(sql(q{SELECT count(*) FROM parent}), '0','mixed removal failure preserves earlier table');
+is(sql(q{SELECT count(*) FROM dolt_status WHERE table_name='public.parent'}),'0','failed removal does not stage earlier table');
+sql(q{SELECT dolt_rm('parent','child')});
+is(sql(q{SELECT count(*) FROM dolt_status WHERE staged AND status='deleted' AND table_name IN ('public.parent','public.child')}),'2','joint parent and child removal succeeds without cascade');
+sql(q{SELECT dolt_reset('--hard'); DROP TABLE child; SELECT dolt_rm('child','--cached')});
+is(sql(q{SELECT status FROM dolt_status WHERE staged AND table_name='public.child'}),'deleted','cached removal accepts table already absent from working');
 $node->stop;done_testing();
