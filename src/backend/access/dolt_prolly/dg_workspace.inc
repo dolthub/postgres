@@ -1035,33 +1035,111 @@ dolt_clean_noargs(PG_FUNCTION_ARGS)
 
 /* ---- dolt_rm ---- */
 
+/* Check both roots, including unstaged foreign keys for --cached. Removing
+ * all members of an FK together is legal; leaving an orphan is not. */
+static void
+rm_check_foreign_keys(const char *state, List *tables)
+{
+	char **names, **schemas;
+	int count, i;
+
+	run("SELECT v->>'name',v->>'schema' FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind'='table'",
+		1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(state)), NULL, true);
+	count = SPI_processed;
+	names = palloc(sizeof(char *) * Max(count, 1));
+	schemas = palloc(sizeof(char *) * Max(count, 1));
+	for (i = 0; i < count; i++)
+	{
+		names[i] = strcell(i, 1);
+		schemas[i] = strcell(i, 2);
+	}
+	for (i = 0; i < count; i++)
+	{
+		Constraint **constraints;
+		int n, j;
+
+		if (name_selected(tables, names[i]))
+			continue;
+		constraints = schema_constraints(metadata(hash_parse(schemas[i]), "schema"), &n);
+		for (j = 0; j < n; j++)
+		{
+			Constraint *con = constraints[j];
+			char *target;
+
+			if (con->contype != CONSTR_FOREIGN)
+				continue;
+			target = dg_qualified_name(con->pktable->schemaname, con->pktable->relname);
+			if (name_selected(tables, target))
+				ereport(ERROR, (errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+								errmsg("cannot remove %s because it is referenced from table %s", target, names[i])));
+		}
+	}
+}
+
 Datum
 dolt_rm(PG_FUNCTION_ARGS)
 {
-	int			n,
-				nest,
-				i;
-	char	  **args = arguments(fcinfo, &n);
-	bool		cached = false;
-	List	   *tables = NIL;
-	VersionRef	staged;
-	char	   *stagedjson;
+	int n, nest, i;
+	char **args = arguments(fcinfo, &n);
+	bool cached = false;
+	List *tables = NIL;
+	VersionRef staged;
+	char *stagedjson, *workingjson, *headjson;
+	StringInfoData unstaged, staged_new;
 
 	standalone(fcinfo, true);
-	nest = begin_api();
-	lock_workspace();
-	stagedjson = staged_state();
+	PreventCommandIfReadOnly("dolt_rm");
 	for (i = 0; i < n; i++)
 	{
 		if (!strcmp(args[i], "--cached"))
 			cached = true;
 		else if (args[i][0] == '-')
 			unsupported(args[i]);
-		else
-			tables = lappend(tables, resolve_object_argument(args[i], stagedjson, working_state(), true));
+	}
+	if (n == 0 || (n == 1 && cached))
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("Nothing specified, nothing removed. Which tables should I remove?")));
+	nest = begin_api();
+	lock_workspace();
+	stagedjson = staged_state();
+	workingjson = working_state();
+	headjson = head_state();
+	initStringInfo(&unstaged);
+	initStringInfo(&staged_new);
+	for (i = 0; i < n; i++)
+	{
+		char *name;
+		bool in_head, in_stage, changed_stage, changed_head;
+
+		if (!strcmp(args[i], "--cached"))
+			continue;
+		name = resolve_object_argument(args[i], stagedjson, workingjson, true);
+		tables = lappend(tables, name);
+		run("WITH h AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind'='table' AND v->>'name'=$4),"
+			"s AS (SELECT v FROM jsonb_array_elements($2::jsonb->'members') v WHERE v->>'kind'='table' AND v->>'name'=$4),"
+			"w AS (SELECT v FROM jsonb_array_elements($3::jsonb->'members') v WHERE v->>'kind'='table' AND v->>'name'=$4) "
+			"SELECT EXISTS(SELECT FROM h),EXISTS(SELECT FROM s),"
+			"EXISTS(SELECT FROM w) AND (SELECT v FROM s) IS DISTINCT FROM (SELECT v FROM w),"
+			"EXISTS(SELECT FROM w) AND (SELECT v FROM h) IS DISTINCT FROM (SELECT v FROM w)",
+			4, VC_TYPES(TEXTOID,TEXTOID,TEXTOID,TEXTOID), VC_ARGS(CStringGetTextDatum(headjson),CStringGetTextDatum(stagedjson),CStringGetTextDatum(workingjson),CStringGetTextDatum(name)), NULL, true);
+		in_head = DatumGetBool(cell(0, 1));
+		in_stage = DatumGetBool(cell(0, 2));
+		changed_stage = DatumGetBool(cell(0, 3));
+		changed_head = DatumGetBool(cell(0, 4));
+		if (!cached && (((in_stage || !in_head) && changed_stage) || ((in_head || !in_stage) && changed_head)))
+			appendStringInfo(&unstaged, "%s%s", unstaged.len ? ", " : "", args[i]);
+		else if (!cached && in_stage && !in_head)
+			appendStringInfo(&staged_new, "%s%s", staged_new.len ? ", " : "", args[i]);
+		else if (!in_stage && !in_head)
+			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("table not found in staged or HEAD: %s", args[i])));
 	}
 	if (!tables)
-		unsupported("dolt_rm requires table names");
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("Nothing specified, nothing removed. Which tables should I remove?")));
+	if (unstaged.len)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("error: the table(s) %s have unstaged changes.", unstaged.data)));
+	if (staged_new.len)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("error: the table(s) %s have changes saved in the index. Use --cached or commit.", staged_new.data)));
+	rm_check_foreign_keys(stagedjson, tables);
+	rm_check_foreign_keys(workingjson, tables);
 	staged = read_ref(branch_ref("staged"));
 	move_ref(branch_ref("staged"), staged, compose_database(staged.target ? staged.target : child(read_ref(branch_ref("heads")).target, 1), NULL, tables));
 	if (!cached)
