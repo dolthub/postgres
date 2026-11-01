@@ -21,5 +21,9 @@ is(sql(q{SELECT count(*) FROM dolt_query_diff($q$SELECT E'a\x1eb'::text AS x,'c'
 is(sql(q{SELECT count(*) FROM dolt_query_diff($q$SELECT NULL::text AS x$q$,$q$SELECT ''::text AS x$q$)}), '2', 'NULL is distinct from empty string');
 is(sql(q{SELECT diff_type,count(*) FROM dolt_query_diff($q$SELECT 1 AS x UNION ALL SELECT 1$q$,$q$SELECT 1 AS x$q$) GROUP BY diff_type}), 'deleted|1', 'keyless duplicate multiplicity is retained');
 is(sql(q{SELECT count(*) FROM dolt_query_diff($q$SELECT * FROM t$q$,$q$SELECT * FROM t$q$)}), '0', 'identical keyed result is empty');
+sql(q{CREATE TABLE parent(id int PRIMARY KEY,v text) USING dolt_prolly_table;
+CREATE TABLE child() INHERITS(parent) USING dolt_prolly_table;
+INSERT INTO parent VALUES(1,'a'); INSERT INTO child VALUES(1,'b')});
+is(sql(q{SELECT diff_type,count(*) FROM dolt_query_diff($q$SELECT * FROM parent WHERE v='a'$q$,$q$SELECT * FROM parent WHERE v='b'$q$) GROUP BY diff_type ORDER BY diff_type}), "added|1\ndeleted|1", 'inherited parent key cannot identify child rows');
 $node->stop;
 done_testing();

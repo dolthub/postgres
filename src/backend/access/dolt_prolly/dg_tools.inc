@@ -15,23 +15,25 @@ run_user_query(const char *sql)
  */
 typedef struct QueryIdentity
 {
-	char *source;
-	char *signature;
-	int nkeys;
-	int *columns;
+	char	   *source;
+	char	   *signature;
+	int			nkeys;
+	int		   *columns;
 } QueryIdentity;
 
 static QueryIdentity
 query_identity(const char *sql)
 {
 	QueryIdentity result = {0};
-	List *raw = raw_parser(sql, RAW_PARSE_DEFAULT);
-	Query *query;
+	List	   *raw = raw_parser(sql, RAW_PARSE_DEFAULT);
+	Query	   *query;
 	RangeTblEntry *rte;
-	Oid relid, pk;
-	Relation rel, index;
+	Oid			relid,
+				pk;
+	Relation	rel,
+				index;
 	StringInfoData signature;
-	int k;
+	int			k;
 
 	if (list_length(raw) != 1)
 		return result;
@@ -50,7 +52,8 @@ query_identity(const char *sql)
 		pstrdup(CatalogViewObjectIdentity(relid, RelationRelationId)) :
 		dg_qualified_name(get_namespace_name(RelationGetNamespace(rel)), RelationGetRelationName(rel));
 	pk = RelationGetPrimaryKeyIndex(rel, false);
-	if (!OidIsValid(pk))
+	/* A parent key does not constrain rows in inherited child tables. */
+	if (!OidIsValid(pk) || (rte->inh && has_subclass(relid)))
 	{
 		relation_close(rel, AccessShareLock);
 		return result;
@@ -63,18 +66,18 @@ query_identity(const char *sql)
 	initStringInfo(&signature);
 	for (k = 0; k < result.nkeys; k++)
 	{
-		AttrNumber attnum = index->rd_index->indkey.values[k];
+		AttrNumber	attnum = index->rd_index->indkey.values[k];
 		Form_pg_attribute att = TupleDescAttr(RelationGetDescr(rel), attnum - 1);
-		ListCell *lc;
-		int column = 0;
-		bool found = false;
+		ListCell   *lc;
+		int			column = 0;
+		bool		found = false;
 
 		appendStringInfo(&signature, "%zu:%s:%u;", strlen(NameStr(att->attname)),
 						 NameStr(att->attname), att->atttypid);
 		foreach(lc, query->targetList)
 		{
 			TargetEntry *tle = lfirst_node(TargetEntry, lc);
-			Var *var = IsA(tle->expr, Var) ? (Var *) tle->expr : NULL;
+			Var		   *var = IsA(tle->expr, Var) ? (Var *) tle->expr : NULL;
 
 			if (tle->resjunk)
 				continue;
@@ -101,10 +104,10 @@ query_identity(const char *sql)
 
 typedef struct QueryRow
 {
-	char *key;
-	char *row;
-	Datum *values;
-	bool *nulls;
+	char	   *key;
+	char	   *row;
+	Datum	   *values;
+	bool	   *nulls;
 } QueryRow;
 
 static int
@@ -127,8 +130,9 @@ static QueryRow *
 query_rows(const char *sql, MemoryContext cxt, int *count, int *natts,
 		   QueryIdentity *identity, bool keyed, bool distinct_sources)
 {
-	QueryRow *rows;
-	int r, c;
+	QueryRow   *rows;
+	int			r,
+				c;
 
 	run_user_query(sql);
 	*count = SPI_processed;
@@ -136,9 +140,10 @@ query_rows(const char *sql, MemoryContext cxt, int *count, int *natts,
 	rows = MemoryContextAlloc(cxt, sizeof(QueryRow) * Max(*count, 1));
 	for (r = 0; r < *count; r++)
 	{
-		StringInfoData key, row;
+		StringInfoData key,
+					row;
 		MemoryContext old = MemoryContextSwitchTo(cxt);
-		char **fields = palloc(sizeof(char *) * *natts);
+		char	  **fields = palloc(sizeof(char *) * *natts);
 
 		initStringInfo(&key);
 		initStringInfo(&row);
@@ -147,7 +152,7 @@ query_rows(const char *sql, MemoryContext cxt, int *count, int *natts,
 		for (c = 0; c < *natts; c++)
 		{
 			Form_pg_attribute att = TupleDescAttr(SPI_tuptable->tupdesc, c);
-			Datum v = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, c + 1, &rows[r].nulls[c]);
+			Datum		v = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, c + 1, &rows[r].nulls[c]);
 
 			fields[c] = rows[r].nulls[c] ? NULL : SPI_getvalue(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, c + 1);
 			rows[r].values[c] = rows[r].nulls[c] ? (Datum) 0 : datumCopy(v, att->attbyval, att->attlen);
@@ -189,9 +194,10 @@ dolt_query_diff(PG_FUNCTION_ARGS)
 			   *b;
 	Datum	   *values;
 	bool	   *nulls;
-	QueryIdentity left = query_identity(first), right = query_identity(second);
-	bool distinct_sources = left.source && right.source && strcmp(left.source, right.source);
-	bool keyed = !distinct_sources && left.source && right.source &&
+	QueryIdentity left = query_identity(first),
+				right = query_identity(second);
+	bool		distinct_sources = left.source && right.source && strcmp(left.source, right.source);
+	bool		keyed = !distinct_sources && left.source && right.source &&
 		left.signature && right.signature && !strcmp(left.signature, right.signature);
 
 	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
