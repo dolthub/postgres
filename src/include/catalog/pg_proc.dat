@@ -12973,3 +12973,8 @@
 { oid => '9247', descr => 'name of the native prolly storage format',
  proname => 'dolt_storage_format', prorettype => 'text', proargtypes => '',
  prosrc => 'dolt_storage_format' },
+
+{ oid => '9260', descr => 'versioned user metadata in a bound catalog context',
+ proname => 'dolt_user_table_context', prorows => '100', proretset => 't',
+ provolatile => 'v', proparallel => 'u', proisstrict => 'f', prorettype => 'record',
+ proargtypes => 'text text text', prosrc => 'dolt_user_table_context' },
