@@ -28,7 +28,10 @@ fails(q{SELECT dolt_rm('parent','--cached')},qr/referenced from table public.chi
 sql(q{SELECT dolt_rm('parent','child','--cached')});
 is(sql(q{SELECT count(*) FROM parent}), '0','cached joint removal leaves working parent');
 sql(q{SELECT dolt_reset('--hard')});
-fails(q{SET default_transaction_read_only=on; SELECT dolt_rm('parent')},qr/read-only transaction/,'read-only removal rejected');
+my $readonly=$node->background_psql('postgres',on_error_stop=>0);
+$readonly->query_safe(q{SET default_transaction_read_only=on});
+my($out,$failed)=$readonly->query(q{SELECT dolt_rm('parent')});
+is($failed,1,'read-only removal rejected');like($readonly->{stderr},qr/read-only transaction/,'read-only diagnostic');$readonly->{stderr}='';$readonly->quit;
 is(sql(q{SELECT count(*) FROM parent}), '0','read-only rejection preserves table');
 sql(q{SELECT dolt_rm('parent')});
 is(sql(q{SELECT status FROM dolt_status WHERE table_name='public.parent'}), 'deleted','clean removal stages deletion');

@@ -1038,29 +1038,19 @@ dolt_clean_noargs(PG_FUNCTION_ARGS)
 /* Check both roots, including unstaged foreign keys for --cached. Removing
  * all members of an FK together is legal; leaving an orphan is not. */
 static void
-rm_check_foreign_keys(const char *state, List *tables)
+rm_check_foreign_keys(bytea *database, List *tables)
 {
-	char **names, **schemas;
 	int count, i;
+	Member *members = database_members(database, &count);
 
-	run("SELECT v->>'name',v->>'schema' FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind'='table'",
-		1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(state)), NULL, true);
-	count = SPI_processed;
-	names = palloc(sizeof(char *) * Max(count, 1));
-	schemas = palloc(sizeof(char *) * Max(count, 1));
-	for (i = 0; i < count; i++)
-	{
-		names[i] = strcell(i, 1);
-		schemas[i] = strcell(i, 2);
-	}
 	for (i = 0; i < count; i++)
 	{
 		Constraint **constraints;
 		int n, j;
 
-		if (name_selected(tables, names[i]))
+		if (strcmp(members[i].kind, "table") || name_selected(tables, members[i].name))
 			continue;
-		constraints = schema_constraints(metadata(hash_parse(schemas[i]), "schema"), &n);
+		constraints = schema_constraints(metadata(child(members[i].hash, 1), "schema"), &n);
 		for (j = 0; j < n; j++)
 		{
 			Constraint *con = constraints[j];
@@ -1071,7 +1061,7 @@ rm_check_foreign_keys(const char *state, List *tables)
 			target = dg_qualified_name(con->pktable->schemaname, con->pktable->relname);
 			if (name_selected(tables, target))
 				ereport(ERROR, (errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
-								errmsg("cannot remove %s because it is referenced from table %s", target, names[i])));
+								errmsg("cannot remove %s because it is referenced from table %s", target, members[i].name)));
 		}
 	}
 }
@@ -1138,9 +1128,9 @@ dolt_rm(PG_FUNCTION_ARGS)
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("error: the table(s) %s have unstaged changes.", unstaged.data)));
 	if (staged_new.len)
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("error: the table(s) %s have changes saved in the index. Use --cached or commit.", staged_new.data)));
-	rm_check_foreign_keys(stagedjson, tables);
-	rm_check_foreign_keys(workingjson, tables);
 	staged = read_ref(branch_ref("staged"));
+	rm_check_foreign_keys(staged.target ? staged.target : child(read_ref(branch_ref("heads")).target, 1), tables);
+	rm_check_foreign_keys(read_ref(branch_ref("working")).target, tables);
 	move_ref(branch_ref("staged"), staged, compose_database(staged.target ? staged.target : child(read_ref(branch_ref("heads")).target, 1), NULL, tables));
 	if (!cached)
 		drop_objects(tables);
