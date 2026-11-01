@@ -281,7 +281,7 @@ static const HelpEntry help_entries[] = {
 	{"dolt_remote", "procedure", "dolt_remote(add name url | remove name)", "Manage remote definitions.", "{\"add\": \"Add a remote\", \"remove\": \"Remove a remote\"}"},
 	{"dolt_reset", "procedure", "dolt_reset([--hard | --soft] [revision] | table...)", "Reset the staged set or the branch head.", "{\"--hard\": \"Reset working and staged sets\", \"--soft\": \"Move HEAD only\"}"},
 	{"dolt_revert", "procedure", "dolt_revert(commit...)", "Create commits that undo earlier commits.", "{\"commit\": \"Commit to revert\", \"--author\": \"Override the commit author\"}"},
-	{"dolt_rm", "procedure", "dolt_rm([--cached] table...)", "Remove tables from the working and staged sets.", "{\"--cached\": \"Unstage only\"}"},
+	{"dolt_rm", "procedure", "dolt_rm([--cached] table...)", "Remove tables from the working and staged sets.", "{\"--cached\": \"Remove from staging while preserving working tables\"}"},
 	{"dolt_stash", "procedure", "dolt_stash(push | pop | apply | drop | clear, name [index])", "Save and restore working set changes.", "{\"push\": \"Save local changes\", \"pop\": \"Apply and remove a stash\", \"apply\": \"Apply a stash\", \"drop\": \"Remove a stash\", \"clear\": \"Remove all stashes of a name\"}"},
 	{"dolt_tag", "procedure", "dolt_tag([-m message] name [revision] | -d name)", "Create or delete tags.", "{\"-m, --message\": \"Tag message\", \"-d\": \"Delete a tag\"}"},
 	{"dolt_verify_constraints", "procedure", "dolt_verify_constraints([--all] [--output-only] [table...])", "Verify constraints of the working set.", "{\"--all\": \"Check all rows\", \"--output-only\": \"Do not record violations\"}"},
