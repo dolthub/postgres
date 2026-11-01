@@ -23,7 +23,7 @@ advances the API snapshot before composed states are read back.
 | `dolt_add(table, ...)` | Stages only the named tables (qualified or resolved along the search path). `.`/`-A` unchanged. |
 | `dolt_reset()` / `('.')` | Unstages everything (staged ← HEAD). `dolt_reset(table, ...)` unstages tables. `dolt_reset(rev)` moves HEAD and staging (mixed). `--soft rev` moves HEAD only. `--hard [rev]` restores every table in the target state, drops working tables the target lacks, and moves HEAD, staging and working; canonical definitions restore missing tables and their dependencies without replaying user DDL. |
 | `dolt_clean([--dry-run] [table ...])` | Drops untracked tables (present in neither HEAD nor staging) through DDL. |
-| `dolt_rm([--cached] table ...)` | Removes tables from staging; without `--cached` also drops them. |
+| `dolt_rm([--cached] table ...)` | Removes tables from staging; without `--cached` also drops them. Ordinary removal rejects uncommitted changes; `--cached` preserves working data. Both modes reject foreign-key orphans in staged or working schemas and reject read-only transactions. |
 | `dolt_checkout(table, ...)` | Restores working tables from HEAD; tables absent from HEAD are dropped (Dolt's MoveTablesFromHeadToWorking). Returns `(0, '')`. Unknown names: "tablespec 'x' did not match any table(s) known to dolt". Tags or hashes: the Dolt detached-HEAD error. Checking out the session branch reports "Already on branch". |
 | `dolt_branch` | `-d`/`-D [-f]` deletes (not the session branch; other attached sessions prevent deletion unless `-f`; refs, pending merge and runtime bindings go), `-m [-f] old new` renames, `-c [-f] src dst` copies. Rename and copy require a clean source branch because branch-tagged relation roots cannot be re-labelled; the new branch starts from the source head. |
 | `dolt_tag('-d', name)` | Deletes a tag. |
@@ -72,3 +72,16 @@ Session advisory locks protect branches from ordinary deletion. Force deletion
 bypasses that protection. Subsequent writes fail once deletion is visible, but
 old snapshots and sessions surviving deletion plus same-name recreation still
 need the authority checks documented in KNOWN-ISSUES.md.
+
+## Table removal validation (2026-11-01)
+
+Removal preflights every requested table before changing refs or running DROP.
+It follows Dolt's HEAD/staged/working checks: ordinary removal protects newly
+staged tables and changes relative to either HEAD or staging; `--cached` permits
+those changes because it leaves working data intact. Foreign-key checks inspect
+both retained schema graphs, even for `--cached` and for a constraint present in
+only one graph. Removing both referencing and referenced tables together is legal.
+Native DROP continues to protect other live dependencies. Tests cover atomic
+failure, already-dropped working tables, no-argument diagnostics and actual
+PostgreSQL read-only sessions. General dependency validation of a staged-only
+removal beyond foreign keys remains separate work.
