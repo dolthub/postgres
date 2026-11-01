@@ -1,0 +1,36 @@
+use strict;
+use warnings FATAL => 'all';
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
+my $node=PostgreSQL::Test::Cluster->new('stash_workspaces');
+$node->init(extra=>['--encoding=UTF8','--locale=C']);$node->start;
+my $s=$node->background_psql('postgres',on_error_stop=>0);
+sub sql { $s->query_safe($_[0]); }
+sub fails {my($q,$pattern,$label)=@_;my($out,$failed)=$s->query($q);is($failed,1,$label);like($s->{stderr},$pattern,"$label diagnostic");$s->{stderr}='';}
+sql(q{CREATE TABLE t(id int PRIMARY KEY,v text) USING dolt_prolly_table; INSERT INTO t VALUES(1,'base'); SELECT dolt_commit('-Am','base'); CREATE TABLE loose(id int) USING dolt_prolly_table; INSERT INTO loose VALUES(9)});
+fails(q{SELECT dolt_stash('push','empty')},qr/No local changes/,'untracked-only changes do not create stash');
+is(sql(q{SELECT * FROM loose}),'9','empty push leaves untracked contents');
+sql(q{UPDATE t SET v='saved'; SELECT dolt_stash('push','saved')});
+is(sql(q{SELECT * FROM loose}),'9','ordinary push preserves untracked table');
+is(sql(q{SELECT v FROM t}),'base','push resets tracked changes');
+is(sql(q{SELECT commit_message FROM dolt_stashes WHERE name='saved'}),'base','stash table exposes original commit description');
+sql(q{SELECT dolt_stash('pop','saved','stash@{0}')});
+is(sql(q{SELECT v FROM t}),'saved','pop accepts formatted reference');
+sql(q{SELECT dolt_reset('--hard'); DROP TABLE t; SELECT dolt_stash('push','deleted')});
+is(sql(q{SELECT v FROM t}),'base','push restores a deleted table');
+sql(q{SELECT dolt_stash('pop','deleted')});
+is(sql(q{SELECT status FROM dolt_status WHERE table_name='public.t'}),'deleted','pop reapplies table deletion');
+sql(q{SELECT dolt_reset('--hard'); CREATE TABLE added(id int) USING dolt_prolly_table; INSERT INTO added VALUES(3); SELECT dolt_add('added'); CREATE TABLE loose(id int) USING dolt_prolly_table; INSERT INTO loose VALUES(9); SELECT dolt_stash('push','all','--include-untracked')});
+is(sql(q{SELECT count(*) FROM dolt_status}),'0','include-untracked resets both added tables');
+sql(q{SELECT dolt_stash('apply','all')});
+is(sql(q{SELECT table_name,staged,status FROM dolt_status ORDER BY table_name}),"public.added|t|new table\npublic.loose|f|new table",'apply restages only originally staged additions');
+is(sql(q{SELECT * FROM loose}),'9','untracked contents restored');
+is(sql(q{SELECT count(*) FROM dolt_stashes WHERE name='all'}),'1','apply retains stash');
+sql(q{SELECT dolt_reset('--hard'); UPDATE t SET v='one'; SELECT dolt_stash('push','a_'); UPDATE t SET v='two'; SELECT dolt_stash('push','aX'); SELECT dolt_stash('clear','a_')});
+is(sql(q{SELECT count(*) FROM dolt_stashes WHERE name='aX'}),'1','stash names are exact keys rather than LIKE patterns');
+sql(q{UPDATE t SET v='local'});
+fails(q{SELECT dolt_stash('pop','aX')},qr/stash entry is kept/,'conflicting pop is atomic');
+is(sql(q{SELECT v FROM t}),'local','conflicting pop preserves working data');
+is(sql(q{SELECT count(*) FROM dolt_stashes WHERE name='aX'}),'1','conflicting pop retains saved data');
+$s->quit;$node->stop;done_testing();

@@ -394,16 +394,16 @@ dolt_rebase(PG_FUNCTION_ARGS)
 static char *
 stash_ref(const char *name, int idx)
 {
-	run("SELECT refname FROM pg_catalog.pg_dolt_ref WHERE refname LIKE 'stash/' || $1 || '/%' ORDER BY split_part(refname,'/',3)::bigint DESC OFFSET $2 LIMIT 1", 2, VC_TYPES(TEXTOID, INT8OID), VC_ARGS(CStringGetTextDatum(name), Int64GetDatum(idx)), NULL, true);
+	run("SELECT refname FROM pg_catalog.pg_dolt_ref WHERE split_part(refname,'/',1)='stash' AND split_part(refname,'/',2)=$1 ORDER BY split_part(refname,'/',3)::bigint DESC OFFSET $2 LIMIT 1", 2, VC_TYPES(TEXTOID, INT8OID), VC_ARGS(CStringGetTextDatum(name), Int64GetDatum(idx)), NULL, true);
 	if (!SPI_processed)
-		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("error: stash@{%d} is not a valid reference in stash %s", idx, name)));
+		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("No stash entries found. error: stash@{%d} is not a valid reference in stash %s", idx, name)));
 	return strcell(0, 1);
 }
 
 static void
-stash_push(const char *name)
+stash_push(const char *name, bool untracked, bool all)
 {
-	char	   *branch = dg_current_branch();
+	const char *branch = dg_current_branch();
 	VersionRef	head = read_ref(branch_ref("heads")),
 				staged = read_ref(branch_ref("staged"));
 	bytea	   *headdb = child(head.target, 1),
@@ -411,30 +411,31 @@ stash_push(const char *name)
 			   *workingdb,
 			   *state;
 	Capture		current = capture_visible();
-	List	   *tracked = list_concat(state_tables(head_state()), state_tables(staged_state())),
-			   *changed = NIL,
-			   *live = state_tables(metadata(current.hash, "database"));
+	List *tracked = list_concat(state_objects(head_state()), state_objects(staged_state()));
+	List *selected = list_copy(tracked);
+	List *ignored = all ? NIL : ignored_untracked_tables(current.json, staged_state());
 	ListCell   *lc;
 	StringInfoData json;
 	char	   *message,
 			   *headmeta = metadata(head.target, "commit");
 	int64		seq;
 
-	if (database_same(current.hash, headdb) && database_same(stageddb, headdb))
+	if (untracked || all)
+		foreach(lc, state_objects(current.json))
+			if (!name_selected(selected, lfirst(lc)) && !name_selected(ignored, lfirst(lc)))
+				selected = lappend(selected, lfirst(lc));
+	/* Include deletions by selecting from HEAD as well as the live root. */
+	workingdb = compose_database(headdb, current.hash, selected);
+	if (database_same(workingdb, headdb) && database_same(stageddb, headdb))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("No local changes to save")));
-	/* Only tracked tables are stashed; untracked tables stay in place. */
-	foreach(lc, live)
-		if (name_selected(tracked, (char *) lfirst(lc)))
-		changed = lappend(changed, lfirst(lc));
-	workingdb = compose_database(headdb, current.hash, changed);
-	run("SELECT coalesce(max(split_part(refname,'/',3)::bigint),0)+1 FROM pg_catalog.pg_dolt_ref WHERE refname LIKE 'stash/' || $1 || '/%'", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(name)), NULL, true);
+	run("SELECT coalesce(max(split_part(refname,'/',3)::bigint),0)+1 FROM pg_catalog.pg_dolt_ref WHERE split_part(refname,'/',1)='stash' AND split_part(refname,'/',2)=$1", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(name)), NULL, true);
 	seq = DatumGetInt64(cell(0, 1));
-	message = psprintf("WIP on %s: %.7s %s", branch, hash_format(head.target), json_value(headmeta, "message"));
+	message = json_value(headmeta, "message");
 	initStringInfo(&json);
 	appendStringInfo(&json, "{\"branch\":%s,\"head\":\"%s\",\"message\":%s}", quote_json(branch), hash_format(head.target), quote_json(message));
 	state = put("stash", json.data, VC_ARGS(PointerGetDatum(workingdb), PointerGetDatum(stageddb), PointerGetDatum(head.target)), 3);
 	move_ref(psprintf("stash/%s/" INT64_FORMAT, name, seq), empty_ref, state);
-	restore_tables(headdb);
+	restore_tables(compose_database(current.hash, headdb, selected));
 	move_ref(branch_ref("staged"), staged, headdb);
 	move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture_visible().hash);
 	advance_snapshot();
@@ -445,24 +446,40 @@ static void
 stash_apply(const char *name, int idx)
 {
 	char	   *ref = stash_ref(name, idx);
-	bytea	   *state = read_ref(ref).target,
-			   *stashdb = child(state, 1),
-			   *stashhead = child(state, 3),
-			   *stashheaddb = child(stashhead, 1),
-			   *current = capture_visible().hash,
-			   *ours;
-	StringInfoData conflicts,
-				violations;
+	bytea *state = read_ref(ref).target,
+		*stashdb = child(state, 1),
+		*stashhead = child(state, 3),
+		*stashheaddb = child(stashhead, 1),
+		*current = capture_visible().hash;
+	StringInfoData conflicts, violations, schema_conflicts;
+	List *added = NIL;
+	List *base_tables = state_tables(metadata(stashheaddb, "database"));
+	List *staged_tables = state_tables(metadata(child(state, 2), "database"));
+	ListCell *lc;
+	Capture merged;
 
-	/* Compare and merge only the stashed tables; untracked tables stay. */
-	ours = compose_database(stashheaddb, current, state_tables(metadata(stashdb, "database")));
-	same_schema(metadata(ours, "database"), metadata(stashdb, "database"));
 	initStringInfo(&conflicts);
 	initStringInfo(&violations);
-	install_database(stashheaddb, ours, stashdb, row_merges(state_tables(metadata(stashdb, "database"))), &conflicts, &violations);
+	initStringInfo(&schema_conflicts);
+	merge_databases(stashheaddb, current, stashdb, &conflicts, &violations, &schema_conflicts);
+	if (schema_conflicts.len)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("merge aborted: schema conflict applying stash@{%d}: %s", idx, schema_conflicts.data)));
 	if (conflicts.len || violations.len)
-		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("error: Your local changes to the following tables would be overwritten by applying stash@{%d}:\n%s", idx, conflicts.len ? conflicts.data : violations.data)));
-	move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture_visible().hash);
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("error: Your local changes would be overwritten by applying stash@{%d}; the stash entry is kept", idx)));
+	merged = capture_visible();
+	/* Dolt restores staging only for newly staged tables, with their full
+	 * merged contents. Previously tracked modifications remain unstaged. */
+	foreach(lc, staged_tables)
+		if (!name_selected(base_tables, lfirst(lc)))
+			added = lappend(added, lfirst(lc));
+	if (added)
+	{
+		VersionRef staged = read_ref(branch_ref("staged"));
+		bytea *base = staged.target ? staged.target : child(read_ref(branch_ref("heads")).target, 1);
+
+		move_ref(branch_ref("staged"), staged, compose_database(base, merged.hash, added));
+	}
+	move_ref(branch_ref("working"), read_ref(branch_ref("working")), merged.hash);
 	advance_snapshot();
 }
 
@@ -481,7 +498,7 @@ stash_clear(const char *name)
 				i;
 	char	  **refs;
 
-	run("SELECT refname FROM pg_catalog.pg_dolt_ref WHERE refname LIKE 'stash/' || $1 || '/%'", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(name)), NULL, true);
+	run("SELECT refname FROM pg_catalog.pg_dolt_ref WHERE split_part(refname,'/',1)='stash' AND split_part(refname,'/',2)=$1", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(name)), NULL, true);
 	n = SPI_processed;
 	refs = palloc(sizeof(char *) * Max(n, 1));
 	for (i = 0; i < n; i++)
@@ -499,8 +516,10 @@ dolt_stash(PG_FUNCTION_ARGS)
 	char	  **args = arguments(fcinfo, &n),
 			   *command,
 			   *name;
+	bool untracked = false, all = false;
 
 	standalone(fcinfo, true);
+	PreventCommandIfReadOnly("dolt_stash");
 	if (n < 2)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("error: invalid arguments. Must provide valid subcommand and stash name")));
 	command = args[0];
@@ -508,21 +527,37 @@ dolt_stash(PG_FUNCTION_ARGS)
 	valid_name(name);
 	if (strchr(name, '/'))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid stash name: %s", name)));
-	if (n > 2)
+	if (!strcmp(command, "push"))
 	{
-		char	   *end;
+		for (int i = 2; i < n; i++)
+		{
+			if (!strcmp(args[i], "--include-untracked") || !strcmp(args[i], "-u"))
+				untracked = true;
+			else if (!strcmp(args[i], "--all") || !strcmp(args[i], "-a"))
+				all = true;
+			else
+				ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("error: invalid arguments. Push takes only subcommand and stash name, with --include-untracked or --all")));
+		}
+	}
+	else if (n > 2)
+	{
+		char *end, *number = args[2];
+		long parsed;
 
-		if (!strcmp(command, "push") || !strcmp(command, "clear"))
-			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("error: invalid arguments. %s takes only subcommand and stash name", !strcmp(command, "push") ? "Push" : "Clear")));
-		idx = strtol(args[2], &end, 10);
-		if (*end || idx < 0 || n > 3)
+		if (!strcmp(command, "clear"))
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("error: invalid arguments. Clear takes only subcommand and stash name")));
+		if (!strncmp(number, "stash@{", 7) && number[strlen(number)-1] == '}')
+			number = pnstrdup(number + 7, strlen(number) - 8);
+		parsed = strtol(number, &end, 10);
+		if (!*number || *end || parsed < 0 || parsed > INT_MAX || n > 3)
 			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("error: %s is not a valid reference", args[2])));
+		idx = parsed;
 	}
 	nest = begin_api();
 	lock_workspace();
 	ensure_repository();
 	if (!strcmp(command, "push"))
-		stash_push(name);
+		stash_push(name, untracked, all);
 	else if (!strcmp(command, "pop"))
 	{
 		stash_apply(name, idx);

@@ -80,7 +80,7 @@ $s->query_safe(q{INSERT INTO t VALUES (10,'ten'); UPDATE t SET v='edited' WHERE 
 ok_sql(q{SELECT dolt_stash('push','mine')},'0','stash push');
 ok_sql(q{SELECT pk||'|'||v FROM t ORDER BY pk},'0|main-one','tracked changes are stashed');
 ok_sql(q{SELECT * FROM dolt_status},'public.u|f|new table','untracked tables stay');
-ok_sql(q{SELECT name,stash_id,branch,hash=dolt_hashof('main'),commit_message LIKE 'WIP on main: % main edits 0' FROM dolt_stashes},'mine|stash@{0}|main|t|t','stashes table');
+ok_sql(q{SELECT name,stash_id,branch,hash=dolt_hashof('main'),commit_message = 'main edits 0' FROM dolt_stashes},'mine|stash@{0}|main|t|t','stashes table');
 $s->query_safe(q{INSERT INTO t VALUES (11,'eleven')});
 ok_sql(q{SELECT dolt_stash('push','mine')},'0','second stash');
 ok_sql(q{SELECT stash_id FROM dolt.stashes ORDER BY stash_id},"stash\@{0}\nstash\@{1}",'newest stash is stash@{0}');
