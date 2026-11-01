@@ -315,14 +315,14 @@ end_api(int nest)
 /* User SQL must not inherit the internal manifest lookup bypass. Nested
  * provider calls may enter begin_api again, so preserve the caller path. */
 static void
-run_context(const char *sql, int nargs, Oid *types, Datum *args,
-			const char *nulls, bool readonly)
+run_context_view(const char *sql, int nargs, Oid *types, Datum *args,
+			const char *nulls, bool readonly, CatalogView *view)
 {
 	int			depth = catalog_api_depth;
 	int			nest = NewGUCNestLevel();
 	char	   *path = pstrdup(api_search_path ? api_search_path : "public");
 	SubTransactionId subids[64];
-	CatalogView *previous = CatalogViewSwitch(NULL);
+	CatalogView *previous = CatalogViewSwitch(view);
 
 	memcpy(subids, catalog_api_subids, sizeof(subids));
 
@@ -349,6 +349,13 @@ run_context(const char *sql, int nargs, Oid *types, Datum *args,
 		AtEOXact_GUC(true, nest);
 	}
 	PG_END_TRY();
+}
+
+static void
+run_context(const char *sql, int nargs, Oid *types, Datum *args,
+			const char *nulls, bool readonly)
+{
+	run_context_view(sql, nargs, types, args, nulls, readonly, NULL);
 }
 
 typedef struct StandaloneCall

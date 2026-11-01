@@ -77,5 +77,6 @@ tests += {
       't/059_query_diff.pl',
       't/060_remove.pl',
       't/061_stash_workspaces.pl',
+      't/062_user_catalog_history.pl',
   ]},
 }

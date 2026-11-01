@@ -376,7 +376,11 @@ dolt_user_table(PG_FUNCTION_ARGS)
 	const char *empty;
 	int			nest = begin_api();
 	bool		exists;
+	CatalogView *view = NULL;
 	char	   *query;
+
+	if (PG_NARGS() == 3)
+		view = context_view(hash_parse(text_to_cstring(PG_GETARG_TEXT_PP(1))), PG_ARGISNULL(2) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(2)));
 
 	if (!strcmp(name, "dolt_docs"))
 	{
@@ -395,12 +399,20 @@ dolt_user_table(PG_FUNCTION_ARGS)
 	}
 	else
 		elog(ERROR, "unknown versioned metadata table");
-	run_context("SELECT EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relname=$1)", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(name)), NULL, true);
+	run_context_view("SELECT EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relname=$1)", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(name)), NULL, true, view);
 	exists = DatumGetBool(cell(0, 1));
 	query = exists ? psprintf("SELECT %s FROM public.%s", columns, name) : psprintf("SELECT %s WHERE false", empty);
 	if (!strcmp(name, "dolt_docs"))
 		query = psprintf("%s UNION ALL SELECT 'AGENT.md'::text,pg_catalog.dolt_default_doc('AGENT.md') %s", query, exists ? "WHERE NOT EXISTS (SELECT 1 FROM public.dolt_docs WHERE doc_name='AGENT.md')" : "");
-	run_context(query, 0, NULL, NULL, NULL, true);
+	run_context_view(query, 0, NULL, NULL, NULL, true, view);
 	return_rows(fcinfo, nest);
 	return (Datum) 0;
+}
+
+Datum
+dolt_user_table_context(PG_FUNCTION_ARGS)
+{
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("metadata name and catalog context cannot be null")));
+	return dolt_user_table(fcinfo);
 }

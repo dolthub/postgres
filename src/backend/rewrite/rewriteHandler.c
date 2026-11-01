@@ -19,6 +19,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/doltsystem.h"
 
 #include "access/doltcatalog.h"
 #include "access/relation.h"
@@ -106,6 +107,8 @@ inherit_catalog_context(Node *node, const RangeTblEntry *context)
 	if (IsA(node, Query))
 		return query_tree_walker((Query *) node, inherit_catalog_context,
 								 (void *) context, QTW_EXAMINE_RTES_BEFORE);
+	if (IsA(node, FuncExpr))
+		dg_system_function_context((FuncExpr *) node, context->dolt_database, context->dolt_branch);
 	if (IsA(node, RangeTblEntry))
 	{
 		RangeTblEntry *rte = (RangeTblEntry *) node;

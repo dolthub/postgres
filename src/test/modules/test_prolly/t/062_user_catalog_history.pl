@@ -1,0 +1,34 @@
+use strict;
+use warnings FATAL => 'all';
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
+my $node=PostgreSQL::Test::Cluster->new('user_catalog_history');
+$node->init(extra=>['--encoding=UTF8','--locale=C']);$node->start;
+my $s=$node->background_psql('postgres',on_error_stop=>0);
+sub sql { $s->query_safe($_[0]); }
+sub fails {my($q,$pattern,$label)=@_;my($out,$failed)=$s->query($q);is($failed,1,$label);like($s->{stderr},$pattern,"$label diagnostic");$s->{stderr}='';}
+sql(q{SELECT dolt_commit('--allow-empty','-m','empty')});
+sql(q{INSERT INTO dolt_query_catalog VALUES('q',1,'q','SELECT 1','old'); SELECT dolt_commit('-Am','first')});
+sql(q{UPDATE dolt_query_catalog SET description='new'; SELECT dolt_commit('-Am','second')});
+is(sql(q{SELECT description FROM dolt_query_catalog AS OF 'HEAD~1'}),'old','unqualified alias reads historical rows');
+is(sql(q{SELECT description FROM dolt.query_catalog AS OF 'HEAD~1'}),'old','dolt schema alias reads historical rows');
+is(sql(q{SELECT count(*) FROM dolt_query_catalog AS OF 'HEAD~2'}),'0','alias is empty before backing table existed');
+is(sql(q{SELECT a.description,b.description FROM dolt_query_catalog AS OF 'HEAD~1' a CROSS JOIN dolt_query_catalog AS OF 'HEAD' b}),'old|new','two alias revisions remain independent');
+sql(q{PREPARE history AS SELECT description FROM dolt_query_catalog AS OF 'HEAD~1'});
+is(sql(q{EXECUTE history}),'old','prepared alias binds historical provider');
+sql(q{UPDATE dolt_query_catalog SET description='third'; SELECT dolt_commit('-Am','third')});
+is(sql(q{EXECUTE history}),'new','prepared relative revision follows moved HEAD');
+sql(q{SELECT dolt_checkout('-b','side'); UPDATE dolt_query_catalog SET description='side'; SELECT dolt_checkout('main')});
+is(sql(q{SELECT description FROM "postgres/side".dolt.query_catalog}),'side','branch-qualified alias reads uncommitted branch state');
+sql(q{DROP TABLE dolt_query_catalog});
+is(sql(q{SELECT count(*) FROM dolt_query_catalog}),'0','drop removes branch data but retains alias');
+fails(q{DROP TABLE dolt_query_catalog},qr/does not exist/,'second drop reports missing backing table');
+sql(q{DROP TABLE IF EXISTS dolt_query_catalog});
+is(sql(q{SELECT description FROM dolt_query_catalog AS OF 'HEAD'}),'third','history survives backing table drop');
+is(sql(q{SELECT description FROM "postgres/side".dolt.query_catalog}),'side','drop leaves other branch unchanged');
+sql(q{INSERT INTO dolt_query_catalog VALUES('new',2,'new','SELECT 2','recreated')});
+is(sql(q{SELECT description FROM dolt_query_catalog}),'recreated','insert recreates backing table automatically');
+sql(q{DROP TABLE dolt.query_catalog});
+is(sql(q{SELECT count(*) FROM dolt.query_catalog}),'0','dolt schema drop targets same backing table');
+$s->quit;$node->stop;done_testing();

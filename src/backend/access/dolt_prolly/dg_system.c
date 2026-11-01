@@ -14,6 +14,8 @@
 #include "catalog/pg_namespace_d.h"
 #include "utils/lsyscache.h"
 #include "utils/acl.h"
+#include "utils/fmgroids.h"
+#include "catalog/pg_collation_d.h"
 
 bool		dolt_show_system_tables = false;
 
@@ -526,6 +528,20 @@ dg_system_function_columns(ParseState *pstate, FuncCall *fc)
 	return desc ? layout_columns(desc) : NIL;
 }
 
+/* A copied system-view rule must carry its immutable revision through the
+ * metadata reader's nested SQL, rather than silently reading the session HEAD. */
+void
+dg_system_function_context(FuncExpr *expr, const char *database, const char *branch)
+{
+	if (expr->funcid != F_DOLT_USER_TABLE || list_length(expr->args) != 1)
+		return;
+	expr->funcid = F_DOLT_USER_TABLE_CONTEXT;
+	expr->args = lappend(expr->args, makeConst(TEXTOID, -1, DEFAULT_COLLATION_OID, -1,
+		CStringGetTextDatum(database), false, false));
+	expr->args = lappend(expr->args, makeConst(TEXTOID, -1, DEFAULT_COLLATION_OID, -1,
+		branch ? CStringGetTextDatum(branch) : (Datum) 0, branch == NULL, false));
+}
+
 /* User content has ordinary branch-aware storage. Built-in aliases only name
  * these tables; they do not own a second copy of their rows. */
 bool		dg_internal_system_ddl;
@@ -569,6 +585,46 @@ dg_system_check_ddl(Node *statement)
 {
 	if (!IsUnderPostmaster || dg_internal_system_ddl)
 		return;
+	if (IsA(statement, DropStmt) && ((DropStmt *) statement)->removeType == OBJECT_TABLE)
+	{
+		DropStmt *drop = (DropStmt *) statement;
+		List *objects = NIL;
+		ListCell *lc;
+
+		foreach(lc, drop->objects)
+		{
+			List *names = lfirst(lc);
+			RangeVar *rv = makeRangeVarFromNameList(names);
+			const char *name = rv->relname;
+			bool metadata;
+
+			if (rv->schemaname && !strcmp(rv->schemaname, "dolt"))
+			{
+				if (!strcmp(name, "docs")) name = "dolt_docs";
+				else if (!strcmp(name, "tests")) name = "dolt_tests";
+				else if (!strcmp(name, "query_catalog")) name = "dolt_query_catalog";
+			}
+			metadata = (!rv->schemaname || !strcmp(rv->schemaname,"public") || !strcmp(rv->schemaname,"dolt")) &&
+				(!strcmp(name,"dolt_docs") || !strcmp(name,"dolt_tests") || !strcmp(name,"dolt_query_catalog"));
+			if (metadata && !rv->catalogname)
+			{
+				Oid id;
+
+				rv->schemaname = "public";
+				rv->relname = (char *) name;
+				id = RangeVarGetRelidExtended(rv, NoLock, RVR_MISSING_OK, NULL, NULL);
+				if (!OidIsValid(id) || get_rel_relkind(id) == RELKIND_VIEW)
+				{
+					if (!drop->missing_ok)
+						ereport(ERROR,(errcode(ERRCODE_UNDEFINED_TABLE),errmsg("table %s does not exist", name)));
+					continue;
+				}
+				names = list_make2(makeString("public"),makeString(pstrdup(name)));
+			}
+			objects = lappend(objects, names);
+		}
+		drop->objects = objects;
+	}
 	if (IsA(statement, CreateStmt))
 		reserved_name(((CreateStmt *) statement)->relation->relname);
 	else if (IsA(statement, CreateForeignTableStmt))
