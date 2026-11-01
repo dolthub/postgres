@@ -50,11 +50,20 @@ overwritten" message on conflicts; `pop` and `drop` remove the entry,
 ## dolt_query_diff
 
 Both query strings are analyzed at parse time (`query_diff_layout`) so the
-result has `from_<col>…, to_<col>…, diff_type`. Rows are compared as whole
-values after running both queries with the caller's search path: rows only
-in the first result are `deleted`, rows only in the second are `added`, and
-identical rows are omitted. Dolt's primary-key based `modified` rows are not
-produced.
+result has `from_<col>…, to_<col>…, diff_type`. Both queries run with the
+caller's search path. Direct single-table projections containing a complete,
+nondeferrable primary key pair rows by that key and report `modified` when
+other output values differ. Key definitions come from each query's bound
+revision. Different logical table names produce separate deletions/additions,
+without rename fingerprints or persistent column tags.
+
+Other results use whole-row multiset comparison: unmatched rows are `deleted`
+or `added`, identical rows cancel, and duplicate multiplicity is preserved.
+This fallback includes joins, aggregates, set operations, incomplete key
+projections and inheritance scans (a parent's key does not constrain its
+children). Typed, length-framed text values distinguish embedded delimiters,
+NULLs and empty strings. Generic query lineage through views/subqueries is not
+yet inferred.
 
 ## dolt.help
 
