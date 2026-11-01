@@ -925,6 +925,15 @@ publish_all(void)
 	if (XactReadOnly)
 		ereport(ERROR, (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION), errmsg("cannot publish prolly roots in a read-only transaction")));
 	qsort(written, count, sizeof(Overlay *), compare_overlays);
+
+	/*
+	 * Write our own nodes before locking any root row. A locked root row is
+	 * held until commit, and every other publisher of its table waits on it,
+	 * so under the lock only the few nodes a merge builds remain to write.
+	 */
+	for (int i = 0; i < count; i++)
+		persist_roots(&written[i]->entries[written[i]->count - 1].roots);
+
 	catalog = table_open(DoltRootRelationId, RowExclusiveLock);
 	for (int i = 0; i < count; i++)
 	{
