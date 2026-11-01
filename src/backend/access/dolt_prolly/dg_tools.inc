@@ -9,19 +9,106 @@ run_user_query(const char *sql)
 }
 
 /* ---- dolt_query_diff ----
- *
- * Both queries are analyzed at parse time (dg_system_function_columns) to
- * build the from_<col>, to_<col>, diff_type layout. Rows are compared as whole
- * values: rows only in the first result are 'deleted', rows only in the
- * second are 'added', and identical rows are omitted (Dolt's keyless rule).
+ * Direct projections of a complete primary key can identify modified rows.
+ * Other results use multiset comparison. Logical names, not OIDs or column
+ * fingerprints, distinguish tables across revisions.
  */
+typedef struct QueryIdentity
+{
+	char	   *source;
+	char	   *signature;
+	int			nkeys;
+	int		   *columns;
+} QueryIdentity;
+
+static QueryIdentity
+query_identity(const char *sql)
+{
+	QueryIdentity result = {0};
+	List	   *raw = raw_parser(sql, RAW_PARSE_DEFAULT);
+	Query	   *query;
+	RangeTblEntry *rte;
+	Oid			relid,
+				pk;
+	Relation	rel,
+				index;
+	StringInfoData signature;
+	int			k;
+
+	if (list_length(raw) != 1)
+		return result;
+	query = parse_analyze_fixedparams(linitial_node(RawStmt, raw), sql, NULL, 0, NULL);
+	if (query->commandType != CMD_SELECT || list_length(query->rtable) != 1 ||
+		query->hasAggs || query->hasWindowFuncs || query->hasTargetSRFs ||
+		query->setOperations || query->groupClause || query->distinctClause)
+		return result;
+	rte = linitial_node(RangeTblEntry, query->rtable);
+	relid = OidIsValid(rte->dolt_rowtype) ? get_typ_typrelid(rte->dolt_rowtype) :
+		(rte->rtekind == RTE_RELATION ? rte->relid : InvalidOid);
+	if (!OidIsValid(relid))
+		return result;
+	rel = relation_open(relid, AccessShareLock);
+	result.source = rel->rd_catalogview ?
+		pstrdup(CatalogViewObjectIdentity(relid, RelationRelationId)) :
+		dg_qualified_name(get_namespace_name(RelationGetNamespace(rel)), RelationGetRelationName(rel));
+	pk = RelationGetPrimaryKeyIndex(rel, false);
+	/* A parent key does not constrain rows in inherited child tables. */
+	if (!OidIsValid(pk) || (rte->inh && has_subclass(relid)))
+	{
+		relation_close(rel, AccessShareLock);
+		return result;
+	}
+
+	/* Catalog metadata suffices; historical indexes need no storage binding. */
+	index = index_open(pk, AccessShareLock);
+	result.nkeys = index->rd_index->indnkeyatts;
+	result.columns = palloc(sizeof(int) * result.nkeys);
+	initStringInfo(&signature);
+	for (k = 0; k < result.nkeys; k++)
+	{
+		AttrNumber	attnum = index->rd_index->indkey.values[k];
+		Form_pg_attribute att = TupleDescAttr(RelationGetDescr(rel), attnum - 1);
+		ListCell   *lc;
+		int			column = 0;
+		bool		found = false;
+
+		appendStringInfo(&signature, "%zu:%s:%u;", strlen(NameStr(att->attname)),
+						 NameStr(att->attname), att->atttypid);
+		foreach(lc, query->targetList)
+		{
+			TargetEntry *tle = lfirst_node(TargetEntry, lc);
+			Var		   *var = IsA(tle->expr, Var) ? (Var *) tle->expr : NULL;
+
+			if (tle->resjunk)
+				continue;
+			if (var && var->varno == 1 && var->varattno == attnum && var->varlevelsup == 0)
+			{
+				result.columns[k] = column;
+				found = true;
+				break;
+			}
+			column++;
+		}
+		if (!found)
+		{
+			result.nkeys = 0;
+			break;
+		}
+	}
+	if (result.nkeys)
+		result.signature = signature.data;
+	index_close(index, AccessShareLock);
+	relation_close(rel, AccessShareLock);
+	return result;
+}
 
 typedef struct QueryRow
 {
 	char	   *key;
+	char	   *row;
 	Datum	   *values;
 	bool	   *nulls;
-}			QueryRow;
+} QueryRow;
 
 static int
 query_row_compare(const void *a, const void *b)
@@ -29,9 +116,19 @@ query_row_compare(const void *a, const void *b)
 	return strcmp(((const QueryRow *) a)->key, ((const QueryRow *) b)->key);
 }
 
-/* TODO KNOWN-ISSUES.md: replace delimiter-based row comparison keys. */
+/* Length framing distinguishes NULL, empty strings and embedded delimiters. */
+static void
+query_field(StringInfo key, const char *value)
+{
+	if (value)
+		appendStringInfo(key, "%zu:%s;", strlen(value), value);
+	else
+		appendStringInfoString(key, "N;");
+}
+
 static QueryRow *
-query_rows(const char *sql, MemoryContext cxt, int *count, int *natts)
+query_rows(const char *sql, MemoryContext cxt, int *count, int *natts,
+		   QueryIdentity *identity, bool keyed, bool distinct_sources)
 {
 	QueryRow   *rows;
 	int			r,
@@ -43,22 +140,36 @@ query_rows(const char *sql, MemoryContext cxt, int *count, int *natts)
 	rows = MemoryContextAlloc(cxt, sizeof(QueryRow) * Max(*count, 1));
 	for (r = 0; r < *count; r++)
 	{
-		StringInfoData key;
+		StringInfoData key,
+					row;
 		MemoryContext old = MemoryContextSwitchTo(cxt);
+		char	  **fields = palloc(sizeof(char *) * *natts);
 
 		initStringInfo(&key);
+		initStringInfo(&row);
 		rows[r].values = palloc(sizeof(Datum) * *natts);
 		rows[r].nulls = palloc(sizeof(bool) * *natts);
 		for (c = 0; c < *natts; c++)
 		{
 			Form_pg_attribute att = TupleDescAttr(SPI_tuptable->tupdesc, c);
 			Datum		v = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, c + 1, &rows[r].nulls[c]);
-			char	   *text = rows[r].nulls[c] ? NULL : SPI_getvalue(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, c + 1);
 
+			fields[c] = rows[r].nulls[c] ? NULL : SPI_getvalue(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, c + 1);
 			rows[r].values[c] = rows[r].nulls[c] ? (Datum) 0 : datumCopy(v, att->attbyval, att->attlen);
-			appendStringInfo(&key, "%s%c", text ? text : "", text ? '\x1e' : '\x1f');
+			appendStringInfo(&row, "%u/", att->atttypid);
+			query_field(&row, fields[c]);
 		}
+		if (distinct_sources)
+			query_field(&key, identity->source);
+		if (keyed)
+		{
+			for (c = 0; c < identity->nkeys; c++)
+				query_field(&key, fields[identity->columns[c]]);
+		}
+		else
+			appendStringInfoString(&key, row.data);
 		rows[r].key = key.data;
+		rows[r].row = row.data;
 		MemoryContextSwitchTo(old);
 	}
 	return rows;
@@ -83,11 +194,16 @@ dolt_query_diff(PG_FUNCTION_ARGS)
 			   *b;
 	Datum	   *values;
 	bool	   *nulls;
+	QueryIdentity left = query_identity(first),
+				right = query_identity(second);
+	bool		distinct_sources = left.source && right.source && strcmp(left.source, right.source);
+	bool		keyed = !distinct_sources && left.source && right.source &&
+		left.signature && right.signature && !strcmp(left.signature, right.signature);
 
 	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
 	nest = begin_api();
-	a = query_rows(first, cxt, &na, &wa);
-	b = query_rows(second, cxt, &nb, &wb);
+	a = query_rows(first, cxt, &na, &wa, &left, keyed, distinct_sources);
+	b = query_rows(second, cxt, &nb, &wb, &right, keyed, distinct_sources);
 	total = wa + wb + 1;
 	if (rsinfo->setDesc->natts != total)
 		ereport(ERROR, (errcode(ERRCODE_DATATYPE_MISMATCH), errmsg("dolt_query_diff result layout does not match the queries")));
@@ -100,7 +216,7 @@ dolt_query_diff(PG_FUNCTION_ARGS)
 		int			cmp = i == na ? 1 : (j == nb ? -1 : strcmp(a[i].key, b[j].key));
 		int			c;
 
-		if (cmp == 0)
+		if (cmp == 0 && !strcmp(a[i].row, b[j].row))
 		{
 			i++;
 			j++;
@@ -108,7 +224,7 @@ dolt_query_diff(PG_FUNCTION_ARGS)
 		}
 		for (c = 0; c < total; c++)
 			nulls[c] = true;
-		if (cmp < 0)
+		if (cmp <= 0)
 		{
 			for (c = 0; c < wa; c++)
 			{
@@ -118,7 +234,7 @@ dolt_query_diff(PG_FUNCTION_ARGS)
 			values[total - 1] = CStringGetTextDatum("deleted");
 			i++;
 		}
-		else
+		if (cmp >= 0)
 		{
 			for (c = 0; c < wb; c++)
 			{
@@ -128,6 +244,8 @@ dolt_query_diff(PG_FUNCTION_ARGS)
 			values[total - 1] = CStringGetTextDatum("added");
 			j++;
 		}
+		if (cmp == 0)
+			values[total - 1] = CStringGetTextDatum("modified");
 		nulls[total - 1] = false;
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}

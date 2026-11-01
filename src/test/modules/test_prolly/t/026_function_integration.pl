@@ -28,8 +28,8 @@ is(sql(q{SELECT count(*) FROM dolt_status}),'0','recreated branch starts clean')
 my $peer=$node->background_psql('postgres',on_error_stop=>0);
 $peer->query_safe(q{SET statement_timeout='2s'; SELECT dolt_checkout('other')});
 sql(q{SELECT dolt_checkout('main')});
-fails(q{SELECT dolt_branch('-D','other')},qr/in use by another session/,'branch deletion protects connected sessions');
-sql(q{SELECT dolt_branch('-D','-f','other')});
+fails(q{SELECT dolt_branch('-d','other')},qr/in use by another session/,'branch deletion protects connected sessions');
+sql(q{SELECT dolt_branch('-D','other')});
 my($out,$failed)=$peer->query(q{INSERT INTO t VALUES(2,'bad')});is($failed,1,'deleted branch rejects subsequent writes');$peer->{stderr}='';$peer->quit;
 sql(q{SELECT dolt_checkout('-b','other')});
 is(sql(q{SELECT * FROM t}),'1|base','forced deletion followed by recreation starts from HEAD');

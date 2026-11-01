@@ -1,0 +1,28 @@
+use strict;
+use warnings FATAL => 'all';
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
+my $node=PostgreSQL::Test::Cluster->new('diff_ignore');
+$node->init(extra=>['--encoding=UTF8','--locale=C']);
+$node->start;
+sub sql { $node->safe_psql('postgres',$_[0]); }
+sql(q{CREATE TABLE tracked(id int PRIMARY KEY) USING dolt_prolly_table; INSERT INTO tracked VALUES(1)});
+sql(q{SELECT dolt_commit('-Am','tracked base')});
+my $base=sql(q{SELECT dolt_hashof('HEAD')});
+sql(q{INSERT INTO dolt_ignore VALUES('temp_*',true),('temp_keep',false),('tracked',true);
+CREATE TABLE temp_skip(id int PRIMARY KEY) USING dolt_prolly_table;
+CREATE TABLE temp_keep(id int PRIMARY KEY) USING dolt_prolly_table});
+is(sql(q{SELECT to_table_name FROM dolt_diff_summary('HEAD','WORKING') ORDER BY to_table_name}), "public.dolt_ignore\npublic.temp_keep", 'working summary excludes ignored additions and honors exceptions');
+is(sql(q{SELECT count(*) FROM dolt_diff_summary('HEAD','WORKING','temp_skip')}), '0', 'named ignored addition is filtered');
+sql(q{INSERT INTO tracked VALUES(2)});
+is(sql(q{SELECT diff_type FROM dolt_diff_summary('HEAD','WORKING','tracked')}), 'modified', 'ignore rules do not hide modifications to tracked tables');
+sql(q{DROP TABLE tracked});
+is(sql(q{SELECT count(*) FROM dolt_diff_summary('HEAD','WORKING','tracked')}), '0', 'working summary excludes ignored deletion');
+sql(q{SELECT dolt_add('-A')});
+is(sql(q{SELECT count(*) FROM dolt_diff_summary('HEAD','STAGED','tracked')}), '0', 'staged summary uses working ignore patterns');
+sql(q{SELECT dolt_commit('-m','delete tracked')});
+is(sql("SELECT diff_type FROM dolt_diff_summary('$base','HEAD','tracked')"), 'dropped', 'committed history still exposes ignored deletion');
+is(sql("SELECT diff_type FROM dolt_diff_summary('$base~1','$base','tracked')"), 'added', 'later ignore rules cannot alter historical additions');
+$node->stop;
+done_testing();

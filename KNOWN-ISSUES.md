@@ -9,8 +9,6 @@ not supported semantics. Address independently with regression tests.
 * **Analysis-only dolt_ignore creation:** EXPLAIN/PREPARE of the first INSERT can
   create the table during parsing. The new lazy docs/tests/query-catalog table
   adapters use the same mechanism. Move lazy creation to execution.
-* **dolt_query_diff row equality:** unescaped text separators permit distinct
-  rows to compare equal. Replace with typed length-delimited encoding.
 
 The SQL reproductions are in /workspace/reports/rewrite-dolt-functions-*.sql.
 

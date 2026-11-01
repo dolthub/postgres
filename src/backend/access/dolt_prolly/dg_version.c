@@ -175,6 +175,8 @@ static bool name_selected(List *names, const char *name);
 static Capture capture_visible(void);
 static bytea *staged_capture(Capture * full);
 static List *ignored_untracked_tables(const char *working, const char *tracked);
+static List *ignored_tables(List *tables);
+static List *state_tables(const char *json);
 static void catalog_activate(void);
 static bool branch_management(char **args, int n);
 static void checkout_tables(char **args, int n);
@@ -2223,12 +2225,18 @@ dolt_diff_summary(PG_FUNCTION_ARGS)
 	char *from, *to, *fromrev, *torev, *table;
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	SPITupleTable *result;
+	List *ignored = NIL;
 	uint64 count, row;
 	int			nest = begin_api();
 
 	diff_revision_arguments(fcinfo, &fromrev, &torev, &table);
 	from = state_json(fromrev);
 	to = !strcmp(fromrev, torev) ? from : state_json(torev);
+	/* Ignore rules filter added/dropped tables only for working/staged
+	 * comparisons. Never hide retained history using today's patterns. */
+	if (!pg_strcasecmp(fromrev, "WORKING") || !pg_strcasecmp(torev, "WORKING") ||
+		!pg_strcasecmp(fromrev, "STAGED") || !pg_strcasecmp(torev, "STAGED"))
+		ignored = ignored_tables(list_concat(state_tables(from), state_tables(to)));
 	if (table)
 	{
 		/* As in Dolt, a name that names nothing has no changes. */
@@ -2260,6 +2268,9 @@ dolt_diff_summary(PG_FUNCTION_ARGS)
 
 			if (!*name)
 				name = TextDatumGetCString(values[1]);
+			if ((!*TextDatumGetCString(values[0]) || !*TextDatumGetCString(values[1])) &&
+				name_selected(ignored, name))
+				continue;
 			values[3] = BoolGetDatum(diff_table_data_changed(fromrev, torev, name, table != NULL, &key_changed));
 			if (key_changed)
 				continue;
