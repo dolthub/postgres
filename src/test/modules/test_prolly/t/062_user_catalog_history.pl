@@ -31,4 +31,5 @@ sql(q{INSERT INTO dolt_query_catalog VALUES('new',2,'new','SELECT 2','recreated'
 is(sql(q{SELECT description FROM dolt_query_catalog}),'recreated','insert recreates backing table automatically');
 sql(q{DROP TABLE dolt.query_catalog});
 is(sql(q{SELECT count(*) FROM dolt.query_catalog}),'0','dolt schema drop targets same backing table');
+fails(q{SELECT * FROM pg_catalog.dolt_user_table_context(NULL,NULL,NULL) AS t(id text)},qr/cannot be null/,'invalid explicit context fails safely');
 $s->quit;$node->stop;done_testing();

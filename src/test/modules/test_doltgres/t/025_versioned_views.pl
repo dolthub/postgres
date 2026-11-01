@@ -107,7 +107,8 @@ is(sql(q{SELECT dolt_checkout('-b','refreshed'); INSERT INTO src2 VALUES (4,'w')
 	SELECT count(*) FROM mv2; SELECT dolt_checkout('main'); SELECT count(*) FROM mv2}),
 	"(0,\"Switched to branch 'refreshed'\")\n4\n(0,\"Switched to branch 'main'\")\n3",'a refresh on a branch stays on it');
 sql(q{DROP MATERIALIZED VIEW lazy; DROP TABLE src2 CASCADE});
-is(sql(q{SELECT count(*) FROM pg_matviews}),'0','DROP MATERIALIZED VIEW and DROP TABLE CASCADE');
+is(sql(q{SELECT count(*) FROM pg_matviews WHERE matviewname IN ('lazy','mv2')}),'0','DROP MATERIALIZED VIEW and DROP TABLE CASCADE');
+is(sql(q{SELECT one FROM heap_mv}),'t','unrelated native materialized view remains visible');
 is(sql(q{SELECT count(*) FROM mv2 AS OF 'HEAD'}),'3','history keeps materialized views');
 
 # ---- versioned sequence dependencies ----

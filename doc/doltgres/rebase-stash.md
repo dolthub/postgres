@@ -99,3 +99,17 @@ tests for argument".
 
 Tests: `src/test/modules/test_prolly/t/024_rebase_stash.pl`; Doltgres
 `TestUserSpaceDoltTables/dolt_rebase` under the postgres profile.
+
+## User metadata alias revisions (2026-11-01)
+
+The docs/tests/query-catalog aliases read ordinary versioned tables. A copied
+system-view rule now binds its metadata reader to the same database root and
+optional branch context as its relation references. Nested reader SQL explicitly
+keeps that provider, so AS OF, branch-qualified aliases and two revisions in one
+statement cannot silently fall back to the session branch. Before a backing
+table existed, the alias returns its empty typed result.
+
+DROP TABLE on these user-content aliases targets the branch's public backing
+table rather than the built-in view. A second DROP reports a missing table;
+INSERT can recreate it through the existing initializer. Retained revisions and
+other branches are unchanged. This adds no persisted catalog materializations.
