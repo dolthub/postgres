@@ -333,30 +333,36 @@ dolt_help(PG_FUNCTION_ARGS)
 
 /* ---- dolt_test_run ---- */
 
-static bool
-numeric_text(const char *s, double *value)
-{
-	char	   *end;
-
-	if (!s || !*s)
-		return false;
-	*value = strtod(s, &end);
-	return *end == '\0';
-}
-
 /* Dolt's comparison of an actual value against the assertion value. */
 static char *
-compare_assertion(const char *type, const char *comparator, const char *expected, const char *actual, bool *passed)
+compare_assertion(const char *type, const char *comparator, const char *expected, const char *actual, Oid actualtype, bool *passed)
 {
-	double		a,
-				b;
 	int			cmp;
 	const char *wording;
 
-	if (numeric_text(expected, &a) && numeric_text(actual, &b))
-		cmp = a < b ? 1 : (a > b ? -1 : 0);
+	actualtype = getBaseType(actualtype);
+	if (!expected || !actual)
+	{
+		if (strcmp(comparator, "==") && strcmp(comparator, "!="))
+			return psprintf("%s is not a valid comparison for NULL values", comparator);
+		cmp = (expected == NULL) == (actual == NULL) ? 0 : 1;
+	}
+	else if (actualtype == BOOLOID)
+	{
+		if (strcmp(comparator, "==") && strcmp(comparator, "!="))
+			return psprintf("%s is not a valid comparison for boolean values. Only '==' and '!=' are supported", comparator);
+		cmp = strcmp(expected, actual);
+	}
+	else if (actualtype == INT2OID || actualtype == INT4OID || actualtype == INT8OID ||
+			 actualtype == NUMERICOID || actualtype == FLOAT4OID || actualtype == FLOAT8OID)
+	{
+		Datum		left = OidFunctionCall3(F_NUMERIC_IN, CStringGetDatum(actual), ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
+		Datum		right = OidFunctionCall3(F_NUMERIC_IN, CStringGetDatum(expected), ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
+
+		cmp = DatumGetInt32(OidFunctionCall2(F_NUMERIC_CMP, left, right));
+	}
 	else
-		cmp = strcmp(actual ? actual : "", expected ? expected : "");
+		cmp = strcmp(actual, expected);
 	if (!strcmp(comparator, "=="))
 	{
 		*passed = cmp == 0;
@@ -397,6 +403,19 @@ compare_assertion(const char *type, const char *comparator, const char *expected
 	return psprintf("Assertion failed: %s %s %s, got %s", type, wording, expected ? expected : "NULL", actual ? actual : "NULL");
 }
 
+/* Reject modifying CTEs and SELECT INTO as well as top-level writes. */
+static bool
+test_query_writes(Node *node, void *unused)
+{
+	if (!node)
+		return false;
+	if (IsA(node, InsertStmt) || IsA(node, UpdateStmt) || IsA(node, DeleteStmt) || IsA(node, MergeStmt))
+		return true;
+	if (IsA(node, SelectStmt) && ((SelectStmt *) node)->intoClause)
+		return true;
+	return raw_expression_tree_walker(node, test_query_writes, unused);
+}
+
 /* Run one test query in a subtransaction so a failing query reports an
  * error status instead of aborting the whole run. */
 static char *
@@ -411,33 +430,54 @@ run_test_query(const char *sql, const char *type, const char *comparator, const 
 	MemoryContextSwitchTo(old);
 	PG_TRY();
 	{
-		char	   *actual;
+		char	   *actual = NULL;
+		Oid			actualtype = INT8OID;
+		List	   *raw = raw_parser(sql, RAW_PARSE_DEFAULT);
 
-		run_user_query(sql);
-		if (!strcmp(type, "expected_rows"))
-			actual = psprintf(UINT64_FORMAT, (uint64) SPI_processed);
-		else if (!strcmp(type, "expected_columns"))
-			actual = psprintf("%d", SPI_tuptable ? SPI_tuptable->tupdesc->natts : 0);
-		else if (!strcmp(type, "expected_single_value"))
+		if (list_length(raw) != 1)
+			message = "Can only run exactly one query";
+		else if (!IsA(linitial_node(RawStmt, raw)->stmt, SelectStmt) || test_query_writes(linitial_node(RawStmt, raw)->stmt, NULL))
+			message = "Cannot execute write queries";
+		if (message)
 		{
-			if (SPI_processed == 0)
-				message = "expected_single_value expects exactly one cell. Received 0 rows";
-			else if (SPI_tuptable->tupdesc->natts != 1)
-				message = "expected_single_value expects exactly one cell. Received multiple columns";
-			else if (SPI_processed > 1)
-				message = "expected_single_value expects exactly one cell. Received multiple rows";
-			actual = message ? NULL : SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+			ReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(old);
+			CurrentResourceOwner = owner;
 		}
 		else
 		{
-			message = psprintf("%s is not a valid assertion type", type);
-			actual = NULL;
+			run_user_query(sql);
+			if (!strcmp(type, "expected_rows"))
+				actual = psprintf(UINT64_FORMAT, (uint64) SPI_processed);
+			else if (!strcmp(type, "expected_columns"))
+				actual = psprintf("%d", SPI_tuptable ? SPI_tuptable->tupdesc->natts : 0);
+			else if (!strcmp(type, "expected_single_value"))
+			{
+				if (SPI_processed == 0)
+					message = "expected_single_value expects exactly one cell. Received 0 rows";
+				else if (SPI_tuptable->tupdesc->natts != 1)
+					message = "expected_single_value expects exactly one cell. Received multiple columns";
+				else if (SPI_processed > 1)
+					message = "expected_single_value expects exactly one cell. Received multiple rows";
+				actual = message ? NULL : SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+				if (!message)
+				{
+					actualtype = TupleDescAttr(SPI_tuptable->tupdesc, 0)->atttypid;
+					if (actual && getBaseType(actualtype) == BOOLOID)
+						actual = !strcmp(actual, "t") ? "true" : "false";
+				}
+			}
+			else
+			{
+				message = psprintf("%s is not a valid assertion type", type);
+				actual = NULL;
+			}
+			if (!message)
+				message = compare_assertion(type, comparator, expected, actual, actualtype, passed);
+			ReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(old);
+			CurrentResourceOwner = owner;
 		}
-		if (!message)
-			message = compare_assertion(type, comparator, expected, actual, passed);
-		ReleaseCurrentSubTransaction();
-		MemoryContextSwitchTo(old);
-		CurrentResourceOwner = owner;
 	}
 	PG_CATCH();
 	{
@@ -456,10 +496,9 @@ run_test_query(const char *sql, const char *type, const char *comparator, const 
 	return message;
 }
 
-Datum
-dolt_test_run(PG_FUNCTION_ARGS)
+static Datum
+test_run_impl(FunctionCallInfo fcinfo, char **selectors, int nselectors)
 {
-	char	   *arg = PG_NARGS() > 0 && !PG_ARGISNULL(0) ? text_to_cstring(PG_GETARG_TEXT_PP(0)) : NULL;
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	int			nest,
 				n,
@@ -473,49 +512,71 @@ dolt_test_run(PG_FUNCTION_ARGS)
 
 	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
 	nest = begin_api();
-	if (arg && (!*arg || !strcmp(arg, "*")))
-		arg = NULL;
-	run_context("SELECT test_name,test_group,test_query,assertion_type,assertion_comparator,assertion_value FROM dolt.tests WHERE $1::text IS NULL OR test_name=$1 OR test_group=$1 ORDER BY test_group NULLS FIRST,test_name COLLATE \"C\"", 1, VC_TYPES(TEXTOID), VC_ARGS(arg ? CStringGetTextDatum(arg) : (Datum) 0), arg ? NULL : "n", true);
-	n = SPI_processed;
-	if (n == 0 && arg)
-		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("could not find tests for argument: %s", arg)));
-	names = palloc(sizeof(char *) * Max(n, 1));
-	groups = palloc(sizeof(char *) * Max(n, 1));
-	queries = palloc(sizeof(char *) * Max(n, 1));
-	types = palloc(sizeof(char *) * Max(n, 1));
-	comparators = palloc(sizeof(char *) * Max(n, 1));
-	expecteds = palloc(sizeof(char *) * Max(n, 1));
-	for (i = 0; i < n; i++)
+	for (int selector = 0; selector < Max(nselectors, 1); selector++)
 	{
-		names[i] = strcell(i, 1);
-		groups[i] = strcell(i, 2);
-		queries[i] = strcell(i, 3);
-		types[i] = strcell(i, 4);
-		comparators[i] = strcell(i, 5);
-		expecteds[i] = strcell(i, 6);
-	}
-	for (i = 0; i < n; i++)
-	{
-		bool		passed;
-		char	   *message = run_test_query(queries[i], types[i], comparators[i], expecteds[i], &passed);
-		Datum		values[5];
-		bool		nulls[5] = {false, false, false, false, false};
+		char	   *arg = nselectors ? selectors[selector] : NULL;
 
-		values[0] = CStringGetTextDatum(names[i]);
-		values[1] = CStringGetTextDatum(groups[i] ? groups[i] : "");
-		values[2] = CStringGetTextDatum(queries[i]);
-		values[3] = CStringGetTextDatum(passed ? "PASS" : "FAIL");
-		values[4] = CStringGetTextDatum(message);
-		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+		if (arg && !strcmp(arg, "*"))
+			arg = NULL;
+		run_context("SELECT test_name,test_group,test_query,assertion_type,assertion_comparator,assertion_value FROM dolt.tests WHERE $1::text IS NULL OR test_name=$1 OR (test_group=$1 AND NOT EXISTS (SELECT 1 FROM dolt.tests WHERE test_name=$1)) ORDER BY test_group NULLS FIRST,test_name COLLATE \"C\"", 1, VC_TYPES(TEXTOID), VC_ARGS(arg ? CStringGetTextDatum(arg) : (Datum) 0), arg ? NULL : "n", true);
+		n = SPI_processed;
+		if (n == 0 && arg)
+			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("could not find tests for argument: %s", arg)));
+		names = palloc(sizeof(char *) * Max(n, 1));
+		groups = palloc(sizeof(char *) * Max(n, 1));
+		queries = palloc(sizeof(char *) * Max(n, 1));
+		types = palloc(sizeof(char *) * Max(n, 1));
+		comparators = palloc(sizeof(char *) * Max(n, 1));
+		expecteds = palloc(sizeof(char *) * Max(n, 1));
+		for (i = 0; i < n; i++)
+		{
+			names[i] = strcell(i, 1);
+			groups[i] = strcell(i, 2);
+			queries[i] = strcell(i, 3);
+			types[i] = strcell(i, 4);
+			comparators[i] = strcell(i, 5);
+			expecteds[i] = strcell(i, 6);
+		}
+		for (i = 0; i < n; i++)
+		{
+			bool		passed;
+			char	   *message = run_test_query(queries[i], types[i], comparators[i], expecteds[i], &passed);
+			Datum		values[5];
+			bool		nulls[5] = {false, false, false, false, false};
+
+			values[0] = CStringGetTextDatum(names[i]);
+			values[1] = CStringGetTextDatum(groups[i] ? groups[i] : "");
+			values[2] = CStringGetTextDatum(queries[i]);
+			values[3] = CStringGetTextDatum(passed ? "PASS" : "FAIL");
+			values[4] = CStringGetTextDatum(message);
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+		}
 	}
 	end_api(nest);
 	return (Datum) 0;
 }
 
 Datum
+dolt_test_run(PG_FUNCTION_ARGS)
+{
+	char	   *arg = PG_NARGS() && !PG_ARGISNULL(0) ? text_to_cstring(PG_GETARG_TEXT_PP(0)) : NULL;
+
+	return test_run_impl(fcinfo, &arg, 1);
+}
+
+Datum
 dolt_test_run_noargs(PG_FUNCTION_ARGS)
 {
-	return dolt_test_run(fcinfo);
+	return test_run_impl(fcinfo, NULL, 0);
+}
+
+Datum
+dolt_test_run_many(PG_FUNCTION_ARGS)
+{
+	int			n;
+	char	  **args = arguments(fcinfo, &n);
+
+	return test_run_impl(fcinfo, args, n);
 }
 
 /* Describe this engine's format, not Dolt's incompatible NBS serialization. */

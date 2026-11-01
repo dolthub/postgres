@@ -12978,3 +12978,8 @@
  proname => 'dolt_user_table_context', prorows => '100', proretset => 't',
  provolatile => 'v', proparallel => 'u', proisstrict => 'f', prorettype => 'record',
  proargtypes => 'text text text', prosrc => 'dolt_user_table_context' },
+
+{ oid => '9261', prorows => '100', descr => 'run selected stored tests', proname => 'dolt_test_run',
+ provolatile => 'v', proparallel => 'u', proisstrict => 'f', proretset => 't', prorettype => 'record', proargtypes => '_text',
+ proallargtypes => '{_text,text,text,text,text,text}', proargmodes => '{v,o,o,o,o,o}',
+ proargnames => '{selectors,test_name,test_group_name,query,status,message}', provariadic => 'text', prosrc => 'dolt_test_run_many' },
