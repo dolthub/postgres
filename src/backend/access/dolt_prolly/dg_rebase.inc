@@ -435,7 +435,7 @@ stash_push(const char *name, bool untracked, bool all)
 	appendStringInfo(&json, "{\"branch\":%s,\"head\":\"%s\",\"message\":%s}", quote_json(branch), hash_format(head.target), quote_json(message));
 	state = put("stash", json.data, VC_ARGS(PointerGetDatum(workingdb), PointerGetDatum(stageddb), PointerGetDatum(head.target)), 3);
 	move_ref(psprintf("stash/%s/" INT64_FORMAT, name, seq), empty_ref, state);
-	restore_tables(compose_database(current.hash, headdb, selected));
+	replace_working(dg_current_branch(), compose_database(current.hash, headdb, selected), NIL);
 	move_ref(branch_ref("staged"), staged, headdb);
 	move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture_visible().hash);
 	advance_snapshot();
