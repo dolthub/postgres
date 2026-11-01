@@ -396,7 +396,12 @@ stash_ref(const char *name, int idx)
 {
 	run("SELECT refname FROM pg_catalog.pg_dolt_ref WHERE split_part(refname,'/',1)='stash' AND split_part(refname,'/',2)=$1 ORDER BY split_part(refname,'/',3)::bigint DESC OFFSET $2 LIMIT 1", 2, VC_TYPES(TEXTOID, INT8OID), VC_ARGS(CStringGetTextDatum(name), Int64GetDatum(idx)), NULL, true);
 	if (!SPI_processed)
-		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("No stash entries found. error: stash@{%d} is not a valid reference in stash %s", idx, name)));
+	{
+		run("SELECT 1 FROM pg_catalog.pg_dolt_ref WHERE split_part(refname,'/',1)='stash' AND split_part(refname,'/',2)=$1 LIMIT 1", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(name)), NULL, true);
+		if (!SPI_processed)
+			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("No stash entries found.")));
+		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("error: stash@{%d} is not a valid reference in stash %s", idx, name)));
+	}
 	return strcell(0, 1);
 }
 

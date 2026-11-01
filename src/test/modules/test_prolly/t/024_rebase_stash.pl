@@ -92,7 +92,7 @@ ok_sql(q{SELECT pk||'|'||v FROM t ORDER BY pk},"0|edited\n10|ten\n11|eleven",'ap
 ok_sql(q{SELECT count(*) FROM dolt_stashes},'1','apply keeps the entry');
 ok_sql(q{SELECT dolt_stash('drop','mine')},'0','drop');
 ok_sql(q{SELECT count(*) FROM dolt_stashes},'0','dropped');
-bad_sql(q{SELECT dolt_stash('pop','mine')},qr/stash@\{0\} is not a valid reference in stash mine/,'missing stash');
+bad_sql(q{SELECT dolt_stash('pop','mine')},qr/No stash entries found/,'missing stash');
 $s->query_safe(q{SELECT dolt_stash('push','a'); INSERT INTO t VALUES (12,'twelve'); SELECT dolt_stash('push','a')});
 ok_sql(q{SELECT dolt_stash('clear','a')},'0','clear');
 ok_sql(q{SELECT count(*) FROM dolt_stashes},'0','cleared');
