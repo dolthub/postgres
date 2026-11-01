@@ -340,6 +340,16 @@ compare_assertion(const char *type, const char *comparator, const char *expected
 	int			cmp;
 	const char *wording;
 
+	if (!strcmp(type, "expected_rows") || !strcmp(type, "expected_columns"))
+	{
+		char *end;
+
+		errno = 0;
+		if (expected)
+			(void) strtoll(expected, &end, 10);
+		if (!expected || !*expected || errno == ERANGE || *end || isspace((unsigned char) *expected))
+			return psprintf("cannot run assertion on non integer value: %s", expected ? expected : "NULL");
+	}
 	actualtype = getBaseType(actualtype);
 	if (!expected || !actual)
 	{
