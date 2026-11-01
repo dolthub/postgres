@@ -37,15 +37,29 @@ Dolt's wording.
 ## dolt_stash and dolt.stashes
 
 `dolt_stash(push|pop|apply|drop|clear, name [, index])`. `push` captures the
-working set, stores a `stash` object (children: stashed working database,
-staged database, head commit; payload with branch, head and the `WIP on
-<branch>: <hash7> <message>` text) under `stash/<name>/<seq>`, and restores
-the tracked tables to HEAD. Only tracked tables are stashed; untracked
-tables stay in place. `pop`/`apply` merge the stash three-way onto the
-current working set (base: the stash's head) and error with Dolt's "would be
-overwritten" message on conflicts; `pop` and `drop` remove the entry,
-`clear` removes every entry of a name. `dolt.stashes` / `dolt_stashes` list
-`name, stash_id (stash@{n}, newest first), branch, hash, commit_message`.
+selected working objects in a `stash` object (children: stashed database,
+original staged database, HEAD commit), whose metadata contains branch, HEAD
+and the original commit message. Named stacks use exact `stash/<name>/<seq>`
+refs; their names are not SQL LIKE patterns. Indexes accept both integer and
+`stash@{n}` syntax.
+
+Default push selects objects tracked in HEAD or staging, including deletions,
+and leaves untracked objects in place. `-u` / `--include-untracked` also selects
+unignored untracked objects; `-a` / `--all` includes ignored objects. Selected
+objects are reset to HEAD, removing selected additions. A push with no selected
+changes fails without adding an entry.
+
+Apply/pop uses the same canonical schema and row merge machinery as other
+three-way operations, with the stash's original HEAD as base. Disjoint local
+changes remain. Conflicts abort the stash command atomically and retain the
+stash. Originally staged additions are staged again with their full merged
+contents; modifications of already tracked tables remain unstaged. Apply keeps
+the entry; pop removes it only after successful application. Read-only
+transactions cannot mutate stashes.
+
+`dolt.stashes` / `dolt_stashes` list `name, stash_id (stash@{n}, newest first),
+branch, hash, commit_message`. Tests cover table additions/deletions, different
+branches, dirty working sets, ignore rules, native types and dependent objects.
 
 ## dolt_query_diff
 
