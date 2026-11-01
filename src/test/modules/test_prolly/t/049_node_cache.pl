@@ -51,6 +51,20 @@ is(sql($count), $expected, 'results are unchanged');
 my ($entries, $bytes) = split /\|/, sql('SELECT entries, bytes FROM dolt_node_cache_stats()');
 cmp_ok($entries, '>=', $hits, "the cache holds the table ($entries nodes, $bytes bytes)");
 
+# A session keeps the nodes it parsed across committed transactions, up to
+# dolt_session_node_cache, so it repeats no shared cache lookups; past that,
+# or after an abort, it drops them.
+sub session_lookups {
+	my ($settings, $between) = @_;
+	my @lookups = map { /^lookups (\d+)$/ ? $1 : () } split /\n/,
+	  sql("$settings BEGIN; $count; COMMIT; SELECT 'lookups ' || hits + misses FROM dolt_node_cache_stats();
+ $between BEGIN; $count; COMMIT; SELECT 'lookups ' || hits + misses FROM dolt_node_cache_stats()");
+	return $lookups[1] - $lookups[0];
+}
+is(session_lookups('', ''), 0, 'a later transaction of the session finds its nodes parsed');
+cmp_ok(session_lookups('SET dolt_session_node_cache = 0;', ''), '>', 100, 'with no session budget it looks them up again');
+cmp_ok(session_lookups('', 'BEGIN; SELECT count(*) FROM t; ROLLBACK;'), '>', 100, 'as it does after an abort');
+
 # Updates read through the cache too, and share their new nodes at commit.
 sql(q{UPDATE t SET v = 'changed' WHERE id % 1000 = 0});
 ($store) = reads(q{SELECT count(*) FROM t WHERE v = 'changed'});

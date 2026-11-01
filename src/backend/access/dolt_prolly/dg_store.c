@@ -1058,12 +1058,15 @@ store_xact(XactEvent event, void *arg)
 			collect_threshold = DG_COLLECT_MINIMUM;
 
 			/*
-			 * Nodes in the chunk store are read through the shared cache, so
-			 * the working store keeps none across transactions: those it
-			 * read are dropped, and those it wrote are shared once committed,
-			 * then dropped. Unwritten nodes are dropped too, unless pinned,
-			 * such as the empty tree and journal folds; they are written only
-			 * when a published root reaches them.
+			 * Nodes in the chunk store are read through the shared cache. A
+			 * committed transaction's working store keeps the parsed ones,
+			 * read or written, up to dolt_session_node_cache, so the next
+			 * transaction need not copy and parse its hot paths again; past
+			 * that, or after an abort, it drops them. An aborted transaction
+			 * marked nodes written that never reached the store. Unwritten
+			 * nodes are dropped too, unless pinned, such as the empty tree
+			 * and journal folds; they are written only when a published root
+			 * reaches them.
 			 */
 			if (event == XACT_EVENT_COMMIT)
 				share_written();
@@ -1071,7 +1074,9 @@ store_xact(XactEvent event, void *arg)
 			if (working_store)
 			{
 				pl_store_drop_unbacked(working_store);
-				pl_store_drop_backed(working_store);
+				if (event != XACT_EVENT_COMMIT ||
+					pl_store_stats(working_store).bytes > (Size) dolt_session_node_cache * 1024)
+					pl_store_drop_backed(working_store);
 			}
 			written = NULL;		/* in TopTransactionContext */
 			written_count = written_capacity = 0;

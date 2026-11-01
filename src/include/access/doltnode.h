@@ -30,6 +30,7 @@ typedef struct DoltNodeCacheStats
 } DoltNodeCacheStats;
 
 extern PGDLLIMPORT int dolt_node_cache_size;
+extern PGDLLIMPORT int dolt_session_node_cache;
 
 extern Size DoltNodeCacheShmemSize(void);
 extern void DoltNodeCacheShmemInit(void);
