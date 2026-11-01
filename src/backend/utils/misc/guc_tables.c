@@ -3710,6 +3710,16 @@ struct config_int ConfigureNamesInt[] =
 	},
 
 	{
+		{"dolt_session_node_cache", PGC_USERSET, RESOURCES_MEM,
+			gettext_noop("Sets the memory a session keeps for parsed prolly nodes across transactions."),
+			gettext_noop("Past it, a session drops the nodes it read at transaction end; 0 keeps none."),
+			GUC_UNIT_KB
+		},
+		&dolt_session_node_cache,
+		16 * 1024, 0, MAX_KILOBYTES, NULL, NULL, NULL
+	},
+
+	{
 		{"dolt_schema_cache_size", PGC_USERSET, RESOURCES_MEM,
 			gettext_noop("Sets the memory for decoded schemas cached per session."),
 			gettext_noop("Least recently used schemas are evicted above this size when a transaction ends."),
