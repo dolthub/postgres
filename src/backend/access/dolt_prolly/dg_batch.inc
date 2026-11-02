@@ -56,6 +56,7 @@ struct DGBatch
 				table_space;
 	RelFileNumber table_file;
 	bool		table;
+	bool		on_snapshot;	/* its state is the transaction snapshot's (on_snapshot) */
 	MemoryContext memory;
 	DGState    *state;			/* the trees the edits apply to */
 	HTAB	   *rows;			/* PendingRow by digest */
@@ -537,6 +538,7 @@ dg_batch(Relation rel, CommandId cid)
 	b->cid = cid;
 	b->subxid = GetCurrentSubTransactionId();
 	b->table = rel->rd_rel->relkind != RELKIND_INDEX;
+	b->on_snapshot = on_snapshot(rel, SnapshotSelf);
 	b->memory = AllocSetContextCreate(TopTransactionContext, "prolly pending edits", ALLOCSET_DEFAULT_SIZES);
 	b->count = 0;
 	b->entries = NULL;
@@ -592,6 +594,9 @@ batch_stale(DGBatch *b)
 {
 	Visibility	now;
 
+	/* A batch built on the transaction snapshot never goes stale. */
+	if (b->on_snapshot)
+		return false;
 	if (b->generation != roots_generation(&b->key))
 		return true;
 	visibility_capture(SnapshotSelf, &now);

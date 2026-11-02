@@ -40,6 +40,7 @@
 #include "access/xlogprefetcher.h"
 #include "access/doltchunk.h"
 #include "access/doltjournal.h"
+#include "access/doltsnapshot.h"
 #include "access/doltnode.h"
 #include "access/doltschema.h"
 #include "access/doltsystem.h"
@@ -814,6 +815,17 @@ struct config_bool ConfigureNamesBool[] =
 		},
 		&dolt_row_journal,
 		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_snapshot_writes", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Builds prolly tables' writes under repeatable read on the transaction snapshot."),
+			gettext_noop("They then merge with later commits only at commit, not as each statement reads."),
+			GUC_NOT_IN_SAMPLE
+		},
+		&dolt_snapshot_writes,
+		true,
 		NULL, NULL, NULL
 	},
 
