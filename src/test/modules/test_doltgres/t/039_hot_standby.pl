@@ -27,6 +27,17 @@ sub standby_fails {
  like($err,$error,$name);
 }
 
+# A session open on the standby sees what replay brings in, statement by statement.
+my $reader=$standby->background_psql('postgres');
+is($reader->query_safe(q{SELECT count(*) FROM vals}),'2','a standby session reads the rows replayed so far');
+$primary->safe_psql('postgres',q{INSERT INTO vals VALUES (10, 'ten')});
+$primary->wait_for_replay_catchup($standby);
+is($reader->query_safe(q{SELECT count(*) FROM vals}),'3','and later rows once they replay');
+$primary->safe_psql('postgres',q{DELETE FROM vals WHERE i = 10});
+$primary->wait_for_replay_catchup($standby);
+is($reader->query_safe(q{SELECT count(*) FROM vals}),'2','and their deletion');
+$reader->quit;
+
 # Writes made after the standby was copied replay too, schema changes included.
 $primary->safe_psql('postgres',q{INSERT INTO vals VALUES (3, 'three'); CREATE TABLE later(a int PRIMARY KEY); INSERT INTO later VALUES (7);
 CREATE SEQUENCE counter START WITH 10 INCREMENT BY 3; SELECT nextval('counter');
