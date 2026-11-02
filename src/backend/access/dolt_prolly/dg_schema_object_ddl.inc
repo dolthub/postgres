@@ -66,7 +66,7 @@ dg_catalog_schema_object_ddl(ParseState *pstate, Node *statement)
 
 		SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
 		nest = begin_api();
-		run("SELECT 1 FROM pg_event_trigger WHERE evtenabled<>'D'", 0, NULL, NULL, NULL, true);
+		run("SELECT 1 FROM pg_event_trigger WHERE evtenabled<>'D' AND evtevent<>'login'", 0, NULL, NULL, NULL, true);
 		if (SPI_processed)
 			unsupported("canonical schema DDL with event triggers");
 		current = capture(true);

@@ -93,6 +93,13 @@ is($s->query_safe(q{SELECT count(*) FROM pg_proc WHERE proname='f' AND proargtyp
 is($s->query_safe(q{SELECT count(*) FROM pg_proc AS OF 'main' WHERE proname='f'}),'1','routine drop retains other branch and history');
 $s->query_safe(q{SELECT dolt_checkout('main')});
 is($s->query_safe(q{SELECT f('x')}),'x_main','other branch routine survives drop');
+# An event trigger is the database's, so the function it calls stays native.
+$s->query_safe(q{CREATE TABLE logins(who text) USING heap; CREATE FUNCTION on_login() RETURNS event_trigger LANGUAGE plpgsql AS $$BEGIN INSERT INTO logins VALUES (session_user); END$$; CREATE EVENT TRIGGER login_trigger ON login EXECUTE FUNCTION on_login(); ALTER EVENT TRIGGER login_trigger ENABLE ALWAYS});
+is($node->safe_psql('postgres',q{SELECT count(*) FROM logins}),'1','an event trigger calls a native PL/pgSQL function');
+is($s->query_safe(q{SELECT count(*) FROM pg_proc AS OF 'main' WHERE proname='on_login'}),'1','which every branch sees');
+$s->query_safe(q{CREATE TABLE after_login(id int); DROP TABLE after_login});
+pass('a login trigger, which DDL never fires, leaves versioned DDL available');
+$s->query_safe(q{DROP EVENT TRIGGER login_trigger; DROP FUNCTION on_login()});
 $s->quit;
 my $e=$node->background_psql('empty_routines',on_error_stop=>0);
 # A database versions its routines once it has prolly storage.

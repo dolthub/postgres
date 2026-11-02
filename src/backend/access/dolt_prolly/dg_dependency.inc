@@ -526,7 +526,7 @@ canonical_drop(Node *statement)
 		CatalogViewSwitch(NULL);
 		SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
 		nest = begin_api();
-		run("SELECT 1 FROM pg_event_trigger WHERE evtenabled<>'D'", 0, NULL, NULL, NULL, true);
+		run("SELECT 1 FROM pg_event_trigger WHERE evtenabled<>'D' AND evtevent<>'login'", 0, NULL, NULL, NULL, true);
 		if (SPI_processed)
 			unsupported("canonical DROP with event triggers");
 		if (targets)

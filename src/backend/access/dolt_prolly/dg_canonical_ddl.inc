@@ -306,7 +306,7 @@ dg_catalog_create(Node *statement, const char *query)
 		skip = catalog_contains(read_ref(branch_ref("working")).target, name);
 		if (skip && !stmt->if_not_exists)
 			ereport(ERROR, (errcode(ERRCODE_DUPLICATE_TABLE), errmsg("relation \"%s\" already exists", stmt->relation->relname)));
-		run("SELECT 1 FROM pg_event_trigger WHERE evtenabled <> 'D'", 0, NULL, NULL, NULL, true);
+		run("SELECT 1 FROM pg_event_trigger WHERE evtenabled <> 'D' AND evtevent <> 'login'", 0, NULL, NULL, NULL, true);
 		if (SPI_processed)
 			unsupported("branch CREATE with event triggers");
 		end_api(nest);

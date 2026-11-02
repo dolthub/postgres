@@ -249,7 +249,7 @@ dg_catalog_alter(Node *statement)
 					oldcount = RelationGetDescr(definition)->natts;
 
 		nest = begin_api();
-		run("SELECT 1 FROM pg_event_trigger WHERE evtenabled<>'D'", 0, NULL, NULL, NULL, true);
+		run("SELECT 1 FROM pg_event_trigger WHERE evtenabled<>'D' AND evtevent<>'login'", 0, NULL, NULL, NULL, true);
 		if (SPI_processed)
 			unsupported("canonical ALTER with event triggers");
 		source = dg_catalog_write_table(dg_current_branch(), name, ACL_UPDATE);
