@@ -34,7 +34,9 @@ creates_versioned_routine(CreateFunctionStmt *stmt)
 
 	if (isAnyTempNamespace(namespace) || dg_system_namespace(get_namespace_name(namespace)))
 		return false;
-	if (stmt->returnType && LookupTypeNameOid(NULL, stmt->returnType, true) == EVENT_TRIGGEROID)
+	/* %TYPE is never event_trigger, and looking it up would notice twice. */
+	if (stmt->returnType && !stmt->returnType->pct_type &&
+		LookupTypeNameOid(NULL, stmt->returnType, true) == EVENT_TRIGGEROID)
 		return false;
 	foreach(lc, stmt->options)
 	{

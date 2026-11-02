@@ -1450,6 +1450,11 @@ dolt_status| SELECT table_name,
     staged,
     status
    FROM dolt.status;
+dolt_status_ignored| SELECT table_name,
+    staged,
+    status,
+    ignored
+   FROM dolt.status_ignored;
 dolt_tags| SELECT tag_name,
     tag_hash,
     tagger,
