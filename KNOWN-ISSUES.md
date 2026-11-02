@@ -58,6 +58,20 @@ The SQL reproductions are in /workspace/reports/rewrite-dolt-functions-*.sql.
   the gate for re-enabling it, with the isolation specs in
   `test_prolly/specs`.
 
+* **Concurrent identical keyless rows share a derived handle (2026-11-02):** a
+  keyless row's handle is derived from its digest unless the writer's view
+  already holds an occurrence of that row, in which case it allocates one
+  (`dg_handle_choose`). Two transactions that insert the same row, neither
+  seeing the other's, both choose the derived handle. Publication then sums the
+  content counts (`merge_counts`), but two occurrences share one handle and its
+  lock record, and no allocation names the second. Seen only as a design gap:
+  `test_prolly/t/027_row_locks.pl` checks that all occurrences stay counted and
+  updatable afterwards, not that each keeps a distinct handle. The window was a
+  statement before `dolt_snapshot_writes`; with it on, it is a whole repeatable
+  read transaction. A fix could check the latest committed state, and other
+  writers' reservations, before deriving, or reassign colliding handles when
+  publication merges counts.
+
 * **No spatial indexes on prolly tables (2026-10-30):** GiST, SP-GiST and BRIN
   are rejected on prolly tables, and PostGIS `geometry` and `geography` have no
   ordered key encoding for a prolly index. Spatial values are stored, versioned,
