@@ -48,9 +48,21 @@ is(standby_sql(q{SELECT a FROM later}),'7','and tables created since it was copi
 is(standby_sql(q{SELECT string_agg(message, ',' ORDER BY date DESC) FROM dolt_log}),'second,first,Initialize data repository','and the branch\'s history');
 is(standby_sql(q{SELECT v FROM vals AS OF 'HEAD~1' WHERE i = 1}),'one','and earlier revisions');
 is(standby_sql(q{SELECT count(*) FROM dolt_diff('HEAD~1', 'HEAD', 'vals')}),'1','and diffs');
+# A standby counts its own scans of versioned tables, as the stats of its queries.
+is(standby_sql(q{SELECT count(*) FROM vals; SELECT pg_stat_force_next_flush(); SELECT seq_scan > 0, seq_tup_read >= 3, pg_stat_have_stats('relation', (SELECT oid FROM pg_database WHERE datname = current_database()), 'vals'::regclass::oid::int8) FROM pg_stat_user_tables WHERE relname = 'vals'}) =~ s/^.*\n//sr,'t|t|t','and counts its scans of them');
 # As natively, a standby sees a sequence's state as logged, which runs ahead of the values handed out.
 is(standby_sql(q{SELECT last_value >= 10, (SELECT last_value FROM pg_sequences WHERE sequencename = 'counter') >= 10 FROM counter}),'t|t','and sequences\' state');
 is(standby_sql(q{SELECT dolt_checkout('feature'); SELECT active_branch(); SELECT string_agg(i::text, ',' ORDER BY i) FROM vals}) =~ s/^[^\n]*\n//sr,"feature\n1,2,4",'a session on a standby checks out another branch and reads it');
+
+# Dropping a versioned table drops its statistics on the standby too.
+$primary->safe_psql('postgres',q{CREATE TABLE gone AS SELECT 1 AS a});
+$primary->wait_for_replay_catchup($standby);
+my $have_stats=q{SELECT pg_stat_have_stats('relation', (SELECT oid FROM pg_database WHERE datname = current_database()), }.standby_sql(q{SELECT 'gone'::regclass::oid}).')';
+standby_sql(q{SELECT count(*) FROM gone});
+is(standby_sql($have_stats),'t','a standby keeps statistics of its reads');
+$primary->safe_psql('postgres',q{DROP TABLE gone});
+$primary->wait_for_replay_catchup($standby);
+is(standby_sql($have_stats),'f','which go when the table is dropped');
 
 # Version-control writes are refused as other writes are.
 standby_fails(q{INSERT INTO vals VALUES (9, 'x')},qr/cannot execute INSERT in a read-only transaction/,'a standby refuses writes');

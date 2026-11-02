@@ -250,6 +250,9 @@ SelectCacheView(int cacheId, int nkeys, Datum *keys)
 		CatalogView *selected;
 
 		selected = CatalogViewSelectKeys(NULL, cache->cc_tupdesc, nkeys, cache->cc_keyno, keys);
+		/* A handle the session has yet to bind is its branch's, once loaded. */
+		if (!selected && !view && (view = dg_catalog_session_view()))
+			selected = CatalogViewSelectKeys(NULL, cache->cc_tupdesc, nkeys, cache->cc_keyno, keys);
 		if (selected)
 			view = selected;
 		if (selected && !CatalogViewContains(view, cache->cc_reloid))

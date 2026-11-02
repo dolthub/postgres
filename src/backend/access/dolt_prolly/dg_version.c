@@ -37,6 +37,7 @@
 #include "catalog/pg_dolt_storage.h"
 #include "catalog/pg_dolt_identity.h"
 #include "utils/inval.h"
+#include "pgstat.h"
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "utils/fmgroids.h"

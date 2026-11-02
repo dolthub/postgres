@@ -510,6 +510,19 @@ canonical_drop(Node *statement)
 				 object->classId != CastRelationId && object->classId != OperatorRelationId))
 				unsupported("canonical dependency deletion object kind");
 		}
+		/* As natively, dropped relations' statistics go when the drop commits. */
+		foreach(lc, targets)
+		{
+			ObjectAddress *object = lfirst(lc);
+			Relation	rel;
+
+			if (object->classId != RelationRelationId || object->objectSubId != 0)
+				continue;
+
+			rel = relation_open(object->objectId, NoLock);
+			pgstat_drop_relation(rel);
+			relation_close(rel, NoLock);
+		}
 		CatalogViewSwitch(NULL);
 		SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
 		nest = begin_api();

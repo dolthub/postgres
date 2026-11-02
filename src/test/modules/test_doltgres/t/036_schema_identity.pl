@@ -63,6 +63,8 @@ for my $kind (sort keys %objects) {
 is(sql(q{SELECT routine_schema FROM information_schema.routines WHERE routine_name = 'crypt' GROUP BY 1}),'public','information_schema lists extension functions');
 is(sql(q{SELECT string_agg(table_schema || '.' || table_name, ',' ORDER BY table_name) FROM information_schema.tables WHERE table_name IN ('t', 'u', 'heap_t')}),'public.heap_t,public.t,app.u','information_schema lists heap and versioned tables');
 is(sql(q{SELECT 'heap_t'::regclass::text, 'app.u'::regclass::text, 'public.crypt(text,text)'::regprocedure::text, 'hstore'::regtype::text}),'heap_t|app.u|crypt(text,text)|hstore','reg* casts name objects in their namespace');
+my $handle = sql(q{SELECT 'f'::regproc::oid});
+is(sql(qq{SELECT '$handle'::regprocedure::text}),'f()','a session names a versioned routine by its handle before any lookup of it by name');
 is(sql(q{SELECT (h -> 'a') FROM t}),'1','an extension operator applies to a versioned table');
 like(sql(q{\dt}),qr/heap_t.*\n.*\bt\b/s,'psql lists heap and versioned tables');
 like(sql(q{\df public.crypt}),qr/crypt/,'psql lists extension functions in public');
