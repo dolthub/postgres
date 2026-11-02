@@ -1179,6 +1179,16 @@ dg_handle_version(Relation rel, uint64 handle, PLHash *digest, PLSlice *row)
 		if (found)
 			return true;
 	}
+
+	/* Writes built on the snapshot conflict with versions committed since, which this still finds. */
+	if (dg_writes_on_snapshot(rel))
+	{
+		s = dg_load_committed_latest(rel);
+		found = dg_handle_digest(s, handle, digest) && row_of_digest(&s->content, *digest, row);
+		dg_release(s);
+		if (found)
+			return true;
+	}
 	if (journal_entry_any(&key, handle, digest, row))
 		return true;
 	if (handle_is_derived(handle) || !handle_delta_any(&key, handle, digest))
