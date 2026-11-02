@@ -47,6 +47,7 @@
 #include "access/table.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "catalog/catalog.h"
 #include "catalog/catalogview.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_authid.h"
@@ -60,6 +61,7 @@
 #include "executor/tuptable.h"
 #include "access/doltbranch.h"
 #include "access/doltcatalog.h"
+#include "access/doltsnapshot.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "storage/dsm_registry.h"
@@ -926,6 +928,15 @@ publish_all(void)
 	if (XactReadOnly)
 		ereport(ERROR, (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION), errmsg("cannot publish prolly roots in a read-only transaction")));
 	qsort(written, count, sizeof(Overlay *), compare_overlays);
+
+	/*
+	 * Write our own nodes before locking any root row. A locked root row is
+	 * held until commit, and every other publisher of its table waits on it,
+	 * so under the lock only the few nodes a merge builds remain to write.
+	 */
+	for (int i = 0; i < count; i++)
+		persist_roots(&written[i]->entries[written[i]->count - 1].roots);
+
 	catalog = table_open(DoltRootRelationId, RowExclusiveLock);
 	for (int i = 0; i < count; i++)
 	{
@@ -1050,12 +1061,15 @@ store_xact(XactEvent event, void *arg)
 			collect_threshold = DG_COLLECT_MINIMUM;
 
 			/*
-			 * Nodes in the chunk store are read through the shared cache, so
-			 * the working store keeps none across transactions: those it
-			 * read are dropped, and those it wrote are shared once committed,
-			 * then dropped. Unwritten nodes are dropped too, unless pinned,
-			 * such as the empty tree and journal folds; they are written only
-			 * when a published root reaches them.
+			 * Nodes in the chunk store are read through the shared cache. A
+			 * committed transaction's working store keeps the parsed ones,
+			 * read or written, up to dolt_session_node_cache, so the next
+			 * transaction need not copy and parse its hot paths again; past
+			 * that, or after an abort, it drops them. An aborted transaction
+			 * marked nodes written that never reached the store. Unwritten
+			 * nodes are dropped too, unless pinned, such as the empty tree
+			 * and journal folds; they are written only when a published root
+			 * reaches them.
 			 */
 			if (event == XACT_EVENT_COMMIT)
 				share_written();
@@ -1063,7 +1077,9 @@ store_xact(XactEvent event, void *arg)
 			if (working_store)
 			{
 				pl_store_drop_unbacked(working_store);
-				pl_store_drop_backed(working_store);
+				if (event != XACT_EVENT_COMMIT ||
+					pl_store_stats(working_store).bytes > (Size) dolt_session_node_cache * 1024)
+					pl_store_drop_backed(working_store);
 			}
 			written = NULL;		/* in TopTransactionContext */
 			written_count = written_capacity = 0;
@@ -1713,6 +1729,78 @@ view_roots(const RootKey *key, Snapshot snap, Roots *base)
 	return view;
 }
 
+bool		dolt_snapshot_writes = true;
+
+/*
+ * Whether writes build on the transaction snapshot now: repeatable read. The
+ * row journal, which records changes against the latest trees, keeps them on
+ * the latest state.
+ */
+bool
+dg_snapshot_writes(void)
+{
+	return dolt_snapshot_writes && !dolt_row_journal && IsolationUsesXactSnapshot() && !IsolationIsSerializable();
+}
+
+/*
+ * Under repeatable read, a load of a user table's or index's latest state
+ * reads the transaction snapshot's roots instead, so the transaction's edits
+ * build on its snapshot tree and merge with later commits only when it
+ * publishes, and a commit elsewhere never makes its batches stale. Checks
+ * that need later commits, as uniqueness does, read them explicitly
+ * (dg_load_committed_latest).
+ */
+static bool
+on_snapshot(Relation rel, Snapshot snap)
+{
+	Oid			namespace = rel->rd_rel->relnamespace;
+
+	/* DDL's private descriptors and provisional relations read the latest state. */
+	if ((snap && snap != SnapshotSelf) || !dg_snapshot_writes() ||
+		CatalogViewIsProvisional(rel->rd_catalogview) || dg_storage_bound(rel))
+		return false;
+
+	/* Catalogs and TOAST tables, whose OIDs may be in the user range, too. */
+	return (rel->rd_rel->relkind == RELKIND_RELATION || rel->rd_rel->relkind == RELKIND_INDEX) &&
+		RelationGetRelid(rel) >= FirstNormalObjectId &&
+		!IsCatalogNamespace(namespace) && !IsToastNamespace(namespace);
+}
+
+/* Whether |rel|'s writes build on the transaction snapshot now (on_snapshot). */
+bool
+dg_writes_on_snapshot(Relation rel)
+{
+	return on_snapshot(rel, SnapshotSelf);
+}
+
+/* The trees of |rel| committed as of |snapshot|, without this transaction's changes. */
+DGState *
+dg_load_committed_as_of(Relation rel, Snapshot snapshot)
+{
+	DGState    *s = new_state(rel);
+	RootKey		key = root_key(rel, dg_relation_branch(rel));
+	Roots		committed = roots_read(&key, snapshot);
+
+	state_set(s, &committed);
+	if (rel->rd_rel->relkind != RELKIND_INDEX)
+		s->delta = handle_delta_get(&key, snapshot);
+	return s;
+}
+
+/* The latest committed trees of |rel|, without this transaction's changes. */
+DGState *
+dg_load_committed_latest(Relation rel)
+{
+	DGState    *s = new_state(rel);
+	RootKey		key = root_key(rel, dg_relation_branch(rel));
+	Roots		committed = roots_latest(&key);
+
+	state_set(s, &committed);
+	if (rel->rd_rel->relkind != RELKIND_INDEX)
+		s->delta = handle_delta_get(&key, GetLatestSnapshot());
+	return s;
+}
+
 static DGState *
 load_state(Relation rel, Snapshot snap, const uint64 *wanted, const char *branch, bool use_base, bool bound)
 {
@@ -1724,6 +1812,7 @@ load_state(Relation rel, Snapshot snap, const uint64 *wanted, const char *branch
 	Overlay    *overlay;
 	OverlayEntry *entry;
 	bool		table = rel->rd_rel->relkind != RELKIND_INDEX;
+	Snapshot	snapshot_view = NULL;	/* the transaction snapshot, if on_snapshot */
 
 	if (!bound)
 		dg_catalog_check_relation(rel, branch, snap);
@@ -1746,7 +1835,15 @@ load_state(Relation rel, Snapshot snap, const uint64 *wanted, const char *branch
 	overlay = overlay_find(&key, false);
 	s->roots_generation = roots_generation(&key);
 	s->roots_generation_known = true;
-	if (snap && IsMVCCSnapshot(snap))
+	if (on_snapshot(rel, snap))
+	{
+		/* Every command of the transaction, including the current one. */
+		PushCopiedSnapshot(GetTransactionSnapshot());
+		snapshot_view = GetActiveSnapshot();
+		snapshot_view->curcid = InvalidCommandId;
+		committed = roots_read(&key, snapshot_view);
+	}
+	else if (snap && IsMVCCSnapshot(snap))
 		committed = roots_read(&key, snap);
 	else
 		committed = roots_latest(&key);
@@ -1766,8 +1863,11 @@ load_state(Relation rel, Snapshot snap, const uint64 *wanted, const char *branch
 	s->based = base.present;
 	if (base.present)
 		s->base = base.content;
+	/* Allocated handles as the roots' snapshot names them. */
 	if (table)
-		s->delta = handle_delta_get(&key, snap);
+		s->delta = handle_delta_get(&key, snapshot_view ? snapshot_view : snap);
+	if (snapshot_view)
+		PopActiveSnapshot();
 	if (!view.present && use_base)
 		dg_branch_base(rel, s);
 	return s;

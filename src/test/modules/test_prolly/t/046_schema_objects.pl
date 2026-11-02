@@ -33,6 +33,24 @@ sql(q{SELECT dolt_checkout('feature');
  CREATE VIEW equalities AS SELECT v OPERATOR(public.===) v AS value FROM t;
  SELECT dolt_commit('-Am','schema objects')});
 is(sql(q{SELECT status FROM dolt_checkout('feature'); SELECT 2 OPERATOR(public.===) 2, (ROW(9)::source::target).v}), "0\nt|10", 'operator and cast execute in the branch');
+# One session resolves operators and casts once per command: switching
+# branches, or rolling back the operator's creation, must not leave a stale view.
+{
+	my ($status, $out, $err) = $node->psql('postgres', q{SELECT status FROM dolt_checkout('feature');
+ SELECT 3 OPERATOR(public.===) 3;
+ SELECT status FROM dolt_checkout('main');
+ SELECT 3 OPERATOR(public.===) 3});
+	is($out, "0\nt\n0", 'the session resolves the operator on its branch only');
+	like($err, qr/operator does not exist/, 'after switching branches, the operator is unknown');
+	($status, $out, $err) = $node->psql('postgres', q{BEGIN;
+ CREATE FUNCTION public.main_same(integer,integer) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT $1=$2';
+ CREATE OPERATOR public.==~ (LEFTARG=integer, RIGHTARG=integer, FUNCTION=public.main_same);
+ SELECT 5 OPERATOR(public.==~) 5;
+ ROLLBACK;
+ SELECT 5 OPERATOR(public.==~) 5});
+	is($out, 't', 'an operator is usable in the command after its creation');
+	like($err, qr/operator does not exist/, 'a rolled back operator is gone from the next command');
+}
 is(sql(q{SELECT count(*) FROM pg_proc WHERE proname='total'}), '0', 'aggregate is absent on main');
 is(sql(q{SELECT count(*) FROM pg_operator WHERE oprname='==='}), '0', 'operator is absent on main');
 is(sql(q{SELECT count(*) FROM pg_cast c JOIN pg_type t ON t.oid=c.castsource WHERE t.typname='source'}), '0', 'cast is absent on main');

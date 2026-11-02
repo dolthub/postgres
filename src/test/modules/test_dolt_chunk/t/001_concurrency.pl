@@ -1,8 +1,8 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # Concurrent inserts of the same chunk never wait for each other: each
-# transaction that finds no committed copy stores its own. Committed chunks
-# survive crash recovery while uncommitted ones do not.
+# transaction stores its own copy. Committed chunks survive crash recovery
+# while uncommitted ones do not.
 use strict;
 use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
@@ -43,7 +43,10 @@ foreach my $outcome ('COMMIT', 'ROLLBACK')
 	is($node->safe_psql('postgres', "SELECT test_chunk_get(chunk_hash('$data')) = '$data'"),
 		't', "chunk readable after $outcome");
 	is($node->safe_psql('postgres', "SELECT test_chunk_put(chunk_hash('$data'), '$data')"),
-		'f', "later put finds a committed copy after $outcome");
+		't', "later put stores its own copy without probing after $outcome");
+	is(rows($data), $outcome eq 'COMMIT' ? '3' : '2', "copies after a later put ($outcome)");
+	is($node->safe_psql('postgres', "SELECT test_chunk_get(chunk_hash('$data')) = '$data'"),
+		't', "chunk readable among its copies after $outcome");
 }
 
 # Overlapping concurrent loads store every chunk with no errors or waits.

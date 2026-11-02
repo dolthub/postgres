@@ -40,6 +40,7 @@
 #include "access/xlogprefetcher.h"
 #include "access/doltchunk.h"
 #include "access/doltjournal.h"
+#include "access/doltsnapshot.h"
 #include "access/doltnode.h"
 #include "access/doltschema.h"
 #include "access/doltsystem.h"
@@ -814,6 +815,17 @@ struct config_bool ConfigureNamesBool[] =
 		},
 		&dolt_row_journal,
 		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_snapshot_writes", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Builds prolly tables' writes under repeatable read on the transaction snapshot."),
+			gettext_noop("They then merge with later commits only at commit, not as each statement reads."),
+			GUC_NOT_IN_SAMPLE
+		},
+		&dolt_snapshot_writes,
+		true,
 		NULL, NULL, NULL
 	},
 
@@ -3707,6 +3719,16 @@ struct config_int ConfigureNamesInt[] =
 		},
 		&dolt_node_cache_size,
 		1024 * 1024, 0, MAX_KILOBYTES, NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_session_node_cache", PGC_USERSET, RESOURCES_MEM,
+			gettext_noop("Sets the memory a session keeps for parsed prolly nodes across transactions."),
+			gettext_noop("Past it, a session drops the nodes it read at transaction end; 0 keeps none."),
+			GUC_UNIT_KB
+		},
+		&dolt_session_node_cache,
+		16 * 1024, 0, MAX_KILOBYTES, NULL, NULL, NULL
 	},
 
 	{

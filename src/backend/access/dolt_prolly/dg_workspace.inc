@@ -1035,39 +1035,113 @@ dolt_clean_noargs(PG_FUNCTION_ARGS)
 
 /* ---- dolt_rm ---- */
 
+/* Check both roots, including unstaged foreign keys for --cached. Removing
+ * all members of an FK together is legal; leaving an orphan is not. */
+static void
+rm_check_foreign_keys(bytea *database, List *tables)
+{
+	int count, i;
+	Member *members = database_members(database, &count);
+
+	for (i = 0; i < count; i++)
+	{
+		Constraint **constraints;
+		int n, j;
+
+		if (strcmp(members[i].kind, "table") || name_selected(tables, members[i].name))
+			continue;
+		constraints = schema_constraints(metadata(child(members[i].hash, 1), "schema"), &n);
+		for (j = 0; j < n; j++)
+		{
+			Constraint *con = constraints[j];
+			char *target;
+
+			if (con->contype != CONSTR_FOREIGN)
+				continue;
+			target = dg_qualified_name(con->pktable->schemaname, con->pktable->relname);
+			if (name_selected(tables, target))
+				ereport(ERROR, (errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+								errmsg("cannot remove %s because it is referenced from table %s", target, members[i].name)));
+		}
+	}
+}
+
 Datum
 dolt_rm(PG_FUNCTION_ARGS)
 {
-	int			n,
-				nest,
-				i;
-	char	  **args = arguments(fcinfo, &n);
-	bool		cached = false;
-	List	   *tables = NIL;
-	VersionRef	staged;
-	char	   *stagedjson;
+	int n, nest, i;
+	char **args = arguments(fcinfo, &n);
+	bool cached = false;
+	List *tables = NIL;
+	VersionRef staged;
+	char *stagedjson, *workingjson, *headjson;
+	StringInfoData unstaged, staged_new;
 
 	standalone(fcinfo, true);
-	nest = begin_api();
-	lock_workspace();
-	stagedjson = staged_state();
+	PreventCommandIfReadOnly("dolt_rm");
 	for (i = 0; i < n; i++)
 	{
 		if (!strcmp(args[i], "--cached"))
 			cached = true;
 		else if (args[i][0] == '-')
 			unsupported(args[i]);
-		else
-			tables = lappend(tables, resolve_object_argument(args[i], stagedjson, working_state(), true));
+	}
+	if (n == 0 || (n == 1 && cached))
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("Nothing specified, nothing removed. Which tables should I remove?")));
+	nest = begin_api();
+	lock_workspace();
+	stagedjson = staged_state();
+	workingjson = working_state();
+	headjson = head_state();
+	initStringInfo(&unstaged);
+	initStringInfo(&staged_new);
+	for (i = 0; i < n; i++)
+	{
+		char *name;
+		bool in_head, in_stage, changed_stage, changed_head;
+
+		if (!strcmp(args[i], "--cached"))
+			continue;
+		name = resolve_object_argument(args[i], stagedjson, workingjson, true);
+		tables = lappend(tables, name);
+		run("WITH h AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind'='table' AND v->>'name'=$4),"
+			"s AS (SELECT v FROM jsonb_array_elements($2::jsonb->'members') v WHERE v->>'kind'='table' AND v->>'name'=$4),"
+			"w AS (SELECT v FROM jsonb_array_elements($3::jsonb->'members') v WHERE v->>'kind'='table' AND v->>'name'=$4) "
+			"SELECT EXISTS(SELECT FROM h),EXISTS(SELECT FROM s),"
+			"EXISTS(SELECT FROM w) AND (SELECT v FROM s) IS DISTINCT FROM (SELECT v FROM w),"
+			"EXISTS(SELECT FROM w) AND (SELECT v FROM h) IS DISTINCT FROM (SELECT v FROM w)",
+			4, VC_TYPES(TEXTOID,TEXTOID,TEXTOID,TEXTOID), VC_ARGS(CStringGetTextDatum(headjson),CStringGetTextDatum(stagedjson),CStringGetTextDatum(workingjson),CStringGetTextDatum(name)), NULL, true);
+		in_head = DatumGetBool(cell(0, 1));
+		in_stage = DatumGetBool(cell(0, 2));
+		changed_stage = DatumGetBool(cell(0, 3));
+		changed_head = DatumGetBool(cell(0, 4));
+		if (!cached && (((in_stage || !in_head) && changed_stage) || ((in_head || !in_stage) && changed_head)))
+			appendStringInfo(&unstaged, "%s%s", unstaged.len ? ", " : "", args[i]);
+		else if (!cached && in_stage && !in_head)
+			appendStringInfo(&staged_new, "%s%s", staged_new.len ? ", " : "", args[i]);
+		else if (!in_stage && !in_head)
+			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("table not found in staged or HEAD: %s", args[i])));
 	}
 	if (!tables)
-		unsupported("dolt_rm requires table names");
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("Nothing specified, nothing removed. Which tables should I remove?")));
+	if (unstaged.len)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("error: the table(s) %s have unstaged changes.", unstaged.data)));
+	if (staged_new.len)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("error: the table(s) %s have changes saved in the index. Use --cached or commit.", staged_new.data)));
 	staged = read_ref(branch_ref("staged"));
+	rm_check_foreign_keys(staged.target ? staged.target : child(read_ref(branch_ref("heads")).target, 1), tables);
+	rm_check_foreign_keys(read_ref(branch_ref("working")).target, tables);
 	move_ref(branch_ref("staged"), staged, compose_database(staged.target ? staged.target : child(read_ref(branch_ref("heads")).target, 1), NULL, tables));
 	if (!cached)
 		drop_objects(tables);
 	end_api(nest);
 	PG_RETURN_INT64(0);
+}
+
+Datum
+dolt_rm_noargs(PG_FUNCTION_ARGS)
+{
+	return dolt_rm(fcinfo);
 }
 
 /* ---- Table checkout: restore working tables from HEAD ---- */
@@ -1443,6 +1517,73 @@ dolt_reflog_noargs(PG_FUNCTION_ARGS)
 /* ---- dolt_revert and dolt_cherry_pick: three-way application of one
  * commit's changes (or their inverse) onto the branch head ---- */
 
+/* A cherry-pick preserves source authorship but records the current committer. */
+static bytea *
+cherry_pick_commit(bytea *database, bytea *head, bytea *source,
+                   const char *author, const char *email)
+{
+	char *meta = metadata(source, "commit");
+	char *saved_name = commit_committer_name;
+	char *saved_email = commit_committer_email;
+	bytea *result = NULL;
+	const char *user = GetUserNameFromId(GetUserId(), false);
+
+	PG_TRY();
+	{
+		commit_committer_name = setting_present(dolt_committer_name) ? dolt_committer_name : (char *) user;
+		commit_committer_email = setting_present(dolt_committer_email) ? dolt_committer_email : default_email(user);
+		result = commit_object(database, head, NULL, json_value(meta, "message"),
+				author ? author : json_value(meta, "author"),
+				email ? email : json_value(meta, "author_email"),
+				pg_strtoint64(json_value(meta, "author_date_us")));
+	}
+	PG_FINALLY();
+	{
+		commit_committer_name = saved_name;
+		commit_committer_email = saved_email;
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static void
+cherry_pick_conflict_counts(const char *json, int64 counts[3])
+{
+	int i;
+
+	run("SELECT (SELECT count(DISTINCT v->>'table') FROM jsonb_array_elements($1::jsonb->'conflicts') v), (SELECT count(DISTINCT v->>'table') FROM jsonb_array_elements($1::jsonb->'schema_conflicts') v), (SELECT count(DISTINCT v->>'table') FROM jsonb_array_elements($1::jsonb->'violations') v)", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
+	for (i = 0; i < 3; i++)
+		counts[i] = DatumGetInt64(cell(0, i + 1));
+}
+
+/* A revert may retain unrelated working edits, but must never absorb a
+ * user's edits to a member changed by the source commit. Check the source
+ * delta even when its inverse would happen to equal the local result. */
+static void
+revert_check_local_changes(bytea *head, bytea *working, bytea *source, bytea *parent)
+{
+	int nh, nw, ns, np;
+	Member *hm = database_members(head, &nh);
+	Member *wm = database_members(working, &nw);
+	Member *sm = database_members(source, &ns);
+	Member *pm = database_members(parent, &np);
+	int i;
+
+	for (i = 0; i < ns + np; i++)
+	{
+		Member *key = i < ns ? &sm[i] : &pm[i - ns];
+		Member *before = merge_member(pm, np, key->kind, key->name);
+		Member *after = merge_member(sm, ns, key->kind, key->name);
+
+		if (!merge_same(before, after) &&
+			!merge_same(merge_member(hm, nh, key->kind, key->name),
+						merge_member(wm, nw, key->kind, key->name)))
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("local changes would be overwritten by revert"),
+							errdetail("Uncommitted changes overlap at %s %s.", key->kind, key->name)));
+	}
+}
+
 static Datum
 apply_commit(FunctionCallInfo fcinfo, bool revert)
 {
@@ -1452,10 +1593,15 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 	char	  **args = arguments(fcinfo, &n),
 			   *author = NULL,
 			   *email = NULL;
-	List	   *revisions = NIL;
+	List	   *revisions = NIL, *targets = NIL;
 	ListCell   *lc;
-	VersionRef	head;
+	VersionRef	head, pending;
+	bool abort_pick = false, continue_pick = false;
+	int64 conflict_counts[3] = {0, 0, 0};
 	bytea	   *commit = NULL;
+	Capture live;
+	const char *operation_name = revert ? "revert" : "cherry-pick";
+	bytea *series_head = NULL, *series_working = NULL, *series_staged = NULL;
 	Datum		values[4];
 	bool		nulls[4] = {false, false, false, false};
 
@@ -1467,25 +1613,125 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 	{
 		if (!strcmp(args[i], "--author") && i + 1 < n)
 			author_option(args[++i], &author, &email);
+		else if (!strcmp(args[i], "--abort"))
+			abort_pick = true;
+		else if (!strcmp(args[i], "--continue"))
+			continue_pick = true;
 		else if (args[i][0] == '-')
 			unsupported(args[i]);
 		else
 			revisions = lappend(revisions, args[i]);
 	}
+	pending = read_ref(branch_ref("merge"));
+	if (abort_pick && continue_pick)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("--continue and --abort are mutually exclusive")));
+	if (continue_pick)
+	{
+		char *json = pending.target ? metadata(pending.target, "merge") : NULL;
+		char *operation = json ? json_value(json, "operation") : NULL;
+		bytea *database;
+
+		if (revisions || !operation || strcmp(operation, operation_name))
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("no %s to continue", operation_name)));
+		cherry_pick_conflict_counts(json, conflict_counts);
+		if (conflict_counts[0] || conflict_counts[1] || conflict_counts[2])
+			goto done;
+
+		if (!author)
+		{
+			author = json_value(json, "author_override");
+			email = json_value(json, "email_override");
+		}
+		validate_working_foreign_keys(dg_current_branch(), NULL);
+		database = staged_capture(&live);
+		head = read_ref(branch_ref("heads"));
+		if (revert)
+		{
+			char *remaining = json_value(json, "remaining");
+			int count = remaining ? pg_strtoint32(remaining) : 0;
+
+			if (!database_same(database, read_ref(branch_ref("staged")).target))
+				ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+								errmsg("all resolved changes must be staged before continuing revert")));
+			series_head = child(pending.target, 6);
+			series_working = child(pending.target, 4);
+			series_staged = child(pending.target, 5);
+			for (i = 0; i < count; i++)
+				targets = lappend(targets, child(pending.target, 7 + i));
+			commit = commit_object(database, head.target, NULL,
+					psprintf("Revert \"%s\"", json_value(metadata(child(pending.target, 3), "commit"), "message")),
+					author ? author : json_value(json, "author_override"),
+					email ? email : json_value(json, "email_override"), GetCurrentTimestamp());
+		}
+		else
+			commit = cherry_pick_commit(database, head.target, child(pending.target, 2),
+					author ? author : json_value(json, "author_override"),
+					email ? email : json_value(json, "email_override"));
+		move_ref(branch_ref("heads"), head, commit);
+		move_ref(branch_ref("staged"), read_ref(branch_ref("staged")), database);
+		move_ref(branch_ref("working"), read_ref(branch_ref("working")), live.hash);
+		finish_merge();
+		advance_snapshot();
+		pending = empty_ref;
+		if (targets)
+			goto apply_targets;
+		goto done;
+	}
+	if (abort_pick)
+	{
+		char *operation = pending.target ? json_value(metadata(pending.target, "merge"), "operation") : NULL;
+		bytea *working, *staged;
+
+		if (revisions || !operation || strcmp(operation, operation_name))
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("no %s to abort", operation_name)));
+		working = child(pending.target, 4);
+		staged = child(pending.target, 5);
+		live = capture_visible();
+		/* Ignored untracked data is outside the operation. Preserve edits
+		 * and deletions made even after the conflict was published. */
+		{
+			List *ignored = ignored_untracked_tables(metadata(working, "database"), metadata(staged, "database"));
+			List *now_ignored = ignored_untracked_tables(live.json, metadata(staged, "database"));
+
+			working = compose_database(working, live.hash, list_concat(ignored, now_ignored));
+		}
+		replace_working(dg_current_branch(), working, NIL);
+		move_ref(branch_ref("working"), read_ref(branch_ref("working")), working);
+		move_ref(branch_ref("staged"), read_ref(branch_ref("staged")), staged);
+		if (revert)
+			move_ref(branch_ref("heads"), read_ref(branch_ref("heads")), child(pending.target, 6));
+		finish_merge();
+		goto done;
+	}
+	if (pending.target)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("a merge, cherry-pick or revert is already in progress")));
 	if (!revisions)
 		unsupported(revert ? "dolt_revert requires a revision" : "dolt_cherry_pick requires a revision");
 	if (!revert && list_length(revisions) != 1)
 		unsupported("cherry-picking more than one commit");
 	head = read_ref(branch_ref("heads"));
-	if (!database_same(capture_visible().hash, child(head.target, 1)) || !database_same(read_ref(branch_ref("staged")).target, child(head.target, 1)))
+	if ((!revert && !database_same(staged_capture(&live), child(head.target, 1))) || !database_same(read_ref(branch_ref("staged")).target, child(head.target, 1)))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("cannot %s with uncommitted changes", revert ? "revert" : "cherry-pick")));
+	/* Resolve every input against the same starting HEAD. Publishing an
+	 * earlier revert must not change the meaning of a later HEAD~N. */
 	foreach(lc, revisions)
+		targets = lappend(targets, resolve(lfirst(lc)));
+	series_head = head.target;
+	series_working = capture_visible().hash;
+	series_staged = read_ref(branch_ref("staged")).target;
+apply_targets:
+	foreach(lc, targets)
 	{
-		bytea	   *target = resolve((char *) lfirst(lc)),
+		bytea	   *target = lfirst(lc),
 				   *parent,
 				   *targetdb,
 				   *parentdb,
-				   *database;
+				   *database,
+				   *newworking;
 		char	   *meta = metadata(target, "commit"),
 				   *message;
 		StringInfoData conflicts,
@@ -1494,10 +1740,15 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 
 		if (parent_count(target) < 1)
 			unsupported("reverting or cherry-picking a root commit");
+		if (!revert && parent_count(target) > 1)
+			unsupported("cherry-picking a merge commit is not supported");
 		parent = child(target, 2);
 		targetdb = child(target, 1);
 		parentdb = child(parent, 1);
 		head = read_ref(branch_ref("heads"));
+		live = capture_visible();
+		if (revert)
+			revert_check_local_changes(child(head.target, 1), live.hash, targetdb, parentdb);
 		initStringInfo(&conflicts);
 		initStringInfo(&violations);
 		initStringInfo(&schema_conflicts);
@@ -1505,20 +1756,59 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 			merge_databases(targetdb, child(head.target, 1), parentdb, &conflicts, &violations, &schema_conflicts);
 		else
 			merge_databases(parentdb, child(head.target, 1), targetdb, &conflicts, &violations, &schema_conflicts);
-		if (conflicts.len || violations.len || schema_conflicts.len)
-			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("%s resulted in conflicts; resolve them with dolt_merge", revert ? "revert" : "cherry-pick")));
 		database = capture_visible().hash;
+		newworking = carry_workspace_changes(child(head.target, 1), live.hash, database);
+		if (!database_same(newworking, database))
+			replace_working(dg_current_branch(), newworking, NIL);
+		if (conflicts.len || violations.len || schema_conflicts.len)
+		{
+			StringInfoData state;
+			int remaining = list_length(targets) - foreach_current_index(lc) - 1;
+			int children_count = 6 + remaining, next = 6;
+			Datum *children = palloc(sizeof(Datum) * children_count);
+			ListCell *queued;
+
+			commit = NULL;
+			children[0] = PointerGetDatum(head.target);
+			children[1] = PointerGetDatum(revert ? parent : target);
+			children[2] = PointerGetDatum(revert ? target : parent);
+			children[3] = PointerGetDatum(series_working);
+			children[4] = PointerGetDatum(series_staged);
+			children[5] = PointerGetDatum(series_head);
+			for_each_from(queued, targets, foreach_current_index(lc) + 1)
+				children[next++] = PointerGetDatum(lfirst(queued));
+			/* Reuse merge conflict resolution without a second commit parent.
+			 * Retain the series origin and queue as graph links so restart,
+			 * conflict edits and object retention cannot lose them. */
+			initStringInfo(&state);
+			appendStringInfoString(&state, "{\"format\":\"DGMERGE1\",\"squash\":true,\"operation\":");
+			escape_json(&state, operation_name);
+			appendStringInfo(&state, ",\"remaining\":%d,\"source\":", remaining);
+			escape_json(&state, revert ? hash_format(target) : (char *) linitial(revisions));
+			if (author)
+			{
+				json_field(&state, "author_override", author, true);
+				json_field(&state, "email_override", email, true);
+			}
+			appendStringInfo(&state, ",\"conflicts\":[%s],\"violations\":[%s],\"schema_conflicts\":[%s]}", conflicts.data, violations.data, schema_conflicts.data);
+			move_ref(branch_ref("merge"), pending,
+					 put("merge", state.data, children, children_count));
+			move_ref(branch_ref("working"), read_ref(branch_ref("working")), newworking);
+			cherry_pick_conflict_counts(state.data, conflict_counts);
+			goto done;
+		}
 		message = revert ? psprintf("Revert \"%s\"", json_value(meta, "message")) : json_value(meta, "message");
-		commit = commit_object(database, head.target, NULL, message, author, email, GetCurrentTimestamp());
+		commit = revert ? commit_object(database, head.target, NULL, message, author, email, GetCurrentTimestamp()) :
+			cherry_pick_commit(database, head.target, target, author, email);
 		move_ref(branch_ref("heads"), head, commit);
 		move_ref(branch_ref("staged"), read_ref(branch_ref("staged")), database);
-		move_ref(branch_ref("working"), read_ref(branch_ref("working")), database);
+		move_ref(branch_ref("working"), read_ref(branch_ref("working")), newworking);
 		advance_snapshot();
 	}
-	values[0] = CStringGetTextDatum(hash_format(commit));
-	values[1] = Int64GetDatum(0);
-	values[2] = Int64GetDatum(0);
-	values[3] = Int64GetDatum(0);
+done:
+	values[0] = CStringGetTextDatum(commit ? hash_format(commit) : "");
+	for (i = 0; i < 3; i++)
+		values[i + 1] = Int64GetDatum(conflict_counts[i]);
 	end_api(nest);
 	return command_record(fcinfo, values, nulls);
 }

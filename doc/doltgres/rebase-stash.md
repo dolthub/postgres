@@ -37,24 +37,47 @@ Dolt's wording.
 ## dolt_stash and dolt.stashes
 
 `dolt_stash(push|pop|apply|drop|clear, name [, index])`. `push` captures the
-working set, stores a `stash` object (children: stashed working database,
-staged database, head commit; payload with branch, head and the `WIP on
-<branch>: <hash7> <message>` text) under `stash/<name>/<seq>`, and restores
-the tracked tables to HEAD. Only tracked tables are stashed; untracked
-tables stay in place. `pop`/`apply` merge the stash three-way onto the
-current working set (base: the stash's head) and error with Dolt's "would be
-overwritten" message on conflicts; `pop` and `drop` remove the entry,
-`clear` removes every entry of a name. `dolt.stashes` / `dolt_stashes` list
-`name, stash_id (stash@{n}, newest first), branch, hash, commit_message`.
+selected working objects in a `stash` object (children: stashed database,
+original staged database, HEAD commit), whose metadata contains branch, HEAD
+and the original commit message. Named stacks use exact `stash/<name>/<seq>`
+refs; their names are not SQL LIKE patterns. Indexes accept both integer and
+`stash@{n}` syntax.
+
+Default push selects objects tracked in HEAD or staging, including deletions,
+and leaves untracked objects in place. `-u` / `--include-untracked` also selects
+unignored untracked objects; `-a` / `--all` includes ignored objects. Selected
+objects are reset to HEAD, removing selected additions. A push with no selected
+changes fails without adding an entry.
+
+Apply/pop uses the same canonical schema and row merge machinery as other
+three-way operations, with the stash's original HEAD as base. Disjoint local
+changes remain. Conflicts abort the stash command atomically and retain the
+stash. Originally staged additions are staged again with their full merged
+contents; modifications of already tracked tables remain unstaged. Apply keeps
+the entry; pop removes it only after successful application. Read-only
+transactions cannot mutate stashes.
+
+`dolt.stashes` / `dolt_stashes` list `name, stash_id (stash@{n}, newest first),
+branch, hash, commit_message`. Tests cover table additions/deletions, different
+branches, dirty working sets, ignore rules, native types and dependent objects.
 
 ## dolt_query_diff
 
 Both query strings are analyzed at parse time (`query_diff_layout`) so the
-result has `from_<col>…, to_<col>…, diff_type`. Rows are compared as whole
-values after running both queries with the caller's search path: rows only
-in the first result are `deleted`, rows only in the second are `added`, and
-identical rows are omitted. Dolt's primary-key based `modified` rows are not
-produced.
+result has `from_<col>…, to_<col>…, diff_type`. Both queries run with the
+caller's search path. Direct single-table projections containing a complete,
+nondeferrable primary key pair rows by that key and report `modified` when
+other output values differ. Key definitions come from each query's bound
+revision. Different logical table names produce separate deletions/additions,
+without rename fingerprints or persistent column tags.
+
+Other results use whole-row multiset comparison: unmatched rows are `deleted`
+or `added`, identical rows cancel, and duplicate multiplicity is preserved.
+This fallback includes joins, aggregates, set operations, incomplete key
+projections and inheritance scans (a parent's key does not constrain its
+children). Typed, length-framed text values distinguish embedded delimiters,
+NULLs and empty strings. Generic query lineage through views/subqueries is not
+yet inferred.
 
 ## dolt.help
 
@@ -76,3 +99,17 @@ tests for argument".
 
 Tests: `src/test/modules/test_prolly/t/024_rebase_stash.pl`; Doltgres
 `TestUserSpaceDoltTables/dolt_rebase` under the postgres profile.
+
+## User metadata alias revisions (2026-11-01)
+
+The docs/tests/query-catalog aliases read ordinary versioned tables. A copied
+system-view rule now binds its metadata reader to the same database root and
+optional branch context as its relation references. Nested reader SQL explicitly
+keeps that provider, so AS OF, branch-qualified aliases and two revisions in one
+statement cannot silently fall back to the session branch. Before a backing
+table existed, the alias returns its empty typed result.
+
+DROP TABLE on these user-content aliases targets the branch's public backing
+table rather than the built-in view. A second DROP reports a missing table;
+INSERT can recreate it through the existing initializer. Retained revisions and
+other branches are unchanged. This adds no persisted catalog materializations.

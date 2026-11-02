@@ -632,6 +632,60 @@ row_of(DGState *s, PLHash digest, PLSlice *row)
 }
 
 /*
+ * Whether the row |handle|, which this transaction's view built on its
+ * snapshot shows (dg_writes_on_snapshot), still holds its key, as heap's
+ * dirty snapshot would see: a row the transaction added does, and a
+ * committed one only while it is still committed.
+ */
+static bool
+snapshot_row_live(Relation table, uint64 handle)
+{
+	DGState    *s = dg_load_committed_latest(table);
+	PLHash		digest;
+	bool		live = handle_digest_of(s, handle, &digest);
+
+	dg_release(s);
+	if (live)
+		return true;
+	s = dg_load_committed_as_of(table, GetTransactionSnapshot());
+	live = !handle_digest_of(s, handle, &digest);
+	dg_release(s);
+	return live;
+}
+
+/*
+ * A row with |index| key [lo, hi) another transaction committed after this
+ * one's snapshot, which its view does not show, and that it has not changed;
+ * zero if there is none.
+ */
+static uint64
+committed_conflict(Relation table, Relation index, PLSlice lo, PLSlice hi)
+{
+	DGState    *rows = dg_load_committed_latest(table);
+	DGState    *entries = dg_load_committed_latest(index);
+	const char *branch = dg_relation_branch(table);
+	KeyRows		found = {index};
+	uint64		conflict = 0;
+
+	dg_check(pl_scan(&entries->content, &lo, &hi, collect_key_rows, &found));
+	for (int i = 0; i < found.count && !conflict; i++)
+	{
+		HandleList	handles = handles_of(rows, found.digests[i], -1);
+
+		for (int j = 0; j < handles.count && !conflict; j++)
+		{
+			CommandId	cid;
+
+			if (!dg_row_modified(table, branch, handles.items[j], &cid))
+				conflict = handles.items[j];
+		}
+	}
+	dg_release(rows);
+	dg_release(entries);
+	return conflict;
+}
+
+/*
  * Another live row of |table| whose |index| key equals that of the row at
  * |tid|, as this transaction sees the latest state; zero if there is none.
  */
@@ -652,6 +706,7 @@ unique_conflict(Relation table, Relation index, uint64 self, StringInfo prefix)
 			   *removed = NIL;
 	ListCell   *lc;
 	uint64		conflict = 0;
+	bool		on_snapshot = dg_writes_on_snapshot(table);
 
 	initStringInfo(&upper);
 	appendBinaryStringInfo(&upper, prefix->data, prefix->len);
@@ -690,10 +745,10 @@ unique_conflict(Relation table, Relation index, uint64 self, StringInfo prefix)
 			if (pl_hash_equal(*(PLHash *) lfirst(lc), found.digests[i]))
 				gone = true;
 		for (int j = 0; j < handles.count && !conflict && !gone; j++)
-			if (handles.items[j] != self)
-				conflict = handles.items[j];
-			else
+			if (handles.items[j] == self)
 				own++;
+			else if (!on_snapshot || snapshot_row_live(table, handles.items[j]))
+				conflict = handles.items[j];
 		for (int j = 0; j < n && !conflict; j++)
 			if (pending[j] != self)
 				conflict = pending[j];
@@ -709,6 +764,10 @@ unique_conflict(Relation table, Relation index, uint64 self, StringInfo prefix)
 	}
 	dg_release(rows);
 	dg_release(entries);
+
+	/* A view built on the snapshot misses rows committed since. */
+	if (!conflict && on_snapshot)
+		conflict = committed_conflict(table, index, lo, hi);
 	return conflict;
 }
 

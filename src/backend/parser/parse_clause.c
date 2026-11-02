@@ -523,8 +523,10 @@ transformRangeFunction(ParseState *pstate, RangeFunction *r)
 		fexpr = (Node *) linitial(pair);
 		coldeflist = (List *) lsecond(pair);
 
-		/* Dolt table functions derive their columns from their arguments */
-		if (coldeflist == NIL && IsA(fexpr, FuncCall))
+		/* Derive columns only when neither SQL spelling supplies them. Stored
+		 * view definitions deparse a single function's descriptor at the
+		 * RangeFunction level; regenerating it here creates conflicting lists. */
+		if (coldeflist == NIL && r->coldeflist == NIL && IsA(fexpr, FuncCall))
 			coldeflist = dg_system_function_columns(pstate, (FuncCall *) fexpr);
 
 		/*

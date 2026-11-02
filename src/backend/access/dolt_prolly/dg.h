@@ -98,6 +98,10 @@ extern DGState *dg_load_bound(Relation rel, Snapshot snapshot, const char *branc
 extern void dg_check(PLStatus status);
 extern PLHash dg_rowhash(PLSlice row);
 extern DGState *dg_load(Relation rel, Snapshot snapshot);
+extern bool dg_snapshot_writes(void);
+extern bool dg_writes_on_snapshot(Relation rel);
+extern DGState *dg_load_committed_latest(Relation rel);
+extern DGState *dg_load_committed_as_of(Relation rel, Snapshot snapshot);
 extern DGState *dg_catalog_mutation_load(Relation rel, Snapshot snapshot);
 extern void dg_catalog_mutation_release(DGState *state);
 extern bool dg_catalog_begin_rewrite(Relation definition);

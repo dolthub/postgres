@@ -242,6 +242,41 @@ like($b->{stderr}, qr/could not serialize access due to concurrent update/,
 $b->{stderr} = '';
 $b->query_safe('ROLLBACK');
 
+# Under Repeatable Read writes build on the transaction snapshot
+# (dolt_snapshot_writes): a commit of other rows meanwhile neither fails the
+# writer nor is lost when it publishes. Uniqueness still sees the latest
+# state, as heap's dirty snapshot does: a key committed since conflicts, and
+# a key whose row was deleted since is free.
+my $updated = sql(q{SELECT string_agg((v + 1)::text, ',' ORDER BY id) FROM t WHERE id IN (1, 2)});
+$b->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM t');
+sql('INSERT INTO t VALUES (25, 130); UPDATE t SET v = v + 1 WHERE id = 1');
+$b->query_safe('INSERT INTO t VALUES (26, 140); UPDATE t SET v = v + 1 WHERE id = 2');
+is($b->query_safe('SELECT count(*) FROM t WHERE id = 25'), '0', 'the snapshot hides a row committed since');
+$b->query_safe('COMMIT');
+is(sql(q{SELECT string_agg(v::text, ',' ORDER BY id) FROM t WHERE id IN (1, 2, 25, 26)}),
+	"$updated,130,140", 'writes on the snapshot merge with later commits');
+$b->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM t');
+sql('INSERT INTO t VALUES (27, 150); DELETE FROM t WHERE id = 26');
+$b->query('INSERT INTO t VALUES (27, 151)');
+like($b->{stderr}, qr/duplicate key value violates unique constraint "t_pkey"/,
+	'a key committed since the snapshot is a duplicate');
+$b->{stderr} = '';
+$b->query_safe('ROLLBACK');
+$b->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM t');
+sql('DELETE FROM t WHERE id = 25');
+$b->query_safe('INSERT INTO t VALUES (25, 131)');
+$b->query_safe('COMMIT');
+is(sql('SELECT v FROM t WHERE id = 25'), '131', 'a key deleted since the snapshot is free');
+sql('CREATE TABLE snapdup(v int)');
+$b->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM snapdup');
+sql('INSERT INTO snapdup VALUES (1), (1)');
+$b->query_safe('INSERT INTO snapdup VALUES (1), (2)');
+$b->query_safe('COMMIT');
+is(sql(q{SELECT string_agg(v::text, ',' ORDER BY v) FROM snapdup}), '1,1,1,2',
+	'identical keyless rows from both merge into their count');
+sql('UPDATE snapdup SET v = 3 WHERE v = 1');
+is(sql('SELECT count(*) FROM snapdup WHERE v = 3'), '3', 'and every occurrence stays addressable');
+
 # AFTER triggers and RETURNING see the old version: each version has its own TID.
 # TODO: triggers on versioned tables. CREATE TRIGGER is native DDL today, and
 # a native trigger cannot depend on a versioned table.

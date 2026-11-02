@@ -37,7 +37,8 @@ SELECT indisunique, indisprimary FROM pg_index WHERE indexrelid = 'pg_dolt_chunk
 SELECT name, setting, unit FROM pg_settings
   WHERE name IN ('dolt_chunk_verify_hashes') ORDER BY name;
 
--- A put that finds a committed copy stores nothing, so repeated puts keep one row.
+-- Puts never probe for a committed copy: every put of this chunk in the
+-- contract stored one.
 SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = chunk_hash('contract alpha');
 
 -- A chunk longer than one heap tuple spans parts, each inline and uncompressed.
@@ -80,7 +81,6 @@ CREATE FUNCTION chunk_xmin_hinted(hash bytea) RETURNS bool LANGUAGE sql AS $$
 $$;
 SELECT test_chunk_put(chunk_hash('hintless'), 'hintless');
 SELECT test_chunk_exists(chunk_hash('hintless')) AS exists;
-SELECT test_chunk_put(chunk_hash('hintless'), 'hintless') AS reput;
 SELECT chunk_xmin_hinted(chunk_hash('hintless')) AS hinted_after_probes;
 -- Control: an ordinary MVCC read of the row sets the hint.
 SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = chunk_hash('hintless');

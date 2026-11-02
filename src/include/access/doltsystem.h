@@ -18,6 +18,7 @@ extern Query *dg_system_delete(struct ParseState *pstate, DeleteStmt *stmt);
 extern void dg_system_insert_target(const RangeVar *rv);
 extern void dg_system_user_target(RangeVar *rv);
 extern void dg_system_check_ddl(Node *statement);
+extern void dg_system_function_context(FuncExpr *expr, const char *database, const char *branch);
 extern void dg_ensure_user_table(const char *name);
 extern bool dg_internal_system_ddl;
 extern void dg_ensure_ignore_table(const char *schema);

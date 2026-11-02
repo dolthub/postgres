@@ -36,6 +36,7 @@
 #include "utils/memutils.h"
 
 int			dolt_node_cache_size = 1024 * 1024;	/* kB */
+int			dolt_session_node_cache = 16 * 1024;	/* kB */
 
 #define NODE_PARTITIONS 128
 

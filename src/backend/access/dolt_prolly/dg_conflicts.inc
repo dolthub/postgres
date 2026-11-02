@@ -272,10 +272,19 @@ conflict_layout(const char *table, const char *from, const char *to)
 		ours = diff_table_schema("WORKING", table);
 		if (!ours->present)
 			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("table not found: %s", table)));
-		if (pending_merge_commits(&oursc, &theirsc, &basec, &json) && !conflicts_merged(json, table))
+		if (pending_merge_commits(&oursc, &theirsc, &basec, &json))
 		{
 			base = diff_table_at(child(basec, 1), table, false);
-			theirs = diff_table_at(child(theirsc, 1), table, false);
+			if (conflicts_merged(json, table))
+			{
+				/* Keyed base rows can be recovered from retained history even
+				 * when the working schema has dropped one of their columns. */
+				if (base->present && !base->keyed)
+					base = ours;
+				theirs = ours;
+			}
+			else
+				theirs = diff_table_at(child(theirsc, 1), table, false);
 		}
 		else
 			base = theirs = ours;
@@ -299,6 +308,7 @@ dolt_conflicts_table(PG_FUNCTION_ARGS)
 			   *ours,
 			   *theirs;
 	int			i;
+	bool retained_base = false;
 	ConflictEmit e;
 
 	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
@@ -308,7 +318,13 @@ dolt_conflicts_table(PG_FUNCTION_ARGS)
 		return (Datum) 0;
 	}
 	if (conflicts_merged(json, name))
-		base = ours = theirs = diff_table_schema("WORKING", name);
+	{
+		ours = theirs = diff_table_schema("WORKING", name);
+		base = diff_table_at(child(basec, 1), name, true);
+		retained_base = base->present && base->keyed;
+		if (base->present && !base->keyed)
+			base = ours;
+	}
 	else
 	{
 		base = diff_table_at(child(basec, 1), name, false);
@@ -353,9 +369,33 @@ dolt_conflicts_table(PG_FUNCTION_ARGS)
 				target->bytes.len -= 8;
 			}
 		}
+		if (retained_base)
+		{
+			size_t lo = 0, hi = base->rows.count;
+
+			row.base = DG_VALUE(false, DG_SLICE(NULL, 0));
+			row.base_count = 0;
+			while (lo < hi)
+			{
+				size_t mid = lo + (hi - lo) / 2;
+				int cmp = pl_compare(base->rows.items[mid].key, row.key);
+
+				if (cmp < 0)
+					lo = mid + 1;
+				else if (cmp > 0)
+					hi = mid;
+				else
+				{
+					row.base = row_at(base, mid, &row.base_count);
+					break;
+				}
+			}
+		}
 		emit_conflict_row(base, ours, theirs, &row, &e);
 		SPI_tuptable = tuptable;
 	}
+	if (retained_base)
+		diff_table_close(base);
 	end_api(nest);
 	return (Datum) 0;
 }

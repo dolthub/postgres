@@ -171,6 +171,24 @@ ignored_tables(List *tables)
 	return result;
 }
 
+/* Ignore rules apply only to tables absent from both HEAD and the supplied
+ * tracked snapshot. Explicitly force-added tables subsequently stay tracked. */
+static List *
+ignored_untracked_tables(const char *working, const char *tracked)
+{
+	List *known = list_concat(state_tables(head_state()), state_tables(tracked));
+	List *candidates = NIL;
+	VersionRef pending = read_ref(branch_ref("merge"));
+	ListCell *lc;
+
+	if (pending.target)
+		known = list_concat(known, state_tables(metadata(child(child(pending.target, 2), 1), "database")));
+	foreach(lc, state_tables(working))
+		if (!name_selected(known, lfirst(lc)))
+			candidates = lappend(candidates, lfirst(lc));
+	return ignored_tables(candidates);
+}
+
 /* Capture the working set and drop ignored untracked tables from it: the
  * state that dolt_add -A and dolt_commit -A stage. |full| receives the
  * complete capture for the working ref. */
@@ -179,16 +197,10 @@ staged_capture(Capture *full)
 {
 	VersionRef	staged = read_ref(branch_ref("staged"));
 	bytea	   *base = staged.target ? staged.target : child(read_ref(branch_ref("heads")).target, 1);
-	List	   *tracked = list_concat(state_tables(head_state()), state_tables(staged_state())),
-			   *candidates = NIL,
-			   *ignored;
-	ListCell   *lc;
+	List *ignored;
 
 	*full = capture_visible();
-	foreach(lc, state_tables(metadata(full->hash, "database")))
-		if (!name_selected(tracked, (char *) lfirst(lc)))
-		candidates = lappend(candidates, lfirst(lc));
-	ignored = ignored_tables(candidates);
+	ignored = ignored_untracked_tables(full->json, staged_state());
 	if (ignored == NIL)
 		return full->hash;
 	return compose_database(full->hash, base, ignored);
@@ -364,7 +376,11 @@ dolt_user_table(PG_FUNCTION_ARGS)
 	const char *empty;
 	int			nest = begin_api();
 	bool		exists;
+	CatalogView *view = NULL;
 	char	   *query;
+
+	if (PG_NARGS() == 3)
+		view = context_view(hash_parse(text_to_cstring(PG_GETARG_TEXT_PP(1))), PG_ARGISNULL(2) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(2)));
 
 	if (!strcmp(name, "dolt_docs"))
 	{
@@ -383,12 +399,20 @@ dolt_user_table(PG_FUNCTION_ARGS)
 	}
 	else
 		elog(ERROR, "unknown versioned metadata table");
-	run_context("SELECT EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relname=$1)", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(name)), NULL, true);
+	run_context_view("SELECT EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relname=$1)", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(name)), NULL, true, view);
 	exists = DatumGetBool(cell(0, 1));
 	query = exists ? psprintf("SELECT %s FROM public.%s", columns, name) : psprintf("SELECT %s WHERE false", empty);
 	if (!strcmp(name, "dolt_docs"))
 		query = psprintf("%s UNION ALL SELECT 'AGENT.md'::text,pg_catalog.dolt_default_doc('AGENT.md') %s", query, exists ? "WHERE NOT EXISTS (SELECT 1 FROM public.dolt_docs WHERE doc_name='AGENT.md')" : "");
-	run_context(query, 0, NULL, NULL, NULL, true);
+	run_context_view(query, 0, NULL, NULL, NULL, true, view);
 	return_rows(fcinfo, nest);
 	return (Datum) 0;
+}
+
+Datum
+dolt_user_table_context(PG_FUNCTION_ARGS)
+{
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("metadata name and catalog context cannot be null")));
+	return dolt_user_table(fcinfo);
 }

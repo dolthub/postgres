@@ -9,19 +9,106 @@ run_user_query(const char *sql)
 }
 
 /* ---- dolt_query_diff ----
- *
- * Both queries are analyzed at parse time (dg_system_function_columns) to
- * build the from_<col>, to_<col>, diff_type layout. Rows are compared as whole
- * values: rows only in the first result are 'deleted', rows only in the
- * second are 'added', and identical rows are omitted (Dolt's keyless rule).
+ * Direct projections of a complete primary key can identify modified rows.
+ * Other results use multiset comparison. Logical names, not OIDs or column
+ * fingerprints, distinguish tables across revisions.
  */
+typedef struct QueryIdentity
+{
+	char	   *source;
+	char	   *signature;
+	int			nkeys;
+	int		   *columns;
+} QueryIdentity;
+
+static QueryIdentity
+query_identity(const char *sql)
+{
+	QueryIdentity result = {0};
+	List	   *raw = raw_parser(sql, RAW_PARSE_DEFAULT);
+	Query	   *query;
+	RangeTblEntry *rte;
+	Oid			relid,
+				pk;
+	Relation	rel,
+				index;
+	StringInfoData signature;
+	int			k;
+
+	if (list_length(raw) != 1)
+		return result;
+	query = parse_analyze_fixedparams(linitial_node(RawStmt, raw), sql, NULL, 0, NULL);
+	if (query->commandType != CMD_SELECT || list_length(query->rtable) != 1 ||
+		query->hasAggs || query->hasWindowFuncs || query->hasTargetSRFs ||
+		query->setOperations || query->groupClause || query->distinctClause)
+		return result;
+	rte = linitial_node(RangeTblEntry, query->rtable);
+	relid = OidIsValid(rte->dolt_rowtype) ? get_typ_typrelid(rte->dolt_rowtype) :
+		(rte->rtekind == RTE_RELATION ? rte->relid : InvalidOid);
+	if (!OidIsValid(relid))
+		return result;
+	rel = relation_open(relid, AccessShareLock);
+	result.source = rel->rd_catalogview ?
+		pstrdup(CatalogViewObjectIdentity(relid, RelationRelationId)) :
+		dg_qualified_name(get_namespace_name(RelationGetNamespace(rel)), RelationGetRelationName(rel));
+	pk = RelationGetPrimaryKeyIndex(rel, false);
+	/* A parent key does not constrain rows in inherited child tables. */
+	if (!OidIsValid(pk) || (rte->inh && has_subclass(relid)))
+	{
+		relation_close(rel, AccessShareLock);
+		return result;
+	}
+
+	/* Catalog metadata suffices; historical indexes need no storage binding. */
+	index = index_open(pk, AccessShareLock);
+	result.nkeys = index->rd_index->indnkeyatts;
+	result.columns = palloc(sizeof(int) * result.nkeys);
+	initStringInfo(&signature);
+	for (k = 0; k < result.nkeys; k++)
+	{
+		AttrNumber	attnum = index->rd_index->indkey.values[k];
+		Form_pg_attribute att = TupleDescAttr(RelationGetDescr(rel), attnum - 1);
+		ListCell   *lc;
+		int			column = 0;
+		bool		found = false;
+
+		appendStringInfo(&signature, "%zu:%s:%u;", strlen(NameStr(att->attname)),
+						 NameStr(att->attname), att->atttypid);
+		foreach(lc, query->targetList)
+		{
+			TargetEntry *tle = lfirst_node(TargetEntry, lc);
+			Var		   *var = IsA(tle->expr, Var) ? (Var *) tle->expr : NULL;
+
+			if (tle->resjunk)
+				continue;
+			if (var && var->varno == 1 && var->varattno == attnum && var->varlevelsup == 0)
+			{
+				result.columns[k] = column;
+				found = true;
+				break;
+			}
+			column++;
+		}
+		if (!found)
+		{
+			result.nkeys = 0;
+			break;
+		}
+	}
+	if (result.nkeys)
+		result.signature = signature.data;
+	index_close(index, AccessShareLock);
+	relation_close(rel, AccessShareLock);
+	return result;
+}
 
 typedef struct QueryRow
 {
 	char	   *key;
+	char	   *row;
 	Datum	   *values;
 	bool	   *nulls;
-}			QueryRow;
+} QueryRow;
 
 static int
 query_row_compare(const void *a, const void *b)
@@ -29,9 +116,19 @@ query_row_compare(const void *a, const void *b)
 	return strcmp(((const QueryRow *) a)->key, ((const QueryRow *) b)->key);
 }
 
-/* TODO KNOWN-ISSUES.md: replace delimiter-based row comparison keys. */
+/* Length framing distinguishes NULL, empty strings and embedded delimiters. */
+static void
+query_field(StringInfo key, const char *value)
+{
+	if (value)
+		appendStringInfo(key, "%zu:%s;", strlen(value), value);
+	else
+		appendStringInfoString(key, "N;");
+}
+
 static QueryRow *
-query_rows(const char *sql, MemoryContext cxt, int *count, int *natts)
+query_rows(const char *sql, MemoryContext cxt, int *count, int *natts,
+		   QueryIdentity *identity, bool keyed, bool distinct_sources)
 {
 	QueryRow   *rows;
 	int			r,
@@ -43,22 +140,36 @@ query_rows(const char *sql, MemoryContext cxt, int *count, int *natts)
 	rows = MemoryContextAlloc(cxt, sizeof(QueryRow) * Max(*count, 1));
 	for (r = 0; r < *count; r++)
 	{
-		StringInfoData key;
+		StringInfoData key,
+					row;
 		MemoryContext old = MemoryContextSwitchTo(cxt);
+		char	  **fields = palloc(sizeof(char *) * *natts);
 
 		initStringInfo(&key);
+		initStringInfo(&row);
 		rows[r].values = palloc(sizeof(Datum) * *natts);
 		rows[r].nulls = palloc(sizeof(bool) * *natts);
 		for (c = 0; c < *natts; c++)
 		{
 			Form_pg_attribute att = TupleDescAttr(SPI_tuptable->tupdesc, c);
 			Datum		v = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, c + 1, &rows[r].nulls[c]);
-			char	   *text = rows[r].nulls[c] ? NULL : SPI_getvalue(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, c + 1);
 
+			fields[c] = rows[r].nulls[c] ? NULL : SPI_getvalue(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, c + 1);
 			rows[r].values[c] = rows[r].nulls[c] ? (Datum) 0 : datumCopy(v, att->attbyval, att->attlen);
-			appendStringInfo(&key, "%s%c", text ? text : "", text ? '\x1e' : '\x1f');
+			appendStringInfo(&row, "%u/", att->atttypid);
+			query_field(&row, fields[c]);
 		}
+		if (distinct_sources)
+			query_field(&key, identity->source);
+		if (keyed)
+		{
+			for (c = 0; c < identity->nkeys; c++)
+				query_field(&key, fields[identity->columns[c]]);
+		}
+		else
+			appendStringInfoString(&key, row.data);
 		rows[r].key = key.data;
+		rows[r].row = row.data;
 		MemoryContextSwitchTo(old);
 	}
 	return rows;
@@ -83,11 +194,16 @@ dolt_query_diff(PG_FUNCTION_ARGS)
 			   *b;
 	Datum	   *values;
 	bool	   *nulls;
+	QueryIdentity left = query_identity(first),
+				right = query_identity(second);
+	bool		distinct_sources = left.source && right.source && strcmp(left.source, right.source);
+	bool		keyed = !distinct_sources && left.source && right.source &&
+		left.signature && right.signature && !strcmp(left.signature, right.signature);
 
 	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
 	nest = begin_api();
-	a = query_rows(first, cxt, &na, &wa);
-	b = query_rows(second, cxt, &nb, &wb);
+	a = query_rows(first, cxt, &na, &wa, &left, keyed, distinct_sources);
+	b = query_rows(second, cxt, &nb, &wb, &right, keyed, distinct_sources);
 	total = wa + wb + 1;
 	if (rsinfo->setDesc->natts != total)
 		ereport(ERROR, (errcode(ERRCODE_DATATYPE_MISMATCH), errmsg("dolt_query_diff result layout does not match the queries")));
@@ -100,7 +216,7 @@ dolt_query_diff(PG_FUNCTION_ARGS)
 		int			cmp = i == na ? 1 : (j == nb ? -1 : strcmp(a[i].key, b[j].key));
 		int			c;
 
-		if (cmp == 0)
+		if (cmp == 0 && !strcmp(a[i].row, b[j].row))
 		{
 			i++;
 			j++;
@@ -108,7 +224,7 @@ dolt_query_diff(PG_FUNCTION_ARGS)
 		}
 		for (c = 0; c < total; c++)
 			nulls[c] = true;
-		if (cmp < 0)
+		if (cmp <= 0)
 		{
 			for (c = 0; c < wa; c++)
 			{
@@ -118,7 +234,7 @@ dolt_query_diff(PG_FUNCTION_ARGS)
 			values[total - 1] = CStringGetTextDatum("deleted");
 			i++;
 		}
-		else
+		if (cmp >= 0)
 		{
 			for (c = 0; c < wb; c++)
 			{
@@ -128,6 +244,8 @@ dolt_query_diff(PG_FUNCTION_ARGS)
 			values[total - 1] = CStringGetTextDatum("added");
 			j++;
 		}
+		if (cmp == 0)
+			values[total - 1] = CStringGetTextDatum("modified");
 		nulls[total - 1] = false;
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
@@ -163,7 +281,7 @@ static const HelpEntry help_entries[] = {
 	{"dolt_remote", "procedure", "dolt_remote(add name url | remove name)", "Manage remote definitions.", "{\"add\": \"Add a remote\", \"remove\": \"Remove a remote\"}"},
 	{"dolt_reset", "procedure", "dolt_reset([--hard | --soft] [revision] | table...)", "Reset the staged set or the branch head.", "{\"--hard\": \"Reset working and staged sets\", \"--soft\": \"Move HEAD only\"}"},
 	{"dolt_revert", "procedure", "dolt_revert(commit...)", "Create commits that undo earlier commits.", "{\"commit\": \"Commit to revert\", \"--author\": \"Override the commit author\"}"},
-	{"dolt_rm", "procedure", "dolt_rm([--cached] table...)", "Remove tables from the working and staged sets.", "{\"--cached\": \"Unstage only\"}"},
+	{"dolt_rm", "procedure", "dolt_rm([--cached] table...)", "Remove tables from the working and staged sets.", "{\"--cached\": \"Remove from staging while preserving working tables\"}"},
 	{"dolt_stash", "procedure", "dolt_stash(push | pop | apply | drop | clear, name [index])", "Save and restore working set changes.", "{\"push\": \"Save local changes\", \"pop\": \"Apply and remove a stash\", \"apply\": \"Apply a stash\", \"drop\": \"Remove a stash\", \"clear\": \"Remove all stashes of a name\"}"},
 	{"dolt_tag", "procedure", "dolt_tag([-m message] name [revision] | -d name)", "Create or delete tags.", "{\"-m, --message\": \"Tag message\", \"-d\": \"Delete a tag\"}"},
 	{"dolt_verify_constraints", "procedure", "dolt_verify_constraints([--all] [--output-only] [table...])", "Verify constraints of the working set.", "{\"--all\": \"Check all rows\", \"--output-only\": \"Do not record violations\"}"},
@@ -215,30 +333,46 @@ dolt_help(PG_FUNCTION_ARGS)
 
 /* ---- dolt_test_run ---- */
 
-static bool
-numeric_text(const char *s, double *value)
-{
-	char	   *end;
-
-	if (!s || !*s)
-		return false;
-	*value = strtod(s, &end);
-	return *end == '\0';
-}
-
 /* Dolt's comparison of an actual value against the assertion value. */
 static char *
-compare_assertion(const char *type, const char *comparator, const char *expected, const char *actual, bool *passed)
+compare_assertion(const char *type, const char *comparator, const char *expected, const char *actual, Oid actualtype, bool *passed)
 {
-	double		a,
-				b;
 	int			cmp;
 	const char *wording;
 
-	if (numeric_text(expected, &a) && numeric_text(actual, &b))
-		cmp = a < b ? 1 : (a > b ? -1 : 0);
+	if (!strcmp(type, "expected_rows") || !strcmp(type, "expected_columns"))
+	{
+		char *end;
+
+		errno = 0;
+		if (expected)
+			(void) strtoll(expected, &end, 10);
+		if (!expected || !*expected || errno == ERANGE || *end || isspace((unsigned char) *expected))
+			return psprintf("cannot run assertion on non integer value: %s", expected ? expected : "NULL");
+	}
+	actualtype = getBaseType(actualtype);
+	if (!expected || !actual)
+	{
+		if (strcmp(comparator, "==") && strcmp(comparator, "!="))
+			return psprintf("%s is not a valid comparison for NULL values", comparator);
+		cmp = (expected == NULL) == (actual == NULL) ? 0 : 1;
+	}
+	else if (actualtype == BOOLOID)
+	{
+		if (strcmp(comparator, "==") && strcmp(comparator, "!="))
+			return psprintf("%s is not a valid comparison for boolean values. Only '==' and '!=' are supported", comparator);
+		cmp = strcmp(expected, actual);
+	}
+	else if (actualtype == INT2OID || actualtype == INT4OID || actualtype == INT8OID ||
+			 actualtype == NUMERICOID || actualtype == FLOAT4OID || actualtype == FLOAT8OID)
+	{
+		Datum		left = OidFunctionCall3(F_NUMERIC_IN, CStringGetDatum(actual), ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
+		Datum		right = OidFunctionCall3(F_NUMERIC_IN, CStringGetDatum(expected), ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
+
+		cmp = DatumGetInt32(OidFunctionCall2(F_NUMERIC_CMP, left, right));
+	}
 	else
-		cmp = strcmp(actual ? actual : "", expected ? expected : "");
+		cmp = strcmp(actual, expected);
 	if (!strcmp(comparator, "=="))
 	{
 		*passed = cmp == 0;
@@ -279,6 +413,19 @@ compare_assertion(const char *type, const char *comparator, const char *expected
 	return psprintf("Assertion failed: %s %s %s, got %s", type, wording, expected ? expected : "NULL", actual ? actual : "NULL");
 }
 
+/* Reject modifying CTEs and SELECT INTO as well as top-level writes. */
+static bool
+test_query_writes(Node *node, void *unused)
+{
+	if (!node)
+		return false;
+	if (IsA(node, InsertStmt) || IsA(node, UpdateStmt) || IsA(node, DeleteStmt) || IsA(node, MergeStmt))
+		return true;
+	if (IsA(node, SelectStmt) && ((SelectStmt *) node)->intoClause)
+		return true;
+	return raw_expression_tree_walker(node, test_query_writes, unused);
+}
+
 /* Run one test query in a subtransaction so a failing query reports an
  * error status instead of aborting the whole run. */
 static char *
@@ -293,33 +440,54 @@ run_test_query(const char *sql, const char *type, const char *comparator, const 
 	MemoryContextSwitchTo(old);
 	PG_TRY();
 	{
-		char	   *actual;
+		char	   *actual = NULL;
+		Oid			actualtype = INT8OID;
+		List	   *raw = raw_parser(sql, RAW_PARSE_DEFAULT);
 
-		run_user_query(sql);
-		if (!strcmp(type, "expected_rows"))
-			actual = psprintf(UINT64_FORMAT, (uint64) SPI_processed);
-		else if (!strcmp(type, "expected_columns"))
-			actual = psprintf("%d", SPI_tuptable ? SPI_tuptable->tupdesc->natts : 0);
-		else if (!strcmp(type, "expected_single_value"))
+		if (list_length(raw) != 1)
+			message = "Can only run exactly one query";
+		else if (!IsA(linitial_node(RawStmt, raw)->stmt, SelectStmt) || test_query_writes(linitial_node(RawStmt, raw)->stmt, NULL))
+			message = "Cannot execute write queries";
+		if (message)
 		{
-			if (SPI_processed == 0)
-				message = "expected_single_value expects exactly one cell. Received 0 rows";
-			else if (SPI_tuptable->tupdesc->natts != 1)
-				message = "expected_single_value expects exactly one cell. Received multiple columns";
-			else if (SPI_processed > 1)
-				message = "expected_single_value expects exactly one cell. Received multiple rows";
-			actual = message ? NULL : SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+			ReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(old);
+			CurrentResourceOwner = owner;
 		}
 		else
 		{
-			message = psprintf("%s is not a valid assertion type", type);
-			actual = NULL;
+			run_user_query(sql);
+			if (!strcmp(type, "expected_rows"))
+				actual = psprintf(UINT64_FORMAT, (uint64) SPI_processed);
+			else if (!strcmp(type, "expected_columns"))
+				actual = psprintf("%d", SPI_tuptable ? SPI_tuptable->tupdesc->natts : 0);
+			else if (!strcmp(type, "expected_single_value"))
+			{
+				if (SPI_processed == 0)
+					message = "expected_single_value expects exactly one cell. Received 0 rows";
+				else if (SPI_tuptable->tupdesc->natts != 1)
+					message = "expected_single_value expects exactly one cell. Received multiple columns";
+				else if (SPI_processed > 1)
+					message = "expected_single_value expects exactly one cell. Received multiple rows";
+				actual = message ? NULL : SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+				if (!message)
+				{
+					actualtype = TupleDescAttr(SPI_tuptable->tupdesc, 0)->atttypid;
+					if (actual && getBaseType(actualtype) == BOOLOID)
+						actual = !strcmp(actual, "t") ? "true" : "false";
+				}
+			}
+			else
+			{
+				message = psprintf("%s is not a valid assertion type", type);
+				actual = NULL;
+			}
+			if (!message)
+				message = compare_assertion(type, comparator, expected, actual, actualtype, passed);
+			ReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(old);
+			CurrentResourceOwner = owner;
 		}
-		if (!message)
-			message = compare_assertion(type, comparator, expected, actual, passed);
-		ReleaseCurrentSubTransaction();
-		MemoryContextSwitchTo(old);
-		CurrentResourceOwner = owner;
 	}
 	PG_CATCH();
 	{
@@ -338,10 +506,9 @@ run_test_query(const char *sql, const char *type, const char *comparator, const 
 	return message;
 }
 
-Datum
-dolt_test_run(PG_FUNCTION_ARGS)
+static Datum
+test_run_impl(FunctionCallInfo fcinfo, char **selectors, int nselectors)
 {
-	char	   *arg = PG_NARGS() > 0 && !PG_ARGISNULL(0) ? text_to_cstring(PG_GETARG_TEXT_PP(0)) : NULL;
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	int			nest,
 				n,
@@ -355,49 +522,71 @@ dolt_test_run(PG_FUNCTION_ARGS)
 
 	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
 	nest = begin_api();
-	if (arg && (!*arg || !strcmp(arg, "*")))
-		arg = NULL;
-	run_context("SELECT test_name,test_group,test_query,assertion_type,assertion_comparator,assertion_value FROM dolt.tests WHERE $1::text IS NULL OR test_name=$1 OR test_group=$1 ORDER BY test_group NULLS FIRST,test_name COLLATE \"C\"", 1, VC_TYPES(TEXTOID), VC_ARGS(arg ? CStringGetTextDatum(arg) : (Datum) 0), arg ? NULL : "n", true);
-	n = SPI_processed;
-	if (n == 0 && arg)
-		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("could not find tests for argument: %s", arg)));
-	names = palloc(sizeof(char *) * Max(n, 1));
-	groups = palloc(sizeof(char *) * Max(n, 1));
-	queries = palloc(sizeof(char *) * Max(n, 1));
-	types = palloc(sizeof(char *) * Max(n, 1));
-	comparators = palloc(sizeof(char *) * Max(n, 1));
-	expecteds = palloc(sizeof(char *) * Max(n, 1));
-	for (i = 0; i < n; i++)
+	for (int selector = 0; selector < Max(nselectors, 1); selector++)
 	{
-		names[i] = strcell(i, 1);
-		groups[i] = strcell(i, 2);
-		queries[i] = strcell(i, 3);
-		types[i] = strcell(i, 4);
-		comparators[i] = strcell(i, 5);
-		expecteds[i] = strcell(i, 6);
-	}
-	for (i = 0; i < n; i++)
-	{
-		bool		passed;
-		char	   *message = run_test_query(queries[i], types[i], comparators[i], expecteds[i], &passed);
-		Datum		values[5];
-		bool		nulls[5] = {false, false, false, false, false};
+		char	   *arg = nselectors ? selectors[selector] : NULL;
 
-		values[0] = CStringGetTextDatum(names[i]);
-		values[1] = CStringGetTextDatum(groups[i] ? groups[i] : "");
-		values[2] = CStringGetTextDatum(queries[i]);
-		values[3] = CStringGetTextDatum(passed ? "PASS" : "FAIL");
-		values[4] = CStringGetTextDatum(message);
-		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+		if (arg && !strcmp(arg, "*"))
+			arg = NULL;
+		run_context("SELECT test_name,test_group,test_query,assertion_type,assertion_comparator,assertion_value FROM dolt.tests WHERE $1::text IS NULL OR test_name=$1 OR (test_group=$1 AND NOT EXISTS (SELECT 1 FROM dolt.tests WHERE test_name=$1)) ORDER BY test_group NULLS FIRST,test_name COLLATE \"C\"", 1, VC_TYPES(TEXTOID), VC_ARGS(arg ? CStringGetTextDatum(arg) : (Datum) 0), arg ? NULL : "n", true);
+		n = SPI_processed;
+		if (n == 0 && arg)
+			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("could not find tests for argument: %s", arg)));
+		names = palloc(sizeof(char *) * Max(n, 1));
+		groups = palloc(sizeof(char *) * Max(n, 1));
+		queries = palloc(sizeof(char *) * Max(n, 1));
+		types = palloc(sizeof(char *) * Max(n, 1));
+		comparators = palloc(sizeof(char *) * Max(n, 1));
+		expecteds = palloc(sizeof(char *) * Max(n, 1));
+		for (i = 0; i < n; i++)
+		{
+			names[i] = strcell(i, 1);
+			groups[i] = strcell(i, 2);
+			queries[i] = strcell(i, 3);
+			types[i] = strcell(i, 4);
+			comparators[i] = strcell(i, 5);
+			expecteds[i] = strcell(i, 6);
+		}
+		for (i = 0; i < n; i++)
+		{
+			bool		passed;
+			char	   *message = run_test_query(queries[i], types[i], comparators[i], expecteds[i], &passed);
+			Datum		values[5];
+			bool		nulls[5] = {false, false, false, false, false};
+
+			values[0] = CStringGetTextDatum(names[i]);
+			values[1] = CStringGetTextDatum(groups[i] ? groups[i] : "");
+			values[2] = CStringGetTextDatum(queries[i]);
+			values[3] = CStringGetTextDatum(passed ? "PASS" : "FAIL");
+			values[4] = CStringGetTextDatum(message);
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+		}
 	}
 	end_api(nest);
 	return (Datum) 0;
 }
 
 Datum
+dolt_test_run(PG_FUNCTION_ARGS)
+{
+	char	   *arg = PG_NARGS() && !PG_ARGISNULL(0) ? text_to_cstring(PG_GETARG_TEXT_PP(0)) : NULL;
+
+	return test_run_impl(fcinfo, &arg, 1);
+}
+
+Datum
 dolt_test_run_noargs(PG_FUNCTION_ARGS)
 {
-	return dolt_test_run(fcinfo);
+	return test_run_impl(fcinfo, NULL, 0);
+}
+
+Datum
+dolt_test_run_many(PG_FUNCTION_ARGS)
+{
+	int			n;
+	char	  **args = arguments(fcinfo, &n);
+
+	return test_run_impl(fcinfo, args, n);
 }
 
 /* Describe this engine's format, not Dolt's incompatible NBS serialization. */

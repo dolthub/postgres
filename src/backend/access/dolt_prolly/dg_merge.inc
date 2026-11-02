@@ -810,7 +810,11 @@ updated_merge(bytea *previous, const char *json)
 	if (!object_read(previous, "merge", NULL, NULL, &array))
 		elog(ERROR, "merge object is not visible");
 	deconstruct_array(array, BYTEAOID, -1, false, TYPALIGN_INT, &children, &nulls, &count);
-	return put("merge", json, children, count);
+	/* Resolution edits only the conflict lists. Preserve operation metadata
+	 * as well as the retained pre-operation workspaces. */
+	run("SELECT ($1::jsonb || $2::jsonb)::text", 2, VC_TYPES(TEXTOID, TEXTOID),
+		VC_ARGS(CStringGetTextDatum(metadata(previous, "merge")), CStringGetTextDatum(json)), NULL, true);
+	return put("merge", strcell(0, 1), children, count);
 }
 
 Datum

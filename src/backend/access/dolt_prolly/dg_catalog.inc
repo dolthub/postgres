@@ -1378,20 +1378,63 @@ dg_catalog_type_visible(Oid id, const char *name, bool *visible)
 	return handled;
 }
 
+/*
+ * The session view of the current command, which every operator, cast and
+ * function lookup asks for: resolved once per command and branch. A ref
+ * write invalidates pg_dolt_ref's relcache entry, which drops it too.
+ */
+static struct
+{
+	LocalTransactionId lxid;
+	CommandId	cid;
+	char		branch[NAMEDATALEN * 2];
+	CatalogView *view;
+	bool		valid;
+	bool		callback;
+}			session_view;
+
+static void
+session_view_invalidate(Datum arg, Oid relid)
+{
+	if (relid == InvalidOid || relid == DoltRefRelationId)
+		session_view.valid = false;
+}
+
 /* Compilation scope for argument-free procedural routines. Execution retains
  * its caller's read/write authority; this view only keys cached declarations. */
 CatalogView *
 dg_catalog_session_view(void)
 {
 	CatalogView *result = CatalogViewCurrent();
+	const char *branch;
+	CommandId	cid;
 
 	if (result || !dg_catalog_active())
 		return result;
 
+	branch = dg_current_branch();
+	cid = GetCurrentCommandId(false);
+	if (session_view.valid && session_view.lxid == MyProc->vxid.lxid && session_view.cid == cid &&
+		strcmp(session_view.branch, branch) == 0)
+		return session_view.view;
+	if (!session_view.callback)
+	{
+		CacheRegisterRelcacheCallback(session_view_invalidate, (Datum) 0);
+		session_view.callback = true;
+	}
+
 	/* The session's branch schema is read as catalogs are, latest committed. */
 	PushActiveSnapshot(GetLatestSnapshot());
-	result = provider_branch_view(dg_current_branch(), catalog_working_schema(dg_current_branch()));
+	result = provider_branch_view(branch, catalog_working_schema(branch));
 	PopActiveSnapshot();
+	session_view.valid = strlen(branch) < sizeof(session_view.branch);
+	if (session_view.valid)
+	{
+		strcpy(session_view.branch, branch);
+		session_view.lxid = MyProc->vxid.lxid;
+		session_view.cid = cid;
+		session_view.view = result;
+	}
 	return result;
 }
 

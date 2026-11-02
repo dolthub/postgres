@@ -38,6 +38,7 @@
 #include "catalog/pg_dolt_identity.h"
 #include "utils/inval.h"
 #include "pgstat.h"
+#include "storage/proc.h"
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "utils/fmgroids.h"
@@ -173,7 +174,12 @@ static PLSlice fill_row(Relation rel, PLSlice row, const bool *fill);
 static PLTree fill_rows(Relation rel, PLTree content, const bool *fill);
 static List *merge_dropped_columns(Relation rel, const char *base);
 static PLTree check_violations(Relation rel, PLTree content, const char *name, StringInfo violations);
+static bool name_selected(List *names, const char *name);
+static Capture capture_visible(void);
 static bytea *staged_capture(Capture * full);
+static List *ignored_untracked_tables(const char *working, const char *tracked);
+static List *ignored_tables(List *tables);
+static List *state_tables(const char *json);
 static void catalog_activate(void);
 static bool branch_management(char **args, int n);
 static void checkout_tables(char **args, int n);
@@ -328,14 +334,14 @@ end_api(int nest)
 /* User SQL must not inherit the internal manifest lookup bypass. Nested
  * provider calls may enter begin_api again, so preserve the caller path. */
 static void
-run_context(const char *sql, int nargs, Oid *types, Datum *args,
-			const char *nulls, bool readonly)
+run_context_view(const char *sql, int nargs, Oid *types, Datum *args,
+			const char *nulls, bool readonly, CatalogView *view)
 {
 	int			depth = catalog_api_depth;
 	int			nest = NewGUCNestLevel();
 	char	   *path = pstrdup(api_search_path ? api_search_path : "public");
 	SubTransactionId subids[64];
-	CatalogView *previous = CatalogViewSwitch(NULL);
+	CatalogView *previous = CatalogViewSwitch(view);
 
 	memcpy(subids, catalog_api_subids, sizeof(subids));
 
@@ -362,6 +368,13 @@ run_context(const char *sql, int nargs, Oid *types, Datum *args,
 		AtEOXact_GUC(true, nest);
 	}
 	PG_END_TRY();
+}
+
+static void
+run_context(const char *sql, int nargs, Oid *types, Datum *args,
+			const char *nulls, bool readonly)
+{
+	run_context_view(sql, nargs, types, args, nulls, readonly, NULL);
 }
 
 typedef struct StandaloneCall
@@ -1677,47 +1690,69 @@ dolt_init(PG_FUNCTION_ARGS)
 Datum
 dolt_add(PG_FUNCTION_ARGS)
 {
-	int			n;
-	char	  **args = arguments(fcinfo, &n);
-	Capture		current;
-	VersionRef	staged,
-				working;
-	int			nest;
+	int n, i;
+	char **args = arguments(fcinfo, &n);
+	bool force = false, all = false;
+	List *names = NIL;
+	Capture current;
+	VersionRef staged, working;
+	int nest;
 
 	standalone(fcinfo, false);
 	require_writable();
+	for (i = 0; i < n; i++)
+	{
+		if (!strcmp(args[i], "--force") || !strcmp(args[i], "-f"))
+			force = true;
+		else if (!strcmp(args[i], ".") || !strcmp(args[i], "-a") ||
+				 !strcmp(args[i], "-A") || !strcmp(args[i], "--all"))
+			all = true;
+		else if (args[i][0] == '-')
+			unsupported(args[i]);
+		else
+			names = lappend(names, args[i]);
+	}
+	if (!all && names == NIL)
+		unsupported("dolt_add requires '.', '-A' or table names");
+
 	nest = begin_api();
 	/* Activation advances command visibility on our private API snapshot. */
 	if (!read_ref("views/enabled").target)
 		catalog_activate();
 	ensure_repository();
-	if (n == 0)
-		unsupported("dolt_add requires '.', '-A' or table names");
-	if (n != 1 || (strcmp(args[0], ".") && strcmp(args[0], "-a") && strcmp(args[0], "-A") && strcmp(args[0], "--all")))
+	if (!all)
 	{
-		/* Stage only the named tables. */
-		List	   *tables = NIL;
-		int			i;
-		char	   *stagedjson = staged_state(),
-				   *workingjson = working_state();
+		List *tables = NIL;
+		char *stagedjson = staged_state(), *workingjson = working_state();
+		List *ignored = force ? NIL : ignored_untracked_tables(workingjson, stagedjson);
+		ListCell *lc;
 
-		for (i = 0; i < n; i++)
+		foreach(lc, names)
 		{
-			if (args[i][0] == '-')
-				unsupported(args[i]);
-			tables = lappend(tables, resolve_object_argument(args[i], stagedjson, workingjson, true));
+			char *name = resolve_object_argument(lfirst(lc), stagedjson, workingjson, true);
+
+			if (!name_selected(ignored, name))
+				tables = lappend(tables, name);
 		}
-		stage_tables(tables);
+		if (tables)
+			stage_tables(tables);
 		end_api(nest);
 		PG_RETURN_INT64(0);
 	}
 	staged = read_ref(branch_ref("staged"));
 	working = read_ref(branch_ref("working"));
-	move_ref(branch_ref("staged"), staged, staged_capture(&current));
+	if (force)
+	{
+		current = capture_visible();
+		move_ref(branch_ref("staged"), staged, current.hash);
+	}
+	else
+		move_ref(branch_ref("staged"), staged, staged_capture(&current));
 	move_ref(branch_ref("working"), working, current.hash);
 	end_api(nest);
 	PG_RETURN_INT64(0);
 }
+
 static List *commit_branches(void);
 static void commit_request_sql_end(void);
 
@@ -2212,15 +2247,27 @@ state_json(const char *revision)
 	}
 	return metadata(child(resolve(revision), 1), "database");
 }
+static bool diff_table_data_changed(const char *from, const char *to,
+                                    const char *name, bool explicit_table, bool *key_changed);
+
 Datum
 dolt_diff_summary(PG_FUNCTION_ARGS)
 {
 	char *from, *to, *fromrev, *torev, *table;
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	SPITupleTable *result;
+	List *ignored = NIL;
+	uint64 count, row;
 	int			nest = begin_api();
 
 	diff_revision_arguments(fcinfo, &fromrev, &torev, &table);
 	from = state_json(fromrev);
 	to = !strcmp(fromrev, torev) ? from : state_json(torev);
+	/* Ignore rules filter added/dropped tables only for working/staged
+	 * comparisons. Never hide retained history using today's patterns. */
+	if (!pg_strcasecmp(fromrev, "WORKING") || !pg_strcasecmp(torev, "WORKING") ||
+		!pg_strcasecmp(fromrev, "STAGED") || !pg_strcasecmp(torev, "STAGED"))
+		ignored = ignored_tables(list_concat(state_tables(from), state_tables(to)));
 	if (table)
 	{
 		/* As in Dolt, a name that names nothing has no changes. */
@@ -2229,10 +2276,40 @@ dolt_diff_summary(PG_FUNCTION_ARGS)
 			table = "";
 	}
 
-	run("WITH a AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence','aggregate','operator','cast')),b AS (SELECT v FROM jsonb_array_elements($2::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence','aggregate','operator','cast')),d AS (SELECT a.v av,b.v bv FROM a FULL JOIN b ON a.v->>'name'=b.v->>'name' AND a.v->>'kind'=b.v->>'kind') SELECT coalesce(av->>'name',''),coalesce(bv->>'name',''),CASE WHEN av IS NULL THEN 'added' WHEN bv IS NULL THEN 'dropped' ELSE 'modified' END,CASE WHEN coalesce(av->>'kind',bv->>'kind')='table' THEN (av->>'content') IS DISTINCT FROM (bv->>'content') ELSE (av->>'schema') IS DISTINCT FROM (bv->>'schema') END,CASE WHEN coalesce(av->>'kind',bv->>'kind')='table' THEN (av->>'schema') IS DISTINCT FROM (bv->>'schema') ELSE av IS NULL OR bv IS NULL END FROM d WHERE ((av->>'content') IS DISTINCT FROM (bv->>'content') OR (av->>'schema') IS DISTINCT FROM (bv->>'schema')) AND ($3::text IS NULL OR coalesce(av->>'name',bv->>'name')=$3) ORDER BY coalesce(av->>'name',bv->>'name') COLLATE \"C\"", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(from), CStringGetTextDatum(to), table ? CStringGetTextDatum(table) : (Datum) 0), table ? NULL : "  n", true);
+	run("WITH a AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence','aggregate','operator','cast')),b AS (SELECT v FROM jsonb_array_elements($2::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence','aggregate','operator','cast')),d AS (SELECT a.v av,b.v bv FROM a FULL JOIN b ON a.v->>'name'=b.v->>'name' AND a.v->>'kind'=b.v->>'kind') SELECT coalesce(av->>'name',''),coalesce(bv->>'name',''),CASE WHEN av IS NULL THEN 'added' WHEN bv IS NULL THEN 'dropped' ELSE 'modified' END,CASE WHEN coalesce(av->>'kind',bv->>'kind')='table' THEN (av->>'content') IS DISTINCT FROM (bv->>'content') ELSE (av->>'schema') IS DISTINCT FROM (bv->>'schema') END,CASE WHEN coalesce(av->>'kind',bv->>'kind')='table' THEN (av->>'schema') IS DISTINCT FROM (bv->>'schema') ELSE av IS NULL OR bv IS NULL END,coalesce(av->>'kind',bv->>'kind') FROM d WHERE ((av->>'content') IS DISTINCT FROM (bv->>'content') OR (av->>'schema') IS DISTINCT FROM (bv->>'schema')) AND ($3::text IS NULL OR coalesce(av->>'name',bv->>'name')=$3) ORDER BY coalesce(av->>'name',bv->>'name') COLLATE \"C\"", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(from), CStringGetTextDatum(to), table ? CStringGetTextDatum(table) : (Datum) 0), table ? NULL : "  n", true);
 	if (table && SPI_processed > 1)
 		ereport(ERROR, (errcode(ERRCODE_AMBIGUOUS_ALIAS), errmsg("ambiguous table name: %s", table)));
-	return_rows(fcinfo, nest);
+	result = SPI_tuptable;
+	count = SPI_processed;
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+	for (row = 0; row < count; row++)
+	{
+		Datum values[5];
+		bool nulls[5];
+		char *kind = SPI_getvalue(result->vals[row], result->tupdesc, 6);
+		int column;
+
+		for (column = 0; column < 5; column++)
+			values[column] = SPI_getbinval(result->vals[row], result->tupdesc, column + 1, &nulls[column]);
+
+		if (!strcmp(kind, "table"))
+		{
+			char *name = TextDatumGetCString(values[0]);
+			bool key_changed;
+
+			if (!*name)
+				name = TextDatumGetCString(values[1]);
+			if ((!*TextDatumGetCString(values[0]) || !*TextDatumGetCString(values[1])) &&
+				name_selected(ignored, name))
+				continue;
+			values[3] = BoolGetDatum(diff_table_data_changed(fromrev, torev, name, table != NULL, &key_changed));
+			if (key_changed)
+				continue;
+		}
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	end_api(nest);
 	return (Datum) 0;
 }
 
