@@ -608,6 +608,16 @@ MultiXactIdExpand(MultiXactId multi, TransactionId xid, MultiXactStatus status)
 
 	for (i = 0, j = 0; i < nmembers; i++)
 	{
+		/*
+		 * An updater records its abort in pg_xact before it leaves the
+		 * ProcArray, so it can still look in progress after a concurrent
+		 * updater, which ignores aborted updaters (DoesMultiXactIdConflict),
+		 * chose not to wait for it. An abort is final: discard the member, or
+		 * the new multixact would have two updaters.
+		 */
+		if (ISUPDATE_from_mxstatus(members[i].status) &&
+			TransactionIdDidAbort(members[i].xid))
+			continue;
 		if (TransactionIdIsInProgress(members[i].xid) ||
 			(ISUPDATE_from_mxstatus(members[i].status) &&
 			 TransactionIdDidCommit(members[i].xid)))
