@@ -80,3 +80,19 @@ The SQL reproductions are in /workspace/reports/rewrite-dolt-functions-*.sql.
   versioned spatial index built from prolly trees, for example over a
   space-filling-curve key (geohash or Hilbert cell) with an exact recheck, rather
   than a native GiST rebuilt per branch, which would not be history-independent.
+
+* **A prepared transaction blocks every commit to its tables (2026-11-02):**
+  PREPARE publishes like a commit: it merges onto the latest roots, writes the
+  (table, branch) row in `pg_dolt_root` and keeps that row locked until COMMIT
+  or ROLLBACK PREPARED. Any other transaction that writes the table on that
+  branch, even different rows, waits at its own COMMIT or PREPARE. Readers and
+  other branches are unaffected. Heap blocks only writers of the same rows or
+  unique keys, so a forgotten prepared transaction here freezes writes to whole
+  tables. Accepted for now. The recovery TAP files 009_twophase,
+  021_row_visibility and 023_pitr_prepared_xact depend on concurrent prepared
+  writers and are skipped in prolly-default runs. Deferring the merge to COMMIT
+  PREPARED would fix the concurrency, but COMMIT PREPARED must not fail, so
+  versioned DDL and branch operations (merge, reset, revert, cherry-pick) would
+  have to wait for pending prepared writers, and the root write would have to
+  commit atomically with the prepared transaction rather than with the session
+  running COMMIT PREPARED. Pinned by `test_prolly/t/035_prepared_locks.pl`.

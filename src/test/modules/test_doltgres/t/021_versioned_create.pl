@@ -78,6 +78,8 @@ is(sql(q{SELECT count(*) FROM pg_class WHERE relname='ct_other'}),'0','main does
 my $fresh='fresh';
 $node->safe_psql('postgres',"CREATE DATABASE $fresh");
 is($node->safe_psql($fresh,q{SET default_table_access_method=dolt_prolly_table; CREATE SCHEMA early; CREATE TABLE early.t(v int DEFAULT 3); INSERT INTO early.t DEFAULT VALUES; SELECT v FROM early.t}),'3','a schema made before the first versioned table joins the branch with it');
+$node->safe_psql('postgres',"CREATE DATABASE fresh_ctas");
+is($node->safe_psql('fresh_ctas',q{SET default_table_access_method=dolt_prolly_table; CREATE TABLE first AS SELECT generate_series(1, 1002) AS a; SELECT count(*), sum(a) FROM first}),'1002|502503','CREATE TABLE AS can make the first versioned table');
 
 sql(q{CREATE TYPE pair AS (a int, b int); CREATE TABLE cpair(v pair); INSERT INTO cpair VALUES (ROW(1,2))});
 is(sql(q{SELECT (v).b FROM cpair}),'2','columns of a versioned composite type');

@@ -21,7 +21,8 @@ dg_catalog_routine_namespace(Oid namespaceid)
 
 /*
  * Whether CREATE FUNCTION makes a versioned routine: SQL or PL/pgSQL in a user
- * schema. Others, such as C functions, stay native and unversioned.
+ * schema. Others, such as C functions, stay native and unversioned, as do
+ * event trigger functions, which only the database's native event triggers call.
  */
 static bool
 creates_versioned_routine(CreateFunctionStmt *stmt)
@@ -32,6 +33,10 @@ creates_versioned_routine(CreateFunctionStmt *stmt)
 	ListCell   *lc;
 
 	if (isAnyTempNamespace(namespace) || dg_system_namespace(get_namespace_name(namespace)))
+		return false;
+	/* %TYPE is never event_trigger, and looking it up would notice twice. */
+	if (stmt->returnType && !stmt->returnType->pct_type &&
+		LookupTypeNameOid(NULL, stmt->returnType, true) == EVENT_TRIGGEROID)
 		return false;
 	foreach(lc, stmt->options)
 	{
@@ -243,7 +248,7 @@ dg_catalog_routine_ddl(ParseState *pstate, Node *statement)
 		PG_TRY();
 		{
 			nest = begin_api();
-			run("SELECT 1 FROM pg_event_trigger WHERE evtenabled<>'D'", 0, NULL, NULL, NULL, true);
+			run("SELECT 1 FROM pg_event_trigger WHERE evtenabled<>'D' AND evtevent<>'login'", 0, NULL, NULL, NULL, true);
 			if (SPI_processed)
 				unsupported("canonical routine DDL with event triggers");
 			end_api(nest);

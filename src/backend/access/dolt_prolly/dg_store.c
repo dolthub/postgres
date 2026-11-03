@@ -41,6 +41,7 @@
 #include "access/parallel.h"
 #include "access/twophase.h"
 #include "access/xlog.h"
+#include "access/xlogrecovery.h"
 #include "access/htup_details.h"
 #include "access/relation.h"
 #include "access/table.h"
@@ -1408,7 +1409,16 @@ static HandleSlot *handle_slot_find(Oid db, Oid space, RelFileNumber file);
 static uint64
 roots_generation(const RootKey *key)
 {
-	HandleSlot *slot = handle_slot_claim(MyDatabaseId, key->space, key->file);
+	HandleSlot *slot;
+
+	/*
+	 * On a hot standby, roots change only by replay, which advances none of
+	 * the counters: while replay stands still, nothing has changed. The high
+	 * bit keeps these apart from the counters a promoted server goes on to.
+	 */
+	if (RecoveryInProgress())
+		return (UINT64CONST(1) << 63) | (uint64) GetXLogReplayRecPtr(NULL);
+	slot = handle_slot_claim(MyDatabaseId, key->space, key->file);
 
 	return (pg_atomic_read_u64(&shared_handles()->roots_generation) << 32) +
 		pg_atomic_read_u64(&slot->roots_generation);

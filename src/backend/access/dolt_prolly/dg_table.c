@@ -130,6 +130,8 @@ begin(Relation rel, Snapshot snap, int nkeys, ScanKey key, ParallelTableScanDesc
 		materialize(scan);
 	scan->position = -1;
 	MemoryContextSwitchTo(old);
+	if (flags & SO_TYPE_SEQSCAN)
+		pgstat_count_heap_scan(rel);
 	return &scan->base;
 }
 
@@ -195,6 +197,8 @@ rescan(TableScanDesc base, ScanKey key, bool set, bool strat, bool sync, bool pa
 	scan->handle_count = scan->handle_position = 0;
 	if (scan->streaming)
 		dg_check(pl_cursor_init(&scan->content, &scan->state->content, NULL));
+	if (base->rs_flags & SO_TYPE_SEQSCAN)
+		pgstat_count_heap_scan(base->rs_rd);
 }
 
 /* The next row occurrence of the walk: the current entry's next handle, or the next entry's first. */
@@ -226,6 +230,7 @@ next_streamed(DGScan *scan, TupleTableSlot *slot)
 	}
 	dg_tid(scan->handles[scan->handle_position++], &tid);
 	dg_decode(scan->base.rs_rd, scan->row, &tid, slot);
+	pgstat_count_heap_getnext(scan->base.rs_rd);
 	return true;
 }
 
@@ -259,6 +264,7 @@ next(TableScanDesc base, ScanDirection dir, TupleTableSlot *slot)
 		dg_decode_mutation(base->rs_rd, entry->row, &tid, slot);
 	else
 		dg_decode(base->rs_rd, entry->row, &tid, slot);
+	pgstat_count_heap_getnext(base->rs_rd);
 	return true;
 }
 /* The rows of a lossy bitmap page's derived handle range, collected by one range scan. */

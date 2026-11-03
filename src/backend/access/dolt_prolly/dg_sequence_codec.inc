@@ -195,7 +195,13 @@ dg_catalog_sequence_refresh(Relation rel)
 		SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
 		nest = begin_api();
 		definition = metadata(CatalogViewObjectSchema(RelationGetRelid(rel)), "schema");
-		sequence_lock(definition, ShareLock);
+
+		/*
+		 * The lock keeps a RESTART from replacing the allocator under us. On a
+		 * hot standby only replay changes it, and recovery allows no stronger
+		 * lock on database objects.
+		 */
+		sequence_lock(definition, RecoveryInProgress() ? AccessShareLock : ShareLock);
 		resource = sequence_resource(definition, false);
 		if (!OidIsValid(resource))
 			elog(ERROR, "sequence allocator is missing");
