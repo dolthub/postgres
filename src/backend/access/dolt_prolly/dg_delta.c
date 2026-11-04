@@ -48,6 +48,7 @@
 #include "common/hashfn.h"
 #include "common/pg_prng.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "port/atomics.h"
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
@@ -60,6 +61,7 @@
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
+#include "utils/wait_event.h"
 
 int			dolt_delta_memory = 256 * 1024;	/* kB */
 
@@ -73,6 +75,10 @@ int			dolt_delta_memory = 256 * 1024;	/* kB */
 
 /* The WAL payload of one append record, past which an append writes another. */
 #define DELTA_RECORD_BYTES ((Size) 1024 * 1024)
+
+/* How long a writer waits for folds to free memory before failing: 30 s in all. */
+#define DELTA_FULL_NAP_US 10000
+#define DELTA_FULL_WAITS 3000
 
 /* Skiplist levels; each level holds about a quarter of the keys below it. */
 #define DELTA_MAX_HEIGHT 12
@@ -169,6 +175,7 @@ static HTAB *trees;
 static dsa_area *area;
 
 static DeltaTree **trees_all(int *count);
+static void fold_note(const DoltDeltaTree *key, TransactionId fold, const DoltDeltaHorizon *horizon);
 
 static Size
 area_bytes(void)
@@ -601,22 +608,34 @@ dolt_delta_append(const DoltDeltaTree *key, const DoltDeltaEdit *edits, int coun
 	(void) GetCurrentCommandId(true);	/* the command wrote */
 	tree = tree_find(key, true);
 
-	/* Allocate everything before the critical section, which must not fail. */
+	/*
+	 * Allocate everything before the critical section, which must not fail.
+	 * While the store is full, wait for folds to free some, as Doltgrust
+	 * throttles writers past its delta budget.
+	 */
 	pending = palloc(count * sizeof(Pending));
-	for (int i = 0; i < count; i++)
+	for (int attempt = 0;; attempt++)
 	{
-		if (!pending_make(tree, &pending[i], &edits[i], topxid, xid, cid))
+		int			made = 0;
+
+		while (made < count && pending_make(tree, &pending[made], &edits[made], topxid, xid, cid))
+			made++;
+		if (made == count)
+			break;
+		for (int j = 0; j < made; j++)
 		{
-			for (int j = 0; j < i; j++)
-			{
-				dsa_free(area, pending[j].version);
-				dsa_free(area, pending[j].key);
-			}
+			dsa_free(area, pending[j].version);
+			dsa_free(area, pending[j].key);
+		}
+		if (attempt >= DELTA_FULL_WAITS)
 			ereport(ERROR,
 					(errcode(ERRCODE_OUT_OF_MEMORY),
 					 errmsg("prolly delta memory is full"),
 					 errhint("Increase \"dolt_delta_memory\", or let pending changes fold into their trees.")));
-		}
+		pgstat_report_wait_start(WAIT_EVENT_PG_SLEEP);
+		pg_usleep(DELTA_FULL_NAP_US);
+		pgstat_report_wait_end();
+		CHECK_FOR_INTERRUPTS();
 	}
 
 	if (!logged)
@@ -984,10 +1003,37 @@ prune_horizon(void)
 /*
  * Record that fold |fold|, not yet committed, wrote |key|'s base holding the
  * versions |horizon| sees. A newer fold's record replaces an older one's:
- * its horizon holds everything the older one's did.
+ * its horizon holds everything the older one's did. The record reaches the
+ * WAL too, for standbys to prune by.
  */
 void
 dolt_delta_set_fold(const DoltDeltaTree *key, TransactionId fold, const DoltDeltaHorizon *horizon)
+{
+	if (XLogStandbyInfoActive())
+	{
+		xl_dolt_delta_fold record = {0};
+
+		record.db = key->db;
+		record.space = key->space;
+		record.file = key->file;
+		record.fold = fold;
+		record.xmin = horizon->xmin;
+		record.xmax = horizon->xmax;
+		record.xcnt = horizon->xcnt;
+		record.branchlen = strlen(key->branch);
+		XLogBeginInsert();
+		XLogRegisterData(&record, SizeOfDoltDeltaFold);
+		XLogRegisterData(key->branch, record.branchlen);
+		if (horizon->xcnt)
+			XLogRegisterData(horizon->xip, horizon->xcnt * sizeof(TransactionId));
+		(void) XLogInsert(RM_DOLT_DELTA_ID, XLOG_DOLT_DELTA_FOLD);
+	}
+	fold_note(key, fold, horizon);
+}
+
+/* Note fold |fold|'s horizon in |key|'s tree, for pruning. */
+static void
+fold_note(const DoltDeltaTree *key, TransactionId fold, const DoltDeltaHorizon *horizon)
 {
 	DeltaTree  *tree;
 	dsa_pointer xip = InvalidDsaPointer;
@@ -1302,6 +1348,10 @@ CheckPointDoltDelta(XLogRecPtr redo)
 	int			fd;
 
 	delta_attach();
+
+	/* A standby has no launcher: its restartpoints prune what folds hold. */
+	if (RecoveryInProgress())
+		(void) dolt_delta_prune_all(true);
 	all = trees_all(&ntrees);
 	initStringInfo(&buffer);
 	header.magic = DELTA_STATE_MAGIC;
@@ -1463,6 +1513,32 @@ dolt_delta_redo(XLogReaderState *record)
 	DoltDeltaTree key;
 	char		branch[DOLT_DELTA_BRANCH_SIZE];
 
+	if (info == XLOG_DOLT_DELTA_FOLD)
+	{
+		xl_dolt_delta_fold fold;
+		DoltDeltaHorizon horizon;
+
+		delta_attach();
+		memcpy(&fold, p, SizeOfDoltDeltaFold);
+		p += SizeOfDoltDeltaFold;
+		if (fold.branchlen >= sizeof(branch))
+			elog(PANIC, "dolt_delta_redo: branch name too long");
+		memcpy(branch, p, fold.branchlen);
+		branch[fold.branchlen] = '\0';
+		p += fold.branchlen;
+		horizon.xmin = fold.xmin;
+		horizon.xmax = fold.xmax;
+		horizon.xcnt = fold.xcnt;
+		horizon.xip = palloc(Max(fold.xcnt, 1) * sizeof(TransactionId));
+		memcpy(horizon.xip, p, fold.xcnt * sizeof(TransactionId));
+		dolt_delta_tree_key(&key, fold.db, fold.space, fold.file, branch);
+		fold_note(&key, fold.fold, &horizon);
+		pfree(horizon.xip);
+
+		/* Earlier folds may have committed since, and the standby's readers moved on. */
+		(void) dolt_delta_prune_all(false);
+		return;
+	}
 	if (info != XLOG_DOLT_DELTA_APPEND)
 		elog(PANIC, "dolt_delta_redo: unknown op code %u", info);
 	delta_attach();

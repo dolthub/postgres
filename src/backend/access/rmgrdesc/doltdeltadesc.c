@@ -26,6 +26,15 @@ dolt_delta_desc(StringInfo buf, XLogReaderState *record)
 						 header.db, header.space, header.file, (int) header.branchlen,
 						 rec + SizeOfDoltDeltaAppend, header.topxid, header.cid, header.count);
 	}
+	else if (info == XLOG_DOLT_DELTA_FOLD)
+	{
+		xl_dolt_delta_fold header;
+
+		memcpy(&header, rec, SizeOfDoltDeltaFold);
+		appendStringInfo(buf, "tree %u/%u/%u branch %.*s; fold %u holds xmin %u xmax %u with %u running",
+						 header.db, header.space, header.file, (int) header.branchlen,
+						 rec + SizeOfDoltDeltaFold, header.fold, header.xmin, header.xmax, header.xcnt);
+	}
 }
 
 const char *
@@ -35,6 +44,8 @@ dolt_delta_identify(uint8 info)
 	{
 		case XLOG_DOLT_DELTA_APPEND:
 			return "APPEND";
+		case XLOG_DOLT_DELTA_FOLD:
+			return "FOLD";
 	}
 	return NULL;
 }

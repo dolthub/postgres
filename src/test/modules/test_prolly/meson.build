@@ -78,5 +78,6 @@ tests += {
       't/061_stash_workspaces.pl',
       't/062_user_catalog_history.pl',
       't/063_stored_tests.pl',
+      't/064_delta_store.pl',
   ]},
 }

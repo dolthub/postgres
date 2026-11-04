@@ -20,6 +20,7 @@
 #include "storage/relfilelocator.h"
 
 #define XLOG_DOLT_DELTA_APPEND	0x00
+#define XLOG_DOLT_DELTA_FOLD	0x10
 
 /* The branch name's room, as RootKey keeps it. */
 #define DOLT_DELTA_BRANCH_SIZE	(NAMEDATALEN * 2)
@@ -47,6 +48,26 @@ typedef struct xl_dolt_delta_version
 } xl_dolt_delta_version;
 
 #define SizeOfDoltDeltaVersion (offsetof(xl_dolt_delta_version, rowlen) + sizeof(uint32))
+
+/*
+ * A fold wrote a tree's base holding the versions |xmin|, |xmax| and the
+ * running xids that follow say: a standby prunes them by it once the fold has
+ * committed and its own snapshots read past it.
+ */
+typedef struct xl_dolt_delta_fold
+{
+	Oid			db;
+	Oid			space;
+	RelFileNumber file;
+	TransactionId fold;
+	TransactionId xmin;
+	TransactionId xmax;
+	uint32		xcnt;
+	uint16		branchlen;
+	/* branch name, then xcnt running xids */
+} xl_dolt_delta_fold;
+
+#define SizeOfDoltDeltaFold (offsetof(xl_dolt_delta_fold, branchlen) + sizeof(uint16))
 
 extern void dolt_delta_redo(XLogReaderState *record);
 extern void dolt_delta_desc(StringInfo buf, XLogReaderState *record);

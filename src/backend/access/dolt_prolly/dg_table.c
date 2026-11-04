@@ -1398,11 +1398,33 @@ dolt_prolly_table_handler(PG_FUNCTION_ARGS)
 void
 dg_history_install(Relation rel, DGState *state, PLTree contents)
 {
+	DGState    *latest = state;
+
 	/* Bound resources retain their original snapshot during root publication. */
 	if (rel->rd_catalogview)
 		PushCopiedSnapshot(GetActiveSnapshot());
-	dg_handle_install(rel, state, contents);
-	dg_save(rel, state, GetCurrentCommandId(true));
+
+	/*
+	 * An install replaces the whole table, which goes to the delta store as
+	 * its difference from the table's content. No other writer may change
+	 * the table until this transaction ends, and the difference is taken from
+	 * the latest content once the lock has waited out every writer before it,
+	 * so that the two never remove one row twice.
+	 */
+	if (!dg_storage_bound(rel) && !CatalogViewIsLeased(RelationGetRelid(rel)))
+	{
+		LockRelationOid(RelationGetRelid(rel), ExclusiveLock);
+		latest = dg_load(rel, SnapshotSelf);
+	}
+	dg_handle_install(rel, latest, contents);
+	dg_save(rel, latest, GetCurrentCommandId(true));
+	if (latest != state)
+	{
+		/* The caller's state now shows what the install wrote, already saved. */
+		dg_set_content(state, contents);
+		state->loaded = contents.root;
+		dg_release(latest);
+	}
 	CommandCounterIncrement();
 	UpdateActiveSnapshotCommandId();
 	dg_rebuild_indexes(rel);
