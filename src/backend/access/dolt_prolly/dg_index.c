@@ -1224,6 +1224,9 @@ rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norder
 		memcpy(scan->keyData, keys, sizeof(ScanKeyData) * nkeys);
 	drop_slot(s);
 	MemoryContextReset(s->context);
+
+	/* The reset took the cursor's memory with the states. */
+	memset(&s->cursor, 0, sizeof(s->cursor));
 	old = MemoryContextSwitchTo(s->context);
 	if (scan->xs_snapshot->snapshot_type == SNAPSHOT_DIRTY)
 		wait_for_reservation(scan);

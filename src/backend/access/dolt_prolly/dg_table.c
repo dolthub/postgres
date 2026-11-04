@@ -169,7 +169,7 @@ materialize(DGScan *scan)
 	if (!scan->materialized)
 	{
 		scan->row_count = 0;
-		dg_scan(scan->state, NULL, NULL, collect_materialized, scan);
+		dg_scan_keep(scan->state, NULL, NULL, collect_materialized, scan);
 		scan->materialized = true;
 	}
 	scan->streaming = false;
@@ -337,7 +337,7 @@ bitmap_next(TableScanDesc base, TupleTableSlot *slot, bool *recheck,
 					MemoryContext old = MemoryContextSwitchTo(scan->context);
 
 					scan->page_count = 0;
-					dg_scan(scan->state, &lo, bounded ? &hi : NULL, collect_page_row, scan);
+					dg_scan_keep(scan->state, &lo, bounded ? &hi : NULL, collect_page_row, scan);
 					MemoryContextSwitchTo(old);
 					scan->page_scanned = true;
 					scan->bitmap_count = scan->page_count;

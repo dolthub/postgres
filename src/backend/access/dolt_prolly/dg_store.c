@@ -2122,7 +2122,7 @@ dg_state_rows(DGState *s)
 {
 	DGRows		rows = {0};
 
-	dg_scan(s, NULL, NULL, collect, &rows);
+	dg_scan_keep(s, NULL, NULL, collect, &rows);
 	return rows;
 }
 /* Logical pages must fit PostgreSQL's exact TID bitmap representation. */

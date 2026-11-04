@@ -69,9 +69,9 @@ gather(void *arg, const DoltDeltaEdit *edit)
 	change->delta = edit->delta;
 }
 
-/* The merged value of |change|: the base's count plus its delta, then the row. */
+/* The merged value of |change|, in |memory|: the base's count plus its delta, then the row. */
 static DGChange *
-resolve(DGState *s, DGChange *change)
+resolve(DGState *s, DGChange *change, MemoryContext memory)
 {
 	PLValue		base;
 	int64		count;
@@ -92,7 +92,7 @@ resolve(DGState *s, DGChange *change)
 	if (change->present)
 	{
 		row = base.present ? (PLSlice) {base.bytes.data + 8, base.bytes.len - 8} : change->row;
-		bytes = MemoryContextAlloc(s->changes->memory, 8 + row.len);
+		bytes = MemoryContextAlloc(memory, 8 + row.len);
 		pl_write64(bytes, (uint64) count);
 		memcpy(bytes + 8, row.data, row.len);
 		change->value = (PLSlice) {bytes, 8 + row.len};
@@ -105,11 +105,23 @@ dg_get(DGState *s, PLSlice key, PLValue *out)
 {
 	if (s->changes)
 	{
-		Gathered	g = {.memory = s->changes->memory};
+		DGChanges  *c = s->changes;
+		Gathered	g;
 
-		if (dolt_delta_get(&s->changes->view, key.data, key.len, gather, &g))
+		/*
+		 * A lookup's value lives until four more lookups that find changes
+		 * have been made, long enough for every caller to copy what it keeps.
+		 */
+		c->lookup = (c->lookup + 1) % lengthof(c->lookups);
+		if (c->lookups[c->lookup])
+			MemoryContextReset(c->lookups[c->lookup]);
+		else
+			c->lookups[c->lookup] = AllocSetContextCreate(c->memory, "prolly lookup", ALLOCSET_SMALL_SIZES);
+		memset(&g, 0, sizeof(g));
+		g.memory = c->lookups[c->lookup];
+		if (dolt_delta_get(&c->view, key.data, key.len, gather, &g))
 		{
-			DGChange   *change = resolve(s, &g.items[0]);
+			DGChange   *change = resolve(s, &g.items[0], g.memory);
 
 			out->present = change->present;
 			out->bytes = change->present ? change->value : (PLSlice) {NULL, 0};
@@ -127,7 +139,7 @@ dg_get(DGState *s, PLSlice key, PLValue *out)
 static void
 cursor_read(DGCursor *c, const PLSlice *bound, bool inclusive)
 {
-	Gathered	g = {.memory = c->state->changes->memory};
+	Gathered	g = {.memory = c->memory};
 	PLSlice		last;
 
 	if (c->count)
@@ -187,7 +199,7 @@ cursor_settle(DGCursor *c)
 			c->valid = true;
 			return;
 		}
-		resolve(c->state, change);
+		resolve(c->state, change, c->memory);
 		if (change->present)
 		{
 			c->entry.key = change->key;
@@ -204,11 +216,34 @@ cursor_settle(DGCursor *c)
 	}
 }
 
+/* Reset |c| for a new walk of |s|, keeping, and emptying, the memory it has. */
+static void
+cursor_reset(DGCursor *c, DGState *s)
+{
+	MemoryContext memory = c->memory;
+
+	if (memory)
+		MemoryContextReset(memory);
+	else if (s->changes)
+		memory = AllocSetContextCreate(s->changes->memory, "prolly cursor", ALLOCSET_SMALL_SIZES);
+	memset(c, 0, sizeof(*c));
+	c->memory = memory;
+	c->state = s;
+}
+
+/* Release what |c| holds; it starts zeroed again. */
+void
+dg_cursor_end(DGCursor *c)
+{
+	if (c->memory)
+		MemoryContextDelete(c->memory);
+	memset(c, 0, sizeof(*c));
+}
+
 void
 dg_cursor_init(DGCursor *c, DGState *s, const PLSlice *lower)
 {
-	memset(c, 0, sizeof(*c));
-	c->state = s;
+	cursor_reset(c, s);
 	dg_check(pl_cursor_init(&c->base, &s->tree, lower));
 	if (s->changes)
 		cursor_read(c, lower, true);
@@ -218,8 +253,7 @@ dg_cursor_init(DGCursor *c, DGState *s, const PLSlice *lower)
 void
 dg_cursor_init_last(DGCursor *c, DGState *s, const PLSlice *upper)
 {
-	memset(c, 0, sizeof(*c));
-	c->state = s;
+	cursor_reset(c, s);
 	c->backward = true;
 	dg_check(pl_cursor_init_last(&c->base, &s->tree, upper));
 	if (s->changes)
@@ -258,23 +292,44 @@ dg_cursor_entry(const DGCursor *c)
 	return c->entry;
 }
 
-/* Call |callback| for each merged entry with key in [lower, upper), until it returns PL_STOP. */
-void
-dg_scan(DGState *s, const PLSlice *lower, const PLSlice *upper, PLScanFn callback, void *arg)
+/* Walk [lower, upper) with |c|, calling |callback| for each merged entry until it returns PL_STOP. */
+static void
+scan_with(DGCursor *c, DGState *s, const PLSlice *lower, const PLSlice *upper, PLScanFn callback, void *arg)
 {
-	DGCursor	c;
-
-	for (dg_cursor_init(&c, s, lower); c.valid; dg_cursor_next(&c))
+	for (dg_cursor_init(c, s, lower); c->valid; dg_cursor_next(c))
 	{
 		PLStatus	status;
 
-		if (upper && pl_compare(c.entry.key, *upper) >= 0)
+		if (upper && pl_compare(c->entry.key, *upper) >= 0)
 			break;
-		status = callback(arg, c.entry.key, c.entry.value);
+		status = callback(arg, c->entry.key, c->entry.value);
 		if (status == PL_STOP)
 			break;
 		dg_check(status);
 	}
+}
+
+/*
+ * Call |callback| for each merged entry with key in [lower, upper), until it
+ * returns PL_STOP. The entries are gone when it returns: the callback copies
+ * what it keeps.
+ */
+void
+dg_scan(DGState *s, const PLSlice *lower, const PLSlice *upper, PLScanFn callback, void *arg)
+{
+	DGCursor	c = {0};
+
+	scan_with(&c, s, lower, upper, callback, arg);
+	dg_cursor_end(&c);
+}
+
+/* dg_scan whose entries last as long as |s|, for callers that keep them. */
+void
+dg_scan_keep(DGState *s, const PLSlice *lower, const PLSlice *upper, PLScanFn callback, void *arg)
+{
+	DGCursor	c = {0};
+
+	scan_with(&c, s, lower, upper, callback, arg);
 }
 
 /* About how many entries the merged content holds: an estimate, for planning. */
@@ -367,7 +422,7 @@ dg_content(DGState *s)
 		edits = palloc(Max(g.count, 1) * sizeof(PLEdit));
 		for (int i = 0; i < g.count; i++)
 		{
-			DGChange   *change = resolve(s, &g.items[i]);
+			DGChange   *change = resolve(s, &g.items[i], g.memory);
 
 			edits[i].key = change->key;
 			edits[i].value.present = change->present;

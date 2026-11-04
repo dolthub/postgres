@@ -42,7 +42,9 @@ typedef struct DGChanges
 	SnapshotData snapshot;		/* view.snapshot */
 	DoltDeltaHorizon horizon;	/* view.base, when the base has one */
 	uint64		seq;			/* the tree's next version sequence at load */
-	MemoryContext memory;		/* where copies and merged values live */
+	MemoryContext memory;		/* where the state and its copies live */
+	MemoryContext lookups[4];	/* point lookups' values, reused in turn */
+	int			lookup;
 } DGChanges;
 
 /*
@@ -74,10 +76,14 @@ typedef struct DGState
 	struct HandleDelta *extra;	/* occurrences the delta does not name, numbered for this state */
 } DGState;
 
-/* A cursor over a state's merged content. */
+/*
+ * A cursor over a state's merged content. It must start zeroed: a cursor
+ * initialized again reuses, and resets, its memory.
+ */
 typedef struct DGCursor
 {
 	DGState    *state;
+	MemoryContext memory;		/* the cursor's changes and values, kept across inits */
 	PLCursor	base;
 	DGChange   *chunk;			/* changes read ahead, in the cursor's direction */
 	int			count;			/* in |chunk| */
@@ -93,6 +99,7 @@ extern PLTree *dg_content(DGState *s);
 extern void dg_set_content(DGState *s, PLTree tree);
 extern bool dg_get(DGState *s, PLSlice key, PLValue *out);
 extern void dg_scan(DGState *s, const PLSlice *lower, const PLSlice *upper, PLScanFn callback, void *arg);
+extern void dg_scan_keep(DGState *s, const PLSlice *lower, const PLSlice *upper, PLScanFn callback, void *arg);
 extern uint64 dg_count(DGState *s);
 extern PLHash dg_state_view(const DGState *s);
 extern void dg_set_base(DGState *s, PLTree tree);
@@ -104,6 +111,7 @@ extern void dg_cursor_init_last(DGCursor *cursor, DGState *s, const PLSlice *upp
 extern void dg_cursor_next(DGCursor *cursor);
 extern void dg_cursor_prev(DGCursor *cursor);
 extern PLEntry dg_cursor_entry(const DGCursor *cursor);
+extern void dg_cursor_end(DGCursor *cursor);
 
 /* Handles below this are derived from content; the counter allocates above it. */
 #define DG_DERIVED_HANDLES (UINT64CONST(1) << 40)
