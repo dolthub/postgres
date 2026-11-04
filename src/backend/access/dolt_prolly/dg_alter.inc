@@ -6,7 +6,7 @@ typedef PLSlice (*AlterField) (int field, PLSlice bytes, void *arg);
 static PLTree
 alter_rows(DGState *state, int oldcount, int count, int *mapping, AlterField transform, void *arg)
 {
-	DGRows		rows = dg_rows(&state->content);
+	DGRows		rows = dg_state_rows(state);
 	PLEntry    *entries = palloc_array(PLEntry, Max(rows.count, 1));
 	size_t		used = 0;
 

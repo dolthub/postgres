@@ -127,7 +127,14 @@ oldest xmin. Aborted versions go at once.
 
 **First write to a tree with no root row** (new storage, or a branch without
 roots yet). The writer creates the row with the base readers would compute
-(`dg_branch_base`). This happens once per tree and is short.
+(`dg_branch_base`), under a lock held to commit, as first publishers did.
+This happens once per tree. Without the row, the base would follow the
+branch's HEAD, and a `dolt_commit` would apply the delta twice.
+
+**Pins.** Between selecting a base and collecting its delta, a reader must
+not lose the versions a newer fold holds. Each backend publishes the oldest
+xmin it loaded under, in shared memory, until its transaction ends. Pruning
+waits for every pin, not only for registered snapshots.
 
 ### 4. Write path (parts 2, 3)
 
@@ -137,9 +144,9 @@ roots yet). The writer creates the row with the base readers would compute
   `pg_dolt_handle`.
 - **`dg_save` callers that build whole trees** (version-control installs,
   DDL rewrites, `dg_history_install`, native catalog mutations) emit
-  `diff(view they loaded, tree they built)` as versions. Every saved state
-  becomes delta, so the overlay stack, `publish_all`, `roots_lock`,
-  `roots_merge` and the commit-time root write all go away.
+  `diff(view they loaded, tree they built)` as versions, unless the tree has
+  no root row yet (section 5). The overlay stack, `publish_all`,
+  `roots_lock`, `roots_merge` and the commit-time root write all go away.
 - **Version-control installs** (merge, reset, checkout, cherry-pick, revert)
   take ExclusiveLock on the tables they install into. Their count deltas then
   can't race concurrent row edits into negative counts. Readers still read
@@ -149,20 +156,32 @@ roots yet). The writer creates the row with the base readers would compute
 
 ### 5. Read path (parts 1, 2)
 
-- **Phase A, materialized views.** `load_state` selects the base and then
-  applies the visible delta to it with `pl_apply` into the working store. A
-  per-backend cache of (tree, base, sorted version ids) reuses the result and
-  applies only versions that became visible since. Every consumer keeps
-  reading a plain `PLTree`. This is the correctness milestone.
-- **Phase B, merge-on-read.** `PLTree` gains an optional delta overlay: a
-  sorted array of (key, count delta, row).
-  - `pl_get`, `pl_scan`, the cursor functions and `pl_count` merge it with the
-    base, as Doltgrust's readers do. They never hash a node.
-  - Anything that needs a real root (`pl_apply`, `pl_diff`, `pl_merge`,
-    exports, and `content.root` readers in version control) materializes
-    first, through one accessor.
-  - Table scans, fetches, index scans, handle lookups and unique checks then
-    cost one base lookup plus one memtable probe.
+Settled 2026-11-04: merge on read from the start. Materializing on every load
+would cost O(delta) node hashing per statement, which is exactly the hot-path
+cost the delta store exists to remove.
+
+- **Loading.** A load reads the base row its snapshot selects, then collects
+  the delta versions that snapshot sees and the base doesn't hold. They go
+  into a backend-local array sorted by key, with each key's net count change.
+  `DGState.tree` is then the base, and `DGState.delta` the array.
+- **Hot readers** go through `dg_get`, `dg_scan`, `DGCursor` and `dg_count`,
+  which merge the base with the array the way Doltgrust's readers do:
+  table scans, fetches, index scans, handle lookups, unique checks and
+  batches. They never hash a node.
+- **Readers that need a real tree** (version control, diff, merge, export,
+  DDL rewrites) call `dg_content`, which applies the array with `pl_apply`
+  first. Renaming the field from `content` to `tree` made the compiler find
+  every such use.
+- **Next.** Collecting is O(delta) per load. Folds keep deltas small, and a
+  per-backend cache or a shared ordered index per tree (Doltgrust's memtable
+  key ranges) can replace collection if profiles show it.
+
+**Saves.** `dg_save` writes a root row only when the tree has none yet:
+fresh storage from CREATE, rewrites and index builds, or a branch's first
+write. That root row has no horizon, because no versions can exist without
+it. Every other save appends `diff(view loaded, tree saved)` as versions. A
+DML batch appends its pending rows and index entries directly. Only folds
+replace existing root rows, so only folds' rows carry a horizon.
 
 ### 6. Folding (part 4)
 

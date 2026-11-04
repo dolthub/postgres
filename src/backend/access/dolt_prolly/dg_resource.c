@@ -525,7 +525,7 @@ storage_base(DGStorage *storage, DGState *state)
 		PushActiveSnapshot(storage->snapshot);
 		PG_TRY();
 		{
-			state->content = dg_history_import(state->store, storage->base);
+			dg_set_base(state, dg_history_import(state->store, storage->base));
 		}
 		PG_FINALLY();
 		{

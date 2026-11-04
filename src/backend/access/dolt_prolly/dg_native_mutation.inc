@@ -303,7 +303,7 @@ dg_catalog_begin_rewrite(Relation definition)
 	table->destination->store = table->source->store;
 	table->destination->nextid = 1;
 	table->width = RelationGetDescr(definition)->natts;
-	dg_check(pl_build(table->source->store, NULL, 0, &table->destination->content));
+	dg_check(pl_build(table->source->store, NULL, 0, &table->destination->tree));
 	MemoryContextSwitchTo(old);
 	return true;
 }
@@ -972,7 +972,7 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 			source = dg_catalog_write_table(dg_current_branch(), table->name, ACL_UPDATE);
 			table->oldcount = RelationGetDescr(source)->natts;
 			table->source = childid == id ? state : dg_load(source, GetActiveSnapshot());
-			table->tree = table->source->content;
+			table->tree = *dg_content(table->source);
 			dg_storage_close_relation(source);
 			CatalogViewSwitch(outer);
 			native_mutation_tables = lappend(native_mutation_tables, table);

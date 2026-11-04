@@ -19,8 +19,10 @@
  * The versions live in shared memory, in a dynamic shared memory area created
  * in place in the main segment, so that the startup process can replay into
  * it and the checkpointer can save it. A partitioned hash table maps tree
- * keys to trees; each tree has its own lock and a list of versions in arrival
- * order.
+ * keys to trees. Each tree is a skiplist of its keys, as Doltgrust's memtable
+ * keeps a tree's keys in order, each key with its versions oldest first, under
+ * the tree's own lock: a reader finds one key's versions, or the next keys in
+ * either direction, without reading the rest.
  *
  * Durability follows heap's buffers: a version reaches the WAL before its
  * transaction commits, and a checkpoint saves every version whose record
@@ -44,6 +46,7 @@
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "common/hashfn.h"
+#include "common/pg_prng.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "port/pg_crc32c.h"
@@ -70,6 +73,9 @@ int			dolt_delta_memory = 256 * 1024;	/* kB */
 /* The WAL payload of one append record, past which an append writes another. */
 #define DELTA_RECORD_BYTES ((Size) 1024 * 1024)
 
+/* Skiplist levels; each level holds about a quarter of the keys below it. */
+#define DELTA_MAX_HEIGHT 12
+
 /* A version's status, as its writer's xids decide it once known. */
 #define VERSION_COMMITTED	0x1
 #define VERSION_ABORTED		0x2
@@ -77,11 +83,11 @@ int			dolt_delta_memory = 256 * 1024;	/* kB */
 #define DELTA_DIR			"pg_dolt"
 #define DELTA_STATE_FILE	DELTA_DIR "/delta.state"
 #define DELTA_STATE_TEMP	DELTA_DIR "/delta.state.tmp"
-#define DELTA_STATE_MAGIC	0x44474c31	/* "DGL1" */
+#define DELTA_STATE_MAGIC	0x44474c32	/* "DGL2" */
 
 typedef struct DeltaVersion
 {
-	dsa_pointer next;
+	dsa_pointer next;			/* the key's next newer version */
 	uint64		seq;
 	XLogRecPtr	lsn;			/* where its WAL record starts; invalid if unlogged */
 	TransactionId topxid;
@@ -89,20 +95,33 @@ typedef struct DeltaVersion
 	CommandId	cid;
 	pg_atomic_uint32 flags;
 	int64		delta;
-	uint32		keylen;
 	uint32		rowlen;
-	uint8		data[FLEXIBLE_ARRAY_MEMBER];	/* key, then row */
+	uint8		row[FLEXIBLE_ARRAY_MEMBER];
 } DeltaVersion;
+
+/* A key of a tree's skiplist, with its versions. The key's bytes follow next[]. */
+typedef struct DeltaKey
+{
+	dsa_pointer first;			/* oldest version */
+	dsa_pointer last;			/* newest version */
+	uint32		keylen;
+	uint32		height;
+	dsa_pointer next[FLEXIBLE_ARRAY_MEMBER];
+} DeltaKey;
+
+#define KEY_BYTES(k) ((uint8 *) &(k)->next[(k)->height])
 
 typedef struct DeltaTree
 {
 	DoltDeltaTree key;			/* hash key */
 	LWLock		lock;
-	dsa_pointer head;
-	dsa_pointer tail;
-	uint64		count;
+	dsa_pointer head;			/* a key of DELTA_MAX_HEIGHT with no bytes */
+	uint64		count;			/* versions */
+	uint64		keys;
 	uint64		bytes;
 	uint64		next_seq;
+	int64		net;			/* every version's delta, summed */
+	pg_prng_state heights;
 } DeltaTree;
 
 typedef struct DeltaControl
@@ -216,6 +235,42 @@ dolt_delta_tree_key(DoltDeltaTree *tree, Oid db, Oid space, RelFileNumber file, 
 	strlcpy(tree->branch, branch, sizeof(tree->branch));
 }
 
+static DeltaKey *
+key_at(dsa_pointer dp)
+{
+	return (DeltaKey *) dsa_get_address(area, dp);
+}
+
+static DeltaVersion *
+version_at(dsa_pointer dp)
+{
+	return (DeltaVersion *) dsa_get_address(area, dp);
+}
+
+/*
+ * A key node of |height| for |key|, unlinked, or invalid when the area is
+ * full. A tree's head is one with no bytes and the most levels.
+ */
+static dsa_pointer
+key_make(const uint8 *key, uint32 keylen, uint32 height)
+{
+	Size		size = offsetof(DeltaKey, next) + height * sizeof(dsa_pointer) + keylen;
+	dsa_pointer dp = dsa_allocate_extended(area, size, DSA_ALLOC_NO_OOM);
+	DeltaKey   *k;
+
+	if (!DsaPointerIsValid(dp))
+		return dp;
+	k = key_at(dp);
+	k->first = k->last = InvalidDsaPointer;
+	k->keylen = keylen;
+	k->height = height;
+	for (uint32 i = 0; i < height; i++)
+		k->next[i] = InvalidDsaPointer;
+	if (keylen)
+		memcpy(KEY_BYTES(k), key, keylen);
+	return dp;
+}
+
 /*
  * The tree for |key|, entered if |create|. Trees are never removed while the
  * server runs, so the pointer stays good after the partition lock is let go.
@@ -238,9 +293,19 @@ tree_find(const DoltDeltaTree *key, bool create)
 	if (tree && !found)
 	{
 		LWLockInitialize(&tree->lock, LWTRANCHE_DOLT_DELTA_TREE);
-		tree->head = tree->tail = InvalidDsaPointer;
-		tree->count = tree->bytes = 0;
-		tree->next_seq = 1;
+		tree->head = key_make(NULL, 0, DELTA_MAX_HEIGHT);
+		if (!DsaPointerIsValid(tree->head))
+		{
+			hash_search_with_hash_value(trees, key, hash, HASH_REMOVE, NULL);
+			tree = NULL;
+		}
+		else
+		{
+			tree->count = tree->keys = tree->bytes = 0;
+			tree->net = 0;
+			tree->next_seq = 1;
+			pg_prng_seed(&tree->heights, hash);
+		}
 	}
 	LWLockRelease(partition);
 	if (!tree)
@@ -250,17 +315,92 @@ tree_find(const DoltDeltaTree *key, bool create)
 	return tree;
 }
 
+/* Compare as pl_compare does: bytes, then length. */
+static int
+key_compare(const uint8 *a, uint32 alen, const uint8 *b, uint32 blen)
+{
+	int			c = memcmp(a, b, Min(alen, blen));
+
+	if (c != 0)
+		return c;
+	return alen < blen ? -1 : alen > blen ? 1 : 0;
+}
+
+/*
+ * The first key of |tree| at or past |key|, or invalid; |preds| receives, per
+ * level, the last key before it (the head if none).
+ */
+static dsa_pointer
+key_search(DeltaTree *tree, const uint8 *key, uint32 keylen, dsa_pointer *preds)
+{
+	dsa_pointer at = tree->head;
+	dsa_pointer next = InvalidDsaPointer;
+
+	for (int level = DELTA_MAX_HEIGHT - 1; level >= 0; level--)
+	{
+		for (;;)
+		{
+			DeltaKey   *k;
+
+			next = key_at(at)->next[level];
+			if (!DsaPointerIsValid(next))
+				break;
+			k = key_at(next);
+			if (key_compare(KEY_BYTES(k), k->keylen, key, keylen) >= 0)
+				break;
+			at = next;
+		}
+		if (preds)
+			preds[level] = at;
+	}
+	return next;
+}
+
+/* The last key of |tree| before |key|, or its last key if |key| is NULL; invalid if none. */
+static dsa_pointer
+key_before(DeltaTree *tree, const uint8 *key, uint32 keylen)
+{
+	dsa_pointer at = tree->head;
+
+	for (int level = DELTA_MAX_HEIGHT - 1; level >= 0; level--)
+	{
+		for (;;)
+		{
+			dsa_pointer next = key_at(at)->next[level];
+			DeltaKey   *k;
+
+			if (!DsaPointerIsValid(next))
+				break;
+			k = key_at(next);
+			if (key && key_compare(KEY_BYTES(k), k->keylen, key, keylen) >= 0)
+				break;
+			at = next;
+		}
+	}
+	return at == tree->head ? InvalidDsaPointer : at;
+}
+
+static uint32
+random_height(DeltaTree *tree)
+{
+	uint32		height = 1;
+
+	while (height < DELTA_MAX_HEIGHT && pg_prng_uint32(&tree->heights) % 4 == 0)
+		height++;
+	return height;
+}
+
 /* A version's bytes, filled but not linked; invalid when the area is full. */
 static dsa_pointer
 version_make(const DoltDeltaEdit *edit, TransactionId topxid, TransactionId xid, CommandId cid)
 {
-	Size		size = offsetof(DeltaVersion, data) + edit->keylen + edit->rowlen;
+	Size		size = offsetof(DeltaVersion, row) + edit->rowlen;
 	dsa_pointer dp = dsa_allocate_extended(area, size, DSA_ALLOC_NO_OOM);
 	DeltaVersion *v;
 
 	if (!DsaPointerIsValid(dp))
 		return dp;
-	v = dsa_get_address(area, dp);
+	v = version_at(dp);
 	v->next = InvalidDsaPointer;
 	v->seq = 0;
 	v->lsn = InvalidXLogRecPtr;
@@ -269,41 +409,93 @@ version_make(const DoltDeltaEdit *edit, TransactionId topxid, TransactionId xid,
 	v->cid = cid;
 	pg_atomic_init_u32(&v->flags, 0);
 	v->delta = edit->delta;
-	v->keylen = edit->keylen;
 	v->rowlen = edit->rowlen;
-	memcpy(v->data, edit->key, edit->keylen);
 	if (edit->rowlen)
-		memcpy(v->data + edit->keylen, edit->row, edit->rowlen);
+		memcpy(v->row, edit->row, edit->rowlen);
 	return dp;
 }
 
-static Size
-version_size(const DeltaVersion *v)
+/*
+ * What one append of a version needs, allocated before the critical section
+ * that links it: the version, and a key node in case its key is new.
+ */
+typedef struct Pending
 {
-	return offsetof(DeltaVersion, data) + v->keylen + v->rowlen;
+	dsa_pointer version;
+	dsa_pointer key;			/* unused, and freed, if the key exists */
+} Pending;
+
+/* Allocate |pending| for |edit|; false, with nothing allocated, if the area is full. */
+static bool
+pending_make(DeltaTree *tree, Pending *pending, const DoltDeltaEdit *edit, TransactionId topxid,
+			 TransactionId xid, CommandId cid)
+{
+	pending->version = version_make(edit, topxid, xid, cid);
+	if (!DsaPointerIsValid(pending->version))
+		return false;
+	pending->key = key_make(edit->key, edit->keylen, random_height(tree));
+	if (!DsaPointerIsValid(pending->key))
+	{
+		dsa_free(area, pending->version);
+		return false;
+	}
+	return true;
 }
 
-/* Link versions at the tail of |tree|, as written at |lsn|. Cannot fail. */
+/*
+ * Link pending versions of |edits| into |tree|, as written at |lsn|. Cannot
+ * fail. A pending key node a version did not need is left for
+ * pending_release, to be freed outside any critical section.
+ */
 static void
-versions_link(DeltaTree *tree, const dsa_pointer *versions, int count, XLogRecPtr lsn)
+versions_link(DeltaTree *tree, const DoltDeltaEdit *edits, Pending *pending, int count, XLogRecPtr lsn)
 {
 	LWLockAcquire(&tree->lock, LW_EXCLUSIVE);
 	for (int i = 0; i < count; i++)
 	{
-		DeltaVersion *v = dsa_get_address(area, versions[i]);
+		dsa_pointer preds[DELTA_MAX_HEIGHT];
+		dsa_pointer found = key_search(tree, edits[i].key, edits[i].keylen, preds);
+		DeltaVersion *v = version_at(pending[i].version);
+		DeltaKey   *k;
 
 		v->seq = tree->next_seq++;
 		v->lsn = lsn;
-		v->next = InvalidDsaPointer;
-		if (DsaPointerIsValid(tree->tail))
-			((DeltaVersion *) dsa_get_address(area, tree->tail))->next = versions[i];
+		if (DsaPointerIsValid(found) &&
+			key_compare(KEY_BYTES(key_at(found)), key_at(found)->keylen, edits[i].key, edits[i].keylen) == 0)
+		{
+			k = key_at(found);
+			version_at(k->last)->next = pending[i].version;
+			k->last = pending[i].version;
+		}
 		else
-			tree->head = versions[i];
-		tree->tail = versions[i];
+		{
+			k = key_at(pending[i].key);
+			for (uint32 level = 0; level < k->height; level++)
+			{
+				DeltaKey   *pred = key_at(preds[level]);
+
+				k->next[level] = pred->next[level];
+				pred->next[level] = pending[i].key;
+			}
+			k->first = k->last = pending[i].version;
+			tree->keys++;
+			tree->bytes += offsetof(DeltaKey, next) + k->height * sizeof(dsa_pointer) + k->keylen;
+			pending[i].key = InvalidDsaPointer;
+		}
 		tree->count++;
-		tree->bytes += version_size(v);
+		tree->net += v->delta;
+		tree->bytes += offsetof(DeltaVersion, row) + v->rowlen;
 	}
 	LWLockRelease(&tree->lock);
+}
+
+/* Free the key nodes linking found unneeded. */
+static void
+pending_release(Pending *pending, int count)
+{
+	for (int i = 0; i < count; i++)
+		if (DsaPointerIsValid(pending[i].key))
+			dsa_free(area, pending[i].key);
 }
 
 /* The WAL record of versions [first, last) of an append, as one buffer. */
@@ -353,18 +545,17 @@ record_build(const DoltDeltaTree *key, TransactionId topxid, CommandId cid,
 
 /*
  * Append |count| versions to |key|'s delta as the current (sub)transaction's,
- * in its current command. A |logged| append reaches the WAL first, one record
- * per DELTA_RECORD_BYTES of payload; an unlogged one, for relations no other
- * session or recovery can see, stays in memory alone.
+ * in command |cid|, which made them. A |logged| append reaches the WAL first,
+ * one record per DELTA_RECORD_BYTES of payload; an unlogged one, for
+ * relations no other session or recovery can see, stays in memory alone.
  */
 void
-dolt_delta_append(const DoltDeltaTree *key, const DoltDeltaEdit *edits, int count, bool logged)
+dolt_delta_append(const DoltDeltaTree *key, const DoltDeltaEdit *edits, int count, CommandId cid, bool logged)
 {
 	TransactionId topxid;
 	TransactionId xid;
-	CommandId	cid;
 	DeltaTree  *tree;
-	dsa_pointer *versions;
+	Pending    *pending;
 	int			first = 0;
 
 	if (count <= 0)
@@ -372,18 +563,20 @@ dolt_delta_append(const DoltDeltaTree *key, const DoltDeltaEdit *edits, int coun
 	delta_attach();
 	topxid = GetTopTransactionId();
 	xid = GetCurrentTransactionId();
-	cid = GetCurrentCommandId(true);
+	(void) GetCurrentCommandId(true);	/* the command wrote */
 	tree = tree_find(key, true);
 
 	/* Allocate everything before the critical section, which must not fail. */
-	versions = palloc(count * sizeof(dsa_pointer));
+	pending = palloc(count * sizeof(Pending));
 	for (int i = 0; i < count; i++)
 	{
-		versions[i] = version_make(&edits[i], topxid, xid, cid);
-		if (!DsaPointerIsValid(versions[i]))
+		if (!pending_make(tree, &pending[i], &edits[i], topxid, xid, cid))
 		{
 			for (int j = 0; j < i; j++)
-				dsa_free(area, versions[j]);
+			{
+				dsa_free(area, pending[j].version);
+				dsa_free(area, pending[j].key);
+			}
 			ereport(ERROR,
 					(errcode(ERRCODE_OUT_OF_MEMORY),
 					 errmsg("prolly delta memory is full"),
@@ -393,8 +586,9 @@ dolt_delta_append(const DoltDeltaTree *key, const DoltDeltaEdit *edits, int coun
 
 	if (!logged)
 	{
-		versions_link(tree, versions, count, InvalidXLogRecPtr);
-		pfree(versions);
+		versions_link(tree, edits, pending, count, InvalidXLogRecPtr);
+		pending_release(pending, count);
+		pfree(pending);
 		return;
 	}
 
@@ -424,14 +618,15 @@ dolt_delta_append(const DoltDeltaTree *key, const DoltDeltaEdit *edits, int coun
 		Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
 		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
 		(void) XLogInsert(RM_DOLT_DELTA_ID, XLOG_DOLT_DELTA_APPEND);
-		versions_link(tree, versions + first, last - first, ProcLastRecPtr);
+		versions_link(tree, edits + first, pending + first, last - first, ProcLastRecPtr);
 		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 		END_CRIT_SECTION();
 
 		pfree(record);
 		first = last;
 	}
-	pfree(versions);
+	pending_release(pending, count);
+	pfree(pending);
 }
 
 /*
@@ -504,47 +699,180 @@ base_holds(const DoltDeltaHorizon *base, const DeltaVersion *v)
 	return true;
 }
 
+/* Whether a reader of |view| counts |v|. */
+static bool
+view_counts(const DoltDeltaView *view, DeltaVersion *v)
+{
+	if (!view->own && TransactionIdIsCurrentTransactionId(v->xid))
+		return false;
+	return version_visible(v, view->snapshot) && !base_holds(view->base, v);
+}
+
 /*
- * Visit every version of |key|'s delta that |snapshot| sees and |base| does
- * not hold, in arrival order, and return how many. The visitor runs under the
- * tree's shared lock with edits pointing into shared memory: it copies what
- * it keeps.
+ * The net change |view| sees to key |k|: the sum of the counts of its
+ * versions the view counts, and the row they name. False if it counts none.
  */
-int
-dolt_delta_scan(const DoltDeltaTree *key, Snapshot snapshot, const DoltDeltaHorizon *base,
-				DoltDeltaVisit visit, void *arg)
+static bool
+key_net(const DoltDeltaView *view, DeltaKey *k, int64 *net, const uint8 **row, uint32 *rowlen)
+{
+	bool		any = false;
+
+	*net = 0;
+	*row = NULL;
+	*rowlen = 0;
+	for (dsa_pointer dp = k->first; DsaPointerIsValid(dp);)
+	{
+		DeltaVersion *v = version_at(dp);
+
+		dp = v->next;
+		if (!view_counts(view, v))
+			continue;
+		any = true;
+		*net += v->delta;
+		if (!*row && v->rowlen)
+		{
+			*row = v->row;
+			*rowlen = v->rowlen;
+		}
+	}
+	return any;
+}
+
+static void
+visit_key(DeltaKey *k, int64 net, const uint8 *row, uint32 rowlen, DoltDeltaVisit visit, void *arg)
+{
+	DoltDeltaEdit edit;
+
+	edit.key = KEY_BYTES(k);
+	edit.keylen = k->keylen;
+	edit.row = row;
+	edit.rowlen = rowlen;
+	edit.delta = net;
+	visit(arg, &edit);
+}
+
+/*
+ * Visit the net change |view| sees to |key|, if any is nonzero, and return
+ * whether there was one. The visitor runs under the tree's shared lock with
+ * pointers into shared memory: it copies what it keeps.
+ */
+bool
+dolt_delta_get(const DoltDeltaView *view, const uint8 *key, uint32 keylen, DoltDeltaVisit visit, void *arg)
 {
 	DeltaTree  *tree;
-	dsa_pointer dp;
+	dsa_pointer found;
+	bool		changed = false;
+
+	delta_attach();
+	tree = tree_find(&view->tree, false);
+	if (!tree)
+		return false;
+	LWLockAcquire(&tree->lock, LW_SHARED);
+	found = key_search(tree, key, keylen, NULL);
+	if (DsaPointerIsValid(found))
+	{
+		DeltaKey   *k = key_at(found);
+		int64		net;
+		const uint8 *row;
+		uint32		rowlen;
+
+		if (key_compare(KEY_BYTES(k), k->keylen, key, keylen) == 0 &&
+			key_net(view, k, &net, &row, &rowlen) && net != 0)
+		{
+			visit_key(k, net, row, rowlen, visit, arg);
+			changed = true;
+		}
+	}
+	LWLockRelease(&tree->lock);
+	return changed;
+}
+
+/*
+ * Visit, in key order, up to |max| keys whose net change |view| sees is
+ * nonzero: forward from |from| (inclusive or not), or from the start if
+ * |from| is NULL, up to |to| (exclusive); or backward from before |from|, or
+ * from the end if |from| is NULL, down to |to| (inclusive). Returns how many
+ * it visited; fewer than |max| means it reached the bound.
+ */
+int
+dolt_delta_range(const DoltDeltaView *view, const uint8 *from, uint32 fromlen, bool inclusive,
+				 const uint8 *to, uint32 tolen, bool backward, int max, DoltDeltaVisit visit, void *arg)
+{
+	DeltaTree  *tree;
+	dsa_pointer at;
 	int			visited = 0;
+
+	delta_attach();
+	tree = tree_find(&view->tree, false);
+	if (!tree)
+		return 0;
+	LWLockAcquire(&tree->lock, LW_SHARED);
+	if (!backward)
+	{
+		at = from ? key_search(tree, from, fromlen, NULL) : key_at(tree->head)->next[0];
+		if (from && !inclusive && DsaPointerIsValid(at) &&
+			key_compare(KEY_BYTES(key_at(at)), key_at(at)->keylen, from, fromlen) == 0)
+			at = key_at(at)->next[0];
+	}
+	else
+		at = key_before(tree, from, fromlen);
+	while (DsaPointerIsValid(at) && visited < max)
+	{
+		DeltaKey   *k = key_at(at);
+		int64		net;
+		const uint8 *row;
+		uint32		rowlen;
+
+		if (to)
+		{
+			int			order = key_compare(KEY_BYTES(k), k->keylen, to, tolen);
+
+			if (backward ? order < 0 : order >= 0)
+				break;
+		}
+		if (key_net(view, k, &net, &row, &rowlen) && net != 0)
+		{
+			visit_key(k, net, row, rowlen, visit, arg);
+			visited++;
+		}
+		at = backward ? key_before(tree, KEY_BYTES(k), k->keylen) : k->next[0];
+	}
+	LWLockRelease(&tree->lock);
+	return visited;
+}
+
+/* The next sequence |key|'s delta will give a version, which identifies what it holds now. */
+uint64
+dolt_delta_seq(const DoltDeltaTree *key)
+{
+	DeltaTree  *tree;
+	uint64		seq;
 
 	delta_attach();
 	tree = tree_find(key, false);
 	if (!tree)
 		return 0;
 	LWLockAcquire(&tree->lock, LW_SHARED);
-	for (dp = tree->head; DsaPointerIsValid(dp);)
-	{
-		DeltaVersion *v = dsa_get_address(area, dp);
-
-		dp = v->next;
-		if (!version_visible(v, snapshot) || base_holds(base, v))
-			continue;
-		if (visit)
-		{
-			DoltDeltaEdit edit;
-
-			edit.key = v->data;
-			edit.keylen = v->keylen;
-			edit.row = v->data + v->keylen;
-			edit.rowlen = v->rowlen;
-			edit.delta = v->delta;
-			visit(arg, &edit, v->seq);
-		}
-		visited++;
-	}
+	seq = tree->next_seq;
 	LWLockRelease(&tree->lock);
-	return visited;
+	return seq;
+}
+
+/* The sum of every count in |key|'s delta, whoever wrote it: an estimate of rows it adds. */
+int64
+dolt_delta_net(const DoltDeltaTree *key)
+{
+	DeltaTree  *tree;
+	int64		net;
+
+	delta_attach();
+	tree = tree_find(key, false);
+	if (!tree)
+		return 0;
+	LWLockAcquire(&tree->lock, LW_SHARED);
+	net = tree->net;
+	LWLockRelease(&tree->lock);
+	return net;
 }
 
 /* How many versions |key|'s delta holds, whoever wrote them. */
@@ -627,25 +955,31 @@ CheckPointDoltDelta(XLogRecPtr redo)
 		DeltaTree  *tree = all[i];
 
 		LWLockAcquire(&tree->lock, LW_SHARED);
-		for (dsa_pointer dp = tree->head; DsaPointerIsValid(dp);)
+		for (dsa_pointer kp = key_at(tree->head)->next[0]; DsaPointerIsValid(kp); kp = key_at(kp)->next[0])
 		{
-			DeltaVersion *v = dsa_get_address(area, dp);
-			DeltaSaved	saved = {0};
+			DeltaKey   *k = key_at(kp);
 
-			dp = v->next;
-			if (XLogRecPtrIsInvalid(v->lsn) || v->lsn >= redo)
-				continue;
-			saved.tree = tree->key;
-			saved.topxid = v->topxid;
-			saved.xid = v->xid;
-			saved.cid = v->cid;
-			saved.lsn = v->lsn;
-			saved.delta = v->delta;
-			saved.keylen = v->keylen;
-			saved.rowlen = v->rowlen;
-			appendBinaryStringInfo(&buffer, &saved, sizeof(saved));
-			appendBinaryStringInfo(&buffer, v->data, v->keylen + v->rowlen);
-			header.count++;
+			for (dsa_pointer dp = k->first; DsaPointerIsValid(dp);)
+			{
+				DeltaVersion *v = version_at(dp);
+				DeltaSaved	saved = {0};
+
+				dp = v->next;
+				if (XLogRecPtrIsInvalid(v->lsn) || v->lsn >= redo)
+					continue;
+				saved.tree = tree->key;
+				saved.topxid = v->topxid;
+				saved.xid = v->xid;
+				saved.cid = v->cid;
+				saved.lsn = v->lsn;
+				saved.delta = v->delta;
+				saved.keylen = k->keylen;
+				saved.rowlen = v->rowlen;
+				appendBinaryStringInfo(&buffer, &saved, sizeof(saved));
+				appendBinaryStringInfo(&buffer, KEY_BYTES(k), k->keylen);
+				appendBinaryStringInfo(&buffer, v->row, v->rowlen);
+				header.count++;
+			}
 		}
 		LWLockRelease(&tree->lock);
 	}
@@ -678,14 +1012,15 @@ restore_version(const DoltDeltaTree *key, const DoltDeltaEdit *edit, Transaction
 				TransactionId xid, CommandId cid, XLogRecPtr lsn)
 {
 	DeltaTree  *tree = tree_find(key, true);
-	dsa_pointer dp = version_make(edit, topxid, xid, cid);
+	Pending		pending;
 
-	if (!DsaPointerIsValid(dp))
+	if (!pending_make(tree, &pending, edit, topxid, xid, cid))
 		ereport(FATAL,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
 				 errmsg("prolly delta memory is full during recovery"),
 				 errhint("Increase \"dolt_delta_memory\".")));
-	versions_link(tree, &dp, 1, lsn);
+	versions_link(tree, edit, &pending, 1, lsn);
+	pending_release(&pending, 1);
 }
 
 /*

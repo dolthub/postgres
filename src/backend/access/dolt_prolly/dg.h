@@ -11,27 +11,61 @@
 #include "utils/memutils.h"
 #include "utils/jsonb.h"
 #include "../../../doltgres/prolly/internal.h"
+#include "access/doltdelta.h"
 
 struct HandleDelta;
 typedef struct DGBatch DGBatch;
 
 /*
+ * A change of one key over a state's base tree: the net count of occurrences
+ * the delta store adds, with the row the key names. Its merged value, the
+ * base's count plus |delta| followed by the row, is resolved on first use.
+ */
+typedef struct DGChange
+{
+	PLSlice		key;
+	int64		delta;
+	PLSlice		row;
+	bool		resolved;
+	bool		present;		/* once resolved: whether the merged entry exists */
+	PLSlice		value;			/* once resolved and present: count, then row */
+} DGChange;
+
+/*
+ * The delta store's versions a state sees over its base: its view of the
+ * tree's delta, read on demand, with the snapshot and horizon it was loaded
+ * under copied into it.
+ */
+typedef struct DGChanges
+{
+	DoltDeltaView view;
+	SnapshotData snapshot;		/* view.snapshot */
+	DoltDeltaHorizon horizon;	/* view.base, when the base has one */
+	uint64		seq;			/* the tree's next version sequence at load */
+	MemoryContext memory;		/* where copies and merged values live */
+} DGChanges;
+
+/*
  * A relation's tree as one caller sees it. States from dg_load share the
  * transaction's working store, which loads missing nodes from the chunk store;
- * other states own a private store. The content tree maps row digest ->
- * count + row for a table, index key -> count + row for an index. A table's
- * row handles are derived from its content, with a delta of allocated ones
- * read from the catalog, or private to the state: see dg_handle.inc.
+ * other states own a private store. The content maps row digest -> count +
+ * row for a table, index key -> count + row for an index: the base |tree|,
+ * which a root row or a default names, with |changes| from the delta store
+ * merged on read (dg_get, dg_scan, DGCursor). dg_content applies them, for
+ * callers that need the whole tree. A table's row handles are derived from
+ * its content, with a delta of allocated ones read from the catalog, or
+ * private to the state: see dg_handle.inc.
  */
 typedef struct DGState
 {
 	PLStore    *store;
-	bool		has_root;
-	PLTree		content;
+	bool		has_root;		/* a root row names the base */
+	PLTree		tree;			/* the base, or the whole content once changes are applied */
+	DGChanges  *changes;		/* changes not applied to |tree|, or NULL */
+	bool		loaded_known;	/* whether |loaded| is known */
+	PLHash		loaded;			/* the content's root as loaded, which saves diff against */
 	uint64		nextid;			/* next handle, for private states only */
 	bool		shared;			/* store is the transaction's working store */
-	bool		based;			/* derived from committed roots */
-	PLHash		base;			/* that committed content root */
 	MemoryContextCallback cleanup;
 	uint64		roots_generation;	/* of its roots' storage, just before they were read */
 	bool		roots_generation_known;
@@ -39,6 +73,36 @@ typedef struct DGState
 	bool		delta_private;	/* the delta belongs to this state, not the catalog */
 	struct HandleDelta *extra;	/* occurrences the delta does not name, numbered for this state */
 } DGState;
+
+/* A cursor over a state's merged content. */
+typedef struct DGCursor
+{
+	DGState    *state;
+	PLCursor	base;
+	DGChange   *chunk;			/* changes read ahead, in the cursor's direction */
+	int			count;			/* in |chunk| */
+	int			next;			/* the next change of |chunk| */
+	bool		exhausted;		/* no changes past |chunk| */
+	bool		backward;
+	bool		valid;
+	int			source;			/* DG_CURSOR_BASE, _CHANGE or _BOTH */
+	PLEntry		entry;
+} DGCursor;
+
+extern PLTree *dg_content(DGState *s);
+extern void dg_set_content(DGState *s, PLTree tree);
+extern bool dg_get(DGState *s, PLSlice key, PLValue *out);
+extern void dg_scan(DGState *s, const PLSlice *lower, const PLSlice *upper, PLScanFn callback, void *arg);
+extern uint64 dg_count(DGState *s);
+extern PLHash dg_state_view(const DGState *s);
+extern void dg_set_base(DGState *s, PLTree tree);
+extern void dg_state_view_delta(DGState *s, const DoltDeltaTree *tree, Snapshot snapshot,
+								const DoltDeltaHorizon *base, bool own);
+extern void dg_cursor_init(DGCursor *cursor, DGState *s, const PLSlice *lower);
+extern void dg_cursor_init_last(DGCursor *cursor, DGState *s, const PLSlice *upper);
+extern void dg_cursor_next(DGCursor *cursor);
+extern void dg_cursor_prev(DGCursor *cursor);
+extern PLEntry dg_cursor_entry(const DGCursor *cursor);
 
 /* Handles below this are derived from content; the counter allocates above it. */
 #define DG_DERIVED_HANDLES (UINT64CONST(1) << 40)
@@ -223,6 +287,7 @@ extern bytea *dg_history_export_tree(const PLTree * tree);
 extern PLTree dg_history_import(PLStore *store, bytea *address);
 extern void dg_history_install(Relation rel, DGState *state, PLTree contents);
 extern DGRows dg_rows(const PLTree * tree);
+extern DGRows dg_state_rows(DGState *s);
 extern void dg_tid(uint64 id, ItemPointer tid);
 extern uint64 dg_id(ItemPointer tid);
 extern PLSlice dg_encode(Relation rel, TupleTableSlot *slot);

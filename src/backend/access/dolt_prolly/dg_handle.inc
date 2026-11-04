@@ -668,7 +668,7 @@ collect_prefix_row(void *arg, PLSlice key, PLSlice value)
 
 /* The rows of |tree| whose digests derive |handle|: rarely more than one. */
 static PrefixRows
-prefix_rows(const PLTree *tree, uint64 handle)
+prefix_rows(DGState *s, uint64 handle)
 {
 	PrefixRows	rows = {0};
 	PLHash		lower,
@@ -676,10 +676,8 @@ prefix_rows(const PLTree *tree, uint64 handle)
 	bool		bounded = handle_prefix_bounds(handle, &lower, &upper);
 	PLSlice		lo = {lower.bytes, PL_HASH_SIZE},
 				hi = {upper.bytes, PL_HASH_SIZE};
-	PLStatus	status = pl_scan(tree, &lo, bounded ? &hi : NULL, collect_prefix_row, &rows);
 
-	if (status != PL_STOP)
-		dg_check(status);
+	dg_scan(s, &lo, bounded ? &hi : NULL, collect_prefix_row, &rows);
 	return rows;
 }
 
@@ -712,7 +710,7 @@ dg_handle_digest(DGState *s, uint64 handle, PLHash *digest)
 		*digest = mapping->digest;
 		return true;
 	}
-	rows = prefix_rows(&s->content, handle);
+	rows = prefix_rows(s, handle);
 	for (int i = 0; i < rows.count; i++)
 	{
 		uint64	   *allocated;
@@ -747,7 +745,7 @@ dg_handles_of(DGState *s, PLHash digest, int64 count, uint64 **handles, int *cap
 	{
 		PLValue		value;
 
-		dg_check(pl_get(&s->content, (PLSlice) {digest.bytes, PL_HASH_SIZE}, &value));
+		dg_get(s, (PLSlice) {digest.bytes, PL_HASH_SIZE}, &value);
 		count = value.present ? (int64) pl_read64(value.bytes.data) : 0;
 	}
 	n = delta_handles(s, digest, &allocated);
@@ -772,7 +770,7 @@ dg_handles_of(DGState *s, PLHash digest, int64 count, uint64 **handles, int *cap
 double
 dg_handle_count(DGState *s)
 {
-	return (double) pl_count(&s->content) + (s->delta ? s->delta->count : 0);
+	return (double) dg_count(s) + (s->delta ? s->delta->count : 0);
 }
 
 /*
@@ -894,7 +892,7 @@ dg_handle_choose(Relation rel, DGState *s, DGBatch *b, PLHash digest)
 	int			status = DG_RECORD_NONE;
 
 	if (!taken)
-		taken = prefix_rows(&s->content, handle).count > 0;
+		taken = prefix_rows(s, handle).count > 0;
 	if (!taken && !s->delta_private && handle_records_exist(rel->rd_locator.dbOid, rel->rd_locator.spcOid, rel->rd_locator.relNumber))
 	{
 		status = dg_record_status(&rel->rd_locator, dg_relation_branch(rel), (int64) handle);
@@ -1212,15 +1210,14 @@ handle_allocate(Relation rel, DGState *s)
 	return dg_allocate_handle(rel);
 }
 
-/* The row bytes of |digest| in |tree|, copied; false if it holds no such row. */
+/* The row bytes of |digest| in |s|, copied; false if it holds no such row. */
 static bool
-row_of_digest(const PLTree *tree, PLHash digest, PLSlice *row)
+row_of_digest(DGState *s, PLHash digest, PLSlice *row)
 {
 	PLValue		value;
 	uint8	   *copy;
 
-	dg_check(pl_get(tree, (PLSlice) {digest.bytes, PL_HASH_SIZE}, &value));
-	if (!value.present || value.bytes.len < 8)
+	if (!dg_get(s, (PLSlice) {digest.bytes, PL_HASH_SIZE}, &value) || value.bytes.len < 8)
 		return false;
 	copy = palloc(Max(value.bytes.len - 8, 1));
 	memcpy(copy, value.bytes.data + 8, value.bytes.len - 8);
@@ -1267,7 +1264,7 @@ dg_handle_version(Relation rel, uint64 handle, PLHash *digest, PLSlice *row)
 		}
 	}
 	s = dg_load_tid(rel, handle);
-	found = dg_handle_digest(s, handle, digest) && row_of_digest(&s->content, *digest, row);
+	found = dg_handle_digest(s, handle, digest) && row_of_digest(s, *digest, row);
 
 	dg_release(s);
 	if (found)
@@ -1275,7 +1272,7 @@ dg_handle_version(Relation rel, uint64 handle, PLHash *digest, PLSlice *row)
 	if (ActiveSnapshotSet())
 	{
 		s = dg_load(rel, GetActiveSnapshot());
-		found = dg_handle_digest(s, handle, digest) && row_of_digest(&s->content, *digest, row);
+		found = dg_handle_digest(s, handle, digest) && row_of_digest(s, *digest, row);
 		dg_release(s);
 		if (found)
 			return true;
@@ -1285,7 +1282,7 @@ dg_handle_version(Relation rel, uint64 handle, PLHash *digest, PLSlice *row)
 	if (dg_writes_on_snapshot(rel))
 	{
 		s = dg_load_committed_latest(rel);
-		found = dg_handle_digest(s, handle, digest) && row_of_digest(&s->content, *digest, row);
+		found = dg_handle_digest(s, handle, digest) && row_of_digest(s, *digest, row);
 		dg_release(s);
 		if (found)
 			return true;
@@ -1293,12 +1290,12 @@ dg_handle_version(Relation rel, uint64 handle, PLHash *digest, PLSlice *row)
 	if (handle_is_derived(handle) || !handle_delta_any(&key, handle, digest))
 		return false;
 	s = dg_load(rel, SnapshotSelf);
-	found = row_of_digest(&s->content, *digest, row);
+	found = row_of_digest(s, *digest, row);
 	dg_release(s);
 	if (!found && ActiveSnapshotSet())
 	{
 		s = dg_load(rel, GetActiveSnapshot());
-		found = row_of_digest(&s->content, *digest, row);
+		found = row_of_digest(s, *digest, row);
 		dg_release(s);
 	}
 	return found;
@@ -1343,7 +1340,7 @@ handle_install_extras(Relation rel, DGState *s, const RootKey *key, CommandId ci
 {
 	InstallExtras extras = {rel, s, key, cid};
 
-	dg_check(pl_scan(&s->content, NULL, NULL, collect_install_extras, &extras));
+	dg_scan(s, NULL, NULL, collect_install_extras, &extras);
 }
 
 /*
@@ -1355,13 +1352,14 @@ handle_install_extras(Relation rel, DGState *s, const RootKey *key, CommandId ci
 void
 dg_handle_install(Relation rel, DGState *s, PLTree contents)
 {
-	PLTree		before = s->content;
+	PLTree		before;
 	HandleChanges changes = {0};
 	RootKey		key = root_key(rel, dg_relation_branch(rel));
 	CommandId	cid = GetCurrentCommandId(true);
 
 	if (!s->has_root && !s->delta_private)
 		handle_install_extras(rel, s, &key, cid);
+	before = *dg_content(s);
 	dg_check(pl_diff(&before, &contents, collect_handle_change, &changes));
 	for (int i = 0; i < changes.count; i++)
 	{
@@ -1398,7 +1396,7 @@ dg_handle_install(Relation rel, DGState *s, PLTree contents)
 			}
 		}
 	}
-	s->content = contents;
+	dg_set_content(s, contents);
 	if (changes.items)
 		pfree(changes.items);
 }

@@ -48,8 +48,20 @@ typedef struct DoltDeltaHorizon
 	TransactionId *xip;
 } DoltDeltaHorizon;
 
-/* A visited version: its edit, and its sequence in the tree's delta. */
-typedef void (*DoltDeltaVisit) (void *arg, const DoltDeltaEdit *edit, uint64 seq);
+/*
+ * What one reader sees of a tree's delta: the versions |snapshot| sees, but
+ * not those |base| holds, and this transaction's own only if |own|.
+ */
+typedef struct DoltDeltaView
+{
+	DoltDeltaTree tree;
+	Snapshot	snapshot;
+	const DoltDeltaHorizon *base;
+	bool		own;
+} DoltDeltaView;
+
+/* A visited key: its net change, the row its key names. Pointers are borrowed. */
+typedef void (*DoltDeltaVisit) (void *arg, const DoltDeltaEdit *edit);
 
 extern PGDLLIMPORT int dolt_delta_memory;
 
@@ -59,9 +71,15 @@ extern void CheckPointDoltDelta(XLogRecPtr redo);
 extern void StartupDoltDelta(XLogRecPtr redo);
 
 extern void dolt_delta_tree_key(DoltDeltaTree *tree, Oid db, Oid space, RelFileNumber file, const char *branch);
-extern void dolt_delta_append(const DoltDeltaTree *tree, const DoltDeltaEdit *edits, int count, bool logged);
-extern int	dolt_delta_scan(const DoltDeltaTree *tree, Snapshot snapshot, const DoltDeltaHorizon *base,
-							DoltDeltaVisit visit, void *arg);
+extern void dolt_delta_append(const DoltDeltaTree *tree, const DoltDeltaEdit *edits, int count,
+							  CommandId cid, bool logged);
+extern bool dolt_delta_get(const DoltDeltaView *view, const uint8 *key, uint32 keylen,
+						   DoltDeltaVisit visit, void *arg);
+extern int	dolt_delta_range(const DoltDeltaView *view, const uint8 *from, uint32 fromlen, bool inclusive,
+							 const uint8 *to, uint32 tolen, bool backward, int max,
+							 DoltDeltaVisit visit, void *arg);
+extern uint64 dolt_delta_seq(const DoltDeltaTree *tree);
+extern int64 dolt_delta_net(const DoltDeltaTree *tree);
 extern uint64 dolt_delta_count(const DoltDeltaTree *tree);
 
 #endif							/* DOLTDELTA_H */

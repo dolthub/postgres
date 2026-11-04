@@ -368,10 +368,10 @@ dg_catalog_create(Node *statement, const char *query)
 		empty->cleanup.func = canonical_empty_cleanup;
 		empty->cleanup.arg = empty;
 		MemoryContextRegisterResetCallback(CurrentMemoryContext, &empty->cleanup);
-		dg_check(pl_build(empty->store, NULL, 0, &empty->content));
-		newmembers[0] = canonical_empty_member("table", name, table, &empty->content);
+		dg_check(pl_build(empty->store, NULL, 0, &empty->tree));
+		newmembers[0] = canonical_empty_member("table", name, table, &empty->tree);
 		for (int i = 0; i < k; i++)
-			newmembers[i + 1] = canonical_empty_member("index", list_nth(index_names, i), list_nth(index_definitions, i), &empty->content);
+			newmembers[i + 1] = canonical_empty_member("index", list_nth(index_names, i), list_nth(index_definitions, i), &empty->tree);
 		dg_release(empty);
 		run("SELECT unnest(objchildren) FROM pg_dolt_object_visible WHERE objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(current.hash)), NULL, true);
 		oldcount = SPI_processed;

@@ -915,7 +915,7 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 					loaded = dg_storage_load(storage);
 					dg_storage_close(storage);
 					present = loaded->has_root;
-					content = loaded->content.root;
+					content = dg_content(loaded)->root;
 				}
 				if (present)
 				{
@@ -947,7 +947,7 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 								state = dg_storage_load(storage);
 								dg_storage_close(storage);
 							}
-							members[i] = PointerGetDatum(put(kinds[i], payload, VC_ARGS(PointerGetDatum(schema), PointerGetDatum(dg_history_export_tree(&state->content))), 2));
+							members[i] = PointerGetDatum(put(kinds[i], payload, VC_ARGS(PointerGetDatum(schema), PointerGetDatum(dg_history_export_tree(dg_content(state)))), 2));
 							if (state != loaded)
 								dg_release(state);
 						}

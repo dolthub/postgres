@@ -3,9 +3,12 @@
  * pg_dolt_root.h
  *	  Committed working roots of prolly relations, per branch.
  *
- * One row per (relation storage, branch) holds the root of that relation's
- * content tree in the chunk store. Rows change only when a transaction publishes, just
- * before it commits, so ordinary MVCC selects the roots a snapshot sees.
+ * One row per (relation storage, branch) holds the base of that relation's
+ * content tree in the chunk store: the tree its delta store versions apply
+ * to (access/doltdelta.h). A fold replaces the row with a tree holding every
+ * version its snapshot saw, recorded as the row's horizon, so ordinary MVCC
+ * selects the base a snapshot sees, and the horizon which versions to add.
+ * A row written whole, not folded, has no horizon (rootxmax invalid).
  * Storage is identified by tablespace and file number, so TRUNCATE (a new
  * file) starts from empty roots and rolling it back restores the old ones.
  * Branch names are authoritative; a rename rewrites them.
@@ -24,9 +27,12 @@ CATALOG(pg_dolt_root,9127,DoltRootRelationId)
 {
 	Oid			rootspace BKI_FORCE_NOT_NULL;	/* tablespace of the storage */
 	Oid			rootfile BKI_FORCE_NOT_NULL;	/* file number of the storage */
+	TransactionId rootxmin BKI_FORCE_NOT_NULL;	/* the folding snapshot's xmin */
+	TransactionId rootxmax BKI_FORCE_NOT_NULL;	/* its xmax; invalid if not folded */
 #ifdef CATALOG_VARLEN
 	text		rootbranch BKI_FORCE_NOT_NULL;
 	bytea		rootcontent BKI_FORCE_NOT_NULL;
+	TransactionId rootxip[1] BKI_FORCE_NULL;	/* its running top-level xids */
 #endif
 } FormData_pg_dolt_root;
 

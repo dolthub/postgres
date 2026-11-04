@@ -1070,7 +1070,7 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 			else
 			{
 				bool		keyed;
-				PLTree		logical = logical_rows(rel, &state->content, &keyed);
+				PLTree		logical = logical_rows(rel, dg_content(state), &keyed);
 				PLEdit		edit;
 				char	   *value = json_value(records[i], theirs ? "theirs" : "ours");
 				bytea	   *key = DatumGetByteaP(DirectFunctionCall2(binary_decode, CStringGetTextDatum(json_value(records[i], "key")), CStringGetTextDatum("hex")));

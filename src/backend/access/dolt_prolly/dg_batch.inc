@@ -2,13 +2,12 @@
  * Pending edits: a command's writes to one relation, applied in one pass
  * ---------------------------------------------------------------------------
  *
- * Every row a command inserts would otherwise rebuild the path to its leaf in
- * each of the relation's trees, hashing every rebuilt node. Instead the write
- * path records its edits here, against the state it loaded, and they are
- * applied with one pl_apply per tree when the trees must be read by anything
- * else: a load of the same roots, the end of a bulk insert, a subtransaction
- * boundary, or commit. The command's own writer reads through the pending
- * edits, so uniqueness checks see the rows the same statement inserted.
+ * The write path records a command's edits here, against the state it
+ * loaded, and appends them to the delta store, one version per key and tree,
+ * when the trees must be read by anything else: a load of the same roots,
+ * the end of a bulk insert, a subtransaction boundary, or commit. The
+ * command's own writer reads through the pending edits, so uniqueness checks
+ * see the rows the same statement inserted.
  */
 
 typedef struct PendingRow
@@ -51,7 +50,7 @@ struct DGBatch
 	CommandId	cid;
 	SubTransactionId subxid;
 	uint64		generation;		/* roots generation the state was loaded under */
-	Visibility	seen;			/* what the latest snapshot saw then */
+	uint64		word;			/* the storage's word then: see storage_word */
 	Oid			table_db,		/* the table's storage */
 				table_space;
 	RelFileNumber table_file;
@@ -100,83 +99,69 @@ batch_table(MemoryContext memory, const char *name, Size keysize, Size entrysize
 }
 
 static int
-compare_edits(const void *a, const void *b)
-{
-	return pl_compare(((const PLEdit *) a)->key, ((const PLEdit *) b)->key);
-}
-
-static int
 compare_entries_by_key(const void *a, const void *b)
 {
 	return pl_compare((*(PendingEntry *const *) a)->key, (*(PendingEntry *const *) b)->key);
 }
 
-/* The count stored for |key| in |tree|, and whether an entry exists. */
+/* The count stored for |key| in |s|, and whether an entry exists. */
 static int64
-tree_count(const PLTree *tree, PLSlice key, PLValue *value)
+tree_count(DGState *s, PLSlice key, PLValue *value)
 {
-	dg_check(pl_get(tree, key, value));
+	dg_get(s, key, value);
 	return value->present ? (int64) pl_read64(value->bytes.data) : 0;
 }
 
-/* A content value: the occurrence count followed by the row. */
-static PLSlice
-count_value(int64 count, PLSlice row)
-{
-	uint8	   *bytes = palloc(8 + row.len);
-
-	pl_write64(bytes, (uint64) count);
-	memcpy(bytes + 8, row.data, row.len);
-	return (PLSlice) {bytes, 8 + row.len};
-}
-
-/* Apply a table batch's edits to its trees, one pass per tree. */
+/* Append a table batch's edits to its tree's delta. */
 static void
 batch_flush_table(DGBatch *b)
 {
 	DGState    *s = b->state;
 	HASH_SEQ_STATUS status;
 	PendingRow *row;
-	PLEdit	   *edits;
+	DoltDeltaEdit *edits;
 	long		n;
 	int			i;
+	bool		check = !batch_stale(b);
 
 	n = hash_get_num_entries(b->rows);
-	edits = palloc(Max(n, 1) * sizeof(PLEdit));
+	edits = palloc(Max(n, 1) * sizeof(DoltDeltaEdit));
 	i = 0;
 	hash_seq_init(&status, b->rows);
 	while ((row = hash_seq_search(&status)) != NULL)
 	{
 		PLValue		old;
-		int64		count = tree_count(&s->content, (PLSlice) {row->digest.bytes, PL_HASH_SIZE}, &old) + row->delta;
+		int64		count;
 
+		if (row->delta == 0)
+			continue;
+		count = tree_count(s, (PLSlice) {row->digest.bytes, PL_HASH_SIZE}, &old) + row->delta;
 		if (old.present && (old.bytes.len != row->row.len + 8 || memcmp(old.bytes.data + 8, row->row.data, row->row.len)))
 			elog(ERROR, "canonical row hash collision");
-		if (count < 0)
+		/* A batch older than later commits may remove rows they added. */
+		if (count < 0 && check)
 			elog(ERROR, "missing canonical row");
-		edits[i].key = (PLSlice) {row->digest.bytes, PL_HASH_SIZE};
-		edits[i].value.present = count > 0;
-		edits[i].value.bytes = count_value(count, row->row);
+		edits[i].key = row->digest.bytes;
+		edits[i].keylen = PL_HASH_SIZE;
+		edits[i].row = row->row.data;
+		edits[i].rowlen = row->row.len;
+		edits[i].delta = row->delta;
 		i++;
 	}
-	if (i)
-	{
-		qsort(edits, i, sizeof(PLEdit), compare_edits);
-		dg_check(pl_apply(&s->content, edits, i, &s->content));
-	}
-
+	delta_append(&b->key, s->tree.root, edits, i, b->cid);
 	pfree(edits);
 	handle_delta_write(&b->key, b->handles, b->cid);
 }
 
-/* Apply an index batch's edits: entries with equal keys combine. */
+/* Append an index batch's edits to its tree's delta: entries with equal keys combine. */
 static void
 batch_flush_index(DGBatch *b)
 {
 	DGState    *s = b->state;
 	PendingEntry **sorted = palloc(Max(b->entry_count, 1) * sizeof(PendingEntry *));
-	PLEdit	   *edits = palloc(Max(b->entry_count, 1) * sizeof(PLEdit));
+	DoltDeltaEdit *edits = palloc(Max(b->entry_count, 1) * sizeof(DoltDeltaEdit));
 	int			n = 0;
+	bool		check = !batch_stale(b);
 
 	memcpy(sorted, b->entries, b->entry_count * sizeof(PendingEntry *));
 	qsort(sorted, b->entry_count, sizeof(PendingEntry *), compare_entries_by_key);
@@ -185,20 +170,21 @@ batch_flush_index(DGBatch *b)
 		PendingEntry *entry = sorted[i];
 		int64		delta = 0;
 		PLValue		old;
-		int64		count;
 
 		for (; i < b->entry_count && pl_compare(sorted[i]->key, entry->key) == 0; i++)
 			delta += sorted[i]->delta;
-		count = tree_count(&s->content, entry->key, &old) + delta;
-		if (count < 0)
+		if (delta == 0)
+			continue;
+		if (check && tree_count(s, entry->key, &old) + delta < 0)
 			elog(ERROR, "prolly index is missing an entry");
-		edits[n].key = entry->key;
-		edits[n].value.present = count > 0;
-		edits[n].value.bytes = count_value(count, entry->row);
+		edits[n].key = entry->key.data;
+		edits[n].keylen = entry->key.len;
+		edits[n].row = entry->row.data;
+		edits[n].rowlen = entry->row.len;
+		edits[n].delta = delta;
 		n++;
 	}
-	if (n)
-		dg_check(pl_apply(&s->content, edits, n, &s->content));
+	delta_append(&b->key, s->tree.root, edits, n, b->cid);
 	pfree(edits);
 	pfree(sorted);
 }
@@ -238,7 +224,7 @@ batch_reload(DGBatch *b, Relation rel)
 	MemoryContextSwitchTo(old);
 }
 
-/* Apply |b|'s edits to its state and save the result. */
+/* Append |b|'s edits to the delta store. */
 static void
 batch_apply(DGBatch *b)
 {
@@ -246,7 +232,6 @@ batch_apply(DGBatch *b)
 		batch_flush_table(b);
 	else
 		batch_flush_index(b);
-	save_roots(&b->key, b->table, b->state, b->cid, b->subxid);
 }
 
 static void
@@ -523,28 +508,28 @@ dg_batch(Relation rel, CommandId cid)
 }
 
 /*
- * A batch's trees are the latest while nothing has published roots and no
- * write to its table's handles has committed since they were loaded.
+ * A batch's trees are the latest while nothing has written its roots and no
+ * write to its storage, versions or handles, has committed since they were
+ * loaded.
  */
 static void
 batch_stamp(DGBatch *b)
 {
 	b->generation = roots_generation(&b->key);
-	visibility_capture(SnapshotSelf, &b->seen);
+	b->word = pg_atomic_read_u64(storage_word(b->key.space, b->key.file));
 }
 
 static bool
 batch_stale(DGBatch *b)
 {
-	Visibility	now;
-
 	/* A batch built on the transaction snapshot never goes stale. */
 	if (b->on_snapshot)
 		return false;
 	if (b->generation != roots_generation(&b->key))
 		return true;
-	visibility_capture(SnapshotSelf, &now);
-	return !visibility_equal(&b->seen, &now);
+
+	/* A commit that changed the storage, or one under way when it was loaded, has moved the word. */
+	return pg_atomic_read_u64(storage_word(b->key.space, b->key.file)) != b->word;
 }
 
 /* Whether the command's batch for |key| is adding the row version |handle|. */
@@ -772,8 +757,7 @@ dg_batch_row(DGBatch *b, PLHash digest, PLSlice *row)
 		*row = pending->row;
 		return true;
 	}
-	dg_check(pl_get(&b->state->content, (PLSlice) {digest.bytes, PL_HASH_SIZE}, &value));
-	if (!value.present || value.bytes.len < 8)
+	if (!dg_get(b->state, (PLSlice) {digest.bytes, PL_HASH_SIZE}, &value) || value.bytes.len < 8)
 		return false;
 	*row = (PLSlice) {value.bytes.data + 8, value.bytes.len - 8};
 	return true;
