@@ -50,7 +50,7 @@ struct DGBatch
 	CommandId	cid;
 	SubTransactionId subxid;
 	uint64		generation;		/* roots generation the state was loaded under */
-	uint64		word;			/* the storage's word then: see storage_word */
+	uint64		words[2];		/* the storage's words then: see storage_word */
 	Oid			table_db,		/* the table's storage */
 				table_space;
 	RelFileNumber table_file;
@@ -516,7 +516,8 @@ static void
 batch_stamp(DGBatch *b)
 {
 	b->generation = roots_generation(&b->key);
-	b->word = pg_atomic_read_u64(storage_word(b->key.space, b->key.file));
+	b->words[STORAGE_HANDLES] = pg_atomic_read_u64(storage_word(b->key.space, b->key.file, STORAGE_HANDLES));
+	b->words[STORAGE_DELTA] = pg_atomic_read_u64(storage_word(b->key.space, b->key.file, STORAGE_DELTA));
 }
 
 static bool
@@ -529,7 +530,8 @@ batch_stale(DGBatch *b)
 		return true;
 
 	/* A commit that changed the storage, or one under way when it was loaded, has moved the word. */
-	return pg_atomic_read_u64(storage_word(b->key.space, b->key.file)) != b->word;
+	return pg_atomic_read_u64(storage_word(b->key.space, b->key.file, STORAGE_HANDLES)) != b->words[STORAGE_HANDLES] ||
+		pg_atomic_read_u64(storage_word(b->key.space, b->key.file, STORAGE_DELTA)) != b->words[STORAGE_DELTA];
 }
 
 /* Whether the command's batch for |key| is adding the row version |handle|. */

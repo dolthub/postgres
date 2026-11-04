@@ -1261,9 +1261,9 @@ step(DGIndexScan *s)
 	{
 		s->started = true;
 		if (s->backward)
-			dg_cursor_init_last(&s->cursor, s->index, s->has_upper ? &hi : NULL);
+			dg_cursor_init_last(&s->cursor, s->index, s->has_upper ? &hi : NULL, s->has_lower ? &lo : NULL);
 		else
-			dg_cursor_init(&s->cursor, s->index, s->has_lower ? &lo : NULL);
+			dg_cursor_init(&s->cursor, s->index, s->has_lower ? &lo : NULL, s->has_upper ? &hi : NULL);
 	}
 	else if (s->backward)
 		dg_cursor_prev(&s->cursor);

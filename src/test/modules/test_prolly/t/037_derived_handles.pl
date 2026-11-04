@@ -89,6 +89,23 @@ sql(q{INSERT INTO dup3 VALUES (1, 'a'), (2, 'b')});
 is($session->query_safe(q{SELECT count(DISTINCT ctid) || ' ' || count(*) FROM dup3}), '6 6', "a session sees another's committed duplicates, each with its handle");
 is($older->query_safe(q{SELECT count(DISTINCT ctid) || ' ' || count(*) FROM dup3}), '4 4', 'an older snapshot does not');
 $older->query_safe('COMMIT');
+
+# A snapshot taken while another transaction was under way, which has since
+# committed without changing the storage's handles, agrees with the latest on
+# them: its reads and the latest state's, which locking a row with a derived
+# handle reads, alternating, share one delta.
+sql(q{INSERT INTO dup3 VALUES (3, 'c')});
+my $busy = $node->background_psql('postgres');
+$busy->query_safe(q{CREATE TABLE unrelated(x int); BEGIN; INSERT INTO unrelated VALUES (1)});
+$older->query_safe(q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM dup3});
+$busy->query_safe('COMMIT');
+$older->query_safe(q{SELECT count(*) FROM dup3; SELECT x FROM dup3 WHERE x = 3 FOR UPDATE}) for 1 .. 10;
+cmp_ok($older->query_safe(q{SELECT pg_stat_get_xact_numscans(9140)}), '<=', 3,
+	'twenty alternating reads of an older snapshot and the latest state read the catalog a few times, not each');
+is($older->query_safe(q{SELECT count(DISTINCT ctid) || ' ' || count(*) FROM dup3}), '7 7', 'and see the same handles');
+$older->query_safe('COMMIT');
+$busy->quit;
+sql(q{DELETE FROM dup3 WHERE x = 3});
 $session->query_safe(q{BEGIN; INSERT INTO dup3 VALUES (1, 'a'); ROLLBACK});
 is($session->query_safe(q{SELECT count(DISTINCT ctid) || ' ' || count(*) FROM dup3}), '6 6', 'a rolled back duplicate leaves no handle behind');
 is(sql(q{DELETE FROM dup3 WHERE x = 1; SELECT count(*) FROM dup3}), '2', 'and every occurrence can be deleted');

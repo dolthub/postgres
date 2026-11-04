@@ -124,7 +124,7 @@ begin(Relation rel, Snapshot snap, int nkeys, ScanKey key, ParallelTableScanDesc
 	scan->state = CatalogViewIsProvisional(rel->rd_catalogview) ? dg_catalog_mutation_load(rel, snap) : dg_load(rel, snap);
 	scan->streaming = !(flags & SO_TYPE_BITMAPSCAN) && !CatalogViewIsProvisional(rel->rd_catalogview) && scan->state->has_root;
 	if (scan->streaming)
-		dg_cursor_init(&scan->content, scan->state, NULL);
+		dg_cursor_init(&scan->content, scan->state, NULL, NULL);
 	else if (!(flags & SO_TYPE_BITMAPSCAN))
 		materialize(scan);
 	scan->position = -1;
@@ -195,7 +195,7 @@ rescan(TableScanDesc base, ScanKey key, bool set, bool strat, bool sync, bool pa
 	scan->bitmap_position = 0;
 	scan->handle_count = scan->handle_position = 0;
 	if (scan->streaming)
-		dg_cursor_init(&scan->content, scan->state, NULL);
+		dg_cursor_init(&scan->content, scan->state, NULL, NULL);
 	if (base->rs_flags & SO_TYPE_SEQSCAN)
 		pgstat_count_heap_scan(base->rs_rd);
 }

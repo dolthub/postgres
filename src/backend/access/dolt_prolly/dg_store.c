@@ -609,8 +609,11 @@ static HTAB *batches;
 static bool batch_adds_handle(const RootKey *key, uint64 handle);
 static void storage_xact_end(bool committed);
 static void storage_pre_commit(void);
-static void storage_touch(Oid db, Oid space, RelFileNumber file);
-static pg_atomic_uint64 *storage_word(Oid space, RelFileNumber file);
+/* The words of a storage: its allocated handles', and its delta versions'. */
+#define STORAGE_HANDLES 0
+#define STORAGE_DELTA 1
+static void storage_touch(Oid db, Oid space, RelFileNumber file, int kind);
+static pg_atomic_uint64 *storage_word(Oid space, RelFileNumber file, int kind);
 static RootKey index_table_key(Relation index, const char *branch, Relation *table);
 struct HandleDelta;
 static struct HandleDelta *handle_delta_get(const RootKey *key, Snapshot snapshot);
@@ -1173,6 +1176,9 @@ register_callbacks(void)
 
 #define DG_HANDLE_SLOTS 65536
 
+/* The commits of a storage's handles a slot remembers: see handle_committers_agree. */
+#define DG_HANDLE_COMMITTERS 8
+
 typedef struct HandleSlot
 {
 	Oid			db;
@@ -1180,7 +1186,11 @@ typedef struct HandleSlot
 	RelFileNumber file;
 	pg_atomic_uint32 used;
 	pg_atomic_uint64 next;
-	pg_atomic_uint64 commit_generation;	/* the storage's word: see storage_word */
+	pg_atomic_uint64 words[2];	/* the storage's words, by kind: see storage_word */
+	slock_t		committers_mutex;	/* guards the committers */
+	TransactionId committers[DG_HANDLE_COMMITTERS]; /* the latest to change its handles */
+	uint32		committers_next;	/* where the next goes */
+	TransactionId committers_dropped;	/* the latest of those pushed out, or invalid */
 	pg_atomic_uint64 roots_generation;	/* bumped by every write of the storage's roots */
 	pg_atomic_uint32 records;	/* whether any row of the storage ever had a lock record */
 } HandleSlot;
@@ -1265,6 +1275,7 @@ handle_table_init(void *ptr)
 	{
 		pg_atomic_init_u32(&table->slots[i].used, 0);
 		pg_atomic_init_u64(&table->slots[i].next, 0);
+		SpinLockInit(&table->slots[i].committers_mutex);
 	}
 	pg_atomic_init_u64(&table->roots_generation, 1);
 }
@@ -1334,7 +1345,12 @@ handle_slot_claim(Oid db, Oid space, RelFileNumber file)
 			candidate->space = space;
 			candidate->file = file;
 			pg_atomic_write_u64(&candidate->next, Max(max, DG_DERIVED_HANDLES) + 1);
-			pg_atomic_write_u64(&candidate->commit_generation, UINT64CONST(1) << 16);
+			pg_atomic_write_u64(&candidate->words[STORAGE_HANDLES], UINT64CONST(1) << 16);
+			for (int i = 0; i < DG_HANDLE_COMMITTERS; i++)
+				candidate->committers[i] = InvalidTransactionId;
+			candidate->committers_next = 0;
+			candidate->committers_dropped = InvalidTransactionId;
+			pg_atomic_write_u64(&candidate->words[STORAGE_DELTA], UINT64CONST(1) << 16);
 			pg_atomic_write_u64(&candidate->roots_generation, 1);
 			pg_atomic_write_u32(&candidate->records, dg_records_exist(space, file) ? 1 : 0);
 			pg_write_barrier();
@@ -1834,7 +1850,7 @@ delta_append(const RootKey *key, PLHash base, const DoltDeltaEdit *edits, int co
 	wrote_versions = true;
 
 	/* Readers' caches and batches of the storage notice the commit by its word. */
-	storage_touch(MyDatabaseId, key->space, key->file);
+	storage_touch(MyDatabaseId, key->space, key->file, STORAGE_DELTA);
 }
 
 /*

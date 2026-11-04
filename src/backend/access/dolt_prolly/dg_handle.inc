@@ -52,9 +52,18 @@ typedef struct HandleDigest
 typedef struct HandleDeltaKey
 {
 	RootKey		key;
-	int			kind;			/* 0: MVCC snapshot; 1: the latest state */
+	int			kind;			/* HANDLE_DELTA_STREAM, _LATEST or _SNAPSHOT */
 	int			pad;
 } HandleDeltaKey;
+
+/*
+ * A storage's cached deltas: one read under the latest snapshot that serves
+ * every MVCC snapshot agreeing with it on the storage's handles, one for the
+ * latest state, and one for an MVCC snapshot the first does not serve.
+ */
+#define HANDLE_DELTA_STREAM		0
+#define HANDLE_DELTA_LATEST		1
+#define HANDLE_DELTA_SNAPSHOT	2
 
 typedef struct HandleDelta HandleDelta;
 
@@ -66,7 +75,8 @@ struct HandleDelta
 	uint64		local_version;	/* handle_local_version_of its storage, when read */
 	bool		streamed;		/* read as handle_stream_build reads, and unchanged since */
 	uint64		word;			/* the storage's word then */
-	TransactionId xmax;			/* the snapshot read under, to tell what other snapshots see */
+	TransactionId xmin;			/* the snapshot read under, to tell what other snapshots see */
+	TransactionId xmax;
 	uint32		xcnt;
 	TransactionId *xip;
 	MemoryContext memory;
@@ -84,12 +94,16 @@ struct HandleDelta
 #define STORAGE_WORD_GENERATION	(UINT64CONST(1) << 16)
 #define STORAGE_WORD_COMMITTERS	(STORAGE_WORD_GENERATION - 1)
 
-/* Storages whose handles this transaction changed, whose readers must notice at commit. */
+/*
+ * Storages whose handles or delta versions this transaction changed, by kind
+ * of word, whose readers must notice at commit.
+ */
 typedef struct StorageTouched
 {
 	Oid			db,
 				space;
 	RelFileNumber file;
+	int			kind;			/* STORAGE_HANDLES or STORAGE_DELTA */
 	bool		counted;		/* counted as a committer in the storage's word */
 } StorageTouched;
 
@@ -100,28 +114,55 @@ static bool storage_committing;	/* past pre-commit: a new touch counts at once *
 
 static HandleSlot *handle_slot_claim(Oid db, Oid space, RelFileNumber file);
 
-static pg_atomic_uint64 *
-storage_word(Oid space, RelFileNumber file)
+/*
+ * Remember this transaction among the latest to change |touched|'s handles,
+ * before its commit can be visible: a cached delta serves a snapshot only if
+ * the two agree on each of them.
+ */
+static void
+handle_committer_note(StorageTouched *touched)
 {
-	return &handle_slot_claim(MyDatabaseId, space, file)->commit_generation;
+	TransactionId xid = GetTopTransactionIdIfAny();
+	HandleSlot *slot = handle_slot_claim(touched->db, touched->space, touched->file);
+	TransactionId *entry;
+
+	if (!TransactionIdIsValid(xid))
+		return;
+	SpinLockAcquire(&slot->committers_mutex);
+	entry = &slot->committers[slot->committers_next];
+	if (TransactionIdIsValid(*entry) &&
+		(!TransactionIdIsValid(slot->committers_dropped) || TransactionIdFollows(*entry, slot->committers_dropped)))
+		slot->committers_dropped = *entry;
+	*entry = xid;
+	slot->committers_next = (slot->committers_next + 1) % DG_HANDLE_COMMITTERS;
+	SpinLockRelease(&slot->committers_mutex);
+}
+
+static pg_atomic_uint64 *
+storage_word(Oid space, RelFileNumber file, int kind)
+{
+	return &handle_slot_claim(MyDatabaseId, space, file)->words[kind];
 }
 
 /* |touched|'s storage has a committer under way: this transaction. */
 static void
 storage_count_committer(StorageTouched *touched)
 {
-	pg_atomic_fetch_add_u64(storage_word(touched->space, touched->file), STORAGE_WORD_GENERATION + 1);
+	pg_atomic_fetch_add_u64(storage_word(touched->space, touched->file, touched->kind), STORAGE_WORD_GENERATION + 1);
 	touched->counted = true;
+	if (touched->kind == STORAGE_HANDLES)
+		handle_committer_note(touched);
 }
 
-/* This transaction changed the handles of storage (|db|, |space|, |file|). */
+/* This transaction changed the handles or the versions, by |kind|, of storage (|db|, |space|, |file|). */
 static void
-storage_touch(Oid db, Oid space, RelFileNumber file)
+storage_touch(Oid db, Oid space, RelFileNumber file, int kind)
 {
 	MemoryContext old;
 
 	for (int i = 0; i < storage_touched_count; i++)
-		if (storage_touched[i].db == db && storage_touched[i].space == space && storage_touched[i].file == file)
+		if (storage_touched[i].db == db && storage_touched[i].space == space && storage_touched[i].file == file &&
+			storage_touched[i].kind == kind)
 			return;
 	old = MemoryContextSwitchTo(TopTransactionContext);
 	if (storage_touched_count == storage_touched_capacity)
@@ -133,12 +174,13 @@ storage_touch(Oid db, Oid space, RelFileNumber file)
 	storage_touched[storage_touched_count].db = db;
 	storage_touched[storage_touched_count].space = space;
 	storage_touched[storage_touched_count].file = file;
+	storage_touched[storage_touched_count].kind = kind;
 	storage_touched[storage_touched_count].counted = false;
 	storage_touched_count++;
 	MemoryContextSwitchTo(old);
 
 	/* Claim the storage's slot now: the commit must find its word. */
-	(void) storage_word(space, file);
+	(void) storage_word(space, file, kind);
 	if (storage_committing)
 		storage_count_committer(&storage_touched[storage_touched_count - 1]);
 }
@@ -172,9 +214,9 @@ storage_xact_end(bool committed)
 		HandleSlot *slot = handle_slot_find(touched->db, touched->space, touched->file);
 
 		if (slot && touched->counted)
-			pg_atomic_fetch_add_u64(&slot->commit_generation, STORAGE_WORD_GENERATION - 1);
+			pg_atomic_fetch_add_u64(&slot->words[touched->kind], STORAGE_WORD_GENERATION - 1);
 		else if (slot && committed)
-			pg_atomic_fetch_add_u64(&slot->commit_generation, STORAGE_WORD_GENERATION);
+			pg_atomic_fetch_add_u64(&slot->words[touched->kind], STORAGE_WORD_GENERATION);
 	}
 	storage_touched = NULL;
 	storage_touched_count = storage_touched_capacity = 0;
@@ -406,7 +448,7 @@ handle_local_write(const RootKey *key, CommandId cid)
 	 * this backend's deltas of the storage, which note the write, no longer
 	 * hold only what a snapshot read.
 	 */
-	storage_touch(MyDatabaseId, key->space, key->file);
+	storage_touch(MyDatabaseId, key->space, key->file, STORAGE_HANDLES);
 	if (handle_deltas)
 	{
 		HASH_SEQ_STATUS status;
@@ -464,7 +506,8 @@ static bool
 handle_storage_touched(const RootKey *key)
 {
 	for (int i = 0; i < storage_touched_count; i++)
-		if (storage_touched[i].space == key->space && storage_touched[i].file == key->file)
+		if (storage_touched[i].space == key->space && storage_touched[i].file == key->file &&
+			storage_touched[i].kind == STORAGE_HANDLES)
 			return true;
 	return false;
 }
@@ -476,7 +519,7 @@ handle_storage_touched(const RootKey *key)
 static bool
 handle_stream_build(HandleDelta *delta, const RootKey *key)
 {
-	uint64		word = pg_atomic_read_u64(storage_word(key->space, key->file));
+	uint64		word = pg_atomic_read_u64(storage_word(key->space, key->file, STORAGE_HANDLES));
 	Snapshot	latest;
 	uint32		n;
 
@@ -495,6 +538,7 @@ handle_stream_build(HandleDelta *delta, const RootKey *key)
 	memcpy(delta->xip, latest->xip, latest->xcnt * sizeof(TransactionId));
 	memcpy(delta->xip + latest->xcnt, latest->subxip, latest->subxcnt * sizeof(TransactionId));
 	delta->xcnt = n;
+	delta->xmin = latest->xmin;
 	delta->xmax = latest->xmax;
 	UnregisterSnapshot(latest);
 	delta->word = word;
@@ -502,45 +546,80 @@ handle_stream_build(HandleDelta *delta, const RootKey *key)
 	return true;
 }
 
+/* Whether |delta|'s read saw |xid| as finished, as XidInMVCCSnapshot would say. */
+static bool
+handle_delta_saw(const HandleDelta *delta, TransactionId xid)
+{
+	if (TransactionIdPrecedes(xid, delta->xmin))
+		return true;
+	if (!TransactionIdPrecedes(xid, delta->xmax))
+		return false;
+	for (uint32 i = 0; i < delta->xcnt; i++)
+		if (TransactionIdEquals(delta->xip[i], xid))
+			return false;
+	return true;
+}
+
 /*
- * Whether |delta|, as handle_stream_build read it, holds what |snapshot|
- * sees: no handle of the storage committed since, and this transaction
- * changed none; and an MVCC snapshot sees every transaction the read saw
- * committed. The latest state sees them all.
+ * Whether |snapshot| and the read of |delta| agree on every transaction that
+ * changed |key|'s handles: those the storage's slot remembers, and, before
+ * them, any it no longer does, which both must see finished.
+ */
+static bool
+handle_committers_agree(const HandleDelta *delta, const RootKey *key, Snapshot snapshot)
+{
+	HandleSlot *slot = handle_slot_claim(MyDatabaseId, key->space, key->file);
+	TransactionId committers[DG_HANDLE_COMMITTERS];
+	TransactionId dropped;
+
+	SpinLockAcquire(&slot->committers_mutex);
+	memcpy(committers, slot->committers, sizeof(committers));
+	dropped = slot->committers_dropped;
+	SpinLockRelease(&slot->committers_mutex);
+	if (TransactionIdIsValid(dropped) &&
+		!(TransactionIdPrecedes(dropped, snapshot->xmin) && TransactionIdPrecedes(dropped, delta->xmin)))
+		return false;
+	for (int i = 0; i < DG_HANDLE_COMMITTERS; i++)
+		if (TransactionIdIsValid(committers[i]) &&
+			XidInMVCCSnapshot(committers[i], snapshot) == handle_delta_saw(delta, committers[i]))
+			return false;
+	return true;
+}
+
+/*
+ * Whether |delta|, as handle_stream_build read it, still holds the storage's
+ * latest handles: no commit to them has begun since, and this transaction
+ * changed none.
+ */
+static bool
+handle_stream_fresh(const HandleDelta *delta, const RootKey *key)
+{
+	return delta->loaded && delta->streamed && !handle_storage_touched(key) &&
+		pg_atomic_read_u64(storage_word(key->space, key->file, STORAGE_HANDLES)) == delta->word;
+}
+
+/*
+ * Whether a fresh |delta| holds what |snapshot| sees: the latest state sees
+ * every committed handle, and an MVCC snapshot what the read saw if the two
+ * agree on each transaction that changed them. Under concurrent writers of
+ * other rows, an older snapshot of a transaction under way usually does.
  */
 static bool
 handle_stream_serves(const HandleDelta *delta, const RootKey *key, Snapshot snapshot)
 {
-	if (!delta->loaded || !delta->streamed || handle_storage_touched(key) ||
-		pg_atomic_read_u64(storage_word(key->space, key->file)) != delta->word)
-		return false;
 	if (!snapshot || !IsMVCCSnapshot(snapshot))
 		return true;
-	if (snapshot->snapshot_type != SNAPSHOT_MVCC || snapshot->suboverflowed ||
-		TransactionIdPrecedes(snapshot->xmax, delta->xmax))
+	if (snapshot->snapshot_type != SNAPSHOT_MVCC || snapshot->suboverflowed)
 		return false;
-	for (uint32 i = 0; i < snapshot->xcnt + snapshot->subxcnt; i++)
-	{
-		TransactionId xid = i < snapshot->xcnt ? snapshot->xip[i] : snapshot->subxip[i - snapshot->xcnt];
-		bool		running = false;
-
-		if (!TransactionIdPrecedes(xid, delta->xmax))
-			continue;
-		for (uint32 j = 0; j < delta->xcnt && !running; j++)
-			running = TransactionIdEquals(delta->xip[j], xid);
-		if (!running)
-			return false;
-	}
-	return true;
+	return handle_committers_agree(delta, key, snapshot);
 }
 
-/* The cached delta of |key| as |snapshot| sees it, reloaded if anything moved. */
-static struct HandleDelta *
-handle_delta_get(const RootKey *key, Snapshot snapshot)
+/* The cached delta of |key| of |kind|, made empty if new. */
+static HandleDelta *
+handle_delta_entry(const RootKey *key, int kind)
 {
 	HandleDeltaKey cache_key = {0};
 	HandleDelta *delta;
-	Visibility	seen;
 	bool		found;
 
 	if (!handle_deltas)
@@ -553,25 +632,39 @@ handle_delta_get(const RootKey *key, Snapshot snapshot)
 		handle_deltas = hash_create("prolly handle deltas", 32, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
 	cache_key.key = *key;
-	cache_key.kind = snapshot && IsMVCCSnapshot(snapshot) ? 0 : 1;
+	cache_key.kind = kind;
 	delta = hash_search(handle_deltas, &cache_key, HASH_ENTER, &found);
 	if (!found)
 	{
 		memset(((char *) delta) + sizeof(HandleDeltaKey), 0, sizeof(*delta) - sizeof(HandleDeltaKey));
 		delta->memory = AllocSetContextCreate(CacheMemoryContext, "prolly handle delta", ALLOCSET_SMALL_SIZES);
 	}
-	if (handle_stream_serves(delta, key, snapshot))
+	return delta;
+}
+
+/*
+ * The cached delta of |key| as |snapshot| sees it, reloaded if anything moved:
+ * the streamed delta where it serves, else one read under |snapshot| itself.
+ */
+static struct HandleDelta *
+handle_delta_get(const RootKey *key, Snapshot snapshot)
+{
+	bool		mvcc = snapshot && IsMVCCSnapshot(snapshot);
+	HandleDelta *delta = handle_delta_entry(key, mvcc ? HANDLE_DELTA_STREAM : HANDLE_DELTA_LATEST);
+	Visibility	seen;
+
+	if ((handle_stream_fresh(delta, key) || handle_stream_build(delta, key)) &&
+		handle_stream_serves(delta, key, snapshot))
 		return delta;
+	if (mvcc)
+		delta = handle_delta_entry(key, HANDLE_DELTA_SNAPSHOT);
 	visibility_capture(snapshot, &seen);
-	if (delta->loaded &&
+	if (delta->loaded && !delta->streamed &&
 		((delta->local_version == handle_local_version_of(key) && visibility_equal(&delta->seen, &seen)) ||
 		 handle_same_view(delta, &seen, key)))
 		return delta;
-	if (!handle_stream_build(delta, key) || !handle_stream_serves(delta, key, snapshot))
-	{
-		handle_delta_load(delta, snapshot);
-		delta->streamed = false;
-	}
+	handle_delta_load(delta, snapshot);
+	delta->streamed = false;
 	delta->seen = seen;
 	delta->local_version = handle_local_version_of(key);
 	return delta;
@@ -781,7 +874,7 @@ dg_handle_count(DGState *s)
  * state before the claimant committed, and then cannot see the claimant's
  * row. It may be forgotten once the claimant precedes the xmin of every
  * running transaction that may write rows, since every state loaded since
- * includes its rows.
+ * includes its rows, or once the claimant has rolled back.
  *
  * Claims are a fixed array of transaction IDs, found by hashing (storage,
  * branch, handle). Handles that share a slot share its claim: a transaction
@@ -865,7 +958,14 @@ handle_claim(Relation rel, const char *branch, uint64 handle)
 	{
 		if (owner == me)
 			return true;
-		if (TransactionIdIsValid(owner) && !TransactionIdPrecedes(owner, handle_claim_horizon()))
+
+		/*
+		 * A claim stands while its claimant may still commit a row no older
+		 * state shows. One that rolled back, as a serialization failure's
+		 * retry finds its first attempt's, published nothing.
+		 */
+		if (TransactionIdIsValid(owner) && !TransactionIdPrecedes(owner, handle_claim_horizon()) &&
+			(TransactionIdIsInProgress(owner) || TransactionIdDidCommit(owner)))
 			return false;
 		if (pg_atomic_compare_exchange_u32(slot, &owner, me))
 			return true;

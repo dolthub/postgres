@@ -33,8 +33,12 @@
 #define DG_CURSOR_CHANGE	1
 #define DG_CURSOR_BOTH		2
 
-/* Changes a cursor reads ahead at a time. */
-#define DG_CURSOR_CHUNK 64
+/*
+ * Changes a cursor reads ahead at first, doubling on each read up to the
+ * most: a lookup of a few keys reads no more than it needs.
+ */
+#define DG_CURSOR_FIRST_CHUNK 4
+#define DG_CURSOR_CHUNK 256
 
 /* Changes gathered from the delta store into backend memory. */
 typedef struct Gathered
@@ -148,12 +152,16 @@ cursor_read(DGCursor *c, const PLSlice *bound, bool inclusive)
 		bound = &last;
 		inclusive = false;
 	}
+	if (!c->chunk_size)
+		c->chunk_size = DG_CURSOR_FIRST_CHUNK;
 	dolt_delta_range(&c->state->changes->view, bound ? bound->data : NULL, bound ? bound->len : 0,
-					 inclusive, NULL, 0, c->backward, DG_CURSOR_CHUNK, gather, &g);
+					 inclusive, c->has_stop ? c->stop.data : NULL, c->has_stop ? c->stop.len : 0,
+					 c->backward, c->chunk_size, gather, &g);
 	c->chunk = g.items;
 	c->count = g.count;
 	c->next = 0;
-	c->exhausted = g.count < DG_CURSOR_CHUNK;
+	c->exhausted = g.count < c->chunk_size;
+	c->chunk_size = Min(c->chunk_size * 2, DG_CURSOR_CHUNK);
 }
 
 /* The cursor's next change, reading ahead when its chunk runs out; NULL if none. */
@@ -240,21 +248,39 @@ dg_cursor_end(DGCursor *c)
 	memset(c, 0, sizeof(*c));
 }
 
+/* Remember where the walk ends: changes past it are never read. */
+static void
+cursor_stop(DGCursor *c, const PLSlice *stop)
+{
+	uint8	   *bytes;
+
+	if (!stop || !c->memory)
+		return;
+	bytes = MemoryContextAlloc(c->memory, Max(stop->len, 1));
+	memcpy(bytes, stop->data, stop->len);
+	c->stop = (PLSlice) {bytes, stop->len};
+	c->has_stop = true;
+}
+
+/* Walk |s| forward from |lower|; entries at or past |upper| may be left out. */
 void
-dg_cursor_init(DGCursor *c, DGState *s, const PLSlice *lower)
+dg_cursor_init(DGCursor *c, DGState *s, const PLSlice *lower, const PLSlice *upper)
 {
 	cursor_reset(c, s);
+	cursor_stop(c, upper);
 	dg_check(pl_cursor_init(&c->base, &s->tree, lower));
 	if (s->changes)
 		cursor_read(c, lower, true);
 	cursor_settle(c);
 }
 
+/* Walk |s| backward from below |upper|; entries below |lower| may be left out. */
 void
-dg_cursor_init_last(DGCursor *c, DGState *s, const PLSlice *upper)
+dg_cursor_init_last(DGCursor *c, DGState *s, const PLSlice *upper, const PLSlice *lower)
 {
 	cursor_reset(c, s);
 	c->backward = true;
+	cursor_stop(c, lower);
 	dg_check(pl_cursor_init_last(&c->base, &s->tree, upper));
 	if (s->changes)
 		cursor_read(c, upper, false);
@@ -296,7 +322,7 @@ dg_cursor_entry(const DGCursor *c)
 static void
 scan_with(DGCursor *c, DGState *s, const PLSlice *lower, const PLSlice *upper, PLScanFn callback, void *arg)
 {
-	for (dg_cursor_init(c, s, lower); c->valid; dg_cursor_next(c))
+	for (dg_cursor_init(c, s, lower, upper); c->valid; dg_cursor_next(c))
 	{
 		PLStatus	status;
 

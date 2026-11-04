@@ -88,7 +88,10 @@ typedef struct DGCursor
 	DGChange   *chunk;			/* changes read ahead, in the cursor's direction */
 	int			count;			/* in |chunk| */
 	int			next;			/* the next change of |chunk| */
+	int			chunk_size;		/* changes the next read asks for */
 	bool		exhausted;		/* no changes past |chunk| */
+	bool		has_stop;		/* whether changes past |stop| are left unread */
+	PLSlice		stop;			/* the bound the walk ends at, in the cursor's memory */
 	bool		backward;
 	bool		valid;
 	int			source;			/* DG_CURSOR_BASE, _CHANGE or _BOTH */
@@ -106,8 +109,8 @@ extern void dg_set_base(DGState *s, PLTree tree);
 extern bool dg_fold_tree(Oid space, RelFileNumber file, const char *branch);
 extern void dg_state_view_delta(DGState *s, const DoltDeltaTree *tree, Snapshot snapshot,
 								const DoltDeltaHorizon *base, bool own);
-extern void dg_cursor_init(DGCursor *cursor, DGState *s, const PLSlice *lower);
-extern void dg_cursor_init_last(DGCursor *cursor, DGState *s, const PLSlice *upper);
+extern void dg_cursor_init(DGCursor *cursor, DGState *s, const PLSlice *lower, const PLSlice *upper);
+extern void dg_cursor_init_last(DGCursor *cursor, DGState *s, const PLSlice *upper, const PLSlice *lower);
 extern void dg_cursor_next(DGCursor *cursor);
 extern void dg_cursor_prev(DGCursor *cursor);
 extern PLEntry dg_cursor_entry(const DGCursor *cursor);
