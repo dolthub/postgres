@@ -5,6 +5,41 @@ merged into `zachmu/doltgres-rewrite` until reviewed. It supersedes the row
 journal (`dg_journal.inc`, `pg_dolt_journal`), which this branch removes, and
 [WRITE-PERF-PLAN.md](WRITE-PERF-PLAN.md) step 3 for ordinary DML.
 
+## Status (2026-11-04)
+
+Milestones 1–4 are done; milestone 5 (merge-on-read) was pulled into 3:
+
+- **Row journal removed** (`c2d99e6f27d`).
+- **Memtable and WAL** (`e58ac8f3ca8`), then the keyed form: a skiplist per
+  tree in a DSA area, with lazy readers (`843b09eb31c`).
+- **Writes and reads** (`843b09eb31c`): batches append versions; saves write
+  a root row only for a tree with none, and otherwise append their diff; no
+  commit-time publication.
+- **Folding and pruning** (`1f43a48779c`): a launcher, per-database workers,
+  `dolt_fold()` and `dolt_delta_stats()`.
+- **Results.** test_prolly, test_doltgres and test_dolt_chunk fail exactly what
+  the merge base fails. TPC-C at scale 1: 1 thread 130 → 163 tps; 10 threads
+  178 → 391 tps. Every consistency check passes.
+
+Lessons:
+
+- **The launcher is not in the proc array.** `TransactionIdIsInProgress` skips
+  the caller's own array slot, and for a process outside the array that is slot
+  0, so the launcher took some running transactions for rolled-back ones and
+  pruned their versions. Pruning now decides "ended" by the xid horizon alone.
+- **Loads must not copy the delta.** The first merge-on-read collected a
+  state's whole delta at load, and a 20,000-row UPDATE, which loads per row,
+  ran out of memory. Hence the shared skiplist and lazy views.
+
+Open:
+
+- **Standby pruning.** A hot standby replays versions but has no fold record
+  to prune them by. It needs a WAL record of each fold's horizon.
+- **Full delta memory** fails writers. Doltgrust throttles them instead.
+- **Version-control installs** append diffs without the table locks section 4
+  calls for.
+- **Branch rename, branch drop and DROP DATABASE** leave their trees in memory.
+
 ## Why
 
 Every commit that writes a prolly table publishes at PRE_COMMIT. It locks the
