@@ -90,7 +90,10 @@ int			dolt_delta_memory = 256 * 1024;	/* kB */
 #define DELTA_DIR			"pg_dolt"
 #define DELTA_STATE_FILE	DELTA_DIR "/delta.state"
 #define DELTA_STATE_TEMP	DELTA_DIR "/delta.state.tmp"
-#define DELTA_STATE_MAGIC	0x44474c32	/* "DGL2" */
+#define DELTA_STATE_MAGIC	0x44474c33	/* "DGL3" */
+
+/* How much of the state file a checkpoint buffers before writing it. */
+#define DELTA_STATE_CHUNK	(1024 * 1024)
 
 typedef struct DeltaVersion
 {
@@ -162,6 +165,7 @@ typedef struct DeltaSaved
 	uint32		rowlen;
 } DeltaSaved;
 
+/* The state file's trailer, after its versions and before its CRC. */
 typedef struct DeltaStateHeader
 {
 	uint32		magic;
@@ -1323,6 +1327,7 @@ trees_all(int *count)
 static void
 write_all(int fd, const void *data, Size size, const char *path)
 {
+	pgstat_report_wait_start(WAIT_EVENT_DOLT_DELTA_STATE_WRITE);
 	errno = 0;
 	if (write(fd, data, size) != size)
 	{
@@ -1330,12 +1335,24 @@ write_all(int fd, const void *data, Size size, const char *path)
 			errno = ENOSPC;
 		ereport(ERROR, (errcode_for_file_access(), errmsg("could not write file \"%s\": %m", path)));
 	}
+	pgstat_report_wait_end();
+}
+
+/* Write what |buffer| holds to |fd|, adding it to |crc|, and empty it. */
+static void
+state_flush(int fd, StringInfo buffer, pg_crc32c *crc)
+{
+	COMP_CRC32C(*crc, buffer->data, buffer->len);
+	write_all(fd, buffer->data, buffer->len, DELTA_STATE_TEMP);
+	resetStringInfo(buffer);
 }
 
 /*
  * Save every logged version whose record precedes |redo|, so that recovery
  * from this checkpoint, which replays only records after it, has them all.
  * Versions of transactions that rolled back are saved too: their xids say so.
+ * The file is written as the versions are read, a chunk at a time, so a large
+ * delta costs the checkpointer no more memory than a small one.
  */
 void
 CheckPointDoltDelta(XLogRecPtr redo)
@@ -1352,6 +1369,12 @@ CheckPointDoltDelta(XLogRecPtr redo)
 	/* A standby has no launcher: its restartpoints prune what folds hold. */
 	if (RecoveryInProgress())
 		(void) dolt_delta_prune_all(true);
+	if (MakePGDirectory(DELTA_DIR) < 0 && errno != EEXIST)
+		ereport(ERROR, (errcode_for_file_access(), errmsg("could not create directory \"%s\": %m", DELTA_DIR)));
+	fd = OpenTransientFile(DELTA_STATE_TEMP, O_CREAT | O_TRUNC | O_WRONLY | PG_BINARY);
+	if (fd < 0)
+		ereport(ERROR, (errcode_for_file_access(), errmsg("could not create file \"%s\": %m", DELTA_STATE_TEMP)));
+	INIT_CRC32C(crc);
 	all = trees_all(&ntrees);
 	initStringInfo(&buffer);
 	header.magic = DELTA_STATE_MAGIC;
@@ -1385,23 +1408,17 @@ CheckPointDoltDelta(XLogRecPtr redo)
 				appendBinaryStringInfo(&buffer, KEY_BYTES(k), k->keylen);
 				appendBinaryStringInfo(&buffer, v->row, v->rowlen);
 				header.count++;
+				if (buffer.len >= DELTA_STATE_CHUNK)
+					state_flush(fd, &buffer, &crc);
 			}
 		}
 		LWLockRelease(&tree->lock);
 	}
 	pfree(all);
 
-	if (MakePGDirectory(DELTA_DIR) < 0 && errno != EEXIST)
-		ereport(ERROR, (errcode_for_file_access(), errmsg("could not create directory \"%s\": %m", DELTA_DIR)));
-	INIT_CRC32C(crc);
-	COMP_CRC32C(crc, &header, sizeof(header));
-	COMP_CRC32C(crc, buffer.data, buffer.len);
+	appendBinaryStringInfo(&buffer, &header, sizeof(header));
+	state_flush(fd, &buffer, &crc);
 	FIN_CRC32C(crc);
-	fd = OpenTransientFile(DELTA_STATE_TEMP, O_CREAT | O_TRUNC | O_WRONLY | PG_BINARY);
-	if (fd < 0)
-		ereport(ERROR, (errcode_for_file_access(), errmsg("could not create file \"%s\": %m", DELTA_STATE_TEMP)));
-	write_all(fd, &header, sizeof(header), DELTA_STATE_TEMP);
-	write_all(fd, buffer.data, buffer.len, DELTA_STATE_TEMP);
 	write_all(fd, &crc, sizeof(crc), DELTA_STATE_TEMP);
 	if (pg_fsync(fd) != 0)
 		ereport(data_sync_elevel(ERROR),
@@ -1464,7 +1481,7 @@ StartupDoltDelta(XLogRecPtr redo)
 		ereport(FATAL, (errcode_for_file_access(), errmsg("could not read file \"%s\": %m", DELTA_STATE_FILE)));
 	CloseTransientFile(fd);
 
-	memcpy(&header, contents, sizeof(header));
+	memcpy(&header, contents + st.st_size - sizeof(crc) - sizeof(header), sizeof(header));
 	memcpy(&stored, contents + st.st_size - sizeof(crc), sizeof(crc));
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc, contents, st.st_size - sizeof(crc));
@@ -1477,8 +1494,8 @@ StartupDoltDelta(XLogRecPtr redo)
 				 errmsg("prolly delta state file \"%s\" is older than the checkpoint recovery starts from",
 						DELTA_STATE_FILE)));
 
-	p = contents + sizeof(header);
-	end = contents + st.st_size - sizeof(crc);
+	p = contents;
+	end = contents + st.st_size - sizeof(crc) - sizeof(header);
 	for (uint64 i = 0; i < header.count; i++)
 	{
 		DeltaSaved	saved;

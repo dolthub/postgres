@@ -17,9 +17,26 @@ Milestones 1–4 are done; milestone 5 (merge-on-read) was pulled into 3:
   commit-time publication.
 - **Folding and pruning** (`1f43a48779c`): a launcher, per-database workers,
   `dolt_fold()` and `dolt_delta_stats()`.
-- **Results.** test_prolly, test_doltgres and test_dolt_chunk fail exactly what
-  the merge base fails. TPC-C at scale 1: 1 thread 130 → 163 tps; 10 threads
-  178 → 391 tps. Every consistency check passes.
+- **Standby pruning, throttling, install locks** (`f66090ab917`): a FOLD WAL
+  record carries each fold's horizon; writers to a full store wait for folds;
+  `dg_history_install` takes ExclusiveLock on the table.
+- **Hot-path fixes** (after profiling TPC-C):
+  - cursors read the delta in chunks of 4 doubling to 256, bounded by their
+    stop key, rather than to the end of the tree;
+  - each storage has two words, one moved by handle commits and one by delta
+    appends, so appends no longer invalidate handle caches and batches;
+  - a claim of a rolled-back claimant can be retaken;
+  - each storage's slot remembers its last 8 handle committers, and a delta
+    of handles read under the latest snapshot serves any MVCC snapshot that
+    agrees with it on them. Repeatable-read transactions no longer reread
+    `pg_dolt_handle` for every load;
+  - the checkpoint streams `delta.state` in 1 MB chunks instead of building
+    it in memory.
+- **Results.** test_prolly, test_doltgres and test_dolt_chunk fail exactly
+  what the merge base fails. TPC-C at scale 1: 1 thread 130 → 163 tps;
+  10 threads 178 → 471 tps (new orders 110 → 279 per second). Every
+  consistency check passes. Sysbench writes are 1.5–2.5× faster, reads
+  unchanged.
 
 Lessons:
 
@@ -30,15 +47,28 @@ Lessons:
 - **Loads must not copy the delta.** The first merge-on-read collected a
   state's whole delta at load, and a 20,000-row UPDATE, which loads per row,
   ran out of memory. Hence the shared skiplist and lazy views.
+- **Caches keyed on "nothing committed since" fail under concurrency.** With
+  ten writers, some transaction always commits between a snapshot and the
+  next load. A cache must ask whether the commits it missed touched what it
+  holds.
+- **Larger fold thresholds help less than expected.** Folding every 262,144
+  versions rather than 4,096 gained ~15%, but a fold worker then needs
+  ~200 MB, and a 60 s TPC-C run on this box ran out of memory. The
+  out-of-memory kills came from catalog-view rebuilds in every backend after
+  autovacuum's statistics updates (a fork-wide cost, not the delta store's)
+  plus the old in-memory checkpoint.
 
 Open:
 
-- **Standby pruning.** A hot standby replays versions but has no fold record
-  to prune them by. It needs a WAL record of each fold's horizon.
-- **Full delta memory** fails writers. Doltgrust throttles them instead.
-- **Version-control installs** append diffs without the table locks section 4
-  calls for.
+- **Folds materialize a tree's whole visible delta** in one `pl_apply`.
+  Doltgrust folds a batch of keys at a time; bounded batches would make large
+  thresholds safe.
 - **Branch rename, branch drop and DROP DATABASE** leave their trees in memory.
+- **TRUNCATE and large installs** append a diff of every row; replacing the
+  root row would be O(1).
+- **Remaining TPC-C costs** are mostly the fork's own: row-lock waits (half of
+  backend time, as in heap but longer-held), catalog binding per statement,
+  and node-cache copies.
 
 ## Why
 

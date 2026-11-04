@@ -21,13 +21,15 @@ sub sql { return $node->safe_psql('postgres', shift) }
 # Nothing folds on its own: every change below stays in the delta store.
 sql(q{CREATE TABLE t(id int PRIMARY KEY, v text NOT NULL);
 CREATE INDEX t_v ON t(v);
-INSERT INTO t SELECT g, 'v' || g FROM generate_series(1, 2000) g});
+INSERT INTO t SELECT g, 'v' || g || repeat('.', 400) FROM generate_series(1, 2000) g});
 my $expected = sql(q{SELECT count(*), sum(id), sum(length(v)) FROM t});
 my ($versions) = split /\|/, (sql('SELECT versions, trees FROM dolt_delta_stats()'));
 cmp_ok($versions, '>', 4000, "the rows are versions in the delta store ($versions)");
 
-# A checkpoint saves the versions; later ones come back from the WAL.
+# A checkpoint saves the versions, a chunk at a time; later ones come back
+# from the WAL.
 sql('CHECKPOINT');
+cmp_ok(-s $node->data_dir . '/pg_dolt/delta.state', '>', 1024 * 1024, 'the state file spans several chunks');
 sql(q{UPDATE t SET v = v || 'x' WHERE id % 3 = 0; DELETE FROM t WHERE id % 7 = 0});
 sql(q{BEGIN; INSERT INTO t VALUES (-1, 'rolled back'); ROLLBACK});
 $expected = sql(q{SELECT count(*), sum(id), sum(length(v)) FROM t});
