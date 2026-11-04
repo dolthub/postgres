@@ -190,6 +190,7 @@ roots_copy(const Roots *roots, MemoryContext memory)
 {
 	Roots		copy = *roots;
 
+	copy.horizon.xip = NULL;
 	if (roots->horizon.xcnt)
 	{
 		copy.horizon.xip = MemoryContextAlloc(memory, roots->horizon.xcnt * sizeof(TransactionId));
@@ -573,6 +574,9 @@ persist_roots(const Roots *roots)
 
 static bool callbacks_registered;
 
+/* Whether this transaction appended versions to the delta store. */
+static bool wrote_versions;
+
 /* Root rows this transaction wrote, whose readers' caches must move at commit. */
 typedef struct WrittenRoot
 {
@@ -853,6 +857,8 @@ store_xact(XactEvent event, void *arg)
 			 */
 			working_close(event != XACT_EVENT_ABORT && event != XACT_EVENT_PARALLEL_ABORT);
 			storage_xact_end(event == XACT_EVENT_COMMIT || event == XACT_EVENT_PARALLEL_COMMIT);
+			dolt_delta_unpin();
+			wrote_versions = false;
 			handle_local_invalidate();
 			batches = NULL;
 			modified = NULL;
@@ -1562,6 +1568,7 @@ dg_load_committed_as_of(Relation rel, Snapshot snapshot)
 
 	state_set(s, &committed);
 	state_collect(s, &key, snapshot, &committed, false);
+	dolt_delta_pin(snapshot->xmin);
 	if (rel->rd_rel->relkind != RELKIND_INDEX)
 		s->delta = handle_delta_get(&key, snapshot);
 	return s;
@@ -1578,6 +1585,7 @@ dg_load_committed_latest(Relation rel)
 
 	state_set(s, &committed);
 	state_collect(s, &key, latest, &committed, false);
+	dolt_delta_pin(latest->xmin);
 	if (rel->rd_rel->relkind != RELKIND_INDEX)
 		s->delta = handle_delta_get(&key, latest);
 	UnregisterSnapshot(latest);
@@ -1639,6 +1647,7 @@ load_state(Relation rel, Snapshot snap, const uint64 *wanted, const char *branch
 	committed = roots_read(&key, read);
 	state_set(s, &committed);
 	state_collect(s, &key, read, &committed, true);
+	dolt_delta_pin(read->xmin);
 	/* Allocated handles as the roots' snapshot names them. */
 	if (table)
 		s->delta = handle_delta_get(&key, pushed ? read : snap);
@@ -1822,6 +1831,7 @@ delta_append(const RootKey *key, PLHash base, const DoltDeltaEdit *edits, int co
 	(void) roots_ensure(key, base);
 	tree = delta_tree(key);
 	dolt_delta_append(&tree, edits, count, cid, true);
+	wrote_versions = true;
 
 	/* Readers' caches and batches of the storage notice the commit by its word. */
 	storage_touch(MyDatabaseId, key->space, key->file);
@@ -1985,6 +1995,89 @@ dg_storage_content_root(RelFileLocator locator, const char *branch, Snapshot sna
 	if (registered)
 		UnregisterSnapshot(read);
 	return committed.present;
+}
+
+/*
+ * Fold the delta of storage (|space|, |file|) on |branch| into a new base, in
+ * the current transaction, which must have written nothing yet: every
+ * version its snapshot sees, which the new root row records as its horizon,
+ * so that readers of the new base leave those versions out and pruning can
+ * drop them once every snapshot reads it. Folds of one tree take turns; one
+ * that finds another running, or the root row locked or gone, folds nothing.
+ * Returns whether it wrote a base.
+ */
+bool
+dg_fold_tree(Oid space, RelFileNumber file, const char *branch)
+{
+	RootKey		key = root_key_of(space, file, branch);
+	DoltDeltaTree tree = delta_tree(&key);
+	Snapshot	snapshot;
+	Relation	catalog;
+	ScanKeyData keys[3];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	Roots		committed = {0};
+	ItemPointerData tid;
+	DGState    *s;
+	DoltDeltaHorizon horizon;
+	bool		folded = false;
+
+	/* Its own versions would count as held once it commits, though it folds none. */
+	if (wrote_versions)
+		elog(ERROR, "a prolly fold must run in a transaction that wrote no prolly rows");
+	if (!ConditionalLockDatabaseObject(DoltRootRelationId, file,
+									   (int32) hash_bytes((const unsigned char *) branch, strlen(branch)),
+									   ExclusiveLock))
+		return false;
+
+	/* Taken after the lock: a fold that held it before is visible. */
+	snapshot = RegisterSnapshot(GetLatestSnapshot());
+	catalog = table_open(DoltRootRelationId, RowExclusiveLock);
+	root_scan_keys(&key, keys);
+	scan = systable_beginscan(catalog, DoltRootKeyIndexId, true, snapshot, 3, keys);
+	tuple = systable_getnext(scan);
+	if (HeapTupleIsValid(tuple))
+	{
+		HeapTupleData locked;
+		Buffer		buffer = InvalidBuffer;
+		TM_FailureData failure;
+
+		committed = roots_from_tuple(tuple, RelationGetDescr(catalog));
+		tid = tuple->t_self;
+		locked.t_self = tid;
+
+		/* A row another transaction holds is not worth waiting for. */
+		if (heap_lock_tuple(catalog, &locked, GetCurrentCommandId(true), LockTupleExclusive,
+							LockWaitSkip, false, &buffer, &failure) != TM_Ok)
+			committed.present = false;
+		if (BufferIsValid(buffer))
+			ReleaseBuffer(buffer);
+	}
+	systable_endscan(scan);
+	if (committed.present)
+	{
+		s = new_state(NULL);
+		state_set(s, &committed);
+		state_collect(s, &key, snapshot, &committed, false);
+		if (s->changes)
+		{
+			PLTree	   *content = dg_content(s);
+			Roots		folded_roots = {.present = true, .content = content->root};
+
+			horizon.xmin = snapshot->xmin;
+			horizon.xmax = snapshot->xmax;
+			horizon.xcnt = snapshot->xcnt;
+			horizon.xip = snapshot->xip;
+			persist_roots(&folded_roots);
+			roots_write(catalog, &key, &tid, content->root, &horizon);
+			dolt_delta_set_fold(&tree, GetTopTransactionId(), &horizon);
+			folded = true;
+		}
+		dg_release(s);
+	}
+	table_close(catalog, RowExclusiveLock);
+	UnregisterSnapshot(snapshot);
+	return folded;
 }
 
 /* Only the transactional resource allocator calls this, before publishing any

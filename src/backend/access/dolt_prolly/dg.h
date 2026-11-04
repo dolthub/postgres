@@ -96,6 +96,7 @@ extern void dg_scan(DGState *s, const PLSlice *lower, const PLSlice *upper, PLSc
 extern uint64 dg_count(DGState *s);
 extern PLHash dg_state_view(const DGState *s);
 extern void dg_set_base(DGState *s, PLTree tree);
+extern bool dg_fold_tree(Oid space, RelFileNumber file, const char *branch);
 extern void dg_state_view_delta(DGState *s, const DoltDeltaTree *tree, Snapshot snapshot,
 								const DoltDeltaHorizon *base, bool own);
 extern void dg_cursor_init(DGCursor *cursor, DGState *s, const PLSlice *lower);

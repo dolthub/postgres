@@ -106,6 +106,7 @@
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
 #include "postmaster/walsummarizer.h"
+#include "access/doltdelta.h"
 #include "replication/logicallauncher.h"
 #include "replication/slotsync.h"
 #include "replication/walsender.h"
@@ -926,6 +927,9 @@ PostmasterMain(int argc, char *argv[])
 	 * before any modules had a chance to take the background worker slots.
 	 */
 	ApplyLauncherRegister();
+
+	/* And the launcher of the prolly delta store's folds. */
+	DoltFoldLauncherRegister();
 
 	/*
 	 * process any libraries that should be preloaded at postmaster start

@@ -13,6 +13,7 @@
 #include "postgres.h"
 
 #include "access/parallel.h"
+#include "access/doltdelta.h"
 #include "access/dolttransport.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
@@ -121,6 +122,12 @@ static const struct
 {
 	{
 		"DoltBundleWorkerMain", DoltBundleWorkerMain
+	},
+	{
+		"DoltFoldLauncherMain", DoltFoldLauncherMain
+	},
+	{
+		"DoltFoldWorkerMain", DoltFoldWorkerMain
 	},
 	{
 		"ParallelWorkerMain", ParallelWorkerMain

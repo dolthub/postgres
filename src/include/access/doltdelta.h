@@ -82,4 +82,21 @@ extern uint64 dolt_delta_seq(const DoltDeltaTree *tree);
 extern int64 dolt_delta_net(const DoltDeltaTree *tree);
 extern uint64 dolt_delta_count(const DoltDeltaTree *tree);
 
+extern void dolt_delta_pin(TransactionId xmin);
+extern void dolt_delta_unpin(void);
+extern void dolt_delta_set_fold(const DoltDeltaTree *tree, TransactionId fold, const DoltDeltaHorizon *horizon);
+extern uint64 dolt_delta_prune(const DoltDeltaTree *tree);
+extern uint64 dolt_delta_prune_all(bool all);
+extern int	dolt_delta_due(Oid db, int versions, int timeout_ms, DoltDeltaTree *due, int max);
+extern void dolt_delta_totals(uint64 *ntrees, uint64 *keys, uint64 *versions, uint64 *bytes);
+
+/* Background folding, dg_fold.c */
+extern PGDLLIMPORT int dolt_fold_workers;
+extern PGDLLIMPORT int dolt_fold_versions;
+extern PGDLLIMPORT int dolt_fold_timeout;
+
+extern void DoltFoldLauncherRegister(void);
+extern void DoltFoldLauncherMain(Datum argument);
+extern void DoltFoldWorkerMain(Datum argument);
+
 #endif							/* DOLTDELTA_H */

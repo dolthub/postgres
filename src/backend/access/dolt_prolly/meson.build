@@ -10,6 +10,7 @@ backend_sources += files(
   'dg_node_cache.c',
   'dg_delta.c',
   'dg_view.c',
+  'dg_fold.c',
   'dg_schema_cache.c',
   'dg_version.c',
   'dg_index.c',

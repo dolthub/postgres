@@ -3721,6 +3721,34 @@ struct config_int ConfigureNamesInt[] =
 	},
 
 	{
+		{"dolt_fold_workers", PGC_POSTMASTER, RESOURCES_BGWRITER,
+			gettext_noop("Sets the most background workers folding the prolly delta store at once."),
+			gettext_noop("0 starts no launcher: pending changes then fold only through dolt_fold()."),
+		},
+		&dolt_fold_workers,
+		2, 0, MAX_BACKENDS, NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_fold_versions", PGC_SIGHUP, RESOURCES_BGWRITER,
+			gettext_noop("Sets the pending versions of a prolly tree past which it is folded."),
+			NULL
+		},
+		&dolt_fold_versions,
+		4096, 1, INT_MAX, NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_fold_timeout", PGC_SIGHUP, RESOURCES_BGWRITER,
+			gettext_noop("Sets how long a prolly tree's oldest pending version waits before the tree is folded."),
+			NULL,
+			GUC_UNIT_MS
+		},
+		&dolt_fold_timeout,
+		5000, 1, INT_MAX, NULL, NULL, NULL
+	},
+
+	{
 		{"dolt_session_node_cache", PGC_USERSET, RESOURCES_MEM,
 			gettext_noop("Sets the memory a session keeps for parsed prolly nodes across transactions."),
 			gettext_noop("Past it, a session drops the nodes it read at transaction end; 0 keeps none."),

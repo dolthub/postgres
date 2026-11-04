@@ -59,6 +59,7 @@
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
+#include "utils/timestamp.h"
 
 int			dolt_delta_memory = 256 * 1024;	/* kB */
 
@@ -121,13 +122,25 @@ typedef struct DeltaTree
 	uint64		bytes;
 	uint64		next_seq;
 	int64		net;			/* every version's delta, summed */
+	TimestampTz oldest;			/* when the oldest version still held arrived */
 	pg_prng_state heights;
+
+	/*
+	 * The newest fold's transaction and the horizon its base holds: once the
+	 * fold committed and every snapshot sees it, the versions it holds go.
+	 */
+	TransactionId fold;
+	DoltDeltaHorizon folded;	/* xip in |folded_xip| */
+	dsa_pointer folded_xip;
 } DeltaTree;
 
 typedef struct DeltaControl
 {
 	Size		area_size;
+	pg_atomic_uint64 bytes;		/* held by every tree's keys and versions */
 	LWLockPadded locks[DELTA_PARTITIONS];
+	int			npins;
+	pg_atomic_uint32 pins[FLEXIBLE_ARRAY_MEMBER];	/* per process: the oldest xmin it loaded under */
 } DeltaControl;
 
 /* One saved version in the state file. */
@@ -155,16 +168,24 @@ static DeltaControl *control;
 static HTAB *trees;
 static dsa_area *area;
 
+static DeltaTree **trees_all(int *count);
+
 static Size
 area_bytes(void)
 {
 	return Max((Size) dolt_delta_memory * 1024, DELTA_MIN_BYTES);
 }
 
+static int
+pin_slots(void)
+{
+	return MaxBackends + NUM_AUXILIARY_PROCS;
+}
+
 static Size
 control_size(void)
 {
-	return MAXALIGN(sizeof(DeltaControl));
+	return MAXALIGN(add_size(offsetof(DeltaControl, pins), mul_size(pin_slots(), sizeof(pg_atomic_uint32))));
 }
 
 static void *
@@ -193,8 +214,12 @@ DoltDeltaShmemInit(void)
 		dsa_area   *created;
 
 		control->area_size = area_bytes();
+		pg_atomic_init_u64(&control->bytes, 0);
 		for (int i = 0; i < DELTA_PARTITIONS; i++)
 			LWLockInitialize(&control->locks[i].lock, LWTRANCHE_DOLT_DELTA_TREES);
+		control->npins = pin_slots();
+		for (int i = 0; i < control->npins; i++)
+			pg_atomic_init_u32(&control->pins[i], InvalidTransactionId);
 
 		/* The postmaster cannot use dynamic segments: cap the area at its place. */
 		created = dsa_create_in_place(area_place(), control->area_size, LWTRANCHE_DOLT_DELTA_DSA, NULL);
@@ -304,6 +329,10 @@ tree_find(const DoltDeltaTree *key, bool create)
 			tree->count = tree->keys = tree->bytes = 0;
 			tree->net = 0;
 			tree->next_seq = 1;
+			tree->oldest = 0;
+			tree->fold = InvalidTransactionId;
+			memset(&tree->folded, 0, sizeof(tree->folded));
+			tree->folded_xip = InvalidDsaPointer;
 			pg_prng_seed(&tree->heights, hash);
 		}
 	}
@@ -450,7 +479,12 @@ pending_make(DeltaTree *tree, Pending *pending, const DoltDeltaEdit *edit, Trans
 static void
 versions_link(DeltaTree *tree, const DoltDeltaEdit *edits, Pending *pending, int count, XLogRecPtr lsn)
 {
+	uint64		bytes;
+
 	LWLockAcquire(&tree->lock, LW_EXCLUSIVE);
+	bytes = tree->bytes;
+	if (count && !tree->count)
+		tree->oldest = GetCurrentTimestamp();
 	for (int i = 0; i < count; i++)
 	{
 		dsa_pointer preds[DELTA_MAX_HEIGHT];
@@ -486,6 +520,7 @@ versions_link(DeltaTree *tree, const DoltDeltaEdit *edits, Pending *pending, int
 		tree->net += v->delta;
 		tree->bytes += offsetof(DeltaVersion, row) + v->rowlen;
 	}
+	pg_atomic_fetch_add_u64(&control->bytes, tree->bytes - bytes);
 	LWLockRelease(&tree->lock);
 }
 
@@ -890,6 +925,327 @@ dolt_delta_count(const DoltDeltaTree *key)
 	count = tree->count;
 	LWLockRelease(&tree->lock);
 	return count;
+}
+
+/* ---------------------------------------------------------------------------
+ * Folding and pruning
+ * ---------------------------------------------------------------------------
+ *
+ * A fold (dg_store.c) writes a new base holding every version its snapshot
+ * saw and records here which those are. Once the fold has committed and
+ * every snapshot sees it, no reader can select an older base, so the
+ * versions it holds go; so do versions whose writers rolled back.
+ *
+ * A reader selects its base under a snapshot it holds, and then reads the
+ * delta through a copy of that snapshot for as long as its state lives. The
+ * pins keep the oldest xmin each process loaded under, until its transaction
+ * ends, so that pruning waits for those readers as well.
+ */
+
+/* Note that this process loaded a state under a snapshot with |xmin|. */
+void
+dolt_delta_pin(TransactionId xmin)
+{
+	pg_atomic_uint32 *pin;
+	TransactionId held;
+
+	if (MyProcNumber < 0 || MyProcNumber >= control->npins || !TransactionIdIsNormal(xmin))
+		return;
+	pin = &control->pins[MyProcNumber];
+	held = pg_atomic_read_u32(pin);
+	if (!TransactionIdIsValid(held) || TransactionIdPrecedes(xmin, held))
+		pg_atomic_write_u32(pin, xmin);
+}
+
+/* This process's transaction ended: its states are gone. */
+void
+dolt_delta_unpin(void)
+{
+	if (control && MyProcNumber >= 0 && MyProcNumber < control->npins)
+		pg_atomic_write_u32(&control->pins[MyProcNumber], InvalidTransactionId);
+}
+
+/* The oldest xid every snapshot, and every pinned state, still sees as running or later. */
+static TransactionId
+prune_horizon(void)
+{
+	TransactionId horizon = GetOldestNonRemovableTransactionId(NULL);
+
+	for (int i = 0; i < control->npins; i++)
+	{
+		TransactionId pin = pg_atomic_read_u32(&control->pins[i]);
+
+		if (TransactionIdIsValid(pin) && TransactionIdPrecedes(pin, horizon))
+			horizon = pin;
+	}
+	return horizon;
+}
+
+/*
+ * Record that fold |fold|, not yet committed, wrote |key|'s base holding the
+ * versions |horizon| sees. A newer fold's record replaces an older one's:
+ * its horizon holds everything the older one's did.
+ */
+void
+dolt_delta_set_fold(const DoltDeltaTree *key, TransactionId fold, const DoltDeltaHorizon *horizon)
+{
+	DeltaTree  *tree;
+	dsa_pointer xip = InvalidDsaPointer;
+
+	delta_attach();
+	tree = tree_find(key, true);
+	if (horizon->xcnt)
+	{
+		xip = dsa_allocate_extended(area, horizon->xcnt * sizeof(TransactionId), DSA_ALLOC_NO_OOM);
+		if (!DsaPointerIsValid(xip))
+			return;				/* the versions stay until a later fold */
+		memcpy(dsa_get_address(area, xip), horizon->xip, horizon->xcnt * sizeof(TransactionId));
+	}
+	LWLockAcquire(&tree->lock, LW_EXCLUSIVE);
+	if (DsaPointerIsValid(tree->folded_xip))
+		dsa_free(area, tree->folded_xip);
+	tree->fold = fold;
+	tree->folded = *horizon;
+	tree->folded.xip = NULL;
+	tree->folded_xip = xip;
+	LWLockRelease(&tree->lock);
+}
+
+/*
+ * Whether |v| can go: rolled back, or held by a base every snapshot reads
+ * past. A writer that precedes |horizon| has ended: the horizon is no newer
+ * than any running xid. Asking the proc array whether it is still running
+ * would be wrong in the launcher, which is not in it.
+ */
+static bool
+version_prunable(DeltaVersion *v, const DoltDeltaHorizon *held, TransactionId horizon)
+{
+	uint32		flags = pg_atomic_read_u32(&v->flags);
+
+	if (flags & VERSION_ABORTED)
+		return true;
+	if (!(flags & VERSION_COMMITTED))
+	{
+		if (!TransactionIdPrecedes(v->topxid, horizon))
+			return false;
+		if (!version_ended_committed(v))
+			return true;
+	}
+	return held && base_holds(held, v);
+}
+
+/*
+ * Remove the versions of |tree| that no reader can count: those of rolled
+ * back writers, and those the newest fold's base holds once every snapshot
+ * reads that base. Returns how many went.
+ */
+static uint64
+tree_prune(DeltaTree *tree, TransactionId horizon)
+{
+	DoltDeltaHorizon held;
+	DoltDeltaHorizon *usable = NULL;
+	uint64		pruned = 0;
+	uint64		bytes;
+	dsa_pointer preds[DELTA_MAX_HEIGHT];
+
+	LWLockAcquire(&tree->lock, LW_EXCLUSIVE);
+	bytes = tree->bytes;
+	if (TransactionIdIsValid(tree->fold) && TransactionIdPrecedes(tree->fold, horizon))
+	{
+		if (!TransactionIdDidCommit(tree->fold))
+		{
+			/* The fold rolled back: its base never was. */
+			tree->fold = InvalidTransactionId;
+			if (DsaPointerIsValid(tree->folded_xip))
+				dsa_free(area, tree->folded_xip);
+			tree->folded_xip = InvalidDsaPointer;
+		}
+		else
+		{
+			held = tree->folded;
+			held.xip = DsaPointerIsValid(tree->folded_xip) ?
+				(TransactionId *) dsa_get_address(area, tree->folded_xip) : NULL;
+			usable = &held;
+		}
+	}
+	for (int level = 0; level < DELTA_MAX_HEIGHT; level++)
+		preds[level] = tree->head;
+	for (dsa_pointer kp = key_at(tree->head)->next[0]; DsaPointerIsValid(kp);)
+	{
+		DeltaKey   *k = key_at(kp);
+		dsa_pointer next = k->next[0];
+		dsa_pointer keep = InvalidDsaPointer,
+					last = InvalidDsaPointer;
+
+		for (dsa_pointer dp = k->first; DsaPointerIsValid(dp);)
+		{
+			DeltaVersion *v = version_at(dp);
+			dsa_pointer vnext = v->next;
+
+			if (version_prunable(v, usable, horizon))
+			{
+				tree->count--;
+				tree->net -= v->delta;
+				tree->bytes -= offsetof(DeltaVersion, row) + v->rowlen;
+				dsa_free(area, dp);
+				pruned++;
+			}
+			else
+			{
+				v->next = InvalidDsaPointer;
+				if (DsaPointerIsValid(last))
+					version_at(last)->next = dp;
+				else
+					keep = dp;
+				last = dp;
+			}
+			dp = vnext;
+		}
+		k->first = keep;
+		k->last = last;
+		if (!DsaPointerIsValid(keep))
+		{
+			/* No versions left: unlink the key from every level it is on. */
+			for (uint32 level = 0; level < k->height; level++)
+				key_at(preds[level])->next[level] = k->next[level];
+			tree->keys--;
+			tree->bytes -= offsetof(DeltaKey, next) + k->height * sizeof(dsa_pointer) + k->keylen;
+			dsa_free(area, kp);
+		}
+		else
+			for (uint32 level = 0; level < k->height; level++)
+				preds[level] = kp;
+		kp = next;
+	}
+	if (usable)
+	{
+		/* Every version the fold holds is gone. */
+		tree->fold = InvalidTransactionId;
+		if (DsaPointerIsValid(tree->folded_xip))
+			dsa_free(area, tree->folded_xip);
+		tree->folded_xip = InvalidDsaPointer;
+	}
+	if (!tree->count)
+		tree->oldest = 0;
+	pg_atomic_fetch_sub_u64(&control->bytes, bytes - tree->bytes);
+	LWLockRelease(&tree->lock);
+	return pruned;
+}
+
+/* Prune |key|'s delta; returns how many versions went. */
+uint64
+dolt_delta_prune(const DoltDeltaTree *key)
+{
+	DeltaTree  *tree;
+
+	delta_attach();
+	tree = tree_find(key, false);
+	return tree ? tree_prune(tree, prune_horizon()) : 0;
+}
+
+/*
+ * Prune every tree with a fold whose versions may go, or any versions at all
+ * when |all|; returns how many versions went.
+ */
+uint64
+dolt_delta_prune_all(bool all)
+{
+	DeltaTree **every;
+	int			ntrees;
+	uint64		pruned = 0;
+	TransactionId horizon;
+
+	delta_attach();
+	horizon = prune_horizon();
+	every = trees_all(&ntrees);
+	for (int i = 0; i < ntrees; i++)
+		if (every[i]->count && (all || TransactionIdIsValid(every[i]->fold)))
+			pruned += tree_prune(every[i], horizon);
+	pfree(every);
+	return pruned;
+}
+
+/*
+ * The trees due a fold, largest first, up to |max|, into |due|: those of
+ * database |db| (any, if invalid) holding at least |versions| versions, or
+ * whose oldest version has waited |timeout_ms|, or any tree with versions
+ * while the store holds more than half its memory. A tree a fold has written
+ * but not yet pruned is not due, unless |versions| is zero, which asks for
+ * every tree with versions.
+ */
+int
+dolt_delta_due(Oid db, int versions, int timeout_ms, DoltDeltaTree *due, int max)
+{
+	DeltaTree **every;
+	int			ntrees;
+	int			found = 0;
+	bool		pressed;
+	TimestampTz now = GetCurrentTimestamp();
+	uint64	   *sizes = palloc(Max(max, 1) * sizeof(uint64));
+
+	delta_attach();
+	pressed = pg_atomic_read_u64(&control->bytes) > control->area_size / 2;
+	every = trees_all(&ntrees);
+	for (int i = 0; i < ntrees; i++)
+	{
+		DeltaTree  *tree = every[i];
+		bool		wanted;
+		uint64		size;
+		int			at;
+
+		if (OidIsValid(db) && tree->key.db != db)
+			continue;
+		LWLockAcquire(&tree->lock, LW_SHARED);
+		size = tree->count;
+		wanted = tree->count &&
+			(versions <= 0 ||
+			 (!TransactionIdIsValid(tree->fold) &&
+			  (pressed || tree->count >= (uint64) versions ||
+			   TimestampDifferenceExceeds(tree->oldest, now, timeout_ms))));
+		LWLockRelease(&tree->lock);
+		if (!wanted)
+			continue;
+
+		/* Keep the |max| largest, in order. */
+		for (at = found; at > 0 && sizes[at - 1] < size; at--)
+			if (at < max)
+			{
+				sizes[at] = sizes[at - 1];
+				due[at] = due[at - 1];
+			}
+		if (at < max)
+		{
+			sizes[at] = size;
+			due[at] = tree->key;
+			found = Min(found + 1, max);
+		}
+	}
+	pfree(every);
+	pfree(sizes);
+	return found;
+}
+
+/* The store's totals, for monitoring: trees, keys, versions and bytes. */
+void
+dolt_delta_totals(uint64 *ntrees, uint64 *keys, uint64 *versions, uint64 *bytes)
+{
+	DeltaTree **every;
+	int			n;
+
+	delta_attach();
+	every = trees_all(&n);
+	*ntrees = *keys = *versions = 0;
+	for (int i = 0; i < n; i++)
+	{
+		LWLockAcquire(&every[i]->lock, LW_SHARED);
+		if (every[i]->count)
+			(*ntrees)++;
+		*keys += every[i]->keys;
+		*versions += every[i]->count;
+		LWLockRelease(&every[i]->lock);
+	}
+	*bytes = pg_atomic_read_u64(&control->bytes);
+	pfree(every);
 }
 
 /* ---------------------------------------------------------------------------
