@@ -277,6 +277,24 @@ capture. Its nodes reach the chunk store only when a commit or ref names them.
 Branch creation copies the source's view root as the new branch's base. That
 is O(delta), not O(rows).
 
+As built, a capture applies each tree's visible delta to its base and then
+discards the result, so the fold worker applies the same versions again.
+Doltgrust's `install_capture` instead makes a captured root the tree's next
+base. Plan (2026-11-04), after commits stop copying trees
+([chunk store plan](CHUNK-STORE-PLAN.md) milestone 6):
+
+- When a capture retains a tree's root, it offers that root as a new base:
+  a `pg_dolt_root` version stamped with the capture's snapshot as its
+  horizon, exactly what a fold of that snapshot would write.
+- It installs only a fold's result:
+  - the capturing transaction wrote no versions of that tree;
+  - its snapshot is an MVCC snapshot newer than the current base's
+    horizon, and the base it read is still the newest;
+  - no fold of the tree is running (the same conditional lock folds take).
+  Otherwise it installs nothing, which is always correct.
+- The root row update and its FOLD WAL record follow the fold path, so pruning,
+  standbys and readers treat the new base like any other fold.
+
 ### 8. Things to settle while building
 
 - Branch rename rekeys memtable trees in the same transaction as its root

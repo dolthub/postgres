@@ -373,6 +373,31 @@ PostgreSQL's own structures.
        table created 541 chunk objects. The fix is to make `pg_dolt_object`
        chunk references use the node hash and read history through the chunk
        store, so a commit records roots without copying.
+     - Plan (2026-11-04, branch `zachmu/commit-tree-roots`), measured first:
+       committing a one-row UPDATE took 48 ms on a 1,000-row table and
+       250–290 ms on a 200,000-row one, with 123k `pg_dolt_object` lookups
+       for 18 new objects. The walk, not the change, set the cost.
+       - **Tree edges name nodes.** A table or index member's second child,
+         and a schema or namespace tree envelope's only child, is the root's
+         node hash in `pg_dolt_chunk`, the same hash its `content` field
+         and `pg_dolt_root` carry. `put_object` checks such an edge with a
+         chunk existence probe. The `chunk` object kind is retired: no new
+         chunk objects, and `pg_dolt_object` holds metadata only.
+       - **Retaining a tree writes only its unbacked nodes.** A capture or
+         DDL that names a tree persists the nodes of its working store that
+         the chunk store lacks, as root rows do. That is the change's size,
+         not the tree's. Schema trees, built in private stores, put only the
+         nodes an existence probe misses.
+       - **Captures load once.** The content root a capture reads from
+         `pg_dolt_root` and the delta is retained from that same load, not
+         reloaded to export.
+       - **History reads open roots lazily** through the node cache and the
+         chunk store, as live reads do, instead of importing a copy.
+       - **Bundles** carry the chunks reachable from their objects' tree
+         edges, and restore puts the missing ones before the objects.
+       - The tree a capture builds is not yet reused as a base; that is the
+         next, separate step (see [the delta store plan](DELTA-STORE-PLAN.md)
+         §7).
    - Resolve the working-state duplication found in the audit, including branch
      rename losing uncommitted work.
 7. **Garbage collection.** Define the reachability and safepoint protocol, then
