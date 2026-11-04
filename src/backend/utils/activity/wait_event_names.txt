@@ -405,6 +405,9 @@ ParallelVacuumDSA	"Waiting for parallel vacuum dynamic shared memory allocation.
 AioUringCompletion	"Waiting for another process to complete IO via io_uring."
 DoltNodeMapping	"Waiting to associate a prolly node with a slot in the shared node cache."
 DoltNodeDSA	"Waiting for shared node cache memory allocation."
+DoltDeltaTrees	"Waiting to find or add a prolly tree in the shared delta store."
+DoltDeltaTree	"Waiting to read or append a prolly tree's pending changes."
+DoltDeltaDSA	"Waiting for shared delta store memory allocation."
 
 # No "ABI_compatibility" region here as WaitEventLWLock has its own C code.
 

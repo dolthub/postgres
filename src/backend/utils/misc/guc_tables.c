@@ -39,6 +39,7 @@
 #include "access/xlog_internal.h"
 #include "access/xlogprefetcher.h"
 #include "access/doltchunk.h"
+#include "access/doltdelta.h"
 #include "access/doltsnapshot.h"
 #include "access/doltnode.h"
 #include "access/doltschema.h"
@@ -3707,6 +3708,16 @@ struct config_int ConfigureNamesInt[] =
 		},
 		&dolt_node_cache_size,
 		1024 * 1024, 0, MAX_KILOBYTES, NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_delta_memory", PGC_POSTMASTER, RESOURCES_MEM,
+			gettext_noop("Sets the shared memory for prolly changes not yet folded into their trees."),
+			gettext_noop("Writers fail once it is full."),
+			GUC_UNIT_KB
+		},
+		&dolt_delta_memory,
+		256 * 1024, 1024, MAX_KILOBYTES, NULL, NULL, NULL
 	},
 
 	{

@@ -8,6 +8,7 @@ backend_sources += files(
   'dg_system.c',
   'dg_manifest.c',
   'dg_node_cache.c',
+  'dg_delta.c',
   'dg_schema_cache.c',
   'dg_version.c',
   'dg_index.c',
