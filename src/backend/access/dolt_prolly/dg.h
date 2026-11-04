@@ -33,8 +33,6 @@ typedef struct DGState
 	bool		based;			/* derived from committed roots */
 	PLHash		base;			/* that committed content root */
 	MemoryContextCallback cleanup;
-	int64	   *journal_seqs;	/* journal entries folded into the tree, ascending */
-	int			journal_count;
 	uint64		roots_generation;	/* of its roots' storage, just before they were read */
 	bool		roots_generation_known;
 	struct HandleDelta *delta;	/* allocated handles, by handle and by digest */
@@ -60,7 +58,6 @@ extern Oid	dg_storage_allocate(Relation definition, const char *branch);
 extern Oid	dg_storage_allocate_kind(char relkind, const char *branch);
 extern bool dg_storage_content_root(RelFileLocator locator, const char *branch, Snapshot snapshot, PLHash *content);
 extern bool dg_storage_resource_root(Oid resource, const char *branch, Snapshot snapshot, PLHash *content, bool *load);
-extern bool dg_journal_pending(const char *branch, Snapshot snapshot);
 extern bytea *dg_manifest_put(const char *kind, bytea *payload, struct ArrayType *children);
 
 /* A member of a database object: its hash, kind and, unless a namespace, name. */

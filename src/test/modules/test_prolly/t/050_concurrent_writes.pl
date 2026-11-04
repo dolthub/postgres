@@ -27,7 +27,7 @@ INSERT INTO stock SELECT g, 100000 FROM generate_series(1, 200) g;
 INSERT INTO account SELECT g, 1000 FROM generate_series(1, 50) g;
 ALTER DATABASE postgres SET default_transaction_isolation = 'repeatable read'});
 
-# The row journal (dolt_row_journal) loses updates here: it is off by default.
+# Concurrent new-order and payment clients must lose no updates.
 {
 	my $log_start = -s $node->logfile;
 	$node->pgbench(

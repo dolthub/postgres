@@ -907,7 +907,7 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 					ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", name, dg_current_branch())));
 				present = dg_storage_resource_root(resource, dg_current_branch(), GetActiveSnapshot(), &content, &load);
 
-				/* Only a full load folds the journal into an index's content. */
+				/* A full load, when the roots alone cannot say. */
 				if (load)
 				{
 					DGStorage  *storage = dg_storage_open(CatalogViewLookupObject(view, RelationRelationId, name), dg_current_branch(), name, schema, resource, GetActiveSnapshot());

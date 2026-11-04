@@ -14,20 +14,19 @@
  * storage's counter, above DG_DERIVED_HANDLES, and pg_dolt_handle maps those
  * to their digest: further occurrences of a row already present, rows whose
  * prefix another live row or another transaction's claim holds, and rows
- * whose derived handle was recently used, so that a lock record or an
- * unfolded journal entry still naming it cannot confuse a reader. Allocated handles are the only handle state
+ * whose derived handle was recently used, so that a lock record still
+ * naming it cannot confuse a reader. Allocated handles are the only handle state
  * written per row, and a branch inherits none of them from its parent:
  * creating a branch copies nothing.
  *
  * The delta is read through a per-backend cache of a (storage, branch)
- * stream, keyed by the snapshot kind it was read under and validated the way
- * the journal's folds are: the same visibility identity and no local writes
- * to the storage's handles since, or the same snapshot but for a later
- * command when this transaction wrote none of them since the delta was read.
- * Across transactions, a delta read under the latest snapshot while no
- * commit to its storage was under way stands, as the journal's stream caches
- * do, while the storage's journal word does not move: every handle write
- * touches the word as a journal write does. States that do not read the
+ * stream, keyed by the snapshot kind it was read under and validated by the
+ * same visibility identity and no local writes to the storage's handles
+ * since, or the same snapshot but for a later command when this transaction
+ * wrote none of them since the delta was read. Across transactions, a delta
+ * read under the latest snapshot while no commit to its storage was under way
+ * stands while the storage's word does not move: every handle write touches
+ * the word, and its commit moves it (storage_touch). States that do not read the
  * catalog, revisions and private rewrites, carry a private delta of their own.
  *
  * Nothing canonical depends on a handle: the content and index trees hold
@@ -66,7 +65,7 @@ struct HandleDelta
 	Visibility	seen;
 	uint64		local_version;	/* handle_local_version_of its storage, when read */
 	bool		streamed;		/* read as handle_stream_build reads, and unchanged since */
-	uint64		word;			/* the storage's journal word then */
+	uint64		word;			/* the storage's word then */
 	TransactionId xmax;			/* the snapshot read under, to tell what other snapshots see */
 	uint32		xcnt;
 	TransactionId *xip;
@@ -75,6 +74,112 @@ struct HandleDelta
 	HTAB	   *by_digest;		/* HandleDigest */
 	int			count;
 };
+
+/*
+ * A storage's shared word: a generation in the high bits, moved by every
+ * commit that changed the storage's handles, and its committers under way
+ * in the low bits. A reader builds or keeps a cache of the storage's delta
+ * only while no committer is under way and the generation stands.
+ */
+#define STORAGE_WORD_GENERATION	(UINT64CONST(1) << 16)
+#define STORAGE_WORD_COMMITTERS	(STORAGE_WORD_GENERATION - 1)
+
+/* Storages whose handles this transaction changed, whose readers must notice at commit. */
+typedef struct StorageTouched
+{
+	Oid			db,
+				space;
+	RelFileNumber file;
+	bool		counted;		/* counted as a committer in the storage's word */
+} StorageTouched;
+
+static StorageTouched *storage_touched;
+static int	storage_touched_count,
+			storage_touched_capacity;
+static bool storage_committing;	/* past pre-commit: a new touch counts at once */
+
+static HandleSlot *handle_slot_claim(Oid db, Oid space, RelFileNumber file);
+
+static pg_atomic_uint64 *
+storage_word(Oid space, RelFileNumber file)
+{
+	return &handle_slot_claim(MyDatabaseId, space, file)->commit_generation;
+}
+
+/* |touched|'s storage has a committer under way: this transaction. */
+static void
+storage_count_committer(StorageTouched *touched)
+{
+	pg_atomic_fetch_add_u64(storage_word(touched->space, touched->file), STORAGE_WORD_GENERATION + 1);
+	touched->counted = true;
+}
+
+/* This transaction changed the handles of storage (|db|, |space|, |file|). */
+static void
+storage_touch(Oid db, Oid space, RelFileNumber file)
+{
+	MemoryContext old;
+
+	for (int i = 0; i < storage_touched_count; i++)
+		if (storage_touched[i].db == db && storage_touched[i].space == space && storage_touched[i].file == file)
+			return;
+	old = MemoryContextSwitchTo(TopTransactionContext);
+	if (storage_touched_count == storage_touched_capacity)
+	{
+		storage_touched_capacity = storage_touched_capacity ? storage_touched_capacity * 2 : 8;
+		storage_touched = storage_touched ? repalloc(storage_touched, storage_touched_capacity * sizeof(StorageTouched)) :
+			palloc(storage_touched_capacity * sizeof(StorageTouched));
+	}
+	storage_touched[storage_touched_count].db = db;
+	storage_touched[storage_touched_count].space = space;
+	storage_touched[storage_touched_count].file = file;
+	storage_touched[storage_touched_count].counted = false;
+	storage_touched_count++;
+	MemoryContextSwitchTo(old);
+
+	/* Claim the storage's slot now: the commit must find its word. */
+	(void) storage_word(space, file);
+	if (storage_committing)
+		storage_count_committer(&storage_touched[storage_touched_count - 1]);
+}
+
+/*
+ * Before the commit becomes visible, count it as a committer of every storage
+ * whose handles it changed: a reader then neither builds a cache nor keeps
+ * one until the commit is visible and counted out.
+ */
+static void
+storage_pre_commit(void)
+{
+	for (int i = 0; i < storage_touched_count; i++)
+		if (!storage_touched[i].counted)
+			storage_count_committer(&storage_touched[i]);
+	storage_committing = true;
+}
+
+/*
+ * At transaction end: count this transaction out of the storages it counted
+ * itself a committer of, which moves their generation again.
+ */
+static void
+storage_xact_end(bool committed)
+{
+	/* The slots were claimed at the touch: finding them reads no catalogs. */
+	shared_handles();
+	for (int i = 0; i < storage_touched_count; i++)
+	{
+		StorageTouched *touched = &storage_touched[i];
+		HandleSlot *slot = handle_slot_find(touched->db, touched->space, touched->file);
+
+		if (slot && touched->counted)
+			pg_atomic_fetch_add_u64(&slot->commit_generation, STORAGE_WORD_GENERATION - 1);
+		else if (slot && committed)
+			pg_atomic_fetch_add_u64(&slot->commit_generation, STORAGE_WORD_GENERATION);
+	}
+	storage_touched = NULL;
+	storage_touched_count = storage_touched_capacity = 0;
+	storage_committing = false;
+}
 
 static HTAB *handle_deltas;
 
@@ -301,7 +406,7 @@ handle_local_write(const RootKey *key, CommandId cid)
 	 * this backend's deltas of the storage, which note the write, no longer
 	 * hold only what a snapshot read.
 	 */
-	journal_touch(MyDatabaseId, key->space, key->file, cid);
+	storage_touch(MyDatabaseId, key->space, key->file);
 	if (handle_deltas)
 	{
 		HASH_SEQ_STATUS status;
@@ -354,29 +459,28 @@ handle_same_view(const HandleDelta *delta, const Visibility *now, const RootKey 
 	return !entry || entry->version == 0 || entry->last_cid < delta->seen.cid;
 }
 
-/* Whether this transaction changed |key|'s storage's journal or handles. */
+/* Whether this transaction changed |key|'s storage's handles. */
 static bool
 handle_storage_touched(const RootKey *key)
 {
-	for (int i = 0; i < journal_touched_count; i++)
-		if (journal_touched[i].space == key->space && journal_touched[i].file == key->file)
+	for (int i = 0; i < storage_touched_count; i++)
+		if (storage_touched[i].space == key->space && storage_touched[i].file == key->file)
 			return true;
 	return false;
 }
 
 /*
- * Read |key|'s delta under the latest snapshot, as journal_stream_build reads
- * a stream: false when a commit to the storage is under way, or this
+ * Read |key|'s delta under the latest snapshot: false when a commit to the storage is under way, or this
  * transaction changed it, so that the delta would hold uncommitted rows.
  */
 static bool
 handle_stream_build(HandleDelta *delta, const RootKey *key)
 {
-	uint64		word = pg_atomic_read_u64(journal_word(key->space, key->file));
+	uint64		word = pg_atomic_read_u64(storage_word(key->space, key->file));
 	Snapshot	latest;
 	uint32		n;
 
-	if ((word & JOURNAL_WORD_COMMITTERS) || handle_storage_touched(key))
+	if ((word & STORAGE_WORD_COMMITTERS) || handle_storage_touched(key))
 		return false;
 	pg_memory_barrier();
 	latest = RegisterSnapshot(GetLatestSnapshot());
@@ -402,13 +506,13 @@ handle_stream_build(HandleDelta *delta, const RootKey *key)
  * Whether |delta|, as handle_stream_build read it, holds what |snapshot|
  * sees: no handle of the storage committed since, and this transaction
  * changed none; and an MVCC snapshot sees every transaction the read saw
- * committed, as journal_stream_covers decides. The latest state sees them all.
+ * committed. The latest state sees them all.
  */
 static bool
 handle_stream_serves(const HandleDelta *delta, const RootKey *key, Snapshot snapshot)
 {
 	if (!delta->loaded || !delta->streamed || handle_storage_touched(key) ||
-		pg_atomic_read_u64(journal_word(key->space, key->file)) != delta->word)
+		pg_atomic_read_u64(storage_word(key->space, key->file)) != delta->word)
 		return false;
 	if (!snapshot || !IsMVCCSnapshot(snapshot))
 		return true;
@@ -774,9 +878,7 @@ handle_claim(Relation rel, const char *branch, uint64 handle)
  * The handle for a new occurrence of |digest| in |s|, recorded through |b|
  * if the command batches its edits: derived when no live row holds its
  * prefix, nothing of this command names it, no lock record still names it,
- * and no other transaction's claim covers it; else allocated. A journal
- * entry may name it: the stream tolerates a repeated sequence, since a
- * removal and the addition after it net out.
+ * and no other transaction's claim covers it; else allocated.
  *
  * Transactions cannot see one another's uncommitted rows, nor a row
  * committed after their state was loaded: the claim keeps two of them from
@@ -1131,8 +1233,7 @@ row_of_digest(const PLTree *tree, PLHash digest, PLSlice *row)
  * The row version |handle| names, live or not, as a fetch under SnapshotAny
  * wants it: the executor fetches versions it saw under an older snapshot and
  * versions this transaction removed. The latest state is tried first, then
- * the active snapshot's, then the journal's own copy of the row, then the
- * delta's record of a removed allocated handle with its row from any state
+ * the active snapshot's, then the delta's record of a removed allocated handle with its row from any state
  * holding it.
  */
 bool
@@ -1146,8 +1247,8 @@ dg_handle_version(Relation rel, uint64 handle, PLHash *digest, PLSlice *row)
 	/*
 	 * A version the pending batch added or removed is answered from the
 	 * batch: loading the table for it would flush the batch, and an AFTER
-	 * trigger fetching each row a statement wrote would then journal and
-	 * refold the table once per row.
+	 * trigger fetching each row a statement wrote would then apply the
+	 * batch once per row.
 	 */
 	if (b && b->table)
 	{
@@ -1189,8 +1290,6 @@ dg_handle_version(Relation rel, uint64 handle, PLHash *digest, PLSlice *row)
 		if (found)
 			return true;
 	}
-	if (journal_entry_any(&key, handle, digest, row))
-		return true;
 	if (handle_is_derived(handle) || !handle_delta_any(&key, handle, digest))
 		return false;
 	s = dg_load(rel, SnapshotSelf);

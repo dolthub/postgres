@@ -349,14 +349,8 @@ dg_storage_resource_root(Oid resource, const char *branch, Snapshot snapshot, PL
 	locator.dbOid = form.storagedb;
 	locator.relNumber = form.storagefile;
 
-	/*
-	 * An index's content includes the entries its table's journal implies,
-	 * and only a load through its definition knows that table: the caller
-	 * loads instead while any stream on the branch has entries.
-	 */
-	*load = form.storagekind == RELKIND_INDEX && dg_journal_pending(branch, snapshot);
-	if (*load)
-		return false;
+	/* The roots and this transaction's changes are the whole content. */
+	*load = false;
 	return dg_storage_content_root(locator, branch, snapshot, content);
 }
 

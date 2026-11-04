@@ -52,7 +52,7 @@ struct DGBatch
 	SubTransactionId subxid;
 	uint64		generation;		/* roots generation the state was loaded under */
 	Visibility	seen;			/* what the latest snapshot saw then */
-	Oid			table_db,		/* the table's storage, whose journal applies */
+	Oid			table_db,		/* the table's storage */
 				table_space;
 	RelFileNumber table_file;
 	bool		table;
@@ -226,40 +226,6 @@ batch_load(Relation rel)
 	return state;
 }
 
-/* A journaled table batch, by (table, command, subtransaction). */
-typedef struct JournalMark
-{
-	Oid			relid;
-	CommandId	cid;
-	SubTransactionId subxid;
-	uint32		pad;
-} JournalMark;
-
-static void
-journal_mark(Oid relid, CommandId cid, SubTransactionId subxid)
-{
-	JournalMark mark = {relid, cid, subxid, 0};
-
-	if (!journal_marks)
-	{
-		HASHCTL		ctl = {0};
-
-		ctl.keysize = sizeof(JournalMark);
-		ctl.entrysize = sizeof(JournalMark);
-		ctl.hcxt = TopTransactionContext;
-		journal_marks = hash_create("prolly journaled batches", 16, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-	}
-	hash_search(journal_marks, &mark, HASH_ENTER, NULL);
-}
-
-static bool
-journal_marked(Oid relid, CommandId cid, SubTransactionId subxid)
-{
-	JournalMark mark = {relid, cid, subxid, 0};
-
-	return journal_marks && hash_search(journal_marks, &mark, HASH_FIND, NULL) != NULL;
-}
-
 /* Reload |b|'s state, opening |rel| for it. */
 static void
 batch_reload(DGBatch *b, Relation rel)
@@ -313,12 +279,9 @@ batch_index_group(DGBatch *tb)
 }
 
 /*
- * Apply table batch |b|, which cannot be journaled, with its indexes'
- * batches from the same command. Saving the table's state takes the stream
- * entries it folded out of the journal, so each index's saved state must have
- * folded exactly those: the indexes apply at once, before anything else can
- * load them, and if any state is stale they all reload together, folding the
- * stream under one snapshot.
+ * Apply table batch |b| with its indexes' batches from the same command: the
+ * indexes apply at once, before anything else can load them, and if any
+ * state is stale they all reload together under one snapshot.
  */
 static void
 batch_apply_group(DGBatch *b, Relation rel)
@@ -354,27 +317,16 @@ batch_apply_group(DGBatch *b, Relation rel)
 		PG_END_TRY();
 		UnregisterSnapshot(snapshot);
 	}
-	if (journal_batch(b, journal_marked(b->relid, b->cid, b->subxid)))
-		journal_mark(b->relid, b->cid, b->subxid);
-	else
-	{
-		batch_apply(b);
-		forboth(lc, group, rc, rels)
-		{
-			DGBatch    *ib = lfirst(lc);
-			Relation	irel = lfirst(rc);
-
-			batch_apply(ib);
-			if (!ib->bound)
-				relation_close(irel, NoLock);
-			batch_forget(ib);
-		}
-		return;
-	}
+	batch_apply(b);
 	forboth(lc, group, rc, rels)
 	{
-		if (!((DGBatch *) lfirst(lc))->bound)
-			relation_close(lfirst(rc), NoLock);
+		DGBatch    *ib = lfirst(lc);
+		Relation	irel = lfirst(rc);
+
+		batch_apply(ib);
+		if (!ib->bound)
+			relation_close(irel, NoLock);
+		batch_forget(ib);
 	}
 }
 
@@ -391,30 +343,22 @@ batch_flush(DGBatch *b)
 
 		/*
 		 * An index's edits follow its table's: the table's batch of the same
-		 * command decides first whether it is journaled, in which case the
-		 * index's edits are implied by the journal and are dropped here; if
-		 * it is applied, the index's edits are applied with it.
+		 * command applies them with its own.
 		 */
 		if (!b->table)
 		{
-			Oid			table_relid = rel->rd_index->indrelid;
+			RootKey		table_key = root_key_of(b->table_space, b->table_file, dg_relation_branch(rel));
+			DGBatch    *tb = batch_find(&table_key);
 
-			if (!journal_marked(table_relid, b->cid, b->subxid))
+			if (tb && tb->cid == b->cid && tb->subxid == b->subxid)
+				batch_flush(tb);
+			if (!batch_find(&key))
 			{
-				RootKey		table_key = root_key_of(b->table_space, b->table_file, dg_relation_branch(rel));
-				DGBatch    *tb = batch_find(&table_key);
-
-				if (tb && tb->cid == b->cid && tb->subxid == b->subxid)
-					batch_flush(tb);
-				if (!batch_find(&key))
-				{
-					if (!bound)
-						relation_close(rel, NoLock);
-					dg_collect();
-					return;
-				}
+				if (!bound)
+					relation_close(rel, NoLock);
+				dg_collect();
+				return;
 			}
-			apply = !journal_marked(table_relid, b->cid, b->subxid);
 		}
 
 		if (apply && b->table && !b->bound)
@@ -553,7 +497,7 @@ dg_batch(Relation rel, CommandId cid)
 	else
 	{
 		Relation	table;
-		RootKey		table_key = journal_index_table(rel, dg_relation_branch(rel), &table);
+		RootKey		table_key = index_table_key(rel, dg_relation_branch(rel), &table);
 
 		b->table_db = table ? table->rd_locator.dbOid : MyDatabaseId;
 		b->table_space = table_key.space;
@@ -580,7 +524,7 @@ dg_batch(Relation rel, CommandId cid)
 
 /*
  * A batch's trees are the latest while nothing has published roots and no
- * journal write to its table has committed since they were loaded.
+ * write to its table's handles has committed since they were loaded.
  */
 static void
 batch_stamp(DGBatch *b)
@@ -715,7 +659,7 @@ dg_batch_remove(DGBatch *b, PLSlice row, uint64 handle)
 			pending->handles[i] = pending->handles[--pending->handle_count];
 	mapping = hash_search(b->handles, &handle, HASH_ENTER, &found);
 	/* An insert cancelled before the batch was flushed never existed in the
-	 * base state.  Do not journal a deletion (or reserve a tombstone) for it. */
+	 * base state.  Do not record a deletion (or reserve a tombstone) for it. */
 	if (found && mapping->present && !dg_handle_digest(b->state, handle, &digest))
 		hash_search(b->handles, &handle, HASH_REMOVE, NULL);
 	else

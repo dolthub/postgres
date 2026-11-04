@@ -1,7 +1,5 @@
-# prolly-row-conflicts with the table's journal stream nearly full: each
-# conflicting update folds the stream into roots it saves, as TPC-C's hot
-# district rows do once their stream reaches its bound. The outcomes are the
-# same as without folds.
+# prolly-row-conflicts after many updates to the hot rows, as TPC-C's district
+# rows see. The outcomes are the same as without them.
 
 setup
 {

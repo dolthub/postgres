@@ -34,7 +34,6 @@
 #include "access/doltversion.h"
 #include "nodes/tidbitmap.h"
 #include "access/doltchunk.h"
-#include "access/doltjournal.h"
 #include "access/doltnode.h"
 #include "access/genam.h"
 #include "access/heapam.h"
@@ -53,7 +52,6 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_dolt_root.h"
 #include "catalog/index.h"
-#include "catalog/pg_dolt_journal.h"
 #include "catalog/pg_dolt_handle.h"
 #include "catalog/pg_index.h"
 #include "utils/syscache.h"
@@ -651,20 +649,10 @@ static bool callbacks_registered;
 static bool loading_for_batch;
 static Snapshot batch_group_snapshot;	/* the stream view a table and its indexes reload under together */
 static HTAB *batches;
-static HTAB *journal_marks;		/* (relid, cid, subxid) of batches that were journaled */
-static bool journal_batch(DGBatch *b, bool forced);
 static bool batch_adds_handle(const RootKey *key, uint64 handle);
-static void journal_consume(const RootKey *key, const int64 *seqs, int count, CommandId cid);
-static void journal_consumed_abort(SubTransactionId subid);
-static DGState *journal_fold_loaded(Relation rel, const char *branch, Snapshot snapshot, DGState *s);
-static DGState *load_unfolded(Relation rel, Snapshot snap, bool *foldable);
-static void journal_fold_roots(PLHash **roots, int *count, int *capacity);
-static uint64 journal_max_handle(Oid space, RelFileNumber file);
-static void journal_xact_end(bool committed);
-static void journal_pre_commit(void);
-static void journal_local_invalidate(void);
-static bool journal_handle_committed(const RootKey *key, uint64 handle);
-static RootKey journal_index_table(Relation index, const char *branch, Relation *table);
+static void storage_xact_end(bool committed);
+static void storage_pre_commit(void);
+static RootKey index_table_key(Relation index, const char *branch, Relation *table);
 struct HandleDelta;
 static struct HandleDelta *handle_delta_get(const RootKey *key, Snapshot snapshot);
 static void handle_local_invalidate(void);
@@ -687,7 +675,6 @@ static void save_roots(const RootKey *key, bool table, DGState *s, CommandId cid
 static uint64 roots_generation(const RootKey *key);
 static void roots_generation_bump(const RootKey *key, bool claim);
 static void handle_table_init(void *ptr);
-static bool journal_entry_any(const RootKey *key, uint64 handle, PLHash *digest, PLSlice *row);
 static void writer_forget(TransactionId xid, int slot);
 
 /*
@@ -1009,7 +996,7 @@ store_xact(XactEvent event, void *arg)
 					publish_all();
 					working_close(true);
 					if (event == XACT_EVENT_PRE_COMMIT)
-						journal_pre_commit();
+						storage_pre_commit();
 				}
 				PG_FINALLY();
 				{
@@ -1045,11 +1032,10 @@ store_xact(XactEvent event, void *arg)
 			 * aborting, when resource owners clean up instead.
 			 */
 			working_close(event != XACT_EVENT_ABORT && event != XACT_EVENT_PARALLEL_ABORT);
-			journal_xact_end(event == XACT_EVENT_COMMIT || event == XACT_EVENT_PARALLEL_COMMIT);
+			storage_xact_end(event == XACT_EVENT_COMMIT || event == XACT_EVENT_PARALLEL_COMMIT);
 			handle_local_invalidate();
 			overlays = NULL;	/* in TopTransactionContext */
 			batches = NULL;
-			journal_marks = NULL;
 			modified = NULL;
 			/* A prepared writer stays registered until readers find it finished. */
 			if (serializable_count && event != XACT_EVENT_PREPARE)
@@ -1068,7 +1054,7 @@ store_xact(XactEvent event, void *arg)
 			 * that, or after an abort, it drops them. An aborted transaction
 			 * marked nodes written that never reached the store. Unwritten
 			 * nodes are dropped too, unless pinned, such as the empty tree
-			 * and journal folds; they are written only when a published root
+			 * and nodes of the empty tree; they are written only when a published root
 			 * reaches them.
 			 */
 			if (event == XACT_EVENT_COMMIT)
@@ -1104,8 +1090,6 @@ store_subxact(SubXactEvent event, SubTransactionId mySubid, SubTransactionId par
 	else if (event == SUBXACT_EVENT_ABORT_SUB)
 	{
 		batch_discard(mySubid);
-		journal_local_invalidate();
-		journal_consumed_abort(mySubid);
 		handle_local_invalidate();
 	}
 	if (event != SUBXACT_EVENT_ABORT_SUB || !overlays)
@@ -1313,8 +1297,7 @@ dg_row_committed(Relation rel, uint64 handle)
 
 	/*
 	 * A derived handle is committed when a committed row holds its prefix;
-	 * an allocated one when a committed transaction mapped it. A row another
-	 * transaction journaled and committed is committed too.
+	 * an allocated one when a committed transaction mapped it.
 	 */
 	if (handle_is_derived(handle))
 	{
@@ -1329,7 +1312,7 @@ dg_row_committed(Relation rel, uint64 handle)
 	}
 	else if (handle_delta_committed(&key, handle))
 		return true;
-	return journal_handle_committed(&key, handle);
+	return false;
 }
 
 /* If this transaction updated or deleted row |handle|, the command that did. */
@@ -1372,7 +1355,7 @@ typedef struct HandleSlot
 	RelFileNumber file;
 	pg_atomic_uint32 used;
 	pg_atomic_uint64 next;
-	pg_atomic_uint64 journal_generation;	/* bumped when a journal write to the storage commits */
+	pg_atomic_uint64 commit_generation;	/* the storage's word: see storage_word */
 	pg_atomic_uint64 roots_generation;	/* bumped by every write of the storage's roots */
 	pg_atomic_uint32 records;	/* whether any row of the storage ever had a lock record */
 } HandleSlot;
@@ -1492,7 +1475,7 @@ handle_slot_find(Oid db, Oid space, RelFileNumber file)
 static uint64
 max_handle(Oid space, RelFileNumber file)
 {
-	return Max(handle_delta_max(space, file), journal_max_handle(space, file));
+	return handle_delta_max(space, file);
 }
 
 /* The slot of a storage, claimed with the next handle after any in use. */
@@ -1526,7 +1509,7 @@ handle_slot_claim(Oid db, Oid space, RelFileNumber file)
 			candidate->space = space;
 			candidate->file = file;
 			pg_atomic_write_u64(&candidate->next, Max(max, DG_DERIVED_HANDLES) + 1);
-			pg_atomic_write_u64(&candidate->journal_generation, UINT64CONST(1) << 16);
+			pg_atomic_write_u64(&candidate->commit_generation, UINT64CONST(1) << 16);
 			pg_atomic_write_u64(&candidate->roots_generation, 1);
 			pg_atomic_write_u32(&candidate->records, dg_records_exist(space, file) ? 1 : 0);
 			pg_write_barrier();
@@ -1651,7 +1634,6 @@ dg_collect(void)
 						add_roots(&roots, &count, &capacity, &both[j]->content, 1);
 			}
 	}
-	journal_fold_roots(&roots, &count, &capacity);
 	pl_store_retain(working_store, roots, count);
 	collect_threshold = Max(DG_COLLECT_MINIMUM, 2 * pl_store_stats(working_store).bytes);
 	if (roots)
@@ -1697,49 +1679,13 @@ state_set(DGState *s, const Roots *roots)
 	s->has_root = roots->present;
 }
 
-/*
- * The roots |key| shows under |snap|: the committed ones, with this
- * transaction's overlay entry for the snapshot applied. |base| receives what
- * the result was built on.
- */
-static Roots
-view_roots(const RootKey *key, Snapshot snap, Roots *base)
-{
-	Overlay    *overlay = overlay_find(key, false);
-	OverlayEntry *entry;
-	Roots		committed,
-				view;
-
-	if (snap && IsMVCCSnapshot(snap))
-		committed = roots_read(key, snap);
-	else
-		committed = roots_latest(key);
-	view = *base = committed;
-	entry = overlay_entry(overlay, snap);
-	if (entry)
-	{
-		if (roots_equal(&entry->base, &committed))
-		{
-			view = entry->roots;
-			*base = entry->base;
-		}
-		else
-			view = roots_merge(&entry->base, &entry->roots, &committed);
-	}
-	return view;
-}
-
 bool		dolt_snapshot_writes = true;
 
-/*
- * Whether writes build on the transaction snapshot now: repeatable read. The
- * row journal, which records changes against the latest trees, keeps them on
- * the latest state.
- */
+/* Whether writes build on the transaction snapshot now: repeatable read. */
 bool
 dg_snapshot_writes(void)
 {
-	return dolt_snapshot_writes && !dolt_row_journal && IsolationUsesXactSnapshot() && !IsolationIsSerializable();
+	return dolt_snapshot_writes && IsolationUsesXactSnapshot() && !IsolationIsSerializable();
 }
 
 /*
@@ -1933,65 +1879,18 @@ revision_relation(Relation rel)
 		!CatalogViewIsProvisional(rel->rd_catalogview);
 }
 
-/* The trees of |rel| under |snap| as the roots name them, before the journal. */
-static DGState *
-load_unfolded(Relation rel, Snapshot snap, bool *foldable)
+DGState *
+dg_load(Relation rel, Snapshot snap)
 {
-	*foldable = false;
 	if (dg_storage_bound(rel))
 		return dg_storage_am_load(rel, snap);
 	if (CatalogViewIsDurable(RelationGetRelid(rel)))
-	{
-		*foldable = true;
 		return durable_base(rel, load_state(rel, snap, NULL, dg_relation_branch(rel), false, true));
-	}
 	if (revision_relation(rel))
 		return revision_state(rel);
 	if (CatalogViewObjectContext(RelationGetRelid(rel)))
 		return dg_storage_am_load(rel, snap);
-	*foldable = true;
 	return load_state(rel, snap, NULL, dg_relation_branch(rel), true, false);
-}
-
-/*
- * A load of the latest state reads its roots, its journal and an index's
- * table at different moments, and a fold another transaction persisted in
- * between, which saves roots that include entries and deletes the entries,
- * makes them disagree; the fold then reports it rather than apply anything.
- * Load again, a few times, then fail as a concurrent update would.
- */
-#define DG_FOLD_ATTEMPTS 10
-
-static bool journal_fold_moved;
-
-/* Whether the fold that produced |s| found its reads disagree: then |s| is released. */
-static bool
-fold_again(DGState *s, int attempt)
-{
-	if (!journal_fold_moved)
-		return false;
-	dg_release(s);
-	if (attempt >= DG_FOLD_ATTEMPTS)
-		ereport(ERROR,
-				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-				 errmsg("could not serialize access due to concurrent update")));
-	return true;
-}
-
-DGState *
-dg_load(Relation rel, Snapshot snap)
-{
-	for (int attempt = 1;; attempt++)
-	{
-		bool		foldable;
-		DGState    *s = load_unfolded(rel, snap, &foldable);
-
-		if (!foldable)
-			return s;
-		s = journal_fold_loaded(rel, dg_relation_branch(rel), snap, s);
-		if (!fold_again(s, attempt))
-			return s;
-	}
 }
 DGState *
 dg_load_branch(Relation rel, Snapshot snap, const char *branch)
@@ -2013,18 +1912,9 @@ dg_load_tid(Relation rel, uint64 id)
 		return revision_state(rel);
 	if (!durable && CatalogViewObjectContext(RelationGetRelid(rel)))
 		return dg_storage_am_load_tid(rel, id);
-	for (int attempt = 1;; attempt++)
-	{
-		DGState    *s;
-
-		if (durable)
-			s = durable_base(rel, load_state(rel, SnapshotSelf, &id, dg_relation_branch(rel), false, true));
-		else
-			s = load_state(rel, SnapshotSelf, &id, dg_relation_branch(rel), true, false);
-		s = journal_fold_loaded(rel, dg_relation_branch(rel), SnapshotSelf, s);
-		if (!fold_again(s, attempt))
-			return s;
-	}
+	if (durable)
+		return durable_base(rel, load_state(rel, SnapshotSelf, &id, dg_relation_branch(rel), false, true));
+	return load_state(rel, SnapshotSelf, &id, dg_relation_branch(rel), true, false);
 }
 
 /* Internal page-reader entrypoint; only dg_resource.c supplies this descriptor. */
@@ -2033,25 +1923,13 @@ dg_load_bound(Relation rel, Snapshot snap, const char *branch)
 {
 	Assert(RelFileNumberIsValid(rel->rd_locator.relNumber));
 	Assert(rel->rd_lockInfo.lockRelId.relId < FirstCatalogViewObjectId);
-	for (int attempt = 1;; attempt++)
-	{
-		DGState    *s = journal_fold_loaded(rel, branch, snap, load_state(rel, snap, NULL, branch, false, true));
-
-		if (!fold_again(s, attempt))
-			return s;
-	}
+	return load_state(rel, snap, NULL, branch, false, true);
 }
 
 DGState *
 dg_load_bound_tid(Relation rel, uint64 id, const char *branch)
 {
-	for (int attempt = 1;; attempt++)
-	{
-		DGState    *s = journal_fold_loaded(rel, branch, SnapshotSelf, load_state(rel, SnapshotSelf, &id, branch, false, true));
-
-		if (!fold_again(s, attempt))
-			return s;
-	}
+	return load_state(rel, SnapshotSelf, &id, branch, false, true);
 }
 
 static void
@@ -2070,13 +1948,6 @@ save_roots(const RootKey *key, bool table, DGState *s, CommandId cid, SubTransac
 		base.content = s->base;
 	}
 	overlay_push(key, cid, subxid, &base, &roots);
-
-	/* The saved trees hold the entries the state folded: they leave the journal. */
-	if (table && s->journal_count)
-	{
-		journal_consume(key, s->journal_seqs, s->journal_count, cid);
-		s->journal_count = 0;
-	}
 }
 static void
 save_state(Relation rel, DGState *s, CommandId cid, const char *branch)
@@ -2095,15 +1966,15 @@ dg_save(Relation rel, DGState *s, CommandId cid)
 }
 
 /*
- * What a snapshot can see of other transactions' journal rows is fixed by
+ * What a snapshot can see of other transactions' catalog rows is fixed by
  * its xmin, xmax and in-progress lists: two snapshots that agree on those see
  * the same committed rows. A load under SnapshotSelf sees what the latest
- * snapshot would. A cached fold is reused only under an identical view, plus
- * the command id for the transaction's own rows; counters that move at
- * commit would lag visibility by the time between a transaction's commit
- * record and its callbacks.
+ * snapshot would. A cache is reused only under an identical view, plus the
+ * command id for the transaction's own rows; counters that move at commit
+ * would lag visibility by the time between a transaction's commit record and
+ * its callbacks.
  */
-#define JOURNAL_XIP_MAX 16
+#define VISIBILITY_XIP_MAX 16
 
 typedef struct Visibility
 {
@@ -2111,7 +1982,7 @@ typedef struct Visibility
 				xmax;
 	uint32		xcnt,
 				subxcnt;
-	TransactionId xip[JOURNAL_XIP_MAX];
+	TransactionId xip[VISIBILITY_XIP_MAX];
 	bool		overflow;		/* too many to record: never equal */
 	CommandId	cid;
 } Visibility;
@@ -2128,7 +1999,7 @@ visibility_capture(Snapshot snapshot, Visibility *v)
 	v->xcnt = seen->xcnt;
 	v->subxcnt = seen->subxcnt;
 	v->cid = snapshot && IsMVCCSnapshot(snapshot) ? snapshot->curcid : InvalidCommandId;
-	if ((uint64) seen->xcnt + seen->subxcnt > JOURNAL_XIP_MAX || seen->suboverflowed)
+	if ((uint64) seen->xcnt + seen->subxcnt > VISIBILITY_XIP_MAX || seen->suboverflowed)
 	{
 		v->overflow = true;
 		return;
@@ -2145,8 +2016,23 @@ visibility_equal(const Visibility *a, const Visibility *b)
 	return !a->overflow && !b->overflow && memcmp(a, b, sizeof(*a)) == 0;
 }
 
+/* The roots key of index |index|'s table on |branch|, opening the table unless bound. */
+static RootKey
+index_table_key(Relation index, const char *branch, Relation *table)
+{
+	RelFileLocator locator;
+
+	if (!dg_storage_bound(index))
+	{
+		*table = relation_open(index->rd_index->indrelid, NoLock);
+		return root_key(*table, branch);
+	}
+	*table = NULL;
+	dg_storage_table_locator(index, &locator);
+	return root_key_of(locator.spcOid, locator.relNumber, branch);
+}
+
 #include "dg_batch.inc"
-#include "dg_journal.inc"
 #include "dg_handle.inc"
 
 /*
@@ -2174,40 +2060,14 @@ dg_storage_content_root(RelFileLocator locator, const char *branch, Snapshot sna
 	entry = overlay_entry(overlay_find(&key, false), snapshot);
 	if (entry)
 		view = roots_equal(&entry->base, &committed) ? entry->roots : roots_merge(&entry->base, &entry->roots, &committed);
-	/*
-	 * Rows journaled to a table's stream are part of its content, though not
-	 * yet of its roots: fold them in. An index has no stream of its own;
-	 * dg_storage_resource_root sends its callers to a full load instead.
-	 */
-	{
-		JournalEntries entries = journal_entries(&key, snapshot ? snapshot : SnapshotSelf);
-
-		if (entries.count)
-		{
-			PLTree		tree = view.present ? tree_at(view.content) : empty_tree();
-
-			journal_apply_table(dg_working_store(), &tree, &entries);
-			*content = tree.root;
-			return true;
-		}
-	}
 	if (!view.present)
 		return false;
 	*content = view.content;
 	return true;
 }
 
-/* Whether any journal entry on |branch| is visible to |snapshot|, in any stream. */
-bool
-dg_journal_pending(const char *branch, Snapshot snapshot)
-{
-	return journal_branch_pending(branch, snapshot);
-}
-
 /* Only the transactional resource allocator calls this, before publishing any
- * branch binding: the new storage starts empty on its branch. A new storage
- * has no journal stream, and its bare descriptor names no definition, so the
- * load does not fold. */
+ * branch binding: the new storage starts empty on its branch. */
 void
 dg_initialize_resource(Relation rel, const char *branch)
 {

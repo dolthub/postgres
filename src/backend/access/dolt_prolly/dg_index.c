@@ -508,7 +508,7 @@ static pg_noreturn void unique_violation(Relation table, Relation index, Datum *
  * every maintained index of |table|. Each index entry carries an occurrence
  * count, like the content tree, so this is one path-local edit per index.
  * Keep the table command ID: a BEFORE trigger may have advanced the current
- * command, but these edits must be discarded when that table batch journals.
+ * command, but these edits belong to that table batch.
  */
 void
 dg_index_apply(Relation table, PLSlice row, int64 delta, uint64 handle, CommandId cid)
