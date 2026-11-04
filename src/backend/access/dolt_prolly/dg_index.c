@@ -50,7 +50,7 @@ typedef struct DGIndexScan
 				upper;
 	bool		has_lower,
 				has_upper;
-	PLCursor	cursor;
+	DGCursor	cursor;
 	bool		started;		/* cursor positioned */
 	bool		backward;		/* direction items are produced in */
 	bool		exhausted;
@@ -405,7 +405,7 @@ dg_index_rebuild(Relation table, Relation index)
 	dg_index_validate(table, index);
 	source = dg_load(table, SnapshotSelf);
 	target = dg_load(index, SnapshotSelf);
-	rows = dg_rows(&source->content);
+	rows = dg_state_rows(source);
 	sorted = palloc0(Max(rows.count, 1) * sizeof(*sorted));
 	entries = palloc0(Max(rows.count, 1) * sizeof(*entries));
 	for (i = 0; i < rows.count; i++)
@@ -444,7 +444,12 @@ dg_index_rebuild(Relation table, Relation index)
 		}
 		entries[i] = sorted[i].entry;
 	}
-	dg_check(pl_build(target->store, entries, used, &target->content));
+	{
+		PLTree		built;
+
+		dg_check(pl_build(target->store, entries, used, &built));
+		dg_set_content(target, built);
+	}
 	dg_save(index, target, GetCurrentCommandId(true));
 	dg_release(source);
 	dg_release(target);
@@ -508,7 +513,7 @@ static pg_noreturn void unique_violation(Relation table, Relation index, Datum *
  * every maintained index of |table|. Each index entry carries an occurrence
  * count, like the content tree, so this is one path-local edit per index.
  * Keep the table command ID: a BEFORE trigger may have advanced the current
- * command, but these edits must be discarded when that table batch journals.
+ * command, but these edits belong to that table batch.
  */
 void
 dg_index_apply(Relation table, PLSlice row, int64 delta, uint64 handle, CommandId cid)
@@ -624,8 +629,7 @@ row_of(DGState *s, PLHash digest, PLSlice *row)
 {
 	PLValue		value;
 
-	dg_check(pl_get(&s->content, (PLSlice) {digest.bytes, PL_HASH_SIZE}, &value));
-	if (!value.present || value.bytes.len < 8)
+	if (!dg_get(s, (PLSlice) {digest.bytes, PL_HASH_SIZE}, &value) || value.bytes.len < 8)
 		return false;
 	*row = (PLSlice) {value.bytes.data + 8, value.bytes.len - 8};
 	return true;
@@ -667,7 +671,7 @@ committed_conflict(Relation table, Relation index, PLSlice lo, PLSlice hi)
 	KeyRows		found = {index};
 	uint64		conflict = 0;
 
-	dg_check(pl_scan(&entries->content, &lo, &hi, collect_key_rows, &found));
+	dg_scan(entries, &lo, &hi, collect_key_rows, &found);
 	for (int i = 0; i < found.count && !conflict; i++)
 	{
 		HandleList	handles = handles_of(rows, found.digests[i], -1);
@@ -714,7 +718,7 @@ unique_conflict(Relation table, Relation index, uint64 self, StringInfo prefix)
 		elog(ERROR, "invalid prolly index key prefix");
 	hi.data = (uint8 *) upper.data;
 	hi.len = upper.len;
-	dg_check(pl_scan(&entries->content, &lo, &hi, collect_key_rows, &found));
+	dg_scan(entries, &lo, &hi, collect_key_rows, &found);
 
 	/* The command's own entries, not yet in the trees, count too. */
 	if (entries_batch)
@@ -864,7 +868,7 @@ check_key(Relation table, Relation index, uint64 self, StringInfo key, PLSlice r
 		rows = dg_load(table, SnapshotSelf);
 		if (!dg_handle_digest(rows, self, &digest))
 			elog(ERROR, "prolly row of a unique check is missing");
-		dg_check(pl_get(&rows->content, (PLSlice) {digest.bytes, PL_HASH_SIZE}, &found));
+		dg_get(rows, (PLSlice) {digest.bytes, PL_HASH_SIZE}, &found);
 		slot = table_slot_create(table, NULL);
 		dg_tid(self, &tid);
 		if (row.data)
@@ -1220,6 +1224,9 @@ rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norder
 		memcpy(scan->keyData, keys, sizeof(ScanKeyData) * nkeys);
 	drop_slot(s);
 	MemoryContextReset(s->context);
+
+	/* The reset took the cursor's memory with the states. */
+	memset(&s->cursor, 0, sizeof(s->cursor));
 	old = MemoryContextSwitchTo(s->context);
 	if (scan->xs_snapshot->snapshot_type == SNAPSHOT_DIRTY)
 		wait_for_reservation(scan);
@@ -1254,20 +1261,20 @@ step(DGIndexScan *s)
 	{
 		s->started = true;
 		if (s->backward)
-			dg_check(pl_cursor_init_last(&s->cursor, &s->index->content, s->has_upper ? &hi : NULL));
+			dg_cursor_init_last(&s->cursor, s->index, s->has_upper ? &hi : NULL, s->has_lower ? &lo : NULL);
 		else
-			dg_check(pl_cursor_init(&s->cursor, &s->index->content, s->has_lower ? &lo : NULL));
+			dg_cursor_init(&s->cursor, s->index, s->has_lower ? &lo : NULL, s->has_upper ? &hi : NULL);
 	}
 	else if (s->backward)
-		dg_check(pl_cursor_prev(&s->cursor));
+		dg_cursor_prev(&s->cursor);
 	else
-		dg_check(pl_cursor_next(&s->cursor));
+		dg_cursor_next(&s->cursor);
 	if (!s->cursor.valid)
 	{
 		s->exhausted = true;
 		return;
 	}
-	entry = pl_cursor_entry(&s->cursor);
+	entry = dg_cursor_entry(&s->cursor);
 	if (s->backward ? s->has_lower && pl_compare(entry.key, lo) < 0 :
 		s->has_upper && pl_compare(entry.key, hi) >= 0)
 		s->exhausted = true;
@@ -1311,7 +1318,7 @@ produce(IndexScanDesc scan)
 		step(s);
 		if (s->exhausted)
 			break;
-		entry = pl_cursor_entry(&s->cursor);
+		entry = dg_cursor_entry(&s->cursor);
 		row = (PLSlice) {entry.value.data + 8, entry.value.len - 8};
 		if (scan->xs_want_itup)
 		{

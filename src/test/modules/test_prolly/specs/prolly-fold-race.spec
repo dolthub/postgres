@@ -1,7 +1,7 @@
-# Two transactions fold the same journal entries into roots each saves. The
-# first commits after the second's snapshot, so the second still sees the
-# entries it folded: it must not apply them again, whether it reads through
-# the table or through an index.
+# Two transactions change rows the first commits after the second's
+# snapshot: the second must not apply the first's changes again, whether it
+# reads through the table or through an index. (Written for the removed row
+# journal, whose folds raced this way; kept for the delta store's folds.)
 
 setup
 {

@@ -147,6 +147,12 @@
 #logical_decoding_work_mem = 64MB	# min 64kB
 #dolt_node_cache_size = 1GB		# prolly nodes shared by sessions, 0 disables
 					# (change requires restart)
+#dolt_delta_memory = 256MB		# prolly changes not yet folded into trees
+					# (change requires restart)
+#dolt_fold_workers = 2			# workers folding prolly changes into trees
+					# (change requires restart)
+#dolt_fold_versions = 4096		# pending versions that make a tree due
+#dolt_fold_timeout = 5s			# how long a pending version may wait
 #dolt_schema_cache_size = 32MB		# per-session decoded schema cache
 #dolt_shared_schema_cache_size = 16MB	# decoded schemas shared by sessions, 0 disables
 #dolt_catalog_cache_entries = 16	# decoded revision catalog views retained per session

@@ -1453,7 +1453,7 @@ foreign_check_snapshot(Relation rel)
 		return;
 	visible = dg_load(rel, GetTransactionSnapshot());
 	latest = dg_load(rel, GetLatestSnapshot());
-	same_root = !memcmp(visible->content.root.bytes, latest->content.root.bytes, PL_HASH_SIZE);
+	same_root = pl_hash_equal(dg_content(visible)->root, dg_content(latest)->root);
 	dg_release(visible);
 	dg_release(latest);
 	if (!same_root)

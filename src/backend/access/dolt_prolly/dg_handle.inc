@@ -14,20 +14,19 @@
  * storage's counter, above DG_DERIVED_HANDLES, and pg_dolt_handle maps those
  * to their digest: further occurrences of a row already present, rows whose
  * prefix another live row or another transaction's claim holds, and rows
- * whose derived handle was recently used, so that a lock record or an
- * unfolded journal entry still naming it cannot confuse a reader. Allocated handles are the only handle state
+ * whose derived handle was recently used, so that a lock record still
+ * naming it cannot confuse a reader. Allocated handles are the only handle state
  * written per row, and a branch inherits none of them from its parent:
  * creating a branch copies nothing.
  *
  * The delta is read through a per-backend cache of a (storage, branch)
- * stream, keyed by the snapshot kind it was read under and validated the way
- * the journal's folds are: the same visibility identity and no local writes
- * to the storage's handles since, or the same snapshot but for a later
- * command when this transaction wrote none of them since the delta was read.
- * Across transactions, a delta read under the latest snapshot while no
- * commit to its storage was under way stands, as the journal's stream caches
- * do, while the storage's journal word does not move: every handle write
- * touches the word as a journal write does. States that do not read the
+ * stream, keyed by the snapshot kind it was read under and validated by the
+ * same visibility identity and no local writes to the storage's handles
+ * since, or the same snapshot but for a later command when this transaction
+ * wrote none of them since the delta was read. Across transactions, a delta
+ * read under the latest snapshot while no commit to its storage was under way
+ * stands while the storage's word does not move: every handle write touches
+ * the word, and its commit moves it (storage_touch). States that do not read the
  * catalog, revisions and private rewrites, carry a private delta of their own.
  *
  * Nothing canonical depends on a handle: the content and index trees hold
@@ -53,9 +52,18 @@ typedef struct HandleDigest
 typedef struct HandleDeltaKey
 {
 	RootKey		key;
-	int			kind;			/* 0: MVCC snapshot; 1: the latest state */
+	int			kind;			/* HANDLE_DELTA_STREAM, _LATEST or _SNAPSHOT */
 	int			pad;
 } HandleDeltaKey;
+
+/*
+ * A storage's cached deltas: one read under the latest snapshot that serves
+ * every MVCC snapshot agreeing with it on the storage's handles, one for the
+ * latest state, and one for an MVCC snapshot the first does not serve.
+ */
+#define HANDLE_DELTA_STREAM		0
+#define HANDLE_DELTA_LATEST		1
+#define HANDLE_DELTA_SNAPSHOT	2
 
 typedef struct HandleDelta HandleDelta;
 
@@ -66,8 +74,9 @@ struct HandleDelta
 	Visibility	seen;
 	uint64		local_version;	/* handle_local_version_of its storage, when read */
 	bool		streamed;		/* read as handle_stream_build reads, and unchanged since */
-	uint64		word;			/* the storage's journal word then */
-	TransactionId xmax;			/* the snapshot read under, to tell what other snapshots see */
+	uint64		word;			/* the storage's word then */
+	TransactionId xmin;			/* the snapshot read under, to tell what other snapshots see */
+	TransactionId xmax;
 	uint32		xcnt;
 	TransactionId *xip;
 	MemoryContext memory;
@@ -75,6 +84,144 @@ struct HandleDelta
 	HTAB	   *by_digest;		/* HandleDigest */
 	int			count;
 };
+
+/*
+ * A storage's shared word: a generation in the high bits, moved by every
+ * commit that changed the storage's handles, and its committers under way
+ * in the low bits. A reader builds or keeps a cache of the storage's delta
+ * only while no committer is under way and the generation stands.
+ */
+#define STORAGE_WORD_GENERATION	(UINT64CONST(1) << 16)
+#define STORAGE_WORD_COMMITTERS	(STORAGE_WORD_GENERATION - 1)
+
+/*
+ * Storages whose handles or delta versions this transaction changed, by kind
+ * of word, whose readers must notice at commit.
+ */
+typedef struct StorageTouched
+{
+	Oid			db,
+				space;
+	RelFileNumber file;
+	int			kind;			/* STORAGE_HANDLES or STORAGE_DELTA */
+	bool		counted;		/* counted as a committer in the storage's word */
+} StorageTouched;
+
+static StorageTouched *storage_touched;
+static int	storage_touched_count,
+			storage_touched_capacity;
+static bool storage_committing;	/* past pre-commit: a new touch counts at once */
+
+static HandleSlot *handle_slot_claim(Oid db, Oid space, RelFileNumber file);
+
+/*
+ * Remember this transaction among the latest to change |touched|'s handles,
+ * before its commit can be visible: a cached delta serves a snapshot only if
+ * the two agree on each of them.
+ */
+static void
+handle_committer_note(StorageTouched *touched)
+{
+	TransactionId xid = GetTopTransactionIdIfAny();
+	HandleSlot *slot = handle_slot_claim(touched->db, touched->space, touched->file);
+	TransactionId *entry;
+
+	if (!TransactionIdIsValid(xid))
+		return;
+	SpinLockAcquire(&slot->committers_mutex);
+	entry = &slot->committers[slot->committers_next];
+	if (TransactionIdIsValid(*entry) &&
+		(!TransactionIdIsValid(slot->committers_dropped) || TransactionIdFollows(*entry, slot->committers_dropped)))
+		slot->committers_dropped = *entry;
+	*entry = xid;
+	slot->committers_next = (slot->committers_next + 1) % DG_HANDLE_COMMITTERS;
+	SpinLockRelease(&slot->committers_mutex);
+}
+
+static pg_atomic_uint64 *
+storage_word(Oid space, RelFileNumber file, int kind)
+{
+	return &handle_slot_claim(MyDatabaseId, space, file)->words[kind];
+}
+
+/* |touched|'s storage has a committer under way: this transaction. */
+static void
+storage_count_committer(StorageTouched *touched)
+{
+	pg_atomic_fetch_add_u64(storage_word(touched->space, touched->file, touched->kind), STORAGE_WORD_GENERATION + 1);
+	touched->counted = true;
+	if (touched->kind == STORAGE_HANDLES)
+		handle_committer_note(touched);
+}
+
+/* This transaction changed the handles or the versions, by |kind|, of storage (|db|, |space|, |file|). */
+static void
+storage_touch(Oid db, Oid space, RelFileNumber file, int kind)
+{
+	MemoryContext old;
+
+	for (int i = 0; i < storage_touched_count; i++)
+		if (storage_touched[i].db == db && storage_touched[i].space == space && storage_touched[i].file == file &&
+			storage_touched[i].kind == kind)
+			return;
+	old = MemoryContextSwitchTo(TopTransactionContext);
+	if (storage_touched_count == storage_touched_capacity)
+	{
+		storage_touched_capacity = storage_touched_capacity ? storage_touched_capacity * 2 : 8;
+		storage_touched = storage_touched ? repalloc(storage_touched, storage_touched_capacity * sizeof(StorageTouched)) :
+			palloc(storage_touched_capacity * sizeof(StorageTouched));
+	}
+	storage_touched[storage_touched_count].db = db;
+	storage_touched[storage_touched_count].space = space;
+	storage_touched[storage_touched_count].file = file;
+	storage_touched[storage_touched_count].kind = kind;
+	storage_touched[storage_touched_count].counted = false;
+	storage_touched_count++;
+	MemoryContextSwitchTo(old);
+
+	/* Claim the storage's slot now: the commit must find its word. */
+	(void) storage_word(space, file, kind);
+	if (storage_committing)
+		storage_count_committer(&storage_touched[storage_touched_count - 1]);
+}
+
+/*
+ * Before the commit becomes visible, count it as a committer of every storage
+ * whose handles it changed: a reader then neither builds a cache nor keeps
+ * one until the commit is visible and counted out.
+ */
+static void
+storage_pre_commit(void)
+{
+	for (int i = 0; i < storage_touched_count; i++)
+		if (!storage_touched[i].counted)
+			storage_count_committer(&storage_touched[i]);
+	storage_committing = true;
+}
+
+/*
+ * At transaction end: count this transaction out of the storages it counted
+ * itself a committer of, which moves their generation again.
+ */
+static void
+storage_xact_end(bool committed)
+{
+	/* The slots were claimed at the touch: finding them reads no catalogs. */
+	shared_handles();
+	for (int i = 0; i < storage_touched_count; i++)
+	{
+		StorageTouched *touched = &storage_touched[i];
+		HandleSlot *slot = handle_slot_find(touched->db, touched->space, touched->file);
+
+		if (slot && touched->counted)
+			pg_atomic_fetch_add_u64(&slot->words[touched->kind], STORAGE_WORD_GENERATION - 1);
+		else if (slot && committed)
+			pg_atomic_fetch_add_u64(&slot->words[touched->kind], STORAGE_WORD_GENERATION);
+	}
+	storage_touched = NULL;
+	storage_touched_count = storage_touched_capacity = 0;
+	storage_committing = false;
+}
 
 static HTAB *handle_deltas;
 
@@ -301,7 +448,7 @@ handle_local_write(const RootKey *key, CommandId cid)
 	 * this backend's deltas of the storage, which note the write, no longer
 	 * hold only what a snapshot read.
 	 */
-	journal_touch(MyDatabaseId, key->space, key->file, cid);
+	storage_touch(MyDatabaseId, key->space, key->file, STORAGE_HANDLES);
 	if (handle_deltas)
 	{
 		HASH_SEQ_STATUS status;
@@ -354,29 +501,29 @@ handle_same_view(const HandleDelta *delta, const Visibility *now, const RootKey 
 	return !entry || entry->version == 0 || entry->last_cid < delta->seen.cid;
 }
 
-/* Whether this transaction changed |key|'s storage's journal or handles. */
+/* Whether this transaction changed |key|'s storage's handles. */
 static bool
 handle_storage_touched(const RootKey *key)
 {
-	for (int i = 0; i < journal_touched_count; i++)
-		if (journal_touched[i].space == key->space && journal_touched[i].file == key->file)
+	for (int i = 0; i < storage_touched_count; i++)
+		if (storage_touched[i].space == key->space && storage_touched[i].file == key->file &&
+			storage_touched[i].kind == STORAGE_HANDLES)
 			return true;
 	return false;
 }
 
 /*
- * Read |key|'s delta under the latest snapshot, as journal_stream_build reads
- * a stream: false when a commit to the storage is under way, or this
+ * Read |key|'s delta under the latest snapshot: false when a commit to the storage is under way, or this
  * transaction changed it, so that the delta would hold uncommitted rows.
  */
 static bool
 handle_stream_build(HandleDelta *delta, const RootKey *key)
 {
-	uint64		word = pg_atomic_read_u64(journal_word(key->space, key->file));
+	uint64		word = pg_atomic_read_u64(storage_word(key->space, key->file, STORAGE_HANDLES));
 	Snapshot	latest;
 	uint32		n;
 
-	if ((word & JOURNAL_WORD_COMMITTERS) || handle_storage_touched(key))
+	if ((word & STORAGE_WORD_COMMITTERS) || handle_storage_touched(key))
 		return false;
 	pg_memory_barrier();
 	latest = RegisterSnapshot(GetLatestSnapshot());
@@ -391,6 +538,7 @@ handle_stream_build(HandleDelta *delta, const RootKey *key)
 	memcpy(delta->xip, latest->xip, latest->xcnt * sizeof(TransactionId));
 	memcpy(delta->xip + latest->xcnt, latest->subxip, latest->subxcnt * sizeof(TransactionId));
 	delta->xcnt = n;
+	delta->xmin = latest->xmin;
 	delta->xmax = latest->xmax;
 	UnregisterSnapshot(latest);
 	delta->word = word;
@@ -398,45 +546,80 @@ handle_stream_build(HandleDelta *delta, const RootKey *key)
 	return true;
 }
 
+/* Whether |delta|'s read saw |xid| as finished, as XidInMVCCSnapshot would say. */
+static bool
+handle_delta_saw(const HandleDelta *delta, TransactionId xid)
+{
+	if (TransactionIdPrecedes(xid, delta->xmin))
+		return true;
+	if (!TransactionIdPrecedes(xid, delta->xmax))
+		return false;
+	for (uint32 i = 0; i < delta->xcnt; i++)
+		if (TransactionIdEquals(delta->xip[i], xid))
+			return false;
+	return true;
+}
+
 /*
- * Whether |delta|, as handle_stream_build read it, holds what |snapshot|
- * sees: no handle of the storage committed since, and this transaction
- * changed none; and an MVCC snapshot sees every transaction the read saw
- * committed, as journal_stream_covers decides. The latest state sees them all.
+ * Whether |snapshot| and the read of |delta| agree on every transaction that
+ * changed |key|'s handles: those the storage's slot remembers, and, before
+ * them, any it no longer does, which both must see finished.
+ */
+static bool
+handle_committers_agree(const HandleDelta *delta, const RootKey *key, Snapshot snapshot)
+{
+	HandleSlot *slot = handle_slot_claim(MyDatabaseId, key->space, key->file);
+	TransactionId committers[DG_HANDLE_COMMITTERS];
+	TransactionId dropped;
+
+	SpinLockAcquire(&slot->committers_mutex);
+	memcpy(committers, slot->committers, sizeof(committers));
+	dropped = slot->committers_dropped;
+	SpinLockRelease(&slot->committers_mutex);
+	if (TransactionIdIsValid(dropped) &&
+		!(TransactionIdPrecedes(dropped, snapshot->xmin) && TransactionIdPrecedes(dropped, delta->xmin)))
+		return false;
+	for (int i = 0; i < DG_HANDLE_COMMITTERS; i++)
+		if (TransactionIdIsValid(committers[i]) &&
+			XidInMVCCSnapshot(committers[i], snapshot) == handle_delta_saw(delta, committers[i]))
+			return false;
+	return true;
+}
+
+/*
+ * Whether |delta|, as handle_stream_build read it, still holds the storage's
+ * latest handles: no commit to them has begun since, and this transaction
+ * changed none.
+ */
+static bool
+handle_stream_fresh(const HandleDelta *delta, const RootKey *key)
+{
+	return delta->loaded && delta->streamed && !handle_storage_touched(key) &&
+		pg_atomic_read_u64(storage_word(key->space, key->file, STORAGE_HANDLES)) == delta->word;
+}
+
+/*
+ * Whether a fresh |delta| holds what |snapshot| sees: the latest state sees
+ * every committed handle, and an MVCC snapshot what the read saw if the two
+ * agree on each transaction that changed them. Under concurrent writers of
+ * other rows, an older snapshot of a transaction under way usually does.
  */
 static bool
 handle_stream_serves(const HandleDelta *delta, const RootKey *key, Snapshot snapshot)
 {
-	if (!delta->loaded || !delta->streamed || handle_storage_touched(key) ||
-		pg_atomic_read_u64(journal_word(key->space, key->file)) != delta->word)
-		return false;
 	if (!snapshot || !IsMVCCSnapshot(snapshot))
 		return true;
-	if (snapshot->snapshot_type != SNAPSHOT_MVCC || snapshot->suboverflowed ||
-		TransactionIdPrecedes(snapshot->xmax, delta->xmax))
+	if (snapshot->snapshot_type != SNAPSHOT_MVCC || snapshot->suboverflowed)
 		return false;
-	for (uint32 i = 0; i < snapshot->xcnt + snapshot->subxcnt; i++)
-	{
-		TransactionId xid = i < snapshot->xcnt ? snapshot->xip[i] : snapshot->subxip[i - snapshot->xcnt];
-		bool		running = false;
-
-		if (!TransactionIdPrecedes(xid, delta->xmax))
-			continue;
-		for (uint32 j = 0; j < delta->xcnt && !running; j++)
-			running = TransactionIdEquals(delta->xip[j], xid);
-		if (!running)
-			return false;
-	}
-	return true;
+	return handle_committers_agree(delta, key, snapshot);
 }
 
-/* The cached delta of |key| as |snapshot| sees it, reloaded if anything moved. */
-static struct HandleDelta *
-handle_delta_get(const RootKey *key, Snapshot snapshot)
+/* The cached delta of |key| of |kind|, made empty if new. */
+static HandleDelta *
+handle_delta_entry(const RootKey *key, int kind)
 {
 	HandleDeltaKey cache_key = {0};
 	HandleDelta *delta;
-	Visibility	seen;
 	bool		found;
 
 	if (!handle_deltas)
@@ -449,25 +632,39 @@ handle_delta_get(const RootKey *key, Snapshot snapshot)
 		handle_deltas = hash_create("prolly handle deltas", 32, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
 	cache_key.key = *key;
-	cache_key.kind = snapshot && IsMVCCSnapshot(snapshot) ? 0 : 1;
+	cache_key.kind = kind;
 	delta = hash_search(handle_deltas, &cache_key, HASH_ENTER, &found);
 	if (!found)
 	{
 		memset(((char *) delta) + sizeof(HandleDeltaKey), 0, sizeof(*delta) - sizeof(HandleDeltaKey));
 		delta->memory = AllocSetContextCreate(CacheMemoryContext, "prolly handle delta", ALLOCSET_SMALL_SIZES);
 	}
-	if (handle_stream_serves(delta, key, snapshot))
+	return delta;
+}
+
+/*
+ * The cached delta of |key| as |snapshot| sees it, reloaded if anything moved:
+ * the streamed delta where it serves, else one read under |snapshot| itself.
+ */
+static struct HandleDelta *
+handle_delta_get(const RootKey *key, Snapshot snapshot)
+{
+	bool		mvcc = snapshot && IsMVCCSnapshot(snapshot);
+	HandleDelta *delta = handle_delta_entry(key, mvcc ? HANDLE_DELTA_STREAM : HANDLE_DELTA_LATEST);
+	Visibility	seen;
+
+	if ((handle_stream_fresh(delta, key) || handle_stream_build(delta, key)) &&
+		handle_stream_serves(delta, key, snapshot))
 		return delta;
+	if (mvcc)
+		delta = handle_delta_entry(key, HANDLE_DELTA_SNAPSHOT);
 	visibility_capture(snapshot, &seen);
-	if (delta->loaded &&
+	if (delta->loaded && !delta->streamed &&
 		((delta->local_version == handle_local_version_of(key) && visibility_equal(&delta->seen, &seen)) ||
 		 handle_same_view(delta, &seen, key)))
 		return delta;
-	if (!handle_stream_build(delta, key) || !handle_stream_serves(delta, key, snapshot))
-	{
-		handle_delta_load(delta, snapshot);
-		delta->streamed = false;
-	}
+	handle_delta_load(delta, snapshot);
+	delta->streamed = false;
 	delta->seen = seen;
 	delta->local_version = handle_local_version_of(key);
 	return delta;
@@ -564,7 +761,7 @@ collect_prefix_row(void *arg, PLSlice key, PLSlice value)
 
 /* The rows of |tree| whose digests derive |handle|: rarely more than one. */
 static PrefixRows
-prefix_rows(const PLTree *tree, uint64 handle)
+prefix_rows(DGState *s, uint64 handle)
 {
 	PrefixRows	rows = {0};
 	PLHash		lower,
@@ -572,10 +769,8 @@ prefix_rows(const PLTree *tree, uint64 handle)
 	bool		bounded = handle_prefix_bounds(handle, &lower, &upper);
 	PLSlice		lo = {lower.bytes, PL_HASH_SIZE},
 				hi = {upper.bytes, PL_HASH_SIZE};
-	PLStatus	status = pl_scan(tree, &lo, bounded ? &hi : NULL, collect_prefix_row, &rows);
 
-	if (status != PL_STOP)
-		dg_check(status);
+	dg_scan(s, &lo, bounded ? &hi : NULL, collect_prefix_row, &rows);
 	return rows;
 }
 
@@ -608,7 +803,7 @@ dg_handle_digest(DGState *s, uint64 handle, PLHash *digest)
 		*digest = mapping->digest;
 		return true;
 	}
-	rows = prefix_rows(&s->content, handle);
+	rows = prefix_rows(s, handle);
 	for (int i = 0; i < rows.count; i++)
 	{
 		uint64	   *allocated;
@@ -643,7 +838,7 @@ dg_handles_of(DGState *s, PLHash digest, int64 count, uint64 **handles, int *cap
 	{
 		PLValue		value;
 
-		dg_check(pl_get(&s->content, (PLSlice) {digest.bytes, PL_HASH_SIZE}, &value));
+		dg_get(s, (PLSlice) {digest.bytes, PL_HASH_SIZE}, &value);
 		count = value.present ? (int64) pl_read64(value.bytes.data) : 0;
 	}
 	n = delta_handles(s, digest, &allocated);
@@ -668,7 +863,7 @@ dg_handles_of(DGState *s, PLHash digest, int64 count, uint64 **handles, int *cap
 double
 dg_handle_count(DGState *s)
 {
-	return (double) pl_count(&s->content) + (s->delta ? s->delta->count : 0);
+	return (double) dg_count(s) + (s->delta ? s->delta->count : 0);
 }
 
 /*
@@ -679,7 +874,7 @@ dg_handle_count(DGState *s)
  * state before the claimant committed, and then cannot see the claimant's
  * row. It may be forgotten once the claimant precedes the xmin of every
  * running transaction that may write rows, since every state loaded since
- * includes its rows.
+ * includes its rows, or once the claimant has rolled back.
  *
  * Claims are a fixed array of transaction IDs, found by hashing (storage,
  * branch, handle). Handles that share a slot share its claim: a transaction
@@ -763,7 +958,14 @@ handle_claim(Relation rel, const char *branch, uint64 handle)
 	{
 		if (owner == me)
 			return true;
-		if (TransactionIdIsValid(owner) && !TransactionIdPrecedes(owner, handle_claim_horizon()))
+
+		/*
+		 * A claim stands while its claimant may still commit a row no older
+		 * state shows. One that rolled back, as a serialization failure's
+		 * retry finds its first attempt's, published nothing.
+		 */
+		if (TransactionIdIsValid(owner) && !TransactionIdPrecedes(owner, handle_claim_horizon()) &&
+			(TransactionIdIsInProgress(owner) || TransactionIdDidCommit(owner)))
 			return false;
 		if (pg_atomic_compare_exchange_u32(slot, &owner, me))
 			return true;
@@ -774,9 +976,7 @@ handle_claim(Relation rel, const char *branch, uint64 handle)
  * The handle for a new occurrence of |digest| in |s|, recorded through |b|
  * if the command batches its edits: derived when no live row holds its
  * prefix, nothing of this command names it, no lock record still names it,
- * and no other transaction's claim covers it; else allocated. A journal
- * entry may name it: the stream tolerates a repeated sequence, since a
- * removal and the addition after it net out.
+ * and no other transaction's claim covers it; else allocated.
  *
  * Transactions cannot see one another's uncommitted rows, nor a row
  * committed after their state was loaded: the claim keeps two of them from
@@ -792,7 +992,7 @@ dg_handle_choose(Relation rel, DGState *s, DGBatch *b, PLHash digest)
 	int			status = DG_RECORD_NONE;
 
 	if (!taken)
-		taken = prefix_rows(&s->content, handle).count > 0;
+		taken = prefix_rows(s, handle).count > 0;
 	if (!taken && !s->delta_private && handle_records_exist(rel->rd_locator.dbOid, rel->rd_locator.spcOid, rel->rd_locator.relNumber))
 	{
 		status = dg_record_status(&rel->rd_locator, dg_relation_branch(rel), (int64) handle);
@@ -1110,15 +1310,14 @@ handle_allocate(Relation rel, DGState *s)
 	return dg_allocate_handle(rel);
 }
 
-/* The row bytes of |digest| in |tree|, copied; false if it holds no such row. */
+/* The row bytes of |digest| in |s|, copied; false if it holds no such row. */
 static bool
-row_of_digest(const PLTree *tree, PLHash digest, PLSlice *row)
+row_of_digest(DGState *s, PLHash digest, PLSlice *row)
 {
 	PLValue		value;
 	uint8	   *copy;
 
-	dg_check(pl_get(tree, (PLSlice) {digest.bytes, PL_HASH_SIZE}, &value));
-	if (!value.present || value.bytes.len < 8)
+	if (!dg_get(s, (PLSlice) {digest.bytes, PL_HASH_SIZE}, &value) || value.bytes.len < 8)
 		return false;
 	copy = palloc(Max(value.bytes.len - 8, 1));
 	memcpy(copy, value.bytes.data + 8, value.bytes.len - 8);
@@ -1131,8 +1330,7 @@ row_of_digest(const PLTree *tree, PLHash digest, PLSlice *row)
  * The row version |handle| names, live or not, as a fetch under SnapshotAny
  * wants it: the executor fetches versions it saw under an older snapshot and
  * versions this transaction removed. The latest state is tried first, then
- * the active snapshot's, then the journal's own copy of the row, then the
- * delta's record of a removed allocated handle with its row from any state
+ * the active snapshot's, then the delta's record of a removed allocated handle with its row from any state
  * holding it.
  */
 bool
@@ -1146,8 +1344,8 @@ dg_handle_version(Relation rel, uint64 handle, PLHash *digest, PLSlice *row)
 	/*
 	 * A version the pending batch added or removed is answered from the
 	 * batch: loading the table for it would flush the batch, and an AFTER
-	 * trigger fetching each row a statement wrote would then journal and
-	 * refold the table once per row.
+	 * trigger fetching each row a statement wrote would then apply the
+	 * batch once per row.
 	 */
 	if (b && b->table)
 	{
@@ -1166,7 +1364,7 @@ dg_handle_version(Relation rel, uint64 handle, PLHash *digest, PLSlice *row)
 		}
 	}
 	s = dg_load_tid(rel, handle);
-	found = dg_handle_digest(s, handle, digest) && row_of_digest(&s->content, *digest, row);
+	found = dg_handle_digest(s, handle, digest) && row_of_digest(s, *digest, row);
 
 	dg_release(s);
 	if (found)
@@ -1174,7 +1372,7 @@ dg_handle_version(Relation rel, uint64 handle, PLHash *digest, PLSlice *row)
 	if (ActiveSnapshotSet())
 	{
 		s = dg_load(rel, GetActiveSnapshot());
-		found = dg_handle_digest(s, handle, digest) && row_of_digest(&s->content, *digest, row);
+		found = dg_handle_digest(s, handle, digest) && row_of_digest(s, *digest, row);
 		dg_release(s);
 		if (found)
 			return true;
@@ -1184,22 +1382,20 @@ dg_handle_version(Relation rel, uint64 handle, PLHash *digest, PLSlice *row)
 	if (dg_writes_on_snapshot(rel))
 	{
 		s = dg_load_committed_latest(rel);
-		found = dg_handle_digest(s, handle, digest) && row_of_digest(&s->content, *digest, row);
+		found = dg_handle_digest(s, handle, digest) && row_of_digest(s, *digest, row);
 		dg_release(s);
 		if (found)
 			return true;
 	}
-	if (journal_entry_any(&key, handle, digest, row))
-		return true;
 	if (handle_is_derived(handle) || !handle_delta_any(&key, handle, digest))
 		return false;
 	s = dg_load(rel, SnapshotSelf);
-	found = row_of_digest(&s->content, *digest, row);
+	found = row_of_digest(s, *digest, row);
 	dg_release(s);
 	if (!found && ActiveSnapshotSet())
 	{
 		s = dg_load(rel, GetActiveSnapshot());
-		found = row_of_digest(&s->content, *digest, row);
+		found = row_of_digest(s, *digest, row);
 		dg_release(s);
 	}
 	return found;
@@ -1244,7 +1440,7 @@ handle_install_extras(Relation rel, DGState *s, const RootKey *key, CommandId ci
 {
 	InstallExtras extras = {rel, s, key, cid};
 
-	dg_check(pl_scan(&s->content, NULL, NULL, collect_install_extras, &extras));
+	dg_scan(s, NULL, NULL, collect_install_extras, &extras);
 }
 
 /*
@@ -1256,13 +1452,14 @@ handle_install_extras(Relation rel, DGState *s, const RootKey *key, CommandId ci
 void
 dg_handle_install(Relation rel, DGState *s, PLTree contents)
 {
-	PLTree		before = s->content;
+	PLTree		before;
 	HandleChanges changes = {0};
 	RootKey		key = root_key(rel, dg_relation_branch(rel));
 	CommandId	cid = GetCurrentCommandId(true);
 
 	if (!s->has_root && !s->delta_private)
 		handle_install_extras(rel, s, &key, cid);
+	before = *dg_content(s);
 	dg_check(pl_diff(&before, &contents, collect_handle_change, &changes));
 	for (int i = 0; i < changes.count; i++)
 	{
@@ -1299,7 +1496,7 @@ dg_handle_install(Relation rel, DGState *s, PLTree contents)
 			}
 		}
 	}
-	s->content = contents;
+	dg_set_content(s, contents);
 	if (changes.items)
 		pfree(changes.items);
 }

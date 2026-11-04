@@ -48,6 +48,7 @@
 
 #include "access/clog.h"
 #include "access/commit_ts.h"
+#include "access/doltdelta.h"
 #include "access/heaptoast.h"
 #include "access/multixact.h"
 #include "access/rewriteheap.h"
@@ -5671,6 +5672,12 @@ StartupXLOG(void)
 	StartupReplicationOrigin();
 
 	/*
+	 * Load the prolly delta store's versions saved by the checkpoint, before
+	 * replay adds those whose records follow it.
+	 */
+	StartupDoltDelta(checkPoint.redo);
+
+	/*
 	 * Initialize unlogged LSN. On a clean shutdown, it's restored from the
 	 * control file. On recovery, all unlogged relations are blown away, so
 	 * the unlogged LSN counter can be reset too.
@@ -7556,6 +7563,7 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	CheckPointSnapBuild();
 	CheckPointLogicalRewriteHeap();
 	CheckPointReplicationOrigin();
+	CheckPointDoltDelta(checkPointRedo);
 
 	/* Write out all dirty data in SLRUs and the main buffer pool */
 	TRACE_POSTGRESQL_BUFFER_CHECKPOINT_START(flags);

@@ -244,7 +244,7 @@ dg_branch_base(Relation rel, DGState *state)
 	SPI_finish();
 	if (!address)
 		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("relation %s has no state on branch %s", RelationGetRelationName(rel), dg_relation_branch(rel))));
-	state->content = dg_history_import(state->store, address);
+	dg_set_base(state, dg_history_import(state->store, address));
 }
 
 const char *

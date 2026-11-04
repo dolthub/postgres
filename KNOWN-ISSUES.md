@@ -38,25 +38,14 @@ The SQL reproductions are in /workspace/reports/rewrite-dolt-functions-*.sql.
   while moving content hashes to 20 bytes on zachmu/short-hashes, which leaves
   these fingerprints at 32.
 
-* **Row journal disabled: unsafe with concurrent writers (2026-10-31):** small
-  batches can be journaled to `pg_dolt_journal` instead of rewriting a table's
-  trees, but `dolt_row_journal` is now off by default. A writer folds the
-  journal into the latest state, then persists that fold mid-transaction:
-  it saves roots that include other transactions' entries and deletes them.
-  Its own later snapshot reads merge those roots in as if they were its own
-  changes, and concurrent folders race to consume the same entries. Under
-  concurrent TPC-C this lost updates (duplicate order numbers, money and stock
-  created or lost), showed repeatable read transactions rows committed after
-  their snapshot, and failed with "prolly journal removes a missing index
-  entry" and "failed to fetch tuple being updated". Partial fixes are merged
-  (fold only entries the snapshot sees, never refold consumed entries, reload a
-  latest state whose roots moved), but other interleavings remain. Folding
-  needs separating from writers, for example compaction by something whose
-  snapshot sees everything it folds, before the journal can be on by default.
-  Its single-threaded TPC-C gain was roughly 5-10% at scale 1.
-  `test_prolly/t/050_concurrent_writes.pl` fails with the journal on and is
-  the gate for re-enabling it, with the isolation specs in
-  `test_prolly/specs`.
+* **Row journal removed (2026-11-04):** the row journal (`pg_dolt_journal`,
+  `dolt_row_journal`) lost updates under concurrent writers, because writers
+  folded it into roots they saved. It is removed on `zachmu/doltgrust-deltas`,
+  which replaces it with the delta store of
+  [DELTA-STORE-PLAN.md](DELTA-STORE-PLAN.md): durable shared deltas over
+  per-tree bases, folded only by background workers.
+  `test_prolly/t/050_concurrent_writes.pl` and the isolation specs in
+  `test_prolly/specs` remain the gate for concurrent writers.
 
 * **Concurrent identical keyless rows share a derived handle (2026-11-02):** a
   keyless row's handle is derived from its digest unless the writer's view

@@ -39,7 +39,7 @@
 #include "access/xlog_internal.h"
 #include "access/xlogprefetcher.h"
 #include "access/doltchunk.h"
-#include "access/doltjournal.h"
+#include "access/doltdelta.h"
 #include "access/doltsnapshot.h"
 #include "access/doltnode.h"
 #include "access/doltschema.h"
@@ -807,17 +807,6 @@ StaticAssertDecl(lengthof(config_type_names) == (PGC_ENUM + 1),
 
 struct config_bool ConfigureNamesBool[] =
 {
-	{
-		{"dolt_row_journal", PGC_SUSET, DEVELOPER_OPTIONS,
-			gettext_noop("Journals small prolly table changes instead of rewriting the tables' trees."),
-			gettext_noop("Not yet safe with concurrent writers."),
-			GUC_NOT_IN_SAMPLE
-		},
-		&dolt_row_journal,
-		false,
-		NULL, NULL, NULL
-	},
-
 	{
 		{"dolt_snapshot_writes", PGC_USERSET, DEVELOPER_OPTIONS,
 			gettext_noop("Builds prolly tables' writes under repeatable read on the transaction snapshot."),
@@ -3719,6 +3708,44 @@ struct config_int ConfigureNamesInt[] =
 		},
 		&dolt_node_cache_size,
 		1024 * 1024, 0, MAX_KILOBYTES, NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_delta_memory", PGC_POSTMASTER, RESOURCES_MEM,
+			gettext_noop("Sets the shared memory for prolly changes not yet folded into their trees."),
+			gettext_noop("Writers fail once it is full."),
+			GUC_UNIT_KB
+		},
+		&dolt_delta_memory,
+		256 * 1024, 1024, MAX_KILOBYTES, NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_fold_workers", PGC_POSTMASTER, RESOURCES_BGWRITER,
+			gettext_noop("Sets the most background workers folding the prolly delta store at once."),
+			gettext_noop("0 starts no launcher: pending changes then fold only through dolt_fold()."),
+		},
+		&dolt_fold_workers,
+		2, 0, MAX_BACKENDS, NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_fold_versions", PGC_SIGHUP, RESOURCES_BGWRITER,
+			gettext_noop("Sets the pending versions of a prolly tree past which it is folded."),
+			NULL
+		},
+		&dolt_fold_versions,
+		4096, 1, INT_MAX, NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_fold_timeout", PGC_SIGHUP, RESOURCES_BGWRITER,
+			gettext_noop("Sets how long a prolly tree's oldest pending version waits before the tree is folded."),
+			NULL,
+			GUC_UNIT_MS
+		},
+		&dolt_fold_timeout,
+		5000, 1, INT_MAX, NULL, NULL, NULL
 	},
 
 	{

@@ -50,7 +50,6 @@ tests += {
     't/034_serializable.pl',
     't/035_commit_tracked.pl',
     't/035_prepared_locks.pl',
-    't/036_row_journal.pl',
     't/037_derived_handles.pl',
     't/038_index_types.pl',
     't/039_foreign_key_checks.pl',
@@ -79,5 +78,6 @@ tests += {
       't/061_stash_workspaces.pl',
       't/062_user_catalog_history.pl',
       't/063_stored_tests.pl',
+      't/064_delta_store.pl',
   ]},
 }

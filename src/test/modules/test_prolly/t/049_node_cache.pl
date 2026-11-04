@@ -1,6 +1,7 @@
 # Prolly nodes are cached in shared memory for every session: a session reads
 # from the chunk store only the nodes no session has read or written since the
-# server started. Results stay right when the cache is too small to hold a table, or holds
+# server started. Writes go to the delta store, and a fold writes the nodes of
+# the trees they make, so the test folds before it measures trees. Results stay right when the cache is too small to hold a table, or holds
 # nothing at all, and history imports leave the subtrees the chunk store holds
 # to be read through the cache. Reads of pg_dolt_chunk's hash index count the
 # chunks a transaction reads from the store.
@@ -16,6 +17,9 @@ $node->append_conf('postgresql.conf', "default_table_access_method='dolt_prolly_
 $node->start;
 sub sql { return $node->safe_psql('postgres', shift) }
 
+# Fold every pending change into the trees now, as the background workers would.
+sub fold { sql('SELECT dolt_fold()') }
+
 # The chunk store reads and cache statistics of |query|, run in a new session.
 sub reads {
 	my ($query) = @_;
@@ -26,12 +30,13 @@ sub reads {
 sql(q{CREATE TABLE t(id int PRIMARY KEY, v text);
 INSERT INTO t SELECT g, repeat(md5(g::text), 3) FROM generate_series(1, 20000) g;
 SELECT dolt_commit('-Am', 'base')});
+fold();
 my $count = 'SELECT count(*), sum(length(v)) FROM t';
 my $expected = sql($count);
 
-# A committed transaction shares the nodes it wrote.
+# A committed fold shares the nodes it wrote.
 my ($store, $hits, $misses) = reads($count);
-is($store, 0, 'a new session reads nothing from the chunk store after the writer commits');
+is($store, 0, 'a new session reads nothing from the chunk store after the fold commits');
 cmp_ok($hits, '>', 100, "the scan reads from the shared cache ($hits nodes)");
 is($misses, 0, 'and finds every node there');
 
@@ -65,22 +70,26 @@ is(session_lookups('', ''), 0, 'a later transaction of the session finds its nod
 cmp_ok(session_lookups('SET dolt_session_node_cache = 0;', ''), '>', 100, 'with no session budget it looks them up again');
 cmp_ok(session_lookups('', 'BEGIN; SELECT count(*) FROM t; ROLLBACK;'), '>', 100, 'as it does after an abort');
 
-# Updates read through the cache too, and share their new nodes at commit.
+# Updates read the trees through the cache too, and their own rows from the delta store.
 sql(q{UPDATE t SET v = 'changed' WHERE id % 1000 = 0});
 ($store) = reads(q{SELECT count(*) FROM t WHERE v = 'changed'});
-is($store, 0, "a reader finds an update's nodes in the cache");
+is($store, 0, "a reader of an update finds the trees in the cache");
 is(sql(q{SELECT count(*) FROM t WHERE v = 'changed'}), 20, 'and sees the update');
 sql(q{SELECT dolt_commit('-Am', 'changed')});
 $expected = sql($count);
 
-# The working store keeps a transaction's intermediate trees out of the chunk
-# store: rewriting rows twenty times stores about what rewriting them once does.
+# Writers store no chunks, and a fold stores only the trees it ends with:
+# rewriting rows twenty times stores about what rewriting them once does.
 my $chunks = 'SELECT count(*) FROM pg_dolt_chunk';
+fold();
 my $start = sql($chunks);
 sql(q{UPDATE t SET v = 'once' WHERE id % 500 = 0});
+is(sql($chunks) - $start, 0, 'a writer stores no chunks');
+fold();
 my $once = sql($chunks) - $start;
 $start = sql($chunks);
 sql(join('', 'BEGIN;', (map { "UPDATE t SET v = 'pass $_' WHERE id % 500 = 0;" } 1 .. 20), 'COMMIT'));
+fold();
 my $twenty = sql($chunks) - $start;
 cmp_ok($twenty, '<', 2 * $once + 10, "twenty rewrites in a transaction store $twenty chunks, one stores $once");
 is(sql(q{SELECT count(*) FROM t WHERE v = 'pass 20'}), 40, 'and the last rewrite is what is read');
@@ -113,6 +122,7 @@ is(sql(q{SELECT dolt_checkout('old'); SELECT count(*), sum(length(v)) FROM t}),
 $expected = sql($count);
 
 # A cache too small for the table evicts as it goes, and stays within its size.
+fold();
 $node->append_conf('postgresql.conf', "dolt_node_cache_size=1MB\n");
 $node->restart;
 is(sql(q{SELECT count(*), sum(length(v)) FROM t}), $expected, 'a scan through a 1 MB cache is right');
@@ -129,6 +139,7 @@ cmp_ok($after, '>', $evictions, 'lookups across the table evict too (' . ($after
 is(sql(q{SELECT count(*), sum(length(v)) FROM t}), $expected, 'and results stay right');
 
 # With no cache, every node is read from the store, privately.
+fold();
 $node->append_conf('postgresql.conf', "dolt_node_cache_size=0\n");
 $node->restart;
 is(sql(q{SELECT count(*), sum(length(v)) FROM t}), $expected, 'without a cache, results are the same');

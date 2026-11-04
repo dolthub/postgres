@@ -840,7 +840,7 @@ dolt_manifest_export(PG_FUNCTION_ARGS)
 		!(rel->rd_rel->relkind == RELKIND_INDEX && rel->rd_rel->relam == get_index_am_oid("dolt_prolly_index", false)))
 		dg_unsupported("manifest export of non-prolly relations");
 	state = dg_load(rel, GetActiveSnapshot());
-	result = export_node(state->store, state->content.root, 0);
+	result = export_node(state->store, dg_content(state)->root, 0);
 	dg_release(state);
 	relation_close(rel, AccessShareLock);
 	SPI_finish();

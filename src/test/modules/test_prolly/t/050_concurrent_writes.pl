@@ -27,7 +27,7 @@ INSERT INTO stock SELECT g, 100000 FROM generate_series(1, 200) g;
 INSERT INTO account SELECT g, 1000 FROM generate_series(1, 50) g;
 ALTER DATABASE postgres SET default_transaction_isolation = 'repeatable read'});
 
-# The row journal (dolt_row_journal) loses updates here: it is off by default.
+# Concurrent new-order and payment clients must lose no updates.
 {
 	my $log_start = -s $node->logfile;
 	$node->pgbench(
@@ -76,14 +76,13 @@ END;
 		or diag(join("\n", @internal[0 .. ($#internal < 4 ? $#internal : 4)]));
 }
 
-# A committing writer writes its own chunks before it waits for another
-# publisher's lock on the table's root row: publishers of one table queue
-# only for the merge, not for each other's chunk writes.
+# A committing writer appends its changes to the delta store and never waits
+# on the table's root rows: only a fold or a tree's first base writes them,
+# so another session locking them does not hold up commits.
 {
 	my $before = sql('SELECT max(rootfile) FROM pg_dolt_root');
 	sql(q{CREATE TABLE publish(id int PRIMARY KEY, v int NOT NULL);
-INSERT INTO publish SELECT g, 0 FROM generate_series(1, 2000) g;
-CREATE EXTENSION pageinspect});
+INSERT INTO publish SELECT g, 0 FROM generate_series(1, 2000) g});
 
 	# The roots of the table and its index: the storage the table created.
 	my $holder = $node->background_psql('postgres');
@@ -93,18 +92,11 @@ CREATE EXTENSION pageinspect});
 	my $writer = $node->background_psql('postgres');
 	$writer->query_safe('BEGIN');
 	$writer->query_safe('UPDATE publish SET v = v + 1');
-	my $xid = $writer->query_safe('SELECT pg_current_xact_id()::xid');
-	$writer->query_until(qr/committing/, "\\echo committing\nCOMMIT;\n");
-	$node->poll_query_until('postgres',
-		"SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE backend_xid = '$xid' AND wait_event_type = 'Lock')")
-	  or die "writer never waited for the root row";
-	ok( sql(qq{SELECT count(*) FROM generate_series(0, pg_relation_size('pg_dolt_chunk') / 8192 - 1) b,
-heap_page_items(get_raw_page('pg_dolt_chunk', b::int)) i WHERE i.t_xmin = '$xid'}) > 0,
-		'a writer waiting for the root row has already written its chunks');
+	$writer->query_safe('COMMIT');
+	is(sql('SELECT sum(v) FROM publish'), '2000', 'the writer commits while the root rows are locked');
 	$holder->query_safe('COMMIT');
 	$holder->quit;
 	$writer->quit;
-	is(sql('SELECT sum(v) FROM publish'), '2000', 'the waiting writer publishes after the lock is released');
 }
 
 $node->stop;

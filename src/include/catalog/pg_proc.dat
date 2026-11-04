@@ -12566,6 +12566,14 @@
   proargmodes => '{o,o,o,o,o,o,o,o,o}',
   proargnames => '{hits,misses,added,evictions,rejected,entries,bytes,total_hits,total_misses}',
   prosrc => 'dolt_node_cache_stats_sql' },
+{ oid => '9135', descr => 'fold pending prolly delta versions into new bases now',
+  proname => 'dolt_fold', provolatile => 'v', proparallel => 'u',
+  prorettype => 'int4', proargtypes => '', prosrc => 'dolt_fold' },
+{ oid => '9136', descr => 'totals of the prolly delta store',
+  proname => 'dolt_delta_stats', provolatile => 'v', proparallel => 'r',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{int8,int8,int8,int8}', proargmodes => '{o,o,o,o}',
+  proargnames => '{trees,keys,versions,bytes}', prosrc => 'dolt_delta_stats' },
 
 
 # Internal manifest building blocks; superuser-only, not version-control commands.

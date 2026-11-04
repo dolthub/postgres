@@ -244,7 +244,7 @@ diff_table_working(const char *name, bool rows)
 	t->live = dg_storage_load(storage);
 	dg_storage_close(storage);
 	if (t->live->has_root)
-		t->rows = logical_rows_for(t, &t->live->content);
+		t->rows = logical_rows_for(t, dg_content(t->live));
 	return t;
 }
 

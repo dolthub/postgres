@@ -139,7 +139,7 @@ type_tables_rewrite(const char *root, const char *type, TypeRecode *recode)
 		Relation	rel = dg_catalog_write_table(dg_current_branch(), table, ACL_UPDATE);
 		DGState    *state = dg_load(rel, SnapshotSelf);
 		TupleDesc	desc = RelationGetDescr(rel);
-		PLTree		tree = state->content;
+		PLTree		tree = *dg_content(state);
 
 		if (recode)
 		{

@@ -47,22 +47,22 @@ sql(q{COMMIT PREPARED 'conflict'});
 sql(q{INSERT INTO t VALUES (40, 0) ON CONFLICT DO NOTHING});
 is(sql('SELECT v FROM t WHERE id = 40'), '400', 'and then finds its committed row');
 
-# Known issue: a prepared transaction holds its tables' root rows until it
-# ends, so every other commit to those tables waits, even one touching other
-# rows. Readers and other tables are unaffected.
+# A prepared transaction's changes wait in the delta store: other commits to
+# its tables, even PREPAREs, go ahead, and readers see its rows only once it
+# commits.
 sql(q{CREATE TABLE u(id int PRIMARY KEY)});
 sql(q{BEGIN; INSERT INTO t VALUES (50, 500); PREPARE TRANSACTION 'root'});
-($code, $out, $err) = $node->psql('postgres', q{SET lock_timeout = '500ms'; INSERT INTO t VALUES (51, 510)});
-like($err, qr/lock timeout/, 'a commit to a prepared transaction\'s table waits for it');
-($code, $out, $err) = $node->psql('postgres',
-	q{SET lock_timeout = '500ms'; BEGIN; INSERT INTO t VALUES (52, 520); PREPARE TRANSACTION 'second'});
-like($err, qr/lock timeout/, 'and so does a second PREPARE');
-is(sql('SELECT count(*) FROM t WHERE id >= 50'), '0', 'readers do not wait');
+sql(q{SET lock_timeout = '500ms'; INSERT INTO t VALUES (51, 510)});
+pass('a commit to a prepared transaction\'s table does not wait for it');
+sql(q{SET lock_timeout = '500ms'; BEGIN; INSERT INTO t VALUES (52, 520); PREPARE TRANSACTION 'second'});
+pass('nor does a second PREPARE');
+is(sql('SELECT count(*) FROM t WHERE id >= 50'), '1', 'readers see neither prepared row');
 sql(q{SET lock_timeout = '500ms'; INSERT INTO u VALUES (1)});
 pass('a commit to another table does not wait');
 sql(q{ROLLBACK PREPARED 'root'});
-sql(q{SET lock_timeout = '500ms'; INSERT INTO t VALUES (51, 510)});
-is(sql('SELECT count(*) FROM t WHERE id >= 50'), '1', 'ending the prepared transaction releases the table');
+sql(q{COMMIT PREPARED 'second'});
+is(sql('SELECT string_agg(id::text, \',\' ORDER BY id) FROM t WHERE id >= 50'), '51,52',
+	'the committed prepared row appears and the rolled back one does not');
 
 $node->stop;
 done_testing();

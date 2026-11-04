@@ -907,7 +907,7 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 					ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", name, dg_current_branch())));
 				present = dg_storage_resource_root(resource, dg_current_branch(), GetActiveSnapshot(), &content, &load);
 
-				/* Only a full load folds the journal into an index's content. */
+				/* A full load, when the roots alone cannot say. */
 				if (load)
 				{
 					DGStorage  *storage = dg_storage_open(CatalogViewLookupObject(view, RelationRelationId, name), dg_current_branch(), name, schema, resource, GetActiveSnapshot());
@@ -915,7 +915,7 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 					loaded = dg_storage_load(storage);
 					dg_storage_close(storage);
 					present = loaded->has_root;
-					content = loaded->content.root;
+					content = dg_content(loaded)->root;
 				}
 				if (present)
 				{
@@ -947,7 +947,7 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 								state = dg_storage_load(storage);
 								dg_storage_close(storage);
 							}
-							members[i] = PointerGetDatum(put(kinds[i], payload, VC_ARGS(PointerGetDatum(schema), PointerGetDatum(dg_history_export_tree(&state->content))), 2));
+							members[i] = PointerGetDatum(put(kinds[i], payload, VC_ARGS(PointerGetDatum(schema), PointerGetDatum(dg_history_export_tree(dg_content(state)))), 2));
 							if (state != loaded)
 								dg_release(state);
 						}

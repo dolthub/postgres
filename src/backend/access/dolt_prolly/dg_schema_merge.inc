@@ -320,8 +320,8 @@ merged_table_member(const char *name, const char *definition)
 	empty->cleanup.func = canonical_empty_cleanup;
 	empty->cleanup.arg = empty;
 	MemoryContextRegisterResetCallback(CurrentMemoryContext, &empty->cleanup);
-	dg_check(pl_build(empty->store, NULL, 0, &empty->content));
-	return canonical_empty_member("table", name, definition, &empty->content);
+	dg_check(pl_build(empty->store, NULL, 0, &empty->tree));
+	return canonical_empty_member("table", name, definition, &empty->tree);
 }
 
 /* ---- Rows across definitions ---- */
@@ -442,7 +442,7 @@ remap_rows(Relation rel, PLTree content, const char *definition, List *dropped, 
 					mapping[j] = i;
 		}
 		state.store = content.store;
-		state.content = content;
+		state.tree = content;
 		result = alter_rows(&state, oldcount, width, mapping, remap_field, &remap);
 	}
 	PG_FINALLY();

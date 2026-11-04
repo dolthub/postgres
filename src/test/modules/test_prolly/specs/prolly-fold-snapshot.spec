@@ -1,7 +1,7 @@
-# A transaction whose write folds a prolly table's journal into roots it saves
-# must go on reading its own snapshot: another session's commit after that
-# snapshot stays invisible to it, the versions it saw stay fetchable, and
-# updating a row the other session changed is a serialization failure.
+# A transaction that writes a prolly table must go on reading its own
+# snapshot: another session's commit after that snapshot stays invisible to
+# it, the versions it saw stay fetchable, and updating a row the other
+# session changed is a serialization failure.
 
 setup
 {

@@ -53,7 +53,7 @@ typedef struct DGScan
 	 * holds for the row. Backward scans materialize the rows instead.
 	 */
 	bool		streaming;
-	PLCursor	content;
+	DGCursor	content;
 	PLSlice		row;			/* the current entry's row */
 	uint64	   *handles;		/* its handles */
 	int			handle_count,
@@ -91,8 +91,7 @@ row_for_handle(DGState *state, PLSlice hash)
 
 	if (hash.len != PL_HASH_SIZE)
 		elog(ERROR, "invalid prolly row reference");
-	dg_check(pl_get(&state->content, hash, &value));
-	if (!value.present || value.bytes.len < 8)
+	if (!dg_get(state, hash, &value) || value.bytes.len < 8)
 		elog(ERROR, "missing canonical row contents");
 	row.data = value.bytes.data + 8;
 	row.len = value.bytes.len - 8;
@@ -125,7 +124,7 @@ begin(Relation rel, Snapshot snap, int nkeys, ScanKey key, ParallelTableScanDesc
 	scan->state = CatalogViewIsProvisional(rel->rd_catalogview) ? dg_catalog_mutation_load(rel, snap) : dg_load(rel, snap);
 	scan->streaming = !(flags & SO_TYPE_BITMAPSCAN) && !CatalogViewIsProvisional(rel->rd_catalogview) && scan->state->has_root;
 	if (scan->streaming)
-		dg_check(pl_cursor_init(&scan->content, &scan->state->content, NULL));
+		dg_cursor_init(&scan->content, scan->state, NULL, NULL);
 	else if (!(flags & SO_TYPE_BITMAPSCAN))
 		materialize(scan);
 	scan->position = -1;
@@ -170,7 +169,7 @@ materialize(DGScan *scan)
 	if (!scan->materialized)
 	{
 		scan->row_count = 0;
-		dg_check(pl_scan(&scan->state->content, NULL, NULL, collect_materialized, scan));
+		dg_scan_keep(scan->state, NULL, NULL, collect_materialized, scan);
 		scan->materialized = true;
 	}
 	scan->streaming = false;
@@ -196,7 +195,7 @@ rescan(TableScanDesc base, ScanKey key, bool set, bool strat, bool sync, bool pa
 	scan->bitmap_position = 0;
 	scan->handle_count = scan->handle_position = 0;
 	if (scan->streaming)
-		dg_check(pl_cursor_init(&scan->content, &scan->state->content, NULL));
+		dg_cursor_init(&scan->content, scan->state, NULL, NULL);
 	if (base->rs_flags & SO_TYPE_SEQSCAN)
 		pgstat_count_heap_scan(base->rs_rd);
 }
@@ -217,7 +216,7 @@ next_streamed(DGScan *scan, TupleTableSlot *slot)
 			ExecClearTuple(slot);
 			return false;
 		}
-		content = pl_cursor_entry(&scan->content);
+		content = dg_cursor_entry(&scan->content);
 		if (content.key.len != PL_HASH_SIZE || content.value.len < 8)
 			elog(ERROR, "invalid prolly scan entry");
 		memcpy(digest.bytes, content.key.data, PL_HASH_SIZE);
@@ -226,7 +225,7 @@ next_streamed(DGScan *scan, TupleTableSlot *slot)
 		scan->handle_count = dg_handles_of(scan->state, digest, (int64) pl_read64(content.value.data),
 										   &scan->handles, &scan->handle_capacity);
 		scan->handle_position = 0;
-		dg_check(pl_cursor_next(&scan->content));
+		dg_cursor_next(&scan->content);
 	}
 	dg_tid(scan->handles[scan->handle_position++], &tid);
 	dg_decode(scan->base.rs_rd, scan->row, &tid, slot);
@@ -338,7 +337,7 @@ bitmap_next(TableScanDesc base, TupleTableSlot *slot, bool *recheck,
 					MemoryContext old = MemoryContextSwitchTo(scan->context);
 
 					scan->page_count = 0;
-					dg_check(pl_scan(&scan->state->content, &lo, bounded ? &hi : NULL, collect_page_row, scan));
+					dg_scan_keep(scan->state, &lo, bounded ? &hi : NULL, collect_page_row, scan);
 					MemoryContextSwitchTo(old);
 					scan->page_scanned = true;
 					scan->bitmap_count = scan->page_count;
@@ -494,14 +493,14 @@ dg_stash_put(Oid relid, const DGState *state, uint64 handle, PLSlice row)
 	entry = hash_search(stash, &key, HASH_ENTER, &found);
 	if (found)
 	{
-		if (pl_hash_equal(entry->content, state->content.root))
+		if (pl_hash_equal(entry->content, dg_state_view(state)))
 			return;
 		stash_bytes -= entry->row.len;
 		pfree(unconstify(uint8 *, entry->row.data));
 	}
 	copy = MemoryContextAlloc(stash_memory, Max(row.len, 1));
 	memcpy(copy, row.data, row.len);
-	entry->content = state->content.root;
+	entry->content = dg_state_view(state);
 	entry->row.data = copy;
 	entry->row.len = row.len;
 	stash_bytes += row.len;
@@ -516,7 +515,7 @@ dg_stash_get(Oid relid, const DGState *state, uint64 handle, PLSlice *row)
 	if (!stash)
 		return false;
 	entry = hash_search(stash, &key, HASH_FIND, NULL);
-	if (!entry || !pl_hash_equal(entry->content, state->content.root))
+	if (!entry || !pl_hash_equal(entry->content, dg_state_view(state)))
 		return false;
 	*row = entry->row;
 	return true;
@@ -667,7 +666,7 @@ multiplicity(DGState *s, PLSlice row, int delta)
 	uint8	   *bytes;
 	PLEdit		edit;
 
-	dg_check(pl_get(&s->content, key, &old));
+	dg_check(pl_get(dg_content(s), key, &old));
 	count = old.present ? pl_read64(old.bytes.data) : 0;
 	if (old.present && (old.bytes.len != row.len + 8 || memcmp(old.bytes.data + 8, row.data, row.len)))
 		elog(ERROR, "canonical row hash collision");
@@ -681,7 +680,7 @@ multiplicity(DGState *s, PLSlice row, int delta)
 	edit.value.present = count > 0;
 	edit.value.bytes.data = bytes;
 	edit.value.bytes.len = 8 + row.len;
-	dg_check(pl_apply(&s->content, &edit, 1, &s->content));
+	dg_check(pl_apply(dg_content(s), &edit, 1, dg_content(s)));
 	pfree(bytes);
 }
 /*
@@ -1399,11 +1398,33 @@ dolt_prolly_table_handler(PG_FUNCTION_ARGS)
 void
 dg_history_install(Relation rel, DGState *state, PLTree contents)
 {
+	DGState    *latest = state;
+
 	/* Bound resources retain their original snapshot during root publication. */
 	if (rel->rd_catalogview)
 		PushCopiedSnapshot(GetActiveSnapshot());
-	dg_handle_install(rel, state, contents);
-	dg_save(rel, state, GetCurrentCommandId(true));
+
+	/*
+	 * An install replaces the whole table, which goes to the delta store as
+	 * its difference from the table's content. No other writer may change
+	 * the table until this transaction ends, and the difference is taken from
+	 * the latest content once the lock has waited out every writer before it,
+	 * so that the two never remove one row twice.
+	 */
+	if (!dg_storage_bound(rel) && !CatalogViewIsLeased(RelationGetRelid(rel)))
+	{
+		LockRelationOid(RelationGetRelid(rel), ExclusiveLock);
+		latest = dg_load(rel, SnapshotSelf);
+	}
+	dg_handle_install(rel, latest, contents);
+	dg_save(rel, latest, GetCurrentCommandId(true));
+	if (latest != state)
+	{
+		/* The caller's state now shows what the install wrote, already saved. */
+		dg_set_content(state, contents);
+		state->loaded = contents.root;
+		dg_release(latest);
+	}
 	CommandCounterIncrement();
 	UpdateActiveSnapshotCommandId();
 	dg_rebuild_indexes(rel);
