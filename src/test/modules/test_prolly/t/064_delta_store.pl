@@ -74,6 +74,50 @@ $reader->query_safe('COMMIT');
 $reader->quit;
 is(sql('SELECT count(*) FROM t WHERE id > 3000'), '0', 'and a new one sees the fold');
 
+# A commit applies each changed tree's delta to capture its root, and installs
+# that root as the tree's base, as a fold of its snapshot would: a fold after
+# it writes the same trees. A writer still running at the capture keeps its
+# version outside the base, and so do the capturing transaction's own later
+# writes.
+my $horizons = q{SELECT string_agg(rootxmax::text, ',' ORDER BY rootfile) FROM pg_dolt_root};
+my $contents = q{SELECT string_agg(encode(rootcontent, 'hex'), ',' ORDER BY rootfile) FROM pg_dolt_root};
+my $old_horizons = sql($horizons);
+sql(q{UPDATE t SET v = 'captured' WHERE id = 1});
+sql(q{SELECT dolt_commit('-Am', 'capture')});
+isnt(sql($horizons), $old_horizons, 'a commit installs the trees it captured as their bases');
+my $captured = sql($contents);
+sql('SELECT dolt_fold()');
+is(sql($contents), $captured, 'which are the trees a fold writes');
+sql(q{UPDATE t SET v = 'again' WHERE id = 1});
+my $running = $node->background_psql('postgres');
+$running->query_safe(q{BEGIN; INSERT INTO t VALUES (-2, 'running')});
+sql(q{SELECT dolt_commit('-am', 'capture again')});
+$running->query_safe('COMMIT');
+$running->quit;
+is(sql(q{SELECT v FROM t WHERE id IN (-2, 1) ORDER BY id}), "running\nagain", 'a writer running at the capture is not lost');
+sql(q{UPDATE t SET v = 'staged' WHERE id = 2});
+sql(q{BEGIN; SELECT dolt_add('.'); INSERT INTO t VALUES (-3, 'after'); COMMIT});
+is(sql(q{SET enable_seqscan = off; SELECT v FROM t WHERE v IN ('after', 'running', 'staged') ORDER BY v}), "after\nrunning\nstaged",
+	"nor are the capturing transaction's own later writes");
+sql('SELECT dolt_fold()');
+is(sql(q{SET enable_seqscan = off; SELECT count(*) FROM t WHERE v IN ('after', 'running', 'staged', 'again')}), '4', 'which a fold writes later');
+$expected = sql(q{SELECT count(*), sum(id), sum(length(v)) FROM t});
+$node->wait_for_catchup($standby);
+is($standby->safe_psql('postgres', q{SELECT count(*), sum(id), sum(length(v)) FROM t}), $expected,
+	'and the standby reads what the primary does');
+# An install rolls back with its savepoint, leaving the old base.
+sql(q{UPDATE t SET v = 'rolled back install' WHERE id = 4});
+$old_horizons = sql($horizons);
+sql(q{BEGIN; SAVEPOINT s; SELECT dolt_add('.'); ROLLBACK TO s; COMMIT});
+is(sql($horizons), $old_horizons, 'an install rolls back with its savepoint');
+is(sql(q{SET enable_seqscan = off; SELECT v FROM t WHERE id = 4}), 'rolled back install', 'and the change it held still reads');
+sql(q{UPDATE t SET v = 'crashed' WHERE id = 3});
+sql(q{SELECT dolt_commit('-am', 'before a crash')});
+$expected = sql(q{SELECT count(*), sum(id), sum(length(v)) FROM t});
+$node->stop('immediate');
+$node->start;
+is(sql(q{SELECT count(*), sum(id), sum(length(v)) FROM t}), $expected, 'recovery replays an installed base');
+
 $standby->stop;
 $node->stop;
 
@@ -96,6 +140,15 @@ is($busy->safe_psql('postgres', q{SELECT count(*), sum(id) FROM b}), '20000|2000
 ok($busy->poll_query_until('postgres', q{SELECT versions = 0 FROM dolt_delta_stats()}),
 	'and every version folds and is pruned');
 is($busy->safe_psql('postgres', q{SELECT count(*), sum(id) FROM b}), '20000|200010000', 'leaving the rows as they were');
+
+# The workers prune by a commit's installs as by folds, but not by one rolled
+# back with its savepoint: they keep the versions the old base lacks.
+$busy->safe_psql('postgres', q{UPDATE b SET v = -1 WHERE id = 1});
+$busy->safe_psql('postgres', q{BEGIN; SAVEPOINT s; SELECT dolt_add('.'); ROLLBACK TO s; COMMIT});
+ok($busy->poll_query_until('postgres', q{SELECT versions = 0 FROM dolt_delta_stats()}),
+	'the workers fold and prune after a rolled back install');
+is($busy->safe_psql('postgres', q{SET enable_seqscan = off; SELECT v FROM b WHERE id = 1}), '-1',
+	'without losing the change it held');
 $busy->stop;
 
 done_testing();

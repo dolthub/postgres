@@ -321,9 +321,10 @@ dg_storage_open(Oid definition, const char *branch, const char *name,
 /*
  * Storage |resource| on |branch|, read without building its definition, for
  * its content root: NULL if it holds none there (dg_storage_content_state).
+ * Sets |located| to the resource's file.
  */
 DGState *
-dg_storage_resource_state(Oid resource, const char *branch, Snapshot snapshot, bool *load)
+dg_storage_resource_state(Oid resource, const char *branch, Snapshot snapshot, RelFileLocator *located, bool *load)
 {
 	LockRelId	lock = {resource, MyDatabaseId};
 	Relation	catalog;
@@ -351,6 +352,7 @@ dg_storage_resource_state(Oid resource, const char *branch, Snapshot snapshot, b
 
 	/* The roots and this transaction's changes are the whole content. */
 	*load = false;
+	*located = locator;
 	return dg_storage_content_state(locator, branch, snapshot);
 }
 

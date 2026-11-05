@@ -901,11 +901,12 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 			if (!definitions_only)
 			{
 				bool		load;
+				RelFileLocator locator;
 				DGState    *loaded;
 
 				if (!OidIsValid(resource))
 					ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", name, dg_current_branch())));
-				loaded = dg_storage_resource_state(resource, dg_current_branch(), GetActiveSnapshot(), &load);
+				loaded = dg_storage_resource_state(resource, dg_current_branch(), GetActiveSnapshot(), &locator, &load);
 
 				/* A full load, when the roots alone cannot say. */
 				if (load)
@@ -937,13 +938,18 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 					 * A member that already records these contents is the
 					 * member this capture would make. Otherwise the member
 					 * names the new root, whose nodes the chunk store holds
-					 * once those this load built are written.
+					 * once those this load built are written, and that root
+					 * becomes the tree's base if a fold would have made it.
 					 */
 					if (!recorded || strcmp(recorded, root))
 					{
 						payload = json_set_string(payload, "content", root);
 						if (persist)
+						{
 							members[i] = PointerGetDatum(put(kinds[i], payload, VC_ARGS(PointerGetDatum(schema), PointerGetDatum(dg_history_retain(content))), 2));
+							if (!load)
+								dg_storage_install_capture(locator, dg_current_branch(), GetActiveSnapshot(), loaded);
+						}
 					}
 					dg_release(loaded);
 				}

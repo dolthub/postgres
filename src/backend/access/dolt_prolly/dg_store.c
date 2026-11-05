@@ -319,8 +319,14 @@ static uint64 store_epoch = 1;	/* moves when the working store is recreated */
 static DoltChunkStore *working_chunks;
 static DoltChunk working_fetched;
 
-/* Nodes this transaction wrote, to share once it commits. */
-static PLHash *written;
+/* Nodes this transaction wrote, to share once it commits, by subtransaction. */
+typedef struct WrittenNode
+{
+	PLHash		hash;
+	SubTransactionId subxid;
+} WrittenNode;
+
+static WrittenNode *written;
 static int	written_count;
 static int	written_capacity;
 
@@ -434,7 +440,7 @@ share_written(void)
 {
 	for (int i = 0; working_store && i < written_count; i++)
 	{
-		PLNode	   *node = pl_find_local(working_store, written[i]);
+		PLNode	   *node = pl_find_local(working_store, written[i].hash);
 
 		if (node)
 			dolt_node_cache_add(node->hash.bytes, node->data, node->size);
@@ -573,12 +579,15 @@ put_pending(Pending *pending, bool probe)
 	{
 		int			capacity = Max(written_count + n, written_capacity * 2);
 
-		written = written ? repalloc(written, capacity * sizeof(PLHash)) :
-			MemoryContextAlloc(TopTransactionContext, capacity * sizeof(PLHash));
+		written = written ? repalloc(written, capacity * sizeof(WrittenNode)) :
+			MemoryContextAlloc(TopTransactionContext, capacity * sizeof(WrittenNode));
 		written_capacity = capacity;
 	}
 	for (int i = 0; i < n; i++)
-		written[written_count++] = pending->nodes[i]->hash;
+	{
+		written[written_count].hash = pending->nodes[i]->hash;
+		written[written_count++].subxid = GetCurrentSubTransactionId();
+	}
 	pfree(hashes);
 	pfree(data);
 	pfree(lengths);
@@ -962,6 +971,24 @@ store_subxact(SubXactEvent event, SubTransactionId mySubid, SubTransactionId par
 	}
 	if (event != SUBXACT_EVENT_ABORT_SUB)
 		return;
+
+	/*
+	 * Nodes this subtransaction and its children wrote are gone: a later write
+	 * of the same node must store it again.
+	 */
+	for (int i = 0; i < written_count;)
+	{
+		if (written[i].subxid >= mySubid)
+		{
+			PLNode	   *node = working_store ? pl_find_local(working_store, written[i].hash) : NULL;
+
+			if (node)
+				pl_node_set_unbacked(node);
+			written[i] = written[--written_count];
+		}
+		else
+			i++;
+	}
 
 	/* Root rows from this subtransaction and its children, with ids >= it, are gone. */
 	foreach(lc, written_roots)
@@ -2050,6 +2077,91 @@ dg_storage_content_state(RelFileLocator locator, const char *branch, Snapshot sn
 	if (registered)
 		UnregisterSnapshot(read);
 	return s;
+}
+
+/*
+ * Offer the content of |s|, which dg_storage_content_state loaded for storage
+ * file |locator| on |branch| under |snapshot| and a capture has just retained,
+ * as the tree's next base, as Doltgrust's install_capture does: the base a
+ * fold of |snapshot| would write, so the fold worker need not apply the same
+ * versions again. It installs only what a fold would:
+ * - the transaction wrote no versions, which the new base must not hold;
+ * - the delta changed the base it loaded, and that base is still the newest
+ *   (a newer row would hold versions |snapshot| does not see);
+ * - no fold or other install of the tree is running.
+ * Its horizon is |snapshot|'s, with this transaction's own xid counted as
+ * running, so versions it writes later stay outside the base. Returns whether
+ * it installed one; otherwise nothing changes, which is always correct.
+ */
+bool
+dg_storage_install_capture(RelFileLocator locator, const char *branch, Snapshot snapshot, DGState *s)
+{
+	RootKey		key = root_key_of(locator.spcOid, locator.relNumber, branch);
+	DoltDeltaTree tree = delta_tree(&key);
+	Roots		read;
+	Roots		latest = {0};
+	Snapshot	now;
+	Relation	catalog;
+	ScanKeyData keys[3];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	ItemPointerData tid;
+	DoltDeltaHorizon horizon;
+	TransactionId own = GetTopTransactionIdIfAny();
+	PLTree	   *content;
+	bool		installed = false;
+
+	if (wrote_versions || !s->has_root || !snapshot || !IsMVCCSnapshot(snapshot))
+		return false;
+	content = dg_content(s);
+
+	/* The base |s| was loaded over, as the same snapshot reads it. */
+	read = roots_read(&key, snapshot);
+	if (!read.present || memcmp(content->root.bytes, read.content.bytes, PL_HASH_SIZE) == 0 || !ConditionalLockDatabaseObject(DoltRootRelationId, key.file,
+														(int32) hash_bytes((const unsigned char *) branch, strlen(branch)),
+														ExclusiveLock))
+		return false;
+	now = RegisterSnapshot(GetLatestSnapshot());
+	catalog = table_open(DoltRootRelationId, RowExclusiveLock);
+	root_scan_keys(&key, keys);
+	scan = systable_beginscan(catalog, DoltRootKeyIndexId, true, now, 3, keys);
+	tuple = systable_getnext(scan);
+	if (HeapTupleIsValid(tuple))
+	{
+		HeapTupleData locked;
+		Buffer		buffer = InvalidBuffer;
+		TM_FailureData failure;
+
+		latest = roots_from_tuple(tuple, RelationGetDescr(catalog));
+		tid = tuple->t_self;
+		locked.t_self = tid;
+		if (heap_lock_tuple(catalog, &locked, GetCurrentCommandId(true), LockTupleExclusive,
+							LockWaitSkip, false, &buffer, &failure) != TM_Ok)
+			latest.present = false;
+		if (BufferIsValid(buffer))
+			ReleaseBuffer(buffer);
+	}
+	systable_endscan(scan);
+	if (latest.present && memcmp(latest.content.bytes, read.content.bytes, PL_HASH_SIZE) == 0 &&
+		TransactionIdEquals(latest.horizon.xmin, read.horizon.xmin) &&
+		TransactionIdEquals(latest.horizon.xmax, read.horizon.xmax))
+	{
+		horizon.xmin = snapshot->xmin;
+		horizon.xmax = snapshot->xmax;
+		horizon.xcnt = snapshot->xcnt;
+		horizon.xip = palloc((snapshot->xcnt + 1) * sizeof(TransactionId));
+		memcpy(horizon.xip, snapshot->xip, snapshot->xcnt * sizeof(TransactionId));
+		if (TransactionIdIsValid(own) && TransactionIdPrecedes(own, snapshot->xmax))
+			horizon.xip[horizon.xcnt++] = own;
+		dg_tree_retain(content);
+		roots_write(catalog, &key, &tid, content->root, &horizon);
+		/* Under this subtransaction's xid, which rolls back with the row. */
+		dolt_delta_set_fold(&tree, GetCurrentTransactionId(), &horizon);
+		installed = true;
+	}
+	table_close(catalog, RowExclusiveLock);
+	UnregisterSnapshot(now);
+	return installed;
 }
 
 /*

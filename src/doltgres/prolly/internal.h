@@ -74,6 +74,7 @@ uint64_t	pl_child_rows(const PLNode *node, uint32_t index);
 PLNode	   *pl_find(PLStore *store, PLHash hash);
 PLNode	   *pl_find_local(PLStore *store, PLHash hash);
 void		pl_node_set_backed(PLNode *node);
+void		pl_node_set_unbacked(PLNode *node);
 void		pl_node_pin(PLStore *store, PLNode *node);
 void		pl_node_unpin(PLStore *store, PLNode *node);
 PLSlice		pl_node_key(const PLNode *node, uint32_t index);

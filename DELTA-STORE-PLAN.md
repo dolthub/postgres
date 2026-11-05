@@ -295,6 +295,35 @@ base. Plan (2026-11-04), after commits stop copying trees
 - The root row update and its FOLD WAL record follow the fold path, so pruning,
   standbys and readers treat the new base like any other fold.
 
+Done (2026-11-05, `dg_storage_install_capture`). As built:
+
+- A capture installs a tree's root when it retained that root for a changed
+  member, so `dolt_status` and other read-only captures install nothing.
+- The horizon is the capture's snapshot plus the capturing transaction's own
+  xid as running: its later writes in the same transaction stay outside the
+  base.
+- The FOLD record names the current subtransaction's xid, not the top
+  transaction's. An install rolled back with its savepoint otherwise left a
+  fold note that pruning took for committed, and the workers dropped versions
+  the restored base lacked (`test_doltgres/005_canonical_sql` lost a row).
+- Nodes written in a subtransaction that rolls back are marked unwritten again,
+  so a later capture in the same transaction writes them again.
+- FOLD redo no longer prunes during crash recovery or before a standby takes
+  snapshots: `GetOldestNonRemovableTransactionId` asserted there. Commits made
+  FOLD records before crashes common enough to expose it.
+
+Release build, folds left to `dolt_fold()`, 200,000-row table:
+
+| | merge base | now |
+|---|---|---|
+| one-row UPDATE, then `dolt_commit('-am')` | 472 ms | 1.0 ms |
+| `dolt_fold()` after that commit | 516 ms | 0.3 ms |
+| first commit after the bulk load | 970 ms | 590 ms |
+
+With the default fold settings, a fold worker often holds a freshly loaded
+tree's lock while a commit captures it; that commit then installs nothing and
+the next commit still applies the delta.
+
 ### 8. Things to settle while building
 
 - Branch rename rekeys memtable trees in the same transaction as its root

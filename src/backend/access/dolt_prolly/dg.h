@@ -133,7 +133,8 @@ extern bool dg_object_read(bytea *hash, const char *kind, char **actual, bytea *
 extern Oid	dg_storage_allocate(Relation definition, const char *branch);
 extern Oid	dg_storage_allocate_kind(char relkind, const char *branch);
 extern DGState *dg_storage_content_state(RelFileLocator locator, const char *branch, Snapshot snapshot);
-extern DGState *dg_storage_resource_state(Oid resource, const char *branch, Snapshot snapshot, bool *load);
+extern DGState *dg_storage_resource_state(Oid resource, const char *branch, Snapshot snapshot, RelFileLocator *located, bool *load);
+extern bool dg_storage_install_capture(RelFileLocator locator, const char *branch, Snapshot snapshot, DGState *s);
 extern bytea *dg_manifest_put(const char *kind, bytea *payload, struct ArrayType *children);
 extern bool dg_manifest_tree_edge(const char *kind, int index);
 
