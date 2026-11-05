@@ -12,6 +12,144 @@ typedef struct BundleObject
 	int state;
 } BundleObject;
 
+/*
+ * Append to |out| the nodes of the tree rooted at |root| that |seen| lacks, as
+ * [hex hash, base64 bytes] pairs after |count| others, reading them through
+ * |store|.
+ */
+static void
+bundle_tree(StringInfo out, int *count, PLStore *store, HTAB *seen, PLHash root)
+{
+	PLNode	   *node;
+	bool		found;
+	char	   *encoded;
+	int			length;
+
+	check_stack_depth();
+	CHECK_FOR_INTERRUPTS();
+	hash_search(seen, root.bytes, HASH_ENTER, &found);
+	if (found)
+		return;
+	node = pl_find(store, root);
+	if (!node)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("retained tree is missing from the chunk store")));
+	for (uint32 i = 0; node->level && i < node->count; i++)
+		bundle_tree(out, count, store, seen, pl_child_hash(node, i));
+	length = pg_b64_enc_len(node->size);
+	encoded = palloc(length + 1);
+	length = pg_b64_encode(node->data, node->size, encoded, length);
+	if (length < 0)
+		elog(ERROR, "could not encode a bundle chunk");
+	encoded[length] = '\0';
+	appendStringInfo(out, "%s[\"", (*count)++ ? "," : "");
+	for (int i = 0; i < PL_HASH_SIZE; i++)
+		appendStringInfo(out, "%02x", root.bytes[i]);
+	appendStringInfo(out, "\",\"%s\"]", encoded);
+	pfree(encoded);
+}
+
+/* The nodes of every tree the visible objects name, as a JSON array. */
+static char *
+bundle_chunks(void)
+{
+	StringInfoData out;
+	HASHCTL		control = {0};
+	HTAB	   *seen;
+	PLStore    *store = dg_private_store();
+	int			count = 0;
+	int			n;
+	char	  **kinds;
+	ArrayType **children;
+
+	control.keysize = PL_HASH_SIZE;
+	control.entrysize = PL_HASH_SIZE;
+	seen = hash_create("bundle chunks", 1024, &control, HASH_ELEM | HASH_BLOBS);
+	run("SELECT objkind,objchildren FROM pg_dolt_object_visible WHERE objkind IN ('table','index','schema','namespace') AND cardinality(objchildren)>0", 0, NULL, NULL, NULL, true);
+	n = SPI_processed;
+	kinds = palloc(sizeof(char *) * Max(n, 1));
+	children = palloc(sizeof(ArrayType *) * Max(n, 1));
+	for (int i = 0; i < n; i++)
+	{
+		kinds[i] = strcell(i, 1);
+		children[i] = DatumGetArrayTypePCopy(cell(i, 2));
+	}
+	initStringInfo(&out);
+	appendStringInfoChar(&out, '[');
+	for (int i = 0; i < n; i++)
+	{
+		Datum	   *values;
+		bool	   *nulls;
+		int			count_children;
+
+		deconstruct_array(children[i], BYTEAOID, -1, false, TYPALIGN_INT, &values, &nulls, &count_children);
+		for (int c = 0; c < count_children; c++)
+		{
+			bytea	   *edge = DatumGetByteaPP(values[c]);
+			PLHash		root;
+
+			if (!dg_manifest_tree_edge(kinds[i], c))
+				continue;
+			if (VARSIZE_ANY_EXHDR(edge) != PL_HASH_SIZE)
+				ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("invalid retained tree address")));
+			memcpy(root.bytes, VARDATA_ANY(edge), PL_HASH_SIZE);
+			bundle_tree(&out, &count, store, seen, root);
+		}
+	}
+	appendStringInfoChar(&out, ']');
+	hash_destroy(seen);
+	pl_store_free(store);
+	return out.data;
+}
+
+/* Put the chunks of bundle |payload| that the chunk store lacks, checking each. */
+static void
+bundle_import_chunks(const char *payload)
+{
+	int			n;
+	uint8	   *hashes;
+	const uint8 **data;
+	Size	   *lengths;
+	bool	   *found;
+	int			missing = 0;
+	DoltChunkStore *chunks;
+
+	run("SELECT decode(v->>0,'hex'),decode(v->>1,'base64') FROM jsonb_array_elements(COALESCE($1::jsonb->'chunks','[]'::jsonb)) v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(payload)), NULL, true);
+	n = SPI_processed;
+	if (!n)
+		return;
+	hashes = palloc((Size) n * PL_HASH_SIZE);
+	data = palloc(sizeof(uint8 *) * n);
+	lengths = palloc(sizeof(Size) * n);
+	found = palloc0(sizeof(bool) * n);
+	for (int i = 0; i < n; i++)
+	{
+		bytea	   *hash = DatumGetByteaPCopy(cell(i, 1));
+		bytea	   *bytes = DatumGetByteaPCopy(cell(i, 2));
+		PLSlice		slice = {(uint8 *) VARDATA_ANY(bytes), VARSIZE_ANY_EXHDR(bytes)};
+		PLHash		actual;
+
+		if (VARSIZE_ANY_EXHDR(hash) != PL_HASH_SIZE || !pl_node_address(slice, &actual) ||
+			memcmp(actual.bytes, VARDATA_ANY(hash), PL_HASH_SIZE))
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("backup chunk hash mismatch")));
+		memcpy(hashes + (Size) i * PL_HASH_SIZE, actual.bytes, PL_HASH_SIZE);
+		data[i] = slice.data;
+		lengths[i] = slice.len;
+	}
+	chunks = dolt_chunk_open(DOLT_CHUNK_WRITE);
+	dolt_chunk_exists_many(chunks, n, hashes, found);
+	for (int i = 0; i < n; i++)
+	{
+		if (found[i])
+			continue;
+		memmove(hashes + (Size) missing * PL_HASH_SIZE, hashes + (Size) i * PL_HASH_SIZE, PL_HASH_SIZE);
+		data[missing] = data[i];
+		lengths[missing++] = lengths[i];
+	}
+	if (missing)
+		dolt_chunk_put_many(chunks, missing, hashes, data, lengths);
+	dolt_chunk_close(chunks);
+}
+
 static char *
 bundle_path(const char *url)
 {
@@ -34,6 +172,7 @@ bundle_capture(void)
 	bytea **targets;
 	char *objects;
 	char *extensions;
+	char *chunks;
 	char **definitions;
 	int definition_count;
 	int count;
@@ -85,6 +224,7 @@ bundle_capture(void)
 	 * JSON is a framing format only; payload bytes retain their native codec. */
 	run("SELECT COALESCE(jsonb_agg(jsonb_build_array(dolt_hash_encode(objhash),objkind,encode(objpayload,'base64'),ARRAY(SELECT dolt_hash_encode(h) FROM unnest(objchildren) h))),'[]'::jsonb)::text FROM pg_dolt_object_visible", 0, NULL, NULL, NULL, true);
 	objects = strcell(0, 1);
+	chunks = bundle_chunks();
 	run("SELECT objhash FROM pg_dolt_object_visible WHERE objkind='sequence'", 0, NULL, NULL, NULL, true);
 	definition_count = SPI_processed;
 	{
@@ -107,7 +247,7 @@ bundle_capture(void)
 		appendStringInfoString(&sequences, sequence_capture(definitions[i]));
 	}
 	appendStringInfoChar(&sequences, ']');
-	return psprintf("{\"format\":\"DGBUNDLE1\",\"encoding\":%d,\"refs\":%s,\"objects\":%s,\"sequences\":%s,\"extensions\":%s}", GetDatabaseEncoding(), refs.data, objects, sequences.data, extensions);
+	return psprintf("{\"format\":\"DGBUNDLE1\",\"encoding\":%d,\"refs\":%s,\"objects\":%s,\"chunks\":%s,\"sequences\":%s,\"extensions\":%s}", GetDatabaseEncoding(), refs.data, objects, chunks, sequences.data, extensions);
 }
 
 static void
@@ -204,6 +344,8 @@ bundle_import_object(HTAB *objects, BundleObject *object)
 
 		if (nulls[i])
 			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("null backup child")));
+		if (dg_manifest_tree_edge(object->kind, i))
+			continue;			/* a tree root, put with the chunks */
 		key = hash_format(DatumGetByteaPP(children[i]));
 		child = hash_search(objects, key, HASH_FIND, NULL);
 		if (!child)
@@ -249,6 +391,7 @@ bundle_import(const char *url)
 		object->children = DatumGetArrayTypePCopy(cell(i, 4));
 		object->state = 0;
 	}
+	bundle_import_chunks(payload);
 	hash_seq_init(&scan, objects);
 	while ((object = hash_seq_search(&scan)) != NULL)
 		bundle_import_object(objects, object);

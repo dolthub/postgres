@@ -20,7 +20,7 @@ static bytea *
 canonical_empty_member(const char *kind, const char *name, const char *definition, PLTree * empty)
 {
 	bytea	   *schema = put("schema", definition, NULL, 0);
-	bytea	   *content = dg_history_export_tree(empty);
+	bytea	   *content = dg_history_retain(empty);
 	bytea	   *raw = palloc(VARHDRSZ + PL_HASH_SIZE);
 	char	   *payload;
 

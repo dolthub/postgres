@@ -531,45 +531,85 @@ collect_unbacked(PLStore *store, PLHash root, Pending *pending)
 	pending->nodes[pending->count++] = node;
 }
 
+/*
+ * Put |pending|'s nodes, remembering them to share once the transaction
+ * commits. With |probe|, nodes the chunk store already holds are skipped,
+ * since a put never deduplicates.
+ */
+static void
+put_pending(Pending *pending, bool probe)
+{
+	DoltChunkStore *chunks;
+	uint8	   *hashes;
+	const uint8 **data;
+	Size	   *lengths;
+	bool	   *found;
+	int			n = 0;
+
+	if (!pending->count)
+		return;
+	chunks = dolt_chunk_open(DOLT_CHUNK_WRITE);
+	hashes = palloc((Size) pending->count * DOLT_CHUNK_HASH_SIZE);
+	data = palloc(pending->count * sizeof(uint8 *));
+	lengths = palloc(pending->count * sizeof(Size));
+	found = palloc0(pending->count * sizeof(bool));
+	for (int i = 0; i < pending->count; i++)
+		memcpy(hashes + (Size) i * DOLT_CHUNK_HASH_SIZE, pending->nodes[i]->hash.bytes, DOLT_CHUNK_HASH_SIZE);
+	if (probe)
+		dolt_chunk_exists_many(chunks, pending->count, hashes, found);
+	for (int i = 0; i < pending->count; i++)
+	{
+		if (found[i])
+			continue;
+		memmove(hashes + (Size) n * DOLT_CHUNK_HASH_SIZE, pending->nodes[i]->hash.bytes, DOLT_CHUNK_HASH_SIZE);
+		data[n] = pending->nodes[i]->data;
+		lengths[n] = pending->nodes[i]->size;
+		pending->nodes[n++] = pending->nodes[i];
+	}
+	if (n)
+		dolt_chunk_put_many(chunks, n, hashes, data, lengths);
+	dolt_chunk_close(chunks);
+	if (written_count + n > written_capacity)
+	{
+		int			capacity = Max(written_count + n, written_capacity * 2);
+
+		written = written ? repalloc(written, capacity * sizeof(PLHash)) :
+			MemoryContextAlloc(TopTransactionContext, capacity * sizeof(PLHash));
+		written_capacity = capacity;
+	}
+	for (int i = 0; i < n; i++)
+		written[written_count++] = pending->nodes[i]->hash;
+	pfree(hashes);
+	pfree(data);
+	pfree(lengths);
+	pfree(found);
+	pfree(pending->nodes);
+}
+
 static void
 persist_roots(const Roots *roots)
 {
-	PLStore    *store = dg_working_store();
 	Pending		pending = {0};
 
 	if (!roots->present)
 		return;
-	collect_unbacked(store, roots->content, &pending);
-	if (pending.count)
-	{
-		DoltChunkStore *chunks = dolt_chunk_open(DOLT_CHUNK_WRITE);
-		uint8	   *hashes = palloc((Size) pending.count * DOLT_CHUNK_HASH_SIZE);
-		const uint8 **data = palloc(pending.count * sizeof(uint8 *));
-		Size	   *lengths = palloc(pending.count * sizeof(Size));
+	collect_unbacked(dg_working_store(), roots->content, &pending);
+	put_pending(&pending, false);
+}
 
-		for (int i = 0; i < pending.count; i++)
-		{
-			memcpy(hashes + (Size) i * DOLT_CHUNK_HASH_SIZE, pending.nodes[i]->hash.bytes, DOLT_CHUNK_HASH_SIZE);
-			data[i] = pending.nodes[i]->data;
-			lengths[i] = pending.nodes[i]->size;
-		}
-		dolt_chunk_put_many(chunks, pending.count, hashes, data, lengths);
-		dolt_chunk_close(chunks);
-		if (written_count + pending.count > written_capacity)
-		{
-			int			capacity = Max(written_count + pending.count, written_capacity * 2);
+/*
+ * Write the nodes of |tree| the chunk store lacks, so that history objects can
+ * name its root: that is, the nodes its store built or imported, not those it
+ * read from the chunk store. Nodes a store other than the working store built
+ * may already be stored, so they are probed first.
+ */
+void
+dg_tree_retain(const PLTree *tree)
+{
+	Pending		pending = {0};
 
-			written = written ? repalloc(written, capacity * sizeof(PLHash)) :
-				MemoryContextAlloc(TopTransactionContext, capacity * sizeof(PLHash));
-			written_capacity = capacity;
-		}
-		for (int i = 0; i < pending.count; i++)
-			written[written_count++] = pending.nodes[i]->hash;
-		pfree(hashes);
-		pfree(data);
-		pfree(lengths);
-		pfree(pending.nodes);
-	}
+	collect_unbacked(tree->store, tree->root, &pending);
+	put_pending(&pending, tree->store != working_store);
 }
 
 static bool callbacks_registered;
@@ -1686,7 +1726,7 @@ import_content(Relation rel, DGState *state, bytea *content)
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
 	PG_TRY();
 	{
-		dg_set_base(state, dg_history_import(state->store, content));
+		dg_set_base(state, dg_history_open(state->store, content));
 	}
 	PG_FINALLY();
 	{
@@ -1972,16 +2012,17 @@ index_table_key(Relation index, const char *branch, Relation *table)
 #include "dg_handle.inc"
 
 /*
- * The content root of storage file |locator| on |branch| as |snapshot| and this
- * transaction's own changes show it, as a load of its relation would: false
- * if the storage holds no root there.
+ * Storage file |locator| on |branch| as |snapshot| and this transaction's own
+ * changes show it, as a load of its relation would, for its content root
+ * (dg_content); NULL if the storage holds no root there. The caller releases
+ * it.
  */
-bool
-dg_storage_content_root(RelFileLocator locator, const char *branch, Snapshot snapshot, PLHash *content)
+DGState *
+dg_storage_content_state(RelFileLocator locator, const char *branch, Snapshot snapshot)
 {
 	RootKey		key = {0};
 	Roots		committed;
-	DGState    *s;
+	DGState    *s = NULL;
 	Snapshot	read;
 	bool		registered = false;
 
@@ -2005,12 +2046,10 @@ dg_storage_content_root(RelFileLocator locator, const char *branch, Snapshot sna
 		s = new_state(NULL);
 		state_set(s, &committed);
 		state_collect(s, &key, read, &committed, true);
-		*content = dg_content(s)->root;
-		dg_release(s);
 	}
 	if (registered)
 		UnregisterSnapshot(read);
-	return committed.present;
+	return s;
 }
 
 /*

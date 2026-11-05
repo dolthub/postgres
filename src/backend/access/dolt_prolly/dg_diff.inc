@@ -209,7 +209,7 @@ diff_table_at(bytea *db, const char *name, bool rows)
 	if (!rows)
 		return t;
 	t->store = dg_private_store();
-	content = dg_history_import(t->store, chunk);
+	content = dg_history_open(t->store, chunk);
 	t->rows = logical_rows_for(t, &content);
 	return t;
 }

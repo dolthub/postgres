@@ -398,6 +398,12 @@ PostgreSQL's own structures.
        - The tree a capture builds is not yet reused as a base; that is the
          next, separate step (see [the delta store plan](DELTA-STORE-PLAN.md)
          §7).
+     - Done (2026-11-05). Same benchmark, release build, one-row UPDATE
+       then `dolt_commit('-am')` on the 200,000-row table once its delta is
+       folded: 264 ms → 1.2 ms. A commit right after a bulk load still costs
+       ~280 ms, applying the unfolded delta; reusing that tree as the base is
+       the next step. The first commit of the 200,000-row load fell from
+       1.2 s to 0.7 s.
    - Resolve the working-state duplication found in the audit, including branch
      rename losing uncommitted work.
 7. **Garbage collection.** Define the reachability and safepoint protocol, then

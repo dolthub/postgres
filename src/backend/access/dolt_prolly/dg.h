@@ -132,9 +132,10 @@ extern struct _SPI_plan *dg_manifest_plan(const char *sql, int nargs, Oid *types
 extern bool dg_object_read(bytea *hash, const char *kind, char **actual, bytea **payload, struct ArrayType **children);
 extern Oid	dg_storage_allocate(Relation definition, const char *branch);
 extern Oid	dg_storage_allocate_kind(char relkind, const char *branch);
-extern bool dg_storage_content_root(RelFileLocator locator, const char *branch, Snapshot snapshot, PLHash *content);
-extern bool dg_storage_resource_root(Oid resource, const char *branch, Snapshot snapshot, PLHash *content, bool *load);
+extern DGState *dg_storage_content_state(RelFileLocator locator, const char *branch, Snapshot snapshot);
+extern DGState *dg_storage_resource_state(Oid resource, const char *branch, Snapshot snapshot, bool *load);
 extern bytea *dg_manifest_put(const char *kind, bytea *payload, struct ArrayType *children);
+extern bool dg_manifest_tree_edge(const char *kind, int index);
 
 /* A member of a database object: its hash, kind and, unless a namespace, name. */
 typedef struct DGMember
@@ -295,8 +296,9 @@ extern DGSchema *dg_schema_find(const char *json);
 extern void dg_schema_set_columns(DGSchema *schema, TupleDesc columns);
 extern void dg_schema_set_nodes(DGSchema *schema, uint32 part, int count, Node **nodes);
 extern void dg_schema_set_opclasses(DGSchema *schema, int count, Oid *types, Oid *opclasses);
-extern bytea *dg_history_export_tree(const PLTree * tree);
-extern PLTree dg_history_import(PLStore *store, bytea *address);
+extern void dg_tree_retain(const PLTree * tree);
+extern bytea *dg_history_retain(const PLTree * tree);
+extern PLTree dg_history_open(PLStore *store, bytea *address);
 extern void dg_history_install(Relation rel, DGState *state, PLTree contents);
 extern DGRows dg_rows(const PLTree * tree);
 extern DGRows dg_state_rows(DGState *s);

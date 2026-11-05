@@ -70,6 +70,8 @@
 #include "access/doltsystem.h"
 #include "catalog/pg_dolt_ref.h"
 #include "catalog/pg_dolt_object.h"
+#include "access/doltchunk.h"
+#include "common/base64.h"
 #include "mb/pg_wchar.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -898,63 +900,53 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 
 			if (!definitions_only)
 			{
-				PLHash		content;
 				bool		load;
-				bool		present;
-				DGState    *loaded = NULL;
+				DGState    *loaded;
 
 				if (!OidIsValid(resource))
 					ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", name, dg_current_branch())));
-				present = dg_storage_resource_root(resource, dg_current_branch(), GetActiveSnapshot(), &content, &load);
+				loaded = dg_storage_resource_state(resource, dg_current_branch(), GetActiveSnapshot(), &load);
 
 				/* A full load, when the roots alone cannot say. */
 				if (load)
 				{
 					DGStorage  *storage = dg_storage_open(CatalogViewLookupObject(view, RelationRelationId, name), dg_current_branch(), name, schema, resource, GetActiveSnapshot());
 
+					if (loaded)
+						dg_release(loaded);
 					loaded = dg_storage_load(storage);
 					dg_storage_close(storage);
-					present = loaded->has_root;
-					content = dg_content(loaded)->root;
+					if (!loaded->has_root)
+					{
+						dg_release(loaded);
+						loaded = NULL;
+					}
 				}
-				if (present)
+				if (loaded)
 				{
+					PLTree	   *content = dg_content(loaded);
 					bytea	   *raw = palloc(VARHDRSZ + PL_HASH_SIZE);
 					char	   *root;
 					char	   *recorded = json_value(payload, "content");
 
 					SET_VARSIZE(raw, VARHDRSZ + PL_HASH_SIZE);
-					memcpy(VARDATA(raw), content.bytes, PL_HASH_SIZE);
+					memcpy(VARDATA(raw), content->root.bytes, PL_HASH_SIZE);
 					root = hash_format(raw);
 
 					/*
 					 * A member that already records these contents is the
-					 * member this capture would make: its retained tree is
-					 * that root's. Only changed contents are loaded to be
-					 * retained.
+					 * member this capture would make. Otherwise the member
+					 * names the new root, whose nodes the chunk store holds
+					 * once those this load built are written.
 					 */
 					if (!recorded || strcmp(recorded, root))
 					{
 						payload = json_set_string(payload, "content", root);
 						if (persist)
-						{
-							DGState    *state = loaded;
-
-							if (!state)
-							{
-								DGStorage  *storage = dg_storage_open(CatalogViewLookupObject(view, RelationRelationId, name), dg_current_branch(), name, schema, resource, GetActiveSnapshot());
-
-								state = dg_storage_load(storage);
-								dg_storage_close(storage);
-							}
-							members[i] = PointerGetDatum(put(kinds[i], payload, VC_ARGS(PointerGetDatum(schema), PointerGetDatum(dg_history_export_tree(dg_content(state)))), 2));
-							if (state != loaded)
-								dg_release(state);
-						}
+							members[i] = PointerGetDatum(put(kinds[i], payload, VC_ARGS(PointerGetDatum(schema), PointerGetDatum(dg_history_retain(content))), 2));
 					}
-				}
-				if (loaded)
 					dg_release(loaded);
+				}
 			}
 			appendStringInfoString(&json, payload);
 		}

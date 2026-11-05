@@ -17,7 +17,8 @@ sql(q{CREATE ROLE reader IN ROLE pg_read_all_data; CREATE TABLE t(id int PRIMARY
 my $first = sql(q{SELECT dolt_commit('-Am','first')});
 my $schema = schema_hash();
 is(sql("SELECT convert_from(objpayload,'UTF8'),cardinality(objchildren) FROM pg_dolt_object WHERE objhash=decode('$schema','hex')"), 'DGSCHEMA2|1', 'schema envelope names one retained prolly root');
-is(sql("SELECT c.objkind FROM pg_dolt_object s JOIN pg_dolt_object c ON c.objhash=s.objchildren[1] WHERE s.objhash=decode('$schema','hex')"), 'chunk', 'canonical schema uses the same chunk store as table contents');
+is(sql("SELECT count(*)>0 FROM pg_dolt_object s JOIN pg_dolt_chunk c ON c.chunkhash=s.objchildren[1] WHERE s.objhash=decode('$schema','hex')"), 't', 'canonical schema uses the same chunk store as table contents');
+is(sql(q{SELECT count(*) FROM pg_dolt_object WHERE objkind='chunk'}), '0', 'no tree is copied into manifest objects');
 is(sql("SET ROLE reader; BEGIN READ ONLY; SELECT v FROM t AS OF '$first'; SELECT pg_current_xact_id_if_assigned() IS NULL; COMMIT"), "first\nt", 'cold schema-tree decoding needs no writes or elevated caller');
 sql(q{UPDATE t SET v='second'});
 my $second = sql(q{SELECT dolt_commit('-am','data only')});

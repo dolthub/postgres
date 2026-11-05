@@ -31,6 +31,11 @@
 
 #define DG_SCHEMA_TREE "DGSCHEMA2"
 
+/*
+ * Object kinds, by the id their hashes encode. Kind 0, "chunk", is retired:
+ * tree nodes live in the chunk store, under their node hashes, and objects
+ * name a tree by its root's (see tree_edge).
+ */
 static const char *const kinds[] = {"chunk", "schema", "table", "index", "database", "commit", "namespace", "tag", "merge", "routine", "rebase", "stash", "trigger", "type", "view", "sequence", "aggregate", "operator", "cast"};
 
 static void
@@ -147,6 +152,24 @@ statement_snapshot_push(void)
 	UpdateActiveSnapshotCommandId();
 }
 
+/*
+ * Whether child |index| of an object of kind id |id| is a tree edge: the root
+ * of a tree in the chunk store, named by its node hash, rather than another
+ * object. A table or index's second child is its content; a schema tree
+ * envelope's only child is its tree.
+ */
+static bool
+tree_edge(int id, int index)
+{
+	return ((id == 2 || id == 3) && index == 1) || ((id == 1 || id == 6) && index == 0);
+}
+
+bool
+dg_manifest_tree_edge(const char *kind, int index)
+{
+	return tree_edge(kind_id(kind), index);
+}
+
 /* The kind of visible object |hash|, under the active snapshot. */
 static char *
 object_kind(bytea *hash)
@@ -260,6 +283,8 @@ put_object(const char *kind, bytea *payload, ArrayType *children)
 
 	if (ARR_NDIM(children) > 1 || (ARR_NDIM(children) == 1 && ARR_LBOUND(children)[0] != 1))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("manifest children must be a one-dimensional array with lower bound 1")));
+	if (id == 0)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("tree nodes belong in the chunk store, not the manifest")));
 	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &links, &nulls, &n);
 	if (((id == 1 || id == 6) && n > 1) || ((id == 2 || id == 3) && n != 2) || (id == 5 && n < 1) || (id == 7 && n != 1) || (id == 8 && n != 3 && n < 5) || ((id == 9 || id >= 15) && n != 1) || (id == 10 && n != 2) || (id == 11 && n != 3))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid manifest child count for %s", kind)));
@@ -275,9 +300,22 @@ put_object(const char *kind, bytea *payload, ArrayType *children)
 
 		if (nulls[i])
 			ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("manifest child cannot be null")));
+		if (tree_edge(id, i))
+		{
+			bytea	   *root = DatumGetByteaPP(links[i]);
+			DoltChunkStore *chunks;
+			bool		stored;
+
+			check_hash(root);
+			chunks = dolt_chunk_open(DOLT_CHUNK_READ);
+			stored = dolt_chunk_exists(chunks, (const uint8 *) VARDATA_ANY(root));
+			dolt_chunk_close(chunks);
+			if (!stored)
+				ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("manifest %s names a tree the chunk store does not hold", kind)));
+			continue;
+		}
 		child = object_kind(DatumGetByteaPP(links[i]));
-		valid = (id == 0 || id == 1 || id == 6) ? strcmp(child, "chunk") == 0 :
-			(id == 2 || id == 3) ? strcmp(child, i == 0 ? "schema" : "chunk") == 0 :
+		valid = (id == 2 || id == 3) ? strcmp(child, "schema") == 0 :
 			id == 4 ? (strcmp(child, "table") == 0 || strcmp(child, "index") == 0 || strcmp(child, "namespace") == 0 || strcmp(child, "routine") == 0 || strcmp(child, "trigger") == 0 || strcmp(child, "type") == 0 || strcmp(child, "view") == 0 || strcmp(child, "sequence") == 0 || strcmp(child, "aggregate") == 0 || strcmp(child, "operator") == 0 || strcmp(child, "cast") == 0) :
 			id == 5 ? strcmp(child, i == 0 ? "database" : "commit") == 0 :
 			id == 7 ? strcmp(child, "commit") == 0 :
@@ -793,38 +831,15 @@ dolt_manifest_cas(PG_FUNCTION_ARGS)
 	PG_RETURN_BYTEA_P(token);
 }
 
-static bytea *
-export_node(PLStore *store, PLHash hash, int depth)
-{
-	PLNode	   *node = pl_find(store, hash);
-	Datum	   *children;
-	uint32		i,
-				count;
-
-	check_stack_depth();
-	if (!node || depth >= PL_MAX_DEPTH)
-		elog(ERROR, "invalid prolly export tree");
-	count = node->level ? node->count : 0;
-	children = palloc(sizeof(Datum) * Max(count, 1));
-	for (i = 0; i < count; i++)
-	{
-		PLHash		child;
-
-		child = pl_child_hash(node, i);
-		children[i] = PointerGetDatum(export_node(store, child, depth + 1));
-	}
-	return put_object("chunk", bytes(node->data, node->size), children_array(children, count));
-}
-
+/*
+ * The address by which objects name |tree|: its root's node hash, once every
+ * node of it is in the chunk store.
+ */
 bytea *
-dg_history_export_tree(const PLTree * tree)
+dg_history_retain(const PLTree * tree)
 {
-	bytea	   *result;
-
-	manifest_begin();
-	result = export_node(tree->store, tree->root, 0);
-	SPI_finish();
-	return result;
+	dg_tree_retain(tree);
+	return bytes(tree->root.bytes, PL_HASH_SIZE);
 }
 
 Datum
@@ -840,7 +855,7 @@ dolt_manifest_export(PG_FUNCTION_ARGS)
 		!(rel->rd_rel->relkind == RELKIND_INDEX && rel->rd_rel->relam == get_index_am_oid("dolt_prolly_index", false)))
 		dg_unsupported("manifest export of non-prolly relations");
 	state = dg_load(rel, GetActiveSnapshot());
-	result = export_node(state->store, dg_content(state)->root, 0);
+	result = dg_history_retain(dg_content(state));
 	dg_release(state);
 	relation_close(rel, AccessShareLock);
 	SPI_finish();
@@ -848,76 +863,20 @@ dolt_manifest_export(PG_FUNCTION_ARGS)
 }
 
 /*
- * Import retained canonical bytes, independently of the source relation's
- * lifetime. With |chunks|, a subtree the chunk store already holds is left
- * there, to be read through the shared node cache when needed: a chunk is
- * written only after every chunk it references.
+ * The tree whose root an object names at |address|, read through |store|,
+ * which fetches its nodes from the chunk store as it needs them.
  */
-static PLHash
-import_node(PLStore *store, DoltChunkStore *chunks, bytea *address, int depth)
-{
-	bytea	   *payload;
-	ArrayType  *children;
-	Datum	   *values;
-	bool	   *nulls;
-	bool	   *held;
-	int			n,
-				i;
-	PLSlice		bytes_;
-	PLHash		hash;
-	PLNode	   *node;
-
-	check_stack_depth();
-	if (depth >= PL_MAX_DEPTH)
-		elog(ERROR, "history chunk tree too deep");
-	if (!dg_object_read(address, "chunk", NULL, &payload, &children))
-		elog(ERROR, "missing history chunk");
-	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &values, &nulls, &n);
-	bytes_.data = (uint8 *) VARDATA(payload);
-	bytes_.len = VARSIZE(payload) - VARHDRSZ;
-	if (!pl_node_address(bytes_, &hash))
-		elog(ERROR, "history chunk hash failed");
-	dg_check(pl_store_import(store, hash, bytes_));
-	node = pl_find_local(store, hash);
-	if (n != (node->level ? (int) node->count : 0))
-		elog(ERROR, "history chunk children do not match its node");
-	held = palloc0(Max(n, 1) * sizeof(bool));
-	if (chunks && n > 0)
-	{
-		uint8	   *hashes = palloc((Size) n * PL_HASH_SIZE);
-
-		for (i = 0; i < n; i++)
-			memcpy(hashes + (Size) i * PL_HASH_SIZE, pl_child_hash(node, i).bytes, PL_HASH_SIZE);
-		dolt_chunk_exists_many(chunks, n, hashes, held);
-		pfree(hashes);
-	}
-	for (i = 0; i < n; i++)
-		if (!held[i] && !pl_find_local(store, pl_child_hash(node, i)))
-			import_node(store, chunks, DatumGetByteaP(values[i]), depth + 1);
-	pfree(held);
-	pfree(payload);
-	pfree(children);
-	pfree(values);
-	pfree(nulls);
-	return hash;
-}
-
 PLTree
-dg_history_import(PLStore *store, bytea *address)
+dg_history_open(PLStore *store, bytea *address)
 {
-	DoltChunkStore *chunks = store->fetch ? dolt_chunk_open(DOLT_CHUNK_READ) : NULL;
-	PLTree		result;
-	PLHash		hash;
+	PLTree		tree = {store};
 
-	hash = import_node(store, chunks, address, 0);
-	if (chunks)
-	{
-		dolt_chunk_close(chunks);
-		dg_check(pl_open_imported(store, hash, &result));
-	}
-	else
-		dg_check(pl_open(store, hash, &result));
-	return result;
+	if (VARSIZE_ANY_EXHDR(address) != PL_HASH_SIZE)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("invalid retained tree address")));
+	memcpy(tree.root.bytes, VARDATA_ANY(address), PL_HASH_SIZE);
+	if (!pl_find(store, tree.root))
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("retained tree is missing from the chunk store")));
+	return tree;
 }
 
 /* Canonical schema properties use the same node encoding and retained chunk
@@ -957,12 +916,10 @@ dg_schema_store(const char *kind, const char *json)
 				(uint8 *) value, strlen(value)
 			};
 		}
-		store = pl_store_create();
-		if (!store)
-			elog(ERROR, "cannot allocate schema tree");
+		store = dg_private_store();
 		dg_check(pl_build(store, entries, n, &tree));
 		{
-			Datum		root = PointerGetDatum(export_node(store, tree.root, 0));
+			Datum		root = PointerGetDatum(dg_history_retain(&tree));
 
 			result = put_object(kind, bytes(DG_SCHEMA_TREE, strlen(DG_SCHEMA_TREE)), children_array(&root, 1));
 		}
@@ -1009,10 +966,8 @@ dg_schema_decode(bytea *address, const char *kind)
 			size_t		i;
 			StringInfoData json;
 
-			store = pl_store_create();
-			if (!store)
-				elog(ERROR, "cannot allocate schema reader");
-			dg_check(pl_open(store, import_node(store, NULL, DatumGetByteaP(values[0]), 0), &tree));
+			store = dg_private_store();
+			tree = dg_history_open(store, DatumGetByteaP(values[0]));
 			rows = dg_rows(&tree);
 			initStringInfo(&json);
 			appendStringInfoChar(&json, '{');

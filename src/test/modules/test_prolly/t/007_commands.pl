@@ -148,6 +148,21 @@ is($session->query_safe('SHOW quote_all_identifiers'),'on','caller quoting resto
 $session->query_safe(q{SELECT * FROM dolt_diff_summary('HEAD','WORKING')});
 is($session->query_safe('SHOW search_path'),'public, pg_catalog','internal search_path restored');
 $session->quit;
+# A commit names each changed tree's root in the chunk store: it writes the
+# nodes the change made, not a copy of the tree.
+sql(q{CREATE TABLE wide(id int PRIMARY KEY, v text) USING dolt_prolly_table;
+      INSERT INTO wide SELECT g, repeat('x', 100) FROM generate_series(1, 20000) g;
+      SELECT dolt_commit('-Am', 'wide')});
+sql(q{SELECT dolt_fold()});
+my $nodes = sql(q{SELECT count(DISTINCT chunkhash) FROM pg_dolt_chunk});
+my $wide_objects = sql(q{SELECT count(*) FROM pg_dolt_object});
+sql(q{UPDATE wide SET v = 'y' WHERE id = 5000});
+my $wide = sql(q{SELECT dolt_commit('-am', 'one row')});
+cmp_ok(sql(q{SELECT count(DISTINCT chunkhash) FROM pg_dolt_chunk}) - $nodes, '<', 30, 'a one-row commit writes only the nodes it changed');
+cmp_ok(sql(q{SELECT count(*) FROM pg_dolt_object}) - $wide_objects, '<', 10, 'a one-row commit copies no tree into the manifest');
+is(sql(q{SELECT count(*) FROM pg_dolt_object WHERE objkind = 'chunk'}), '0', 'commits make no chunk objects');
+is(sql("SELECT v FROM wide AS OF '$wide' WHERE id = 5000"), 'y', 'the committed root reads back through the chunk store');
+cmp_ok($nodes, '>', 300, 'the table spans many nodes');
 sql(q{CREATE ROLE reader});
 fails(q{SET ROLE reader; SELECT * FROM dolt_log()},qr/permission denied/,'history authorization restricted');
 fails(q{SET ROLE reader; SELECT * FROM dolt_tags},qr/permission denied/,'tag view authorization restricted');
