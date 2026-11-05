@@ -150,17 +150,19 @@ rename_publish(CatalogView *view, Capture current, List *targets)
 	int			count,
 				used = 0;
 
-	run("SELECT t.objhash,t.objkind,CASE WHEN t.objkind<>'namespace' THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(current.hash)), NULL, true);
-	count = SPI_processed;
-	members = palloc_array(bytea *, Max(count, 1));
-	kinds = palloc_array(char *, Max(count, 1));
-	names = palloc_array(char *, Max(count, 1));
-	children = palloc_array(Datum, Max(count, 1));
-	for (int i = 0; i < count; i++)
 	{
-		members[i] = DatumGetByteaPCopy(cell(i, 1));
-		kinds[i] = strcell(i, 2);
-		names[i] = strcell(i, 3);
+		DGMember   *listed = dg_database_members(current.hash, &count);
+
+		members = palloc_array(bytea *, Max(count, 1));
+		kinds = palloc_array(char *, Max(count, 1));
+		names = palloc_array(char *, Max(count, 1));
+		children = palloc_array(Datum, Max(count, 1));
+		for (int i = 0; i < count; i++)
+		{
+			members[i] = listed[i].hash;
+			kinds[i] = (char *) listed[i].kind;
+			names[i] = strcmp(listed[i].kind, "namespace") ? (char *) listed[i].name : NULL;
+		}
 	}
 	initStringInfo(&json);
 	appendStringInfoChar(&json, '[');

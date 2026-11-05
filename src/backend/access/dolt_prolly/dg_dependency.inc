@@ -50,9 +50,8 @@ publish_deletions(List *objects, CatalogView *view)
 				used = 0;
 	bytea	   *database;
 	List	   *deleted_columns = NIL;
+	DGMember   *listed = dg_database_members(current.hash, &n);
 
-	run("SELECT o.objhash,o.objkind FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) h JOIN pg_dolt_object_visible o ON o.objhash=h WHERE d.objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(current.hash)), NULL, true);
-	n = SPI_processed;
 	hashes = palloc_array(bytea *, Max(n, 1));
 	kinds = palloc_array(char *, Max(n, 1));
 	definitions = palloc_array(char *, Max(n, 1));
@@ -62,8 +61,8 @@ publish_deletions(List *objects, CatalogView *view)
 	children = palloc_array(Datum, Max(n, 1));
 	for (int i = 0; i < n; i++)
 	{
-		hashes[i] = DatumGetByteaPCopy(cell(i, 1));
-		kinds[i] = strcell(i, 2);
+		hashes[i] = listed[i].hash;
+		kinds[i] = (char *) listed[i].kind;
 	}
 	for (int i = 0; i < n; i++)
 	{

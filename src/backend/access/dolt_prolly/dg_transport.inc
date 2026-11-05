@@ -48,9 +48,88 @@ bundle_tree(StringInfo out, int *count, PLStore *store, HTAB *seen, PLHash root)
 	pfree(encoded);
 }
 
-/* The nodes of every tree the visible objects name, as a JSON array. */
+/* Append chunk |hash|, read from |chunks|, as bundle_tree does a node. */
+static void
+bundle_chunk(StringInfo out, int *count, DoltChunkStore *chunks, const uint8 *hash)
+{
+	DoltChunk	chunk;
+	char	   *encoded;
+	int			length;
+
+	if (!dolt_chunk_get(chunks, hash, &chunk))
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("database root is missing from the chunk store")));
+	length = pg_b64_enc_len(chunk.length);
+	encoded = palloc(length + 1);
+	length = pg_b64_encode(chunk.data, chunk.length, encoded, length);
+	if (length < 0)
+		elog(ERROR, "could not encode a bundle chunk");
+	encoded[length] = '\0';
+	appendStringInfo(out, "%s[\"", (*count)++ ? "," : "");
+	for (int i = 0; i < PL_HASH_SIZE; i++)
+		appendStringInfo(out, "%02x", hash[i]);
+	appendStringInfo(out, "\",\"%s\"]", encoded);
+	pfree(encoded);
+	dolt_chunk_release(chunks, &chunk);
+}
+
+/* The sequence schemas the roots a bundle carries name, each once. */
+static List *bundle_sequences;
+
+typedef struct BundleRoot
+{
+	StringInfo	out;
+	int		   *count;
+	HTAB	   *seen;
+	DoltChunkStore *chunks;
+} BundleRoot;
+
+static void
+bundle_root_node(void *arg, const uint8 *hash, int level)
+{
+	BundleRoot *bundle = arg;
+	bool		found;
+
+	hash_search(bundle->seen, hash, HASH_ENTER, &found);
+	if (!found)
+		bundle_chunk(bundle->out, bundle->count, bundle->chunks, hash);
+}
+
+/* Append the nodes of database root |root| and of the content trees it names. */
+static void
+bundle_root(StringInfo out, int *count, PLStore *store, HTAB *seen, bytea *root)
+{
+	BundleRoot	bundle = {out, count, seen, dolt_chunk_open(DOLT_CHUNK_READ)};
+	DGRootEntry *entries;
+	int			n;
+
+	if (hash_search(seen, VARDATA_ANY(root), HASH_FIND, NULL))
+		return;
+	dg_root_nodes(root, bundle_root_node, &bundle);
+	dolt_chunk_close(bundle.chunks);
+	entries = dg_root_entries(root, &n);
+	for (int i = 0; i < n; i++)
+	{
+		if (entries[i].has_content)
+			bundle_tree(out, count, store, seen, entries[i].content);
+		if (!strcmp(entries[i].kind, "sequence"))
+		{
+			bytea	   *schema = bytes_of_hash(&entries[i].schema);
+			bool		listed = false;
+
+			foreach_ptr(bytea, known, bundle_sequences)
+				listed |= VARSIZE_ANY_EXHDR(known) == PL_HASH_SIZE && !memcmp(VARDATA_ANY(known), VARDATA_ANY(schema), PL_HASH_SIZE);
+			if (!listed)
+				bundle_sequences = lappend(bundle_sequences, schema);
+		}
+	}
+}
+
+/*
+ * The nodes of every tree and database root the visible objects name, and of
+ * the |nroots| roots |roots| refs name, as a JSON array.
+ */
 static char *
-bundle_chunks(void)
+bundle_chunks(bytea **roots, int nroots)
 {
 	StringInfoData out;
 	HASHCTL		control = {0};
@@ -64,7 +143,7 @@ bundle_chunks(void)
 	control.keysize = PL_HASH_SIZE;
 	control.entrysize = PL_HASH_SIZE;
 	seen = hash_create("bundle chunks", 1024, &control, HASH_ELEM | HASH_BLOBS);
-	run("SELECT objkind,objchildren FROM pg_dolt_object_visible WHERE objkind IN ('table','index','schema','namespace') AND cardinality(objchildren)>0", 0, NULL, NULL, NULL, true);
+	run("SELECT objkind,objchildren FROM pg_dolt_object_visible WHERE cardinality(objchildren)>0", 0, NULL, NULL, NULL, true);
 	n = SPI_processed;
 	kinds = palloc(sizeof(char *) * Max(n, 1));
 	children = palloc(sizeof(ArrayType *) * Max(n, 1));
@@ -87,6 +166,11 @@ bundle_chunks(void)
 			bytea	   *edge = DatumGetByteaPP(values[c]);
 			PLHash		root;
 
+			if (dg_manifest_root_edge(kinds[i], c))
+			{
+				bundle_root(&out, &count, store, seen, edge);
+				continue;
+			}
 			if (!dg_manifest_tree_edge(kinds[i], c))
 				continue;
 			if (VARSIZE_ANY_EXHDR(edge) != PL_HASH_SIZE)
@@ -95,6 +179,8 @@ bundle_chunks(void)
 			bundle_tree(&out, &count, store, seen, root);
 		}
 	}
+	for (int i = 0; i < nroots; i++)
+		bundle_root(&out, &count, store, seen, roots[i]);
 	appendStringInfoChar(&out, ']');
 	hash_destroy(seen);
 	pl_store_free(store);
@@ -224,18 +310,21 @@ bundle_capture(void)
 	 * JSON is a framing format only; payload bytes retain their native codec. */
 	run("SELECT COALESCE(jsonb_agg(jsonb_build_array(dolt_hash_encode(objhash),objkind,encode(objpayload,'base64'),ARRAY(SELECT dolt_hash_encode(h) FROM unnest(objchildren) h))),'[]'::jsonb)::text FROM pg_dolt_object_visible", 0, NULL, NULL, NULL, true);
 	objects = strcell(0, 1);
-	chunks = bundle_chunks();
-	run("SELECT objhash FROM pg_dolt_object_visible WHERE objkind='sequence'", 0, NULL, NULL, NULL, true);
-	definition_count = SPI_processed;
 	{
-		bytea **hashes = palloc(sizeof(bytea *) * definition_count);
+		bytea	  **roots = palloc(sizeof(bytea *) * Max(count, 1));
+		int			nroots = 0;
 
-		definitions = palloc(sizeof(char *) * definition_count);
-		for (int i = 0; i < definition_count; i++)
-			hashes[i] = DatumGetByteaPCopy(cell(i, 1));
-		for (int i = 0; i < definition_count; i++)
-			definitions[i] = metadata(child(hashes[i], 1), "schema");
+		for (int i = 0; i < count; i++)
+			if (!strncmp(names[i], "working/", 8) || !strncmp(names[i], "staged/", 7))
+				roots[nroots++] = targets[i];
+		bundle_sequences = NIL;
+		chunks = bundle_chunks(roots, nroots);
 	}
+	definition_count = list_length(bundle_sequences);
+	definitions = palloc(sizeof(char *) * Max(definition_count, 1));
+	foreach_ptr(bytea, schema, bundle_sequences)
+		definitions[foreach_current_index(schema)] = metadata(schema, "schema");
+	bundle_sequences = NIL;
 	initStringInfo(&sequences);
 	appendStringInfoChar(&sequences, '[');
 	for (int i = 0; i < definition_count; i++)
@@ -344,8 +433,8 @@ bundle_import_object(HTAB *objects, BundleObject *object)
 
 		if (nulls[i])
 			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("null backup child")));
-		if (dg_manifest_tree_edge(object->kind, i))
-			continue;			/* a tree root, put with the chunks */
+		if (dg_manifest_tree_edge(object->kind, i) || dg_manifest_root_edge(object->kind, i))
+			continue;			/* a tree or database root, put with the chunks */
 		key = hash_format(DatumGetByteaPP(children[i]));
 		child = hash_search(objects, key, HASH_FIND, NULL);
 		if (!child)

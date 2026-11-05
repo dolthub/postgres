@@ -161,6 +161,10 @@ my $wide = sql(q{SELECT dolt_commit('-am', 'one row')});
 cmp_ok(sql(q{SELECT count(DISTINCT chunkhash) FROM pg_dolt_chunk}) - $nodes, '<', 30, 'a one-row commit writes only the nodes it changed');
 cmp_ok(sql(q{SELECT count(*) FROM pg_dolt_object}) - $wide_objects, '<', 10, 'a one-row commit copies no tree into the manifest');
 is(sql(q{SELECT count(*) FROM pg_dolt_object WHERE objkind = 'chunk'}), '0', 'commits make no chunk objects');
+is(sql(q{SELECT count(*) FROM pg_dolt_object WHERE objkind IN ('database', 'table', 'index', 'sequence', 'routine', 'view')}), '0',
+	'database states and their members live in roots, not objects');
+is(sql("SELECT count(*) FROM pg_dolt_object c CROSS JOIN LATERAL dolt_root_find(c.objchildren[1], 'table', 'public.wide') m WHERE c.objhash = dolt_hash_decode('$wide') AND m.content IS NOT NULL"),
+	'1', 'a commit names a root that holds the table');
 is(sql("SELECT v FROM wide AS OF '$wide' WHERE id = 5000"), 'y', 'the committed root reads back through the chunk store');
 cmp_ok($nodes, '>', 300, 'the table spans many nodes');
 sql(q{CREATE ROLE reader});

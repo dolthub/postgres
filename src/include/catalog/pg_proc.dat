@@ -12577,6 +12577,14 @@
 
 
 # Internal manifest building blocks; superuser-only, not version-control commands.
+{ oid => '9042', descr => 'address of a schema definition object',
+  proname => 'dolt_schema_address', provolatile => 's', proparallel => 'u',
+  proisstrict => 't', prorettype => 'bytea', proargtypes => 'text',
+  prosrc => 'dolt_schema_address' },
+{ oid => '9043', descr => 'a database root rendered as JSON',
+  proname => 'dolt_root_json', provolatile => 's', proparallel => 'u',
+  proisstrict => 't', prorettype => 'text', proargtypes => 'bytea',
+  prosrc => 'dolt_root_json' },
 { oid => '9038', descr => 'internal database root builder',
   proname => 'dolt_root_put', provolatile => 'v', proparallel => 'u',
   proisstrict => 't', prorettype => 'bytea', proargtypes => '_text _text _bytea _bytea',

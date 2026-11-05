@@ -137,6 +137,7 @@ extern DGState *dg_storage_resource_state(Oid resource, const char *branch, Snap
 extern bool dg_storage_install_capture(RelFileLocator locator, const char *branch, Snapshot snapshot, DGState *s);
 extern bytea *dg_manifest_put(const char *kind, bytea *payload, struct ArrayType *children);
 extern bool dg_manifest_tree_edge(const char *kind, int index);
+extern bool dg_manifest_root_edge(const char *kind, int index);
 
 /* A member of a database root (dg_root.c): kind, qualified name, schema object, content root. */
 typedef struct DGRootEntry
@@ -147,10 +148,13 @@ typedef struct DGRootEntry
 	bool		has_content;
 	PLHash		content;
 } DGRootEntry;
-extern bytea *dg_root_build(const DGRootEntry *entries, int n, const char *encoding);
+extern bytea *dg_root_build(const DGRootEntry *entries, int n, const char *encoding, List *extensions);
 extern bool dg_root_find(bytea *root, const char *kind, const char *name, DGRootEntry *out);
 extern DGRootEntry *dg_root_entries(bytea *root, int *count);
 extern char *dg_root_encoding(bytea *root);
+extern List *dg_root_extensions(bytea *root);
+extern void dg_root_check(bytea *root);
+extern bool dg_root_creator(bytea *root, TransactionId *creator);
 extern void dg_root_nodes(bytea *root, void (*fn) (void *arg, const uint8 *hash, int level), void *arg);
 extern bytea *dg_member_ref(const DGRootEntry *entry);
 extern bool dg_is_member_ref(bytea *value);
@@ -279,6 +283,7 @@ extern bool dg_native_rewrite_active(void);
 extern void dg_release(DGState *state);
 extern void dg_branch_base(Relation rel, DGState *state);
 extern bytea *dg_schema_store(const char *kind, const char *json);
+extern bytea *dg_schema_address(const char *kind, const char *json);
 extern char *dg_schema_read(bytea *address, const char *kind);
 extern char *dg_schema_decode(bytea *address, const char *kind);
 

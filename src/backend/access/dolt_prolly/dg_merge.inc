@@ -189,10 +189,11 @@ merge_base(bytea *ours, bytea *theirs)
 static bytea *
 table_chunk(bytea *db, const char *name)
 {
-	run("SELECT o.objchildren[2] FROM pg_dolt_object_visible db CROSS JOIN LATERAL unnest(db.objchildren) ch JOIN pg_dolt_object_visible o ON o.objhash=ch WHERE db.objhash=$1 AND o.objkind='table' AND convert_from(o.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
-	if (SPI_processed != 1)
+	bytea	   *member = dg_database_member(db, "table", name);
+
+	if (!member)
 		elog(ERROR, "missing retained table: %s", name);
-	return (bytea *) DatumGetPointer(cell(0, 1));
+	return child(member, 2);
 }
 
 static int

@@ -76,13 +76,14 @@ sql(q{ALTER TABLE shifted DROP COLUMN trash; UPDATE shifted SET v=11 WHERE id=1;
 is(sql(q{SELECT * FROM shifted ORDER BY id}),"1|11\n2|20",'DROP before indexed columns remaps keys and rebuilds indexes');
 fails(q{INSERT INTO shifted VALUES(3,20)},qr/duplicate key/,'shifted unique index still enforces values');
 my $schema_before=sql(q{SELECT encode(bindschema,'hex') FROM pg_dolt_binding WHERE bindbranch='main' AND bindname='public.shifted'});
-my $content_before=sql(q{SELECT v->>'content' FROM pg_dolt_ref r JOIN pg_dolt_object_visible o ON o.objhash=r.reftarget CROSS JOIN LATERAL jsonb_array_elements(convert_from(o.objpayload,'UTF8')::jsonb->'members') v WHERE refname='working/main' AND v->>'name'='public.shifted'});
+my $content_before=sql(q{SELECT encode(m.content,'hex') FROM pg_dolt_ref r CROSS JOIN LATERAL dolt_root_find(r.reftarget,'table','public.shifted') m WHERE refname='working/main'});
 # Capture the preceding DML before comparing the canonical content root.
 sql(q{SELECT dolt_add('.')});
-$content_before=sql(q{SELECT v->>'content' FROM pg_dolt_ref r JOIN pg_dolt_object_visible o ON o.objhash=r.reftarget CROSS JOIN LATERAL jsonb_array_elements(convert_from(o.objpayload,'UTF8')::jsonb->'members') v WHERE refname='working/main' AND v->>'name'='public.shifted'});
+$content_before=sql(q{SELECT encode(m.content,'hex') FROM pg_dolt_ref r CROSS JOIN LATERAL dolt_root_find(r.reftarget,'table','public.shifted') m WHERE refname='working/main'});
+like($content_before,qr/^[0-9a-f]{40}$/,'the working root holds the table\'s content root');
 sql(q{ALTER TABLE shifted ADD COLUMN roundtrip text; ALTER TABLE shifted DROP COLUMN roundtrip});
 is(sql(q{SELECT encode(bindschema,'hex') FROM pg_dolt_binding WHERE bindbranch='main' AND bindname='public.shifted'}),$schema_before,'ADD then DROP restores byte-identical schema');
-is(sql(q{SELECT v->>'content' FROM pg_dolt_ref r JOIN pg_dolt_object_visible o ON o.objhash=r.reftarget CROSS JOIN LATERAL jsonb_array_elements(convert_from(o.objpayload,'UTF8')::jsonb->'members') v WHERE refname='working/main' AND v->>'name'='public.shifted'}),$content_before,'ADD then DROP restores byte-identical content root');
+is(sql(q{SELECT encode(m.content,'hex') FROM pg_dolt_ref r CROSS JOIN LATERAL dolt_root_find(r.reftarget,'table','public.shifted') m WHERE refname='working/main'}),$content_before,'ADD then DROP restores byte-identical content root');
 $a->quit;$b->quit;
 sql(q{SELECT dolt_commit('-Am','main altered')});
 $node->stop('immediate');$node->start;

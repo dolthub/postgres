@@ -67,7 +67,7 @@ is(sql(q{SELECT length(salt) FROM secrets}),'11','ALTER TABLE adds a column with
 # A database root lists, by name, the extensions whose objects its definitions use.
 sub root_extensions {
  my $ref=shift;
- return sql(qq{SELECT convert_from(o.objpayload, 'UTF8')::jsonb->'extensions' FROM pg_dolt_ref r JOIN pg_dolt_object_visible o ON o.objhash = r.reftarget WHERE r.refname = '$ref'});
+ return sql(qq{SELECT dolt_root_json(r.reftarget)::jsonb->'extensions' FROM pg_dolt_ref r WHERE r.refname = '$ref'});
 }
 is(root_extensions('working/main'),'["hstore", "pgcrypto", "server_test_ext"]','a root lists the extensions its definitions use');
 is(root_extensions('working/other'),'','and a root whose definitions use none lists none');

@@ -27,6 +27,8 @@
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "access/xact.h"
+#include "storage/proc.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
@@ -42,6 +44,7 @@
 #define ROOT_MAX_LEVEL 8
 
 #define TAG_ENCODING 1
+#define TAG_EXTENSIONS 2		/* extension names, each ending in NUL */
 
 #define FLAG_CONTENT 0x0001
 
@@ -393,11 +396,60 @@ root_field(bytea *root, uint8 tag)
 	return NULL;
 }
 
+/* Check that |root| names a database root the chunk store holds. */
+void
+dg_root_check(bytea *root)
+{
+	DoltChunkStore *chunks = dolt_chunk_open(DOLT_CHUNK_READ);
+	bool		stored = dolt_chunk_exists(chunks, root_hash(root));
+
+	dolt_chunk_close(chunks);
+	if (!stored)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("database root is not in the chunk store")));
+	node_cache_init();
+	(void) node_read(root_hash(root));
+}
+
 /* The server encoding |root| was built under. */
 char *
 dg_root_encoding(bytea *root)
 {
 	return root_field(root, TAG_ENCODING);
+}
+
+/* The extensions |root|'s definitions use, by name, in order. */
+List *
+dg_root_extensions(bytea *root)
+{
+	CachedNode *node;
+	uint32		at;
+	List	   *result = NIL;
+
+	node_cache_init();
+	node = node_read(root_hash(root));
+	at = get32(node->bytes + 12);
+	while (at && at + 3 <= node->length && node->bytes[at] != 0)
+	{
+		uint16		length = get16(node->bytes + at + 1);
+
+		if (at + 3 + length > node->length)
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("database root node is malformed")));
+		if (node->bytes[at] == TAG_EXTENSIONS)
+		{
+			const char *p = (const char *) node->bytes + at + 3;
+			const char *end = p + length;
+
+			while (p < end)
+			{
+				size_t		n = strnlen(p, end - p);
+
+				result = lappend(result, pnstrdup(p, n));
+				p += n + 1;
+			}
+		}
+		at += 3 + length;
+	}
+	return result;
 }
 
 static void
@@ -475,9 +527,30 @@ item_cost(int level, const RootItem *item)
 	return (level ? INDEX_STRIDE : LEAF_STRIDE) + item->length;
 }
 
-/* Encode |items| as a node of |level|, with |encoding| as the top node's field. */
+/* The top node's tagged fields: the encoding, then any extensions. */
+typedef struct TopFields
+{
+	const char *encoding;
+	List	   *extensions;
+} TopFields;
+
+static Size
+top_size(const TopFields *top)
+{
+	Size		size = 3 + strlen(top->encoding) + 1;
+
+	if (top->extensions)
+	{
+		size += 3;
+		foreach_ptr(char, name, top->extensions)
+			size += strlen(name) + 1;
+	}
+	return size;
+}
+
+/* Encode |items| as a node of |level|, with |top|'s fields if it is the top node. */
 static PLHash
-node_write(Built *built, int level, const RootItem *items, int n, const char *encoding)
+node_write(Built *built, int level, const RootItem *items, int n, const TopFields *top)
 {
 	Size		stride = level ? INDEX_STRIDE : LEAF_STRIDE;
 	Size		length = ROOT_HEADER + stride * n;
@@ -489,10 +562,10 @@ node_write(Built *built, int level, const RootItem *items, int n, const char *en
 
 	for (int i = 0; i < n; i++)
 		length += items[i].length;
-	if (encoding)
+	if (top)
 	{
 		extension = length;
-		length += 3 + strlen(encoding) + 1;
+		length += top_size(top);
 	}
 	bytes = palloc0(length);
 	memcpy(bytes, ROOT_MAGIC, 4);
@@ -522,11 +595,31 @@ node_write(Built *built, int level, const RootItem *items, int n, const char *en
 				memcpy(slot + 28, items[i].entry->content.bytes, PL_HASH_SIZE);
 		}
 	}
-	if (encoding)
+	if (top)
 	{
-		bytes[extension] = TAG_ENCODING;
-		put16(bytes + extension + 1, strlen(encoding));
-		memcpy(bytes + extension + 3, encoding, strlen(encoding));
+		Size		at = extension;
+
+		bytes[at] = TAG_ENCODING;
+		put16(bytes + at + 1, strlen(top->encoding));
+		memcpy(bytes + at + 3, top->encoding, strlen(top->encoding));
+		at += 3 + strlen(top->encoding);
+		if (top->extensions)
+		{
+			Size		start = at + 3;
+			Size		p = start;
+
+			bytes[at] = TAG_EXTENSIONS;
+			foreach_ptr(char, name, top->extensions)
+			{
+				memcpy(bytes + p, name, strlen(name) + 1);
+				p += strlen(name) + 1;
+			}
+			if (p - start > PG_UINT16_MAX)
+				ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("database root lists too many extensions")));
+			put16(bytes + at + 1, p - start);
+			at = p;
+		}
+		bytes[at] = 0;
 	}
 	slice.data = bytes;
 	slice.len = length;
@@ -550,9 +643,9 @@ node_write(Built *built, int level, const RootItem *items, int n, const char *en
  * the level above in |parents|, or the root when they fit one node.
  */
 static PLHash
-level_write(Built *built, int level, RootItem *items, int n, const char *encoding)
+level_write(Built *built, int level, RootItem *items, int n, const TopFields *top)
 {
-	Size		whole = ROOT_HEADER + 3 + strlen(encoding) + 1;
+	Size		whole = ROOT_HEADER + top_size(top);
 	RootItem	   *parents;
 	int			nparents = 0;
 	int			start = 0;
@@ -561,7 +654,7 @@ level_write(Built *built, int level, RootItem *items, int n, const char *encodin
 	for (int i = 0; i < n; i++)
 		whole += item_cost(level, &items[i]);
 	if (whole <= ROOT_BUDGET || n <= 1)
-		return node_write(built, level, items, n, encoding);
+		return node_write(built, level, items, n, top);
 	if (level >= ROOT_MAX_LEVEL)
 		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("database root is too large")));
 	parents = palloc(sizeof(RootItem) * n);
@@ -605,17 +698,86 @@ level_write(Built *built, int level, RootItem *items, int n, const char *encodin
 			size = ROOT_HEADER;
 		}
 	}
-	return level_write(built, level + 1, parents, nparents, encoding);
+	return level_write(built, level + 1, parents, nparents, top);
 }
 
 /*
- * Build the root of |n| members |entries|, under server encoding |encoding|:
- * write the chunks the store lacks, and return its address. Members must
- * have distinct keys.
+ * Roots this transaction wrote, with the subtransaction that wrote each, for
+ * dg_root_creator. In TopTransactionContext, so forgotten with the
+ * transaction, which |created_lxid| tells.
+ */
+typedef struct CreatedRoot
+{
+	uint8		hash[PL_HASH_SIZE];
+	TransactionId xid;
+} CreatedRoot;
+
+static HTAB *created_roots;
+static LocalTransactionId created_lxid = InvalidLocalTransactionId;
+
+static HTAB *
+created(bool make)
+{
+	if (created_lxid != MyProc->vxid.lxid)
+	{
+		created_roots = NULL;
+		created_lxid = InvalidLocalTransactionId;
+	}
+	if (!created_roots && make)
+	{
+		HASHCTL		ctl = {0};
+
+		ctl.keysize = PL_HASH_SIZE;
+		ctl.entrysize = sizeof(CreatedRoot);
+		ctl.hcxt = TopTransactionContext;
+		created_roots = hash_create("created database roots", 16, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		created_lxid = MyProc->vxid.lxid;
+	}
+	return created_roots;
+}
+
+static void
+note_created(const uint8 *hash)
+{
+	bool		found;
+	CreatedRoot *entry = hash_search(created(true), hash, HASH_ENTER, &found);
+
+	entry->xid = GetCurrentTransactionId();
+}
+
+/*
+ * Whether database root |root| can be read, and, as object_creator does for
+ * objects, the transaction that wrote it when that is this transaction (its
+ * only copy, which rolls back with it), else InvalidTransactionId. Unlike an
+ * object, a root needs no visibility check: its address comes only from a
+ * visible ref or object, and its bytes are fixed by its hash. So a read
+ * through the shared node cache serves, and costs no chunk store probe.
+ */
+bool
+dg_root_creator(bytea *root, TransactionId *creator)
+{
+	CreatedRoot *entry = created(false) ? hash_search(created_roots, root_hash(root), HASH_FIND, NULL) : NULL;
+
+	*creator = InvalidTransactionId;
+	if (entry && TransactionIdIsCurrentTransactionId(entry->xid))
+	{
+		*creator = entry->xid;
+		return true;
+	}
+	node_cache_init();
+	(void) node_read(root_hash(root));
+	return true;
+}
+
+/*
+ * Build the root of |n| members |entries|, under server encoding |encoding|,
+ * using |extensions|, sorted names: write the chunks the store lacks, and
+ * return its address. Members must have distinct keys.
  */
 bytea *
-dg_root_build(const DGRootEntry *entries, int n, const char *encoding)
+dg_root_build(const DGRootEntry *entries, int n, const char *encoding, List *extensions)
 {
+	TopFields	top = {encoding, extensions};
 	RootItem	   *items = palloc(sizeof(RootItem) * Max(n, 1));
 	Built		built = {0};
 	PLHash		root;
@@ -635,10 +797,12 @@ dg_root_build(const DGRootEntry *entries, int n, const char *encoding)
 	built.hashes = palloc((Size) built.capacity * PL_HASH_SIZE);
 	built.data = palloc(built.capacity * sizeof(uint8 *));
 	built.lengths = palloc(built.capacity * sizeof(Size));
-	root = level_write(&built, 0, items, n, encoding);
+	root = level_write(&built, 0, items, n, &top);
 
 	/* Write the chunks the store lacks: a put never deduplicates. */
 	{
+		bool		root_written = false;
+
 		DoltChunkStore *chunks = dolt_chunk_open(DOLT_CHUNK_WRITE);
 		bool	   *found = palloc0(built.count * sizeof(bool));
 		int			missing = 0;
@@ -648,6 +812,8 @@ dg_root_build(const DGRootEntry *entries, int n, const char *encoding)
 		{
 			if (found[i])
 				continue;
+			if (memcmp(built.hashes + (Size) i * PL_HASH_SIZE, root.bytes, PL_HASH_SIZE) == 0)
+				root_written = true;
 			memmove(built.hashes + (Size) missing * PL_HASH_SIZE, built.hashes + (Size) i * PL_HASH_SIZE, PL_HASH_SIZE);
 			built.data[missing] = built.data[i];
 			built.lengths[missing++] = built.lengths[i];
@@ -655,6 +821,8 @@ dg_root_build(const DGRootEntry *entries, int n, const char *encoding)
 		if (missing)
 			dolt_chunk_put_many(chunks, missing, built.hashes, (const uint8 *const *) built.data, built.lengths);
 		dolt_chunk_close(chunks);
+		if (root_written)
+			note_created(root.bytes);
 	}
 	result = palloc(VARHDRSZ + PL_HASH_SIZE);
 	SET_VARSIZE(result, VARHDRSZ + PL_HASH_SIZE);
@@ -777,7 +945,7 @@ dolt_root_put(PG_FUNCTION_ARGS)
 		if (!contentnulls[i])
 			hash_from(DatumGetByteaPP(contents[i]), &entries[i].content);
 	}
-	PG_RETURN_BYTEA_P(dg_root_build(entries, n, GetDatabaseEncodingName()));
+	PG_RETURN_BYTEA_P(dg_root_build(entries, n, GetDatabaseEncodingName(), NIL));
 }
 
 /* dolt_root_members(root): the members of a root, in key order. */

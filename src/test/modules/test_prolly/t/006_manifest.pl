@@ -35,7 +35,7 @@ my $schema = put('schema', 'test-schema-v1:id=int4,value=text');
 is(put('schema', 'test-schema-v1:id=int4,value=text'), $schema, 'immutable object deduplication');
 my $schema_payload = 'test-schema-v1:id=int4,value=text';
 is($schema, substr(sha256_hex('DGMOBJ01' . pack('NNN', 1, 0, length($schema_payload)) . $schema_payload), 0, 40), 'object envelope matches independent truncated SHA-256 encoding');
-my $empty = put('database', 'test-db-v1:empty');
+my $empty = sql(q{SELECT encode(dolt_root_put('{}','{}','{}','{}'),'hex')});
 my $c1 = put('commit', 'author=test;message=initial', $empty);
 my $c2 = put('commit', 'author=test;message=second', $empty, $c1);
 is(put('commit', 'author=test;message=initial', $empty), $c1, 'identical commit encoding deterministic');
@@ -44,16 +44,20 @@ my $t1 = sql(cas('heads/probe', undef, $c1));
 is(readref('heads/probe'), $c1, 'create and read HEAD');
 is(readref('heads/missing'), '', 'absent ref returns null fields');
 failure(cas('heads/probe', undef, $c1), qr/duplicate key/, 'concurrent-style duplicate creation rejected');
-failure(cas('heads/bad', undef, $empty), qr/requires commit/, 'HEAD requires commit object');
+failure(cas('heads/bad', undef, $empty), qr/not visible/, 'HEAD requires commit object');
+failure(cas('working/bad', undef, $c1), qr/not in the chunk store/, 'a working set requires a database root');
 failure(q{SELECT dolt_manifest_put('commit',''::bytea,ARRAY[]::bytea[])}, qr/child count/, 'commit needs database child');
-failure(q{SELECT dolt_manifest_put('table',''::bytea,ARRAY[decode(repeat('00',20),'hex'),decode(repeat('00',20),'hex')])}, qr/not visible/, 'dangling children rejected');
+failure(q{SELECT dolt_manifest_put('tag',''::bytea,ARRAY[decode(repeat('00',20),'hex')])}, qr/not visible/, 'dangling children rejected');
+failure(q{SELECT dolt_manifest_put('commit',''::bytea,ARRAY[decode(repeat('00',20),'hex')])}, qr/not in the chunk store/, 'dangling database roots rejected');
+failure(q{SELECT dolt_manifest_put('table',''::bytea,ARRAY[]::bytea[])}, qr/belong in database roots/, 'members are not manifest objects');
+failure(q{SELECT dolt_manifest_put('database',''::bytea,ARRAY[]::bytea[])}, qr/belong in database roots/, 'nor are database states');
 failure(q{SELECT dolt_manifest_put('schema',''::bytea,ARRAY[NULL,NULL]::bytea[])}, qr/child count/, 'schema child count validated');
-failure(q{SELECT dolt_manifest_put('database',''::bytea,ARRAY[NULL]::bytea[])}, qr/cannot be null/, 'null children rejected');
+failure(q{SELECT dolt_manifest_put('tag',''::bytea,ARRAY[NULL]::bytea[])}, qr/cannot be null/, 'null children rejected');
 failure(q{SELECT dolt_manifest_put('chunk',''::bytea,ARRAY[]::bytea[])}, qr/belong in the chunk store/, 'tree nodes are not manifest objects');
-failure("SELECT dolt_manifest_put('table',''::bytea,ARRAY[".hasharg($schema).",decode(repeat('00',20),'hex')])", qr/chunk store does not hold/, 'tree edges must name stored nodes');
+failure(q{SELECT dolt_manifest_put('schema',convert_to('DGSCHEMA2','UTF8'),ARRAY[decode(repeat('00',20),'hex')])}, qr/chunk store does not hold/, 'tree edges must name stored nodes');
 failure(q{SELECT dolt_manifest_get('\x00'::bytea)}, qr/20 bytes/, 'invalid hash size rejected');
 failure(cas('main', undef, $c1), qr/heads\//, 'ref namespace checked');
-failure("SELECT dolt_manifest_put('database',''::bytea,ARRAY[".hasharg($c1)."])", qr/invalid commit child/, 'typed DAG edges enforced');
+failure("SELECT dolt_manifest_put('rebase',''::bytea,ARRAY[".hasharg($schema).",".hasharg($schema)."])", qr/invalid schema child/, 'typed DAG edges enforced');
 
 # Snapshot semantics, own writes, rollback and ABA.
 my $reader = $node->background_psql('postgres', on_error_stop => 0);
@@ -163,9 +167,7 @@ sql(q{CREATE TABLE same(LIKE p) USING dolt_prolly_table; INSERT INTO same SELECT
 is(sql(q{SELECT encode(dolt_manifest_export('same'),'hex')}), $chunk, 'export ignores relation identity and insertion history');
 sql('DROP TABLE same');
 
-my $table = put('table', 'test-table-v1:public.p', $schema, $chunk);
-my $index = put('index', 'test-index-v1:public.p_pkey', $schema, $indexchunk);
-my $database = put('database', 'test-db-v1:public.p,public.p_pkey', $table, $index);
+my $database = sql("SELECT encode(dolt_root_put('{table,index}','{public.p,public.p_pkey}',ARRAY[".hasharg($schema).",".hasharg($schema)."],ARRAY[".hasharg($chunk).",".hasharg($indexchunk)."]),'hex')");
 my $commit = put('commit', 'author=test;message=captured', $database, $c2);
 sql(cas('tags/captured', undef, $commit));
 is(sql(q{SELECT count(*) FROM pg_dolt_object WHERE objkind='chunk'}), '0', 'trees are not copied into manifest objects');
@@ -182,7 +184,7 @@ is(sql("SELECT octet_length(payload) FROM dolt_manifest_get(".hasharg($large).")
 my $main_token = token('heads/probe');
 my $preparer = $node->background_psql('postgres');
 $preparer->query_safe('BEGIN');
-my $prepared_db = $preparer->query_safe(q{SELECT encode(dolt_manifest_put('database','prepared-state'::bytea,ARRAY[]::bytea[]),'hex')});
+my $prepared_db = $preparer->query_safe(q{SELECT encode(dolt_root_put('{namespace}','{prepared}',ARRAY[decode(repeat('11',20),'hex')],'{NULL}'),'hex')});
 my $prepared_commit = $preparer->query_safe("SELECT encode(dolt_manifest_put('commit','prepared-history'::bytea,ARRAY[".hasharg($prepared_db).','.hasharg($commit)."]),'hex')");
 $preparer->query_safe(cas('heads/probe', $main_token, $prepared_commit));
 $preparer->query_safe(cas('working/probe', undef, $prepared_db));

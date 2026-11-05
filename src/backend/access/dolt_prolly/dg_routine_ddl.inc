@@ -90,15 +90,28 @@ objects_publish(const char *kind, List *removed, const char *prefix, bool all, L
 				BoolGetDatum(all), CStringGetTextDatum(kind), CStringGetTextDatum(prefix ? prefix : "\x01")),
 		NULL, true);
 	json = strcell(0, 1);
-	run(psprintf("SELECT o.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) h JOIN pg_dolt_object_visible o ON o.objhash=h CROSS JOIN LATERAL (SELECT CASE WHEN o.objkind=$5 THEN convert_from(o.objpayload,'UTF8')::jsonb END AS v) p WHERE d.objhash=$1 AND NOT coalesce(%s, false)", matches),
-		6, VC_TYPES(BYTEAOID, TEXTOID, TEXTOID, BOOLOID, TEXTOID, TEXTOID),
-		VC_ARGS(PointerGetDatum(current.hash), CStringGetTextDatum(names.data), CStringGetTextDatum(payloads.data),
-				BoolGetDatum(all), CStringGetTextDatum(kind), CStringGetTextDatum(prefix ? prefix : "\x01")),
-		NULL, true);
-	n = SPI_processed;
-	members = palloc_array(Datum, n + list_length(definitions) + 1);
-	for (int i = 0; i < n; i++)
-		members[i] = cell(i, 1);
+	{
+		int			count;
+		DGMember   *listed = dg_database_members(current.hash, &count);
+
+		/* The members the JSON above kept: all but the matching |kind| ones. */
+		n = 0;
+		members = palloc_array(Datum, count + list_length(definitions) + 1);
+		for (int i = 0; i < count; i++)
+		{
+			bool		match = false;
+
+			if (!strcmp(listed[i].kind, kind))
+			{
+				match = all || (prefix && strncmp(listed[i].name, prefix, strlen(prefix)) == 0);
+				foreach_ptr(char, name, removed)
+					match |= !strcmp(name, listed[i].name);
+			}
+
+			if (!match)
+				members[n++] = PointerGetDatum(listed[i].hash);
+		}
+	}
 	foreach_ptr(char, definition, definitions)
 		members[n++] = PointerGetDatum(object_member(kind, definition));
 	database = canonical_database(json, members, n);
