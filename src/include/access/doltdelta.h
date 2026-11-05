@@ -84,7 +84,12 @@ extern uint64 dolt_delta_count(const DoltDeltaTree *tree);
 
 extern void dolt_delta_pin(TransactionId xmin);
 extern void dolt_delta_unpin(void);
-extern void dolt_delta_set_fold(const DoltDeltaTree *tree, TransactionId fold, const DoltDeltaHorizon *horizon);
+extern void dolt_delta_set_fold(const DoltDeltaTree *tree, TransactionId fold, const DoltDeltaHorizon *horizon,
+								const uint8 *root, const uint8 *base, const DoltDeltaHorizon *base_horizon);
+
+/* Rebuild a fold's tree in recovery, if the chunk store lacks it (dg_store.c). */
+extern void dg_refold(const DoltDeltaTree *tree, const DoltDeltaHorizon *horizon, const uint8 *root,
+					  const uint8 *base, const DoltDeltaHorizon *base_horizon);
 extern uint64 dolt_delta_prune(const DoltDeltaTree *tree);
 extern uint64 dolt_delta_prune_all(bool all);
 extern int	dolt_delta_due(Oid db, int versions, int timeout_ms, DoltDeltaTree *due, int max);

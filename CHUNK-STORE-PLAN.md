@@ -273,13 +273,27 @@ PostgreSQL's own structures.
 
 ## Unlogged chunk journal (selected 2026-11-05)
 
-Status, 2026-11-05: steps 1 and 2 are done on branch
-`zachmu/unlogged-chunk-journal` (`b8b84528227`). TPC-C at 10 threads went
-from 419 to 540 tps with every chunk logged, and to 683 tps with unlogged
-folds. WAL fell from 239 KB to 41 KB per transaction: 33 KB of row edits and
-8 KB of lock records
-([report](/workspace/reports/unlogged-chunk-journal/index.html)). Step 3 is
-next.
+Status, 2026-11-05: steps 1–3 are done. Steps 1 and 2 merged as
+`1b726d44e5c`. TPC-C at 10 threads went from 419 to 540 tps with every chunk
+logged, and to 683 tps with unlogged folds. WAL fell from 239 KB to 41 KB per
+transaction: 33 KB of row edits and 8 KB of lock records
+([report](/workspace/reports/unlogged-chunk-journal/index.html)). Step 3
+(branch `zachmu/standby-refold`) made unlogged folds the default:
+
+- FOLD records carry the base root, the base's horizon and the new root.
+- Replay of a FOLD record whose root the journal lacks rebuilds the tree
+  (`dg_refold`) from that base and the versions the fold's horizon sees. It
+  writes the nodes unlogged and stops replay if the root differs.
+- This runs in the startup process, before the fold's commit makes the base
+  visible and before pruning drops its versions.
+- Crash recovery skips any fold whose chunks were made durable, since its
+  root is present.
+- Restartpoints fsync the journal, so a standby rebuilds only what it had not
+  made durable.
+
+A deliberately mismatched root is not tested yet: no test can forge a FOLD
+record. Step 4 (unlogged captures) is deferred, since commits are rare in the
+benchmarks.
 
 **Why.** Under TPC-C (scale 1, one thread), the heap store made the WAL
 342 KB per transaction against stock's 5.5 KB

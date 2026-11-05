@@ -821,10 +821,10 @@ struct config_bool ConfigureNamesBool[] =
 	{
 		{"dolt_unlogged_folds", PGC_SIGHUP, WAL_SETTINGS,
 			gettext_noop("Writes the trees prolly folds make without logging their chunks."),
-			gettext_noop("A fold's chunks are then durable at its commit, but standbys do not receive them.")
+			gettext_noop("A fold's chunks are then durable at its commit, and standbys and recovery rebuild them from the logged edits.")
 		},
 		&dolt_unlogged_folds,
-		false,
+		true,
 		NULL, NULL, NULL
 	},
 

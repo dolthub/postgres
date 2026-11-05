@@ -50,9 +50,11 @@ typedef struct xl_dolt_delta_version
 #define SizeOfDoltDeltaVersion (offsetof(xl_dolt_delta_version, rowlen) + sizeof(uint32))
 
 /*
- * A fold wrote a tree's base holding the versions |xmin|, |xmax| and the
- * running xids that follow say: a standby prunes them by it once the fold has
- * committed and its own snapshots read past it.
+ * A fold wrote a tree's base |root| holding the versions |xmin|, |xmax| and the
+ * running xids that follow say, over the base |base| that held those its own
+ * horizon says (none if |base_xmax| is invalid). A standby that lacks |root|
+ * builds it from |base| and the versions it replayed, and prunes them once the
+ * fold has committed and its own snapshots read past it.
  */
 typedef struct xl_dolt_delta_fold
 {
@@ -63,8 +65,13 @@ typedef struct xl_dolt_delta_fold
 	TransactionId xmin;
 	TransactionId xmax;
 	uint32		xcnt;
+	TransactionId base_xmin;
+	TransactionId base_xmax;
+	uint32		base_xcnt;
+	uint8		root[20];
+	uint8		base[20];
 	uint16		branchlen;
-	/* branch name, then xcnt running xids */
+	/* branch name, then xcnt running xids, then base_xcnt of the base's */
 } xl_dolt_delta_fold;
 
 #define SizeOfDoltDeltaFold (offsetof(xl_dolt_delta_fold, branchlen) + sizeof(uint16))

@@ -31,9 +31,11 @@ dolt_delta_desc(StringInfo buf, XLogReaderState *record)
 		xl_dolt_delta_fold header;
 
 		memcpy(&header, rec, SizeOfDoltDeltaFold);
-		appendStringInfo(buf, "tree %u/%u/%u branch %.*s; fold %u holds xmin %u xmax %u with %u running",
+		appendStringInfo(buf, "tree %u/%u/%u branch %.*s; fold %u holds xmin %u xmax %u with %u running; root %02x%02x%02x%02x over %02x%02x%02x%02x",
 						 header.db, header.space, header.file, (int) header.branchlen,
-						 rec + SizeOfDoltDeltaFold, header.fold, header.xmin, header.xmax, header.xcnt);
+						 rec + SizeOfDoltDeltaFold, header.fold, header.xmin, header.xmax, header.xcnt,
+						 header.root[0], header.root[1], header.root[2], header.root[3],
+						 header.base[0], header.base[1], header.base[2], header.base[3]);
 	}
 }
 

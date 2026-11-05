@@ -62,6 +62,12 @@ is(sql(q{SET enable_seqscan = off; SELECT count(*) FROM t WHERE v = 'late'}), '1
 $node->wait_for_catchup($standby);
 is($standby->safe_psql('postgres', q{SELECT count(*), sum(id), sum(length(v)) FROM t}), $expected,
 	'and so does the standby');
+my $bases_present = q{SELECT count(*) FILTER (WHERE dolt_chunk_read(rootcontent) IS NULL) || '/' || count(*) FROM pg_dolt_root WHERE rootxmax::text <> '0'};
+like($standby->safe_psql('postgres', $bases_present), qr{^0/[1-9]}, 'which rebuilt every folded base it replayed, though the fold logged none of its chunks');
+$standby->stop('immediate');
+$standby->start;
+is($standby->safe_psql('postgres', q{SELECT count(*), sum(id), sum(length(v)) FROM t}), $expected,
+	'and reads the same after a crash, rebuilding again what it had not made durable');
 
 # A snapshot older than the fold keeps reading the old base and the versions.
 my $reader = $node->background_psql('postgres');
@@ -154,8 +160,8 @@ $node->start;
 is(sql(q{SELECT count(*), sum(id), sum(length(v)) FROM t}), $expected, 'recovery replays an installed base');
 $standby->stop;
 
-# With dolt_unlogged_folds, a fold logs none of the chunks it writes. They are
-# durable once the fold commits, so a crash right after it loses none.
+# By default (dolt_unlogged_folds) a fold logs none of the chunks it writes.
+# They are durable once the fold commits, so a crash right after it loses none.
 sql(q{CREATE TABLE unlogged_fold(id int PRIMARY KEY, v text);
 INSERT INTO unlogged_fold SELECT g, repeat(md5(g::text), 2) FROM generate_series(1, 20000) g});
 sql('SELECT dolt_fold()');
@@ -169,9 +175,10 @@ sub fold_wal
 	return (sql(qq{SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(), '$wal')}),
 		sql(q{SELECT count(*) FROM dolt_chunk_list()}) - $chunks);
 }
+sql(q{ALTER SYSTEM SET dolt_unlogged_folds = off; SELECT pg_reload_conf()});
 my ($logged_wal, $logged_chunks) = fold_wal('logged fold');
 cmp_ok($logged_wal, '>', $logged_chunks * 1000, "a logged fold logs its $logged_chunks chunks ($logged_wal bytes of WAL)");
-sql(q{ALTER SYSTEM SET dolt_unlogged_folds = on; SELECT pg_reload_conf()});
+sql(q{ALTER SYSTEM RESET dolt_unlogged_folds; SELECT pg_reload_conf()});
 my ($unlogged_wal, $unlogged_chunks) = fold_wal('unlogged fold');
 cmp_ok($unlogged_chunks, '>', 100, "an unlogged fold writes $unlogged_chunks chunks");
 cmp_ok($unlogged_wal, '<', $logged_wal / 20, "and logs none of them ($unlogged_wal bytes of WAL)");
@@ -180,7 +187,6 @@ $node->stop('immediate');
 $node->start;
 is(sql(q{SELECT count(*), sum(length(v)) FILTER (WHERE v = 'unlogged fold') FROM unlogged_fold}), $expected,
 	'a crash after an unlogged fold loses none of its tree');
-sql(q{ALTER SYSTEM RESET dolt_unlogged_folds; SELECT pg_reload_conf()});
 
 $node->stop;
 

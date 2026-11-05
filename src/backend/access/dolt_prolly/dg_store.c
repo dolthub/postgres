@@ -677,6 +677,131 @@ dg_storage_fold_root(DGState *s, bool unlogged)
 }
 
 /*
+ * Rebuilding a fold in recovery. A fold's nodes may skip the WAL, so a
+ * standby, or crash recovery of a fold that never committed, builds the
+ * tree itself when it replays the fold's record: from the base the record
+ * names and the versions its horizon sees, which the WAL brought. Prolly trees
+ * depend only on their contents, so it gets the root the record names, or
+ * replay stops. Recovery has no transaction, so this reads and writes through
+ * a store of its own instead of the working store.
+ */
+static DoltChunkStore *refold_chunks;
+static DoltChunk refold_fetched;
+
+static PLStatus
+refold_fetch(void *arg, PLHash hash, PLSlice *bytes)
+{
+	Size		length;
+	const uint8 *cached = dolt_node_cache_get(hash.bytes, &length);
+
+	if (cached)
+	{
+		bytes->data = cached;
+		bytes->len = length;
+		return PL_OK;
+	}
+	if (refold_fetched.pin)
+		dolt_chunk_release(refold_chunks, &refold_fetched);
+	if (!dolt_chunk_get(refold_chunks, hash.bytes, &refold_fetched))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("prolly chunk is missing from the chunk store")));
+	bytes->data = refold_fetched.data;
+	bytes->len = refold_fetched.length;
+	dolt_node_cache_add(hash.bytes, bytes->data, bytes->len);
+	return PL_OK;
+}
+
+/* Write a rebuilt fold's batch, unlogged, and drop it, as fold_flush does. */
+static void
+refold_flush(PLStore *store)
+{
+	int			n = 0;
+	uint8	   *hashes = palloc(Max(store->unbacked_count, 1) * DOLT_CHUNK_HASH_SIZE);
+	const uint8 **data = palloc(Max(store->unbacked_count, 1) * sizeof(uint8 *));
+	Size	   *lengths = palloc(Max(store->unbacked_count, 1) * sizeof(Size));
+
+	for (size_t i = 0; i < store->unbacked_count; i++)
+	{
+		PLNode	   *node = store->unbacked[i];
+
+		if (node->backed)
+			continue;
+		memcpy(hashes + (Size) n * DOLT_CHUNK_HASH_SIZE, node->hash.bytes, DOLT_CHUNK_HASH_SIZE);
+		data[n] = node->data;
+		lengths[n++] = node->size;
+		dolt_node_cache_add(node->hash.bytes, node->data, node->size);
+	}
+	if (n)
+		dolt_chunk_put_many(refold_chunks, n, hashes, data, lengths);
+	for (size_t i = 0; i < store->unbacked_count; i++)
+		if (!store->unbacked[i]->backed)
+			pl_node_set_backed(store->unbacked[i]);
+	pl_store_drop_backed(store);
+	pfree(hashes);
+	pfree(data);
+	pfree(lengths);
+}
+
+void
+dg_refold(const DoltDeltaTree *tree, const DoltDeltaHorizon *horizon, const uint8 *root,
+		  const uint8 *base, const DoltDeltaHorizon *base_horizon)
+{
+	MemoryContext memory = AllocSetContextCreate(CurrentMemoryContext, "prolly refold", ALLOCSET_DEFAULT_SIZES);
+	MemoryContext old = MemoryContextSwitchTo(memory);
+	SnapshotData snapshot = {0};
+	DGState    *s;
+	PLStore    *store;
+	PLHash		built;
+
+	refold_chunks = dolt_chunk_open(DOLT_CHUNK_WRITE_UNLOGGED);
+	if (dolt_chunk_exists(refold_chunks, root))
+	{
+		dolt_chunk_close(refold_chunks);
+		refold_chunks = NULL;
+		MemoryContextSwitchTo(old);
+		MemoryContextDelete(memory);
+		return;
+	}
+
+	/* The fold's view: what its snapshot saw committed, less what its base held. */
+	snapshot.snapshot_type = SNAPSHOT_MVCC;
+	snapshot.xmin = horizon->xmin;
+	snapshot.xmax = horizon->xmax;
+	snapshot.xip = horizon->xip;
+	snapshot.xcnt = horizon->xcnt;
+	snapshot.curcid = FirstCommandId;
+	store = pl_store_create();
+	if (!store)
+		ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("out of memory creating prolly store")));
+	pl_store_set_fetch(store, refold_fetch, NULL);
+	s = palloc0(sizeof(DGState));
+	memcpy(s->tree.root.bytes, base, PL_HASH_SIZE);
+	s->tree.store = store;
+	dg_state_view_delta(s, tree, &snapshot, TransactionIdIsValid(base_horizon->xmax) ? base_horizon : NULL, false);
+	PG_TRY();
+	{
+		built = dg_fold_content(s, store, refold_flush);
+	}
+	PG_FINALLY();
+	{
+		if (refold_fetched.pin)
+			dolt_chunk_release(refold_chunks, &refold_fetched);
+		dolt_chunk_close(refold_chunks);
+		refold_chunks = NULL;
+		pl_store_free(store);
+	}
+	PG_END_TRY();
+	if (memcmp(built.bytes, root, PL_HASH_SIZE) != 0)
+		ereport(FATAL,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("rebuilt prolly fold of tree %u/%u/%u on branch \"%s\" does not match its logged root",
+						tree->db, tree->space, tree->file, tree->branch)));
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(memory);
+}
+
+/*
  * Write the nodes of |tree| the chunk store lacks, so that history objects can
  * name its root: that is, the nodes its store built or imported, not those it
  * read from the chunk store. Nodes a store other than the working store built
@@ -2271,7 +2396,7 @@ dg_storage_install_capture(RelFileLocator locator, const char *branch, Snapshot 
 			horizon.xip[horizon.xcnt++] = own;
 		roots_write(catalog, &key, &tid, root, &horizon);
 		/* Under this subtransaction's xid, which rolls back with the row. */
-		dolt_delta_set_fold(&tree, GetCurrentTransactionId(), &horizon);
+		dolt_delta_set_fold(&tree, GetCurrentTransactionId(), &horizon, root.bytes, read.content.bytes, &read.horizon);
 		installed = true;
 	}
 	table_close(catalog, RowExclusiveLock);
@@ -2350,7 +2475,8 @@ dg_fold_tree(Oid space, RelFileNumber file, const char *branch)
 			horizon.xcnt = snapshot->xcnt;
 			horizon.xip = snapshot->xip;
 			roots_write(catalog, &key, &tid, root, &horizon);
-			dolt_delta_set_fold(&tree, GetTopTransactionId(), &horizon);
+			dolt_delta_set_fold(&tree, GetTopTransactionId(), &horizon, root.bytes, committed.content.bytes,
+								&committed.horizon);
 			folded = true;
 		}
 		dg_release(s);
