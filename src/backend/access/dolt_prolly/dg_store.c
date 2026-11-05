@@ -769,6 +769,13 @@ typedef struct Modified
 	SubTransactionId subxid;
 } Modified;
 
+/*
+ * Row versions this transaction created, by inserting or updating, which a
+ * heap tuple's xmin would show: the foreign key checks of an update that keeps
+ * its keys may be skipped only for a version an earlier transaction made.
+ */
+static HTAB *created;
+
 static HTAB *modified;
 
 /* The tables a serializable transaction wrote, rechecked before it publishes. */
@@ -977,6 +984,7 @@ store_xact(XactEvent event, void *arg)
 			handle_local_invalidate();
 			batches = NULL;
 			modified = NULL;
+			created = NULL;
 			/* A prepared writer stays registered until readers find it finished. */
 			if (serializable_count && event != XACT_EVENT_PREPARE)
 				writer_forget(GetTopTransactionIdIfAny(), -1);
@@ -1069,6 +1077,15 @@ store_subxact(SubXactEvent event, SubTransactionId mySubid, SubTransactionId par
 		while ((row = hash_seq_search(&status)) != NULL)
 			if (row->subxid >= mySubid)
 				hash_search(modified, &row->key, HASH_REMOVE, NULL);
+	}
+	if (created)
+	{
+		Modified   *row;
+
+		hash_seq_init(&status, created);
+		while ((row = hash_seq_search(&status)) != NULL)
+			if (row->subxid >= mySubid)
+				hash_search(created, &row->key, HASH_REMOVE, NULL);
 	}
 }
 
@@ -1274,6 +1291,38 @@ dg_row_committed(Relation rel, uint64 handle)
 }
 
 /* If this transaction updated or deleted row |handle|, the command that did. */
+void
+dg_note_created(Relation rel, const char *branch, uint64 handle)
+{
+	ModifiedKey key = modified_key(rel, branch, handle);
+	Modified   *row;
+
+	if (!created)
+	{
+		HASHCTL		ctl = {0};
+
+		ctl.keysize = sizeof(ModifiedKey);
+		ctl.entrysize = sizeof(Modified);
+		ctl.hcxt = TopTransactionContext;
+		created = hash_create("prolly created rows", 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	row = hash_search(created, &key, HASH_ENTER, NULL);
+	row->cid = GetCurrentCommandId(false);
+	row->subxid = GetCurrentSubTransactionId();
+}
+
+/* Whether this transaction created row version |handle|, as dg_note_created recorded. */
+bool
+dg_row_created(Relation rel, const char *branch, uint64 handle)
+{
+	ModifiedKey key;
+
+	if (!created)
+		return false;
+	key = modified_key(rel, branch, handle);
+	return hash_search(created, &key, HASH_FIND, NULL) != NULL;
+}
+
 bool
 dg_row_modified(Relation rel, const char *branch, uint64 handle, CommandId *cid)
 {

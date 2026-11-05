@@ -6,7 +6,9 @@
 #include "dg.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include "access/doltbranch.h"
 #include "access/htup_details.h"
+#include "access/relation.h"
 #include "catalog/pg_enum.h"
 #include "catalog/pg_type.h"
 #include "common/int128.h"
@@ -1172,14 +1174,25 @@ prolly_slot_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 	return 0;
 }
 
+/*
+ * Whether this transaction created the row version |slot| holds, as a heap
+ * tuple's xmin tells: the version its tid names, in the relation it came from.
+ */
 static bool
 prolly_slot_is_current_xact_tuple(TupleTableSlot *slot)
 {
+	Relation	rel;
+	bool		result;
+
 	Assert(!TTS_EMPTY(slot));
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("don't have a storage tuple in this context")));
-	return false;
+	if (!OidIsValid(slot->tts_tableOid) || !ItemPointerIsValid(&slot->tts_tid))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("don't have a storage tuple in this context")));
+	rel = relation_open(slot->tts_tableOid, NoLock);
+	result = dg_row_created(rel, dg_relation_branch(rel), dg_id(&slot->tts_tid));
+	relation_close(rel, NoLock);
+	return result;
 }
 
 /* As tts_virtual_materialize: copy every by-reference value into one allocation the slot owns. */

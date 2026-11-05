@@ -219,6 +219,8 @@ extern void dg_identity_delete_branch(const char *branch);
 extern void dg_identity_sync(const char *branch, List *members, List *tables);
 extern void dg_note_modified(Relation rel, const char *branch, uint64 handle, CommandId cid);
 extern bool dg_row_modified(Relation rel, const char *branch, uint64 handle, CommandId *cid);
+extern void dg_note_created(Relation rel, const char *branch, uint64 handle);
+extern bool dg_row_created(Relation rel, const char *branch, uint64 handle);
 extern bool dg_row_committed(Relation rel, uint64 handle);
 extern bool dg_handle_digest(DGState *s, uint64 handle, PLHash *digest);
 extern int	dg_handles_of(DGState *s, PLHash digest, int64 count, uint64 **handles, int *capacity);
