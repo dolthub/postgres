@@ -99,6 +99,7 @@ typedef struct DGCursor
 } DGCursor;
 
 extern PLTree *dg_content(DGState *s);
+extern PLHash dg_fold_content(DGState *s, PLStore *store, void (*flush) (PLStore *store));
 extern void dg_set_content(DGState *s, PLTree tree);
 extern bool dg_get(DGState *s, PLSlice key, PLValue *out);
 extern void dg_scan(DGState *s, const PLSlice *lower, const PLSlice *upper, PLScanFn callback, void *arg);
@@ -132,9 +133,34 @@ extern struct _SPI_plan *dg_manifest_plan(const char *sql, int nargs, Oid *types
 extern bool dg_object_read(bytea *hash, const char *kind, char **actual, bytea **payload, struct ArrayType **children);
 extern Oid	dg_storage_allocate(Relation definition, const char *branch);
 extern Oid	dg_storage_allocate_kind(char relkind, const char *branch);
-extern bool dg_storage_content_root(RelFileLocator locator, const char *branch, Snapshot snapshot, PLHash *content);
-extern bool dg_storage_resource_root(Oid resource, const char *branch, Snapshot snapshot, PLHash *content, bool *load);
+extern DGState *dg_storage_content_state(RelFileLocator locator, const char *branch, Snapshot snapshot);
+extern DGState *dg_storage_resource_state(Oid resource, const char *branch, Snapshot snapshot, RelFileLocator *located, bool *load);
+extern bool dg_storage_install_capture(RelFileLocator locator, const char *branch, Snapshot snapshot, DGState *s, PLHash root);
+extern PLHash dg_storage_fold_root(DGState *s);
 extern bytea *dg_manifest_put(const char *kind, bytea *payload, struct ArrayType *children);
+extern bool dg_manifest_tree_edge(const char *kind, int index);
+extern bool dg_manifest_root_edge(const char *kind, int index);
+
+/* A member of a database root (dg_root.c): kind, qualified name, schema object, content root. */
+typedef struct DGRootEntry
+{
+	char	   *kind;
+	char	   *name;
+	PLHash		schema;
+	bool		has_content;
+	PLHash		content;
+} DGRootEntry;
+extern bytea *dg_root_build(const DGRootEntry *entries, int n, const char *encoding, List *extensions);
+extern bool dg_root_find(bytea *root, const char *kind, const char *name, DGRootEntry *out);
+extern DGRootEntry *dg_root_entries(bytea *root, int *count);
+extern char *dg_root_encoding(bytea *root);
+extern List *dg_root_extensions(bytea *root);
+extern void dg_root_check(bytea *root);
+extern bool dg_root_creator(bytea *root, TransactionId *creator);
+extern void dg_root_nodes(bytea *root, void (*fn) (void *arg, const uint8 *hash, int level), void *arg);
+extern bytea *dg_member_ref(const DGRootEntry *entry);
+extern bool dg_is_member_ref(bytea *value);
+extern void dg_member_decode(bytea *ref, DGRootEntry *out);
 
 /* A member of a database object: its hash, kind and, unless a namespace, name. */
 typedef struct DGMember
@@ -193,6 +219,8 @@ extern void dg_identity_delete_branch(const char *branch);
 extern void dg_identity_sync(const char *branch, List *members, List *tables);
 extern void dg_note_modified(Relation rel, const char *branch, uint64 handle, CommandId cid);
 extern bool dg_row_modified(Relation rel, const char *branch, uint64 handle, CommandId *cid);
+extern void dg_note_created(Relation rel, const char *branch, uint64 handle);
+extern bool dg_row_created(Relation rel, const char *branch, uint64 handle);
 extern bool dg_row_committed(Relation rel, uint64 handle);
 extern bool dg_handle_digest(DGState *s, uint64 handle, PLHash *digest);
 extern int	dg_handles_of(DGState *s, PLHash digest, int64 count, uint64 **handles, int *capacity);
@@ -259,6 +287,7 @@ extern bool dg_native_rewrite_active(void);
 extern void dg_release(DGState *state);
 extern void dg_branch_base(Relation rel, DGState *state);
 extern bytea *dg_schema_store(const char *kind, const char *json);
+extern bytea *dg_schema_address(const char *kind, const char *json);
 extern char *dg_schema_read(bytea *address, const char *kind);
 extern char *dg_schema_decode(bytea *address, const char *kind);
 
@@ -295,8 +324,9 @@ extern DGSchema *dg_schema_find(const char *json);
 extern void dg_schema_set_columns(DGSchema *schema, TupleDesc columns);
 extern void dg_schema_set_nodes(DGSchema *schema, uint32 part, int count, Node **nodes);
 extern void dg_schema_set_opclasses(DGSchema *schema, int count, Oid *types, Oid *opclasses);
-extern bytea *dg_history_export_tree(const PLTree * tree);
-extern PLTree dg_history_import(PLStore *store, bytea *address);
+extern void dg_tree_retain(const PLTree * tree);
+extern bytea *dg_history_retain(const PLTree * tree);
+extern PLTree dg_history_open(PLStore *store, bytea *address);
 extern void dg_history_install(Relation rel, DGState *state, PLTree contents);
 extern DGRows dg_rows(const PLTree * tree);
 extern DGRows dg_state_rows(DGState *s);

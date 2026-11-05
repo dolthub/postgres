@@ -32,7 +32,7 @@ CREATE INDEX m_mo ON m(mo);
 CREATE FUNCTION cheer(x mood) RETURNS mood LANGUAGE sql AS $$SELECT x$$;
 SELECT dolt_commit('-Am','base');
 });
-like(sql(q{SELECT convert_from(objpayload,'UTF8')::jsonb->'dependents'->>'routine:public.f' FROM pg_dolt_object WHERE objhash=(SELECT reftarget FROM pg_dolt_ref WHERE refname='working/main')}),
+like(sql(q{SELECT dolt_root_json(reftarget)::jsonb->'dependents'->>'routine:public.f' FROM pg_dolt_ref WHERE refname='working/main'}),
 	qr/"table", "public.u"/,'the dependency record lists a routine\'s users');
 
 # ---- routines ----

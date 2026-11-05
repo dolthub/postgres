@@ -2015,6 +2015,7 @@ provider_reload(CatalogView *view, void *arg)
 	PG_TRY();
 	{
 		bytea	   *database;
+		TransactionId creator;
 
 		MemoryContextSwitchTo(scratch);
 		if (!ActiveSnapshotSet())
@@ -2024,7 +2025,7 @@ provider_reload(CatalogView *view, void *arg)
 		}
 		nest = begin_api();
 		database = hash_parse(entry->database);
-		if (!object_read(database, "database", NULL, NULL, NULL))
+		if (!dg_root_creator(database, &creator))
 			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("revision does not name a visible database object")));
 		/* The view keeps its durable OIDs, and so the bindings recorded. */
 		provider_current_entry = NULL;
@@ -2048,9 +2049,8 @@ static TransactionId
 provider_creator(bytea *database)
 {
 	TransactionId creator = InvalidTransactionId;
-	bool		found = false;
 
-	if (!object_creator(database, "database", &found, &creator))
+	if (!dg_root_creator(database, &creator))
 		elog(ERROR, "canonical catalog root disappeared");
 	return creator;
 }
@@ -2076,8 +2076,12 @@ provider_lookup(const char *branch, bytea *database)
 	 * Visibility is required even on a cache hit: an aborted object must not
 	 * survive through a backend cache.
 	 */
-	if (!object_read(database, "database", NULL, NULL, NULL))
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("revision does not name a visible database object")));
+	{
+		TransactionId creator;
+
+		if (!dg_root_creator(database, &creator))
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("revision does not name a visible database object")));
+	}
 	if (!identity_callback)
 	{
 		CacheRegisterRelcacheCallback(provider_identities_changed, (Datum) 0);

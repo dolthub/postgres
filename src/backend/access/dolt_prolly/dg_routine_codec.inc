@@ -165,7 +165,7 @@ object_payload(const char *kind, const char *definition)
 			VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
 		definition = strcell(0, 1);
 	}
-	run("SELECT jsonb_build_object('kind',$2::text,'name',$1::jsonb->>'name','schema',encode(sha256(convert_to($1,'UTF8')),'hex'))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(definition), CStringGetTextDatum(kind)), NULL, true);
+	run("SELECT jsonb_build_object('kind',$2::text,'name',$1::jsonb->>'name','schema',encode(pg_catalog.dolt_schema_address($1),'hex'))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(definition), CStringGetTextDatum(kind)), NULL, true);
 	return strcell(0, 1);
 }
 

@@ -189,10 +189,11 @@ merge_base(bytea *ours, bytea *theirs)
 static bytea *
 table_chunk(bytea *db, const char *name)
 {
-	run("SELECT o.objchildren[2] FROM pg_dolt_object_visible db CROSS JOIN LATERAL unnest(db.objchildren) ch JOIN pg_dolt_object_visible o ON o.objhash=ch WHERE db.objhash=$1 AND o.objkind='table' AND convert_from(o.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
-	if (SPI_processed != 1)
+	bytea	   *member = dg_database_member(db, "table", name);
+
+	if (!member)
 		elog(ERROR, "missing retained table: %s", name);
-	return (bytea *) DatumGetPointer(cell(0, 1));
+	return child(member, 2);
 }
 
 static int
@@ -730,12 +731,12 @@ install_database(bytea *base, bytea *ours, bytea *theirs, List *merges, StringIn
 		char	   *name = merge->table;
 		Relation	rel = dg_catalog_write_table(dg_current_branch(), name, ACL_UPDATE);
 		DGState    *state = dg_load(rel, SnapshotSelf);
-		PLTree		right = dg_history_import(state->store, table_chunk(theirs, name)),
+		PLTree		right = dg_history_open(state->store, table_chunk(theirs, name)),
 					result = right;
 
 		if (base)
 		{
-			PLTree		left = dg_history_import(state->store, table_chunk(ours, name));
+			PLTree		left = dg_history_open(state->store, table_chunk(ours, name));
 			PLTree		ancestor;
 			bool	   *lacks[3] = {NULL};
 			bool		keyed = OidIsValid(RelationGetPrimaryKeyIndex(rel, false));
@@ -749,7 +750,7 @@ install_database(bytea *base, bytea *ours, bytea *theirs, List *merges, StringIn
 			if (merge->remap && !merge->definitions[0])
 				dg_check(pl_build(state->store, NULL, 0, &ancestor));
 			else
-				ancestor = dg_history_import(state->store, table_chunk(base, name));
+				ancestor = dg_history_open(state->store, table_chunk(base, name));
 			if (merge->remap)
 			{
 				PLTree	   *sides[3] = {&ancestor, &left, &right};
@@ -1066,7 +1067,7 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 			PLTree		result;
 
 			if (json_value(records[i], "whole_table"))
-				result = dg_history_import(state->store, table_chunk(child((bytea *) DatumGetPointer(parents[theirs ? 1 : 0]), 1), name));
+				result = dg_history_open(state->store, table_chunk(child((bytea *) DatumGetPointer(parents[theirs ? 1 : 0]), 1), name));
 			else
 			{
 				bool		keyed;

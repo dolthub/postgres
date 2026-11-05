@@ -275,7 +275,7 @@ pl_store_drop_backed(PLStore *store)
 		{
 			PLNode	   *node = *link;
 
-			if (!node->backed)
+			if (!node->backed || node->holds)
 			{
 				link = &node->next;
 				continue;
@@ -431,6 +431,16 @@ void
 pl_node_set_backed(PLNode *node)
 {
 	node->backed = true;
+}
+
+/*
+ * Undo pl_node_set_backed for a node whose write rolled back. It is still
+ * listed, so the next pl_store_drop_unbacked drops it unless it is pinned.
+ */
+void
+pl_node_set_unbacked(PLNode *node)
+{
+	node->backed = false;
 }
 
 /* Find a node already in this store, without consulting a backing store. */

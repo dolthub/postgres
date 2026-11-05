@@ -1674,11 +1674,7 @@ RI_FKey_fk_upd_check_required(Trigger *trigger, Relation fk_rel,
 	 * way to know that.)
 	 */
 
-	/*
-	 * Prolly virtual tuples have no per-tuple XID; conservatively retain the
-	 * check.
-	 */
-	if (fk_rel->rd_rel->relam == DOLT_PROLLY_TABLE_AM_OID || slot_is_current_xact_tuple(oldslot))
+	if (slot_is_current_xact_tuple(oldslot))
 		return true;
 
 	/* If all old and new key values are equal, no check is needed */

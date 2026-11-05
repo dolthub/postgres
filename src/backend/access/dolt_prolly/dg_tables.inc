@@ -74,9 +74,9 @@ dolt_branches(PG_FUNCTION_ARGS)
 	run("WITH refs AS (SELECT substr(r.refname,7) AS name,r.reftarget AS h FROM pg_dolt_ref r WHERE r.refname LIKE 'heads/%'),"
 		"c AS (SELECT refs.name,refs.h,convert_from(o.objpayload,'UTF8')::jsonb AS m,o.objchildren[1] AS db FROM refs JOIN pg_dolt_object_visible o ON o.objhash=refs.h) "
 		"SELECT c.name,pg_catalog.dolt_hash_encode(c.h),m->>'committer',m->>'email'," DG_DATE_SQL("m->>'date_us'") ",m->>'message',''::text,''::text,"
-		"CASE WHEN c.name=$1 THEN $2 ELSE coalesce(wo.objpayload<>dbo.objpayload,false) END,"
+		"CASE WHEN c.name=$1 THEN $2 ELSE coalesce(w.reftarget<>c.db AND pg_catalog.dolt_root_json(w.reftarget)<>pg_catalog.dolt_root_json(c.db),false) END,"
 		"m->>'author',m->>'author_email'," DG_DATE_SQL("m->>'author_date_us'") " "
-		"FROM c LEFT JOIN pg_dolt_ref w ON w.refname='working/' || c.name LEFT JOIN pg_dolt_object_visible wo ON wo.objhash=w.reftarget LEFT JOIN pg_dolt_object_visible dbo ON dbo.objhash=c.db ORDER BY c.name COLLATE \"C\"",
+		"FROM c LEFT JOIN pg_dolt_ref w ON w.refname='working/' || c.name ORDER BY c.name COLLATE \"C\"",
 		2, VC_TYPES(TEXTOID, BOOLOID), VC_ARGS(CStringGetTextDatum(dg_current_branch()), BoolGetDatum(dirty)), NULL, true);
 	return_rows(fcinfo, nest);
 	return (Datum) 0;
@@ -208,9 +208,9 @@ dolt_diff_changes(PG_FUNCTION_ARGS)
 	}
 	run("WITH RECURSIVE walk(h) AS (SELECT $1::bytea UNION SELECT unnest(o.objchildren[2:]) FROM walk w JOIN pg_dolt_object_visible o ON o.objhash=w.h),"
 		"commits AS (SELECT o.objhash,convert_from(o.objpayload,'UTF8')::jsonb AS m,o.objchildren FROM walk w JOIN pg_dolt_object_visible o ON o.objhash=w.h WHERE o.objkind='commit'),"
-		"states AS (SELECT 2 AS grp,pg_catalog.dolt_hash_encode(c.objhash) AS commit_hash,c.m,convert_from(d.objpayload,'UTF8')::jsonb AS db,"
-		" (SELECT convert_from(p.objpayload,'UTF8')::jsonb FROM pg_dolt_object_visible pc JOIN pg_dolt_object_visible p ON p.objhash=pc.objchildren[1] WHERE pc.objhash=c.objchildren[2]) AS pdb"
-		" FROM commits c JOIN pg_dolt_object_visible d ON d.objhash=c.objchildren[1]"
+		"states AS (SELECT 2 AS grp,pg_catalog.dolt_hash_encode(c.objhash) AS commit_hash,c.m,pg_catalog.dolt_root_json(c.objchildren[1])::jsonb AS db,"
+		" (SELECT pg_catalog.dolt_root_json(pc.objchildren[1])::jsonb FROM pg_dolt_object_visible pc WHERE pc.objhash=c.objchildren[2]) AS pdb"
+		" FROM commits c"
 		" UNION ALL SELECT 0,'STAGED',NULL,$3::jsonb,$2::jsonb WHERE $3::jsonb->'members' <> $2::jsonb->'members'"
 		" UNION ALL SELECT 1,'WORKING',NULL,$4::jsonb,$3::jsonb WHERE $4::jsonb->'members' <> $3::jsonb->'members'),"
 		"deltas AS (SELECT s.grp,s.commit_hash,s.m,n.name,"

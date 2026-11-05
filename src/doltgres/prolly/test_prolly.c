@@ -1247,6 +1247,117 @@ test_hash_text(void)
 	}
 }
 
+/* A working store's backing store, for the merger test: fetches copy from it. */
+static PLStatus
+fetch_backing(void *arg, PLHash hash, PLSlice *bytes)
+{
+	return pl_store_export((PLStore *) arg, hash, bytes);
+}
+
+/* Write |store|'s unbacked nodes to |backing|, mark them backed, and drop every backed node. */
+static void
+write_back(PLStore *store, PLStore *backing)
+{
+	for (size_t i = 0; i < store->unbacked_count; i++)
+	{
+		PLNode	   *node = store->unbacked[i];
+
+		if (node->backed)
+			continue;
+		OK(pl_store_import(backing, node->hash, bytes(node->data, node->size)));
+		pl_node_set_backed(node);
+	}
+	pl_store_drop_backed(store);
+}
+
+/*
+ * A merger fed edits in batches, its store dropping every written node between
+ * them, makes the tree one pl_apply of all the edits makes, and holds only its
+ * path and pending entries between batches.
+ */
+static void
+test_merger_batches(void)
+{
+	enum
+	{
+	SLOTS = 30000, ROUNDS = 12};
+	uint8_t		(*keys)[8] = calloc(SLOTS + 500, 8);
+	uint8_t		(*values)[16] = calloc(SLOTS + 500, 16);
+	PLEntry    *entries = calloc(SLOTS, sizeof(PLEntry));
+	PLEdit	   *edits = calloc(SLOTS + 500, sizeof(PLEdit));
+	uint32_t	rng = 0xbeef;
+	size_t		count = 0;
+	PLStore    *backing = pl_store_create();
+	PLTree		base;
+
+	CHECK(keys && values && entries && edits && backing);
+	for (size_t i = 0; i < SLOTS + 500; i++)
+	{
+		pl_key_int64((int64_t) i * 2, keys[i]);
+		pl_write32(values[i], (uint32_t) i);
+	}
+	for (size_t i = 0; i < SLOTS; i++)
+		entries[count++] = (PLEntry) {{keys[i], 8}, {values[i], 8}};
+	OK(pl_build(backing, entries, count, &base));
+	for (unsigned round = 0; round < ROUNDS; round++)
+	{
+		PLStore    *expected_store = pl_store_create();
+		PLStore    *store = pl_store_create();
+		PLTree		expected,
+					merged,
+					from;
+		PLMerger   *merger;
+		size_t		n = 0,
+					at = 0;
+
+		CHECK(expected_store && store);
+		pl_store_set_fetch(expected_store, fetch_backing, backing);
+		pl_store_set_fetch(store, fetch_backing, backing);
+
+		/* Puts, deletes and appends past the end; some rounds touch every leaf. */
+		for (size_t i = 0; i < SLOTS + 500; i++)
+		{
+			rng = rng * 1103515245u + 12345u;
+			if ((rng >> 16) % (round % 3 == 0 ? 3 : 40) != 0)
+				continue;
+			edits[n].key = (PLSlice) {keys[i], 8};
+			edits[n].value.present = (rng >> 8) % 4 != 0;
+			pl_write32(values[i] + 8, round);
+			edits[n].value.bytes = (PLSlice) {values[i], 12};
+			n++;
+		}
+		from = (PLTree) {expected_store, base.root};
+		OK(pl_apply(&from, edits, n, &expected));
+
+		from = (PLTree) {store, base.root};
+		OK(pl_merger_start(&from, &merger));
+		while (at < n)
+		{
+			size_t		batch;
+
+			rng = rng * 1103515245u + 12345u;
+			batch = 1 + (rng >> 16) % 700;
+			if (batch > n - at)
+				batch = n - at;
+			OK(pl_merger_feed(merger, edits + at, batch));
+			at += batch;
+			write_back(store, backing);
+			CHECK(pl_store_stats(store).chunks <= PL_MAX_DEPTH);
+		}
+		CHECK(pl_merger_feed(merger, edits, n ? 1 : 0) == (n ? PL_INVALID : PL_OK));
+		OK(pl_merger_finish(merger, &merged));
+		CHECK(pl_hash_equal(merged.root, expected.root));
+		write_back(store, backing);
+		pl_store_free(store);
+		pl_store_free(expected_store);
+	}
+	pl_store_free(backing);
+	free(keys);
+	free(values);
+	free(entries);
+	free(edits);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1260,6 +1371,7 @@ main(int argc, char **argv)
 	test_versions();
 	test_random_history();
 	test_apply_batches();
+	test_merger_batches();
 	test_retain();
 	test_conflict_matrix();
 	test_ranges_and_shifted_boundaries();

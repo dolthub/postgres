@@ -31,6 +31,11 @@
 
 #define DG_SCHEMA_TREE "DGSCHEMA2"
 
+/*
+ * Object kinds, by the id their hashes encode. Kind 0, "chunk", is retired:
+ * tree nodes live in the chunk store, under their node hashes, and objects
+ * name a tree by its root's (see tree_edge).
+ */
 static const char *const kinds[] = {"chunk", "schema", "table", "index", "database", "commit", "namespace", "tag", "merge", "routine", "rebase", "stash", "trigger", "type", "view", "sequence", "aggregate", "operator", "cast"};
 
 static void
@@ -147,6 +152,48 @@ statement_snapshot_push(void)
 	UpdateActiveSnapshotCommandId();
 }
 
+/*
+ * What child |index| of an object of kind id |id| names: another object; the
+ * root of a tree in the chunk store, by its node hash (a schema tree
+ * envelope's only child); or a database root (a commit's state, a merge's
+ * working and staged states, a stash's states).
+ */
+typedef enum EdgeKind
+{
+	EDGE_OBJECT,
+	EDGE_TREE,
+	EDGE_ROOT,
+} EdgeKind;
+
+static EdgeKind
+edge_kind(int id, int index)
+{
+	if ((id == 1 || id == 6) && index == 0)
+		return EDGE_TREE;
+	if ((id == 5 && index == 0) || (id == 8 && (index == 3 || index == 4)) || (id == 11 && index < 2))
+		return EDGE_ROOT;
+	return EDGE_OBJECT;
+}
+
+/* Kinds a database root's members once were, before roots held them inline. */
+static bool
+retired_kind(int id)
+{
+	return id == 0 || id == 2 || id == 3 || id == 4 || id == 9 || (id >= 12 && id <= 18);
+}
+
+bool
+dg_manifest_tree_edge(const char *kind, int index)
+{
+	return edge_kind(kind_id(kind), index) == EDGE_TREE;
+}
+
+bool
+dg_manifest_root_edge(const char *kind, int index)
+{
+	return edge_kind(kind_id(kind), index) == EDGE_ROOT;
+}
+
 /* The kind of visible object |hash|, under the active snapshot. */
 static char *
 object_kind(bytea *hash)
@@ -240,6 +287,39 @@ dg_object_read(bytea *hash, const char *kind, char **actual, bytea **payload, Ar
 }
 
 /* Children are immutable and already visible, so construction cannot form cycles. */
+/*
+ * The address of an object of kind id |id| with |payload| and children
+ * |links|: the hash of its envelope (magic, kind, child count, payload
+ * length, child hashes, payload).
+ */
+static bytea *
+object_address(int id, bytea *payload, Datum *links, int n)
+{
+	Size		length = 20 + (Size) n * PL_HASH_SIZE + VARSIZE_ANY_EXHDR(payload);
+	uint8	   *encoding,
+			   *p;
+	PLSlice		input;
+	PLHash		hash;
+
+	if (length > MaxAllocSize)
+		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("manifest object too large")));
+	encoding = palloc(length);
+	memcpy(encoding, "DGMOBJ01", 8);
+	pl_write32(encoding + 8, id);
+	pl_write32(encoding + 12, n);
+	pl_write32(encoding + 16, VARSIZE_ANY_EXHDR(payload));
+	p = encoding + 20;
+	for (int i = 0; i < n; i++, p += PL_HASH_SIZE)
+		memcpy(p, VARDATA_ANY(DatumGetByteaPP(links[i])), PL_HASH_SIZE);
+	memcpy(p, VARDATA_ANY(payload), VARSIZE_ANY_EXHDR(payload));
+	input.data = encoding;
+	input.len = length;
+	if (!pl_hash_bytes(input, &hash))
+		elog(ERROR, "manifest SHA-256 failed");
+	pfree(encoding);
+	return bytes(hash.bytes, PL_HASH_SIZE);
+}
+
 static bytea *
 put_object(const char *kind, bytea *payload, ArrayType *children)
 {
@@ -248,11 +328,6 @@ put_object(const char *kind, bytea *payload, ArrayType *children)
 				i;
 	Datum	   *links;
 	bool	   *nulls;
-	Size		length;
-	uint8	   *encoding,
-			   *p;
-	PLHash		hash;
-	PLSlice		input;
 	bytea	   *address;
 	char	   *existing_kind;
 	bytea	   *existing_payload;
@@ -260,6 +335,10 @@ put_object(const char *kind, bytea *payload, ArrayType *children)
 
 	if (ARR_NDIM(children) > 1 || (ARR_NDIM(children) == 1 && ARR_LBOUND(children)[0] != 1))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("manifest children must be a one-dimensional array with lower bound 1")));
+	if (id == 0)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("tree nodes belong in the chunk store, not the manifest")));
+	if (retired_kind(id))
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("database states and their members belong in database roots, not the manifest")));
 	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &links, &nulls, &n);
 	if (((id == 1 || id == 6) && n > 1) || ((id == 2 || id == 3) && n != 2) || (id == 5 && n < 1) || (id == 7 && n != 1) || (id == 8 && n != 3 && n < 5) || ((id == 9 || id >= 15) && n != 1) || (id == 10 && n != 2) || (id == 11 && n != 3))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid manifest child count for %s", kind)));
@@ -275,38 +354,37 @@ put_object(const char *kind, bytea *payload, ArrayType *children)
 
 		if (nulls[i])
 			ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("manifest child cannot be null")));
+		if (edge_kind(id, i) == EDGE_ROOT)
+		{
+			dg_root_check(DatumGetByteaPP(links[i]));
+			continue;
+		}
+		if (edge_kind(id, i) == EDGE_TREE)
+		{
+			bytea	   *root = DatumGetByteaPP(links[i]);
+			DoltChunkStore *chunks;
+			bool		stored;
+
+			check_hash(root);
+			chunks = dolt_chunk_open(DOLT_CHUNK_READ);
+			stored = dolt_chunk_exists(chunks, (const uint8 *) VARDATA_ANY(root));
+			dolt_chunk_close(chunks);
+			if (!stored)
+				ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("manifest %s names a tree the chunk store does not hold", kind)));
+			continue;
+		}
 		child = object_kind(DatumGetByteaPP(links[i]));
-		valid = (id == 0 || id == 1 || id == 6) ? strcmp(child, "chunk") == 0 :
-			(id == 2 || id == 3) ? strcmp(child, i == 0 ? "schema" : "chunk") == 0 :
-			id == 4 ? (strcmp(child, "table") == 0 || strcmp(child, "index") == 0 || strcmp(child, "namespace") == 0 || strcmp(child, "routine") == 0 || strcmp(child, "trigger") == 0 || strcmp(child, "type") == 0 || strcmp(child, "view") == 0 || strcmp(child, "sequence") == 0 || strcmp(child, "aggregate") == 0 || strcmp(child, "operator") == 0 || strcmp(child, "cast") == 0) :
-			id == 5 ? strcmp(child, i == 0 ? "database" : "commit") == 0 :
+		valid = id == 5 ? strcmp(child, "commit") == 0 :
 			id == 7 ? strcmp(child, "commit") == 0 :
 			/* Merge children 4/5 retain working/staged databases. Optional
 			 * later children retain a series HEAD and queued commits. */
-			id == 8 ? strcmp(child, i == 3 || i == 4 ? "database" : "commit") == 0 :
-			(id == 9 || id == 12 || id == 13 || id == 14 || id >= 15) ? strcmp(child, "schema") == 0 :
+			id == 8 ? strcmp(child, "commit") == 0 :
 			id == 10 ? strcmp(child, "commit") == 0 :
-			id == 11 ? strcmp(child, i < 2 ? "database" : "commit") == 0 : false;
+			id == 11 ? strcmp(child, "commit") == 0 : false;
 		if (!valid)
 			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid %s child for manifest %s", child, kind)));
 	}
-	length = 20 + (Size) n * PL_HASH_SIZE + VARSIZE_ANY_EXHDR(payload);
-	if (length > MaxAllocSize)
-		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("manifest object too large")));
-	encoding = palloc(length);
-	memcpy(encoding, "DGMOBJ01", 8);
-	pl_write32(encoding + 8, id);
-	pl_write32(encoding + 12, n);
-	pl_write32(encoding + 16, VARSIZE_ANY_EXHDR(payload));
-	p = encoding + 20;
-	for (i = 0; i < n; i++, p += PL_HASH_SIZE)
-		memcpy(p, VARDATA_ANY(DatumGetByteaPP(links[i])), PL_HASH_SIZE);
-	memcpy(p, VARDATA_ANY(payload), VARSIZE_ANY_EXHDR(payload));
-	input.data = encoding;
-	input.len = length;
-	if (!pl_hash_bytes(input, &hash))
-		elog(ERROR, "manifest SHA-256 failed");
-	address = bytes(hash.bytes, PL_HASH_SIZE);
+	address = object_address(id, payload, links, n);
 
 	/*
 	 * Identical immutable objects can be inserted by independent
@@ -339,207 +417,60 @@ put_object(const char *kind, bytea *payload, ArrayType *children)
 		table_close(catalog, RowExclusiveLock);
 	}
 	PopActiveSnapshot();
-	pfree(encoding);
 	return address;
 }
 
 /*
- * Members of database objects. An object's hash names immutable content, so a
- * member's kind and name, and a database's members, are cached by hash; the
- * database object is still read each time, which checks that it is visible.
- * Its children then are too.
+ * Members of database roots. A member is passed as a reference, its entry
+ * encoded on its own (dg_root.c), except a namespace, which is passed as its
+ * definition object.
  */
-typedef struct CachedMember
+static bytea *
+address_value(const PLHash *hash)
 {
-	uint8		hash[PL_HASH_SIZE];
-	char	   *kind;
-	char	   *name;
-	int			nchildren;
-	bytea	  **children;		/* a definition's schema and content */
-} CachedMember;
-
-typedef struct CachedDatabase
-{
-	uint8		hash[PL_HASH_SIZE];
-	int			count;
-	DGMember   *members;		/* hashes by child order */
-	HTAB	   *names;			/* "kind/name" -> member index */
-} CachedDatabase;
-
-typedef struct NamedMember
-{
-	char		key[2 * (2 * NAMEDATALEN + 2) + 16];
-	int			index;
-} NamedMember;
-
-static MemoryContext member_memory;
-static HTAB *cached_members;
-static HTAB *cached_databases;
-static Size member_cache_bytes;
-
-#define MEMBER_CACHE_LIMIT (32 * 1024 * 1024)
-
-static void
-member_cache_init(void)
-{
-	HASHCTL		ctl = {0};
-
-	if (member_memory && member_cache_bytes < MEMBER_CACHE_LIMIT)
-		return;
-	if (member_memory)
-		MemoryContextDelete(member_memory);
-	member_memory = AllocSetContextCreate(TopMemoryContext, "database members", ALLOCSET_DEFAULT_SIZES);
-	member_cache_bytes = 0;
-	ctl.keysize = PL_HASH_SIZE;
-	ctl.entrysize = sizeof(CachedMember);
-	ctl.hcxt = member_memory;
-	cached_members = hash_create("database member kinds", 1024, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-	ctl.entrysize = sizeof(CachedDatabase);
-	cached_databases = hash_create("database members", 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	return bytes(hash->bytes, PL_HASH_SIZE);
 }
 
-static void
-member_key(char *key, const char *kind, const char *name)
+static DGMember
+member_of(const DGRootEntry *entry)
 {
-	snprintf(key, sizeof(((NamedMember *) NULL)->key), "%s/%s", kind, name);
-}
+	DGMember	member;
 
-/* The kind and name of visible member |hash|. */
-static CachedMember *
-member_describe(bytea *hash)
-{
-	CachedMember *member;
-	bool		found;
-	char	   *kind;
-	bytea	   *payload;
-	ArrayType  *children;
-	Datum	   *values;
-	bool	   *nulls;
-	int			n;
-	MemoryContext previous;
-
-	member = hash_search(cached_members, VARDATA_ANY(hash), HASH_FIND, NULL);
-	if (member)
-		return member;
-	if (!dg_object_read(hash, NULL, &kind, &payload, &children))
-		elog(ERROR, "database member is not visible");
-	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &values, &nulls, &n);
-	member = hash_search(cached_members, VARDATA_ANY(hash), HASH_ENTER, &found);
-	member->kind = MemoryContextStrdup(member_memory, kind);
-	member->name = NULL;
-	member->nchildren = n;
-	previous = MemoryContextSwitchTo(member_memory);
-	member->children = palloc0_array(bytea *, Max(n, 1));
-	for (int i = 0; i < n; i++)
-		if (!nulls[i])
-			member->children[i] = DatumGetByteaPCopy(values[i]);
-	MemoryContextSwitchTo(previous);
-	member_cache_bytes += n * (VARHDRSZ + PL_HASH_SIZE + sizeof(bytea *));
-	if (strcmp(kind, "namespace") && VARSIZE_ANY_EXHDR(payload) > 0 && *VARDATA_ANY(payload) == '{')
-	{
-		/* A JSON object payload names its member, as ->>'name' reads it. */
-		char	   *text = pnstrdup(VARDATA_ANY(payload), VARSIZE_ANY_EXHDR(payload));
-		Jsonb	   *document;
-		JsonbValue	buffer;
-		JsonbValue *name;
-
-		document = DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(pg_any_to_server(text, strlen(text), PG_UTF8))));
-		name = JB_ROOT_IS_OBJECT(document) ? getKeyJsonValueFromContainer(&document->root, "name", 4, &buffer) : NULL;
-		if (name && name->type == jbvString)
-			member->name = MemoryContextStrdup(member_memory, pnstrdup(name->val.string.val, name->val.string.len));
-		member_cache_bytes += VARSIZE_ANY_EXHDR(payload) / 8;
-	}
-	member_cache_bytes += sizeof(*member) + 64;
+	member.kind = entry->kind;
+	member.name = entry->name;
+	member.hash = strcmp(entry->kind, "namespace") == 0 ? address_value(&entry->schema) : dg_member_ref(entry);
 	return member;
 }
 
-static CachedDatabase *
-database_describe(bytea *database)
-{
-	CachedDatabase *cached;
-	ArrayType  *children;
-	Datum	   *values;
-	bool	   *nulls;
-	int			n;
-	bool		found;
-	HASHCTL		ctl = {0};
-
-	if (VARSIZE_ANY_EXHDR(database) != PL_HASH_SIZE ||
-		!dg_object_read(database, "database", NULL, NULL, &children))
-		elog(ERROR, "database object is not visible");
-	member_cache_init();
-	cached = hash_search(cached_databases, VARDATA_ANY(database), HASH_FIND, NULL);
-	if (cached)
-		return cached;
-	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &values, &nulls, &n);
-	for (int i = 0; i < n; i++)
-		(void) member_describe(DatumGetByteaPP(values[i]));
-	cached = hash_search(cached_databases, VARDATA_ANY(database), HASH_ENTER, &found);
-	cached->count = n;
-	cached->members = MemoryContextAllocZero(member_memory, sizeof(DGMember) * Max(n, 1));
-	ctl.keysize = sizeof(((NamedMember *) NULL)->key);
-	ctl.entrysize = sizeof(NamedMember);
-	ctl.hcxt = member_memory;
-	cached->names = hash_create("database member names", Max(n, 16), &ctl, HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
-	for (int i = 0; i < n; i++)
-	{
-		bytea	   *hash = DatumGetByteaPP(values[i]);
-		CachedMember *member = member_describe(hash);
-		bytea	   *copy = MemoryContextAlloc(member_memory, VARHDRSZ + PL_HASH_SIZE);
-
-		SET_VARSIZE(copy, VARHDRSZ + PL_HASH_SIZE);
-		memcpy(VARDATA(copy), VARDATA_ANY(hash), PL_HASH_SIZE);
-		cached->members[i].hash = copy;
-		cached->members[i].kind = member->kind;
-		cached->members[i].name = member->name;
-		if (member->name)
-		{
-			char		key[sizeof(((NamedMember *) NULL)->key)];
-			NamedMember *named;
-
-			member_key(key, member->kind, member->name);
-			named = hash_search(cached->names, key, HASH_ENTER, &found);
-			if (!found)
-				named->index = i;
-		}
-	}
-	member_cache_bytes += sizeof(*cached) + n * (sizeof(DGMember) + 96);
-	return cached;
-}
-
 /*
- * Child |index| of member |hash| of a database read earlier, or NULL if that
- * member is not cached. A member's children are fixed by its hash, and
- * visible while it is.
+ * Child |index| of member |hash|, as the member objects once had them: its
+ * schema, then its content. Sets |known| unless |hash| is a reference.
  */
 bytea *
 dg_member_child(bytea *hash, int index, bool *known)
 {
-	CachedMember *member = NULL;
+	DGRootEntry entry;
 
-	if (cached_members && VARSIZE_ANY_EXHDR(hash) == PL_HASH_SIZE)
-		member = hash_search(cached_members, VARDATA_ANY(hash), HASH_FIND, NULL);
-	*known = member != NULL;
-	if (!member || index < 1 || index > member->nchildren || !member->children[index - 1])
+	*known = dg_is_member_ref(hash);
+	if (!*known)
 		return NULL;
-	return DatumGetByteaPCopy(PointerGetDatum(member->children[index - 1]));
+	dg_member_decode(hash, &entry);
+	if (index == 1)
+		return address_value(&entry.schema);
+	if (index == 2 && entry.has_content)
+		return address_value(&entry.content);
+	return NULL;
 }
 
-/* The members of visible database object |database|, in its child order. */
+/* The members of database root |database|, in key order. */
 DGMember *
 dg_database_members(bytea *database, int *count)
 {
-	CachedDatabase *cached = database_describe(database);
-	DGMember   *result = palloc_array(DGMember, Max(cached->count, 1));
+	DGRootEntry *entries = dg_root_entries(database, count);
+	DGMember   *result = palloc_array(DGMember, Max(*count, 1));
 
-	for (int i = 0; i < cached->count; i++)
-	{
-		result[i] = cached->members[i];
-		result[i].hash = DatumGetByteaPCopy(PointerGetDatum(cached->members[i].hash));
-		result[i].kind = pstrdup(cached->members[i].kind);
-		result[i].name = cached->members[i].name ? pstrdup(cached->members[i].name) : NULL;
-	}
-	*count = cached->count;
+	for (int i = 0; i < *count; i++)
+		result[i] = member_of(&entries[i]);
 	return result;
 }
 
@@ -547,15 +478,11 @@ dg_database_members(bytea *database, int *count)
 bytea *
 dg_database_member(bytea *database, const char *kind, const char *name)
 {
-	CachedDatabase *cached = database_describe(database);
-	char		key[sizeof(((NamedMember *) NULL)->key)];
-	NamedMember *named;
+	DGRootEntry entry;
 
-	if (strlen(kind) + strlen(name) + 2 > sizeof(key))
+	if (!dg_root_find(database, kind, name, &entry))
 		return NULL;
-	member_key(key, kind, name);
-	named = hash_search(cached->names, key, HASH_FIND, NULL);
-	return named ? DatumGetByteaPCopy(PointerGetDatum(cached->members[named->index].hash)) : NULL;
+	return member_of(&entry).hash;
 }
 
 /* Store an object natively, as dolt_manifest_put does. */
@@ -647,11 +574,17 @@ hash_equal(bytea *a, bytea *b)
 static bytea *
 member_schema(bytea *hash)
 {
+	DGRootEntry entry;
 	ArrayType  *children;
 	Datum	   *values;
 	bool	   *nulls;
 	int			n;
 
+	if (dg_is_member_ref(hash))
+	{
+		dg_member_decode(hash, &entry);
+		return address_value(&entry.schema);
+	}
 	if (!dg_object_read(hash, NULL, NULL, NULL, &children))
 		return NULL;
 	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &values, &nulls, &n);
@@ -723,9 +656,18 @@ dolt_manifest_cas(PG_FUNCTION_ARGS)
 		const char *refname = text_to_cstring(name);
 		char	   *expected = strncmp(refname, "merge/", 6) == 0 ? "merge" : strncmp(refname, "rebase/", 7) == 0 ? "rebase" : strncmp(refname, "stash/", 6) == 0 ? "stash" : (strncmp(refname, "working/", 8) == 0 || strncmp(refname, "staged/", 7) == 0) ? "database" : "commit";
 
-		statement_snapshot_push();
-		kind = object_kind(PG_GETARG_BYTEA_PP(2));
-		PopActiveSnapshot();
+		/* A working set names a database root, which is no object. */
+		if (strcmp(expected, "database") == 0)
+		{
+			dg_root_check(PG_GETARG_BYTEA_PP(2));
+			kind = expected;
+		}
+		else
+		{
+			statement_snapshot_push();
+			kind = object_kind(PG_GETARG_BYTEA_PP(2));
+			PopActiveSnapshot();
+		}
 
 		if (strcmp(kind, expected) != 0 &&
 			!(strncmp(text_to_cstring(name), "tags/", 5) == 0 && strcmp(kind, "tag") == 0))
@@ -793,38 +735,15 @@ dolt_manifest_cas(PG_FUNCTION_ARGS)
 	PG_RETURN_BYTEA_P(token);
 }
 
-static bytea *
-export_node(PLStore *store, PLHash hash, int depth)
-{
-	PLNode	   *node = pl_find(store, hash);
-	Datum	   *children;
-	uint32		i,
-				count;
-
-	check_stack_depth();
-	if (!node || depth >= PL_MAX_DEPTH)
-		elog(ERROR, "invalid prolly export tree");
-	count = node->level ? node->count : 0;
-	children = palloc(sizeof(Datum) * Max(count, 1));
-	for (i = 0; i < count; i++)
-	{
-		PLHash		child;
-
-		child = pl_child_hash(node, i);
-		children[i] = PointerGetDatum(export_node(store, child, depth + 1));
-	}
-	return put_object("chunk", bytes(node->data, node->size), children_array(children, count));
-}
-
+/*
+ * The address by which objects name |tree|: its root's node hash, once every
+ * node of it is in the chunk store.
+ */
 bytea *
-dg_history_export_tree(const PLTree * tree)
+dg_history_retain(const PLTree * tree)
 {
-	bytea	   *result;
-
-	manifest_begin();
-	result = export_node(tree->store, tree->root, 0);
-	SPI_finish();
-	return result;
+	dg_tree_retain(tree);
+	return bytes(tree->root.bytes, PL_HASH_SIZE);
 }
 
 Datum
@@ -840,7 +759,7 @@ dolt_manifest_export(PG_FUNCTION_ARGS)
 		!(rel->rd_rel->relkind == RELKIND_INDEX && rel->rd_rel->relam == get_index_am_oid("dolt_prolly_index", false)))
 		dg_unsupported("manifest export of non-prolly relations");
 	state = dg_load(rel, GetActiveSnapshot());
-	result = export_node(state->store, dg_content(state)->root, 0);
+	result = dg_history_retain(dg_content(state));
 	dg_release(state);
 	relation_close(rel, AccessShareLock);
 	SPI_finish();
@@ -848,83 +767,27 @@ dolt_manifest_export(PG_FUNCTION_ARGS)
 }
 
 /*
- * Import retained canonical bytes, independently of the source relation's
- * lifetime. With |chunks|, a subtree the chunk store already holds is left
- * there, to be read through the shared node cache when needed: a chunk is
- * written only after every chunk it references.
+ * The tree whose root an object names at |address|, read through |store|,
+ * which fetches its nodes from the chunk store as it needs them.
  */
-static PLHash
-import_node(PLStore *store, DoltChunkStore *chunks, bytea *address, int depth)
-{
-	bytea	   *payload;
-	ArrayType  *children;
-	Datum	   *values;
-	bool	   *nulls;
-	bool	   *held;
-	int			n,
-				i;
-	PLSlice		bytes_;
-	PLHash		hash;
-	PLNode	   *node;
-
-	check_stack_depth();
-	if (depth >= PL_MAX_DEPTH)
-		elog(ERROR, "history chunk tree too deep");
-	if (!dg_object_read(address, "chunk", NULL, &payload, &children))
-		elog(ERROR, "missing history chunk");
-	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &values, &nulls, &n);
-	bytes_.data = (uint8 *) VARDATA(payload);
-	bytes_.len = VARSIZE(payload) - VARHDRSZ;
-	if (!pl_node_address(bytes_, &hash))
-		elog(ERROR, "history chunk hash failed");
-	dg_check(pl_store_import(store, hash, bytes_));
-	node = pl_find_local(store, hash);
-	if (n != (node->level ? (int) node->count : 0))
-		elog(ERROR, "history chunk children do not match its node");
-	held = palloc0(Max(n, 1) * sizeof(bool));
-	if (chunks && n > 0)
-	{
-		uint8	   *hashes = palloc((Size) n * PL_HASH_SIZE);
-
-		for (i = 0; i < n; i++)
-			memcpy(hashes + (Size) i * PL_HASH_SIZE, pl_child_hash(node, i).bytes, PL_HASH_SIZE);
-		dolt_chunk_exists_many(chunks, n, hashes, held);
-		pfree(hashes);
-	}
-	for (i = 0; i < n; i++)
-		if (!held[i] && !pl_find_local(store, pl_child_hash(node, i)))
-			import_node(store, chunks, DatumGetByteaP(values[i]), depth + 1);
-	pfree(held);
-	pfree(payload);
-	pfree(children);
-	pfree(values);
-	pfree(nulls);
-	return hash;
-}
-
 PLTree
-dg_history_import(PLStore *store, bytea *address)
+dg_history_open(PLStore *store, bytea *address)
 {
-	DoltChunkStore *chunks = store->fetch ? dolt_chunk_open(DOLT_CHUNK_READ) : NULL;
-	PLTree		result;
-	PLHash		hash;
+	PLTree		tree = {store};
 
-	hash = import_node(store, chunks, address, 0);
-	if (chunks)
-	{
-		dolt_chunk_close(chunks);
-		dg_check(pl_open_imported(store, hash, &result));
-	}
-	else
-		dg_check(pl_open(store, hash, &result));
-	return result;
+	if (VARSIZE_ANY_EXHDR(address) != PL_HASH_SIZE)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("invalid retained tree address")));
+	memcpy(tree.root.bytes, VARDATA_ANY(address), PL_HASH_SIZE);
+	if (!pl_find(store, tree.root))
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("retained tree is missing from the chunk store")));
+	return tree;
 }
 
 /* Canonical schema properties use the same node encoding and retained chunk
  * ownership as table contents. Runtime OIDs/transaction metadata never enter
  * this tree. The outer object kind distinguishes table schemas/namespaces. */
-bytea *
-dg_schema_store(const char *kind, const char *json)
+static bytea *
+schema_object(const char *kind, const char *json, bool store_it)
 {
 	PLStore    *volatile store = NULL;
 	bytea	   *result = NULL;
@@ -957,14 +820,22 @@ dg_schema_store(const char *kind, const char *json)
 				(uint8 *) value, strlen(value)
 			};
 		}
-		store = pl_store_create();
-		if (!store)
-			elog(ERROR, "cannot allocate schema tree");
+		store = dg_private_store();
 		dg_check(pl_build(store, entries, n, &tree));
 		{
-			Datum		root = PointerGetDatum(export_node(store, tree.root, 0));
+			bytea	   *payload = bytes(DG_SCHEMA_TREE, strlen(DG_SCHEMA_TREE));
+			Datum		root;
 
-			result = put_object(kind, bytes(DG_SCHEMA_TREE, strlen(DG_SCHEMA_TREE)), children_array(&root, 1));
+			if (store_it)
+			{
+				root = PointerGetDatum(dg_history_retain(&tree));
+				result = put_object(kind, payload, children_array(&root, 1));
+			}
+			else
+			{
+				root = PointerGetDatum(bytes(tree.root.bytes, PL_HASH_SIZE));
+				result = object_address(kind_id(kind), payload, &root, 1);
+			}
 		}
 	}
 	PG_FINALLY();
@@ -975,6 +846,32 @@ dg_schema_store(const char *kind, const char *json)
 	PG_END_TRY();
 	SPI_finish();
 	return result;
+}
+
+/* Canonical schema properties use the same node encoding and retained chunk
+ * ownership as table contents. Runtime OIDs/transaction metadata never enter
+ * this tree. The outer object kind distinguishes table schemas/namespaces. */
+bytea *
+dg_schema_store(const char *kind, const char *json)
+{
+	return schema_object(kind, json, true);
+}
+
+/*
+ * The address dg_schema_store would give definition |json| of |kind|,
+ * without writing anything: members name their schema by it.
+ */
+bytea *
+dg_schema_address(const char *kind, const char *json)
+{
+	return schema_object(kind, json, false);
+}
+
+/* dolt_schema_address(definition): the schema object address a definition has. */
+Datum
+dolt_schema_address(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BYTEA_P(dg_schema_address("schema", text_to_cstring(PG_GETARG_TEXT_PP(0))));
 }
 
 /* The definition of schema object |address|, decoded; see dg_schema_cache.c. */
@@ -1009,10 +906,8 @@ dg_schema_decode(bytea *address, const char *kind)
 			size_t		i;
 			StringInfoData json;
 
-			store = pl_store_create();
-			if (!store)
-				elog(ERROR, "cannot allocate schema reader");
-			dg_check(pl_open(store, import_node(store, NULL, DatumGetByteaP(values[0]), 0), &tree));
+			store = dg_private_store();
+			tree = dg_history_open(store, DatumGetByteaP(values[0]));
 			rows = dg_rows(&tree);
 			initStringInfo(&json);
 			appendStringInfoChar(&json, '{');

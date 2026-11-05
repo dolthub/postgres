@@ -74,6 +74,85 @@ $reader->query_safe('COMMIT');
 $reader->quit;
 is(sql('SELECT count(*) FROM t WHERE id > 3000'), '0', 'and a new one sees the fold');
 
+# A commit applies each changed tree's delta to capture its root, and installs
+# that root as the tree's base, as a fold of its snapshot would: a fold after
+# it writes the same trees. A writer still running at the capture keeps its
+# version outside the base, and so do the capturing transaction's own later
+# writes.
+my $horizons = q{SELECT string_agg(rootxmax::text, ',' ORDER BY rootfile) FROM pg_dolt_root};
+my $contents = q{SELECT string_agg(encode(rootcontent, 'hex'), ',' ORDER BY rootfile) FROM pg_dolt_root};
+my $old_horizons = sql($horizons);
+sql(q{UPDATE t SET v = 'captured' WHERE id = 1});
+sql(q{SELECT dolt_commit('-Am', 'capture')});
+isnt(sql($horizons), $old_horizons, 'a commit installs the trees it captured as their bases');
+my $captured = sql($contents);
+sql('SELECT dolt_fold()');
+is(sql($contents), $captured, 'which are the trees a fold writes');
+sql(q{UPDATE t SET v = 'again' WHERE id = 1});
+my $running = $node->background_psql('postgres');
+$running->query_safe(q{BEGIN; INSERT INTO t VALUES (-2, 'running')});
+sql(q{SELECT dolt_commit('-am', 'capture again')});
+$running->query_safe('COMMIT');
+$running->quit;
+is(sql(q{SELECT v FROM t WHERE id IN (-2, 1) ORDER BY id}), "running\nagain", 'a writer running at the capture is not lost');
+sql(q{UPDATE t SET v = 'staged' WHERE id = 2});
+sql(q{BEGIN; SELECT dolt_add('.'); INSERT INTO t VALUES (-3, 'after'); COMMIT});
+is(sql(q{SET enable_seqscan = off; SELECT v FROM t WHERE v IN ('after', 'running', 'staged') ORDER BY v}), "after\nrunning\nstaged",
+	"nor are the capturing transaction's own later writes");
+sql('SELECT dolt_fold()');
+is(sql(q{SET enable_seqscan = off; SELECT count(*) FROM t WHERE v IN ('after', 'running', 'staged', 'again')}), '4', 'which a fold writes later');
+$expected = sql(q{SELECT count(*), sum(id), sum(length(v)) FROM t});
+$node->wait_for_catchup($standby);
+is($standby->safe_psql('postgres', q{SELECT count(*), sum(id), sum(length(v)) FROM t}), $expected,
+	'and the standby reads what the primary does');
+# An install rolls back with its savepoint, leaving the old base.
+sql(q{UPDATE t SET v = 'rolled back install' WHERE id = 4});
+$old_horizons = sql($horizons);
+sql(q{BEGIN; SAVEPOINT s; SELECT dolt_add('.'); ROLLBACK TO s; COMMIT});
+is(sql($horizons), $old_horizons, 'an install rolls back with its savepoint');
+is(sql(q{SET enable_seqscan = off; SELECT v FROM t WHERE id = 4}), 'rolled back install', 'and the change it held still reads');
+# A fold applies its delta a batch of keys at a time, writing and dropping each
+# batch's nodes as it goes: it makes the tree a fold in one batch makes,
+# holding a small part of it at once.
+sql(q{CREATE TABLE batched(id int PRIMARY KEY, v text);
+CREATE TABLE whole(id int PRIMARY KEY, v text);
+INSERT INTO batched SELECT g, repeat(md5(g::text), 2) FROM generate_series(1, 40000) g;
+INSERT INTO whole SELECT g, repeat(md5(g::text), 2) FROM generate_series(1, 40000) g;
+UPDATE batched SET v = 'changed' WHERE id % 7 = 0;
+UPDATE whole SET v = 'changed' WHERE id % 7 = 0});
+my $tree_nodes = sql(q{SELECT count(DISTINCT chunkhash) FROM pg_dolt_chunk});
+my $offset = -s $node->logfile;
+sql(q{SET dolt_fold_batch = 100; SET client_min_messages = debug1; SET log_min_messages = debug1; SELECT dolt_fold()});
+my @held = map { /held at most (\d+) nodes/ ? $1 : () } split /\n/, slurp_file($node->logfile, $offset);
+my $roots = q{SELECT count(DISTINCT r.rootcontent) FROM pg_dolt_root r JOIN pg_class c ON c.relfilenode = r.rootfile WHERE c.relname IN ('batched', 'whole')};
+$tree_nodes = sql(q{SELECT count(DISTINCT chunkhash) FROM pg_dolt_chunk}) - $tree_nodes;
+cmp_ok(scalar(@held), '>=', 2, 'folds log what they held');
+my ($most) = sort { $b <=> $a } @held;
+cmp_ok($most, '<', $tree_nodes / 10, "a fold of 40,000 rows in batches of 100 holds at most $most nodes, of $tree_nodes written");
+is(sql(q{SELECT count(*), sum(length(v)) FROM batched}), sql(q{SELECT count(*), sum(length(v)) FROM whole}), 'and reads as the other table');
+sql(q{UPDATE batched SET v = 'again' WHERE id % 11 = 0; UPDATE whole SET v = 'again' WHERE id % 11 = 0});
+sql(q{SET dolt_fold_batch = 7; SELECT dolt_fold()});
+is(sql(q{SELECT count(DISTINCT chunkhash) > 0 FROM pg_dolt_chunk}), 't', 'folds in tiny batches finish');
+is(sql(q{SELECT count(*) FILTER (WHERE v = 'again'), count(*) FILTER (WHERE v = 'changed') FROM batched}), '3636|5195', 'with every change applied');
+is(sql(q{SELECT (SELECT string_agg(md5(v), '' ORDER BY id) FROM batched) = (SELECT string_agg(md5(v), '' ORDER BY id) FROM whole)}), 't',
+	'the same rows, row for row');
+
+# A commit's capture applies a table's delta the same way.
+sql(q{UPDATE batched SET v = 'committed' WHERE id % 3 = 0});
+$offset = -s $node->logfile;
+sql(q{SET dolt_fold_batch = 100; SET log_min_messages = debug1; SELECT dolt_commit('-Am', 'batched capture')});
+@held = map { /held at most (\d+) nodes/ ? $1 : () } split /\n/, slurp_file($node->logfile, $offset);
+cmp_ok(scalar(@held), '>=', 1, 'a commit folds what it captures');
+($most) = sort { $b <=> $a } @held;
+cmp_ok($most, '<', $tree_nodes / 10, "in batches, holding at most $most nodes");
+is(sql(q{SELECT count(*) FROM batched AS OF 'HEAD' WHERE v = 'committed'}), '13333', 'and the commit holds every change');
+sql(q{UPDATE t SET v = 'crashed' WHERE id = 3});
+sql(q{SELECT dolt_commit('-am', 'before a crash')});
+$expected = sql(q{SELECT count(*), sum(id), sum(length(v)) FROM t});
+$node->stop('immediate');
+$node->start;
+is(sql(q{SELECT count(*), sum(id), sum(length(v)) FROM t}), $expected, 'recovery replays an installed base');
+
 $standby->stop;
 $node->stop;
 
@@ -96,6 +175,15 @@ is($busy->safe_psql('postgres', q{SELECT count(*), sum(id) FROM b}), '20000|2000
 ok($busy->poll_query_until('postgres', q{SELECT versions = 0 FROM dolt_delta_stats()}),
 	'and every version folds and is pruned');
 is($busy->safe_psql('postgres', q{SELECT count(*), sum(id) FROM b}), '20000|200010000', 'leaving the rows as they were');
+
+# The workers prune by a commit's installs as by folds, but not by one rolled
+# back with its savepoint: they keep the versions the old base lacks.
+$busy->safe_psql('postgres', q{UPDATE b SET v = -1 WHERE id = 1});
+$busy->safe_psql('postgres', q{BEGIN; SAVEPOINT s; SELECT dolt_add('.'); ROLLBACK TO s; COMMIT});
+ok($busy->poll_query_until('postgres', q{SELECT versions = 0 FROM dolt_delta_stats()}),
+	'the workers fold and prune after a rolled back install');
+is($busy->safe_psql('postgres', q{SET enable_seqscan = off; SELECT v FROM b WHERE id = 1}), '-1',
+	'without losing the change it held');
 $busy->stop;
 
 done_testing();

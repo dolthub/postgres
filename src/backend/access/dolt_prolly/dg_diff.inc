@@ -174,11 +174,12 @@ same_key_columns(DiffTable *a, DiffTable *b)
 static bool
 database_member(bytea *db, const char *name, bytea **schema, bytea **chunk)
 {
-	run("SELECT o.objchildren[1],o.objchildren[2] FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible o ON o.objhash=ch WHERE d.objhash=$1 AND o.objkind='table' AND convert_from(o.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
-	if (!SPI_processed)
+	bytea	   *member = dg_database_member(db, "table", name);
+
+	if (!member)
 		return false;
-	*schema = DatumGetByteaPCopy(cell(0, 1));
-	*chunk = DatumGetByteaPCopy(cell(0, 2));
+	*schema = child(member, 1);
+	*chunk = child(member, 2);
 	return true;
 }
 
@@ -209,7 +210,7 @@ diff_table_at(bytea *db, const char *name, bool rows)
 	if (!rows)
 		return t;
 	t->store = dg_private_store();
-	content = dg_history_import(t->store, chunk);
+	content = dg_history_open(t->store, chunk);
 	t->rows = logical_rows_for(t, &content);
 	return t;
 }
@@ -320,14 +321,25 @@ diff_object_revision(const char *revision, const char *name, bool rows)
 		db = read_ref(branch_ref("working")).target;
 	if (!db)
 		return diff_table_absent(name);
-	run("SELECT o.objkind,o.objchildren[1] FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible o ON o.objhash=ch WHERE d.objhash=$1 AND o.objkind IN ('table','routine','view','type','trigger','sequence','aggregate','operator','cast') AND convert_from(o.objpayload,'UTF8')::jsonb->>'name'=$2", 2,
-		VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
-	if (!SPI_processed)
-		return diff_table_absent(name);
-	if (SPI_processed != 1)
-		ereport(ERROR, (errcode(ERRCODE_AMBIGUOUS_ALIAS), errmsg("ambiguous versioned object name: %s", name)));
-	kind = strcell(0, 1);
-	schema = DatumGetByteaPCopy(cell(0, 2));
+	{
+		static const char *const kinds[] = {"aggregate", "cast", "operator", "routine", "sequence", "table", "trigger", "type", "view"};
+		bytea	   *found = NULL;
+
+		for (i = 0; i < lengthof(kinds); i++)
+		{
+			bytea	   *member = dg_database_member(db, kinds[i], name);
+
+			if (!member)
+				continue;
+			if (found)
+				ereport(ERROR, (errcode(ERRCODE_AMBIGUOUS_ALIAS), errmsg("ambiguous versioned object name: %s", name)));
+			found = member;
+			kind = (char *) kinds[i];
+		}
+		if (!found)
+			return diff_table_absent(name);
+		schema = child(found, 1);
+	}
 	if (!strcmp(kind, "table"))
 		return rows ? diff_table_revision(revision, name) : diff_table_schema(revision, name);
 

@@ -144,5 +144,27 @@ $a->query('SELECT 1');
 like($a->{stderr}, qr/violates foreign key constraint/, 'the coerced reference prevents concurrent deletion');
 $a->quit;
 $b->quit;
+
+# As for heap tuples, an update that keeps its keys checks no foreign key,
+# unless this transaction made the row version it changes: that version's
+# insert check has not run yet.
+sql(q{CREATE TABLE kept_parent(id int PRIMARY KEY);
+ INSERT INTO kept_parent VALUES (1), (2);
+ CREATE TABLE kept_child(id int PRIMARY KEY, parent int REFERENCES kept_parent, note text);
+ INSERT INTO kept_child VALUES (1, 1, 'a')});
+my $checks = sub { my @t = grep { /Trigger for constraint/ } split /\n/, sql($_[0]); scalar @t };
+is($checks->(q{EXPLAIN (ANALYZE, COSTS OFF) UPDATE kept_child SET note = 'b' WHERE id = 1}), 0,
+	'an update that keeps a committed row\'s keys checks no foreign key');
+is($checks->(q{EXPLAIN (ANALYZE, COSTS OFF) UPDATE kept_child SET parent = 2 WHERE id = 1}), 1, 'one that changes them does');
+is($checks->(q{BEGIN; INSERT INTO kept_child VALUES (2, 1, 'new');
+ EXPLAIN (ANALYZE, COSTS OFF) UPDATE kept_child SET note = 'c' WHERE id = 2; COMMIT}), 1,
+	'and so does one of a row this transaction inserted');
+is($checks->(q{BEGIN; UPDATE kept_child SET note = 'd' WHERE id = 1;
+ EXPLAIN (ANALYZE, COSTS OFF) UPDATE kept_child SET note = 'e' WHERE id = 1; COMMIT}), 1,
+	'or of a version this transaction made by updating');
+is($checks->(q{BEGIN; UPDATE kept_child SET note = 'f' WHERE id = 1; SAVEPOINT s; ROLLBACK TO s; COMMIT;
+ EXPLAIN (ANALYZE, COSTS OFF) UPDATE kept_child SET note = 'g' WHERE id = 1}), 0, 'which a later transaction does not repeat');
+fails(q{BEGIN; DELETE FROM kept_parent WHERE id = 2; INSERT INTO kept_child VALUES (3, 2, 'x'); COMMIT},
+	qr/violates foreign key constraint/, 'checks still reject a missing parent');
 $node->stop;
 done_testing();

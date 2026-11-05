@@ -44,6 +44,7 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "access/xlogutils.h"
 #include "access/xloginsert.h"
 #include "common/hashfn.h"
 #include "common/pg_prng.h"
@@ -1552,8 +1553,13 @@ dolt_delta_redo(XLogReaderState *record)
 		fold_note(&key, fold.fold, &horizon);
 		pfree(horizon.xip);
 
-		/* Earlier folds may have committed since, and the standby's readers moved on. */
-		(void) dolt_delta_prune_all(false);
+		/*
+		 * Earlier folds may have committed since, and the standby's readers
+		 * moved on. Crash recovery, and a standby before it takes snapshots,
+		 * has no horizon to prune by yet; later folds and prunes catch up.
+		 */
+		if (standbyState == STANDBY_SNAPSHOT_READY)
+			(void) dolt_delta_prune_all(false);
 		return;
 	}
 	if (info != XLOG_DOLT_DELTA_APPEND)

@@ -38,6 +38,7 @@ typedef struct PLNode
 	bool		backed;			/* known to be in the backing store */
 	bool		marked;			/* reachable, during pl_store_retain */
 	uint32_t	pins;			/* holders keeping it until written, across pl_store_drop_unbacked */
+	uint32_t	holds;			/* holders keeping it across pl_store_drop_backed */
 	size_t		unbacked_slot;	/* position in the store's unbacked list, while listed */
 	struct PLNode *next;
 } PLNode;
@@ -74,6 +75,7 @@ uint64_t	pl_child_rows(const PLNode *node, uint32_t index);
 PLNode	   *pl_find(PLStore *store, PLHash hash);
 PLNode	   *pl_find_local(PLStore *store, PLHash hash);
 void		pl_node_set_backed(PLNode *node);
+void		pl_node_set_unbacked(PLNode *node);
 void		pl_node_pin(PLStore *store, PLNode *node);
 void		pl_node_unpin(PLStore *store, PLNode *node);
 PLSlice		pl_node_key(const PLNode *node, uint32_t index);

@@ -1823,6 +1823,11 @@ setup_privileges(FILE *cmdfd)
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_prolly_root(regclass) FROM PUBLIC;\n\n");
 	PG_CMD_PUTS("REVOKE ALL ON pg_catalog.pg_dolt_object, pg_catalog.pg_dolt_ref, pg_catalog.pg_dolt_binding, pg_catalog.pg_dolt_storage, pg_catalog.dolt_log, pg_catalog.dolt_tags FROM PUBLIC;\n");
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_manifest_put(text, bytea, bytea[]) FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_root_put(text[], text[], bytea[], bytea[]) FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_root_members(bytea) FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_root_nodes(bytea) FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_root_find(bytea, text, text) FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_root_json(bytea) FROM PUBLIC;\n");
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_manifest_get(bytea) FROM PUBLIC;\n");
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_manifest_read(text) FROM PUBLIC;\n");
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_manifest_cas(text, bytea, bytea) FROM PUBLIC;\n");

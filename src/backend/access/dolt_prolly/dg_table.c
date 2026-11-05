@@ -714,6 +714,7 @@ insert_row(Relation rel, TupleTableSlot *slot, CommandId cid, int options, BulkI
 		row = dg_encode(rel, slot);
 		handle = dg_handle_choose(rel, dg_batch_state(batch), batch, dg_rowhash(row));
 		dg_batch_insert(batch, row, handle);
+		dg_note_created(rel, dg_relation_branch(rel), handle);
 		dg_index_apply(rel, row, 1, handle, cid);
 		pgstat_count_heap_insert(rel, 1);
 		dg_collect();
@@ -1004,6 +1005,7 @@ update_row(Relation rel, ItemPointer tid, TupleTableSlot *slot, CommandId cid, S
 	old_row = copy_slice(old_row);
 	dg_batch_remove(b, old_row, handle);
 	dg_batch_insert(b, new_row, successor);
+	dg_note_created(rel, dg_relation_branch(rel), successor);
 	if (!pl_hash_equal(old_digest, new_digest))
 	{
 		dg_index_apply(rel, old_row, -1, handle, cid);

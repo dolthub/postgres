@@ -765,7 +765,7 @@ replace_working(const char *branch, bytea *database, List *tables)
 			continue;
 		rel = dg_catalog_write_table(branch, members[i].name, ACL_UPDATE);
 		state = dg_load(rel, SnapshotSelf);
-		tree = dg_history_import(state->store, table_chunk(database, members[i].name));
+		tree = dg_history_open(state->store, table_chunk(database, members[i].name));
 		dg_history_install(rel, state, tree);
 		dg_release(state);
 		dg_storage_close_relation(rel);

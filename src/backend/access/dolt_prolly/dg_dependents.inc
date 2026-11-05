@@ -400,21 +400,10 @@ database_extensions(const char *json, const char *edges)
 static void
 database_check_extensions(bytea *database)
 {
-	bytea	   *payload;
-	Jsonb	   *root;
-	JsonbValue	extensions;
-
-	if (!database || !dg_object_read(database, "database", NULL, &payload, NULL))
+	if (!database)
 		return;
-	root = DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(pnstrdup(VARDATA_ANY(payload), VARSIZE_ANY_EXHDR(payload)))));
-	if (!JB_ROOT_IS_OBJECT(root) ||
-		!getKeyJsonValueFromContainer(&root->root, "extensions", strlen("extensions"), &extensions) ||
-		extensions.type != jbvBinary)
-		return;
-	for (int i = 0; i < json_length(&extensions); i++)
+	foreach_ptr(char, name, dg_root_extensions(database))
 	{
-		char	   *name = json_item_text(&extensions, i);
-
 		if (!OidIsValid(get_extension_oid(name, true)))
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_OBJECT),
@@ -424,23 +413,32 @@ database_check_extensions(bytea *database)
 	}
 }
 
-/* Add the dependency record of |members| to a database root's |json|. */
+/*
+ * Add the dependency record of |members| to a database root's |json|, and,
+ * with |extensions|, the extensions whose objects they use, which roots store.
+ */
 static char *
-database_dependents(const char *json, Datum *members, int count)
+database_dependents(const char *json, Datum *members, int count, bool extensions)
 {
 	StringInfoData edges;
 	uint64		n;
 	bytea	  **schemas;
 	char	  **kinds;
 
-	run("SELECT o.objkind,o.objchildren[1] FROM pg_catalog.pg_dolt_object_visible o WHERE o.objhash=ANY($1) AND o.objkind IN ('table','index','routine','trigger','type','view','sequence','aggregate','operator','cast')", 1, VC_TYPES(BYTEAARRAYOID), VC_ARGS(PointerGetDatum(links(members, count))), NULL, true);
-	n = SPI_processed;
-	schemas = palloc_array(bytea *, Max(n, 1));
-	kinds = palloc_array(char *, Max(n, 1));
-	for (uint64 i = 0; i < n; i++)
+	/* Every member but a namespace, which refers to nothing. */
+	n = 0;
+	schemas = palloc_array(bytea *, Max(count, 1));
+	kinds = palloc_array(char *, Max(count, 1));
+	for (int i = 0; i < count; i++)
 	{
-		kinds[i] = strcell(i, 1);
-		schemas[i] = DatumGetByteaPCopy(cell(i, 2));
+		bytea	   *member = DatumGetByteaPP(members[i]);
+		DGRootEntry entry;
+
+		if (!dg_is_member_ref(member))
+			continue;
+		dg_member_decode(member, &entry);
+		kinds[n] = entry.kind;
+		schemas[n++] = bytes_of_hash(&entry.schema);
 	}
 	initStringInfo(&edges);
 	appendStringInfoChar(&edges, '[');
@@ -466,7 +464,8 @@ database_dependents(const char *json, Datum *members, int count)
 		}
 	}
 	appendStringInfoChar(&edges, ']');
-	json = database_extensions(json, edges.data);
+	if (extensions)
+		json = database_extensions(json, edges.data);
 	run("SELECT jsonb_set($1::jsonb,'{dependents}',COALESCE((SELECT jsonb_object_agg(r,d) FROM (SELECT e->>0 r,jsonb_agg(DISTINCT jsonb_build_array(e->>1,e->>2)) d FROM jsonb_array_elements($2::jsonb) e GROUP BY e->>0) g),'{}'::jsonb))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), CStringGetTextDatum(edges.data)), NULL, true);
 	return strcell(0, 1);
 }
@@ -581,14 +580,13 @@ native_ref_target(const char *name)
 static char *
 database_referrer(bytea *database, char **references, int count, const char *except)
 {
-	bytea	   *payload;
 	Jsonb	   *root;
 	JsonbValue	dependents;
 	JsonbValue *found;
 
-	if (!database || !dg_object_read(database, "database", NULL, &payload, NULL))
+	if (!database)
 		return NULL;
-	root = DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(pnstrdup(VARDATA_ANY(payload), VARSIZE_ANY_EXHDR(payload)))));
+	root = DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(database_json(database))));
 	found = JB_ROOT_IS_OBJECT(root) ? getKeyJsonValueFromContainer(&root->root, "dependents", strlen("dependents"), &dependents) : NULL;
 	if (!found || found->type != jbvBinary)
 		return NULL;

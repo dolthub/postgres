@@ -1196,7 +1196,7 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 				if (!json_same(definition, old))
 				{
 					bytea	   *schema = put("schema", definition, NULL, 0);
-					bytea	   *content = table && table->rewrite ? dg_history_export_tree(&table->tree) : child(members[i], 2);
+					bytea	   *content = table && table->rewrite ? dg_history_retain(&table->tree) : child(members[i], 2);
 					Oid			resource = binding_relation(dg_current_branch(), names[i], oldschema);
 
 					if (!OidIsValid(resource))

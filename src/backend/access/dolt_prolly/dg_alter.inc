@@ -76,11 +76,13 @@ alter_database(Capture current, const char *name, bytea *member)
 
 	run("SELECT jsonb_set($1::jsonb,'{members}',(SELECT jsonb_agg(CASE WHEN v->>'name'=$2 THEN $3::jsonb ELSE v END) FROM jsonb_array_elements($1::jsonb->'members') v))::text", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(current.json), CStringGetTextDatum(name), CStringGetTextDatum(metadata(member, "table"))), NULL, true);
 	json = strcell(0, 1);
-	run("SELECT CASE WHEN o.objkind='table' AND convert_from(o.objpayload,'UTF8')::jsonb->>'name'=$2 THEN $3 ELSE ch END FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible o ON o.objhash=ch WHERE d.objhash=$1", 3, VC_TYPES(BYTEAOID, TEXTOID, BYTEAOID), VC_ARGS(PointerGetDatum(current.hash), CStringGetTextDatum(name), PointerGetDatum(member)), NULL, true);
-	n = SPI_processed;
-	children = palloc_array(Datum, Max(n, 1));
-	for (int i = 0; i < n; i++)
-		children[i] = cell(i, 1);
+	{
+		DGMember   *members = dg_database_members(current.hash, &n);
+
+		children = palloc_array(Datum, Max(n, 1));
+		for (int i = 0; i < n; i++)
+			children[i] = PointerGetDatum(!strcmp(members[i].kind, "table") && !strcmp(members[i].name, name) ? member : members[i].hash);
+	}
 	return canonical_database(json, children, n);
 }
 
@@ -276,10 +278,9 @@ dg_catalog_alter(Node *statement)
 		}
 		else
 		{
-			run("SELECT t.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='table' AND CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(current.hash), CStringGetTextDatum(name)), NULL, true);
-			if (SPI_processed != 1)
+			descriptor = dg_database_member(current.hash, "table", name);
+			if (!descriptor)
 				elog(ERROR, "canonical ALTER member missing");
-			descriptor = DatumGetByteaPCopy(cell(0, 1));
 			json = metadata(child(descriptor, 1), "schema");
 			{
 				char	   *path = column ? psprintf("{columns,%d,comment}", att) : "{comment}";

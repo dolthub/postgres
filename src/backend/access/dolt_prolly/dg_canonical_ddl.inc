@@ -20,7 +20,7 @@ static bytea *
 canonical_empty_member(const char *kind, const char *name, const char *definition, PLTree * empty)
 {
 	bytea	   *schema = put("schema", definition, NULL, 0);
-	bytea	   *content = dg_history_export_tree(empty);
+	bytea	   *content = dg_history_retain(empty);
 	bytea	   *raw = palloc(VARHDRSZ + PL_HASH_SIZE);
 	char	   *payload;
 
@@ -146,11 +146,12 @@ adopt_schema(Oid schema)
 			Datum	   *members;
 			int			count;
 
-			run("SELECT unnest(objchildren) FROM pg_dolt_object_visible WHERE objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(current.hash)), NULL, true);
-			count = SPI_processed;
-			members = palloc_array(Datum, count + 1);
-			for (int i = 0; i < count; i++)
-				members[i] = cell(i, 1);
+			{
+				Datum	   *listed = database_member_datums(current.hash, &count);
+
+				members = palloc_array(Datum, count + 1);
+				memcpy(members, listed, sizeof(Datum) * count);
+			}
 			members[count] = PointerGetDatum(put("namespace", definition, NULL, 0));
 			run("SELECT jsonb_set($1::jsonb,'{members}',($1::jsonb->'members')||jsonb_build_array(jsonb_build_object('kind','namespace','definition',$2::jsonb)))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(current.json), CStringGetTextDatum(definition)), NULL, true);
 			move_ref(branch_ref("working"), working, canonical_database(strcell(0, 1), members, count + 1));
@@ -373,12 +374,13 @@ dg_catalog_create(Node *statement, const char *query)
 		for (int i = 0; i < k; i++)
 			newmembers[i + 1] = canonical_empty_member("index", list_nth(index_names, i), list_nth(index_definitions, i), &empty->tree);
 		dg_release(empty);
-		run("SELECT unnest(objchildren) FROM pg_dolt_object_visible WHERE objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(current.hash)), NULL, true);
-		oldcount = SPI_processed;
-		total = oldcount + k + 1 + list_length(sequences);
-		members = palloc_array(Datum, total);
-		for (int i = 0; i < oldcount; i++)
-			members[i] = cell(i, 1);
+		{
+			Datum	   *listed = database_member_datums(current.hash, &oldcount);
+
+			total = oldcount + k + 1 + list_length(sequences);
+			members = palloc_array(Datum, total);
+			memcpy(members, listed, sizeof(Datum) * oldcount);
+		}
 		initStringInfo(&added);
 		appendStringInfoChar(&added, '[');
 		for (int i = 0; i <= k; i++)

@@ -653,10 +653,9 @@ dg_catalog_matview_refresh(Relation rel, bool populated)
 			nest = begin_api();
 			working = read_ref(branch_ref("working"));
 			current = capture(true);
-			run("SELECT t.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='table' AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(current.hash), CStringGetTextDatum(name)), NULL, true);
-			if (SPI_processed != 1)
+			member = dg_database_member(current.hash, "table", name);
+			if (!member)
 				elog(ERROR, "versioned materialized view %s is missing", name);
-			member = DatumGetByteaPCopy(cell(0, 1));
 			{
 				bytea	   *oldschema = child(member, 1);
 				char	   *definition;

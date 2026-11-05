@@ -70,6 +70,8 @@
 #include "access/doltsystem.h"
 #include "catalog/pg_dolt_ref.h"
 #include "catalog/pg_dolt_object.h"
+#include "access/doltchunk.h"
+#include "common/base64.h"
 #include "mb/pg_wchar.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -587,42 +589,6 @@ object_read(bytea *hash, const char *kind, char **actual, bytea **payload, Array
 	return dg_object_read(hash, kind, actual, payload, children);
 }
 
-/*
- * Whether object |hash| of |kind| exists, and the transaction that created
- * it if that is this transaction and no other copy is committed.
- */
-static bool
-object_creator(bytea *hash, const char *kind, bool *found, TransactionId *creator)
-{
-	Relation	catalog = table_open(DoltObjectRelationId, AccessShareLock);
-	ScanKeyData key;
-	SysScanDesc scan;
-	HeapTuple	tuple;
-
-	*found = false;
-	*creator = InvalidTransactionId;
-	ScanKeyInit(&key, Anum_pg_dolt_object_objhash, BTEqualStrategyNumber, F_BYTEAEQ, PointerGetDatum(hash));
-	scan = systable_beginscan(catalog, DoltObjectKeyIndexId, true, api_snapshot(), 1, &key);
-	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
-	{
-		bool		isnull;
-		char	   *objkind = TextDatumGetCString(heap_getattr(tuple, Anum_pg_dolt_object_objkind, RelationGetDescr(catalog), &isnull));
-		TransactionId xid = HeapTupleHeaderGetXmin(tuple->t_data);
-
-		if (strcmp(objkind, kind))
-			continue;
-		*found = true;
-		if (!TransactionIdIsCurrentTransactionId(xid))
-		{
-			*creator = InvalidTransactionId;
-			break;
-		}
-		*creator = xid;
-	}
-	systable_endscan(scan);
-	table_close(catalog, AccessShareLock);
-	return *found;
-}
 
 /* The |index|th (from 1) child of object |hash|, or NULL. */
 static bytea *
@@ -665,6 +631,60 @@ links(Datum *hashes, int count)
 {
 	return count ? construct_array(hashes, count, BYTEAOID, -1, false, TYPALIGN_INT) : construct_empty_array(BYTEAOID);
 }
+/* Whether |kind| names members of database roots, which are not objects. */
+static bool
+member_kind(const char *kind)
+{
+	static const char *const kinds[] = {"table", "index", "routine", "trigger", "type", "view", "sequence", "aggregate", "operator", "cast"};
+
+	for (int i = 0; i < lengthof(kinds); i++)
+		if (!strcmp(kind, kinds[i]))
+			return true;
+	return false;
+}
+
+static bytea *
+bytes_of_hash(const PLHash *hash)
+{
+	bytea	   *v = palloc(VARHDRSZ + PL_HASH_SIZE);
+
+	SET_VARSIZE(v, VARHDRSZ + PL_HASH_SIZE);
+	memcpy(VARDATA(v), hash->bytes, PL_HASH_SIZE);
+	return v;
+}
+
+static void
+hash_of_bytes(bytea *v, PLHash *hash)
+{
+	if (VARSIZE_ANY_EXHDR(v) != PL_HASH_SIZE)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid content hash length")));
+	memcpy(hash->bytes, VARDATA_ANY(v), PL_HASH_SIZE);
+}
+
+static char *json_value(const char *json, const char *key);
+
+/*
+ * The member reference for a |kind| member whose payload |json| names it,
+ * with its schema and, for a table or index, its content as |hashes|, as the
+ * member objects once held them.
+ */
+static bytea *
+member_ref(const char *kind, const char *json, Datum *hashes, int count)
+{
+	DGRootEntry entry = {0};
+	char	   *name = json_value(json, "name");
+
+	if (!name || count < 1 || count > 2)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid %s member", kind)));
+	entry.kind = (char *) kind;
+	entry.name = name;
+	hash_of_bytes(DatumGetByteaPP(hashes[0]), &entry.schema);
+	entry.has_content = count == 2;
+	if (entry.has_content)
+		hash_of_bytes(DatumGetByteaPP(hashes[1]), &entry.content);
+	return dg_member_ref(&entry);
+}
+
 static bytea *
 put(const char *kind, const char *json, Datum *hashes, int count)
 {
@@ -673,6 +693,8 @@ put(const char *kind, const char *json, Datum *hashes, int count)
 	require_writable();
 	if ((!strcmp(kind, "schema") || !strcmp(kind, "namespace")) && count == 0)
 		result = dg_schema_store(kind, json);
+	else if (member_kind(kind))
+		result = member_ref(kind, json, hashes, count);
 	else
 	{
 		/* The payload is the JSON normalized, in UTF-8. */
@@ -685,6 +707,9 @@ put(const char *kind, const char *json, Datum *hashes, int count)
 	UpdateActiveSnapshotCommandId();
 	return result;
 }
+static char *database_json(bytea *root);
+static char *member_json(bytea *ref, const char *kind);
+
 static char *
 metadata(bytea *hash, const char *kind)
 {
@@ -693,6 +718,10 @@ metadata(bytea *hash, const char *kind)
 
 	if (!strcmp(kind, "schema") || !strcmp(kind, "namespace"))
 		return dg_schema_read(hash, kind);
+	if (!strcmp(kind, "database"))
+		return database_json(hash);
+	if (dg_is_member_ref(hash))
+		return member_json(hash, kind);
 	if (!object_read(hash, kind, NULL, &payload, NULL))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("revision does not name a visible %s object", kind)));
 	text = pnstrdup(VARDATA_ANY(payload), VARSIZE_ANY_EXHDR(payload));
@@ -790,25 +819,300 @@ static Constraint **schema_constraints(const char *definition, int *count);
 static IndexStmt *schema_index(const char *definition);
 static char *json_set_string(const char *json, const char *key, const char *value);
 
-static char *database_dependents(const char *json, Datum *members, int count);
+static char *database_dependents(const char *json, Datum *members, int count, bool extensions);
 static char *routine_body_encode(HeapTuple tuple, char **dependencies);
 static Oid	provider_view_dependency(CatalogView * view, const char *kind, const char *name);
 
+/*
+ * The extensions whose objects |members| use, sorted by name: a root records
+ * them, since the server may drop an extension its history still needs.
+ */
+static List *
+members_extensions(Datum *members, int count)
+{
+	CatalogView *previous = CatalogViewSwitch(NULL);
+	char	   *volatile json = NULL;
+	List	   *result = NIL;
+
+	/* Extensions are native: their objects are read from the physical catalogs. */
+	PG_TRY();
+	{
+		json = database_dependents("{}", members, count, true);
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	run("SELECT e FROM jsonb_array_elements_text(COALESCE($1::jsonb->'extensions','[]')) e", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
+	for (uint64 i = 0; i < SPI_processed; i++)
+		result = lappend(result, strcell(i, 1));
+	return result;
+}
+
+/*
+ * The database root of |members|: references, and namespace definition
+ * objects. |json| lists them as DGDB1 once did; the root needs only the
+ * members themselves.
+ */
 static bytea *
 canonical_database(const char *json, Datum *members, int count)
 {
-	char	   *normalized;
-	ArrayType  *array;
-	Datum	   *values;
-	bool	   *nulls;
-	int			n;
+	DGRootEntry *entries = palloc0(sizeof(DGRootEntry) * Max(count, 1));
 
-	run("SELECT jsonb_set($1::jsonb || jsonb_build_object('encoding',current_setting('server_encoding')),'{members}',COALESCE((SELECT jsonb_agg(v ORDER BY v->>'kind' COLLATE \"C\",COALESCE(v->>'name',v->'definition'->>'name') COLLATE \"C\") FROM jsonb_array_elements($1::jsonb->'members') v),'[]'::jsonb))::text", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
-	normalized = database_dependents(strcell(0, 1), members, count);
-	run("SELECT coalesce(array_agg(h ORDER BY h),'{}'::bytea[]) FROM unnest($1::bytea[]) h", 1, VC_TYPES(BYTEAARRAYOID), VC_ARGS(PointerGetDatum(links(members, count))), NULL, true);
-	array = DatumGetArrayTypeP(cell(0, 1));
-	deconstruct_array(array, BYTEAOID, -1, false, TYPALIGN_INT, &values, &nulls, &n);
-	return put("database", normalized, values, n);
+	(void) json;
+	for (int i = 0; i < count; i++)
+	{
+		bytea	   *member = DatumGetByteaPP(members[i]);
+
+		if (dg_is_member_ref(member))
+			dg_member_decode(member, &entries[i]);
+		else
+		{
+			entries[i].kind = "namespace";
+			entries[i].name = json_value(metadata(member, "namespace"), "name");
+			hash_of_bytes(member, &entries[i].schema);
+		}
+	}
+	return dg_root_build(entries, count, GetDatabaseEncodingName(), members_extensions(members, count));
+}
+
+/* The members of database root |db|, as Datums of their references. */
+static Datum *
+database_member_datums(bytea *db, int *count)
+{
+	DGMember   *members = dg_database_members(db, count);
+	Datum	   *result = palloc_array(Datum, Max(*count, 1));
+
+	for (int i = 0; i < *count; i++)
+		result[i] = PointerGetDatum(members[i].hash);
+	return result;
+}
+
+/*
+ * The fingerprint of sequence schema |schema|: the address of its definition
+ * without the allocation seed it retains for restore, so that allocation alone
+ * changes no description. Cached by schema, which never changes.
+ */
+static char *
+sequence_fingerprint(const PLHash *schema)
+{
+	static HTAB *fingerprints;
+	typedef struct Fingerprint
+	{
+		uint8		schema[PL_HASH_SIZE];
+		char		hex[PL_HASH_SIZE * 2 + 1];
+	} Fingerprint;
+	Fingerprint *entry;
+	bool		found;
+
+	if (!fingerprints)
+	{
+		HASHCTL		ctl = {0};
+
+		ctl.keysize = PL_HASH_SIZE;
+		ctl.entrysize = sizeof(Fingerprint);
+		ctl.hcxt = TopMemoryContext;
+		fingerprints = hash_create("sequence fingerprints", 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	entry = hash_search(fingerprints, schema->bytes, HASH_FIND, NULL);
+	if (!entry)
+	{
+		char	   *definition = metadata(bytes_of_hash(schema), "schema");
+		bytea	   *address;
+
+		run("SELECT ($1::jsonb - 'last_value' - 'is_called')::text", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
+		address = dg_schema_address("schema", strcell(0, 1));
+		entry = hash_search(fingerprints, schema->bytes, HASH_ENTER, &found);
+		for (int i = 0; i < PL_HASH_SIZE; i++)
+			snprintf(entry->hex + 2 * i, 3, "%02x", ((uint8 *) VARDATA_ANY(address))[i]);
+	}
+	return entry->hex;
+}
+
+/* A member's DGDB1 description: kind, name, schema address and content. */
+static void
+member_description(StringInfo out, const DGRootEntry *entry)
+{
+	appendStringInfoString(out, "{\"kind\":");
+	escape_json(out, entry->kind);
+	appendStringInfoString(out, ",\"name\":");
+	escape_json(out, entry->name);
+	appendStringInfoString(out, ",\"schema\":\"");
+	if (!strcmp(entry->kind, "sequence"))
+		appendStringInfoString(out, sequence_fingerprint(&entry->schema));
+	else
+		for (int i = 0; i < PL_HASH_SIZE; i++)
+			appendStringInfo(out, "%02x", entry->schema.bytes[i]);
+	appendStringInfoChar(out, '"');
+	if (entry->has_content)
+	{
+		appendStringInfoString(out, ",\"content\":");
+		escape_json(out, hash_format(bytes_of_hash(&entry->content)));
+	}
+	appendStringInfoChar(out, '}');
+}
+
+static char *
+normalized_json(const char *json)
+{
+	return DatumGetCString(DirectFunctionCall1(jsonb_out, DirectFunctionCall1(jsonb_in, CStringGetDatum(json))));
+}
+
+/* The payload member object |ref| of |kind| once had. */
+static char *
+member_json(bytea *ref, const char *kind)
+{
+	DGRootEntry entry;
+	StringInfoData out;
+
+	dg_member_decode(ref, &entry);
+	if (kind && strcmp(kind, entry.kind))
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("revision does not name a visible %s object", kind)));
+	initStringInfo(&out);
+	member_description(&out, &entry);
+	return normalized_json(out.data);
+}
+
+/* Renderings of database roots as DGDB1 JSON, by root: roots never change. */
+typedef struct RenderedRoot
+{
+	uint8		hash[PL_HASH_SIZE];
+	char	   *json;
+} RenderedRoot;
+
+static MemoryContext rendered_memory;
+static HTAB *rendered_roots;
+static Size rendered_bytes;
+
+#define RENDERED_LIMIT (16 * 1024 * 1024)
+
+/*
+ * Database root |root| as the DGDB1 JSON the version-control commands still
+ * read: members by kind and name, namespace definitions inline, and the
+ * dependents derived from the definitions.
+ */
+static char *
+database_json(bytea *root)
+{
+	RenderedRoot *rendered;
+	bool		found;
+	int			n;
+	DGRootEntry *entries;
+	Datum	   *members;
+	StringInfoData json;
+	char	   *encoding;
+	char	   *volatile result = NULL;
+
+	if (VARSIZE_ANY_EXHDR(root) != PL_HASH_SIZE)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("revision does not name a database root")));
+	if (rendered_roots)
+	{
+		rendered = hash_search(rendered_roots, VARDATA_ANY(root), HASH_FIND, NULL);
+		if (rendered)
+			return pstrdup(rendered->json);
+	}
+	entries = dg_root_entries(root, &n);
+	encoding = dg_root_encoding(root);
+
+	/* Callers such as DROP's dependency checks may hold no SPI connection. */
+	{
+		MemoryContext caller = CurrentMemoryContext;
+
+		if (SPI_connect() != SPI_OK_CONNECT)
+			elog(ERROR, "cannot connect version-control SPI");
+		MemoryContextSwitchTo(caller);
+	}
+	members = palloc(sizeof(Datum) * Max(n, 1));
+	initStringInfo(&json);
+	appendStringInfoString(&json, "{\"format\":\"DGDB1\",\"encoding\":");
+	escape_json(&json, encoding ? encoding : GetDatabaseEncodingName());
+	appendStringInfoString(&json, ",\"members\":[");
+	for (int i = 0; i < n; i++)
+	{
+		if (i)
+			appendStringInfoChar(&json, ',');
+		if (!strcmp(entries[i].kind, "namespace"))
+		{
+			bytea	   *definition = bytes_of_hash(&entries[i].schema);
+
+			members[i] = PointerGetDatum(definition);
+			appendStringInfoString(&json, "{\"kind\":\"namespace\",\"definition\":");
+			appendStringInfoString(&json, metadata(definition, "namespace"));
+			appendStringInfoChar(&json, '}');
+		}
+		else
+		{
+			members[i] = PointerGetDatum(dg_member_ref(&entries[i]));
+			member_description(&json, &entries[i]);
+		}
+	}
+	appendStringInfoChar(&json, ']');
+	{
+		List	   *extensions = dg_root_extensions(root);
+
+		if (extensions)
+		{
+			appendStringInfoString(&json, ",\"extensions\":[");
+			foreach_ptr(char, name, extensions)
+			{
+				if (foreach_current_index(name))
+					appendStringInfoChar(&json, ',');
+				escape_json(&json, name);
+			}
+			appendStringInfoChar(&json, ']');
+		}
+	}
+	appendStringInfoChar(&json, '}');
+
+	/* Extensions are native: their objects are read from the physical catalogs. */
+	{
+		CatalogView *previous = CatalogViewSwitch(NULL);
+
+		PG_TRY();
+		{
+			result = database_dependents(normalized_json(json.data), members, n, false);
+		}
+		PG_FINALLY();
+		{
+			CatalogViewSwitch(previous);
+		}
+		PG_END_TRY();
+	}
+	SPI_finish();
+
+	if (!rendered_roots || rendered_bytes > RENDERED_LIMIT)
+	{
+		HASHCTL		ctl = {0};
+
+		if (rendered_memory)
+			MemoryContextDelete(rendered_memory);
+		rendered_memory = AllocSetContextCreate(TopMemoryContext, "rendered database roots", ALLOCSET_DEFAULT_SIZES);
+		rendered_bytes = 0;
+		ctl.keysize = PL_HASH_SIZE;
+		ctl.entrysize = sizeof(RenderedRoot);
+		ctl.hcxt = rendered_memory;
+		rendered_roots = hash_create("rendered database roots", 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	rendered = hash_search(rendered_roots, VARDATA_ANY(root), HASH_ENTER, &found);
+	if (!found)
+	{
+		rendered->json = MemoryContextStrdup(rendered_memory, result);
+		rendered_bytes += strlen(result) + sizeof(RenderedRoot);
+	}
+	return result;
+}
+
+/* dolt_root_json(root): a database root as DGDB1 JSON, for internal SQL. */
+Datum
+dolt_root_json(PG_FUNCTION_ARGS)
+{
+	char	   *json;
+	int			nest = begin_api();
+
+	json = database_json(PG_GETARG_BYTEA_PP(0));
+	end_api(nest);
+	PG_RETURN_TEXT_P(cstring_to_text(json));
 }
 
 #include "dg_expression_codec.inc"
@@ -898,63 +1202,71 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 
 			if (!definitions_only)
 			{
-				PLHash		content;
 				bool		load;
-				bool		present;
-				DGState    *loaded = NULL;
+				RelFileLocator locator;
+				DGState    *loaded;
 
 				if (!OidIsValid(resource))
 					ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", name, dg_current_branch())));
-				present = dg_storage_resource_root(resource, dg_current_branch(), GetActiveSnapshot(), &content, &load);
+				loaded = dg_storage_resource_state(resource, dg_current_branch(), GetActiveSnapshot(), &locator, &load);
 
 				/* A full load, when the roots alone cannot say. */
 				if (load)
 				{
 					DGStorage  *storage = dg_storage_open(CatalogViewLookupObject(view, RelationRelationId, name), dg_current_branch(), name, schema, resource, GetActiveSnapshot());
 
+					if (loaded)
+						dg_release(loaded);
 					loaded = dg_storage_load(storage);
 					dg_storage_close(storage);
-					present = loaded->has_root;
-					content = dg_content(loaded)->root;
+					if (!loaded->has_root)
+					{
+						dg_release(loaded);
+						loaded = NULL;
+					}
 				}
-				if (present)
+				if (loaded)
 				{
-					bytea	   *raw = palloc(VARHDRSZ + PL_HASH_SIZE);
+					PLHash		content;
+					bool		written = false;
 					char	   *root;
 					char	   *recorded = json_value(payload, "content");
 
-					SET_VARSIZE(raw, VARHDRSZ + PL_HASH_SIZE);
-					memcpy(VARDATA(raw), content.bytes, PL_HASH_SIZE);
-					root = hash_format(raw);
+					/*
+					 * A capture that keeps its root applies the delta as a
+					 * fold does, a batch at a time, writing as it goes; one
+					 * that only compares, such as status, writes nothing.
+					 */
+					if (persist && !load && loaded->changes)
+					{
+						content = dg_storage_fold_root(loaded);
+						written = true;
+					}
+					else
+						content = dg_content(loaded)->root;
+					root = hash_format(bytes_of_hash(&content));
 
 					/*
 					 * A member that already records these contents is the
-					 * member this capture would make: its retained tree is
-					 * that root's. Only changed contents are loaded to be
-					 * retained.
+					 * member this capture would make. Otherwise the member
+					 * names the new root, whose nodes the chunk store holds
+					 * once those this load built are written, and that root
+					 * becomes the tree's base if a fold would have made it.
 					 */
 					if (!recorded || strcmp(recorded, root))
 					{
 						payload = json_set_string(payload, "content", root);
 						if (persist)
 						{
-							DGState    *state = loaded;
+							bytea	   *address = written ? bytes_of_hash(&content) : dg_history_retain(dg_content(loaded));
 
-							if (!state)
-							{
-								DGStorage  *storage = dg_storage_open(CatalogViewLookupObject(view, RelationRelationId, name), dg_current_branch(), name, schema, resource, GetActiveSnapshot());
-
-								state = dg_storage_load(storage);
-								dg_storage_close(storage);
-							}
-							members[i] = PointerGetDatum(put(kinds[i], payload, VC_ARGS(PointerGetDatum(schema), PointerGetDatum(dg_history_export_tree(dg_content(state)))), 2));
-							if (state != loaded)
-								dg_release(state);
+							members[i] = PointerGetDatum(put(kinds[i], payload, VC_ARGS(PointerGetDatum(schema), PointerGetDatum(address)), 2));
+							if (!load)
+								dg_storage_install_capture(locator, dg_current_branch(), GetActiveSnapshot(), loaded, content);
 						}
 					}
-				}
-				if (loaded)
 					dg_release(loaded);
+				}
 			}
 			appendStringInfoString(&json, payload);
 		}

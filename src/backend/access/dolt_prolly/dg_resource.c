@@ -319,11 +319,12 @@ dg_storage_open(Oid definition, const char *branch, const char *name,
 }
 
 /*
- * The content root of storage |resource| on |branch|, read without building its
- * definition: false if it holds none there.
+ * Storage |resource| on |branch|, read without building its definition, for
+ * its content root: NULL if it holds none there (dg_storage_content_state).
+ * Sets |located| to the resource's file.
  */
-bool
-dg_storage_resource_root(Oid resource, const char *branch, Snapshot snapshot, PLHash *content, bool *load)
+DGState *
+dg_storage_resource_state(Oid resource, const char *branch, Snapshot snapshot, RelFileLocator *located, bool *load)
 {
 	LockRelId	lock = {resource, MyDatabaseId};
 	Relation	catalog;
@@ -351,7 +352,8 @@ dg_storage_resource_root(Oid resource, const char *branch, Snapshot snapshot, PL
 
 	/* The roots and this transaction's changes are the whole content. */
 	*load = false;
-	return dg_storage_content_root(locator, branch, snapshot, content);
+	*located = locator;
+	return dg_storage_content_state(locator, branch, snapshot);
 }
 
 /* Only this checked entrypoint admits a canonical descriptor to page storage.
@@ -525,7 +527,7 @@ storage_base(DGStorage *storage, DGState *state)
 		PushActiveSnapshot(storage->snapshot);
 		PG_TRY();
 		{
-			dg_set_base(state, dg_history_import(state->store, storage->base));
+			dg_set_base(state, dg_history_open(state->store, storage->base));
 		}
 		PG_FINALLY();
 		{

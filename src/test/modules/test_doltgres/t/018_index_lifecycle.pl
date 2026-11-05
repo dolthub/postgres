@@ -54,8 +54,9 @@ sql(q{DROP INDEX x_idx; CREATE INDEX x_idx ON t(x DESC) INCLUDE(v)});
 is(sql(q{SELECT x,v FROM t WHERE x>=11 ORDER BY x DESC}),"21|b\n11|a",'replacement index supports ordering and INCLUDE');
 is(sql(q{SELECT attname||':'||attcollation FROM pg_attribute WHERE attrelid='x_idx'::regclass ORDER BY attnum}),"x:0\nv:0",'an included column has no collation, as in PostgreSQL');
 # Another table's DDL leaves the index's stored definition as it is.
-my $index_member=q{SELECT encode(o.objhash,'hex') FROM pg_dolt_ref r JOIN pg_dolt_object_visible d ON d.objhash=r.reftarget CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible o ON o.objhash=ch WHERE r.refname='working/other' AND o.objkind='index' AND convert_from(o.objpayload,'UTF8')::jsonb->>'name'='public.x_idx'};
+my $index_member=q{SELECT encode(m.schema,'hex') || ':' || encode(m.content,'hex') FROM pg_dolt_ref r CROSS JOIN LATERAL dolt_root_find(r.reftarget,'index','public.x_idx') m WHERE r.refname='working/other'};
 my $member=sql($index_member);
+like($member,qr/^[0-9a-f]{40}:[0-9a-f]{40}$/,'the index is a member of the branch\'s root');
 sql(q{CREATE TABLE unrelated(a int); ALTER TABLE unrelated ADD COLUMN b int; DROP TABLE unrelated});
 is(sql($index_member),$member,'other tables\' DDL keeps an index member byte-identical');
 sql(q{CREATE INDEX partial_idx ON t(x) WHERE x>0});

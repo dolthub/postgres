@@ -25,6 +25,7 @@
  *-------------------------------------------------------------------------
  */
 #include "dg.h"
+#include "miscadmin.h"
 
 #include "access/transam.h"
 #include "common/hashfn.h"
@@ -73,9 +74,9 @@ gather(void *arg, const DoltDeltaEdit *edit)
 	change->delta = edit->delta;
 }
 
-/* The merged value of |change|, in |memory|: the base's count plus its delta, then the row. */
+/* The merged value of |change| over |tree|, in |memory|: the base's count plus its delta, then the row. */
 static DGChange *
-resolve(DGState *s, DGChange *change, MemoryContext memory)
+resolve_over(const PLTree *tree, DGChange *change, MemoryContext memory)
 {
 	PLValue		base;
 	int64		count;
@@ -84,7 +85,7 @@ resolve(DGState *s, DGChange *change, MemoryContext memory)
 
 	if (change->resolved)
 		return change;
-	dg_check(pl_get(&s->tree, change->key, &base));
+	dg_check(pl_get(tree, change->key, &base));
 	count = (base.present ? (int64) pl_read64(base.bytes.data) : 0) + change->delta;
 	if (base.present && change->row.len &&
 		(base.bytes.len != change->row.len + 8 || memcmp(base.bytes.data + 8, change->row.data, change->row.len) != 0))
@@ -102,6 +103,12 @@ resolve(DGState *s, DGChange *change, MemoryContext memory)
 		change->value = (PLSlice) {bytes, 8 + row.len};
 	}
 	return change;
+}
+
+static DGChange *
+resolve(DGState *s, DGChange *change, MemoryContext memory)
+{
+	return resolve_over(&s->tree, change, memory);
 }
 
 bool
@@ -465,6 +472,77 @@ dg_content(DGState *s)
 		s->loaded_known = true;
 	}
 	return &s->tree;
+}
+
+/*
+ * The root of |s|'s content, its changes applied to its base as Doltgrust
+ * folds: dolt_fold_batch changed keys at a time, read in key order and merged
+ * into the base through |store|, a store of the caller's own over the chunk
+ * store. After each batch, |flush| writes the nodes the batch made and drops
+ * them, so a fold holds one batch of changes, the merge's path and the nodes
+ * of one batch, however large the delta. |s| itself is left as it was.
+ */
+PLHash
+dg_fold_content(DGState *s, PLStore *store, void (*flush) (PLStore *store))
+{
+	PLTree		base = {store, s->tree.root};
+	PLMerger   *volatile merger = NULL;
+	MemoryContext batch = AllocSetContextCreate(CurrentMemoryContext, "prolly fold batch", ALLOCSET_DEFAULT_SIZES);
+	uint8	   *from = NULL;
+	uint32		fromlen = 0;
+	PLTree		out;
+
+	if (!s->changes)
+		return s->tree.root;
+	dg_check(pl_merger_start(&base, (PLMerger **) &merger));
+	PG_TRY();
+	{
+		int			visited;
+
+		do
+		{
+			Gathered	g = {.memory = batch};
+			PLEdit	   *edits;
+
+			CHECK_FOR_INTERRUPTS();
+			visited = dolt_delta_range(&s->changes->view, from, fromlen, false, NULL, 0, false, dolt_fold_batch, gather, &g);
+			edits = MemoryContextAlloc(batch, sizeof(PLEdit) * Max(g.count, 1));
+			for (int i = 0; i < g.count; i++)
+			{
+				DGChange   *change = resolve_over(&base, &g.items[i], batch);
+
+				edits[i].key = change->key;
+				edits[i].value.present = change->present;
+				edits[i].value.bytes = change->present ? change->value : (PLSlice) {NULL, 0};
+			}
+			dg_check(pl_merger_feed(merger, edits, g.count));
+			if (g.count)
+			{
+				if (from)
+					pfree(from);
+				fromlen = g.items[g.count - 1].key.len;
+				from = palloc(Max(fromlen, 1));
+				memcpy(from, g.items[g.count - 1].key.data, fromlen);
+			}
+			MemoryContextReset(batch);
+			flush(store);
+		} while (visited == dolt_fold_batch);
+		{
+			PLMerger   *finishing = merger;
+
+			merger = NULL;
+			dg_check(pl_merger_finish(finishing, &out));
+		}
+		flush(store);
+	}
+	PG_FINALLY();
+	{
+		if (merger)
+			pl_merger_free(merger);
+		MemoryContextDelete(batch);
+	}
+	PG_END_TRY();
+	return out.root;
 }
 
 /* Replace the whole content with |tree|, keeping the root the state was loaded with. */

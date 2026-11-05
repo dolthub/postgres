@@ -225,26 +225,34 @@ void
 dg_branch_base(Relation rel, DGState *state)
 {
 	MemoryContext caller = CurrentMemoryContext;
-	Oid			types[] = {TEXTOID, TEXTOID, TEXTOID};
-	Datum		args[] = {CStringGetTextDatum(psprintf("heads/%s", dg_relation_branch(rel))),
-		CStringGetTextDatum(get_namespace_name(RelationGetNamespace(rel))),
-	CStringGetTextDatum(RelationGetRelationName(rel))};
+	Oid			types[] = {TEXTOID};
+	Datum		args[] = {CStringGetTextDatum(psprintf("heads/%s", dg_relation_branch(rel)))};
+	bytea	   *root = NULL;
 	bytea	   *address = NULL;
 	bool		isnull;
+	char	   *name = dg_qualified_name(get_namespace_name(RelationGetNamespace(rel)), RelationGetRelationName(rel));
+	DGRootEntry entry;
 
 	if (!strcmp(dg_relation_branch(rel), "main"))
 		return;
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "cannot connect branch SPI");
 	MemoryContextSwitchTo(caller);
-	SPI_execute_with_args("SELECT d.objchildren[2] FROM pg_catalog.pg_dolt_ref r JOIN pg_catalog.pg_dolt_object_visible c ON c.objhash=r.reftarget JOIN pg_catalog.pg_dolt_object_visible db ON db.objhash=c.objchildren[1] CROSS JOIN LATERAL unnest(db.objchildren) ch JOIN pg_catalog.pg_dolt_object_visible d ON d.objhash=ch WHERE r.refname=$1 AND d.objkind IN ('table','index') AND (pg_catalog.convert_from(d.objpayload,'UTF8')::jsonb->>'name')=pg_catalog.format('%I.%I',$2,$3)", 3, types, args, NULL, true, 1);
+	SPI_execute_with_args("SELECT c.objchildren[1] FROM pg_catalog.pg_dolt_ref r JOIN pg_catalog.pg_dolt_object_visible c ON c.objhash=r.reftarget WHERE r.refname=$1", 1, types, args, NULL, true, 1);
 	MemoryContextSwitchTo(caller);
 	if (SPI_processed)
-		address = DatumGetByteaPCopy(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+		root = DatumGetByteaPCopy(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
 	SPI_finish();
+	if (root && (dg_root_find(root, rel->rd_rel->relkind == RELKIND_INDEX ? "index" : "table", name, &entry) ||
+				 dg_root_find(root, "table", name, &entry)) && entry.has_content)
+	{
+		address = palloc(VARHDRSZ + PL_HASH_SIZE);
+		SET_VARSIZE(address, VARHDRSZ + PL_HASH_SIZE);
+		memcpy(VARDATA(address), entry.content.bytes, PL_HASH_SIZE);
+	}
 	if (!address)
 		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("relation %s has no state on branch %s", RelationGetRelationName(rel), dg_relation_branch(rel))));
-	dg_set_base(state, dg_history_import(state->store, address));
+	dg_set_base(state, dg_history_open(state->store, address));
 }
 
 const char *

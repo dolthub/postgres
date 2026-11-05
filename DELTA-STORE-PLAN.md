@@ -60,9 +60,29 @@ Lessons:
 
 Open:
 
-- **Folds materialize a tree's whole visible delta** in one `pl_apply`.
-  Doltgrust folds a batch of keys at a time; bounded batches would make large
-  thresholds safe.
+- **Folds are bounded (2026-11-05).** As Doltgrust's `fold_delta` does, a
+  fold reads `dolt_fold_batch` changed keys at a time (4,096 by default) and
+  feeds them in key order to one resumable merge (`PLMerger`), which writes
+  each node once, as its boundary is reached, and reuses untouched subtrees by
+  reference. After each batch the fold writes the nodes it made to the chunk
+  store, offers them to the shared node cache and drops them, keeping only the
+  merge's path (held across the drop) and its pending entries (which copy the
+  bytes they borrowed). Commits that keep what they capture fold the same way;
+  read-only captures, such as status, still apply in memory, since they must
+  not write. Release build, one `dolt_fold()` of every row updated:
+
+  | rows | private memory before | after | fold time before | after |
+  |---|---|---|---|---|
+  | 100,000 | 197 MB | 13 MB | 341 ms | 281 ms |
+  | 262,144 | 516 MB | 16 MB | 1,011 ms | 795 ms |
+
+  A backend's RSS still grows with the delta store it reads, which is shared
+  memory sized by `dolt_delta_memory`.
+
+  TPC-C at scale 1 and 10 threads (60 s, every check passing) no longer runs
+  out of memory with `dolt_fold_versions=262144`: 484 and 494 tps, against
+  449 and 477 with the default 4,096. The larger threshold helps a little;
+  it no longer costs memory.
 - **Branch rename, branch drop and DROP DATABASE** leave their trees in memory.
 - **TRUNCATE and large installs** append a diff of every row; replacing the
   root row would be O(1).
@@ -276,6 +296,53 @@ read the materialized view of their snapshot (5A), which is Doltgrust's
 capture. Its nodes reach the chunk store only when a commit or ref names them.
 Branch creation copies the source's view root as the new branch's base. That
 is O(delta), not O(rows).
+
+As built, a capture applies each tree's visible delta to its base and then
+discards the result, so the fold worker applies the same versions again.
+Doltgrust's `install_capture` instead makes a captured root the tree's next
+base. Plan (2026-11-04), after commits stop copying trees
+([chunk store plan](CHUNK-STORE-PLAN.md) milestone 6):
+
+- When a capture retains a tree's root, it offers that root as a new base:
+  a `pg_dolt_root` version stamped with the capture's snapshot as its
+  horizon, exactly what a fold of that snapshot would write.
+- It installs only a fold's result:
+  - the capturing transaction wrote no versions of that tree;
+  - its snapshot is an MVCC snapshot newer than the current base's
+    horizon, and the base it read is still the newest;
+  - no fold of the tree is running (the same conditional lock folds take).
+  Otherwise it installs nothing, which is always correct.
+- The root row update and its FOLD WAL record follow the fold path, so pruning,
+  standbys and readers treat the new base like any other fold.
+
+Done (2026-11-05, `dg_storage_install_capture`). As built:
+
+- A capture installs a tree's root when it retained that root for a changed
+  member, so `dolt_status` and other read-only captures install nothing.
+- The horizon is the capture's snapshot plus the capturing transaction's own
+  xid as running: its later writes in the same transaction stay outside the
+  base.
+- The FOLD record names the current subtransaction's xid, not the top
+  transaction's. An install rolled back with its savepoint otherwise left a
+  fold note that pruning took for committed, and the workers dropped versions
+  the restored base lacked (`test_doltgres/005_canonical_sql` lost a row).
+- Nodes written in a subtransaction that rolls back are marked unwritten again,
+  so a later capture in the same transaction writes them again.
+- FOLD redo no longer prunes during crash recovery or before a standby takes
+  snapshots: `GetOldestNonRemovableTransactionId` asserted there. Commits made
+  FOLD records before crashes common enough to expose it.
+
+Release build, folds left to `dolt_fold()`, 200,000-row table:
+
+| | merge base | now |
+|---|---|---|
+| one-row UPDATE, then `dolt_commit('-am')` | 472 ms | 1.0 ms |
+| `dolt_fold()` after that commit | 516 ms | 0.3 ms |
+| first commit after the bulk load | 970 ms | 590 ms |
+
+With the default fold settings, a fold worker often holds a freshly loaded
+tree's lock while a commit captures it; that commit then installs nothing and
+the next commit still applies the delta.
 
 ### 8. Things to settle while building
 

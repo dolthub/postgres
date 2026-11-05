@@ -319,8 +319,14 @@ static uint64 store_epoch = 1;	/* moves when the working store is recreated */
 static DoltChunkStore *working_chunks;
 static DoltChunk working_fetched;
 
-/* Nodes this transaction wrote, to share once it commits. */
-static PLHash *written;
+/* Nodes this transaction wrote, to share once it commits, by subtransaction. */
+typedef struct WrittenNode
+{
+	PLHash		hash;
+	SubTransactionId subxid;
+} WrittenNode;
+
+static WrittenNode *written;
 static int	written_count;
 static int	written_capacity;
 
@@ -434,7 +440,7 @@ share_written(void)
 {
 	for (int i = 0; working_store && i < written_count; i++)
 	{
-		PLNode	   *node = pl_find_local(working_store, written[i]);
+		PLNode	   *node = pl_find_local(working_store, written[i].hash);
 
 		if (node)
 			dolt_node_cache_add(node->hash.bytes, node->data, node->size);
@@ -531,45 +537,151 @@ collect_unbacked(PLStore *store, PLHash root, Pending *pending)
 	pending->nodes[pending->count++] = node;
 }
 
+/*
+ * Put |pending|'s nodes, remembering them to share once the transaction
+ * commits. With |probe|, nodes the chunk store already holds are skipped,
+ * since a put never deduplicates.
+ */
+static void
+put_pending(Pending *pending, bool probe)
+{
+	DoltChunkStore *chunks;
+	uint8	   *hashes;
+	const uint8 **data;
+	Size	   *lengths;
+	bool	   *found;
+	int			n = 0;
+
+	if (!pending->count)
+		return;
+	chunks = dolt_chunk_open(DOLT_CHUNK_WRITE);
+	hashes = palloc((Size) pending->count * DOLT_CHUNK_HASH_SIZE);
+	data = palloc(pending->count * sizeof(uint8 *));
+	lengths = palloc(pending->count * sizeof(Size));
+	found = palloc0(pending->count * sizeof(bool));
+	for (int i = 0; i < pending->count; i++)
+		memcpy(hashes + (Size) i * DOLT_CHUNK_HASH_SIZE, pending->nodes[i]->hash.bytes, DOLT_CHUNK_HASH_SIZE);
+	if (probe)
+		dolt_chunk_exists_many(chunks, pending->count, hashes, found);
+	for (int i = 0; i < pending->count; i++)
+	{
+		if (found[i])
+			continue;
+		memmove(hashes + (Size) n * DOLT_CHUNK_HASH_SIZE, pending->nodes[i]->hash.bytes, DOLT_CHUNK_HASH_SIZE);
+		data[n] = pending->nodes[i]->data;
+		lengths[n] = pending->nodes[i]->size;
+		pending->nodes[n++] = pending->nodes[i];
+	}
+	if (n)
+		dolt_chunk_put_many(chunks, n, hashes, data, lengths);
+	dolt_chunk_close(chunks);
+	if (written_count + n > written_capacity)
+	{
+		int			capacity = Max(written_count + n, written_capacity * 2);
+
+		written = written ? repalloc(written, capacity * sizeof(WrittenNode)) :
+			MemoryContextAlloc(TopTransactionContext, capacity * sizeof(WrittenNode));
+		written_capacity = capacity;
+	}
+	for (int i = 0; i < n; i++)
+	{
+		written[written_count].hash = pending->nodes[i]->hash;
+		written[written_count++].subxid = GetCurrentSubTransactionId();
+	}
+	pfree(hashes);
+	pfree(data);
+	pfree(lengths);
+	pfree(found);
+	pfree(pending->nodes);
+}
+
 static void
 persist_roots(const Roots *roots)
 {
-	PLStore    *store = dg_working_store();
 	Pending		pending = {0};
 
 	if (!roots->present)
 		return;
-	collect_unbacked(store, roots->content, &pending);
-	if (pending.count)
+	collect_unbacked(dg_working_store(), roots->content, &pending);
+	put_pending(&pending, false);
+}
+
+/*
+ * Write the nodes a fold's batch made in |store|, offer them to every session
+ * through the shared node cache, and drop every node the chunk store holds, but
+ * those the fold's merge keeps. Nodes are immutable and named by their hashes,
+ * so sharing them before the fold commits is safe: a reader reaches them only
+ * through a root that names them.
+ */
+/* The most nodes a fold's store held at once, for its log line. */
+static size_t fold_peak;
+
+static void
+fold_flush(PLStore *store)
+{
+	Pending		pending = {0};
+
+	for (size_t i = 0; i < store->unbacked_count; i++)
 	{
-		DoltChunkStore *chunks = dolt_chunk_open(DOLT_CHUNK_WRITE);
-		uint8	   *hashes = palloc((Size) pending.count * DOLT_CHUNK_HASH_SIZE);
-		const uint8 **data = palloc(pending.count * sizeof(uint8 *));
-		Size	   *lengths = palloc(pending.count * sizeof(Size));
+		PLNode	   *node = store->unbacked[i];
 
-		for (int i = 0; i < pending.count; i++)
+		if (node->backed)
+			continue;
+		if (pending.count == pending.capacity)
 		{
-			memcpy(hashes + (Size) i * DOLT_CHUNK_HASH_SIZE, pending.nodes[i]->hash.bytes, DOLT_CHUNK_HASH_SIZE);
-			data[i] = pending.nodes[i]->data;
-			lengths[i] = pending.nodes[i]->size;
+			pending.capacity = pending.capacity ? pending.capacity * 2 : 64;
+			pending.nodes = pending.nodes ? repalloc(pending.nodes, pending.capacity * sizeof(PLNode *)) :
+				palloc(pending.capacity * sizeof(PLNode *));
 		}
-		dolt_chunk_put_many(chunks, pending.count, hashes, data, lengths);
-		dolt_chunk_close(chunks);
-		if (written_count + pending.count > written_capacity)
-		{
-			int			capacity = Max(written_count + pending.count, written_capacity * 2);
-
-			written = written ? repalloc(written, capacity * sizeof(PLHash)) :
-				MemoryContextAlloc(TopTransactionContext, capacity * sizeof(PLHash));
-			written_capacity = capacity;
-		}
-		for (int i = 0; i < pending.count; i++)
-			written[written_count++] = pending.nodes[i]->hash;
-		pfree(hashes);
-		pfree(data);
-		pfree(lengths);
-		pfree(pending.nodes);
+		pending.nodes[pending.count++] = node;
 	}
+	for (int i = 0; i < pending.count; i++)
+	{
+		dolt_node_cache_add(pending.nodes[i]->hash.bytes, pending.nodes[i]->data, pending.nodes[i]->size);
+		pl_node_set_backed(pending.nodes[i]);
+	}
+	fold_peak = Max(fold_peak, pl_store_stats(store).chunks);
+	put_pending(&pending, false);
+	pl_store_drop_backed(store);
+}
+
+/*
+ * The root of |s|'s content, its changes applied to its base a batch at a
+ * time, with every node it holds written to the chunk store and shared.
+ */
+PLHash
+dg_storage_fold_root(DGState *s)
+{
+	PLStore    *store = dg_private_store();
+	PLHash		root;
+
+	fold_peak = 0;
+	PG_TRY();
+	{
+		root = dg_fold_content(s, store, fold_flush);
+	}
+	PG_FINALLY();
+	{
+		pl_store_free(store);
+	}
+	PG_END_TRY();
+	elog(DEBUG1, "prolly fold held at most %zu nodes", fold_peak);
+	return root;
+}
+
+/*
+ * Write the nodes of |tree| the chunk store lacks, so that history objects can
+ * name its root: that is, the nodes its store built or imported, not those it
+ * read from the chunk store. Nodes a store other than the working store built
+ * may already be stored, so they are probed first.
+ */
+void
+dg_tree_retain(const PLTree *tree)
+{
+	Pending		pending = {0};
+
+	collect_unbacked(tree->store, tree->root, &pending);
+	put_pending(&pending, tree->store != working_store);
 }
 
 static bool callbacks_registered;
@@ -656,6 +768,13 @@ typedef struct Modified
 	CommandId	cid;
 	SubTransactionId subxid;
 } Modified;
+
+/*
+ * Row versions this transaction created, by inserting or updating, which a
+ * heap tuple's xmin would show: the foreign key checks of an update that keeps
+ * its keys may be skipped only for a version an earlier transaction made.
+ */
+static HTAB *created;
 
 static HTAB *modified;
 
@@ -865,6 +984,7 @@ store_xact(XactEvent event, void *arg)
 			handle_local_invalidate();
 			batches = NULL;
 			modified = NULL;
+			created = NULL;
 			/* A prepared writer stays registered until readers find it finished. */
 			if (serializable_count && event != XACT_EVENT_PREPARE)
 				writer_forget(GetTopTransactionIdIfAny(), -1);
@@ -923,6 +1043,24 @@ store_subxact(SubXactEvent event, SubTransactionId mySubid, SubTransactionId par
 	if (event != SUBXACT_EVENT_ABORT_SUB)
 		return;
 
+	/*
+	 * Nodes this subtransaction and its children wrote are gone: a later write
+	 * of the same node must store it again.
+	 */
+	for (int i = 0; i < written_count;)
+	{
+		if (written[i].subxid >= mySubid)
+		{
+			PLNode	   *node = working_store ? pl_find_local(working_store, written[i].hash) : NULL;
+
+			if (node)
+				pl_node_set_unbacked(node);
+			written[i] = written[--written_count];
+		}
+		else
+			i++;
+	}
+
 	/* Root rows from this subtransaction and its children, with ids >= it, are gone. */
 	foreach(lc, written_roots)
 	{
@@ -939,6 +1077,15 @@ store_subxact(SubXactEvent event, SubTransactionId mySubid, SubTransactionId par
 		while ((row = hash_seq_search(&status)) != NULL)
 			if (row->subxid >= mySubid)
 				hash_search(modified, &row->key, HASH_REMOVE, NULL);
+	}
+	if (created)
+	{
+		Modified   *row;
+
+		hash_seq_init(&status, created);
+		while ((row = hash_seq_search(&status)) != NULL)
+			if (row->subxid >= mySubid)
+				hash_search(created, &row->key, HASH_REMOVE, NULL);
 	}
 }
 
@@ -1144,6 +1291,38 @@ dg_row_committed(Relation rel, uint64 handle)
 }
 
 /* If this transaction updated or deleted row |handle|, the command that did. */
+void
+dg_note_created(Relation rel, const char *branch, uint64 handle)
+{
+	ModifiedKey key = modified_key(rel, branch, handle);
+	Modified   *row;
+
+	if (!created)
+	{
+		HASHCTL		ctl = {0};
+
+		ctl.keysize = sizeof(ModifiedKey);
+		ctl.entrysize = sizeof(Modified);
+		ctl.hcxt = TopTransactionContext;
+		created = hash_create("prolly created rows", 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	row = hash_search(created, &key, HASH_ENTER, NULL);
+	row->cid = GetCurrentCommandId(false);
+	row->subxid = GetCurrentSubTransactionId();
+}
+
+/* Whether this transaction created row version |handle|, as dg_note_created recorded. */
+bool
+dg_row_created(Relation rel, const char *branch, uint64 handle)
+{
+	ModifiedKey key;
+
+	if (!created)
+		return false;
+	key = modified_key(rel, branch, handle);
+	return hash_search(created, &key, HASH_FIND, NULL) != NULL;
+}
+
 bool
 dg_row_modified(Relation rel, const char *branch, uint64 handle, CommandId *cid)
 {
@@ -1686,7 +1865,7 @@ import_content(Relation rel, DGState *state, bytea *content)
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
 	PG_TRY();
 	{
-		dg_set_base(state, dg_history_import(state->store, content));
+		dg_set_base(state, dg_history_open(state->store, content));
 	}
 	PG_FINALLY();
 	{
@@ -1972,16 +2151,17 @@ index_table_key(Relation index, const char *branch, Relation *table)
 #include "dg_handle.inc"
 
 /*
- * The content root of storage file |locator| on |branch| as |snapshot| and this
- * transaction's own changes show it, as a load of its relation would: false
- * if the storage holds no root there.
+ * Storage file |locator| on |branch| as |snapshot| and this transaction's own
+ * changes show it, as a load of its relation would, for its content root
+ * (dg_content); NULL if the storage holds no root there. The caller releases
+ * it.
  */
-bool
-dg_storage_content_root(RelFileLocator locator, const char *branch, Snapshot snapshot, PLHash *content)
+DGState *
+dg_storage_content_state(RelFileLocator locator, const char *branch, Snapshot snapshot)
 {
 	RootKey		key = {0};
 	Roots		committed;
-	DGState    *s;
+	DGState    *s = NULL;
 	Snapshot	read;
 	bool		registered = false;
 
@@ -2005,12 +2185,91 @@ dg_storage_content_root(RelFileLocator locator, const char *branch, Snapshot sna
 		s = new_state(NULL);
 		state_set(s, &committed);
 		state_collect(s, &key, read, &committed, true);
-		*content = dg_content(s)->root;
-		dg_release(s);
 	}
 	if (registered)
 		UnregisterSnapshot(read);
-	return committed.present;
+	return s;
+}
+
+/*
+ * Offer |root|, the content of |s|, which dg_storage_content_state loaded for
+ * storage file |locator| on |branch| under |snapshot| and a capture has just
+ * written to the chunk store, as the tree's next base, as Doltgrust's install_capture does: the base a
+ * fold of |snapshot| would write, so the fold worker need not apply the same
+ * versions again. It installs only what a fold would:
+ * - the transaction wrote no versions, which the new base must not hold;
+ * - the delta changed the base it loaded, and that base is still the newest
+ *   (a newer row would hold versions |snapshot| does not see);
+ * - no fold or other install of the tree is running.
+ * Its horizon is |snapshot|'s, with this transaction's own xid counted as
+ * running, so versions it writes later stay outside the base. Returns whether
+ * it installed one; otherwise nothing changes, which is always correct.
+ */
+bool
+dg_storage_install_capture(RelFileLocator locator, const char *branch, Snapshot snapshot, DGState *s, PLHash root)
+{
+	RootKey		key = root_key_of(locator.spcOid, locator.relNumber, branch);
+	DoltDeltaTree tree = delta_tree(&key);
+	Roots		read;
+	Roots		latest = {0};
+	Snapshot	now;
+	Relation	catalog;
+	ScanKeyData keys[3];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	ItemPointerData tid;
+	DoltDeltaHorizon horizon;
+	TransactionId own = GetTopTransactionIdIfAny();
+	bool		installed = false;
+
+	if (wrote_versions || !s->has_root || !snapshot || !IsMVCCSnapshot(snapshot))
+		return false;
+	/* The base |s| was loaded over, as the same snapshot reads it. */
+	read = roots_read(&key, snapshot);
+	if (!read.present || memcmp(root.bytes, read.content.bytes, PL_HASH_SIZE) == 0 || !ConditionalLockDatabaseObject(DoltRootRelationId, key.file,
+														(int32) hash_bytes((const unsigned char *) branch, strlen(branch)),
+														ExclusiveLock))
+		return false;
+	now = RegisterSnapshot(GetLatestSnapshot());
+	catalog = table_open(DoltRootRelationId, RowExclusiveLock);
+	root_scan_keys(&key, keys);
+	scan = systable_beginscan(catalog, DoltRootKeyIndexId, true, now, 3, keys);
+	tuple = systable_getnext(scan);
+	if (HeapTupleIsValid(tuple))
+	{
+		HeapTupleData locked;
+		Buffer		buffer = InvalidBuffer;
+		TM_FailureData failure;
+
+		latest = roots_from_tuple(tuple, RelationGetDescr(catalog));
+		tid = tuple->t_self;
+		locked.t_self = tid;
+		if (heap_lock_tuple(catalog, &locked, GetCurrentCommandId(true), LockTupleExclusive,
+							LockWaitSkip, false, &buffer, &failure) != TM_Ok)
+			latest.present = false;
+		if (BufferIsValid(buffer))
+			ReleaseBuffer(buffer);
+	}
+	systable_endscan(scan);
+	if (latest.present && memcmp(latest.content.bytes, read.content.bytes, PL_HASH_SIZE) == 0 &&
+		TransactionIdEquals(latest.horizon.xmin, read.horizon.xmin) &&
+		TransactionIdEquals(latest.horizon.xmax, read.horizon.xmax))
+	{
+		horizon.xmin = snapshot->xmin;
+		horizon.xmax = snapshot->xmax;
+		horizon.xcnt = snapshot->xcnt;
+		horizon.xip = palloc((snapshot->xcnt + 1) * sizeof(TransactionId));
+		memcpy(horizon.xip, snapshot->xip, snapshot->xcnt * sizeof(TransactionId));
+		if (TransactionIdIsValid(own) && TransactionIdPrecedes(own, snapshot->xmax))
+			horizon.xip[horizon.xcnt++] = own;
+		roots_write(catalog, &key, &tid, root, &horizon);
+		/* Under this subtransaction's xid, which rolls back with the row. */
+		dolt_delta_set_fold(&tree, GetCurrentTransactionId(), &horizon);
+		installed = true;
+	}
+	table_close(catalog, RowExclusiveLock);
+	UnregisterSnapshot(now);
+	return installed;
 }
 
 /*
@@ -2077,15 +2336,13 @@ dg_fold_tree(Oid space, RelFileNumber file, const char *branch)
 		state_collect(s, &key, snapshot, &committed, false);
 		if (s->changes)
 		{
-			PLTree	   *content = dg_content(s);
-			Roots		folded_roots = {.present = true, .content = content->root};
+			PLHash		root = dg_storage_fold_root(s);
 
 			horizon.xmin = snapshot->xmin;
 			horizon.xmax = snapshot->xmax;
 			horizon.xcnt = snapshot->xcnt;
 			horizon.xip = snapshot->xip;
-			persist_roots(&folded_roots);
-			roots_write(catalog, &key, &tid, content->root, &horizon);
+			roots_write(catalog, &key, &tid, root, &horizon);
 			dolt_delta_set_fold(&tree, GetTopTransactionId(), &horizon);
 			folded = true;
 		}
