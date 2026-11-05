@@ -589,42 +589,6 @@ object_read(bytea *hash, const char *kind, char **actual, bytea **payload, Array
 	return dg_object_read(hash, kind, actual, payload, children);
 }
 
-/*
- * Whether object |hash| of |kind| exists, and the transaction that created
- * it if that is this transaction and no other copy is committed.
- */
-static bool
-object_creator(bytea *hash, const char *kind, bool *found, TransactionId *creator)
-{
-	Relation	catalog = table_open(DoltObjectRelationId, AccessShareLock);
-	ScanKeyData key;
-	SysScanDesc scan;
-	HeapTuple	tuple;
-
-	*found = false;
-	*creator = InvalidTransactionId;
-	ScanKeyInit(&key, Anum_pg_dolt_object_objhash, BTEqualStrategyNumber, F_BYTEAEQ, PointerGetDatum(hash));
-	scan = systable_beginscan(catalog, DoltObjectKeyIndexId, true, api_snapshot(), 1, &key);
-	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
-	{
-		bool		isnull;
-		char	   *objkind = TextDatumGetCString(heap_getattr(tuple, Anum_pg_dolt_object_objkind, RelationGetDescr(catalog), &isnull));
-		TransactionId xid = HeapTupleHeaderGetXmin(tuple->t_data);
-
-		if (strcmp(objkind, kind))
-			continue;
-		*found = true;
-		if (!TransactionIdIsCurrentTransactionId(xid))
-		{
-			*creator = InvalidTransactionId;
-			break;
-		}
-		*creator = xid;
-	}
-	systable_endscan(scan);
-	table_close(catalog, AccessShareLock);
-	return *found;
-}
 
 /* The |index|th (from 1) child of object |hash|, or NULL. */
 static bytea *
@@ -1263,14 +1227,24 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 				}
 				if (loaded)
 				{
-					PLTree	   *content = dg_content(loaded);
-					bytea	   *raw = palloc(VARHDRSZ + PL_HASH_SIZE);
+					PLHash		content;
+					bool		written = false;
 					char	   *root;
 					char	   *recorded = json_value(payload, "content");
 
-					SET_VARSIZE(raw, VARHDRSZ + PL_HASH_SIZE);
-					memcpy(VARDATA(raw), content->root.bytes, PL_HASH_SIZE);
-					root = hash_format(raw);
+					/*
+					 * A capture that keeps its root applies the delta as a
+					 * fold does, a batch at a time, writing as it goes; one
+					 * that only compares, such as status, writes nothing.
+					 */
+					if (persist && !load && loaded->changes)
+					{
+						content = dg_storage_fold_root(loaded);
+						written = true;
+					}
+					else
+						content = dg_content(loaded)->root;
+					root = hash_format(bytes_of_hash(&content));
 
 					/*
 					 * A member that already records these contents is the
@@ -1284,9 +1258,11 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 						payload = json_set_string(payload, "content", root);
 						if (persist)
 						{
-							members[i] = PointerGetDatum(put(kinds[i], payload, VC_ARGS(PointerGetDatum(schema), PointerGetDatum(dg_history_retain(content))), 2));
+							bytea	   *address = written ? bytes_of_hash(&content) : dg_history_retain(dg_content(loaded));
+
+							members[i] = PointerGetDatum(put(kinds[i], payload, VC_ARGS(PointerGetDatum(schema), PointerGetDatum(address)), 2));
 							if (!load)
-								dg_storage_install_capture(locator, dg_current_branch(), GetActiveSnapshot(), loaded);
+								dg_storage_install_capture(locator, dg_current_branch(), GetActiveSnapshot(), loaded, content);
 						}
 					}
 					dg_release(loaded);

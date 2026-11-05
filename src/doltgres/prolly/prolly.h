@@ -136,6 +136,17 @@ PLStatus	pl_validate(const PLTree *tree);
 PLStatus	pl_build(PLStore *store, const PLEntry *entries, size_t count, PLTree *out);
 PLStatus	pl_apply(const PLTree *tree, const PLEdit *edits, size_t count, PLTree *out);
 
+/*
+ * A merge fed in batches: each batch's keys ascend and follow the last batch's.
+ * Between batches the caller may drop every node the store's backing store
+ * holds; the merger keeps its own. Finish frees it, as does free.
+ */
+typedef struct PLMerger PLMerger;
+PLStatus	pl_merger_start(const PLTree *tree, PLMerger **out);
+PLStatus	pl_merger_feed(PLMerger *merger, const PLEdit *edits, size_t count);
+PLStatus	pl_merger_finish(PLMerger *merger, PLTree *out);
+void		pl_merger_free(PLMerger *merger);
+
 /* Branch is O(1); branches share store ownership, which remains with the caller. */
 PLTree		pl_branch(const PLTree *tree);
 PLStatus	pl_get(const PLTree *tree, PLSlice key, PLValue *out);

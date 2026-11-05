@@ -396,6 +396,7 @@ typedef struct PLLevel
 {
 	PLEntry		pending[PL_MAX_ENTRIES];
 	uint8_t		values[PL_MAX_ENTRIES][PL_CHILD_MAX];
+	uint8_t    *owned[PL_MAX_ENTRIES];	/* copies of pending bytes, made at a pause */
 	uint32_t	count;
 	size_t		bytes;
 	uint64_t	entries;		/* entries ever added at this level */
@@ -410,6 +411,17 @@ typedef struct PLStream
 } PLStream;
 
 static PLStatus stream_flush(PLStream *stream, uint32_t level);
+
+/* Free the copies a level's pending entries own, once they are written. */
+static void
+level_release(PLLevel *l)
+{
+	for (uint32_t i = 0; i < l->count; i++)
+	{
+		free(l->owned[i]);
+		l->owned[i] = NULL;
+	}
+}
 
 /* Add a child reference at |level| (one above the child's own level). */
 static PLStatus
@@ -459,10 +471,58 @@ stream_flush(PLStream *stream, uint32_t level)
 
 	if (status != PL_OK)
 		return status;
+	level_release(l);
 	l->count = 0;
 	l->bytes = 0;
 	return stream_child(stream, level + 1, pl_node_key(node, node->count - 1), node->hash,
 						pl_node_rows(node), false);
+}
+
+/*
+ * Copy the bytes every pending entry borrows, from nodes and from the
+ * caller's edits, so that both may go while the stream waits for more.
+ */
+static PLStatus
+stream_own(PLStream *stream)
+{
+	for (uint32_t level = 0; level <= PL_MAX_DEPTH; level++)
+	{
+		PLLevel    *l = &stream->levels[level];
+
+		for (uint32_t i = 0; i < l->count; i++)
+		{
+			PLEntry    *entry = &l->pending[i];
+			bool		child = entry->value.data == l->values[i];
+			size_t		length = entry->key.len + (child ? 0 : entry->value.len);
+			uint8_t    *copy;
+
+			if (l->owned[i])
+				continue;
+			copy = malloc(length ? length : 1);
+			if (!copy)
+				return PL_NOMEM;
+			memcpy(copy, entry->key.data, entry->key.len);
+			entry->key.data = copy;
+			if (!child)
+			{
+				memcpy(copy + entry->key.len, entry->value.data, entry->value.len);
+				entry->value.data = copy + entry->key.len;
+			}
+			l->owned[i] = copy;
+		}
+	}
+	return PL_OK;
+}
+
+static void
+stream_free(PLStream *stream)
+{
+	if (!stream->levels)
+		return;
+	for (uint32_t level = 0; level <= PL_MAX_DEPTH; level++)
+		level_release(&stream->levels[level]);
+	free(stream->levels);
+	stream->levels = NULL;
 }
 
 /*
@@ -531,95 +591,152 @@ stream_finish(PLStream *stream, PLTree *out)
 	return PL_OK;
 }
 
-PLStatus
-pl_apply(const PLTree *tree, const PLEdit *edits, size_t count, PLTree *out)
+/*
+ * A merge of edits into a tree, fed in batches of ascending keys. Between
+ * batches it holds the path to where it stopped, so the store may drop every
+ * other node it has written to its backing store, and its pending entries own
+ * their bytes.
+ */
+struct PLMerger
 {
-	PLStream	stream = {0};
+	PLTree		tree;
+	PLStream	stream;
 	PLNode	   *path[PL_MAX_DEPTH];
 	uint32_t	next[PL_MAX_DEPTH];
 	bool		right[PL_MAX_DEPTH];
-	uint32_t	depth = 0,
-				entry = 0;
-	PLNode	   *node;
-	PLStatus	status = PL_OK;
-	size_t		i;
-	bool		edge = true;
+	uint32_t	depth;
+	uint32_t	entry;			/* the next entry of the leaf at the path's end */
+	bool		started;		/* the path leads to the leaf of the first edit */
+	bool		passed;			/* the tree's entries are all streamed */
+	bool		held;			/* the path's nodes are held */
+	uint8_t    *last;			/* the last key fed, which the next must follow */
+	size_t		last_len;
+	bool		fed;
+};
 
-	if (!tree || !out || (count && !edits))
+static void
+merger_hold(PLMerger *merger, bool hold)
+{
+	if (merger->held == hold)
+		return;
+	for (uint32_t d = 0; d < merger->depth; d++)
+	{
+		if (hold)
+			merger->path[d]->holds++;
+		else
+			merger->path[d]->holds--;
+	}
+	merger->held = hold;
+}
+
+PLStatus
+pl_merger_start(const PLTree *tree, PLMerger **out)
+{
+	PLMerger   *merger;
+
+	if (!tree || !out)
 		return PL_INVALID;
-	for (i = 0; i < count; i++)
-		if (!valid_slice(edits[i].key) || (edits[i].value.present && !valid_slice(edits[i].value.bytes)) ||
-			(i && pl_compare(edits[i - 1].key, edits[i].key) >= 0))
-			return PL_INVALID;
-	node = pl_find(tree->store, tree->root);
+	if (!pl_find(tree->store, tree->root))
+		return PL_CORRUPT;
+	merger = calloc(1, sizeof(*merger));
+	if (!merger)
+		return PL_NOMEM;
+	merger->tree = *tree;
+	merger->stream.store = tree->store;
+	merger->stream.levels = calloc(PL_MAX_DEPTH + 1, sizeof(PLLevel));
+	if (!merger->stream.levels)
+	{
+		free(merger);
+		return PL_NOMEM;
+	}
+	*out = merger;
+	return PL_OK;
+}
+
+void
+pl_merger_free(PLMerger *merger)
+{
+	if (!merger)
+		return;
+	merger_hold(merger, false);
+	stream_free(&merger->stream);
+	free(merger->last);
+	free(merger);
+}
+
+/* Descend to the leaf holding |key|, reusing every subtree to its left. */
+static PLStatus
+merger_descend(PLMerger *merger, PLSlice key)
+{
+	PLNode	   *node = pl_find(merger->tree.store, merger->tree.root);
+	bool		edge = true;
+	PLStatus	status = PL_OK;
+
 	if (!node)
 		return PL_CORRUPT;
-	if (!count)
-	{
-		*out = *tree;
-		return PL_OK;
-	}
-	stream.store = tree->store;
-	stream.levels = calloc(PL_MAX_DEPTH + 1, sizeof(PLLevel));
-	if (!stream.levels)
-		return PL_NOMEM;
-
-	/*
-	 * Descend to the leaf holding the first edit, reusing every subtree to
-	 * its left. Those subtrees precede the path, so all levels below them are
-	 * empty when each is appended.
-	 */
+	merger->depth = 0;
 	while (status == PL_OK)
 	{
 		uint32_t	c;
+		PLHash		hash;
 
-		if (depth >= PL_MAX_DEPTH)
-		{
-			status = PL_CORRUPT;
-			break;
-		}
-		path[depth] = node;
-		right[depth] = edge;
+		if (merger->depth >= PL_MAX_DEPTH)
+			return PL_CORRUPT;
+		merger->path[merger->depth] = node;
+		merger->right[merger->depth] = edge;
 		if (!node->level)
 		{
-			depth++;
+			merger->depth++;
 			break;
 		}
-		c = lower_bound(node, edits[0].key);
+		c = lower_bound(node, key);
 		if (c >= node->count)
 			c = node->count - 1;
 		for (uint32_t j = 0; j < c && status == PL_OK; j++)
-		{
-			status = stream_child(&stream, node->level, pl_node_key(node, j), pl_child_hash(node, j),
+			status = stream_child(&merger->stream, node->level, pl_node_key(node, j), pl_child_hash(node, j),
 								  pl_child_rows(node, j), true);
-		}
-		next[depth++] = c + 1;
+		merger->next[merger->depth++] = c + 1;
 		edge = edge && c == node->count - 1;
-		{
-			PLHash		hash;
-
-			hash = pl_child_hash(node, c);
-			node = pl_find(tree->store, hash);
-		}
-		if (!node || node->level + 1 != path[depth - 1]->level)
+		hash = pl_child_hash(node, c);
+		node = pl_find(merger->tree.store, hash);
+		if (!node || node->level + 1 != merger->path[merger->depth - 1]->level)
 			status = PL_CORRUPT;
 	}
+	merger->entry = 0;
+	merger->started = true;
+	return status;
+}
 
-	i = 0;
-	while (status == PL_OK)
+/*
+ * Merge |count| edits, after any fed before. Unless |final|, it stops when they
+ * run out, before streaming any entry or subtree a later edit might change.
+ */
+static PLStatus
+merger_run(PLMerger *merger, const PLEdit *edits, size_t count, bool final)
+{
+	PLStream   *stream = &merger->stream;
+	PLStatus	status = PL_OK;
+	size_t		i = 0;
+
+	if (!merger->started && count)
+		status = merger_descend(merger, edits[0].key);
+	while (status == PL_OK && merger->started && !merger->passed)
 	{
-		PLNode	   *leaf = path[depth - 1];
+		PLNode	   *leaf = merger->path[merger->depth - 1];
 
 		/* Merge this leaf's entries with the edits that fall inside it. */
-		while (status == PL_OK && entry < leaf->count)
+		while (status == PL_OK && merger->entry < leaf->count)
 		{
-			PLEntry		current = {pl_node_key(leaf, entry), pl_node_value(leaf, entry)};
-			int			comparison = i == count ? -1 : pl_compare(current.key, edits[i].key);
+			PLEntry		current = {pl_node_key(leaf, merger->entry), pl_node_value(leaf, merger->entry)};
+			int			comparison;
 
+			if (i == count && !final)
+				return PL_OK;
+			comparison = i == count ? -1 : pl_compare(current.key, edits[i].key);
 			if (comparison < 0)
 			{
-				status = stream_entry(&stream, current);
-				entry++;
+				status = stream_entry(stream, current);
+				merger->entry++;
 			}
 			else
 			{
@@ -627,24 +744,28 @@ pl_apply(const PLTree *tree, const PLEdit *edits, size_t count, PLTree *out)
 				{
 					PLEntry		edited = {edits[i].key, edits[i].value.bytes};
 
-					status = stream_entry(&stream, edited);
+					status = stream_entry(stream, edited);
 				}
 				if (comparison == 0)
-					entry++;
+					merger->entry++;
 				i++;
 			}
 		}
 		if (status != PL_OK)
 			break;
+		if (i == count && !final)
+			return PL_OK;
 
 		/*
 		 * Move to the next leaf, appending whole untouched subtrees whenever
 		 * the levels at and below them are empty.
 		 */
-		depth--;
-		while (depth)
+		merger->depth--;
+		while (merger->depth)
 		{
-			PLNode	   *parent = path[depth - 1];
+			uint32_t	depth = merger->depth;
+			PLNode	   *parent = merger->path[depth - 1];
+			PLNode	   *node;
 			uint32_t	c,
 						level;
 			bool		child_right,
@@ -652,46 +773,47 @@ pl_apply(const PLTree *tree, const PLEdit *edits, size_t count, PLTree *out)
 			PLSlice		last;
 			PLHash		hash;
 
-			if (next[depth - 1] >= parent->count)
+			if (merger->next[depth - 1] >= parent->count)
 			{
-				depth--;
+				merger->depth--;
 				continue;
 			}
-			c = next[depth - 1]++;
+			c = merger->next[depth - 1]++;
 			level = parent->level - 1;
-			child_right = right[depth - 1] && c == parent->count - 1;
+			child_right = merger->right[depth - 1] && c == parent->count - 1;
 			last = pl_node_key(parent, c);
 			hash = pl_child_hash(parent, c);
 			skip = (i == count || pl_compare(edits[i].key, last) > 0) && (!child_right || i == count);
 			for (uint32_t k = 0; skip && k <= level; k++)
-				skip = stream.levels[k].count == 0;
+				skip = stream->levels[k].count == 0;
 			if (skip)
 			{
-				stream.store->stats.skipped++;
-				status = stream_child(&stream, parent->level, last, hash,
-									  pl_child_rows(parent, c), true);
+				stream->store->stats.skipped++;
+				status = stream_child(stream, parent->level, last, hash, pl_child_rows(parent, c), true);
 				if (status != PL_OK)
 					break;
 				continue;
 			}
-			node = pl_find(stream.store, hash);
+			node = pl_find(stream->store, hash);
 			if (!node || node->level != level)
 			{
 				status = PL_CORRUPT;
 				break;
 			}
-			path[depth] = node;
-			right[depth] = child_right;
-			next[depth] = 0;
-			depth++;
+			merger->path[depth] = node;
+			merger->right[depth] = child_right;
+			merger->next[depth] = 0;
+			merger->depth++;
 			if (!level)
 			{
-				entry = 0;
+				merger->entry = 0;
 				break;
 			}
 		}
-		if (status != PL_OK || !depth)
+		if (status != PL_OK)
 			break;
+		if (!merger->depth)
+			merger->passed = true;
 	}
 
 	/* Edits past the old last key extend the tree. */
@@ -700,11 +822,103 @@ pl_apply(const PLTree *tree, const PLEdit *edits, size_t count, PLTree *out)
 		{
 			PLEntry		edited = {edits[i].key, edits[i].value.bytes};
 
-			status = stream_entry(&stream, edited);
+			status = stream_entry(stream, edited);
 		}
+	return status;
+}
+
+static PLStatus
+check_edits(PLMerger *merger, const PLEdit *edits, size_t count)
+{
+	if (count && !edits)
+		return PL_INVALID;
+	for (size_t i = 0; i < count; i++)
+		if (!valid_slice(edits[i].key) || (edits[i].value.present && !valid_slice(edits[i].value.bytes)) ||
+			(i && pl_compare(edits[i - 1].key, edits[i].key) >= 0))
+			return PL_INVALID;
+	if (count && merger->fed)
+	{
+		PLSlice		last = {merger->last, merger->last_len};
+
+		if (pl_compare(last, edits[0].key) >= 0)
+			return PL_INVALID;
+	}
+	return PL_OK;
+}
+
+PLStatus
+pl_merger_feed(PLMerger *merger, const PLEdit *edits, size_t count)
+{
+	PLStatus	status;
+
+	if (!merger)
+		return PL_INVALID;
+	status = check_edits(merger, edits, count);
+	if (status != PL_OK || !count)
+		return status;
+	merger_hold(merger, false);
+	status = merger_run(merger, edits, count, false);
 	if (status == PL_OK)
-		status = stream_finish(&stream, out);
-	free(stream.levels);
+		status = stream_own(&merger->stream);
+	if (status == PL_OK)
+	{
+		uint8_t    *last = malloc(edits[count - 1].key.len ? edits[count - 1].key.len : 1);
+
+		if (!last)
+			return PL_NOMEM;
+		memcpy(last, edits[count - 1].key.data, edits[count - 1].key.len);
+		free(merger->last);
+		merger->last = last;
+		merger->last_len = edits[count - 1].key.len;
+		merger->fed = true;
+	}
+	merger_hold(merger, true);
+	return status;
+}
+
+PLStatus
+pl_merger_finish(PLMerger *merger, PLTree *out)
+{
+	PLStatus	status = PL_OK;
+
+	if (!merger || !out)
+		return PL_INVALID;
+	merger_hold(merger, false);
+	if (!merger->fed)
+		*out = merger->tree;
+	else
+	{
+		status = merger_run(merger, NULL, 0, true);
+		if (status == PL_OK)
+			status = stream_finish(&merger->stream, out);
+	}
+	pl_merger_free(merger);
+	return status;
+}
+
+PLStatus
+pl_apply(const PLTree *tree, const PLEdit *edits, size_t count, PLTree *out)
+{
+	PLMerger   *merger;
+	PLStatus	status;
+
+	if (!tree || !out)
+		return PL_INVALID;
+	status = pl_merger_start(tree, &merger);
+	if (status != PL_OK)
+		return status;
+	status = check_edits(merger, edits, count);
+	if (status != PL_OK || !count)
+	{
+		pl_merger_free(merger);
+		if (status == PL_OK)
+			*out = *tree;
+		return status;
+	}
+	status = merger_run(merger, edits, count, true);
+	if (status == PL_OK)
+		status = stream_finish(&merger->stream, out);
+	pl_merger_free(merger);
 	return status;
 }
 

@@ -111,6 +111,41 @@ $old_horizons = sql($horizons);
 sql(q{BEGIN; SAVEPOINT s; SELECT dolt_add('.'); ROLLBACK TO s; COMMIT});
 is(sql($horizons), $old_horizons, 'an install rolls back with its savepoint');
 is(sql(q{SET enable_seqscan = off; SELECT v FROM t WHERE id = 4}), 'rolled back install', 'and the change it held still reads');
+# A fold applies its delta a batch of keys at a time, writing and dropping each
+# batch's nodes as it goes: it makes the tree a fold in one batch makes,
+# holding a small part of it at once.
+sql(q{CREATE TABLE batched(id int PRIMARY KEY, v text);
+CREATE TABLE whole(id int PRIMARY KEY, v text);
+INSERT INTO batched SELECT g, repeat(md5(g::text), 2) FROM generate_series(1, 40000) g;
+INSERT INTO whole SELECT g, repeat(md5(g::text), 2) FROM generate_series(1, 40000) g;
+UPDATE batched SET v = 'changed' WHERE id % 7 = 0;
+UPDATE whole SET v = 'changed' WHERE id % 7 = 0});
+my $tree_nodes = sql(q{SELECT count(DISTINCT chunkhash) FROM pg_dolt_chunk});
+my $offset = -s $node->logfile;
+sql(q{SET dolt_fold_batch = 100; SET client_min_messages = debug1; SET log_min_messages = debug1; SELECT dolt_fold()});
+my @held = map { /held at most (\d+) nodes/ ? $1 : () } split /\n/, slurp_file($node->logfile, $offset);
+my $roots = q{SELECT count(DISTINCT r.rootcontent) FROM pg_dolt_root r JOIN pg_class c ON c.relfilenode = r.rootfile WHERE c.relname IN ('batched', 'whole')};
+$tree_nodes = sql(q{SELECT count(DISTINCT chunkhash) FROM pg_dolt_chunk}) - $tree_nodes;
+cmp_ok(scalar(@held), '>=', 2, 'folds log what they held');
+my ($most) = sort { $b <=> $a } @held;
+cmp_ok($most, '<', $tree_nodes / 10, "a fold of 40,000 rows in batches of 100 holds at most $most nodes, of $tree_nodes written");
+is(sql(q{SELECT count(*), sum(length(v)) FROM batched}), sql(q{SELECT count(*), sum(length(v)) FROM whole}), 'and reads as the other table');
+sql(q{UPDATE batched SET v = 'again' WHERE id % 11 = 0; UPDATE whole SET v = 'again' WHERE id % 11 = 0});
+sql(q{SET dolt_fold_batch = 7; SELECT dolt_fold()});
+is(sql(q{SELECT count(DISTINCT chunkhash) > 0 FROM pg_dolt_chunk}), 't', 'folds in tiny batches finish');
+is(sql(q{SELECT count(*) FILTER (WHERE v = 'again'), count(*) FILTER (WHERE v = 'changed') FROM batched}), '3636|5195', 'with every change applied');
+is(sql(q{SELECT (SELECT string_agg(md5(v), '' ORDER BY id) FROM batched) = (SELECT string_agg(md5(v), '' ORDER BY id) FROM whole)}), 't',
+	'the same rows, row for row');
+
+# A commit's capture applies a table's delta the same way.
+sql(q{UPDATE batched SET v = 'committed' WHERE id % 3 = 0});
+$offset = -s $node->logfile;
+sql(q{SET dolt_fold_batch = 100; SET log_min_messages = debug1; SELECT dolt_commit('-Am', 'batched capture')});
+@held = map { /held at most (\d+) nodes/ ? $1 : () } split /\n/, slurp_file($node->logfile, $offset);
+cmp_ok(scalar(@held), '>=', 1, 'a commit folds what it captures');
+($most) = sort { $b <=> $a } @held;
+cmp_ok($most, '<', $tree_nodes / 10, "in batches, holding at most $most nodes");
+is(sql(q{SELECT count(*) FROM batched AS OF 'HEAD' WHERE v = 'committed'}), '13333', 'and the commit holds every change');
 sql(q{UPDATE t SET v = 'crashed' WHERE id = 3});
 sql(q{SELECT dolt_commit('-am', 'before a crash')});
 $expected = sql(q{SELECT count(*), sum(id), sum(length(v)) FROM t});

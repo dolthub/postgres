@@ -60,9 +60,24 @@ Lessons:
 
 Open:
 
-- **Folds materialize a tree's whole visible delta** in one `pl_apply`.
-  Doltgrust folds a batch of keys at a time; bounded batches would make large
-  thresholds safe.
+- **Folds are bounded (2026-11-05).** As Doltgrust's `fold_delta` does, a
+  fold reads `dolt_fold_batch` changed keys at a time (4,096 by default) and
+  feeds them in key order to one resumable merge (`PLMerger`), which writes
+  each node once, as its boundary is reached, and reuses untouched subtrees by
+  reference. After each batch the fold writes the nodes it made to the chunk
+  store, offers them to the shared node cache and drops them, keeping only the
+  merge's path (held across the drop) and its pending entries (which copy the
+  bytes they borrowed). Commits that keep what they capture fold the same way;
+  read-only captures, such as status, still apply in memory, since they must
+  not write. Release build, one `dolt_fold()` of every row updated:
+
+  | rows | private memory before | after | fold time before | after |
+  |---|---|---|---|---|
+  | 100,000 | 197 MB | 13 MB | 341 ms | 281 ms |
+  | 262,144 | 516 MB | 16 MB | 1,011 ms | 795 ms |
+
+  A backend's RSS still grows with the delta store it reads, which is shared
+  memory sized by `dolt_delta_memory`.
 - **Branch rename, branch drop and DROP DATABASE** leave their trees in memory.
 - **TRUNCATE and large installs** append a diff of every row; replacing the
   root row would be O(1).

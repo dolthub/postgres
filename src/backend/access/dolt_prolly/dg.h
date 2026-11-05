@@ -99,6 +99,7 @@ typedef struct DGCursor
 } DGCursor;
 
 extern PLTree *dg_content(DGState *s);
+extern PLHash dg_fold_content(DGState *s, PLStore *store, void (*flush) (PLStore *store));
 extern void dg_set_content(DGState *s, PLTree tree);
 extern bool dg_get(DGState *s, PLSlice key, PLValue *out);
 extern void dg_scan(DGState *s, const PLSlice *lower, const PLSlice *upper, PLScanFn callback, void *arg);
@@ -134,7 +135,8 @@ extern Oid	dg_storage_allocate(Relation definition, const char *branch);
 extern Oid	dg_storage_allocate_kind(char relkind, const char *branch);
 extern DGState *dg_storage_content_state(RelFileLocator locator, const char *branch, Snapshot snapshot);
 extern DGState *dg_storage_resource_state(Oid resource, const char *branch, Snapshot snapshot, RelFileLocator *located, bool *load);
-extern bool dg_storage_install_capture(RelFileLocator locator, const char *branch, Snapshot snapshot, DGState *s);
+extern bool dg_storage_install_capture(RelFileLocator locator, const char *branch, Snapshot snapshot, DGState *s, PLHash root);
+extern PLHash dg_storage_fold_root(DGState *s);
 extern bytea *dg_manifest_put(const char *kind, bytea *payload, struct ArrayType *children);
 extern bool dg_manifest_tree_edge(const char *kind, int index);
 extern bool dg_manifest_root_edge(const char *kind, int index);

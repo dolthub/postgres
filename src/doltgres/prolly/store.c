@@ -275,7 +275,7 @@ pl_store_drop_backed(PLStore *store)
 		{
 			PLNode	   *node = *link;
 
-			if (!node->backed)
+			if (!node->backed || node->holds)
 			{
 				link = &node->next;
 				continue;

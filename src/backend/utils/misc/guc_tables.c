@@ -3739,6 +3739,15 @@ struct config_int ConfigureNamesInt[] =
 	},
 
 	{
+		{"dolt_fold_batch", PGC_USERSET, RESOURCES_MEM,
+			gettext_noop("Sets how many changed keys a prolly fold applies at a time."),
+			gettext_noop("A fold holds one batch of changes and the nodes it writes for them at once.")
+		},
+		&dolt_fold_batch,
+		4096, 1, INT_MAX, NULL, NULL, NULL
+	},
+
+	{
 		{"dolt_fold_timeout", PGC_SIGHUP, RESOURCES_BGWRITER,
 			gettext_noop("Sets how long a prolly tree's oldest pending version waits before the tree is folded."),
 			NULL,
