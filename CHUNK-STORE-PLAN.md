@@ -273,7 +273,13 @@ PostgreSQL's own structures.
 
 ## Unlogged chunk journal (selected 2026-11-05)
 
-Status: started on branch `zachmu/unlogged-chunk-journal`.
+Status, 2026-11-05: steps 1 and 2 are done on branch
+`zachmu/unlogged-chunk-journal` (`b8b84528227`). TPC-C at 10 threads went
+from 419 to 540 tps with every chunk logged, and to 683 tps with unlogged
+folds. WAL fell from 239 KB to 41 KB per transaction: 33 KB of row edits and
+8 KB of lock records
+([report](/workspace/reports/unlogged-chunk-journal/index.html)). Step 3 is
+next.
 
 **Why.** Under TPC-C (scale 1, one thread), the heap store made the WAL
 342 KB per transaction against stock's 5.5 KB
