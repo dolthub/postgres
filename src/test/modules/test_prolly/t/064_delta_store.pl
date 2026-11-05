@@ -120,19 +120,19 @@ INSERT INTO batched SELECT g, repeat(md5(g::text), 2) FROM generate_series(1, 40
 INSERT INTO whole SELECT g, repeat(md5(g::text), 2) FROM generate_series(1, 40000) g;
 UPDATE batched SET v = 'changed' WHERE id % 7 = 0;
 UPDATE whole SET v = 'changed' WHERE id % 7 = 0});
-my $tree_nodes = sql(q{SELECT count(DISTINCT chunkhash) FROM pg_dolt_chunk});
+my $tree_nodes = sql(q{SELECT count(*) FROM dolt_chunk_list()});
 my $offset = -s $node->logfile;
 sql(q{SET dolt_fold_batch = 100; SET client_min_messages = debug1; SET log_min_messages = debug1; SELECT dolt_fold()});
 my @held = map { /held at most (\d+) nodes/ ? $1 : () } split /\n/, slurp_file($node->logfile, $offset);
 my $roots = q{SELECT count(DISTINCT r.rootcontent) FROM pg_dolt_root r JOIN pg_class c ON c.relfilenode = r.rootfile WHERE c.relname IN ('batched', 'whole')};
-$tree_nodes = sql(q{SELECT count(DISTINCT chunkhash) FROM pg_dolt_chunk}) - $tree_nodes;
+$tree_nodes = sql(q{SELECT count(*) FROM dolt_chunk_list()}) - $tree_nodes;
 cmp_ok(scalar(@held), '>=', 2, 'folds log what they held');
 my ($most) = sort { $b <=> $a } @held;
 cmp_ok($most, '<', $tree_nodes / 10, "a fold of 40,000 rows in batches of 100 holds at most $most nodes, of $tree_nodes written");
 is(sql(q{SELECT count(*), sum(length(v)) FROM batched}), sql(q{SELECT count(*), sum(length(v)) FROM whole}), 'and reads as the other table');
 sql(q{UPDATE batched SET v = 'again' WHERE id % 11 = 0; UPDATE whole SET v = 'again' WHERE id % 11 = 0});
 sql(q{SET dolt_fold_batch = 7; SELECT dolt_fold()});
-is(sql(q{SELECT count(DISTINCT chunkhash) > 0 FROM pg_dolt_chunk}), 't', 'folds in tiny batches finish');
+is(sql(q{SELECT count(*) > 0 FROM dolt_chunk_list()}), 't', 'folds in tiny batches finish');
 is(sql(q{SELECT count(*) FILTER (WHERE v = 'again'), count(*) FILTER (WHERE v = 'changed') FROM batched}), '3636|5195', 'with every change applied');
 is(sql(q{SELECT (SELECT string_agg(md5(v), '' ORDER BY id) FROM batched) = (SELECT string_agg(md5(v), '' ORDER BY id) FROM whole)}), 't',
 	'the same rows, row for row');
@@ -152,8 +152,36 @@ $expected = sql(q{SELECT count(*), sum(id), sum(length(v)) FROM t});
 $node->stop('immediate');
 $node->start;
 is(sql(q{SELECT count(*), sum(id), sum(length(v)) FROM t}), $expected, 'recovery replays an installed base');
-
 $standby->stop;
+
+# With dolt_unlogged_folds, a fold logs none of the chunks it writes. They are
+# durable once the fold commits, so a crash right after it loses none.
+sql(q{CREATE TABLE unlogged_fold(id int PRIMARY KEY, v text);
+INSERT INTO unlogged_fold SELECT g, repeat(md5(g::text), 2) FROM generate_series(1, 20000) g});
+sql('SELECT dolt_fold()');
+sub fold_wal
+{
+	my ($value) = @_;
+	sql(qq{UPDATE unlogged_fold SET v = '$value' WHERE id % 5 = 0});
+	my $chunks = sql(q{SELECT count(*) FROM dolt_chunk_list()});
+	my $wal = sql(q{SELECT pg_current_wal_insert_lsn()});
+	sql('SELECT dolt_fold()');
+	return (sql(qq{SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(), '$wal')}),
+		sql(q{SELECT count(*) FROM dolt_chunk_list()}) - $chunks);
+}
+my ($logged_wal, $logged_chunks) = fold_wal('logged fold');
+cmp_ok($logged_wal, '>', $logged_chunks * 1000, "a logged fold logs its $logged_chunks chunks ($logged_wal bytes of WAL)");
+sql(q{ALTER SYSTEM SET dolt_unlogged_folds = on; SELECT pg_reload_conf()});
+my ($unlogged_wal, $unlogged_chunks) = fold_wal('unlogged fold');
+cmp_ok($unlogged_chunks, '>', 100, "an unlogged fold writes $unlogged_chunks chunks");
+cmp_ok($unlogged_wal, '<', $logged_wal / 20, "and logs none of them ($unlogged_wal bytes of WAL)");
+$expected = sql(q{SELECT count(*), sum(length(v)) FILTER (WHERE v = 'unlogged fold') FROM unlogged_fold});
+$node->stop('immediate');
+$node->start;
+is(sql(q{SELECT count(*), sum(length(v)) FILTER (WHERE v = 'unlogged fold') FROM unlogged_fold}), $expected,
+	'a crash after an unlogged fold loses none of its tree');
+sql(q{ALTER SYSTEM RESET dolt_unlogged_folds; SELECT pg_reload_conf()});
+
 $node->stop;
 
 # With the launcher and workers running, versions fold and are pruned on

@@ -537,6 +537,9 @@ collect_unbacked(PLStore *store, PLHash root, Pending *pending)
 	pending->nodes[pending->count++] = node;
 }
 
+/* Whether puts skip the WAL: a fold's, when dolt_unlogged_folds is on. */
+static bool unlogged_puts;
+
 /*
  * Put |pending|'s nodes, remembering them to share once the transaction
  * commits. With |probe|, nodes the chunk store already holds are skipped,
@@ -554,7 +557,7 @@ put_pending(Pending *pending, bool probe)
 
 	if (!pending->count)
 		return;
-	chunks = dolt_chunk_open(DOLT_CHUNK_WRITE);
+	chunks = dolt_chunk_open(unlogged_puts ? DOLT_CHUNK_WRITE_UNLOGGED : DOLT_CHUNK_WRITE);
 	hashes = palloc((Size) pending->count * DOLT_CHUNK_HASH_SIZE);
 	data = palloc(pending->count * sizeof(uint8 *));
 	lengths = palloc(pending->count * sizeof(Size));
@@ -648,20 +651,24 @@ fold_flush(PLStore *store)
 /*
  * The root of |s|'s content, its changes applied to its base a batch at a
  * time, with every node it holds written to the chunk store and shared.
+ * |unlogged| keeps the nodes out of the WAL: only for a tree that a standby can
+ * derive from the logged edits, as a fold's.
  */
 PLHash
-dg_storage_fold_root(DGState *s)
+dg_storage_fold_root(DGState *s, bool unlogged)
 {
 	PLStore    *store = dg_private_store();
 	PLHash		root;
 
 	fold_peak = 0;
+	unlogged_puts = unlogged;
 	PG_TRY();
 	{
 		root = dg_fold_content(s, store, fold_flush);
 	}
 	PG_FINALLY();
 	{
+		unlogged_puts = false;
 		pl_store_free(store);
 	}
 	PG_END_TRY();
@@ -2336,7 +2343,7 @@ dg_fold_tree(Oid space, RelFileNumber file, const char *branch)
 		state_collect(s, &key, snapshot, &committed, false);
 		if (s->changes)
 		{
-			PLHash		root = dg_storage_fold_root(s);
+			PLHash		root = dg_storage_fold_root(s, dolt_unlogged_folds);
 
 			horizon.xmin = snapshot->xmin;
 			horizon.xmax = snapshot->xmax;

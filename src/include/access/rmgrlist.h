@@ -48,3 +48,4 @@ PG_RMGR(RM_REPLORIGIN_ID, "ReplicationOrigin", replorigin_redo, replorigin_desc,
 PG_RMGR(RM_GENERIC_ID, "Generic", generic_redo, generic_desc, generic_identify, NULL, NULL, generic_mask, NULL)
 PG_RMGR(RM_LOGICALMSG_ID, "LogicalMessage", logicalmsg_redo, logicalmsg_desc, logicalmsg_identify, NULL, NULL, NULL, logicalmsg_decode)
 PG_RMGR(RM_DOLT_DELTA_ID, "DoltDelta", dolt_delta_redo, dolt_delta_desc, dolt_delta_identify, NULL, NULL, NULL, NULL)
+PG_RMGR(RM_DOLT_CHUNK_ID, "DoltChunk", dolt_chunk_redo, dolt_chunk_desc, dolt_chunk_identify, NULL, NULL, NULL, NULL)

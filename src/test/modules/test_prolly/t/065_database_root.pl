@@ -56,7 +56,7 @@ is(sql("SELECT count(*) FROM generate_series(1, 3000, 37) g, dolt_root_find(" . 
 my $grown = root(qq{$tables UNION ALL SELECT 'table', 'public.table_1500a', 0});
 is(sql("SELECT count(*) FROM dolt_root_nodes(" . hexarg($grown) . ") n WHERE NOT EXISTS (SELECT 1 FROM dolt_root_nodes(" . hexarg($big) . ") o WHERE o.node = n.node)"),
 	$levels + 1, 'one insert changes one node per level');
-is(sql("SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash IN (SELECT node FROM dolt_root_nodes(" . hexarg($grown) . "))"),
+is(sql("SELECT count(*) FROM dolt_chunk_list() WHERE chunk IN (SELECT node FROM dolt_root_nodes(" . hexarg($grown) . "))"),
 	sql("SELECT count(*) FROM dolt_root_nodes(" . hexarg($grown) . ")"), 'and only new chunks are written');
 
 # The functions read any root's members, so only superusers may call them.

@@ -1239,7 +1239,7 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 					 */
 					if (persist && !load && loaded->changes)
 					{
-						content = dg_storage_fold_root(loaded);
+						content = dg_storage_fold_root(loaded, false);
 						written = true;
 					}
 					else

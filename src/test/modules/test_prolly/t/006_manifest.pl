@@ -20,7 +20,7 @@ sub readref { return sql("SELECT encode(target,'hex') FROM dolt_manifest_read('$
 sub token { return sql("SELECT encode(token,'hex') FROM dolt_manifest_read('$_[0]')"); }
 sub hasharg { return "decode('$_[0]','hex')"; }
 # The hash of the bytes the chunk store holds under node hash |$_[0]|.
-sub stored { return sql("SELECT encode(substr(sha256(string_agg(chunkdata,''::bytea ORDER BY chunkpart)),1,20),'hex') FROM (SELECT DISTINCT ON (chunkpart) chunkpart,chunkdata FROM pg_dolt_chunk WHERE chunkhash=".hasharg($_[0]).") p"); }
+sub stored { return sql("SELECT encode(substr(sha256(dolt_chunk_read(".hasharg($_[0]).")),1,20),'hex')"); }
 sub put {
  my ($kind, $payload, @children) = @_;
  return sql("SELECT encode(dolt_manifest_put('$kind',convert_to('$payload','UTF8'),ARRAY[" . join(',', map {hasharg($_)} @children) . "]::bytea[]),'hex')");
@@ -242,7 +242,7 @@ my $restore = PostgreSQL::Test::Cluster->new('manifest_restore');
 $restore->init_from_backup($node, 'history');
 $restore->start;
 is($restore->safe_psql('postgres', q{SELECT encode(target,'hex') FROM dolt_manifest_read('tags/captured')}), $commit, 'physical backup preserves history ref');
-is($restore->safe_psql('postgres', "SELECT encode(substr(sha256(string_agg(chunkdata,''::bytea ORDER BY chunkpart)),1,20),'hex') FROM (SELECT DISTINCT ON (chunkpart) chunkpart,chunkdata FROM pg_dolt_chunk WHERE chunkhash=".hasharg($chunk).") p"), $root, 'physical backup preserves historical chunks');
+is($restore->safe_psql('postgres', "SELECT encode(substr(sha256(dolt_chunk_read(".hasharg($chunk).")),1,20),'hex')"), $root, 'physical backup preserves historical chunks');
 $restore->stop;
 $node->stop;
 done_testing();

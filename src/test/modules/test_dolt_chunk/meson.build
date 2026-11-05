@@ -29,6 +29,6 @@ tests += {
     'sql': ['test_dolt_chunk'],
   },
   'tap': {
-    'tests': ['t/001_concurrency.pl'],
+    'tests': ['t/001_journal.pl'],
   },
 }

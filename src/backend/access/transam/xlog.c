@@ -48,6 +48,7 @@
 
 #include "access/clog.h"
 #include "access/commit_ts.h"
+#include "access/doltchunk.h"
 #include "access/doltdelta.h"
 #include "access/heaptoast.h"
 #include "access/multixact.h"
@@ -5678,6 +5679,12 @@ StartupXLOG(void)
 	StartupDoltDelta(checkPoint.redo);
 
 	/*
+	 * Index the chunk journal past its index and drop a torn tail, before
+	 * replay appends the chunks logged after it.
+	 */
+	StartupDoltChunkJournal(haveBackupLabel);
+
+	/*
 	 * Initialize unlogged LSN. On a clean shutdown, it's restored from the
 	 * control file. On recovery, all unlogged relations are blown away, so
 	 * the unlogged LSN counter can be reset too.
@@ -7564,6 +7571,7 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	CheckPointLogicalRewriteHeap();
 	CheckPointReplicationOrigin();
 	CheckPointDoltDelta(checkPointRedo);
+	CheckPointDoltChunkJournal();
 
 	/* Write out all dirty data in SLRUs and the main buffer pool */
 	TRACE_POSTGRESQL_BUFFER_CHECKPOINT_START(flags);

@@ -4,7 +4,8 @@
  *		SQL access to the dolt chunk store interface for tests and benchmarks.
  *
  * Everything here goes through access/doltchunk.h, so the same functions test
- * whichever implementation is installed. test_chunk_use_store('memory')
+ * whichever implementation is installed, the journal unless
+ * test_chunk_use_store('memory')
  * installs a session-local, non-transactional implementation, which shows that
  * callers depend only on the interface contract.
  *
@@ -22,7 +23,6 @@
 #include "access/doltchunk.h"
 #include "access/htup_details.h"
 #include "catalog/pg_type.h"
-#include "executor/spi.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -47,7 +47,6 @@ PG_FUNCTION_INFO_V1(test_chunk_store_stats);
 PG_FUNCTION_INFO_V1(test_chunk_pin_survives_puts);
 PG_FUNCTION_INFO_V1(test_chunk_bench_put);
 PG_FUNCTION_INFO_V1(test_chunk_bench_get);
-PG_FUNCTION_INFO_V1(test_chunk_bench_get_spi);
 
 /* ---- An in-memory implementation: session-local and non-transactional ---- */
 
@@ -108,7 +107,7 @@ memory_exists(void *state, int n, const uint8 *hashes, bool *found)
 }
 
 static int
-memory_put(void *state, int n, const uint8 *hashes, const uint8 *const *data, const Size *lengths)
+memory_put(void *state, int n, const uint8 *hashes, const uint8 *const *data, const Size *lengths, bool logged)
 {
 	int			stored = 0;
 
@@ -204,7 +203,7 @@ test_chunk_use_store(PG_FUNCTION_ARGS)
 	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	const DoltChunkStoreRoutine *previous;
 
-	if (strcmp(name, "heap") == 0)
+	if (strcmp(name, "journal") == 0)
 		previous = dolt_chunk_set_routine(NULL);
 	else if (strcmp(name, "memory") == 0)
 		previous = dolt_chunk_set_routine(&memory_routine);
@@ -260,7 +259,7 @@ test_chunk_put(PG_FUNCTION_ARGS)
 {
 	bytea	   *hash = PG_GETARG_BYTEA_PP(0);
 	bytea	   *data = PG_GETARG_BYTEA_PP(1);
-	DoltChunkStore *store = dolt_chunk_open(DOLT_CHUNK_WRITE);
+	DoltChunkStore *store = dolt_chunk_open(PG_GETARG_BOOL(2) ? DOLT_CHUNK_WRITE : DOLT_CHUNK_WRITE_UNLOGGED);
 	bool		stored;
 
 	stored = dolt_chunk_put(store, hash_argument(hash), (const uint8 *) VARDATA_ANY(data),
@@ -538,45 +537,5 @@ test_chunk_bench_get(PG_FUNCTION_ARGS)
 			elog(ERROR, "benchmark chunk missing");
 	}
 	dolt_chunk_close(store);
-	PG_RETURN_FLOAT8(INSTR_TIME_GET_DOUBLE(total));
-}
-
-/* The same lookups through a prepared SPI query, for comparison. */
-Datum
-test_chunk_bench_get_spi(PG_FUNCTION_ARGS)
-{
-	int32		seed = PG_GETARG_INT32(0);
-	int64		nchunks = PG_GETARG_INT64(1);
-	int64		count = PG_GETARG_INT64(2);
-	uint64		rng = (uint64) PG_GETARG_INT32(3);
-	Oid			types[] = {BYTEAOID};
-	bytea	   *key = palloc(VARHDRSZ + DOLT_CHUNK_HASH_SIZE);
-	SPIPlanPtr	plan;
-	instr_time	total;
-
-	SET_VARSIZE(key, VARHDRSZ + DOLT_CHUNK_HASH_SIZE);
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "SPI_connect failed");
-	plan = SPI_prepare("SELECT chunkdata FROM pg_catalog.pg_dolt_chunk WHERE chunkhash = $1", 1, types);
-	if (!plan)
-		elog(ERROR, "SPI_prepare failed");
-	INSTR_TIME_SET_ZERO(total);
-	for (int64 n = 0; n < count; n++)
-	{
-		instr_time	start,
-					end;
-		Datum		args[1] = {PointerGetDatum(key)};
-
-		CHECK_FOR_INTERRUPTS();
-		synthetic_chunk(seed, (int64) (splitmix64(&rng) % (uint64) nchunks),
-						(uint8 *) VARDATA(key), NULL, 0);
-		INSTR_TIME_SET_CURRENT(start);
-		if (SPI_execute_plan(plan, args, NULL, true, 1) != SPI_OK_SELECT || SPI_processed != 1)
-			elog(ERROR, "benchmark chunk missing");
-		INSTR_TIME_SET_CURRENT(end);
-		INSTR_TIME_ACCUM_DIFF(total, end, start);
-		SPI_freetuptable(SPI_tuptable);
-	}
-	SPI_finish();
 	PG_RETURN_FLOAT8(INSTR_TIME_GET_DOUBLE(total));
 }

@@ -154,11 +154,11 @@ sql(q{CREATE TABLE wide(id int PRIMARY KEY, v text) USING dolt_prolly_table;
       INSERT INTO wide SELECT g, repeat('x', 100) FROM generate_series(1, 20000) g;
       SELECT dolt_commit('-Am', 'wide')});
 sql(q{SELECT dolt_fold()});
-my $nodes = sql(q{SELECT count(DISTINCT chunkhash) FROM pg_dolt_chunk});
+my $nodes = sql(q{SELECT count(*) FROM dolt_chunk_list()});
 my $wide_objects = sql(q{SELECT count(*) FROM pg_dolt_object});
 sql(q{UPDATE wide SET v = 'y' WHERE id = 5000});
 my $wide = sql(q{SELECT dolt_commit('-am', 'one row')});
-cmp_ok(sql(q{SELECT count(DISTINCT chunkhash) FROM pg_dolt_chunk}) - $nodes, '<', 30, 'a one-row commit writes only the nodes it changed');
+cmp_ok(sql(q{SELECT count(*) FROM dolt_chunk_list()}) - $nodes, '<', 30, 'a one-row commit writes only the nodes it changed');
 cmp_ok(sql(q{SELECT count(*) FROM pg_dolt_object}) - $wide_objects, '<', 10, 'a one-row commit copies no tree into the manifest');
 is(sql(q{SELECT count(*) FROM pg_dolt_object WHERE objkind = 'chunk'}), '0', 'commits make no chunk objects');
 is(sql(q{SELECT count(*) FROM pg_dolt_object WHERE objkind IN ('database', 'table', 'index', 'sequence', 'routine', 'view')}), '0',

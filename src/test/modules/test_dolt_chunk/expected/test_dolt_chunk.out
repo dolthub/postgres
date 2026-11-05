@@ -1,7 +1,7 @@
 CREATE EXTENSION test_dolt_chunk;
 --
--- Interface contract, against the built-in heap store and then a test-only,
--- non-transactional in-memory store.
+-- Interface contract, against the built-in journal and then a test-only,
+-- session-local in-memory store.
 --
 CREATE FUNCTION error_of(query text) RETURNS text LANGUAGE plpgsql AS $$
 BEGIN
@@ -152,7 +152,7 @@ SELECT test_chunk_pin_survives_puts(chunk_hash('contract alpha'), 40) AS pin_sur
 SELECT test_chunk_use_store('memory') AS previous_store;
  previous_store 
 ----------------
- heap
+ journal
 (1 row)
 
 \i :contract
@@ -306,7 +306,7 @@ SELECT test_chunk_exists(chunk_hash('memory rollback')) AS kept_after_rollback;
  t
 (1 row)
 
-SELECT test_chunk_use_store('heap') AS previous_store;
+SELECT test_chunk_use_store('journal') AS previous_store;
  previous_store 
 ----------------
  memory
@@ -315,92 +315,19 @@ SELECT test_chunk_use_store('heap') AS previous_store;
 SELECT test_chunk_use_store('bogus');
 ERROR:  unknown chunk store "bogus"
 --
--- Heap implementation details.
+-- Journal implementation details.
 --
--- Storage is inline and uncompressed, keyed by hash, part and inserting transaction.
-SELECT attname, attstorage FROM pg_attribute
-  WHERE attrelid = 'pg_dolt_chunk'::regclass AND attnum > 0 ORDER BY attnum;
-  attname  | attstorage 
------------+------------
- chunkpart | p
- chunksize | p
- chunkcopy | p
- chunkhash | p
- chunkdata | p
-(5 rows)
+SELECT name, setting FROM pg_settings
+  WHERE name IN ('dolt_chunk_journal_tail', 'dolt_chunk_verify_hashes') ORDER BY name;
+           name           | setting 
+--------------------------+---------
+ dolt_chunk_journal_tail  | 131072
+ dolt_chunk_verify_hashes | off
+(2 rows)
 
-SELECT reltoastrelid = 0 AS no_toast FROM pg_class WHERE oid = 'pg_dolt_chunk'::regclass;
- no_toast 
-----------
- t
-(1 row)
-
-SELECT indisunique, indisprimary FROM pg_index WHERE indexrelid = 'pg_dolt_chunk_hash_index'::regclass;
- indisunique | indisprimary 
--------------+--------------
- t           | t
-(1 row)
-
-SELECT name, setting, unit FROM pg_settings
-  WHERE name IN ('dolt_chunk_verify_hashes') ORDER BY name;
-           name           | setting | unit 
---------------------------+---------+------
- dolt_chunk_verify_hashes | off     | 
-(1 row)
-
--- Puts never probe for a committed copy: every put of this chunk in the
--- contract stored one.
-SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = chunk_hash('contract alpha');
- count 
--------
-     4
-(1 row)
-
--- A chunk longer than one heap tuple spans parts, each inline and uncompressed.
-SELECT test_chunk_put(chunk_hash(x), x) FROM (SELECT decode(repeat('cd', 20000), 'hex') AS x) s;
- test_chunk_put 
-----------------
- t
-(1 row)
-
-SELECT chunkpart, chunksize, length(chunkdata), pg_column_compression(chunkdata) IS NULL AS uncompressed
-  FROM pg_dolt_chunk WHERE chunkhash = chunk_hash(decode(repeat('cd', 20000), 'hex')) ORDER BY chunkpart;
- chunkpart | chunksize | length | uncompressed 
------------+-----------+--------+--------------
-         0 |     20000 |   8092 | t
-         1 |     20000 |   8092 | t
-         2 |     20000 |   3816 | t
-(3 rows)
-
-SELECT test_chunk_get(chunk_hash(x)) = x AS multipart_roundtrip
-  FROM (SELECT decode(repeat('cd', 20000), 'hex') AS x) s;
- multipart_roundtrip 
----------------------
- t
-(1 row)
-
-SELECT test_chunk_delete(chunk_hash(decode(repeat('cd', 20000), 'hex'))) AS multipart_deleted;
- multipart_deleted 
--------------------
- t
-(1 row)
-
-SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = chunk_hash(decode(repeat('cd', 20000), 'hex'));
- count 
--------
-     0
-(1 row)
-
--- Puts are transactional here: own writes are visible, rollback removes them.
-BEGIN;
-SELECT test_chunk_put(chunk_hash('beta'), 'beta');
- test_chunk_put 
-----------------
- t
-(1 row)
-
-SELECT test_chunk_exists(chunk_hash('beta')) AS own_write;
- own_write 
+-- A put of a chunk the recent index holds appends nothing.
+SELECT test_chunk_put(chunk_hash('beta'), 'beta') AS first_put;
+ first_put 
 -----------
  t
 (1 row)
@@ -408,94 +335,107 @@ SELECT test_chunk_exists(chunk_hash('beta')) AS own_write;
 SELECT test_chunk_put(chunk_hash('beta'), 'beta') AS second_put;
  second_put 
 ------------
- t
-(1 row)
-
-ROLLBACK;
-SELECT test_chunk_exists(chunk_hash('beta')) AS after_rollback;
- after_rollback 
-----------------
  f
 (1 row)
 
-SELECT test_chunk_put(chunk_hash('beta'), 'beta') AS reinserted;
- reinserted 
-------------
- t
+SELECT count(*) FROM dolt_chunk_list() WHERE chunk = chunk_hash('beta');
+ count 
+-------
+     1
 (1 row)
 
+-- Puts are not transactional: a rolled-back put stays, for garbage collection.
 BEGIN;
-SAVEPOINT s;
 SELECT test_chunk_put(chunk_hash('gamma'), 'gamma');
  test_chunk_put 
 ----------------
  t
 (1 row)
 
+ROLLBACK;
+SELECT test_chunk_exists(chunk_hash('gamma')) AS kept_after_rollback;
+ kept_after_rollback 
+---------------------
+ t
+(1 row)
+
+BEGIN;
+SAVEPOINT s;
+SELECT test_chunk_put(chunk_hash('gamma2'), 'gamma2');
+ test_chunk_put 
+----------------
+ t
+(1 row)
+
 ROLLBACK TO s;
-SELECT test_chunk_exists(chunk_hash('gamma')) AS after_savepoint_rollback;
- after_savepoint_rollback 
---------------------------
- f
+SELECT test_chunk_exists(chunk_hash('gamma2')) AS kept_after_savepoint_rollback;
+ kept_after_savepoint_rollback 
+-------------------------------
+ t
 (1 row)
 
 COMMIT;
--- A deleted chunk can be put again.
+-- A deleted chunk can be put again, and is listed once.
 SELECT test_chunk_put(chunk_hash('contract delta'), 'contract delta') AS reput_after_delete;
  reput_after_delete 
 --------------------
  t
 (1 row)
 
-SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = chunk_hash('contract delta');
- count 
--------
-     1
+SELECT count(*), min(bytes) FROM dolt_chunk_list() WHERE chunk = chunk_hash('contract delta');
+ count | min 
+-------+-----
+     1 |  14
 (1 row)
 
--- Existence probes do not set hint bits on rows they examine. With data
--- checksums, a hint on a page's first change after a checkpoint logs a
--- full-page image. pageinspect reads the row without touching hints.
-CREATE EXTENSION pageinspect;
-CREATE FUNCTION chunk_xmin_hinted(hash bytea) RETURNS bool LANGUAGE sql AS $$
-  SELECT (t_infomask & 256) <> 0
-    FROM generate_series(0, pg_relation_size('pg_dolt_chunk') / 8192 - 1) AS b,
-         heap_page_items(get_raw_page('pg_dolt_chunk', b::int)) AS i
-   WHERE t_data IS NOT NULL AND position(hash IN t_data) > 0
-$$;
-SELECT test_chunk_put(chunk_hash('hintless'), 'hintless');
- test_chunk_put 
-----------------
+SELECT dolt_chunk_read(chunk_hash('contract delta')) = 'contract delta' AS read_back;
+ read_back 
+-----------
  t
 (1 row)
 
-SELECT test_chunk_exists(chunk_hash('hintless')) AS exists;
- exists 
---------
+SELECT dolt_chunk_read(chunk_hash('contract missing')) IS NULL AS missing_read;
+ missing_read 
+--------------
  t
 (1 row)
 
-SELECT chunk_xmin_hinted(chunk_hash('hintless')) AS hinted_after_probes;
- hinted_after_probes 
----------------------
- f
+-- A logged put writes its bytes to the WAL once; an unlogged put writes none.
+SELECT pg_current_wal_insert_lsn() AS before \gset
+SELECT count(*) FILTER (WHERE test_chunk_put(chunk_hash(x), x)) AS logged_puts
+  FROM (SELECT convert_to(repeat(lpad(g::text, 4, '0'), 1000), 'UTF8') AS x FROM generate_series(1, 100) g) s;
+ logged_puts 
+-------------
+         100
 (1 row)
 
--- Control: an ordinary MVCC read of the row sets the hint.
-SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = chunk_hash('hintless');
- count 
--------
-     1
-(1 row)
-
-SELECT chunk_xmin_hinted(chunk_hash('hintless')) AS hinted_after_select;
- hinted_after_select 
----------------------
+SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(), :'before') BETWEEN 400000 AND 420000 AS logged_wal;
+ logged_wal 
+------------
  t
 (1 row)
 
-DROP FUNCTION chunk_xmin_hinted(bytea);
-DROP EXTENSION pageinspect;
+SELECT pg_current_wal_insert_lsn() AS before \gset
+SELECT count(*) FILTER (WHERE test_chunk_put(chunk_hash(x), x, false)) AS unlogged_puts
+  FROM (SELECT convert_to(repeat(lpad(g::text, 5, 'u'), 800), 'UTF8') AS x FROM generate_series(1, 100) g) s;
+ unlogged_puts 
+---------------
+           100
+(1 row)
+
+SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(), :'before') < 4096 AS unlogged_wal;
+ unlogged_wal 
+--------------
+ t
+(1 row)
+
+SELECT count(*) FILTER (WHERE test_chunk_get(chunk_hash(x)) = x) AS unlogged_readable
+  FROM (SELECT convert_to(repeat(lpad(g::text, 5, 'u'), 800), 'UTF8') AS x FROM generate_series(1, 100) g) s;
+ unlogged_readable 
+-------------------
+               100
+(1 row)
+
 -- Read-only transactions cannot write.
 BEGIN READ ONLY;
 SELECT test_chunk_put(chunk_hash('delta'), 'delta');
@@ -530,10 +470,14 @@ SELECT count(*) FILTER (WHERE test_chunk_get(chunk_hash(x)) = x) AS all_readable
            20
 (1 row)
 
--- The catalog is private.
+-- The journal's SQL access is private.
 CREATE ROLE regress_chunk_reader;
 SET ROLE regress_chunk_reader;
-SELECT count(*) FROM pg_dolt_chunk;
-ERROR:  permission denied for table pg_dolt_chunk
+SELECT count(*) FROM dolt_chunk_list();
+ERROR:  permission denied for function dolt_chunk_list
+SELECT dolt_chunk_read(chunk_hash('beta'));
+ERROR:  permission denied for function dolt_chunk_read
+SELECT session_reads FROM dolt_chunk_stats();
+ERROR:  permission denied for function dolt_chunk_stats
 RESET ROLE;
 DROP ROLE regress_chunk_reader;

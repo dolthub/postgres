@@ -46,6 +46,7 @@
 int			dolt_fold_workers = 2;
 int			dolt_fold_versions = 4096;
 int			dolt_fold_batch = 4096;
+bool		dolt_unlogged_folds = false;
 int			dolt_fold_timeout = 5000;	/* ms */
 
 /* How often the launcher looks for work. */
