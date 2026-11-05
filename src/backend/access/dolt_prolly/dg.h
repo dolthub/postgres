@@ -138,6 +138,24 @@ extern bool dg_storage_install_capture(RelFileLocator locator, const char *branc
 extern bytea *dg_manifest_put(const char *kind, bytea *payload, struct ArrayType *children);
 extern bool dg_manifest_tree_edge(const char *kind, int index);
 
+/* A member of a database root (dg_root.c): kind, qualified name, schema object, content root. */
+typedef struct DGRootEntry
+{
+	char	   *kind;
+	char	   *name;
+	PLHash		schema;
+	bool		has_content;
+	PLHash		content;
+} DGRootEntry;
+extern bytea *dg_root_build(const DGRootEntry *entries, int n, const char *encoding);
+extern bool dg_root_find(bytea *root, const char *kind, const char *name, DGRootEntry *out);
+extern DGRootEntry *dg_root_entries(bytea *root, int *count);
+extern char *dg_root_encoding(bytea *root);
+extern void dg_root_nodes(bytea *root, void (*fn) (void *arg, const uint8 *hash, int level), void *arg);
+extern bytea *dg_member_ref(const DGRootEntry *entry);
+extern bool dg_is_member_ref(bytea *value);
+extern void dg_member_decode(bytea *ref, DGRootEntry *out);
+
 /* A member of a database object: its hash, kind and, unless a namespace, name. */
 typedef struct DGMember
 {
