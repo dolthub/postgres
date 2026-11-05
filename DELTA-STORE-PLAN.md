@@ -78,6 +78,11 @@ Open:
 
   A backend's RSS still grows with the delta store it reads, which is shared
   memory sized by `dolt_delta_memory`.
+
+  TPC-C at scale 1 and 10 threads (60 s, every check passing) no longer runs
+  out of memory with `dolt_fold_versions=262144`: 484 and 494 tps, against
+  449 and 477 with the default 4,096. The larger threshold helps a little;
+  it no longer costs memory.
 - **Branch rename, branch drop and DROP DATABASE** leave their trees in memory.
 - **TRUNCATE and large installs** append a diff of every row; replacing the
   root row would be O(1).
