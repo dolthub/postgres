@@ -59,5 +59,12 @@ is(sql("SELECT count(*) FROM dolt_root_nodes(" . hexarg($grown) . ") n WHERE NOT
 is(sql("SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash IN (SELECT node FROM dolt_root_nodes(" . hexarg($grown) . "))"),
 	sql("SELECT count(*) FROM dolt_root_nodes(" . hexarg($grown) . ")"), 'and only new chunks are written');
 
+# The functions read any root's members, so only superusers may call them.
+sql(q{CREATE ROLE reader});
+($status, $out, $err) = $node->psql('postgres', "SET ROLE reader; SELECT count(*) FROM dolt_root_members(" . hexarg($small) . ")");
+like($err, qr/permission denied/, 'reading a root needs privilege');
+($status, $out, $err) = $node->psql('postgres', "SET ROLE reader; SELECT dolt_root_json(" . hexarg($small) . ")");
+like($err, qr/permission denied/, 'and so does its rendering');
+
 $node->stop;
 done_testing();

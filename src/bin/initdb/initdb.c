@@ -1827,6 +1827,7 @@ setup_privileges(FILE *cmdfd)
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_root_members(bytea) FROM PUBLIC;\n");
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_root_nodes(bytea) FROM PUBLIC;\n");
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_root_find(bytea, text, text) FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_root_json(bytea) FROM PUBLIC;\n");
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_manifest_get(bytea) FROM PUBLIC;\n");
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_manifest_read(text) FROM PUBLIC;\n");
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_manifest_cas(text, bytea, bytea) FROM PUBLIC;\n");
