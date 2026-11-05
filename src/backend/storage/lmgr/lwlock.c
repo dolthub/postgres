@@ -183,6 +183,8 @@ static const char *const BuiltinTrancheNames[] = {
 	[LWTRANCHE_DOLT_DELTA_TREES] = "DoltDeltaTrees",
 	[LWTRANCHE_DOLT_DELTA_TREE] = "DoltDeltaTree",
 	[LWTRANCHE_DOLT_DELTA_DSA] = "DoltDeltaDSA",
+	[LWTRANCHE_DOLT_CHUNK_APPEND] = "DoltChunkAppend",
+	[LWTRANCHE_DOLT_CHUNK_INDEX] = "DoltChunkIndex",
 };
 
 StaticAssertDecl(lengthof(BuiltinTrancheNames) ==

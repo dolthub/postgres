@@ -16,12 +16,20 @@
 #include "postgres.h"
 
 #include "access/doltchunk.h"
+#include "access/htup_details.h"
 #include "access/xact.h"
 #include "common/cryptohash.h"
 #include "common/sha2.h"
+#include "fmgr.h"
+#include "funcapi.h"
+#include "miscadmin.h"
+#include "utils/builtins.h"
 #include "utils/memutils.h"
 
 bool		dolt_chunk_verify_hashes = false;
+
+/* Chunks this session looked up in the store, found or not. */
+static uint64 session_reads;
 
 /* A copy held through a store handle. */
 typedef struct Pin
@@ -50,19 +58,29 @@ static bool xact_callback_registered;
 static const DoltChunkStoreRoutine *
 routine(void)
 {
-	return current_routine ? current_routine : dolt_chunk_heap_routine();
+	return current_routine ? current_routine : dolt_chunk_journal_routine();
 }
 
-/* Pins never outlive a transaction; abandoned handles cannot leak them. */
+/*
+ * Unlogged puts become durable before the commit record. Pins never outlive a
+ * transaction; abandoned handles cannot leak them.
+ */
 static void
 chunk_xact_callback(XactEvent event, void *arg)
 {
+	if (event == XACT_EVENT_PRE_COMMIT || event == XACT_EVENT_PARALLEL_PRE_COMMIT ||
+		event == XACT_EVENT_PRE_PREPARE)
+	{
+		dolt_chunk_journal_pre_commit();
+		return;
+	}
 	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT &&
 		event != XACT_EVENT_PREPARE && event != XACT_EVENT_PARALLEL_COMMIT &&
 		event != XACT_EVENT_PARALLEL_ABORT)
 		return;
 	pin_epoch++;
 	open_stores = 0;
+	dolt_chunk_journal_xact_end();
 }
 
 static void
@@ -200,6 +218,7 @@ dolt_chunk_get_many(DoltChunkStore *store, int n, const uint8 *hashes, DoltChunk
 		chunks[i].length = 0;
 		chunks[i].pin = 0;
 	}
+	session_reads += n;
 	if (n > 0)
 		store->routine->get(store->state, n, hashes, store_found, &ctx);
 }
@@ -229,7 +248,7 @@ dolt_chunk_exists(DoltChunkStore *store, const uint8 *hash)
 static void
 require_write(DoltChunkStore *store)
 {
-	if (store->intent != DOLT_CHUNK_WRITE)
+	if (store->intent == DOLT_CHUNK_READ)
 		elog(ERROR, "dolt chunk store opened read-only");
 	if (XactReadOnly)
 		ereport(ERROR,
@@ -255,7 +274,7 @@ dolt_chunk_put_many(DoltChunkStore *store, int n, const uint8 *hashes,
 		if (dolt_chunk_verify_hashes)
 			verify(hashes + (Size) i * DOLT_CHUNK_HASH_SIZE, data[i], lengths[i]);
 	}
-	stored = store->routine->put(store->state, n, hashes, data, lengths);
+	stored = store->routine->put(store->state, n, hashes, data, lengths, store->intent == DOLT_CHUNK_WRITE);
 	return stored;
 }
 
@@ -299,4 +318,90 @@ dolt_chunk_set_routine(const DoltChunkStoreRoutine *replacement)
 		elog(ERROR, "cannot change the dolt chunk store while a store is open");
 	current_routine = replacement;
 	return previous;
+}
+
+/* ---- SQL access, for tests and diagnostics ---- */
+
+static void
+require_superuser(void)
+{
+	if (!superuser())
+		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("chunk store functions require superuser")));
+}
+
+static bytea *
+bytes_value(const uint8 *data, Size length)
+{
+	bytea	   *value = palloc(VARHDRSZ + length);
+
+	SET_VARSIZE(value, VARHDRSZ + length);
+	memcpy(VARDATA(value), data, length);
+	return value;
+}
+
+static bool
+list_row(void *arg, const uint8 *hash, Size length)
+{
+	ReturnSetInfo *rsinfo = arg;
+	Datum		values[2];
+	bool		nulls[2] = {false};
+
+	values[0] = PointerGetDatum(bytes_value(hash, DOLT_CHUNK_HASH_SIZE));
+	values[1] = Int64GetDatum((int64) length);
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	return true;
+}
+
+/* dolt_chunk_list(): every chunk the store holds, with its size. */
+Datum
+dolt_chunk_list(PG_FUNCTION_ARGS)
+{
+	DoltChunkStore *store;
+
+	require_superuser();
+	InitMaterializedSRF(fcinfo, 0);
+	store = dolt_chunk_open(DOLT_CHUNK_READ);
+	dolt_chunk_scan(store, list_row, fcinfo->resultinfo);
+	dolt_chunk_close(store);
+	return (Datum) 0;
+}
+
+/* dolt_chunk_read(hash): a chunk's bytes, or NULL if the store lacks it. */
+Datum
+dolt_chunk_read(PG_FUNCTION_ARGS)
+{
+	bytea	   *hash = PG_GETARG_BYTEA_PP(0);
+	DoltChunkStore *store;
+	DoltChunk	chunk;
+	bytea	   *result = NULL;
+
+	require_superuser();
+	if (VARSIZE_ANY_EXHDR(hash) != DOLT_CHUNK_HASH_SIZE)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("a chunk hash has %d bytes", DOLT_CHUNK_HASH_SIZE)));
+	store = dolt_chunk_open(DOLT_CHUNK_READ);
+	if (dolt_chunk_get(store, (const uint8 *) VARDATA_ANY(hash), &chunk))
+		result = bytes_value(chunk.data, chunk.length);
+	dolt_chunk_close(store);
+	if (!result)
+		PG_RETURN_NULL();
+	PG_RETURN_BYTEA_P(result);
+}
+
+/* dolt_chunk_stats(): the store's chunks and bytes, and this session's lookups. */
+Datum
+dolt_chunk_stats(PG_FUNCTION_ARGS)
+{
+	DoltChunkStoreStats stats = {0};
+	TupleDesc	desc;
+	Datum		values[3];
+	bool		nulls[3] = {false};
+
+	require_superuser();
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	dolt_chunk_store_stats(&stats);
+	values[0] = Float8GetDatum(stats.chunks);
+	values[1] = Int64GetDatum((int64) stats.bytes);
+	values[2] = Int64GetDatum((int64) session_reads);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(desc, values, nulls)));
 }

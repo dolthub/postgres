@@ -819,6 +819,16 @@ struct config_bool ConfigureNamesBool[] =
 	},
 
 	{
+		{"dolt_unlogged_folds", PGC_SIGHUP, WAL_SETTINGS,
+			gettext_noop("Writes the trees prolly folds make without logging their chunks."),
+			gettext_noop("A fold's chunks are then durable at its commit, but standbys do not receive them.")
+		},
+		&dolt_unlogged_folds,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"dolt_chunk_verify_hashes", PGC_SUSET, DEVELOPER_OPTIONS,
 			gettext_noop("Verifies that prolly chunk contents match their hashes."),
 			gettext_noop("Checks every chunk put and every chunk read into the node cache."),
@@ -3718,6 +3728,15 @@ struct config_int ConfigureNamesInt[] =
 		},
 		&dolt_delta_memory,
 		256 * 1024, 1024, MAX_KILOBYTES, NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_chunk_journal_tail", PGC_POSTMASTER, RESOURCES_MEM,
+			gettext_noop("Sets how many recent prolly chunks are indexed in shared memory."),
+			gettext_noop("When that many chunks follow the journal's index, they are written as a new index run."),
+		},
+		&dolt_chunk_journal_tail,
+		131072, 64, INT_MAX / 2, NULL, NULL, NULL
 	},
 
 	{

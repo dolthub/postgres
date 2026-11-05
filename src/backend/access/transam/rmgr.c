@@ -22,6 +22,7 @@
 #include "access/brin_xlog.h"
 #include "access/clog.h"
 #include "access/commit_ts.h"
+#include "access/doltchunk_xlog.h"
 #include "access/doltdelta_xlog.h"
 #include "access/generic_xlog.h"
 #include "access/ginxlog.h"

@@ -14,6 +14,12 @@
  *	- a chunk put in a transaction is durable once that transaction commits;
  *	- the bytes returned for a hash are the bytes that were put under it.
  *
+ * A store opened with DOLT_CHUNK_WRITE logs its puts, so recovery and
+ * standbys get the chunks from the WAL. One opened with
+ * DOLT_CHUNK_WRITE_UNLOGGED doesn't: its puts are durable at commit, but a
+ * standby has them only if it can derive them itself, as it derives a fold's
+ * tree from the logged row edits.
+ *
  * Callers must not rely on whether a put disappears on rollback, whether a put
  * waits for a concurrent inserter, whether other running transactions' puts are
  * visible, or how a store locks or stores anything. Implementations differ in
@@ -35,6 +41,7 @@ typedef enum DoltChunkIntent
 {
 	DOLT_CHUNK_READ,
 	DOLT_CHUNK_WRITE,
+	DOLT_CHUNK_WRITE_UNLOGGED,
 } DoltChunkIntent;
 
 typedef struct DoltChunkStore DoltChunkStore;
@@ -57,6 +64,7 @@ typedef struct DoltChunkStoreStats
 } DoltChunkStoreStats;
 
 extern PGDLLIMPORT bool dolt_chunk_verify_hashes;
+extern PGDLLIMPORT int dolt_chunk_journal_tail;
 
 extern DoltChunkStore *dolt_chunk_open(DoltChunkIntent intent);
 extern void dolt_chunk_close(DoltChunkStore *store);
@@ -76,13 +84,13 @@ extern bool dolt_chunk_exists(DoltChunkStore *store, const uint8 *hash);
  * Put n chunks, given hashes and contents; returns how many this call stored.
  * A store may store another copy of a chunk it already holds rather than
  * look for it first. The store may reorder the batch. Requires
- * DOLT_CHUNK_WRITE.
+ * a write intent.
  */
 extern int	dolt_chunk_put_many(DoltChunkStore *store, int n, const uint8 *hashes,
 								const uint8 *const *data, const Size *lengths);
 extern bool dolt_chunk_put(DoltChunkStore *store, const uint8 *hash, const uint8 *data, Size length);
 
-/* Garbage-collection primitives. Deleting requires DOLT_CHUNK_WRITE. */
+/* Garbage-collection primitives. Deleting requires a write intent; deletions are always logged. */
 extern void dolt_chunk_scan(DoltChunkStore *store, DoltChunkScanFn fn, void *arg);
 extern int	dolt_chunk_delete_many(DoltChunkStore *store, int n, const uint8 *hashes);
 
@@ -107,19 +115,28 @@ typedef struct DoltChunkStoreRoutine
 	void		(*close) (void *state);
 	void		(*get) (void *state, int n, const uint8 *hashes, DoltChunkFoundFn found, void *arg);
 	void		(*exists) (void *state, int n, const uint8 *hashes, bool *found);
-	int			(*put) (void *state, int n, const uint8 *hashes, const uint8 *const *data, const Size *lengths);
+	int			(*put) (void *state, int n, const uint8 *hashes, const uint8 *const *data, const Size *lengths,
+						bool logged);
 	void		(*scan) (void *state, DoltChunkScanFn fn, void *arg);
 	int			(*remove) (void *state, int n, const uint8 *hashes);
 	void		(*stats) (DoltChunkStoreStats *stats);
 } DoltChunkStoreRoutine;
 
-/* The built-in implementation: the pg_dolt_chunk heap catalog. */
-extern const DoltChunkStoreRoutine *dolt_chunk_heap_routine(void);
+/* The built-in implementation: the chunk journal. */
+extern const DoltChunkStoreRoutine *dolt_chunk_journal_routine(void);
 
 /*
  * Install an implementation for this backend, or NULL for the built-in one;
  * returns the previous one. No store may be open.
  */
 extern const DoltChunkStoreRoutine *dolt_chunk_set_routine(const DoltChunkStoreRoutine *routine);
+
+/* The journal's shared state, startup, checkpoints and commits. */
+extern Size DoltChunkJournalShmemSize(void);
+extern void DoltChunkJournalShmemInit(void);
+extern void StartupDoltChunkJournal(bool from_backup);
+extern void CheckPointDoltChunkJournal(void);
+extern void dolt_chunk_journal_pre_commit(void);
+extern void dolt_chunk_journal_xact_end(void);
 
 #endif							/* DOLTCHUNK_H */

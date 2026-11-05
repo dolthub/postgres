@@ -3,8 +3,8 @@
 # server started. Writes go to the delta store, and a fold writes the nodes of
 # the trees they make, so the test folds before it measures trees. Results stay right when the cache is too small to hold a table, or holds
 # nothing at all, and history imports leave the subtrees the chunk store holds
-# to be read through the cache. Reads of pg_dolt_chunk's hash index count the
-# chunks a transaction reads from the store.
+# to be read through the cache. dolt_chunk_stats() counts the chunks a session
+# reads from the store.
 use strict;
 use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
@@ -23,7 +23,7 @@ sub fold { sql('SELECT dolt_fold()') }
 # The chunk store reads and cache statistics of |query|, run in a new session.
 sub reads {
 	my ($query) = @_;
-	my @lines = split /\n/, sql("BEGIN; $query; SELECT pg_stat_get_xact_numscans(9126) || ' ' || hits || ' ' || misses FROM dolt_node_cache_stats(); COMMIT");
+	my @lines = split /\n/, sql("BEGIN; $query; SELECT (SELECT session_reads FROM dolt_chunk_stats()) || ' ' || hits || ' ' || misses FROM dolt_node_cache_stats(); COMMIT");
 	return split / /, $lines[-1];
 }
 
@@ -80,7 +80,7 @@ $expected = sql($count);
 
 # Writers store no chunks, and a fold stores only the trees it ends with:
 # rewriting rows twenty times stores about what rewriting them once does.
-my $chunks = 'SELECT count(*) FROM pg_dolt_chunk';
+my $chunks = 'SELECT count(*) FROM dolt_chunk_list()';
 fold();
 my $start = sql($chunks);
 sql(q{UPDATE t SET v = 'once' WHERE id % 500 = 0});

@@ -94,6 +94,7 @@ extern void dolt_delta_totals(uint64 *ntrees, uint64 *keys, uint64 *versions, ui
 extern PGDLLIMPORT int dolt_fold_workers;
 extern PGDLLIMPORT int dolt_fold_versions;
 extern PGDLLIMPORT int dolt_fold_batch;
+extern PGDLLIMPORT bool dolt_unlogged_folds;
 extern PGDLLIMPORT int dolt_fold_timeout;
 
 extern void DoltFoldLauncherRegister(void);

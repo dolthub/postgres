@@ -15,6 +15,7 @@
 #include "postgres.h"
 
 #include "access/clog.h"
+#include "access/doltchunk.h"
 #include "access/doltdelta.h"
 #include "access/doltnode.h"
 #include "access/commit_ts.h"
@@ -154,6 +155,7 @@ CalculateShmemSize(int *num_semaphores)
 	size = add_size(size, AioShmemSize());
 	size = add_size(size, DoltNodeCacheShmemSize());
 	size = add_size(size, DoltDeltaShmemSize());
+	size = add_size(size, DoltChunkJournalShmemSize());
 
 	/* include additional requested shmem from preload libraries */
 	size = add_size(size, total_addin_request);
@@ -351,6 +353,7 @@ CreateOrAttachShmemStructs(void)
 	AioShmemInit();
 	DoltNodeCacheShmemInit();
 	DoltDeltaShmemInit();
+	DoltChunkJournalShmemInit();
 }
 
 /*

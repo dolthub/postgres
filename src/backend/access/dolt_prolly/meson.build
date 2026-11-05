@@ -4,7 +4,7 @@ backend_sources += files(
   'dg_resource.c',
   'dg_branch.c',
   'dg_chunk.c',
-  'dg_chunk_heap.c',
+  'dg_chunk_journal.c',
   'dg_system.c',
   'dg_manifest.c',
   'dg_node_cache.c',

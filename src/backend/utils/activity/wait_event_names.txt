@@ -218,6 +218,9 @@ DATA_FILE_READ	"Waiting for a read from a relation data file."
 DATA_FILE_SYNC	"Waiting for changes to a relation data file to reach durable storage."
 DATA_FILE_TRUNCATE	"Waiting for a relation data file to be truncated."
 DATA_FILE_WRITE	"Waiting for a write to a relation data file."
+DOLT_CHUNK_READ	"Waiting for a read from the prolly chunk journal."
+DOLT_CHUNK_SYNC	"Waiting for the prolly chunk journal to reach durable storage."
+DOLT_CHUNK_WRITE	"Waiting for a write to the prolly chunk journal."
 DOLT_DELTA_STATE_WRITE	"Waiting for a write to the prolly delta store's checkpoint file."
 DSM_ALLOCATE	"Waiting for a dynamic shared memory segment to be allocated."
 DSM_FILL_ZERO_WRITE	"Waiting to fill a dynamic shared memory backing file with zeroes."
@@ -409,6 +412,8 @@ DoltNodeDSA	"Waiting for shared node cache memory allocation."
 DoltDeltaTrees	"Waiting to find or add a prolly tree in the shared delta store."
 DoltDeltaTree	"Waiting to read or append a prolly tree's pending changes."
 DoltDeltaDSA	"Waiting for shared delta store memory allocation."
+DoltChunkAppend	"Waiting to append to the prolly chunk journal."
+DoltChunkIndex	"Waiting to look up or index chunks in the prolly chunk journal."
 
 # No "ABI_compatibility" region here as WaitEventLWLock has its own C code.
 
