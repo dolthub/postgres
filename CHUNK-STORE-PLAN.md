@@ -271,6 +271,95 @@ workloads, or index maintenance dominating write throughput.
 settled one, merged periodically. That approximates sorted runs using
 PostgreSQL's own structures.
 
+## Unlogged chunk journal (selected 2026-11-05)
+
+Status: started on branch `zachmu/unlogged-chunk-journal`.
+
+**Why.** Under TPC-C (scale 1, one thread), the heap store made the WAL
+342 KB per transaction against stock's 5.5 KB
+([measurements](/workspace/reports/tpcc-bottleneck/index.html)).
+84% of it was chunks:
+
+- the `pg_dolt_chunk` heap, which logs every node's bytes;
+- full-page images from its hash index, whose random keys put every insert
+  on a random page.
+
+Commits flushed that WAL. The writes also churned the node cache, and readers
+then missed and read chunks back.
+
+**Principle.** Only row edits have to be in the WAL. A tree derived from a
+base and a set of edits can be rebuilt from them. Prolly trees are history
+independent, so the rebuild yields the same root hash. Fold output therefore
+needs no WAL: only the edits and the fold's record do. Chunks that can't be
+derived from edits keep going through the WAL:
+
+- database roots;
+- schema definitions;
+- commit objects;
+- trees built whole (rewrites, index builds, bundles and fetched data).
+
+**Store.** This revives the journal of `zachmu/chunk-journal`, cluster-wide
+and outside the buffer manager:
+
+- **Files:**
+  - `pg_dolt/chunks/journal`, a stream of records, each a header (CRC-32C,
+    length, kind, hash) followed by the chunk's bytes;
+  - `pg_dolt/chunks/index`, holding two alternating metapages and the sorted
+    runs. A metapage gives the stream position the runs cover and the list of
+    live runs, with a generation and a CRC.
+- **Recent index:** records past the indexed position are indexed in shared
+  memory, in the main segment. When that index fills, it's written as a run.
+  When runs pile up, they're merged.
+- **Writes and reads:**
+  - Appends are plain file writes, serialized by one lock and written before
+    they're indexed.
+  - Readers take a short shared lock to locate a chunk, then read without it,
+    since records never move.
+  - No WAL and no shared buffers, so no full-page images.
+- **Durability:**
+  - **Logged puts** also write a `DoltChunk/PUT` WAL record holding the
+    chunks. Redo appends any the journal lacks, and checkpoints fsync the
+    journal.
+  - **Unlogged puts** (folds) fsync the journal before the transaction's
+    commit record, so a visible base always names durable chunks.
+  - **Runs and metapages:** the stream is fsynced up to the indexed position
+    before a metapage moves, and runs are fsynced before the metapage that
+    names them.
+- **Startup**, before redo: read the newer valid metapage, index the stream
+  past it until a record fails its CRC, and truncate there.
+- **Databases share one journal.** Chunks are content addressed, so
+  `CREATE DATABASE` copies nothing, and base backups copy the files.
+- **Garbage collection** later rewrites the whole journal from the live
+  chunks. Splitting it into segment files waits until a database is too
+  large to rewrite at once.
+
+**Standbys** receive logged chunks through the WAL and rebuild fold output
+themselves:
+
+- A FOLD record carries the base root and the new root.
+- The standby folds the edits that the record's snapshot can see into its
+  base, and checks that it gets the logged root.
+- It keeps those edits until its own fold finishes, and readers use the older
+  base until then.
+- A mismatch stops replay with an error.
+
+**Steps:**
+
+1. The journal store replaces the heap store and the `pg_dolt_chunk`
+   catalog, with every put logged. Tests read chunks through
+   `dolt_chunk_list()`. *Gate:*
+   - test_dolt_chunk, test_prolly and test_doltgres as before;
+   - crash tests for a torn tail and for runs written at a crash;
+   - WAL bytes per chunk.
+2. Unlogged fold output, behind `dolt_unlogged_folds` (off by default):
+   folds fsync before commit. *Gate:* crash tests, and TPC-C windows and WAL
+   per transaction.
+3. Standbys re-fold, so unlogged folds become the default. *Gate:* the hot
+   standby tests with unlogged folds on, including a deliberately mismatched
+   root.
+4. Captures write their trees unlogged and log what a standby needs to
+   rebuild them.
+
 ## Milestones
 
 1. **Minimal store (done, `645794b3460`):**
