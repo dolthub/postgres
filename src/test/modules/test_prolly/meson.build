@@ -81,5 +81,6 @@ tests += {
       't/064_delta_store.pl',
       't/065_database_root.pl',
       't/066_recovery_pruning.pl',
+      't/067_delta_settle.pl',
   ]},
 }

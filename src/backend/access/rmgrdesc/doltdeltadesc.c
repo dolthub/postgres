@@ -26,6 +26,15 @@ dolt_delta_desc(StringInfo buf, XLogReaderState *record)
 						 header.db, header.space, header.file, (int) header.branchlen,
 						 rec + SizeOfDoltDeltaAppend, header.topxid, header.cid, header.count);
 	}
+	else if (info == XLOG_DOLT_DELTA_SETTLE)
+	{
+		xl_dolt_delta_settle header;
+
+		memcpy(&header, rec, SizeOfDoltDeltaSettle);
+		appendStringInfo(buf, "tree %u/%u/%u branch %.*s; %u keys settled through %u",
+						 header.db, header.space, header.file, (int) header.branchlen,
+						 rec + SizeOfDoltDeltaSettle, header.count, header.conflict);
+	}
 	else if (info == XLOG_DOLT_DELTA_FOLD)
 	{
 		xl_dolt_delta_fold header;
@@ -48,6 +57,8 @@ dolt_delta_identify(uint8 info)
 			return "APPEND";
 		case XLOG_DOLT_DELTA_FOLD:
 			return "FOLD";
+		case XLOG_DOLT_DELTA_SETTLE:
+			return "SETTLE";
 	}
 	return NULL;
 }

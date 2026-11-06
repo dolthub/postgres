@@ -21,6 +21,7 @@
 
 #define XLOG_DOLT_DELTA_APPEND	0x00
 #define XLOG_DOLT_DELTA_FOLD	0x10
+#define XLOG_DOLT_DELTA_SETTLE	0x20
 
 /* The branch name's room, as RootKey keeps it. */
 #define DOLT_DELTA_BRANCH_SIZE	(NAMEDATALEN * 2)
@@ -75,6 +76,44 @@ typedef struct xl_dolt_delta_fold
 } xl_dolt_delta_fold;
 
 #define SizeOfDoltDeltaFold (offsetof(xl_dolt_delta_fold, branchlen) + sizeof(uint16))
+
+/*
+ * Keys of one tree settled without a fold: each key's versions, which every
+ * snapshot sees and no base holds, replaced by one version with their net
+ * count, or by none if it is zero. The versions are named by the WAL position
+ * of their record and their xid; the first is kept, with the net count, the
+ * record's position and |row|. A standby resolves conflicts with snapshots
+ * that may not see |conflict|.
+ */
+typedef struct xl_dolt_delta_settle
+{
+	Oid			db;
+	Oid			space;
+	RelFileNumber file;
+	TransactionId conflict;		/* the newest writer settled */
+	uint32		count;			/* keys that follow */
+	uint16		branchlen;
+	/* branch name, then each key: xl_dolt_delta_settled, key, versions, row */
+} xl_dolt_delta_settle;
+
+#define SizeOfDoltDeltaSettle (offsetof(xl_dolt_delta_settle, branchlen) + sizeof(uint16))
+
+typedef struct xl_dolt_delta_settled
+{
+	int64		delta;			/* the net count; zero drops the key */
+	uint32		keylen;
+	uint32		nversions;		/* xl_dolt_delta_version_id after the key */
+	uint32		rowlen;			/* row bytes after them, when delta is not zero */
+} xl_dolt_delta_settled;
+
+#define SizeOfDoltDeltaSettled (offsetof(xl_dolt_delta_settled, rowlen) + sizeof(uint32))
+
+typedef struct xl_dolt_delta_version_id
+{
+	XLogRecPtr	lsn;
+	TransactionId topxid;
+	TransactionId xid;
+} xl_dolt_delta_version_id;
 
 extern void dolt_delta_redo(XLogReaderState *record);
 extern void dolt_delta_desc(StringInfo buf, XLogReaderState *record);

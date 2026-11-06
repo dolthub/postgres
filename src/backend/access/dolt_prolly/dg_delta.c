@@ -57,6 +57,7 @@
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/shmem.h"
+#include "storage/standby.h"
 #include "utils/dsa.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
@@ -91,7 +92,7 @@ int			dolt_delta_memory = 256 * 1024;	/* kB */
 #define DELTA_DIR			"pg_dolt"
 #define DELTA_STATE_FILE	DELTA_DIR "/delta.state"
 #define DELTA_STATE_TEMP	DELTA_DIR "/delta.state.tmp"
-#define DELTA_STATE_MAGIC	0x44474c33	/* "DGL3" */
+#define DELTA_STATE_MAGIC	0x44474c34	/* "DGL4" */
 
 /* How much of the state file a checkpoint buffers before writing it. */
 #define DELTA_STATE_CHUNK	(1024 * 1024)
@@ -133,6 +134,7 @@ typedef struct DeltaTree
 	uint64		next_seq;
 	int64		net;			/* every version's delta, summed */
 	TimestampTz oldest;			/* when the oldest version still held arrived */
+	uint64		settle_hint;	/* versions added to keys that had some, since the last settling */
 	pg_prng_state heights;
 
 	/*
@@ -166,13 +168,28 @@ typedef struct DeltaSaved
 	uint32		rowlen;
 } DeltaSaved;
 
-/* The state file's trailer, after its versions and before its CRC. */
+/*
+ * A tree's fold note in the state file, then its running xids: without it, a
+ * restart would keep versions the fold's base holds and could not prune them,
+ * and readers of its base would know no better than the root row says.
+ */
+typedef struct DeltaSavedFold
+{
+	DoltDeltaTree tree;
+	TransactionId fold;
+	TransactionId xmin;
+	TransactionId xmax;
+	uint32		xcnt;
+} DeltaSavedFold;
+
+/* The state file's trailer, after its versions and fold notes, before its CRC. */
 typedef struct DeltaStateHeader
 {
 	uint32		magic;
 	uint32		pad;
 	XLogRecPtr	redo;
 	uint64		count;
+	uint64		folds;
 } DeltaStateHeader;
 
 static DeltaControl *control;
@@ -512,6 +529,7 @@ versions_link(DeltaTree *tree, const DoltDeltaEdit *edits, Pending *pending, int
 			k = key_at(found);
 			version_at(k->last)->next = pending[i].version;
 			k->last = pending[i].version;
+			tree->settle_hint++;
 		}
 		else
 		{
@@ -1114,6 +1132,387 @@ version_prunable(DeltaVersion *v, const DoltDeltaHorizon *held, TransactionId ho
 	return held && base_holds(held, v);
 }
 
+/* ---------------------------------------------------------------------------
+ * Settling
+ * ---------------------------------------------------------------------------
+ *
+ * Rows are keyed by their contents, so every update of a hot row leaves its
+ * old key behind with an insert and a delete that cancel, and index entries
+ * likewise. Until a fold, readers walk past them. Once every snapshot sees a
+ * key's versions and no base holds any of them, every reader counts all of
+ * them or none, so they can become one version with their net count, or none
+ * at all if it is zero: the key is settled. Settling is logged, naming the
+ * versions by their records' positions and xids, so that replay, the
+ * checkpoint's state file and standbys agree on what replaced what.
+ */
+
+/* Keys a settling pass looks at, at most, so that it holds the lock briefly. */
+#define SETTLE_BATCH 4096
+
+/* Whether |v| may settle: committed, seen by every snapshot, held by no base. */
+static bool
+version_settleable(DeltaVersion *v, const DoltDeltaHorizon *held, TransactionId horizon)
+{
+	uint32		flags = pg_atomic_read_u32(&v->flags);
+
+	if ((flags & VERSION_ABORTED) || !XLogRecPtrIsValid(v->lsn) || !TransactionIdPrecedes(v->topxid, horizon))
+		return false;
+	if (!(flags & VERSION_COMMITTED) && !version_ended_committed(v))
+		return false;
+	return !(held && base_holds(held, v));
+}
+
+/*
+ * Replace the versions of |key| in |tree| that |ids| name by the first of
+ * them with count |delta|, written at |lsn|, or by none if |delta| is zero.
+ * A kept version missing from the tree is made from |row|. Under the tree's
+ * lock, exclusive.
+ */
+static void
+settle_apply(DeltaTree *tree, const uint8 *key, uint32 keylen, const xl_dolt_delta_version_id *ids, int nids,
+			 int64 delta, const uint8 *row, uint32 rowlen, XLogRecPtr lsn)
+{
+	dsa_pointer preds[DELTA_MAX_HEIGHT];
+	dsa_pointer found = key_search(tree, key, keylen, preds);
+	DeltaKey   *k;
+	dsa_pointer keep = InvalidDsaPointer,
+				last = InvalidDsaPointer;
+	bool		kept = false;
+
+	if (!DsaPointerIsValid(found) || key_compare(KEY_BYTES(key_at(found)), key_at(found)->keylen, key, keylen) != 0)
+		return;
+	k = key_at(found);
+	for (dsa_pointer dp = k->first; DsaPointerIsValid(dp);)
+	{
+		DeltaVersion *v = version_at(dp);
+		dsa_pointer vnext = v->next;
+		int			named = -1;
+
+		for (int i = 0; i < nids && named < 0; i++)
+			if (v->lsn == ids[i].lsn && TransactionIdEquals(v->xid, ids[i].xid))
+				named = i;
+		if (named == 0 && delta != 0)
+		{
+			tree->net += delta - v->delta;
+			v->delta = delta;
+			v->lsn = lsn;
+			pg_atomic_fetch_or_u32(&v->flags, VERSION_COMMITTED);
+			kept = true;
+		}
+		else if (named >= 0)
+		{
+			tree->count--;
+			tree->net -= v->delta;
+			tree->bytes -= offsetof(DeltaVersion, row) + v->rowlen;
+			dsa_free(area, dp);
+			dp = vnext;
+			continue;
+		}
+		v->next = InvalidDsaPointer;
+		if (DsaPointerIsValid(last))
+			version_at(last)->next = dp;
+		else
+			keep = dp;
+		last = dp;
+		dp = vnext;
+	}
+	if (delta != 0 && !kept)
+	{
+		DoltDeltaEdit edit = {key, keylen, row, rowlen, delta};
+		dsa_pointer made = version_make(&edit, ids[0].topxid, ids[0].xid, FirstCommandId);
+		DeltaVersion *v;
+
+		if (!DsaPointerIsValid(made))
+			ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("prolly delta memory is full")));
+		v = version_at(made);
+		v->seq = tree->next_seq++;
+		v->lsn = lsn;
+		pg_atomic_fetch_or_u32(&v->flags, VERSION_COMMITTED);
+		tree->count++;
+		tree->net += delta;
+		tree->bytes += offsetof(DeltaVersion, row) + rowlen;
+		if (DsaPointerIsValid(last))
+			version_at(last)->next = made;
+		else
+			keep = made;
+		last = made;
+	}
+	k->first = keep;
+	k->last = last;
+	if (!DsaPointerIsValid(keep))
+	{
+		for (uint32 level = 0; level < k->height; level++)
+			key_at(preds[level])->next[level] = k->next[level];
+		tree->keys--;
+		tree->bytes -= offsetof(DeltaKey, next) + k->height * sizeof(dsa_pointer) + k->keylen;
+		dsa_free(area, found);
+	}
+}
+
+/* A key a settling pass chose, as it found it. */
+typedef struct SettleCandidate
+{
+	uint8	   *key;
+	uint32		keylen;
+	int			nids;
+	xl_dolt_delta_version_id *ids;	/* oldest first; the kept one is moved first */
+	int64		delta;
+	uint8	   *row;
+	uint32		rowlen;
+} SettleCandidate;
+
+/* Whether |k|'s versions are still exactly those |c| names, in order. */
+static bool
+settle_unchanged(DeltaKey *k, const SettleCandidate *c, const xl_dolt_delta_version_id *found)
+{
+	int			i = 0;
+
+	for (dsa_pointer dp = k->first; DsaPointerIsValid(dp); dp = version_at(dp)->next, i++)
+		if (i >= c->nids || version_at(dp)->lsn != found[i].lsn || !TransactionIdEquals(version_at(dp)->xid, found[i].xid))
+			return false;
+	return i == c->nids;
+}
+
+/*
+ * Settle the keys of |tree| whose versions every snapshot by |horizon| sees
+ * and no base holds: choose them under the shared lock, then check, log and
+ * apply them under the exclusive lock. Returns how many versions went.
+ */
+static uint64
+tree_settle(DeltaTree *tree, TransactionId horizon)
+{
+	MemoryContext memory = AllocSetContextCreate(CurrentMemoryContext, "prolly settle", ALLOCSET_DEFAULT_SIZES);
+	MemoryContext old = MemoryContextSwitchTo(memory);
+	SettleCandidate *cands = palloc(SETTLE_BATCH * sizeof(SettleCandidate));
+	xl_dolt_delta_version_id **orders = palloc(SETTLE_BATCH * sizeof(xl_dolt_delta_version_id *));
+	int			ncands = 0;
+	int			waiting = 0;	/* keys that could settle once snapshots move on */
+	uint64		settled = 0;
+	DoltDeltaHorizon held;
+	DoltDeltaHorizon *outstanding = NULL;
+	uint64		hint;
+
+	LWLockAcquire(&tree->lock, LW_SHARED);
+	hint = tree->settle_hint;
+	if (TransactionIdIsValid(tree->fold))
+	{
+		held = tree->folded;
+		held.xip = DsaPointerIsValid(tree->folded_xip) ?
+			(TransactionId *) dsa_get_address(area, tree->folded_xip) : NULL;
+		outstanding = &held;
+	}
+	for (dsa_pointer kp = key_at(tree->head)->next[0]; DsaPointerIsValid(kp) && ncands < SETTLE_BATCH;
+		 kp = key_at(kp)->next[0])
+	{
+		DeltaKey   *k = key_at(kp);
+		int			n = 0,
+					keep = -1;
+		int64		net = 0;
+		bool		ok = true;
+		SettleCandidate *c;
+
+		for (dsa_pointer dp = k->first; DsaPointerIsValid(dp) && ok; dp = version_at(dp)->next)
+		{
+			DeltaVersion *v = version_at(dp);
+
+			ok = version_settleable(v, outstanding, horizon);
+			net += v->delta;
+			n++;
+		}
+		if (n == 0 || (n == 1 && net != 0))
+			continue;
+		if (!ok)
+		{
+			waiting++;
+			continue;
+		}
+		c = &cands[ncands];
+		c->keylen = k->keylen;
+		c->key = palloc(Max(k->keylen, 1));
+		memcpy(c->key, KEY_BYTES(k), k->keylen);
+		c->nids = n;
+		c->ids = palloc(n * sizeof(xl_dolt_delta_version_id));
+		orders[ncands] = palloc(n * sizeof(xl_dolt_delta_version_id));
+		c->delta = net;
+		c->row = NULL;
+		c->rowlen = 0;
+		n = 0;
+		for (dsa_pointer dp = k->first; DsaPointerIsValid(dp); dp = version_at(dp)->next, n++)
+		{
+			DeltaVersion *v = version_at(dp);
+
+			orders[ncands][n].lsn = v->lsn;
+			orders[ncands][n].topxid = v->topxid;
+			orders[ncands][n].xid = v->xid;
+
+			/* Keep the version with the longest row: an insert's, not a delete's. */
+			if (net != 0 && (keep < 0 || v->rowlen > c->rowlen))
+			{
+				keep = n;
+				c->rowlen = v->rowlen;
+				c->row = (uint8 *) v->row;
+			}
+		}
+		if (c->row)
+			c->row = memcpy(palloc(Max(c->rowlen, 1)), c->row, c->rowlen);
+		memcpy(c->ids, orders[ncands], c->nids * sizeof(xl_dolt_delta_version_id));
+		if (keep > 0)
+		{
+			xl_dolt_delta_version_id first = c->ids[0];
+
+			c->ids[0] = c->ids[keep];
+			c->ids[keep] = first;
+		}
+		ncands++;
+	}
+	LWLockRelease(&tree->lock);
+
+	if (ncands)
+	{
+		StringInfoData record;
+		xl_dolt_delta_settle header = {0};
+		uint64		bytes;
+		int			nlogged = 0;
+
+		LWLockAcquire(&tree->lock, LW_EXCLUSIVE);
+		bytes = tree->bytes;
+		initStringInfo(&record);
+		header.db = tree->key.db;
+		header.space = tree->key.space;
+		header.file = tree->key.file;
+		header.branchlen = strlen(tree->key.branch);
+		appendBinaryStringInfo(&record, (const char *) &header, SizeOfDoltDeltaSettle);
+		appendBinaryStringInfo(&record, tree->key.branch, header.branchlen);
+		for (int i = 0; i < ncands; i++)
+		{
+			SettleCandidate *c = &cands[i];
+			dsa_pointer found = key_search(tree, c->key, c->keylen, NULL);
+			xl_dolt_delta_settled entry;
+
+			/* A writer or a prune may have changed the key since. */
+			if (!DsaPointerIsValid(found) || key_compare(KEY_BYTES(key_at(found)), key_at(found)->keylen, c->key, c->keylen) != 0 ||
+				!settle_unchanged(key_at(found), c, orders[i]))
+			{
+				c->nids = 0;
+				continue;
+			}
+			entry.delta = c->delta;
+			entry.keylen = c->keylen;
+			entry.nversions = c->nids;
+			entry.rowlen = c->delta != 0 ? c->rowlen : 0;
+			appendBinaryStringInfo(&record, (const char *) &entry, SizeOfDoltDeltaSettled);
+			appendBinaryStringInfo(&record, (const char *) c->key, c->keylen);
+			appendBinaryStringInfo(&record, (const char *) c->ids, c->nids * sizeof(xl_dolt_delta_version_id));
+			if (entry.rowlen)
+				appendBinaryStringInfo(&record, (const char *) c->row, entry.rowlen);
+			for (int j = 0; j < c->nids; j++)
+				if (!TransactionIdIsValid(header.conflict) || TransactionIdFollows(c->ids[j].topxid, header.conflict))
+					header.conflict = c->ids[j].topxid;
+			nlogged++;
+		}
+		if (nlogged)
+		{
+			XLogRecPtr	lsn;
+
+			header.count = nlogged;
+			memcpy(record.data, &header, SizeOfDoltDeltaSettle);
+			XLogBeginInsert();
+			XLogRegisterData(record.data, record.len);
+			START_CRIT_SECTION();
+			lsn = XLogInsert(RM_DOLT_DELTA_ID, XLOG_DOLT_DELTA_SETTLE);
+			(void) lsn;
+			for (int i = 0; i < ncands; i++)
+			{
+				SettleCandidate *c = &cands[i];
+
+				if (!c->nids)
+					continue;
+				settle_apply(tree, c->key, c->keylen, c->ids, c->nids, c->delta, c->row, c->rowlen, ProcLastRecPtr);
+				settled += c->nids - (c->delta != 0);
+			}
+			END_CRIT_SECTION();
+		}
+
+		/* Writers since the choice, and keys still waiting, keep the hint. */
+		if (ncands < SETTLE_BATCH && !waiting && tree->settle_hint == hint)
+			tree->settle_hint = 0;
+		if (!tree->count)
+			tree->oldest = 0;
+		pg_atomic_fetch_sub_u64(&control->bytes, bytes - tree->bytes);
+		LWLockRelease(&tree->lock);
+	}
+	else
+	{
+		LWLockAcquire(&tree->lock, LW_EXCLUSIVE);
+		if (!waiting && tree->settle_hint == hint)
+			tree->settle_hint = 0;
+		LWLockRelease(&tree->lock);
+	}
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(memory);
+	return settled;
+}
+
+/* Replay a SETTLE record. */
+static void
+settle_redo(XLogReaderState *record)
+{
+	char	   *p = XLogRecGetData(record);
+	char	   *end = p + XLogRecGetDataLen(record);
+	xl_dolt_delta_settle header;
+	char		branch[DOLT_DELTA_BRANCH_SIZE];
+	DoltDeltaTree key;
+	DeltaTree  *tree;
+	uint64		bytes;
+
+	delta_attach();
+	memcpy(&header, p, SizeOfDoltDeltaSettle);
+	p += SizeOfDoltDeltaSettle;
+	if (header.branchlen >= sizeof(branch))
+		elog(PANIC, "dolt_delta_redo: branch name too long");
+	memcpy(branch, p, header.branchlen);
+	branch[header.branchlen] = '\0';
+	p += header.branchlen;
+	if (InHotStandby)
+	{
+		RelFileLocator locator = {header.space, header.db, header.file};
+
+		ResolveRecoveryConflictWithSnapshot(header.conflict, false, locator);
+	}
+	dolt_delta_tree_key(&key, header.db, header.space, header.file, branch);
+	tree = tree_find(&key, false);
+	if (!tree)
+		return;
+	LWLockAcquire(&tree->lock, LW_EXCLUSIVE);
+	bytes = tree->bytes;
+	for (uint32 i = 0; i < header.count; i++)
+	{
+		xl_dolt_delta_settled entry;
+		const uint8 *keybytes;
+		xl_dolt_delta_version_id *ids;
+
+		if (p + SizeOfDoltDeltaSettled > end)
+			elog(PANIC, "dolt_delta_redo: malformed record");
+		memcpy(&entry, p, SizeOfDoltDeltaSettled);
+		p += SizeOfDoltDeltaSettled;
+		keybytes = (const uint8 *) p;
+		p += entry.keylen;
+		ids = palloc(Max(entry.nversions, 1) * sizeof(xl_dolt_delta_version_id));
+		memcpy(ids, p, entry.nversions * sizeof(xl_dolt_delta_version_id));
+		p += entry.nversions * sizeof(xl_dolt_delta_version_id);
+		settle_apply(tree, keybytes, entry.keylen, ids, entry.nversions, entry.delta,
+					 (const uint8 *) p, entry.rowlen, record->ReadRecPtr);
+		p += entry.rowlen;
+		pfree(ids);
+	}
+	if (!tree->count)
+		tree->oldest = 0;
+	pg_atomic_fetch_sub_u64(&control->bytes, bytes - tree->bytes);
+	LWLockRelease(&tree->lock);
+	if (p != end)
+		elog(PANIC, "dolt_delta_redo: malformed record");
+}
+
 /*
  * Remove the versions of |tree| that no reader can count: those of rolled
  * back writers, and those the newest fold's base holds once every snapshot
@@ -1242,8 +1641,14 @@ dolt_delta_prune_all(bool all)
 	horizon = prune_horizon();
 	every = trees_all(&ntrees);
 	for (int i = 0; i < ntrees; i++)
+	{
+		bool		hinted = every[i]->settle_hint > 0;
+
 		if (every[i]->count && (all || TransactionIdIsValid(every[i]->fold)))
 			pruned += tree_prune(every[i], horizon);
+		if (every[i]->count && (all || hinted) && !RecoveryInProgress())
+			pruned += tree_settle(every[i], horizon);
+	}
 	pfree(every);
 	return pruned;
 }
@@ -1392,7 +1797,8 @@ CheckPointDoltDelta(XLogRecPtr redo)
 {
 	DeltaTree **all;
 	int			ntrees;
-	StringInfoData buffer;
+	StringInfoData buffer,
+				folds;
 	DeltaStateHeader header = {0};
 	pg_crc32c	crc;
 	int			fd;
@@ -1410,6 +1816,7 @@ CheckPointDoltDelta(XLogRecPtr redo)
 	INIT_CRC32C(crc);
 	all = trees_all(&ntrees);
 	initStringInfo(&buffer);
+	initStringInfo(&folds);
 	header.magic = DELTA_STATE_MAGIC;
 	header.redo = redo;
 	for (int i = 0; i < ntrees; i++)
@@ -1445,10 +1852,28 @@ CheckPointDoltDelta(XLogRecPtr redo)
 					state_flush(fd, &buffer, &crc);
 			}
 		}
+
+		/* Taken under the same lock as the versions, so the two agree. */
+		if (TransactionIdIsValid(tree->fold))
+		{
+			DeltaSavedFold saved = {0};
+
+			saved.tree = tree->key;
+			saved.fold = tree->fold;
+			saved.xmin = tree->folded.xmin;
+			saved.xmax = tree->folded.xmax;
+			saved.xcnt = DsaPointerIsValid(tree->folded_xip) ? tree->folded.xcnt : 0;
+			appendBinaryStringInfo(&folds, &saved, sizeof(saved));
+			if (saved.xcnt)
+				appendBinaryStringInfo(&folds, dsa_get_address(area, tree->folded_xip), saved.xcnt * sizeof(TransactionId));
+			header.folds++;
+		}
 		LWLockRelease(&tree->lock);
 	}
 	pfree(all);
 
+	appendBinaryStringInfo(&buffer, folds.data, folds.len);
+	pfree(folds.data);
 	appendBinaryStringInfo(&buffer, &header, sizeof(header));
 	state_flush(fd, &buffer, &crc);
 	FIN_CRC32C(crc);
@@ -1552,6 +1977,26 @@ StartupDoltDelta(XLogRecPtr redo)
 			continue;
 		restore_version(&saved.tree, &edit, saved.topxid, saved.xid, saved.cid, saved.lsn);
 	}
+	for (uint64 i = 0; i < header.folds; i++)
+	{
+		DeltaSavedFold saved;
+		DoltDeltaHorizon horizon;
+
+		if (p + sizeof(saved) > end)
+			ereport(FATAL, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("prolly delta state file \"%s\" is corrupt", DELTA_STATE_FILE)));
+		memcpy(&saved, p, sizeof(saved));
+		p += sizeof(saved);
+		if (p + saved.xcnt * sizeof(TransactionId) > end)
+			ereport(FATAL, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("prolly delta state file \"%s\" is corrupt", DELTA_STATE_FILE)));
+		horizon.xmin = saved.xmin;
+		horizon.xmax = saved.xmax;
+		horizon.xcnt = saved.xcnt;
+		horizon.xip = palloc(Max(saved.xcnt, 1) * sizeof(TransactionId));
+		memcpy(horizon.xip, p, saved.xcnt * sizeof(TransactionId));
+		p += saved.xcnt * sizeof(TransactionId);
+		fold_note(&saved.tree, saved.fold, &horizon);
+		pfree(horizon.xip);
+	}
 	pfree(contents);
 }
 
@@ -1565,6 +2010,13 @@ dolt_delta_redo(XLogReaderState *record)
 	DoltDeltaTree key;
 	char		branch[DOLT_DELTA_BRANCH_SIZE];
 
+	if (info == XLOG_DOLT_DELTA_SETTLE)
+	{
+		/* A standby prunes with what its primary settles, as with what it folds. */
+		settle_redo(record);
+		(void) dolt_delta_prune_all(false);
+		return;
+	}
 	if (info == XLOG_DOLT_DELTA_FOLD)
 	{
 		xl_dolt_delta_fold fold;
