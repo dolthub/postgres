@@ -63,6 +63,14 @@ sql('SELECT dolt_fold()');
 is(sql(q{SELECT n FROM hot WHERE id = 1}), '1000', 'and a fold afterwards writes the same rows');
 is(sql(q{SET enable_seqscan = off; SELECT count(*) FROM hot WHERE n < 1000}), '9', 'and index entries');
 
+# A tree made after another's is gone starts with nothing queued to settle.
+sql(q{DROP TABLE hot; SELECT dolt_fold()});
+sql(q{CREATE TABLE warm(id int PRIMARY KEY, n int); INSERT INTO warm SELECT g, 0 FROM generate_series(1, 10) g});
+sql('SELECT dolt_fold()');
+sql(join('', map { "UPDATE warm SET n = n + 1 WHERE id = 2;" } 1 .. 100));
+ok($node->poll_query_until('postgres', "SELECT versions < 20 FROM dolt_delta_stats()"), 'a new table settles too');
+is(sql('SELECT n FROM warm WHERE id = 2'), '100', 'and reads its last value');
+
 $standby->stop;
 $node->stop;
 done_testing();
