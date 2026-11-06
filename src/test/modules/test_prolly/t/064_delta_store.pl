@@ -218,6 +218,21 @@ ok($busy->poll_query_until('postgres', q{SELECT versions = 0 FROM dolt_delta_sta
 	'the workers fold and prune after a rolled back install');
 is($busy->safe_psql('postgres', q{SET enable_seqscan = off; SELECT v FROM b WHERE id = 1}), '-1',
 	'without losing the change it held');
+
+# Past half the budget, one database's trees fold in parallel.
+$busy->safe_psql('postgres', q{CREATE TABLE p1(id int PRIMARY KEY, v text); CREATE TABLE p2(id int PRIMARY KEY, v text);
+CREATE TABLE p3(id int PRIMARY KEY, v text)});
+$busy->safe_psql('postgres', q{BEGIN;
+INSERT INTO p1 SELECT i, repeat('p', 40) FROM generate_series(1, 20000) i;
+INSERT INTO p2 SELECT i, repeat('p', 40) FROM generate_series(1, 20000) i;
+INSERT INTO p3 SELECT i, repeat('p', 40) FROM generate_series(1, 20000) i;
+COMMIT});
+ok($busy->poll_query_until('postgres',
+	q{SELECT count(*) >= 2 FROM pg_stat_activity WHERE backend_type = 'dolt fold worker' AND datname = 'postgres'}),
+	'a pressed store folds one database with several workers');
+ok($busy->poll_query_until('postgres', q{SELECT versions = 0 FROM dolt_delta_stats()}), 'which fold everything');
+is($busy->safe_psql('postgres', q{SELECT (SELECT count(*) FROM p1) + (SELECT count(*) FROM p2) + (SELECT count(*) FROM p3)}),
+	'60000', 'and lose nothing');
 $busy->stop;
 
 # With nothing folding, the store grows past its budget rather than refuse
