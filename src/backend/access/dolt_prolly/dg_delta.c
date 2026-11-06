@@ -993,7 +993,15 @@ dolt_delta_unpin(void)
 static TransactionId
 prune_horizon(void)
 {
-	TransactionId horizon = GetOldestNonRemovableTransactionId(NULL);
+	TransactionId horizon;
+
+	/*
+	 * Crash recovery, and a standby before it takes snapshots, has no readers:
+	 * every committed fold's versions are free, by a horizon past every xid.
+	 */
+	if (RecoveryInProgress() && standbyState != STANDBY_SNAPSHOT_READY)
+		return XidFromFullTransactionId(ReadNextFullTransactionId());
+	horizon = GetOldestNonRemovableTransactionId(NULL);
 
 	for (int i = 0; i < control->npins; i++)
 	{
@@ -1015,7 +1023,10 @@ void
 dolt_delta_set_fold(const DoltDeltaTree *key, TransactionId fold, const DoltDeltaHorizon *horizon,
 					const uint8 *root, const uint8 *base, const DoltDeltaHorizon *base_horizon)
 {
-	if (XLogStandbyInfoActive())
+	/*
+	 * Logged at every wal_level: crash recovery prunes by it, or replay of the
+	 * versions since the checkpoint could fill the delta's memory.
+	 */
 	{
 		xl_dolt_delta_fold record = {0};
 
@@ -1090,6 +1101,13 @@ version_prunable(DeltaVersion *v, const DoltDeltaHorizon *held, TransactionId ho
 	{
 		if (!TransactionIdPrecedes(v->topxid, horizon))
 			return false;
+
+		/*
+		 * In recovery, a writer whose commit is still to be replayed, or a
+		 * prepared one, has not ended: only a replayed abort ends it.
+		 */
+		if (RecoveryInProgress() && !TransactionIdDidCommit(v->xid))
+			return TransactionIdDidAbort(v->xid);
 		if (!version_ended_committed(v))
 			return true;
 	}
@@ -1112,8 +1130,11 @@ tree_prune(DeltaTree *tree, TransactionId horizon)
 
 	LWLockAcquire(&tree->lock, LW_EXCLUSIVE);
 	bytes = tree->bytes;
-	if (TransactionIdIsValid(tree->fold) && TransactionIdPrecedes(tree->fold, horizon))
+	if (TransactionIdIsValid(tree->fold) && TransactionIdPrecedes(tree->fold, horizon) &&
+		(TransactionIdDidCommit(tree->fold) || TransactionIdDidAbort(tree->fold) ||
+		 !(RecoveryInProgress() || TransactionIdIsInProgress(tree->fold))))
 	{
+		/* In recovery, a fold whose commit is still to be replayed waits for it. */
 		if (!TransactionIdDidCommit(tree->fold))
 		{
 			/* The fold rolled back: its base never was. */
@@ -1449,7 +1470,9 @@ restore_version(const DoltDeltaTree *key, const DoltDeltaEdit *edit, Transaction
 	DeltaTree  *tree = tree_find(key, true);
 	Pending		pending;
 
-	if (!pending_make(tree, &pending, edit, topxid, xid, cid))
+	/* Free what committed folds hold before giving up: recovery has no fold workers. */
+	if (!pending_make(tree, &pending, edit, topxid, xid, cid) &&
+		(dolt_delta_prune_all(false) == 0 || !pending_make(tree, &pending, edit, topxid, xid, cid)))
 		ereport(FATAL,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
 				 errmsg("prolly delta memory is full during recovery"),
@@ -1582,11 +1605,10 @@ dolt_delta_redo(XLogReaderState *record)
 
 		/*
 		 * Earlier folds may have committed since, and the standby's readers
-		 * moved on. Crash recovery, and a standby before it takes snapshots,
-		 * has no horizon to prune by yet; later folds and prunes catch up.
+		 * moved on; crash recovery, and a standby before it takes snapshots,
+		 * has no readers (prune_horizon).
 		 */
-		if (standbyState == STANDBY_SNAPSHOT_READY)
-			(void) dolt_delta_prune_all(false);
+		(void) dolt_delta_prune_all(false);
 		return;
 	}
 	if (info != XLOG_DOLT_DELTA_APPEND)
