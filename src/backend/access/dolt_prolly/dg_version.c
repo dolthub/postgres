@@ -41,6 +41,7 @@
 #include "storage/proc.h"
 #include "access/genam.h"
 #include "access/htup_details.h"
+#include "access/multixact.h"
 #include "utils/fmgroids.h"
 #include "commands/alter.h"
 #include "commands/comment.h"

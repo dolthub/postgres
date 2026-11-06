@@ -53,6 +53,10 @@ static uint64 extension_generation = 1;
  */
 static uint64 base_generation = 1;
 
+/* The base's pg_class definitions, and whether a pg_class change awaits a check. */
+static uint64 provider_base_classes;
+static bool provider_base_suspect;
+
 static void
 provider_identities_changed(Datum arg, Oid relid)
 {
@@ -319,12 +323,80 @@ provider_xact(XactEvent event, void *arg)
 }
 
 static void
-provider_base_forget(Datum arg, int cacheid, uint32 hashvalue)
+provider_base_drop(void)
 {
 	base_generation++;
 	if (provider_base)
 		CatalogViewBaseRelease(provider_base);
 	provider_base = NULL;
+	provider_base_suspect = false;
+}
+
+/*
+ * A pg_class row changed, most often only its statistics: VACUUM and ANALYZE
+ * of the physical catalogs update relpages and reltuples about once a second
+ * under load. Dropping the base for each would make every session rebuild
+ * its catalog view, so the next lookup compares the rows' definitions first
+ * (provider_check_base). Other catalogs' changes are definitions.
+ */
+static void
+provider_base_forget(Datum arg, int cacheid, uint32 hashvalue)
+{
+	if (cacheid == RELOID && provider_base)
+		provider_base_suspect = true;
+	else
+		provider_base_drop();
+}
+
+/*
+ * A fingerprint of a pg_class row's definition: the row less the columns
+ * VACUUM and ANALYZE maintain.
+ */
+static uint64
+class_definition_hash(HeapTuple tuple)
+{
+	HeapTuple	copy = heap_copytuple(tuple);
+	Form_pg_class form = (Form_pg_class) GETSTRUCT(copy);
+	uint64		hash;
+
+	form->relpages = 0;
+	form->reltuples = 0;
+	form->relallvisible = 0;
+	form->relallfrozen = 0;
+	form->relfrozenxid = InvalidTransactionId;
+	form->relminmxid = InvalidMultiXactId;
+	hash = hash_bytes_extended((const unsigned char *) copy->t_data + copy->t_data->t_hoff,
+							   copy->t_len - copy->t_data->t_hoff, form->oid);
+	heap_freetuple(copy);
+	return hash;
+}
+
+/* The sum of the definition fingerprints of the pg_class rows the base holds. */
+static uint64
+class_definitions(void)
+{
+	Relation	rel = table_open(RelationRelationId, AccessShareLock);
+	TableScanDesc scan = table_beginscan_catalog(rel, 0, NULL);
+	HeapTuple	tuple;
+	uint64		sum = 0;
+
+	while ((tuple = heap_getnext(scan, ForwardScanDirection)))
+		if (provider_bootstrap(RelationRelationId, tuple, RelationGetDescr(rel)))
+			sum += class_definition_hash(tuple);
+	table_endscan(scan);
+	table_close(rel, AccessShareLock);
+	return sum;
+}
+
+/* Keep the base if the pg_class rows that changed kept their definitions. */
+static void
+provider_check_base(void)
+{
+	if (!provider_base_suspect)
+		return;
+	provider_base_suspect = false;
+	if (class_definitions() != provider_base_classes)
+		provider_base_drop();
 }
 
 static CatalogViewBase *
@@ -343,6 +415,7 @@ provider_shared_base(void)
 			CacheRegisterSyscacheCallback(caches[i], provider_base_forget, (Datum) 0);
 		registered = true;
 	}
+	provider_check_base();
 	if (provider_base)
 		return provider_base;
 	base = CatalogViewBaseCreate();
@@ -425,6 +498,8 @@ provider_shared_base(void)
 	if (provider_base)
 		CatalogViewBaseRelease(provider_base);
 	provider_base = base;
+	provider_base_classes = class_definitions();
+	provider_base_suspect = false;
 	return base;
 }
 
@@ -1639,9 +1714,20 @@ provider_table_type(DGProviderRows *rows, CatalogView *view, bytea *database,
 
 #include "dg_sequence_provider.inc"
 
+/* Catalog views this session has built, for tests. */
+static int64 provider_loads;
+
+/* dolt_catalog_view_loads(): how many catalog views this session has built. */
+Datum
+dolt_catalog_view_loads(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(provider_loads);
+}
+
 static void
 provider_populate(CatalogView *view, bytea *database, const char *branch)
 {
+	provider_loads++;
 	DGProviderRows rows = {0};
 	List	   *inherited = NIL;
 	DGMember   *listed;
@@ -2071,6 +2157,8 @@ provider_lookup(const char *branch, bytea *database)
 	Oid			user;
 	int			security,
 				nest;
+
+	provider_check_base();
 
 	/*
 	 * Visibility is required even on a cache hit: an aborted object must not
