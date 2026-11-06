@@ -99,4 +99,13 @@ sql('ALTER TABLE renamed_heap RENAME TO renamed_heap2');
 is($binder->query_safe(q{SELECT to_regclass('renamed_heap2') IS NOT NULL, to_regclass('renamed_heap') IS NULL}),'t|t','a renamed relation is seen by its new name');
 is($binder->query_safe('SELECT count(*) FROM versions'),'1','and versioned tables still read');
 $binder->quit;sql('DROP TABLE renamed_heap2');
+
+# Rebinding after each commit's invalidations replaces cached bindings without
+# growing the session's cache memory.
+sql('CREATE TABLE rebound(id int PRIMARY KEY,v int) USING dolt_prolly_table; INSERT INTO rebound VALUES(1,0)');
+my $cache=q{SELECT 'cache',total_bytes FROM pg_backend_memory_contexts WHERE name='CacheMemoryContext'};
+my $rounds=join('',map {"UPDATE rebound SET v=v+1 WHERE id=1; SELECT v FROM rebound WHERE id=1;\n"} 1..5000);
+my $sizes=sql("$rounds$cache;\n$rounds$cache;\n$rounds$rounds$cache;");
+my ($warm,$grown)=(grep {s/^cache\|//} split(/\n/,$sizes))[1,2];
+is($grown,$warm,'rebinding leaves cache memory unchanged');
 $node->stop;done_testing();
