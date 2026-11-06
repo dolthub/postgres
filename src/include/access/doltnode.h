@@ -37,6 +37,13 @@ extern void DoltNodeCacheShmemInit(void);
 
 extern const uint8 *dolt_node_cache_get(const uint8 *hash, Size *length);
 extern void dolt_node_cache_add(const uint8 *hash, const uint8 *data, Size length);
+/* What a lookup does to a node's usage. */
+#define DOLT_NODE_LEAVE		0
+#define DOLT_NODE_TOUCH		1
+#define DOLT_NODE_DEMOTE	2
+
+extern const uint8 *dolt_node_cache_lookup(const uint8 *hash, Size *length, int use);
+extern void dolt_node_cache_insert(const uint8 *hash, const uint8 *data, Size length, bool cold);
 extern void dolt_node_cache_report(void);
 extern void dolt_node_cache_stats(DoltNodeCacheStats *stats);
 

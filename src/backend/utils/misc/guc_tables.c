@@ -493,6 +493,14 @@ static const struct config_enum_entry wal_compression_options[] = {
 	{NULL, 0, false}
 };
 
+static const struct config_enum_entry dolt_fold_cache_options[] = {
+	{"add", DOLT_FOLD_CACHE_ADD, false},
+	{"cold", DOLT_FOLD_CACHE_COLD, false},
+	{"none", DOLT_FOLD_CACHE_NONE, false},
+	{"replace", DOLT_FOLD_CACHE_REPLACE, false},
+	{NULL, 0, false}
+};
+
 static const struct config_enum_entry file_copy_method_options[] = {
 	{"copy", FILE_COPY_METHOD_COPY, false},
 #if defined(HAVE_COPYFILE) && defined(COPYFILE_CLONE_FORCE) || defined(HAVE_COPY_FILE_RANGE)
@@ -821,10 +829,10 @@ struct config_bool ConfigureNamesBool[] =
 	{
 		{"dolt_unlogged_folds", PGC_SIGHUP, WAL_SETTINGS,
 			gettext_noop("Writes the trees prolly folds make without logging their chunks."),
-			gettext_noop("A fold's chunks are then durable at its commit, but standbys do not receive them.")
+			gettext_noop("A fold's chunks are then durable at its commit, and standbys and recovery rebuild them from the logged edits.")
 		},
 		&dolt_unlogged_folds,
-		false,
+		true,
 		NULL, NULL, NULL
 	},
 
@@ -5465,6 +5473,17 @@ struct config_enum ConfigureNamesEnum[] =
 		&pgstat_fetch_consistency,
 		PGSTAT_FETCH_CONSISTENCY_CACHE, stats_fetch_consistency,
 		NULL, assign_stats_fetch_consistency, NULL
+	},
+
+	{
+		{"dolt_fold_cache", PGC_SUSET, DEVELOPER_OPTIONS,
+			gettext_noop("Sets how prolly folds use the shared node cache."),
+			gettext_noop("add puts the nodes a fold reads and writes in the cache; cold puts them there unused; none leaves the cache as it was; replace adds the nodes it writes and demotes those it reads, which its tree replaces."),
+			GUC_NOT_IN_SAMPLE
+		},
+		&dolt_fold_cache,
+		DOLT_FOLD_CACHE_REPLACE, dolt_fold_cache_options,
+		NULL, NULL, NULL
 	},
 
 	{

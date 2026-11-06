@@ -1012,7 +1012,8 @@ prune_horizon(void)
  * WAL too, for standbys to prune by.
  */
 void
-dolt_delta_set_fold(const DoltDeltaTree *key, TransactionId fold, const DoltDeltaHorizon *horizon)
+dolt_delta_set_fold(const DoltDeltaTree *key, TransactionId fold, const DoltDeltaHorizon *horizon,
+					const uint8 *root, const uint8 *base, const DoltDeltaHorizon *base_horizon)
 {
 	if (XLogStandbyInfoActive())
 	{
@@ -1025,12 +1026,22 @@ dolt_delta_set_fold(const DoltDeltaTree *key, TransactionId fold, const DoltDelt
 		record.xmin = horizon->xmin;
 		record.xmax = horizon->xmax;
 		record.xcnt = horizon->xcnt;
+		if (base_horizon && TransactionIdIsValid(base_horizon->xmax))
+		{
+			record.base_xmin = base_horizon->xmin;
+			record.base_xmax = base_horizon->xmax;
+			record.base_xcnt = base_horizon->xcnt;
+		}
+		memcpy(record.root, root, sizeof(record.root));
+		memcpy(record.base, base, sizeof(record.base));
 		record.branchlen = strlen(key->branch);
 		XLogBeginInsert();
 		XLogRegisterData(&record, SizeOfDoltDeltaFold);
 		XLogRegisterData(key->branch, record.branchlen);
 		if (horizon->xcnt)
 			XLogRegisterData(horizon->xip, horizon->xcnt * sizeof(TransactionId));
+		if (record.base_xcnt)
+			XLogRegisterData(base_horizon->xip, record.base_xcnt * sizeof(TransactionId));
 		(void) XLogInsert(RM_DOLT_DELTA_ID, XLOG_DOLT_DELTA_FOLD);
 	}
 	fold_note(key, fold, horizon);
@@ -1534,7 +1545,8 @@ dolt_delta_redo(XLogReaderState *record)
 	if (info == XLOG_DOLT_DELTA_FOLD)
 	{
 		xl_dolt_delta_fold fold;
-		DoltDeltaHorizon horizon;
+		DoltDeltaHorizon horizon,
+					base_horizon = {0};
 
 		delta_attach();
 		memcpy(&fold, p, SizeOfDoltDeltaFold);
@@ -1549,9 +1561,24 @@ dolt_delta_redo(XLogReaderState *record)
 		horizon.xcnt = fold.xcnt;
 		horizon.xip = palloc(Max(fold.xcnt, 1) * sizeof(TransactionId));
 		memcpy(horizon.xip, p, fold.xcnt * sizeof(TransactionId));
+		p += fold.xcnt * sizeof(TransactionId);
+		base_horizon.xmin = fold.base_xmin;
+		base_horizon.xmax = fold.base_xmax;
+		base_horizon.xcnt = fold.base_xcnt;
+		base_horizon.xip = palloc(Max(fold.base_xcnt, 1) * sizeof(TransactionId));
+		memcpy(base_horizon.xip, p, fold.base_xcnt * sizeof(TransactionId));
 		dolt_delta_tree_key(&key, fold.db, fold.space, fold.file, branch);
+
+		/*
+		 * A standby, or crash recovery of a fold whose chunks never became
+		 * durable, rebuilds the tree from its base and the versions replayed
+		 * so far, before the fold's commit can make it a reader's base, and
+		 * before pruning can drop the versions it holds.
+		 */
+		dg_refold(&key, &horizon, fold.root, fold.base, &base_horizon);
 		fold_note(&key, fold.fold, &horizon);
 		pfree(horizon.xip);
+		pfree(base_horizon.xip);
 
 		/*
 		 * Earlier folds may have committed since, and the standby's readers

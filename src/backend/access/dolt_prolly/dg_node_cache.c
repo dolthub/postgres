@@ -231,10 +231,13 @@ use_slot(NodeSlot *slot)
 
 /*
  * A copy of the node |hash|, valid until the next call, with its length in
- * |*length|; NULL if the cache lacks it.
+ * |*length|; NULL if the cache lacks it. |use| says what the lookup does to
+ * the node's usage: DOLT_NODE_TOUCH counts a use, keeping it longer;
+ * DOLT_NODE_DEMOTE clears its usage, so the clock evicts it next unless a
+ * reader uses it again.
  */
 const uint8 *
-dolt_node_cache_get(const uint8 *hash, Size *length)
+dolt_node_cache_lookup(const uint8 *hash, Size *length, int use)
 {
 	NodeMapping *entry;
 	uint32		hashcode;
@@ -260,7 +263,16 @@ dolt_node_cache_get(const uint8 *hash, Size *length)
 		}
 		memcpy(copied, dsa_get_address(area, slot->data), slot->length);
 		*length = slot->length;
-		use_slot(slot);
+		if (use == DOLT_NODE_TOUCH)
+			use_slot(slot);
+		else if (use == DOLT_NODE_DEMOTE)
+		{
+			uint32		state = pg_atomic_read_u32(&slot->state);
+
+			while ((state & NODE_USAGE_MASK) &&
+				   !pg_atomic_compare_exchange_u32(&slot->state, &state, state & ~NODE_USAGE_MASK))
+				;
+		}
 	}
 	LWLockRelease(lock);
 	if (!entry)
@@ -343,6 +355,12 @@ claim_slot(int32 *out)
 	return false;
 }
 
+const uint8 *
+dolt_node_cache_get(const uint8 *hash, Size *length)
+{
+	return dolt_node_cache_lookup(hash, length, DOLT_NODE_TOUCH);
+}
+
 /* Room in the area for |length| bytes, evicting nodes to make it. */
 static dsa_pointer
 allocate_bytes(Size length)
@@ -358,9 +376,12 @@ allocate_bytes(Size length)
 	}
 }
 
-/* Add the node |hash|, unless the cache cannot make room for it. */
+/*
+ * Add the node |hash|, unless the cache cannot make room for it. A |cold|
+ * node starts unused, so the clock evicts it first unless a reader uses it.
+ */
 void
-dolt_node_cache_add(const uint8 *hash, const uint8 *data, Size length)
+dolt_node_cache_insert(const uint8 *hash, const uint8 *data, Size length, bool cold)
 {
 	NodeMapping *entry;
 	NodeSlot   *slot;
@@ -397,7 +418,7 @@ dolt_node_cache_add(const uint8 *hash, const uint8 *data, Size length)
 	if (entry && !found)
 	{
 		entry->slot = index;
-		pg_atomic_write_u32(&slot->state, NODE_VALID | NODE_USAGE_ONE);
+		pg_atomic_write_u32(&slot->state, NODE_VALID | (cold ? 0 : NODE_USAGE_ONE));
 	}
 	LWLockRelease(lock);
 	if (entry && !found)
@@ -412,6 +433,12 @@ dolt_node_cache_add(const uint8 *hash, const uint8 *data, Size length)
 	dsa_free(area, bytes);
 	if (!entry)
 		pg_atomic_fetch_add_u64(&cache->rejected, 1);
+}
+
+void
+dolt_node_cache_add(const uint8 *hash, const uint8 *data, Size length)
+{
+	dolt_node_cache_insert(hash, data, length, false);
 }
 
 /* Add this session's hits and misses to the server's; once per transaction. */
