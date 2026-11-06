@@ -66,6 +66,9 @@
 #include "utils/wait_event.h"
 
 int			dolt_delta_memory = 256 * 1024;	/* kB */
+int			dolt_delta_memory_limit = -1;	/* kB */
+int			dolt_delta_throttle = 75;	/* percent of dolt_delta_memory */
+double		dolt_delta_throttle_delay = 0.1;	/* ms per kB appended, at the budget */
 
 #define DELTA_PARTITIONS 16
 
@@ -78,9 +81,12 @@ int			dolt_delta_memory = 256 * 1024;	/* kB */
 /* The WAL payload of one append record, past which an append writes another. */
 #define DELTA_RECORD_BYTES ((Size) 1024 * 1024)
 
-/* How long a writer waits for folds to free memory before failing: 30 s in all. */
+/* How long a writer at the memory limit naps between looks, and how often it says so. */
 #define DELTA_FULL_NAP_US 10000
-#define DELTA_FULL_WAITS 3000
+#define DELTA_FULL_LOG_MS 10000
+
+/* The longest one append's throttle delay. */
+#define DELTA_THROTTLE_MAX_US 1000000
 
 /* Keys a tree queues to settle, at most; past it, the next fold drops them. */
 #define SETTLE_QUEUE_MAX 1048576
@@ -152,8 +158,10 @@ typedef struct DeltaTree
 
 typedef struct DeltaControl
 {
-	Size		area_size;
+	Size		budget;			/* dolt_delta_memory: the area's place in the main segment */
 	pg_atomic_uint64 bytes;		/* held by every tree's keys and versions */
+	pg_atomic_uint64 throttled_us;
+	pg_atomic_uint64 limit_waits;
 	LWLockPadded locks[DELTA_PARTITIONS];
 	int			npins;
 	pg_atomic_uint32 pins[FLEXIBLE_ARRAY_MEMBER];	/* per process: the oldest xmin it loaded under */
@@ -199,6 +207,10 @@ typedef struct DeltaStateHeader
 static DeltaControl *control;
 static HTAB *trees;
 static dsa_area *area;
+
+/* What this backend's top-level transaction has appended, which no fold frees before it ends. */
+static TransactionId appended_xid = InvalidTransactionId;
+static uint64 appended_bytes;
 
 static DeltaTree **trees_all(int *count);
 static void fold_note(const DoltDeltaTree *key, TransactionId fold, const DoltDeltaHorizon *horizon);
@@ -246,18 +258,23 @@ DoltDeltaShmemInit(void)
 	{
 		dsa_area   *created;
 
-		control->area_size = area_bytes();
+		control->budget = area_bytes();
 		pg_atomic_init_u64(&control->bytes, 0);
+		pg_atomic_init_u64(&control->throttled_us, 0);
+		pg_atomic_init_u64(&control->limit_waits, 0);
 		for (int i = 0; i < DELTA_PARTITIONS; i++)
 			LWLockInitialize(&control->locks[i].lock, LWTRANCHE_DOLT_DELTA_TREES);
 		control->npins = pin_slots();
 		for (int i = 0; i < control->npins; i++)
 			pg_atomic_init_u32(&control->pins[i], InvalidTransactionId);
 
-		/* The postmaster cannot use dynamic segments: cap the area at its place. */
-		created = dsa_create_in_place(area_place(), control->area_size, LWTRANCHE_DOLT_DELTA_DSA, NULL);
+		/*
+		 * The postmaster cannot use dynamic segments: cap the area at its
+		 * place until a process that can attaches.
+		 */
+		created = dsa_create_in_place(area_place(), control->budget, LWTRANCHE_DOLT_DELTA_DSA, NULL);
 		dsa_pin(created);
-		dsa_set_size_limit(created, control->area_size);
+		dsa_set_size_limit(created, control->budget);
 		dsa_detach(created);
 	}
 	info.keysize = sizeof(DoltDeltaTree);
@@ -276,6 +293,15 @@ delta_attach(void)
 
 		area = dsa_attach_in_place(area_place(), NULL);
 		dsa_pin_mapping(area);
+
+		/*
+		 * Past its budget, the store grows into dynamic segments rather than
+		 * refuse writes, which a transaction larger than the budget, or folds
+		 * that fall behind, would otherwise meet. Writers are slowed there,
+		 * and wait at dolt_delta_memory_limit, before they allocate.
+		 */
+		if (IsUnderPostmaster)
+			dsa_set_size_limit(area, (size_t) -1);
 		MemoryContextSwitchTo(old);
 	}
 }
@@ -629,6 +655,95 @@ record_build(const DoltDeltaTree *key, TransactionId topxid, CommandId cid,
 	return buffer;
 }
 
+/* The memory a writer may hold the store to, or 0 for no limit. */
+static uint64
+delta_limit(void)
+{
+	if (dolt_delta_memory_limit < 0)
+		return 0;
+	return Max((uint64) dolt_delta_memory_limit * 1024, control->budget);
+}
+
+/*
+ * One nap of a writer that cannot append yet: the store is at its limit, or
+ * the system would give it no more memory. Folds free memory as every
+ * snapshot reads past them; the writer waits for that rather than fail, and
+ * says so every DELTA_FULL_LOG_MS.
+ */
+static void
+delta_wait(TimestampTz *said)
+{
+	TimestampTz now = GetCurrentTimestamp();
+
+	if (*said == 0)
+		pg_atomic_fetch_add_u64(&control->limit_waits, 1);
+	if (*said == 0 || TimestampDifferenceExceeds(*said, now, DELTA_FULL_LOG_MS))
+	{
+		ereport(LOG,
+				(errmsg("waiting for prolly folds to free delta store memory"),
+				 errdetail("The store holds %llu bytes; its budget is %zu bytes.",
+						   (unsigned long long) pg_atomic_read_u64(&control->bytes), control->budget)));
+		*said = now;
+	}
+	pgstat_report_wait_start(WAIT_EVENT_DOLT_DELTA_LIMIT);
+	pg_usleep(DELTA_FULL_NAP_US);
+	pgstat_report_wait_end();
+	CHECK_FOR_INTERRUPTS();
+}
+
+/*
+ * Slow a writer about to append |edits| while the store is past its throttle
+ * point: by dolt_delta_throttle_delay per kilobyte at the budget, in
+ * proportion to how far past the point it is, so that the further folds fall
+ * behind, the more writers yield to them. At dolt_delta_memory_limit, wait
+ * for memory first; that counts every version, a writer's own included.
+ */
+static void
+delta_throttle(const DoltDeltaEdit *edits, int count)
+{
+	TransactionId topxid = GetTopTransactionId();
+	uint64		budget = control->budget;
+	uint64		start = budget * dolt_delta_throttle / 100;
+	uint64		limit = delta_limit();
+	uint64		bytes = pg_atomic_read_u64(&control->bytes);
+	uint64		appending = 0;
+	double		past;
+	long		delay_us;
+
+	if (limit)
+	{
+		for (TimestampTz said = 0; bytes >= limit; bytes = pg_atomic_read_u64(&control->bytes))
+			delta_wait(&said);
+	}
+	for (int i = 0; i < count; i++)
+		appending += offsetof(DeltaVersion, row) + edits[i].rowlen + offsetof(DeltaKey, next) + edits[i].keylen;
+
+	/*
+	 * A writer's own transaction does not count toward its throttling: no
+	 * fold frees those versions before it ends, so slowing it for them would
+	 * only slow a large transaction the more it wrote.
+	 */
+	if (appended_xid != topxid)
+	{
+		appended_xid = topxid;
+		appended_bytes = 0;
+	}
+	bytes -= Min(bytes, appended_bytes);
+	appended_bytes += appending;
+	if (bytes <= start || dolt_delta_throttle_delay <= 0)
+		return;
+	past = (double) (bytes - start) / (double) Max(budget - start, 1);
+	delay_us = (long) Min(past * dolt_delta_throttle_delay * 1000.0 * ((double) appending / 1024.0),
+						  (double) DELTA_THROTTLE_MAX_US);
+	if (delay_us <= 0)
+		return;
+	pg_atomic_fetch_add_u64(&control->throttled_us, delay_us);
+	pgstat_report_wait_start(WAIT_EVENT_DOLT_DELTA_THROTTLE);
+	pg_usleep(delay_us);
+	pgstat_report_wait_end();
+	CHECK_FOR_INTERRUPTS();
+}
+
 /*
  * Append |count| versions to |key|'s delta as the current (sub)transaction's,
  * in command |cid|, which made them. A |logged| append reaches the WAL first,
@@ -654,11 +769,13 @@ dolt_delta_append(const DoltDeltaTree *key, const DoltDeltaEdit *edits, int coun
 
 	/*
 	 * Allocate everything before the critical section, which must not fail.
-	 * While the store is full, wait for folds to free some, as Doltgrust
+	 * Past the throttle point, wait first in proportion to what this appends,
+	 * so that writers slow to the pace folds free memory, as Doltgrust
 	 * throttles writers past its delta budget.
 	 */
+	delta_throttle(edits, count);
 	pending = palloc(count * sizeof(Pending));
-	for (int attempt = 0;; attempt++)
+	for (TimestampTz said = 0;;)
 	{
 		int			made = 0;
 
@@ -671,15 +788,14 @@ dolt_delta_append(const DoltDeltaTree *key, const DoltDeltaEdit *edits, int coun
 			dsa_free(area, pending[j].version);
 			dsa_free(area, pending[j].key);
 		}
-		if (attempt >= DELTA_FULL_WAITS)
+
+		/* Only a process that cannot grow the area meets it full: no folds run there. */
+		if (!IsUnderPostmaster)
 			ereport(ERROR,
 					(errcode(ERRCODE_OUT_OF_MEMORY),
 					 errmsg("prolly delta memory is full"),
-					 errhint("Increase \"dolt_delta_memory\", or let pending changes fold into their trees.")));
-		pgstat_report_wait_start(WAIT_EVENT_PG_SLEEP);
-		pg_usleep(DELTA_FULL_NAP_US);
-		pgstat_report_wait_end();
-		CHECK_FOR_INTERRUPTS();
+					 errhint("Increase \"dolt_delta_memory\", or run dolt_fold().")));
+		delta_wait(&said);
 	}
 
 	if (!logged)
@@ -1768,7 +1884,7 @@ dolt_delta_prune_all(bool all)
  * The trees due a fold, largest first, up to |max|, into |due|: those of
  * database |db| (any, if invalid) holding at least |versions| versions, or
  * whose oldest version has waited |timeout_ms|, or any tree with versions
- * while the store holds more than half its memory. A tree a fold has written
+ * while the store holds more than half its budget. A tree a fold has written
  * but not yet pruned is not due, unless |versions| is zero, which asks for
  * every tree with versions.
  */
@@ -1783,7 +1899,7 @@ dolt_delta_due(Oid db, int versions, int timeout_ms, DoltDeltaTree *due, int max
 	uint64	   *sizes = palloc(Max(max, 1) * sizeof(uint64));
 
 	delta_attach();
-	pressed = pg_atomic_read_u64(&control->bytes) > control->area_size / 2;
+	pressed = dolt_delta_pressure() > 0.5;
 	every = trees_all(&ntrees);
 	for (int i = 0; i < ntrees; i++)
 	{
@@ -1824,26 +1940,38 @@ dolt_delta_due(Oid db, int versions, int timeout_ms, DoltDeltaTree *due, int max
 	return found;
 }
 
-/* The store's totals, for monitoring: trees, keys, versions and bytes. */
+/* How full the store is: its bytes over its budget, past 1 once it has grown. */
+double
+dolt_delta_pressure(void)
+{
+	delta_attach();
+	return (double) pg_atomic_read_u64(&control->bytes) / (double) control->budget;
+}
+
+/* The store's totals, for monitoring. */
 void
-dolt_delta_totals(uint64 *ntrees, uint64 *keys, uint64 *versions, uint64 *bytes)
+dolt_delta_totals(DoltDeltaTotals *totals)
 {
 	DeltaTree **every;
 	int			n;
 
 	delta_attach();
 	every = trees_all(&n);
-	*ntrees = *keys = *versions = 0;
+	memset(totals, 0, sizeof(*totals));
 	for (int i = 0; i < n; i++)
 	{
 		LWLockAcquire(&every[i]->lock, LW_SHARED);
 		if (every[i]->count)
-			(*ntrees)++;
-		*keys += every[i]->keys;
-		*versions += every[i]->count;
+			totals->trees++;
+		totals->keys += every[i]->keys;
+		totals->versions += every[i]->count;
 		LWLockRelease(&every[i]->lock);
 	}
-	*bytes = pg_atomic_read_u64(&control->bytes);
+	totals->bytes = pg_atomic_read_u64(&control->bytes);
+	totals->budget = control->budget;
+	totals->allocated = dsa_get_total_size(area);
+	totals->throttled_us = pg_atomic_read_u64(&control->throttled_us);
+	totals->limit_waits = pg_atomic_read_u64(&control->limit_waits);
 	pfree(every);
 }
 
@@ -2006,13 +2134,16 @@ restore_version(const DoltDeltaTree *key, const DoltDeltaEdit *edit, Transaction
 	DeltaTree  *tree = tree_find(key, true);
 	Pending		pending;
 
-	/* Free what committed folds hold before giving up: recovery has no fold workers. */
+	/*
+	 * Recovery grows the area as writers do, and is never throttled or held
+	 * to the limit: the primary already was. Free what committed folds hold
+	 * before growing, though, since recovery has no fold workers.
+	 */
 	if (!pending_make(tree, &pending, edit, topxid, xid, cid) &&
 		(dolt_delta_prune_all(false) == 0 || !pending_make(tree, &pending, edit, topxid, xid, cid)))
 		ereport(FATAL,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
-				 errmsg("prolly delta memory is full during recovery"),
-				 errhint("Increase \"dolt_delta_memory\".")));
+				 errmsg("could not allocate prolly delta store memory during recovery")));
 	versions_link(tree, edit, &pending, 1, lsn);
 	pending_release(&pending, 1);
 }

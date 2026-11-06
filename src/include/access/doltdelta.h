@@ -64,6 +64,22 @@ typedef struct DoltDeltaView
 typedef void (*DoltDeltaVisit) (void *arg, const DoltDeltaEdit *edit);
 
 extern PGDLLIMPORT int dolt_delta_memory;
+extern PGDLLIMPORT int dolt_delta_memory_limit;
+extern PGDLLIMPORT int dolt_delta_throttle;
+extern PGDLLIMPORT double dolt_delta_throttle_delay;
+
+/* The delta store's totals, for monitoring. */
+typedef struct DoltDeltaTotals
+{
+	uint64		trees;			/* with versions */
+	uint64		keys;
+	uint64		versions;
+	uint64		bytes;			/* held by keys and versions */
+	uint64		budget;			/* dolt_delta_memory */
+	uint64		allocated;		/* shared memory the store has, its budget and any growth */
+	uint64		throttled_us;	/* writers' delays while over the throttle point */
+	uint64		limit_waits;	/* appends that waited at dolt_delta_memory_limit */
+} DoltDeltaTotals;
 
 extern Size DoltDeltaShmemSize(void);
 extern void DoltDeltaShmemInit(void);
@@ -93,7 +109,8 @@ extern void dg_refold(const DoltDeltaTree *tree, const DoltDeltaHorizon *horizon
 extern uint64 dolt_delta_prune(const DoltDeltaTree *tree);
 extern uint64 dolt_delta_prune_all(bool all);
 extern int	dolt_delta_due(Oid db, int versions, int timeout_ms, DoltDeltaTree *due, int max);
-extern void dolt_delta_totals(uint64 *ntrees, uint64 *keys, uint64 *versions, uint64 *bytes);
+extern double dolt_delta_pressure(void);
+extern void dolt_delta_totals(DoltDeltaTotals *totals);
 
 /* Background folding, dg_fold.c */
 extern PGDLLIMPORT int dolt_fold_workers;

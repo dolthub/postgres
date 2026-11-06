@@ -174,6 +174,8 @@ Section: ClassName - WaitEventTimeout
 
 BASE_BACKUP_THROTTLE	"Waiting during base backup when throttling activity."
 CHECKPOINT_WRITE_DELAY	"Waiting between writes while performing a checkpoint."
+DOLT_DELTA_LIMIT	"Waiting for folds to free prolly delta store memory at <varname>dolt_delta_memory_limit</varname>."
+DOLT_DELTA_THROTTLE	"Waiting before appending prolly changes while the delta store is past its throttle point."
 PG_SLEEP	"Waiting due to a call to <function>pg_sleep</function> or a sibling function."
 RECOVERY_APPLY_DELAY	"Waiting to apply WAL during recovery because of a delay setting."
 RECOVERY_RETRIEVE_RETRY_INTERVAL	"Waiting during recovery when WAL data is not available from any source (<filename>pg_wal</filename>, archive or stream)."

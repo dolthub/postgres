@@ -3730,13 +3730,33 @@ struct config_int ConfigureNamesInt[] =
 
 	{
 		{"dolt_delta_memory", PGC_POSTMASTER, RESOURCES_MEM,
-			gettext_noop("Sets the shared memory for prolly changes not yet folded into their trees."),
-			gettext_noop("Writers fail once it is full."),
+			gettext_noop("Sets the shared memory budget for prolly changes not yet folded into their trees."),
+			gettext_noop("Past it, the store grows into dynamic shared memory while writers are slowed for folds to catch up."),
 			GUC_UNIT_KB
 		},
 		&dolt_delta_memory,
 		256 * 1024, 1024, MAX_KILOBYTES, NULL, NULL, NULL
 	},
+
+	{
+		{"dolt_delta_memory_limit", PGC_SIGHUP, RESOURCES_MEM,
+			gettext_noop("Sets the most memory the prolly delta store grows to."),
+			gettext_noop("At it, writers wait for folds to free memory. -1 sets no limit."),
+			GUC_UNIT_KB
+		},
+		&dolt_delta_memory_limit,
+		-1, -1, MAX_KILOBYTES, NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_delta_throttle", PGC_SIGHUP, RESOURCES_MEM,
+			gettext_noop("Sets the percentage of dolt_delta_memory past which writers of prolly changes are slowed."),
+			gettext_noop("100 slows them only past the budget.")
+		},
+		&dolt_delta_throttle,
+		75, 0, 100, NULL, NULL, NULL
+	},
+
 
 	{
 		{"dolt_chunk_journal_tail", PGC_POSTMASTER, RESOURCES_MEM,
@@ -4256,6 +4276,16 @@ struct config_real ConfigureNamesReal[] =
 		&phony_random_seed,
 		0.0, -1.0, 1.0,
 		check_random_seed, assign_random_seed, show_random_seed
+	},
+
+	{
+		{"dolt_delta_throttle_delay", PGC_SIGHUP, RESOURCES_MEM,
+			gettext_noop("Sets how long a writer of prolly changes waits per kilobyte it appends, with the delta store at its budget."),
+			gettext_noop("The wait grows in proportion to how far the store is past its throttle point. 0 disables throttling."),
+			GUC_UNIT_MS
+		},
+		&dolt_delta_throttle_delay,
+		0.1, 0, 1000, NULL, NULL, NULL
 	},
 
 	{

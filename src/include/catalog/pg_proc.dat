@@ -12572,8 +12572,10 @@
 { oid => '9136', descr => 'totals of the prolly delta store',
   proname => 'dolt_delta_stats', provolatile => 'v', proparallel => 'r',
   prorettype => 'record', proargtypes => '',
-  proallargtypes => '{int8,int8,int8,int8}', proargmodes => '{o,o,o,o}',
-  proargnames => '{trees,keys,versions,bytes}', prosrc => 'dolt_delta_stats' },
+  proallargtypes => '{int8,int8,int8,int8,int8,int8,float8,int8}',
+  proargmodes => '{o,o,o,o,o,o,o,o}',
+  proargnames => '{trees,keys,versions,bytes,budget,allocated,throttled_ms,limit_waits}',
+  prosrc => 'dolt_delta_stats' },
 
 
 # Internal manifest building blocks; superuser-only, not version-control commands.
