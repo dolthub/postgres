@@ -83,4 +83,20 @@ is($plans->query_safe('EXECUTE branch_plan'),'20','uncommitted root invisible');
 is($plans->query_safe('EXECUTE branch_plan'),'20','committed root outside old snapshot invisible');
 $plans->query_safe('COMMIT');is($plans->query_safe('EXECUTE branch_plan'),'21','next snapshot sees published working root');
 $writer->quit;$plans->quit;
+
+# VACUUM and ANALYZE of the physical catalogs change only pg_class statistics:
+# a session keeps its catalog view. A real change of a pg_class row's
+# definition is still seen.
+my $binder=$node->background_psql('postgres');
+$binder->query_safe('SELECT count(*) FROM versions');
+my $loads=$binder->query_safe('SELECT dolt_catalog_view_loads()');
+sql('VACUUM pg_dolt_lock; ANALYZE pg_dolt_root; VACUUM ANALYZE pg_statistic');
+$binder->query_safe('SELECT count(*) FROM versions');
+is($binder->query_safe('SELECT dolt_catalog_view_loads()'),$loads,'catalog statistics updates leave the catalog view loaded');
+sql('CREATE TABLE renamed_heap(a int) USING heap');
+$binder->query_safe('SELECT count(*) FROM renamed_heap');
+sql('ALTER TABLE renamed_heap RENAME TO renamed_heap2');
+is($binder->query_safe(q{SELECT to_regclass('renamed_heap2') IS NOT NULL, to_regclass('renamed_heap') IS NULL}),'t|t','a renamed relation is seen by its new name');
+is($binder->query_safe('SELECT count(*) FROM versions'),'1','and versioned tables still read');
+$binder->quit;sql('DROP TABLE renamed_heap2');
 $node->stop;done_testing();
