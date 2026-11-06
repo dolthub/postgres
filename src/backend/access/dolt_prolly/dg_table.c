@@ -74,6 +74,8 @@ typedef struct DGScan
 	int			bitmap_position;
 	DGCursor	bitmap_cursor;	/* the content tree, walked in handle order */
 	bool		bitmap_cursor_open;
+	uint64		bitmap_last;	/* the handle fetched last */
+	uint64		bitmap_near;	/* a gap between handles the walk steps across */
 	MemoryContext bitmap_row;	/* the row fetched last, until the next fetch */
 }			DGScan;
 
@@ -131,6 +133,7 @@ begin(Relation rel, Snapshot snap, int nkeys, ScanKey key, ParallelTableScanDesc
 	else if (!(flags & SO_TYPE_BITMAPSCAN))
 		materialize(scan);
 	scan->position = -1;
+	scan->bitmap_last = PG_UINT64_MAX;
 	MemoryContextSwitchTo(old);
 	if (flags & SO_TYPE_SEQSCAN)
 		pgstat_count_heap_scan(rel);
@@ -197,6 +200,7 @@ rescan(TableScanDesc base, ScanKey key, bool set, bool strat, bool sync, bool pa
 	scan->bitmap_count = 0;
 	scan->bitmap_position = 0;
 	scan->bitmap_cursor_open = false;
+	scan->bitmap_last = PG_UINT64_MAX;
 	scan->handle_count = scan->handle_position = 0;
 	if (scan->streaming)
 		dg_cursor_init(&scan->content, scan->state, NULL, NULL);
@@ -388,12 +392,16 @@ bitmap_next(TableScanDesc base, TupleTableSlot *slot, bool *recheck,
 			bool		found;
 
 			if (!scan->bitmap_row)
+			{
+				/* About four rows' worth of the handle space, for derived handles spread evenly. */
 				scan->bitmap_row = AllocSetContextCreate(scan->context, "prolly bitmap row", ALLOCSET_SMALL_SIZES);
+				scan->bitmap_near = 4 * (DG_DERIVED_HANDLES / Max(dg_count(scan->state), 1));
+			}
 			MemoryContextReset(scan->bitmap_row);
 
 			old = MemoryContextSwitchTo(scan->bitmap_row);
 			found = dg_handle_row_ordered(scan->state, &scan->bitmap_cursor, &scan->bitmap_cursor_open,
-										  dg_id(&tid), &digest, &row);
+										  &scan->bitmap_last, scan->bitmap_near, dg_id(&tid), &digest, &row);
 			MemoryContextSwitchTo(old);
 			if (!found)
 				continue;

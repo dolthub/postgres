@@ -873,18 +873,21 @@ dg_handle_row(DGState *s, uint64 handle, PLHash *digest, PLSlice *row)
 	return true;
 }
 
-/* Entries a walk steps through toward the next handle before it descends anew. */
-#define HANDLE_WALK_STEPS 32
+/* Entries a walk steps through toward the next handle before it searches instead. */
+#define HANDLE_WALK_STEPS 8
 
 /*
  * dg_handle_row for handles visited in ascending order, as a bitmap scan
- * visits them. Derived handles follow the content tree's key order, so
- * |cursor| stays on the tree between calls (|*open|): it steps forward to the
- * next handle's rows when they are near, and descends anew when they are not.
- * The row lives until the cursor moves.
+ * visits them. Derived handles follow the content tree's key order, so when
+ * the next handle is within |near| of the last one (|*last|), a cursor left
+ * on the tree (|*open|) steps forward to its rows. A handle farther away is
+ * searched for alone, within its bounds, and the cursor closed, so that
+ * scattered rows cost one search each, and a dense run one step each. The row
+ * lives until the next call.
  */
 bool
-dg_handle_row_ordered(DGState *s, DGCursor *cursor, bool *open, uint64 handle, PLHash *digest, PLSlice *row)
+dg_handle_row_ordered(DGState *s, DGCursor *cursor, bool *open, uint64 *last, uint64 near,
+					  uint64 handle, PLHash *digest, PLSlice *row)
 {
 	PLHash		lower,
 				upper;
@@ -893,8 +896,17 @@ dg_handle_row_ordered(DGState *s, DGCursor *cursor, bool *open, uint64 handle, P
 				hi;
 	PrefixRows	rows = {0};
 
+	bool		walk;
+
 	if (!handle_is_derived(handle))
 		return dg_handle_row(s, handle, digest, row);
+	walk = *last != PG_UINT64_MAX && handle > *last && handle - *last <= near;
+	*last = handle;
+	if (!walk)
+	{
+		*open = false;
+		return dg_handle_row(s, handle, digest, row);
+	}
 	bounded = handle_prefix_bounds(handle, &lower, &upper);
 	lo = (PLSlice) {lower.bytes, PL_HASH_SIZE};
 	hi = (PLSlice) {upper.bytes, PL_HASH_SIZE};
@@ -903,7 +915,10 @@ dg_handle_row_ordered(DGState *s, DGCursor *cursor, bool *open, uint64 handle, P
 		for (int steps = 0; cursor->valid && pl_compare(cursor->entry.key, lo) < 0 && steps < HANDLE_WALK_STEPS; steps++)
 			dg_cursor_next(cursor);
 		if (cursor->valid && pl_compare(cursor->entry.key, lo) < 0)
+		{
 			*open = false;
+			return dg_handle_row(s, handle, digest, row);
+		}
 	}
 	if (!*open)
 	{
