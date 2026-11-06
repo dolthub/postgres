@@ -126,6 +126,91 @@ key_digest(Relation index, PLSlice key, PLHash *digest)
 	return i + 2 == key.len;
 }
 
+/*
+ * The columns of an entry of |index| into |values| and |nulls|: key columns
+ * decoded from its key, and included ones from |included|, the entry's value
+ * after its count. Every key column's type must be dg_key_decodable, as
+ * canreturn reports.
+ */
+static void
+key_columns(Relation index, PLSlice key, PLSlice included, Datum *values, bool *nulls)
+{
+	size_t		i = 0;
+	StringInfoData field;
+
+	initStringInfo(&field);
+	for (int j = 0; j < index->rd_index->indnatts; j++)
+	{
+		bool		desc = (index->rd_indoption[j] & INDOPTION_DESC) != 0;
+		uint8		xor = desc ? 255 : 0;
+
+		values[j] = (Datum) 0;
+		nulls[j] = true;
+		if (j >= index->rd_index->indnkeyatts)
+		{
+			PLValue		field;
+
+			dg_check(pl_tuple_get(included, j - index->rd_index->indnkeyatts, &field));
+			if (field.present)
+			{
+				values[j] = dg_decode_value(TupleDescAttr(RelationGetDescr(index), j)->atttypid, field.bytes);
+				nulls[j] = false;
+			}
+			continue;
+		}
+		if (i >= key.len)
+			elog(ERROR, "malformed prolly index key");
+		if (key.data[i++] != 1)
+			continue;			/* a null: its tag alone */
+		resetStringInfo(&field);
+		for (;;)
+		{
+			uint8		byte;
+
+			if (i + 1 >= key.len)
+				elog(ERROR, "malformed prolly index key");
+			byte = key.data[i++] ^ xor;
+			if (byte == 0)
+			{
+				if ((key.data[i++] ^ xor) == 0)
+					break;		/* the terminator */
+			}
+			appendStringInfoChar(&field, (char) byte);
+		}
+		values[j] = dg_key_decode(TupleDescAttr(RelationGetDescr(index), j)->atttypid,
+								  (PLSlice) {(uint8 *) field.data, (size_t) field.len});
+		nulls[j] = false;
+	}
+}
+
+/*
+ * The values of |index|'s included columns in table row |row|, packed as a
+ * tuple: an entry's value after its count. Empty if it has none. Like
+ * btree's, an entry carries them so that index-only scans return them.
+ */
+static PLSlice
+index_included(Relation index, PLSlice row)
+{
+	int			nkey = index->rd_index->indnkeyatts,
+				natts = index->rd_index->indnatts;
+	PLValue    *fields;
+	uint8	   *packed,
+			   *copy;
+	size_t		length;
+
+	if (natts == nkey)
+		return (PLSlice) {NULL, 0};
+	fields = palloc0_array(PLValue, natts - nkey);
+	for (int j = nkey; j < natts; j++)
+		dg_check(pl_tuple_get(row, index->rd_index->indkey.values[j] - 1, &fields[j - nkey]));
+	dg_check(pl_tuple_pack(fields, natts - nkey, &packed, &length));
+	copy = palloc(Max(length, 1));
+	memcpy(copy, packed, length);
+	free(packed);
+	pfree(fields);
+	return (PLSlice) {copy, length};
+}
+
 /* Use the same expression evaluator as native index insertion. */
 static void
 index_values(Relation index, TupleTableSlot *slot, Datum *values, bool *nulls)
@@ -414,6 +499,7 @@ dg_index_rebuild(Relation table, Relation index)
 		StringInfoData key;
 		uint64		count = pl_read64(rows.items[i].value.data);
 		PLSlice		row = {rows.items[i].value.data + 8, rows.items[i].value.len - 8};
+		PLSlice		included;
 		uint8	   *value;
 
 		initStringInfo(&key);
@@ -424,10 +510,13 @@ dg_index_rebuild(Relation table, Relation index)
 		}
 		sorted[used].entry.key.data = (uint8 *) key.data;
 		sorted[used].entry.key.len = key.len;
-		value = palloc(8);
+		included = index_included(index, row);
+		value = palloc(8 + included.len);
 		pl_write64(value, count);
+		if (included.len)
+			memcpy(value + 8, included.data, included.len);
 		sorted[used].entry.value.data = value;
-		sorted[used].entry.value.len = 8;
+		sorted[used].entry.value.len = 8 + included.len;
 		used++;
 	}
 	qsort(sorted, used, sizeof(*sorted), compare_entries);
@@ -539,7 +628,7 @@ dg_index_apply(Relation table, PLSlice row, int64 delta, uint64 handle, CommandI
 			continue;
 		}
 		batch = dg_batch(index, cid);
-		dg_batch_index(batch, (PLSlice) {(uint8 *) key.data, key.len}, prefix, digest, delta);
+		dg_batch_index(batch, (PLSlice) {(uint8 *) key.data, key.len}, prefix, digest, index_included(index, row), delta);
 		/*
 		 * Writers of bound canonical storage may bypass the executor's index
 		 * insertion, so the AM checks their unique indexes itself.
@@ -1023,13 +1112,17 @@ beginscan(Relation rel, int nkeys, int norderbys)
 	scan->opaque = s;
 	return scan;
 }
+/*
+ * Whether an entry satisfies the scan's keys: its row in |slot|, or, with no
+ * slot, its index columns in |values| and |nulls|.
+ */
 static bool
-matches(IndexScanDesc scan, TupleTableSlot *slot)
+matches(IndexScanDesc scan, TupleTableSlot *slot, Datum *columns, bool *column_nulls)
 {
 	int			i;
 	Datum values[INDEX_MAX_KEYS];
 	bool nulls[INDEX_MAX_KEYS];
-	bool expressions = !heap_attisnull(scan->indexRelation->rd_indextuple, Anum_pg_index_indexprs, NULL);
+	bool expressions = slot && !heap_attisnull(scan->indexRelation->rd_indextuple, Anum_pg_index_indexprs, NULL);
 
 	if (expressions)
 		index_values(scan->indexRelation, slot, values, nulls);
@@ -1039,7 +1132,12 @@ matches(IndexScanDesc scan, TupleTableSlot *slot)
 		bool		null;
 		Datum		value;
 
-		if (expressions)
+		if (!slot)
+		{
+			null = column_nulls[key->sk_attno - 1];
+			value = columns[key->sk_attno - 1];
+		}
+		else if (expressions)
 		{
 			null = nulls[key->sk_attno - 1];
 			value = values[key->sk_attno - 1];
@@ -1312,6 +1410,8 @@ produce(IndexScanDesc scan)
 		PLEntry		entry;
 		PLSlice		row;
 		PLHash		digest;
+		Datum		columns[INDEX_MAX_KEYS];
+		bool		column_nulls[INDEX_MAX_KEYS];
 		HandleList	handles;
 		ItemPointerData first_tid;
 
@@ -1335,12 +1435,20 @@ produce(IndexScanDesc scan)
 			continue;
 
 		/*
-		 * The entry's row is the table's, found by the digest that ends its
-		 * key, as btree finds a heap tuple by its TID. A bitmap scan's table
-		 * scan reads the rows itself.
+		 * An index-only scan returns the key columns, decoded from the key.
+		 * Other scans' rows are the table's, found by the digest that ends
+		 * the key, as btree finds a heap tuple by its TID; a bitmap scan's
+		 * table scan reads them itself.
 		 */
 		row = (PLSlice) {NULL, 0};
-		if (!s->bitmap_table || scan->xs_want_itup)
+		if (scan->xs_want_itup)
+		{
+			key_columns(scan->indexRelation, entry.key, (PLSlice) {entry.value.data + 8, entry.value.len - 8},
+						columns, column_nulls);
+			if (!matches(scan, NULL, columns, column_nulls))
+				continue;
+		}
+		else if (!s->bitmap_table)
 		{
 			if (!row_of(s->table, digest, &row))
 				elog(ERROR, "prolly index entry names a row its table lacks");
@@ -1355,10 +1463,10 @@ produce(IndexScanDesc scan)
 			dg_tid(handles.items[0], &first_tid);
 		else
 			ItemPointerSet(&first_tid, 0, FirstOffsetNumber);
-		if (!s->bitmap_table)
+		if (row.data)
 		{
 			dg_decode(scan->heapRelation, row, &first_tid, s->slot);
-			if (!matches(scan, s->slot))
+			if (!matches(scan, s->slot, NULL, NULL))
 				continue;
 		}
 		for (int j = 0; j < handles.count; j++)
@@ -1373,13 +1481,7 @@ produce(IndexScanDesc scan)
 					dg_stash_put(RelationGetRelid(scan->heapRelation), s->table, handles.items[j], row);
 			}
 			if (scan->xs_want_itup)
-			{
-				Datum		values[INDEX_MAX_KEYS];
-				bool		nulls[INDEX_MAX_KEYS];
-
-				index_values(scan->indexRelation, s->slot, values, nulls);
-				tuple = heap_form_tuple(RelationGetDescr(scan->indexRelation), values, nulls);
-			}
+				tuple = heap_form_tuple(RelationGetDescr(scan->indexRelation), columns, column_nulls);
 			add_item(s, &tid, tuple);
 		}
 	}
@@ -1456,10 +1558,12 @@ restorepos(IndexScanDesc scan)
 
 	s->position = s->mark;
 }
+/* Key columns of decodable types come from the key, and included columns from the value. */
 static bool
 canreturn(Relation index, int attribute)
 {
-	return true;
+	return attribute > index->rd_index->indnkeyatts ||
+		dg_key_decodable(TupleDescAttr(RelationGetDescr(index), attribute - 1)->atttypid);
 }
 Datum
 dolt_prolly_index_handler(PG_FUNCTION_ARGS)

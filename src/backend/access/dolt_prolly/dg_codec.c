@@ -2182,3 +2182,81 @@ dg_key_field(Oid type, PLSlice bytes)
 		return bytes;
 	return dg_key_value(type, decode_value(type, bytes));
 }
+
+/*
+ * Whether key bytes of |type| decode back to the value, so that an
+ * index-only scan returns it from the index key alone, as btree does.
+ */
+bool
+dg_key_decodable(Oid type)
+{
+	type = getBaseType(type);
+	if (key_is_row(type))
+		return true;
+	switch (type)
+	{
+		case VARCHAROID:
+		case NAMEOID:
+		case CHAROID:
+		case UUIDOID:
+		case DATEOID:
+		case TIMEOID:
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
+		case CASHOID:
+			return true;
+	}
+	return false;
+}
+
+/* The value of |type| whose key bytes are |bytes|; dg_key_decodable(type) must hold. */
+Datum
+dg_key_decode(Oid type, PLSlice bytes)
+{
+	int64		n;
+
+	type = getBaseType(type);
+	if (key_is_row(type))
+		return decode_value(type, bytes);
+	switch (type)
+	{
+		case VARCHAROID:
+			return PointerGetDatum(cstring_to_text_with_len((const char *) bytes.data, (int) bytes.len));
+		case NAMEOID:
+			{
+				Name		name = palloc0(NAMEDATALEN);
+
+				memcpy(NameStr(*name), bytes.data, Min(bytes.len, NAMEDATALEN - 1));
+				return NameGetDatum(name);
+			}
+		case CHAROID:
+			return CharGetDatum(bytes.len ? (char) bytes.data[0] : '\0');
+		case UUIDOID:
+			{
+				pg_uuid_t  *uuid = palloc(sizeof(pg_uuid_t));
+
+				if (bytes.len != UUID_LEN)
+					elog(ERROR, "malformed uuid index key");
+				memcpy(uuid->data, bytes.data, UUID_LEN);
+				return UUIDPGetDatum(uuid);
+			}
+	}
+	if (bytes.len != 8)
+		elog(ERROR, "malformed index key");
+	n = (int64) (pl_read64(bytes.data) ^ (UINT64CONST(1) << 63));
+	switch (type)
+	{
+		case DATEOID:
+			return DateADTGetDatum((DateADT) n);
+		case TIMEOID:
+			return TimeADTGetDatum((TimeADT) n);
+		case TIMESTAMPOID:
+			return TimestampGetDatum((Timestamp) n);
+		case TIMESTAMPTZOID:
+			return TimestampTzGetDatum((TimestampTz) n);
+		case CASHOID:
+			return CashGetDatum((Cash) n);
+	}
+	elog(ERROR, "index keys of type %u do not decode", type);
+	pg_unreachable();
+}

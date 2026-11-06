@@ -104,6 +104,23 @@ sql(q{CREATE INDEX t_k_v ON t(k) INCLUDE (v)});
 is(plan_of(q{SELECT v FROM t WHERE k = 3}), 'Index Only Scan', 'included column makes the query covering');
 is(sql(q{SELECT string_agg(v, ',' ORDER BY v) FROM t WHERE k = 3}), sql(q{SET enable_indexonlyscan=off; SET enable_indexscan=off; SET enable_bitmapscan=off; SELECT string_agg(v, ',' ORDER BY v) FROM t WHERE k = 3}), 'included column values match');
 
+
+# An index-only scan decodes key columns from the entry's key, without the
+# table's rows, for every type whose key bytes decode; others read the table.
+sql(q{CREATE TABLE typed(id int PRIMARY KEY, b bigint, s text, vc varchar(20), ts timestamptz, d date, u uuid, f float8, pad text);
+INSERT INTO typed SELECT g, g * 1000000000::bigint, 's' || g, 'vc' || g, timestamptz '2026-01-01 00:00+00' + g * interval '1 minute',
+	date '2026-01-01' + g, md5(g::text)::uuid, g / 3.0, repeat('p', 200) FROM generate_series(1, 2000) g;
+CREATE INDEX typed_keys ON typed(b, s DESC, vc, ts, d, u); CREATE INDEX typed_f ON typed(f)});
+my $covered = q{SELECT string_agg(b || s || vc || ts || d || u, ',' ORDER BY b) FROM typed WHERE b BETWEEN 5000000000 AND 900000000000};
+is(plan_of($covered), 'Index Only Scan', 'decodable key columns make a query covering');
+is(sql($covered), sql("SET enable_indexonlyscan=off; SET enable_indexscan=off; SET enable_bitmapscan=off; $covered"),
+	'and decode to the values the table holds, ascending or descending');
+is(plan_of(q{SELECT f FROM typed WHERE f > 100}) eq 'Index Only Scan' ? 'covering' : 'not covering', 'not covering',
+	'a key column whose bytes do not decode reads the table');
+my $only = nodes_read(q{SELECT count(b) FROM typed WHERE b > 0});
+my $fetching = nodes_read(q{SET enable_indexonlyscan=off; SELECT count(pad) FROM typed WHERE b > 0});
+cmp_ok($only * 2, '<', $fetching, "an index-only scan reads the index alone ($only nodes, $fetching with the table)");
+
 # Another branch with the same relation and different rows is fetched correctly.
 sql(q{SELECT dolt_commit('-Am', 'base'); SELECT dolt_branch('other')});
 sql(q{SELECT dolt_checkout('other'); UPDATE t SET v = 'branched' WHERE k = 7});

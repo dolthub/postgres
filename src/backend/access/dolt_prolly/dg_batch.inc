@@ -26,11 +26,15 @@ typedef struct PendingHandle
 	bool		present;
 } PendingHandle;
 
-/* An index entry: its key, as index_entry encodes it, ending in its row's digest. */
+/*
+ * An index entry: its key, as index_entry encodes it, ending in its row's
+ * digest, and its included columns, if the index has any.
+ */
 typedef struct PendingEntry
 {
 	PLSlice		key;
 	PLHash		digest;			/* of the row, as the key's escaped tail encodes */
+	PLSlice		included;
 	int64		delta;
 } PendingEntry;
 
@@ -178,8 +182,8 @@ batch_flush_index(DGBatch *b)
 			elog(ERROR, "prolly index is missing an entry");
 		edits[n].key = entry->key.data;
 		edits[n].keylen = entry->key.len;
-		edits[n].row = NULL;
-		edits[n].rowlen = 0;
+		edits[n].row = entry->included.data;
+		edits[n].rowlen = entry->included.len;
 		edits[n].delta = delta;
 		n++;
 	}
@@ -657,9 +661,12 @@ dg_batch_remove(DGBatch *b, PLSlice row, uint64 handle)
 	MemoryContextSwitchTo(old);
 }
 
-/* Record an index entry |key| for the row with |digest|, added (delta 1) or removed (-1). */
+/*
+ * Record an index entry |key| for the row with |digest|, with its |included|
+ * columns, added (delta 1) or removed (-1).
+ */
 void
-dg_batch_index(DGBatch *b, PLSlice key, size_t prefix, PLHash digest, int64 delta)
+dg_batch_index(DGBatch *b, PLSlice key, size_t prefix, PLHash digest, PLSlice included, int64 delta)
 {
 	MemoryContext old = MemoryContextSwitchTo(b->memory);
 	PendingEntry *entry;
@@ -678,6 +685,7 @@ dg_batch_index(DGBatch *b, PLSlice key, size_t prefix, PLHash digest, int64 delt
 	b->entries[b->entry_count++] = entry;
 	entry->key = slice_copy(key);
 	entry->digest = digest;
+	entry->included = slice_copy(included);
 	entry->delta = delta;
 	group = hash_search(b->prefixes, &hash, HASH_ENTER, &found);
 	if (!found)
