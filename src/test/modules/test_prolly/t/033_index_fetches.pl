@@ -27,6 +27,30 @@ $seq = sql(q{SET enable_indexscan=off; SET enable_bitmapscan=off; SELECT string_
 is(idx(q{SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t WHERE k = 7}), $seq, 'index scan sees updates and deletes');
 is(bitmap(q{SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t WHERE k = 7}), $seq, 'bitmap scan sees updates and deletes');
 like($seq, qr/^7:v7!,/, 'the updated rows are in the answer');
+# An index entry holds its key and the row's digest, which names the row in
+# the table, not the row: wide rows reach the WAL once, however many indexes
+# they have, and index scans read them from the table.
+sql(q{CREATE TABLE wide_rows(id int PRIMARY KEY, k int, v text); CREATE INDEX wide_rows_k ON wide_rows(k)});
+my $lsn = sql('SELECT pg_current_wal_insert_lsn()');
+sql(q{INSERT INTO wide_rows SELECT g, g % 10, (SELECT string_agg(md5(g::text || i::text), '') FROM generate_series(1, 125) i) FROM generate_series(1, 200) g});
+my $wal = sql("SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(), '$lsn')");
+cmp_ok($wal, '<', 200 * 4000 * 1.5, "200 rows of 4,000 bytes under two indexes log $wal bytes of WAL");
+is(idx(q{SELECT count(*), sum(length(v)) FROM wide_rows WHERE k = 3}), '20|80000', 'an index scan reads the rows from the table');
+is(bitmap(q{SELECT count(*), sum(length(v)) FROM wide_rows WHERE k = 3}), '20|80000', 'and so does a bitmap scan');
+sql('SELECT dolt_fold()');
+is(idx(q{SELECT count(*), sum(length(v)) FROM wide_rows WHERE k = 3}), '20|80000', 'and after a fold');
+# A bitmap scan fetches rows walking the table in handle order: dense
+# bitmaps step through it, sparse ones descend to each row, and either finds
+# duplicate rows' allocated handles and changes not folded yet.
+sql(q{CREATE TABLE walked(k int, v text); CREATE INDEX walked_k ON walked(k);
+INSERT INTO walked SELECT g % 100, 'w' || (g % 3000) FROM generate_series(1, 6000) g});
+sql('SELECT dolt_fold()');
+sql(q{UPDATE walked SET v = v || '+' WHERE k % 7 = 0; INSERT INTO walked SELECT 5, 'new' || g FROM generate_series(1, 50) g});
+my $walk = q{SELECT count(*), count(DISTINCT v), string_agg(v, ',' ORDER BY v) FROM walked WHERE k };
+for my $cond ('< 90', 'IN (3, 77)', '= 5', '>= 0')
+{
+	is(bitmap("$walk $cond"), sql("SET enable_indexscan=off; SET enable_bitmapscan=off; $walk $cond"), "a bitmap scan of k $cond finds every row");
+}
 is(idx(q{BEGIN; UPDATE t SET v = 'pending' WHERE id = 57; SELECT v FROM t WHERE k = 7 AND id = 57; ROLLBACK}), 'pending', 'index fetch in the writing transaction sees its pending version');
 is(idx(q{SELECT v FROM t WHERE k = 7 AND id = 57}), 'v57!', 'and the rolled back version is gone');
 
@@ -91,6 +115,23 @@ $other->quit;
 sql(q{CREATE INDEX t_k_v ON t(k) INCLUDE (v)});
 is(plan_of(q{SELECT v FROM t WHERE k = 3}), 'Index Only Scan', 'included column makes the query covering');
 is(sql(q{SELECT string_agg(v, ',' ORDER BY v) FROM t WHERE k = 3}), sql(q{SET enable_indexonlyscan=off; SET enable_indexscan=off; SET enable_bitmapscan=off; SELECT string_agg(v, ',' ORDER BY v) FROM t WHERE k = 3}), 'included column values match');
+
+
+# An index-only scan decodes key columns from the entry's key, without the
+# table's rows, for every type whose key bytes decode; others read the table.
+sql(q{CREATE TABLE typed(id int PRIMARY KEY, b bigint, s text, vc varchar(20), ts timestamptz, d date, u uuid, f float8, pad text);
+INSERT INTO typed SELECT g, g * 1000000000::bigint, 's' || g, 'vc' || g, timestamptz '2026-01-01 00:00+00' + g * interval '1 minute',
+	date '2026-01-01' + g, md5(g::text)::uuid, g / 3.0, repeat('p', 200) FROM generate_series(1, 2000) g;
+CREATE INDEX typed_keys ON typed(b, s DESC, vc, ts, d, u); CREATE INDEX typed_f ON typed(f)});
+my $covered = q{SELECT string_agg(b || s || vc || ts || d || u, ',' ORDER BY b) FROM typed WHERE b BETWEEN 5000000000 AND 900000000000};
+is(plan_of($covered), 'Index Only Scan', 'decodable key columns make a query covering');
+is(sql($covered), sql("SET enable_indexonlyscan=off; SET enable_indexscan=off; SET enable_bitmapscan=off; $covered"),
+	'and decode to the values the table holds, ascending or descending');
+is(plan_of(q{SELECT f FROM typed WHERE f > 100}) eq 'Index Only Scan' ? 'covering' : 'not covering', 'not covering',
+	'a key column whose bytes do not decode reads the table');
+my $only = nodes_read(q{SELECT count(b) FROM typed WHERE b > 0});
+my $fetching = nodes_read(q{SET enable_indexonlyscan=off; SELECT count(pad) FROM typed WHERE b > 0});
+cmp_ok($only * 2, '<', $fetching, "an index-only scan reads the index alone ($only nodes, $fetching with the table)");
 
 # Another branch with the same relation and different rows is fetched correctly.
 sql(q{SELECT dolt_commit('-Am', 'base'); SELECT dolt_branch('other')});

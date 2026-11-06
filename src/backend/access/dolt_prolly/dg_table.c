@@ -72,6 +72,11 @@ typedef struct DGScan
 	OffsetNumber bitmap_offsets[TBM_MAX_TUPLES_PER_PAGE];
 	int			bitmap_count;
 	int			bitmap_position;
+	DGCursor	bitmap_cursor;	/* the content tree, walked in handle order */
+	bool		bitmap_cursor_open;
+	uint64		bitmap_last;	/* the handle fetched last */
+	uint64		bitmap_near;	/* a gap between handles the walk steps across */
+	MemoryContext bitmap_row;	/* the row fetched last, until the next fetch */
 }			DGScan;
 
 PLHash
@@ -128,6 +133,7 @@ begin(Relation rel, Snapshot snap, int nkeys, ScanKey key, ParallelTableScanDesc
 	else if (!(flags & SO_TYPE_BITMAPSCAN))
 		materialize(scan);
 	scan->position = -1;
+	scan->bitmap_last = PG_UINT64_MAX;
 	MemoryContextSwitchTo(old);
 	if (flags & SO_TYPE_SEQSCAN)
 		pgstat_count_heap_scan(rel);
@@ -193,6 +199,8 @@ rescan(TableScanDesc base, ScanKey key, bool set, bool strat, bool sync, bool pa
 	scan->position = -1;
 	scan->bitmap_count = 0;
 	scan->bitmap_position = 0;
+	scan->bitmap_cursor_open = false;
+	scan->bitmap_last = PG_UINT64_MAX;
 	scan->handle_count = scan->handle_position = 0;
 	if (scan->streaming)
 		dg_cursor_init(&scan->content, scan->state, NULL, NULL);
@@ -373,9 +381,31 @@ bitmap_next(TableScanDesc base, TupleTableSlot *slot, bool *recheck,
 			dg_decode(base->rs_rd, row, &tid, slot);
 			return true;
 		}
-		if (!dg_handle_digest(scan->state, dg_id(&tid), &digest))
-			continue;
-		row = row_for_handle(scan->state, (PLSlice) {digest.bytes, PL_HASH_SIZE});
+		if (CatalogViewIsProvisional(base->rs_rd->rd_catalogview))
+		{
+			if (!dg_handle_row(scan->state, dg_id(&tid), &digest, &row))
+				continue;
+		}
+		else
+		{
+			MemoryContext old;
+			bool		found;
+
+			if (!scan->bitmap_row)
+			{
+				/* About four rows' worth of the handle space, for derived handles spread evenly. */
+				scan->bitmap_row = AllocSetContextCreate(scan->context, "prolly bitmap row", ALLOCSET_SMALL_SIZES);
+				scan->bitmap_near = 4 * (DG_DERIVED_HANDLES / Max(dg_count(scan->state), 1));
+			}
+			MemoryContextReset(scan->bitmap_row);
+
+			old = MemoryContextSwitchTo(scan->bitmap_row);
+			found = dg_handle_row_ordered(scan->state, &scan->bitmap_cursor, &scan->bitmap_cursor_open,
+										  &scan->bitmap_last, scan->bitmap_near, dg_id(&tid), &digest, &row);
+			MemoryContextSwitchTo(old);
+			if (!found)
+				continue;
+		}
 		if (CatalogViewIsProvisional(base->rs_rd->rd_catalogview))
 			dg_decode_mutation(base->rs_rd, row, &tid, slot);
 		else
@@ -412,13 +442,17 @@ fetch(Relation rel, ItemPointer tid, Snapshot snap, TupleTableSlot *slot)
 		return true;
 	}
 	s = CatalogViewIsProvisional(rel->rd_catalogview) ? dg_catalog_mutation_load(rel, snap) : dg_load(rel, snap);
-	if (!dg_handle_digest(s, dg_id(tid), &digest))
 	{
-		release_state(rel, s);
-		ExecClearTuple(slot);
-		return false;
+		PLSlice		row;
+
+		if (!dg_handle_row(s, dg_id(tid), &digest, &row))
+		{
+			release_state(rel, s);
+			ExecClearTuple(slot);
+			return false;
+		}
+		dg_decode(rel, row, tid, slot);
 	}
-	dg_decode(rel, row_for_handle(s, (PLSlice) {digest.bytes, PL_HASH_SIZE}), tid, slot);
 	release_state(rel, s);
 	return true;
 }
@@ -577,12 +611,11 @@ fetch_index(IndexFetchTableData *base, ItemPointer tid, Snapshot snap, TupleTabl
 	{
 		PLHash		digest;
 
-		if (!dg_handle_digest(f->state, dg_id(tid), &digest))
+		if (!dg_handle_row(f->state, dg_id(tid), &digest, &row))
 		{
 			ExecClearTuple(slot);
 			return false;
 		}
-		row = row_for_handle(f->state, (PLSlice) {digest.bytes, PL_HASH_SIZE});
 	}
 	dg_decode(rel, row, tid, slot);
 
