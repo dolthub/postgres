@@ -755,13 +755,25 @@ collect_prefix_row(void *arg, PLSlice key, PLSlice value)
 		return PL_STOP;
 	memcpy(rows->digests[rows->count].bytes, key.data, PL_HASH_SIZE);
 	rows->counts[rows->count] = value.len >= 8 ? (int64) pl_read64(value.data) : 0;
+	if (rows->want_rows)
+	{
+		size_t		len = value.len >= 8 ? value.len - 8 : 0;
+		uint8	   *copy = palloc(Max(len, 1));
+
+		if (len)
+			memcpy(copy, value.data + 8, len);
+		rows->rows[rows->count] = (PLSlice) {copy, len};
+	}
 	rows->count++;
 	return PL_OK;
 }
 
-/* The rows of |tree| whose digests derive |handle|: rarely more than one. */
+/*
+ * The rows of |tree| whose digests derive |handle|: rarely more than one.
+ * With |want_rows|, their contents too.
+ */
 static PrefixRows
-prefix_rows(DGState *s, uint64 handle)
+prefix_rows_with(DGState *s, uint64 handle, bool want_rows)
 {
 	PrefixRows	rows = {0};
 	PLHash		lower,
@@ -770,8 +782,15 @@ prefix_rows(DGState *s, uint64 handle)
 	PLSlice		lo = {lower.bytes, PL_HASH_SIZE},
 				hi = {upper.bytes, PL_HASH_SIZE};
 
+	rows.want_rows = want_rows;
 	dg_scan(s, &lo, bounded ? &hi : NULL, collect_prefix_row, &rows);
 	return rows;
+}
+
+static PrefixRows
+prefix_rows(DGState *s, uint64 handle)
+{
+	return prefix_rows_with(s, handle, false);
 }
 
 /* The digest row |handle| names in |s|, if the row is live there. */
@@ -812,6 +831,102 @@ dg_handle_digest(DGState *s, uint64 handle, PLHash *digest)
 		if (rows.counts[i] - n >= 1)
 		{
 			*digest = rows.digests[i];
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * The digest and the row |handle| names in |s|, if the row is live there: for
+ * a derived handle, the one search that finds the digest also reads the row.
+ * The row may live only until the state's next lookup.
+ */
+bool
+dg_handle_row(DGState *s, uint64 handle, PLHash *digest, PLSlice *row)
+{
+	PrefixRows	rows;
+	PLValue		value;
+
+	if (handle_is_derived(handle))
+	{
+		rows = prefix_rows_with(s, handle, true);
+		for (int i = 0; i < rows.count; i++)
+		{
+			uint64	   *allocated;
+			int			n = delta_handles(s, rows.digests[i], &allocated);
+
+			if (rows.counts[i] - n >= 1)
+			{
+				*digest = rows.digests[i];
+				*row = rows.rows[i];
+				return true;
+			}
+		}
+		return false;
+	}
+	if (!dg_handle_digest(s, handle, digest))
+		return false;
+	if (!dg_get(s, (PLSlice) {digest->bytes, PL_HASH_SIZE}, &value) || value.bytes.len < 8)
+		elog(ERROR, "missing canonical row contents");
+	*row = (PLSlice) {value.bytes.data + 8, value.bytes.len - 8};
+	return true;
+}
+
+/* Entries a walk steps through toward the next handle before it descends anew. */
+#define HANDLE_WALK_STEPS 32
+
+/*
+ * dg_handle_row for handles visited in ascending order, as a bitmap scan
+ * visits them. Derived handles follow the content tree's key order, so
+ * |cursor| stays on the tree between calls (|*open|): it steps forward to the
+ * next handle's rows when they are near, and descends anew when they are not.
+ * The row lives until the cursor moves.
+ */
+bool
+dg_handle_row_ordered(DGState *s, DGCursor *cursor, bool *open, uint64 handle, PLHash *digest, PLSlice *row)
+{
+	PLHash		lower,
+				upper;
+	bool		bounded;
+	PLSlice		lo,
+				hi;
+	PrefixRows	rows = {0};
+
+	if (!handle_is_derived(handle))
+		return dg_handle_row(s, handle, digest, row);
+	bounded = handle_prefix_bounds(handle, &lower, &upper);
+	lo = (PLSlice) {lower.bytes, PL_HASH_SIZE};
+	hi = (PLSlice) {upper.bytes, PL_HASH_SIZE};
+	if (*open)
+	{
+		for (int steps = 0; cursor->valid && pl_compare(cursor->entry.key, lo) < 0 && steps < HANDLE_WALK_STEPS; steps++)
+			dg_cursor_next(cursor);
+		if (cursor->valid && pl_compare(cursor->entry.key, lo) < 0)
+			*open = false;
+	}
+	if (!*open)
+	{
+		dg_cursor_init(cursor, s, &lo, NULL);
+		*open = true;
+	}
+	rows.want_rows = true;
+	while (cursor->valid && (!bounded || pl_compare(cursor->entry.key, hi) < 0) &&
+		   rows.count < lengthof(rows.digests))
+	{
+		if (pl_compare(cursor->entry.key, lo) >= 0)
+			(void) collect_prefix_row(&rows, cursor->entry.key, cursor->entry.value);
+		dg_cursor_next(cursor);
+	}
+	for (int i = 0; i < rows.count; i++)
+	{
+		uint64	   *allocated;
+		int			n = delta_handles(s, rows.digests[i], &allocated);
+
+		if (rows.counts[i] - n >= 1)
+		{
+			*digest = rows.digests[i];
+			*row = rows.rows[i];
 			return true;
 		}
 	}

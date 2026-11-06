@@ -917,6 +917,8 @@ typedef struct PrefixRows
 {
 	PLHash		digests[8];
 	int64		counts[8];
+	PLSlice		rows[8];		/* copies, if the search wants them */
+	bool		want_rows;
 	int			count;
 } PrefixRows;
 static PrefixRows prefix_rows(DGState *s, uint64 handle);

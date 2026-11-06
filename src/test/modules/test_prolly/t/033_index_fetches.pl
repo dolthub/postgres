@@ -39,6 +39,18 @@ is(idx(q{SELECT count(*), sum(length(v)) FROM wide_rows WHERE k = 3}), '20|80000
 is(bitmap(q{SELECT count(*), sum(length(v)) FROM wide_rows WHERE k = 3}), '20|80000', 'and so does a bitmap scan');
 sql('SELECT dolt_fold()');
 is(idx(q{SELECT count(*), sum(length(v)) FROM wide_rows WHERE k = 3}), '20|80000', 'and after a fold');
+# A bitmap scan fetches rows walking the table in handle order: dense
+# bitmaps step through it, sparse ones descend to each row, and either finds
+# duplicate rows' allocated handles and changes not folded yet.
+sql(q{CREATE TABLE walked(k int, v text); CREATE INDEX walked_k ON walked(k);
+INSERT INTO walked SELECT g % 100, 'w' || (g % 3000) FROM generate_series(1, 6000) g});
+sql('SELECT dolt_fold()');
+sql(q{UPDATE walked SET v = v || '+' WHERE k % 7 = 0; INSERT INTO walked SELECT 5, 'new' || g FROM generate_series(1, 50) g});
+my $walk = q{SELECT count(*), count(DISTINCT v), string_agg(v, ',' ORDER BY v) FROM walked WHERE k };
+for my $cond ('< 90', 'IN (3, 77)', '= 5', '>= 0')
+{
+	is(bitmap("$walk $cond"), sql("SET enable_indexscan=off; SET enable_bitmapscan=off; $walk $cond"), "a bitmap scan of k $cond finds every row");
+}
 is(idx(q{BEGIN; UPDATE t SET v = 'pending' WHERE id = 57; SELECT v FROM t WHERE k = 7 AND id = 57; ROLLBACK}), 'pending', 'index fetch in the writing transaction sees its pending version');
 is(idx(q{SELECT v FROM t WHERE k = 7 AND id = 57}), 'v57!', 'and the rolled back version is gone');
 

@@ -223,6 +223,8 @@ extern void dg_note_created(Relation rel, const char *branch, uint64 handle);
 extern bool dg_row_created(Relation rel, const char *branch, uint64 handle);
 extern bool dg_row_committed(Relation rel, uint64 handle);
 extern bool dg_handle_digest(DGState *s, uint64 handle, PLHash *digest);
+extern bool dg_handle_row(DGState *s, uint64 handle, PLHash *digest, PLSlice *row);
+extern bool dg_handle_row_ordered(DGState *s, DGCursor *cursor, bool *open, uint64 handle, PLHash *digest, PLSlice *row);
 extern int	dg_handles_of(DGState *s, PLHash digest, int64 count, uint64 **handles, int *capacity);
 extern double dg_handle_count(DGState *s);
 extern uint64 dg_handle_choose(Relation rel, DGState *s, DGBatch *b, PLHash digest);
