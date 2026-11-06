@@ -366,6 +366,8 @@ tree_find(const DoltDeltaTree *key, bool create)
 			tree->fold = InvalidTransactionId;
 			memset(&tree->folded, 0, sizeof(tree->folded));
 			tree->folded_xip = InvalidDsaPointer;
+			tree->settle_queue = InvalidDsaPointer;
+			tree->settle_queued = 0;
 			pg_prng_seed(&tree->heights, hash);
 		}
 	}
