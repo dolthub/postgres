@@ -121,6 +121,32 @@ is(sql(q{SELECT dolt_checkout('old'); SELECT count(*), sum(length(v)) FROM t}),
 	qq{(0,"Switched to branch 'old'")\n20000|1920000}, 'an old branch reads its own table');
 $expected = sql($count);
 
+# dolt_fold_cache decides what a fold leaves in the cache: by default
+# (replace) the nodes it writes, demoting the nodes of the base it reads, which
+# those replace; with add, both; with cold, both, but unused; with none,
+# nothing, so readers of the new trees read them from the chunk store.
+my $added = q{SELECT added FROM dolt_node_cache_stats()};
+for my $mode ('replace', 'add', 'cold', 'none')
+{
+	sql(qq{UPDATE t SET v = 'fold $mode' WHERE id % 400 = 0});
+	my $before = sql($added);
+	sql(qq{SET dolt_fold_cache = $mode; SELECT dolt_fold()});
+	my $fold_added = sql($added) - $before;
+	if ($mode eq 'none')
+	{
+		is($fold_added, 0, 'a fold with dolt_fold_cache = none adds nothing to the cache');
+		my ($from_store) = reads(qq{SELECT count(*) FROM t WHERE v = 'fold $mode'});
+		cmp_ok($from_store, '>', 0, "and a reader of its tree reads the new nodes from the chunk store ($from_store)");
+	}
+	else
+	{
+		cmp_ok($fold_added, '>', 0, "a fold with dolt_fold_cache = $mode adds the nodes it writes ($fold_added)");
+	}
+	is(sql(qq{SELECT count(*) FROM t WHERE v = 'fold $mode'}), 50, "and its tree reads right ($mode)");
+}
+
+$expected = sql($count);
+
 # A cache too small for the table evicts as it goes, and stays within its size.
 fold();
 $node->append_conf('postgresql.conf', "dolt_node_cache_size=1MB\n");

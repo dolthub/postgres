@@ -619,6 +619,51 @@ persist_roots(const Roots *roots)
 /* The most nodes a fold's store held at once, for its log line. */
 static size_t fold_peak;
 
+/* A fold's use of the shared node cache, as dolt_fold_cache sets it. */
+static const uint8 *
+fold_cache_get(const uint8 *hash, Size *length)
+{
+	return dolt_node_cache_lookup(hash, length,
+								  dolt_fold_cache == DOLT_FOLD_CACHE_ADD ? DOLT_NODE_TOUCH :
+								  dolt_fold_cache == DOLT_FOLD_CACHE_REPLACE ? DOLT_NODE_DEMOTE : DOLT_NODE_LEAVE);
+}
+
+static void
+fold_cache_add(const uint8 *hash, const uint8 *data, Size length)
+{
+	if (dolt_fold_cache != DOLT_FOLD_CACHE_NONE)
+		dolt_node_cache_insert(hash, data, length, dolt_fold_cache == DOLT_FOLD_CACHE_COLD);
+}
+
+/*
+ * A base node a fold read on a miss: under replace, it is not added, since the
+ * fold's tree replaces it.
+ */
+static void
+fold_cache_add_read(const uint8 *hash, const uint8 *data, Size length)
+{
+	if (dolt_fold_cache != DOLT_FOLD_CACHE_REPLACE)
+		fold_cache_add(hash, data, length);
+}
+
+/* Read node |hash| for a fold, through the cache as dolt_fold_cache says. */
+static PLStatus
+fold_fetch_node(void *arg, PLHash hash, PLSlice *bytes)
+{
+	Size		length;
+	const uint8 *cached = fold_cache_get(hash.bytes, &length);
+
+	if (cached)
+	{
+		bytes->data = cached;
+		bytes->len = length;
+		return PL_OK;
+	}
+	fetch_chunk(arg, hash, bytes);
+	fold_cache_add_read(hash.bytes, bytes->data, bytes->len);
+	return PL_OK;
+}
+
 static void
 fold_flush(PLStore *store)
 {
@@ -640,7 +685,7 @@ fold_flush(PLStore *store)
 	}
 	for (int i = 0; i < pending.count; i++)
 	{
-		dolt_node_cache_add(pending.nodes[i]->hash.bytes, pending.nodes[i]->data, pending.nodes[i]->size);
+		fold_cache_add(pending.nodes[i]->hash.bytes, pending.nodes[i]->data, pending.nodes[i]->size);
 		pl_node_set_backed(pending.nodes[i]);
 	}
 	fold_peak = Max(fold_peak, pl_store_stats(store).chunks);
@@ -660,6 +705,7 @@ dg_storage_fold_root(DGState *s, bool unlogged)
 	PLStore    *store = dg_private_store();
 	PLHash		root;
 
+	pl_store_set_fetch(store, fold_fetch_node, NULL);
 	fold_peak = 0;
 	unlogged_puts = unlogged;
 	PG_TRY();
@@ -692,7 +738,7 @@ static PLStatus
 refold_fetch(void *arg, PLHash hash, PLSlice *bytes)
 {
 	Size		length;
-	const uint8 *cached = dolt_node_cache_get(hash.bytes, &length);
+	const uint8 *cached = fold_cache_get(hash.bytes, &length);
 
 	if (cached)
 	{
@@ -708,7 +754,7 @@ refold_fetch(void *arg, PLHash hash, PLSlice *bytes)
 				 errmsg("prolly chunk is missing from the chunk store")));
 	bytes->data = refold_fetched.data;
 	bytes->len = refold_fetched.length;
-	dolt_node_cache_add(hash.bytes, bytes->data, bytes->len);
+	fold_cache_add_read(hash.bytes, bytes->data, bytes->len);
 	return PL_OK;
 }
 
@@ -730,7 +776,7 @@ refold_flush(PLStore *store)
 		memcpy(hashes + (Size) n * DOLT_CHUNK_HASH_SIZE, node->hash.bytes, DOLT_CHUNK_HASH_SIZE);
 		data[n] = node->data;
 		lengths[n++] = node->size;
-		dolt_node_cache_add(node->hash.bytes, node->data, node->size);
+		fold_cache_add(node->hash.bytes, node->data, node->size);
 	}
 	if (n)
 		dolt_chunk_put_many(refold_chunks, n, hashes, data, lengths);

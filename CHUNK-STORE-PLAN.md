@@ -291,6 +291,23 @@ transaction: 33 KB of row edits and 8 KB of lock records
 - Restartpoints fsync the journal, so a standby rebuilds only what it had not
   made durable.
 
+Fold cache policy (2026-11-06, branch `zachmu/fold-cache-policy`):
+`dolt_fold_cache` (developer, default `replace`) decides what a fold does to
+the shared node cache. Under `replace`, a fold adds the nodes it writes and
+demotes to unused the nodes of the base it reads, since its tree replaces
+them. TPC-C at 10 threads, one run each:
+
+| policy | tps | node cache misses |
+|---|---|---|
+| `add` (previous) | 687–699 | 9.4% |
+| `cold` (fold output added unused) | 674 | 9.9% |
+| `none` (folds only read the cache) | 541 | 26.8% |
+| `replace` | 779 | 3.5% |
+| `replace`, folds paced at 30 s | 863 | 2.4% |
+
+At one thread, `replace` went from 215 to 333 tps. `none` is worst: readers
+need the new trees at once.
+
 A deliberately mismatched root is not tested yet: no test can forge a FOLD
 record. Step 4 (unlogged captures) is deferred, since commits are rare in the
 benchmarks.

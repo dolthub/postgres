@@ -100,6 +100,17 @@ extern PGDLLIMPORT int dolt_fold_workers;
 extern PGDLLIMPORT int dolt_fold_versions;
 extern PGDLLIMPORT int dolt_fold_batch;
 extern PGDLLIMPORT bool dolt_unlogged_folds;
+
+/* What a fold does with the shared node cache (dolt_fold_cache). */
+typedef enum DoltFoldCache
+{
+	DOLT_FOLD_CACHE_ADD,		/* adds the nodes it reads and writes, and uses those it finds */
+	DOLT_FOLD_CACHE_COLD,		/* adds them unused, and leaves those it finds as they were */
+	DOLT_FOLD_CACHE_NONE,		/* only reads the cache, leaving it as it was */
+	DOLT_FOLD_CACHE_REPLACE,	/* adds what it writes, and demotes the base's nodes it reads */
+} DoltFoldCache;
+
+extern PGDLLIMPORT int dolt_fold_cache;
 extern PGDLLIMPORT int dolt_fold_timeout;
 
 extern void DoltFoldLauncherRegister(void);
