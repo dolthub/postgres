@@ -754,8 +754,9 @@ revision_selected:
 binding_done:
 		if (cacheable)
 		{
+			char	   *key = bind_cache_key(rv, rte, revision, resolution_path, user, target);
 			MemoryContext old = MemoryContextSwitchTo(CacheMemoryContext);
-			BindCacheEntry *entry = bind_cache_find(bind_cache_key(rv, rte, revision, resolution_path, user, target), true);
+			BindCacheEntry *entry = bind_cache_find(key, true);
 
 			if (entry->desc)
 			{
