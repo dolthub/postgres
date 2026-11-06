@@ -147,8 +147,11 @@
 #logical_decoding_work_mem = 64MB	# min 64kB
 #dolt_node_cache_size = 1GB		# prolly nodes shared by sessions, 0 disables
 					# (change requires restart)
-#dolt_delta_memory = 256MB		# prolly changes not yet folded into trees
+#dolt_delta_memory = 256MB		# budget for prolly changes not yet folded into trees
 					# (change requires restart)
+#dolt_delta_memory_limit = -1		# most the delta store grows to; -1 is no limit
+#dolt_delta_throttle = 75		# percent of the budget past which writers slow
+#dolt_delta_throttle_delay = 0.1ms	# writer wait per kB appended at the budget
 #dolt_chunk_journal_tail = 131072	# recent prolly chunks indexed in shared memory
 					# (change requires restart)
 #dolt_fold_workers = 2			# workers folding prolly changes into trees

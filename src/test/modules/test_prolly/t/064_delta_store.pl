@@ -218,6 +218,59 @@ ok($busy->poll_query_until('postgres', q{SELECT versions = 0 FROM dolt_delta_sta
 	'the workers fold and prune after a rolled back install');
 is($busy->safe_psql('postgres', q{SET enable_seqscan = off; SELECT v FROM b WHERE id = 1}), '-1',
 	'without losing the change it held');
+
+# Past half the budget, one database's trees fold in parallel.
+$busy->safe_psql('postgres', q{CREATE TABLE p1(id int PRIMARY KEY, v text); CREATE TABLE p2(id int PRIMARY KEY, v text);
+CREATE TABLE p3(id int PRIMARY KEY, v text)});
+$busy->safe_psql('postgres', q{BEGIN;
+INSERT INTO p1 SELECT i, repeat('p', 40) FROM generate_series(1, 20000) i;
+INSERT INTO p2 SELECT i, repeat('p', 40) FROM generate_series(1, 20000) i;
+INSERT INTO p3 SELECT i, repeat('p', 40) FROM generate_series(1, 20000) i;
+COMMIT});
+ok($busy->poll_query_until('postgres',
+	q{SELECT count(*) >= 2 FROM pg_stat_activity WHERE backend_type = 'dolt fold worker' AND datname = 'postgres'}),
+	'a pressed store folds one database with several workers');
+ok($busy->poll_query_until('postgres', q{SELECT versions = 0 FROM dolt_delta_stats()}), 'which fold everything');
+is($busy->safe_psql('postgres', q{SELECT (SELECT count(*) FROM p1) + (SELECT count(*) FROM p2) + (SELECT count(*) FROM p3)}),
+	'60000', 'and lose nothing');
 $busy->stop;
+
+# With nothing folding, the store grows past its budget rather than refuse
+# writes: a transaction larger than the budget commits, later writers are
+# slowed, and recovery replays all of it. At dolt_delta_memory_limit, writers
+# wait for folds, and can be canceled while they do.
+my $grow = PostgreSQL::Test::Cluster->new('delta_grow');
+$grow->init(extra => ['--encoding=UTF8', '--locale=C']);
+$grow->append_conf('postgresql.conf', qq{default_table_access_method='dolt_prolly_table'
+dolt_delta_memory=2MB
+dolt_fold_workers=0
+});
+$grow->start;
+$grow->safe_psql('postgres', q{CREATE TABLE g(id int PRIMARY KEY, v text)});
+$grow->safe_psql('postgres', q{INSERT INTO g SELECT i, repeat('x', 40) FROM generate_series(1, 40000) i});
+is($grow->safe_psql('postgres', q{SELECT bytes > budget, allocated > budget FROM dolt_delta_stats()}), 't|t',
+	'a transaction larger than the budget grows the store');
+$grow->safe_psql('postgres', q{INSERT INTO g SELECT i, repeat('y', 40) FROM generate_series(40001, 50000) i});
+is($grow->safe_psql('postgres', q{SELECT throttled_ms > 0, limit_waits FROM dolt_delta_stats()}), 't|0',
+	'and writers past the throttle point are slowed, not refused');
+$grow->stop('immediate');
+$grow->start;
+is($grow->safe_psql('postgres', q{SELECT count(*), count(*) FILTER (WHERE v LIKE 'y%') FROM g}), '50000|10000',
+	'recovery replays a store larger than its budget');
+$grow->safe_psql('postgres', q{ALTER SYSTEM SET dolt_delta_memory_limit = '4MB'; SELECT pg_reload_conf()});
+# Versions reach the store as the transaction commits, after its statement
+# timeout is off; a cancel still stops the wait.
+my $waiter = $grow->background_psql('postgres', on_error_stop => 0);
+$waiter->query_until(qr/started/, q{\echo started
+INSERT INTO g VALUES (0, 'z');
+});
+ok($grow->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_stat_activity WHERE wait_event = 'DoltDeltaLimit'}),
+	'a writer at the limit waits for folds');
+$grow->safe_psql('postgres', q{SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE wait_event = 'DoltDeltaLimit'});
+$waiter->quit;
+like($waiter->{stderr}, qr/canceling statement due to user request/, 'until canceled');
+is($grow->safe_psql('postgres', q{SELECT limit_waits > 0, count(*) FROM dolt_delta_stats(), g GROUP BY 1}), 't|50000',
+	'having written nothing');
+$grow->stop;
 
 done_testing();

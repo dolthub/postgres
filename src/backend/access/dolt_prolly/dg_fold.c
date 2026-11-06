@@ -8,10 +8,11 @@
  * watches the delta store (dg_delta.c): a tree is due a fold once it holds
  * dolt_fold_versions versions, once its oldest version has waited
  * dolt_fold_timeout, or, largest first, while the store holds more than half
- * its memory. For each database with trees due, the launcher starts a worker
- * connected to it, up to dolt_fold_workers at once. A worker folds each due
- * tree in a transaction of its own (dg_fold_tree), then prunes what the fold
- * holds, and exits once nothing is due.
+ * its budget. For each database with trees due, the launcher starts a worker
+ * connected to it, up to dolt_fold_workers at once; while the store is past
+ * half its budget, one database may have several, which fold different trees.
+ * A worker folds each due tree in a transaction of its own (dg_fold_tree),
+ * then prunes what the fold holds, and exits once nothing is due.
  *
  * The launcher also prunes: a fold's versions go once every snapshot reads
  * past it, which may be well after the worker has exited.
@@ -170,6 +171,7 @@ DoltFoldLauncherMain(Datum argument)
 	for (;;)
 	{
 		int			n;
+		int			per_db;
 		bool		sweep;
 
 		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
@@ -202,16 +204,21 @@ DoltFoldLauncherMain(Datum argument)
 				i++;
 		}
 
-		/* Start a worker for each database with trees due, while there is room. */
+		/*
+		 * Start a worker for each database with trees due, while there is
+		 * room. Under pressure, a database's trees fold in parallel: a
+		 * worker folding a tree another holds skips to the next.
+		 */
 		n = dolt_delta_due(InvalidOid, dolt_fold_versions, dolt_fold_timeout, due, FOLD_BATCH);
+		per_db = dolt_delta_pressure() > 0.5 ? dolt_fold_workers : 1;
 		for (int i = 0; i < n && nworkers < dolt_fold_workers; i++)
 		{
 			BackgroundWorker bgw = {0};
-			bool		running = false;
+			int			running = 0;
 
-			for (int j = 0; j < nworkers && !running; j++)
-				running = workers[j].db == due[i].db;
-			if (running)
+			for (int j = 0; j < nworkers; j++)
+				running += workers[j].db == due[i].db;
+			if (running >= per_db || running >= n)
 				continue;
 			bgw.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
 			bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
@@ -250,24 +257,29 @@ dolt_fold(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(folded);
 }
 
-/* dolt_delta_stats(): the delta store's totals. */
+/*
+ * dolt_delta_stats(): the delta store's totals, its budget, the shared memory
+ * it has, how long writers have been throttled, and how many waited at the
+ * limit.
+ */
 Datum
 dolt_delta_stats(PG_FUNCTION_ARGS)
 {
 	TupleDesc	desc;
-	Datum		values[4];
-	bool		nulls[4] = {false};
-	uint64		trees,
-				keys,
-				versions,
-				bytes;
+	Datum		values[8];
+	bool		nulls[8] = {false};
+	DoltDeltaTotals totals;
 
 	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
-	dolt_delta_totals(&trees, &keys, &versions, &bytes);
-	values[0] = Int64GetDatum((int64) trees);
-	values[1] = Int64GetDatum((int64) keys);
-	values[2] = Int64GetDatum((int64) versions);
-	values[3] = Int64GetDatum((int64) bytes);
+	dolt_delta_totals(&totals);
+	values[0] = Int64GetDatum((int64) totals.trees);
+	values[1] = Int64GetDatum((int64) totals.keys);
+	values[2] = Int64GetDatum((int64) totals.versions);
+	values[3] = Int64GetDatum((int64) totals.bytes);
+	values[4] = Int64GetDatum((int64) totals.budget);
+	values[5] = Int64GetDatum((int64) totals.allocated);
+	values[6] = Float8GetDatum((double) totals.throttled_us / 1000.0);
+	values[7] = Int64GetDatum((int64) totals.limit_waits);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(desc, values, nulls)));
 }
