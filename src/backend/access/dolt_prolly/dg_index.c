@@ -83,7 +83,8 @@ escaped(StringInfo out, PLSlice bytes, bool descending)
 }
 /*
  * The row digest an index key of |index| ends with, read back from its
- * escaped bytes: cheaper than hashing the row the value holds.
+ * escaped bytes. It is the entry's tuple id: an entry's value is only its
+ * occurrence count, and the row is the table's, found by its digest.
  */
 static bool
 key_digest(Relation index, PLSlice key, PLHash *digest)
@@ -423,11 +424,10 @@ dg_index_rebuild(Relation table, Relation index)
 		}
 		sorted[used].entry.key.data = (uint8 *) key.data;
 		sorted[used].entry.key.len = key.len;
-		value = palloc(8 + row.len);
+		value = palloc(8);
 		pl_write64(value, count);
-		memcpy(value + 8, row.data, row.len);
 		sorted[used].entry.value.data = value;
-		sorted[used].entry.value.len = 8 + row.len;
+		sorted[used].entry.value.len = 8;
 		used++;
 	}
 	qsort(sorted, used, sizeof(*sorted), compare_entries);
@@ -539,7 +539,7 @@ dg_index_apply(Relation table, PLSlice row, int64 delta, uint64 handle, CommandI
 			continue;
 		}
 		batch = dg_batch(index, cid);
-		dg_batch_index(batch, (PLSlice) {(uint8 *) key.data, key.len}, prefix, digest, row, delta);
+		dg_batch_index(batch, (PLSlice) {(uint8 *) key.data, key.len}, prefix, digest, delta);
 		/*
 		 * Writers of bound canonical storage may bypass the executor's index
 		 * insertion, so the AM checks their unique indexes itself.
@@ -613,7 +613,7 @@ collect_key_rows(void *arg, PLSlice key, PLSlice value)
 			palloc_array(PLHash, rows->capacity);
 	}
 	if (!key_digest(rows->index, key, &rows->digests[rows->count]))
-		rows->digests[rows->count] = dg_rowhash((PLSlice) {value.data + 8, value.len - 8});
+		elog(ERROR, "malformed prolly index key");
 	rows->count++;
 	return PL_OK;
 }
@@ -1311,6 +1311,7 @@ produce(IndexScanDesc scan)
 	{
 		PLEntry		entry;
 		PLSlice		row;
+		PLHash		digest;
 		HandleList	handles;
 		ItemPointerData first_tid;
 
@@ -1319,24 +1320,32 @@ produce(IndexScanDesc scan)
 		if (s->exhausted)
 			break;
 		entry = dg_cursor_entry(&s->cursor);
-		row = (PLSlice) {entry.value.data + 8, entry.value.len - 8};
+		if (!key_digest(scan->indexRelation, entry.key, &digest))
+			elog(ERROR, "malformed prolly index key");
 		if (scan->xs_want_itup)
 		{
 			handles.count = (int) Min(pl_read64(entry.value.data), (uint64) INT_MAX);
 			handles.items = NULL;
 		}
 		else
-		{
-			PLHash		digest;
-
-			if (!key_digest(scan->indexRelation, entry.key, &digest))
-				digest = dg_rowhash(row);
 			handles = handles_of(s->table, digest, (int64) pl_read64(entry.value.data));
-		}
 
 		/* Duplicate occurrences share bytes and qualifications, not TIDs. */
 		if (handles.count == 0)
 			continue;
+
+		/*
+		 * The entry's row is the table's, found by the digest that ends its
+		 * key, as btree finds a heap tuple by its TID. A bitmap scan's table
+		 * scan reads the rows itself.
+		 */
+		row = (PLSlice) {NULL, 0};
+		if (!s->bitmap_table || scan->xs_want_itup)
+		{
+			if (!row_of(s->table, digest, &row))
+				elog(ERROR, "prolly index entry names a row its table lacks");
+			row.data = memcpy(palloc(Max(row.len, 1)), row.data, row.len);
+		}
 
 		/* Bitmap bounds are conservative. Defer the qualification to the
 		 * table scan so that it decodes each candidate only once, even when
@@ -1360,7 +1369,8 @@ produce(IndexScanDesc scan)
 			if (handles.items)
 			{
 				dg_tid(handles.items[j], &tid);
-				dg_stash_put(RelationGetRelid(scan->heapRelation), s->table, handles.items[j], row);
+				if (row.data)
+					dg_stash_put(RelationGetRelid(scan->heapRelation), s->table, handles.items[j], row);
 			}
 			if (scan->xs_want_itup)
 			{

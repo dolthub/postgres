@@ -27,6 +27,18 @@ $seq = sql(q{SET enable_indexscan=off; SET enable_bitmapscan=off; SELECT string_
 is(idx(q{SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t WHERE k = 7}), $seq, 'index scan sees updates and deletes');
 is(bitmap(q{SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t WHERE k = 7}), $seq, 'bitmap scan sees updates and deletes');
 like($seq, qr/^7:v7!,/, 'the updated rows are in the answer');
+# An index entry holds its key and the row's digest, which names the row in
+# the table, not the row: wide rows reach the WAL once, however many indexes
+# they have, and index scans read them from the table.
+sql(q{CREATE TABLE wide_rows(id int PRIMARY KEY, k int, v text); CREATE INDEX wide_rows_k ON wide_rows(k)});
+my $lsn = sql('SELECT pg_current_wal_insert_lsn()');
+sql(q{INSERT INTO wide_rows SELECT g, g % 10, (SELECT string_agg(md5(g::text || i::text), '') FROM generate_series(1, 125) i) FROM generate_series(1, 200) g});
+my $wal = sql("SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(), '$lsn')");
+cmp_ok($wal, '<', 200 * 4000 * 1.5, "200 rows of 4,000 bytes under two indexes log $wal bytes of WAL");
+is(idx(q{SELECT count(*), sum(length(v)) FROM wide_rows WHERE k = 3}), '20|80000', 'an index scan reads the rows from the table');
+is(bitmap(q{SELECT count(*), sum(length(v)) FROM wide_rows WHERE k = 3}), '20|80000', 'and so does a bitmap scan');
+sql('SELECT dolt_fold()');
+is(idx(q{SELECT count(*), sum(length(v)) FROM wide_rows WHERE k = 3}), '20|80000', 'and after a fold');
 is(idx(q{BEGIN; UPDATE t SET v = 'pending' WHERE id = 57; SELECT v FROM t WHERE k = 7 AND id = 57; ROLLBACK}), 'pending', 'index fetch in the writing transaction sees its pending version');
 is(idx(q{SELECT v FROM t WHERE k = 7 AND id = 57}), 'v57!', 'and the rolled back version is gone');
 

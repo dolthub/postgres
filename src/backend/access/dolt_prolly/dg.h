@@ -271,7 +271,7 @@ extern DGBatch *dg_batch_latest(Relation rel, CommandId cid);
 extern DGState *dg_batch_state(DGBatch *batch);
 extern void dg_batch_insert(DGBatch *batch, PLSlice row, uint64 handle);
 extern void dg_batch_remove(DGBatch *batch, PLSlice row, uint64 handle);
-extern void dg_batch_index(DGBatch *batch, PLSlice key, size_t prefix, PLHash digest, PLSlice row, int64 delta);
+extern void dg_batch_index(DGBatch *batch, PLSlice key, size_t prefix, PLHash digest, int64 delta);
 extern void dg_batch_index_prefix(DGBatch *batch, PLSlice prefix, List **added, List **removed);
 extern bool dg_batch_handle_digest(DGBatch *batch, uint64 handle, PLHash *digest);
 extern bool dg_batch_row(DGBatch *batch, PLHash digest, PLSlice *row);
