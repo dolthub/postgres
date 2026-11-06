@@ -49,6 +49,8 @@ is(sql('SELECT n FROM hot WHERE id = 1'), '1000', 'the row reads its last value'
 is(sql(q{SET enable_seqscan = off; SELECT id FROM hot WHERE n = 1000}), '1', 'and so does its index');
 is(sql(q{SET enable_seqscan = off; SELECT count(*) FROM hot WHERE n < 1000}), '9', 'which holds no stale entries');
 
+# Settling commits nothing, so its records reach the standby once flushed.
+sql('CHECKPOINT');
 $node->wait_for_replay_catchup($standby);
 is($standby->safe_psql('postgres', 'SELECT n FROM hot WHERE id = 1'), '1000', 'a standby replays the settling');
 cmp_ok($standby->safe_psql('postgres', $versions), '<', 20, 'and holds as few versions');

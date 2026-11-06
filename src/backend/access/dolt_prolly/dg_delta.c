@@ -82,6 +82,9 @@ int			dolt_delta_memory = 256 * 1024;	/* kB */
 #define DELTA_FULL_NAP_US 10000
 #define DELTA_FULL_WAITS 3000
 
+/* Keys a tree queues to settle, at most; past it, the next fold drops them. */
+#define SETTLE_QUEUE_MAX 1048576
+
 /* Skiplist levels; each level holds about a quarter of the keys below it. */
 #define DELTA_MAX_HEIGHT 12
 
@@ -134,7 +137,8 @@ typedef struct DeltaTree
 	uint64		next_seq;
 	int64		net;			/* every version's delta, summed */
 	TimestampTz oldest;			/* when the oldest version still held arrived */
-	uint64		settle_hint;	/* versions added to keys that had some, since the last settling */
+	dsa_pointer settle_queue;	/* keys that gained a version, to settle: key nodes linked by next[0] */
+	uint32		settle_queued;
 	pg_prng_state heights;
 
 	/*
@@ -529,7 +533,22 @@ versions_link(DeltaTree *tree, const DoltDeltaEdit *edits, Pending *pending, int
 			k = key_at(found);
 			version_at(k->last)->next = pending[i].version;
 			k->last = pending[i].version;
-			tree->settle_hint++;
+
+			/*
+			 * The key may settle once every snapshot sees its versions: queue
+			 * it, on the node the append made in case the key was new. Replay
+			 * queues nothing; only a primary settles.
+			 */
+			if (DsaPointerIsValid(pending[i].key) && tree->settle_queued < SETTLE_QUEUE_MAX && !RecoveryInProgress())
+			{
+				DeltaKey   *q = key_at(pending[i].key);
+
+				q->next[0] = tree->settle_queue;
+				tree->settle_queue = pending[i].key;
+				tree->settle_queued++;
+				tree->bytes += offsetof(DeltaKey, next) + q->height * sizeof(dsa_pointer) + q->keylen;
+				pending[i].key = InvalidDsaPointer;
+			}
 		}
 		else
 		{
@@ -1146,8 +1165,8 @@ version_prunable(DeltaVersion *v, const DoltDeltaHorizon *held, TransactionId ho
  * checkpoint's state file and standbys agree on what replaced what.
  */
 
-/* Keys a settling pass looks at, at most, so that it holds the lock briefly. */
-#define SETTLE_BATCH 4096
+/* Keys a settling pass looks at under one lock acquisition. */
+#define SETTLE_CHUNK 256
 
 /* Whether |v| may settle: committed, seen by every snapshot, held by no base. */
 static bool
@@ -1273,27 +1292,27 @@ settle_unchanged(DeltaKey *k, const SettleCandidate *c, const xl_dolt_delta_vers
 	return i == c->nids;
 }
 
-/*
- * Settle the keys of |tree| whose versions every snapshot by |horizon| sees
- * and no base holds: choose them under the shared lock, then check, log and
- * apply them under the exclusive lock. Returns how many versions went.
- */
-static uint64
-tree_settle(DeltaTree *tree, TransactionId horizon)
+/* A queued key's bytes, copied out of the queue. */
+typedef struct SettleKey
 {
-	MemoryContext memory = AllocSetContextCreate(CurrentMemoryContext, "prolly settle", ALLOCSET_DEFAULT_SIZES);
-	MemoryContext old = MemoryContextSwitchTo(memory);
-	SettleCandidate *cands = palloc(SETTLE_BATCH * sizeof(SettleCandidate));
-	xl_dolt_delta_version_id **orders = palloc(SETTLE_BATCH * sizeof(xl_dolt_delta_version_id *));
-	int			ncands = 0;
-	int			waiting = 0;	/* keys that could settle once snapshots move on */
-	uint64		settled = 0;
+	uint8	   *data;
+	uint32		len;
+} SettleKey;
+
+/*
+ * Choose, of |keys| (|n| of them), those whose versions may settle, under the
+ * shared lock, into |cands| with their versions in |orders|. Keys that could
+ * settle once snapshots move on go back into |waiting|.
+ */
+static int
+settle_choose(DeltaTree *tree, TransactionId horizon, SettleKey *keys, int n,
+			  SettleCandidate *cands, xl_dolt_delta_version_id **orders, List **waiting)
+{
 	DoltDeltaHorizon held;
 	DoltDeltaHorizon *outstanding = NULL;
-	uint64		hint;
+	int			ncands = 0;
 
 	LWLockAcquire(&tree->lock, LW_SHARED);
-	hint = tree->settle_hint;
 	if (TransactionIdIsValid(tree->fold))
 	{
 		held = tree->folded;
@@ -1301,54 +1320,59 @@ tree_settle(DeltaTree *tree, TransactionId horizon)
 			(TransactionId *) dsa_get_address(area, tree->folded_xip) : NULL;
 		outstanding = &held;
 	}
-	for (dsa_pointer kp = key_at(tree->head)->next[0]; DsaPointerIsValid(kp) && ncands < SETTLE_BATCH;
-		 kp = key_at(kp)->next[0])
+	for (int i = 0; i < n; i++)
 	{
-		DeltaKey   *k = key_at(kp);
-		int			n = 0,
+		dsa_pointer kp = key_search(tree, keys[i].data, keys[i].len, NULL);
+		DeltaKey   *k;
+		int			count = 0,
 					keep = -1;
 		int64		net = 0;
 		bool		ok = true;
 		SettleCandidate *c;
 
-		for (dsa_pointer dp = k->first; DsaPointerIsValid(dp) && ok; dp = version_at(dp)->next)
+		if (!DsaPointerIsValid(kp) || key_compare(KEY_BYTES(key_at(kp)), key_at(kp)->keylen, keys[i].data, keys[i].len) != 0)
+			continue;
+		k = key_at(kp);
+		for (dsa_pointer dp = k->first; DsaPointerIsValid(dp); dp = version_at(dp)->next)
 		{
 			DeltaVersion *v = version_at(dp);
 
-			ok = version_settleable(v, outstanding, horizon);
+			ok = ok && version_settleable(v, outstanding, horizon);
 			net += v->delta;
-			n++;
+			count++;
 		}
-		if (n == 0 || (n == 1 && net != 0))
+		if (count == 0 || (count == 1 && net != 0))
 			continue;
 		if (!ok)
 		{
-			waiting++;
+			SettleKey	   *again = palloc(sizeof(SettleKey));
+
+			*again = keys[i];
+			*waiting = lappend(*waiting, again);
 			continue;
 		}
 		c = &cands[ncands];
-		c->keylen = k->keylen;
-		c->key = palloc(Max(k->keylen, 1));
-		memcpy(c->key, KEY_BYTES(k), k->keylen);
-		c->nids = n;
-		c->ids = palloc(n * sizeof(xl_dolt_delta_version_id));
-		orders[ncands] = palloc(n * sizeof(xl_dolt_delta_version_id));
+		c->keylen = keys[i].len;
+		c->key = keys[i].data;
+		c->nids = count;
+		c->ids = palloc(count * sizeof(xl_dolt_delta_version_id));
+		orders[ncands] = palloc(count * sizeof(xl_dolt_delta_version_id));
 		c->delta = net;
 		c->row = NULL;
 		c->rowlen = 0;
-		n = 0;
-		for (dsa_pointer dp = k->first; DsaPointerIsValid(dp); dp = version_at(dp)->next, n++)
+		count = 0;
+		for (dsa_pointer dp = k->first; DsaPointerIsValid(dp); dp = version_at(dp)->next, count++)
 		{
 			DeltaVersion *v = version_at(dp);
 
-			orders[ncands][n].lsn = v->lsn;
-			orders[ncands][n].topxid = v->topxid;
-			orders[ncands][n].xid = v->xid;
+			orders[ncands][count].lsn = v->lsn;
+			orders[ncands][count].topxid = v->topxid;
+			orders[ncands][count].xid = v->xid;
 
 			/* Keep the version with the longest row: an insert's, not a delete's. */
 			if (net != 0 && (keep < 0 || v->rowlen > c->rowlen))
 			{
-				keep = n;
+				keep = count;
 				c->rowlen = v->rowlen;
 				c->row = (uint8 *) v->row;
 			}
@@ -1366,87 +1390,172 @@ tree_settle(DeltaTree *tree, TransactionId horizon)
 		ncands++;
 	}
 	LWLockRelease(&tree->lock);
+	return ncands;
+}
 
-	if (ncands)
+/*
+ * Check, log and apply |cands| under the exclusive lock: a writer or a prune
+ * may have changed a key since it was chosen. Returns how many versions went.
+ */
+static uint64
+settle_commit(DeltaTree *tree, SettleCandidate *cands, xl_dolt_delta_version_id **orders, int ncands)
+{
+	StringInfoData record;
+	xl_dolt_delta_settle header = {0};
+	uint64		bytes,
+				settled = 0;
+	int			nlogged = 0;
+
+	LWLockAcquire(&tree->lock, LW_EXCLUSIVE);
+	bytes = tree->bytes;
+	initStringInfo(&record);
+	header.db = tree->key.db;
+	header.space = tree->key.space;
+	header.file = tree->key.file;
+	header.branchlen = strlen(tree->key.branch);
+	appendBinaryStringInfo(&record, (const char *) &header, SizeOfDoltDeltaSettle);
+	appendBinaryStringInfo(&record, tree->key.branch, header.branchlen);
+	for (int i = 0; i < ncands; i++)
 	{
-		StringInfoData record;
-		xl_dolt_delta_settle header = {0};
-		uint64		bytes;
-		int			nlogged = 0;
+		SettleCandidate *c = &cands[i];
+		dsa_pointer found = key_search(tree, c->key, c->keylen, NULL);
+		xl_dolt_delta_settled entry;
 
-		LWLockAcquire(&tree->lock, LW_EXCLUSIVE);
-		bytes = tree->bytes;
-		initStringInfo(&record);
-		header.db = tree->key.db;
-		header.space = tree->key.space;
-		header.file = tree->key.file;
-		header.branchlen = strlen(tree->key.branch);
-		appendBinaryStringInfo(&record, (const char *) &header, SizeOfDoltDeltaSettle);
-		appendBinaryStringInfo(&record, tree->key.branch, header.branchlen);
+		if (!DsaPointerIsValid(found) || key_compare(KEY_BYTES(key_at(found)), key_at(found)->keylen, c->key, c->keylen) != 0 ||
+			!settle_unchanged(key_at(found), c, orders[i]))
+		{
+			c->nids = 0;
+			continue;
+		}
+		entry.delta = c->delta;
+		entry.keylen = c->keylen;
+		entry.nversions = c->nids;
+		entry.rowlen = c->delta != 0 ? c->rowlen : 0;
+		appendBinaryStringInfo(&record, (const char *) &entry, SizeOfDoltDeltaSettled);
+		appendBinaryStringInfo(&record, (const char *) c->key, c->keylen);
+		appendBinaryStringInfo(&record, (const char *) c->ids, c->nids * sizeof(xl_dolt_delta_version_id));
+		if (entry.rowlen)
+			appendBinaryStringInfo(&record, (const char *) c->row, entry.rowlen);
+		for (int j = 0; j < c->nids; j++)
+			if (!TransactionIdIsValid(header.conflict) || TransactionIdFollows(c->ids[j].topxid, header.conflict))
+				header.conflict = c->ids[j].topxid;
+		nlogged++;
+	}
+	if (nlogged)
+	{
+		header.count = nlogged;
+		memcpy(record.data, &header, SizeOfDoltDeltaSettle);
+		XLogBeginInsert();
+		XLogRegisterData(record.data, record.len);
+		START_CRIT_SECTION();
+		(void) XLogInsert(RM_DOLT_DELTA_ID, XLOG_DOLT_DELTA_SETTLE);
 		for (int i = 0; i < ncands; i++)
 		{
 			SettleCandidate *c = &cands[i];
-			dsa_pointer found = key_search(tree, c->key, c->keylen, NULL);
-			xl_dolt_delta_settled entry;
 
-			/* A writer or a prune may have changed the key since. */
-			if (!DsaPointerIsValid(found) || key_compare(KEY_BYTES(key_at(found)), key_at(found)->keylen, c->key, c->keylen) != 0 ||
-				!settle_unchanged(key_at(found), c, orders[i]))
-			{
-				c->nids = 0;
+			if (!c->nids)
 				continue;
-			}
-			entry.delta = c->delta;
-			entry.keylen = c->keylen;
-			entry.nversions = c->nids;
-			entry.rowlen = c->delta != 0 ? c->rowlen : 0;
-			appendBinaryStringInfo(&record, (const char *) &entry, SizeOfDoltDeltaSettled);
-			appendBinaryStringInfo(&record, (const char *) c->key, c->keylen);
-			appendBinaryStringInfo(&record, (const char *) c->ids, c->nids * sizeof(xl_dolt_delta_version_id));
-			if (entry.rowlen)
-				appendBinaryStringInfo(&record, (const char *) c->row, entry.rowlen);
-			for (int j = 0; j < c->nids; j++)
-				if (!TransactionIdIsValid(header.conflict) || TransactionIdFollows(c->ids[j].topxid, header.conflict))
-					header.conflict = c->ids[j].topxid;
-			nlogged++;
+			settle_apply(tree, c->key, c->keylen, c->ids, c->nids, c->delta, c->row, c->rowlen, ProcLastRecPtr);
+			settled += c->nids - (c->delta != 0);
 		}
-		if (nlogged)
-		{
-			XLogRecPtr	lsn;
-
-			header.count = nlogged;
-			memcpy(record.data, &header, SizeOfDoltDeltaSettle);
-			XLogBeginInsert();
-			XLogRegisterData(record.data, record.len);
-			START_CRIT_SECTION();
-			lsn = XLogInsert(RM_DOLT_DELTA_ID, XLOG_DOLT_DELTA_SETTLE);
-			(void) lsn;
-			for (int i = 0; i < ncands; i++)
-			{
-				SettleCandidate *c = &cands[i];
-
-				if (!c->nids)
-					continue;
-				settle_apply(tree, c->key, c->keylen, c->ids, c->nids, c->delta, c->row, c->rowlen, ProcLastRecPtr);
-				settled += c->nids - (c->delta != 0);
-			}
-			END_CRIT_SECTION();
-		}
-
-		/* Writers since the choice, and keys still waiting, keep the hint. */
-		if (ncands < SETTLE_BATCH && !waiting && tree->settle_hint == hint)
-			tree->settle_hint = 0;
-		if (!tree->count)
-			tree->oldest = 0;
-		pg_atomic_fetch_sub_u64(&control->bytes, bytes - tree->bytes);
-		LWLockRelease(&tree->lock);
+		END_CRIT_SECTION();
 	}
-	else
+	if (!tree->count)
+		tree->oldest = 0;
+	pg_atomic_fetch_sub_u64(&control->bytes, bytes - tree->bytes);
+	LWLockRelease(&tree->lock);
+	pfree(record.data);
+	return settled;
+}
+
+static int
+compare_plkeys(const void *a, const void *b)
+{
+	const SettleKey *x = a,
+			   *y = b;
+
+	return key_compare(x->data, x->len, y->data, y->len);
+}
+
+/*
+ * Settle the keys |tree| queued as they gained versions, whose versions every
+ * snapshot by |horizon| sees and no base holds, SETTLE_CHUNK keys at a time,
+ * so that neither lock is held long. Keys that must wait for snapshots go
+ * back on the queue. Returns how many versions went.
+ */
+static uint64
+tree_settle(DeltaTree *tree, TransactionId horizon)
+{
+	MemoryContext memory = AllocSetContextCreate(CurrentMemoryContext, "prolly settle", ALLOCSET_DEFAULT_SIZES);
+	MemoryContext old = MemoryContextSwitchTo(memory);
+	SettleCandidate *cands = palloc(SETTLE_CHUNK * sizeof(SettleCandidate));
+	xl_dolt_delta_version_id **orders = palloc(SETTLE_CHUNK * sizeof(xl_dolt_delta_version_id *));
+	List	   *waiting = NIL;
+	SettleKey	   *keys;
+	int			nkeys = 0,
+				unique = 0;
+	dsa_pointer queue;
+	uint64		settled = 0,
+				freed = 0;
+
+	/* Take the queue, and copy its keys, sorted and once each. */
+	LWLockAcquire(&tree->lock, LW_EXCLUSIVE);
+	queue = tree->settle_queue;
+	nkeys = tree->settle_queued;
+	tree->settle_queue = InvalidDsaPointer;
+	tree->settle_queued = 0;
+	LWLockRelease(&tree->lock);
+	keys = palloc(Max(nkeys, 1) * sizeof(SettleKey));
+	nkeys = 0;
+	while (DsaPointerIsValid(queue))
+	{
+		DeltaKey   *q = key_at(queue);
+		dsa_pointer next = q->next[0];
+		uint8	   *copy = palloc(Max(q->keylen, 1));
+
+		memcpy(copy, KEY_BYTES(q), q->keylen);
+		keys[nkeys].data = copy;
+		keys[nkeys++].len = q->keylen;
+		freed += offsetof(DeltaKey, next) + q->height * sizeof(dsa_pointer) + q->keylen;
+		dsa_free(area, queue);
+		queue = next;
+	}
+	if (freed)
 	{
 		LWLockAcquire(&tree->lock, LW_EXCLUSIVE);
-		if (!waiting && tree->settle_hint == hint)
-			tree->settle_hint = 0;
+		tree->bytes -= freed;
 		LWLockRelease(&tree->lock);
+		pg_atomic_fetch_sub_u64(&control->bytes, freed);
+	}
+	qsort(keys, nkeys, sizeof(SettleKey), compare_plkeys);
+	for (int i = 0; i < nkeys; i++)
+		if (unique == 0 || compare_plkeys(&keys[unique - 1], &keys[i]) != 0)
+			keys[unique++] = keys[i];
+
+	for (int first = 0; first < unique; first += SETTLE_CHUNK)
+	{
+		int			n = Min(SETTLE_CHUNK, unique - first);
+		int			ncands = settle_choose(tree, horizon, keys + first, n, cands, orders, &waiting);
+
+		if (ncands)
+			settled += settle_commit(tree, cands, orders, ncands);
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	/* Keys that wait for snapshots go back on the queue, on fresh nodes. */
+	foreach_ptr(SettleKey, key, waiting)
+	{
+		dsa_pointer node = key_make(key->data, key->len, 1);
+
+		if (!DsaPointerIsValid(node))
+			break;
+		LWLockAcquire(&tree->lock, LW_EXCLUSIVE);
+		key_at(node)->next[0] = tree->settle_queue;
+		tree->settle_queue = node;
+		tree->settle_queued++;
+		tree->bytes += offsetof(DeltaKey, next) + sizeof(dsa_pointer) + key->len;
+		LWLockRelease(&tree->lock);
+		pg_atomic_fetch_add_u64(&control->bytes, offsetof(DeltaKey, next) + sizeof(dsa_pointer) + key->len);
 	}
 	MemoryContextSwitchTo(old);
 	MemoryContextDelete(memory);
@@ -1642,7 +1751,7 @@ dolt_delta_prune_all(bool all)
 	every = trees_all(&ntrees);
 	for (int i = 0; i < ntrees; i++)
 	{
-		bool		hinted = every[i]->settle_hint > 0;
+		bool		hinted = DsaPointerIsValid(every[i]->settle_queue);
 
 		if (every[i]->count && (all || TransactionIdIsValid(every[i]->fold)))
 			pruned += tree_prune(every[i], horizon);
