@@ -24,7 +24,7 @@
  * with collations that match the remote table's columns, which we can
  * consider to be user error.
  *
- * Portions Copyright (c) 2012-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  contrib/postgres_fdw/deparse.c
@@ -39,6 +39,7 @@
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_collation.h"
+#include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_opfamily.h"
@@ -160,6 +161,7 @@ static void deparseDistinctExpr(DistinctExpr *node, deparse_expr_cxt *context);
 static void deparseScalarArrayOpExpr(ScalarArrayOpExpr *node,
 									 deparse_expr_cxt *context);
 static void deparseRelabelType(RelabelType *node, deparse_expr_cxt *context);
+static void deparseArrayCoerceExpr(ArrayCoerceExpr *node, deparse_expr_cxt *context);
 static void deparseBoolExpr(BoolExpr *node, deparse_expr_cxt *context);
 static void deparseNullTest(NullTest *node, deparse_expr_cxt *context);
 static void deparseCaseExpr(CaseExpr *node, deparse_expr_cxt *context);
@@ -455,6 +457,11 @@ foreign_expr_walker(Node *node,
 											  AuthIdRelationId, fpinfo))
 								return false;
 							break;
+						case REGDATABASEOID:
+							if (!is_shippable(DatumGetObjectId(c->constvalue),
+											  DatabaseRelationId, fpinfo))
+								return false;
+							break;
 					}
 				}
 
@@ -685,6 +692,54 @@ foreign_expr_walker(Node *node,
 				 * an input foreign Var (same logic as for a real function).
 				 */
 				collation = r->resultcollid;
+				if (collation == InvalidOid)
+					state = FDW_COLLATE_NONE;
+				else if (inner_cxt.state == FDW_COLLATE_SAFE &&
+						 collation == inner_cxt.collation)
+					state = FDW_COLLATE_SAFE;
+				else if (collation == DEFAULT_COLLATION_OID)
+					state = FDW_COLLATE_NONE;
+				else
+					state = FDW_COLLATE_UNSAFE;
+			}
+			break;
+		case T_ArrayCoerceExpr:
+			{
+				ArrayCoerceExpr *e = (ArrayCoerceExpr *) node;
+
+				/*
+				 * Push down only when the per-element coercion is a plain
+				 * relabeling, that is, elemexpr is a RelabelType or a bare
+				 * CaseTestExpr.  Any other element coercion -- a cast
+				 * function, an I/O conversion (CoerceViaIO), or a domain
+				 * coercion -- is kept local.  We ship only a bare
+				 * "arg::resulttype" cast (nothing at all for an
+				 * implicit-format coercion), so a non-relabeling conversion
+				 * would be re-resolved against the remote server's catalogs
+				 * and session state and could silently change the result.
+				 * This matches the handling of the scalar coercions for the
+				 * I/O and domain cases (never shipped); an element cast
+				 * function is kept local too, which is more conservative than
+				 * the scalar case (a scalar cast function is shipped when it
+				 * is shippable).
+				 */
+				if (!IsA(e->elemexpr, RelabelType) &&
+					!IsA(e->elemexpr, CaseTestExpr))
+					return false;
+
+				/*
+				 * Recurse to input subexpression.
+				 */
+				if (!foreign_expr_walker((Node *) e->arg,
+										 glob_cxt, &inner_cxt, case_arg_cxt))
+					return false;
+
+				/*
+				 * T_ArrayCoerceExpr must not introduce a collation not
+				 * derived from an input foreign Var (same logic as for a
+				 * function).
+				 */
+				collation = e->resultcollid;
 				if (collation == InvalidOid)
 					state = FDW_COLLATE_NONE;
 				else if (inner_cxt.state == FDW_COLLATE_SAFE &&
@@ -1154,7 +1209,7 @@ is_foreign_pathkey(PlannerInfo *root,
 static char *
 deparse_type_name(Oid type_oid, int32 typemod)
 {
-	bits16		flags = FORMAT_TYPE_TYPEMOD_GIVEN;
+	uint16		flags = FORMAT_TYPE_TYPEMOD_GIVEN;
 
 	if (!is_builtin(type_oid))
 		flags |= FORMAT_TYPE_FORCE_QUALIFY;
@@ -1423,10 +1478,8 @@ deparseTargetList(StringInfo buf,
 	first = true;
 	for (i = 1; i <= tupdesc->natts; i++)
 	{
-		Form_pg_attribute attr = TupleDescAttr(tupdesc, i - 1);
-
 		/* Ignore dropped attributes. */
-		if (attr->attisdropped)
+		if (TupleDescCompactAttr(tupdesc, i - 1)->attisdropped)
 			continue;
 
 		if (have_wholerow ||
@@ -2115,7 +2168,7 @@ deparseInsertSql(StringInfo buf, RangeTblEntry *rte,
 		foreach(lc, targetAttrs)
 		{
 			int			attnum = lfirst_int(lc);
-			Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+			CompactAttribute *attr = TupleDescCompactAttr(tupdesc, attnum - 1);
 
 			if (!first)
 				appendStringInfoString(buf, ", ");
@@ -2181,7 +2234,7 @@ rebuildInsertSql(StringInfo buf, Relation rel,
 		foreach(lc, target_attrs)
 		{
 			int			attnum = lfirst_int(lc);
-			Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+			CompactAttribute *attr = TupleDescCompactAttr(tupdesc, attnum - 1);
 
 			if (!first)
 				appendStringInfoString(buf, ", ");
@@ -2231,7 +2284,7 @@ deparseUpdateSql(StringInfo buf, RangeTblEntry *rte,
 	foreach(lc, targetAttrs)
 	{
 		int			attnum = lfirst_int(lc);
-		Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+		CompactAttribute *attr = TupleDescCompactAttr(tupdesc, attnum - 1);
 
 		if (!first)
 			appendStringInfoString(buf, ", ");
@@ -2508,12 +2561,15 @@ deparseAnalyzeSizeSql(StringInfo buf, Relation rel)
 }
 
 /*
- * Construct SELECT statement to acquire the number of rows and the relkind of
- * a relation.
+ * Construct SELECT statement to acquire the number of pages, the number of
+ * rows, and the relkind/relhassubclass of a relation.
  *
- * Note: we just return the remote server's reltuples value, which might
- * be off a good deal, but it doesn't seem worth working harder.  See
+ * Note: we just return the remote server's relpages/reltuples values, which
+ * might be off a good deal, but it doesn't seem worth working harder.  See
  * comments in postgresAcquireSampleRowsFunc.
+ *
+ * Note: in the stats-import case it is the user's responsibility to ensure
+ * that those stats values are up-to-date.
  */
 void
 deparseAnalyzeInfoSql(StringInfo buf, Relation rel)
@@ -2524,7 +2580,7 @@ deparseAnalyzeInfoSql(StringInfo buf, Relation rel)
 	initStringInfo(&relname);
 	deparseRelation(&relname, rel);
 
-	appendStringInfoString(buf, "SELECT reltuples, relkind FROM pg_catalog.pg_class WHERE oid = ");
+	appendStringInfoString(buf, "SELECT relpages, reltuples, relkind, relhassubclass FROM pg_catalog.pg_class WHERE oid = ");
 	deparseStringLiteral(buf, relname.data);
 	appendStringInfoString(buf, "::pg_catalog.regclass");
 }
@@ -2912,6 +2968,9 @@ deparseExpr(Expr *node, deparse_expr_cxt *context)
 			break;
 		case T_RelabelType:
 			deparseRelabelType((RelabelType *) node, context);
+			break;
+		case T_ArrayCoerceExpr:
+			deparseArrayCoerceExpr((ArrayCoerceExpr *) node, context);
 			break;
 		case T_BoolExpr:
 			deparseBoolExpr((BoolExpr *) node, context);
@@ -3496,6 +3555,24 @@ deparseRelabelType(RelabelType *node, deparse_expr_cxt *context)
 {
 	deparseExpr(node->arg, context);
 	if (node->relabelformat != COERCE_IMPLICIT_CAST)
+		appendStringInfo(context->buf, "::%s",
+						 deparse_type_name(node->resulttype,
+										   node->resulttypmod));
+}
+
+/*
+ * Deparse an ArrayCoerceExpr (array-type conversion) node.
+ */
+static void
+deparseArrayCoerceExpr(ArrayCoerceExpr *node, deparse_expr_cxt *context)
+{
+	deparseExpr(node->arg, context);
+
+	/*
+	 * No difference how to deparse explicit cast, but if we omit implicit
+	 * cast in the query, it'll be more user-friendly
+	 */
+	if (node->coerceformat != COERCE_IMPLICIT_CAST)
 		appendStringInfo(context->buf, "::%s",
 						 deparse_type_name(node->resulttype,
 										   node->resulttypmod));

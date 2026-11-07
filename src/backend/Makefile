@@ -2,7 +2,7 @@
 #
 # Makefile for the postgres backend
 #
-# Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
 # src/backend/Makefile
@@ -16,11 +16,33 @@ subdir = src/backend
 top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 
-SUBDIRS = access archive backup bootstrap catalog parser commands executor \
-	foreign lib libpq \
-	main nodes optimizer partitioning port postmaster \
-	regex replication rewrite \
-	statistics storage tcop tsearch utils $(top_builddir)/src/timezone \
+SUBDIRS = \
+	access \
+	archive \
+	backup \
+	bootstrap \
+	catalog \
+	parser \
+	commands \
+	executor \
+	foreign \
+	lib \
+	libpq \
+	main \
+	nodes \
+	optimizer \
+	partitioning \
+	port \
+	postmaster \
+	regex \
+	replication \
+	rewrite \
+	statistics \
+	storage \
+	tcop \
+	tsearch \
+	utils \
+	$(top_builddir)/src/timezone \
 	jit
 
 include $(srcdir)/common.mk
@@ -63,10 +85,12 @@ all: submake-libpgport submake-catalog-headers submake-utils-headers postgres $(
 
 ifneq ($(PORTNAME), cygwin)
 ifneq ($(PORTNAME), win32)
+ifneq ($(PORTNAME), aix)
 
 postgres: $(OBJS)
 	$(CC) $(CFLAGS) $(call expand_subsys,$^) $(LDFLAGS) $(LIBS) -o $@
 
+endif
 endif
 endif
 
@@ -94,6 +118,24 @@ libpostgres.a: postgres
 	touch $@
 
 endif # win32
+
+ifeq ($(PORTNAME), aix)
+
+postgres: $(POSTGRES_IMP)
+	$(CC) $(CFLAGS) $(call expand_subsys,$(OBJS)) $(LDFLAGS) -Wl,-bE:$(top_builddir)/src/backend/$(POSTGRES_IMP) $(LIBS) -Wl,-brtllib -o $@
+
+# Linking to a single .o with -r is a lot faster than building a .a or passing
+# all objects to MKLDEXPORT.
+#
+# It looks alluring to use $(CC) -r instead of ld -r, but that doesn't
+# trivially work with gcc, due to gcc specific static libraries linked in with
+# -r.
+$(POSTGRES_IMP): $(OBJS)
+	ld -b64 -r -o SUBSYS.o $(call expand_subsys,$^)
+	$(MKLDEXPORT) SUBSYS.o . > $@
+	@rm -f SUBSYS.o
+
+endif # aix
 
 $(top_builddir)/src/port/libpgport_srv.a: | submake-libpgport
 
@@ -179,6 +221,7 @@ endif
 	$(MAKE) -C utils install-data
 	$(INSTALL_DATA) $(srcdir)/libpq/pg_hba.conf.sample '$(DESTDIR)$(datadir)/pg_hba.conf.sample'
 	$(INSTALL_DATA) $(srcdir)/libpq/pg_ident.conf.sample '$(DESTDIR)$(datadir)/pg_ident.conf.sample'
+	$(INSTALL_DATA) $(srcdir)/libpq/pg_hosts.conf.sample '$(DESTDIR)$(datadir)/pg_hosts.conf.sample'
 	$(INSTALL_DATA) $(srcdir)/utils/misc/postgresql.conf.sample '$(DESTDIR)$(datadir)/postgresql.conf.sample'
 
 ifeq ($(with_llvm), yes)
@@ -238,6 +281,7 @@ endif
 	$(MAKE) -C utils uninstall-data
 	rm -f '$(DESTDIR)$(datadir)/pg_hba.conf.sample' \
 	      '$(DESTDIR)$(datadir)/pg_ident.conf.sample' \
+	      '$(DESTDIR)$(datadir)/pg_hosts.conf.sample' \
 	      '$(DESTDIR)$(datadir)/postgresql.conf.sample'
 ifeq ($(with_llvm), yes)
 	$(call uninstall_llvm_module,postgres)

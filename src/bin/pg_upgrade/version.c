@@ -3,7 +3,7 @@
  *
  *	Postgres-version-specific routines
  *
- *	Copyright (c) 2010-2025, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *	src/bin/pg_upgrade/version.c
  */
 
@@ -169,8 +169,6 @@ process_extension_updates(DbInfo *dbinfo, PGresult *res, void *arg)
 	int			i_name = PQfnumber(res, "name");
 	UpgradeTaskReport *report = (UpgradeTaskReport *) arg;
 	PQExpBufferData connectbuf;
-
-	AssertVariableIsOfType(&process_extension_updates, UpgradeTaskProcessCB);
 
 	if (ntups == 0)
 		return;

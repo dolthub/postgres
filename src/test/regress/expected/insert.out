@@ -117,6 +117,16 @@ insert into inserttest (f2[1], f2[2]) values (1,default);  -- not supported
 ERROR:  cannot set an array element to DEFAULT
 LINE 1: insert into inserttest (f2[1], f2[2]) values (1,default);
                                        ^
+-- subscripts are transformed again for each VALUES row
+begin;
+insert into inserttest (f2[(select 1)], f2[(1 IS NOT NULL)::int + 1]) values (9,10), (11,12) RETURNING f2;
+   f2    
+---------
+ {9,10}
+ {11,12}
+(2 rows)
+
+rollback;
 insert into inserttest (f3.if1, f3.if2) values (1,array['foo']);
 insert into inserttest (f3.if1, f3.if2) values (1,'{foo}'), (2,'{bar}');
 insert into inserttest (f3.if1, f3.if2) select 3, '{baz,quux}';
@@ -567,13 +577,14 @@ from hash_parted order by part;
  a      | text    |           |          |         | extended |              | 
  b      | integer |           |          |         | plain    |              | 
 Partition key: LIST (lower(a))
-Partitions: part_aa_bb FOR VALUES IN ('aa', 'bb'),
-            part_cc_dd FOR VALUES IN ('cc', 'dd'),
-            part_ee_ff FOR VALUES IN ('ee', 'ff'), PARTITIONED,
-            part_gg FOR VALUES IN ('gg'), PARTITIONED,
-            part_null FOR VALUES IN (NULL),
-            part_xx_yy FOR VALUES IN ('xx', 'yy'), PARTITIONED,
-            part_default DEFAULT, PARTITIONED
+Partitions:
+    part_aa_bb FOR VALUES IN ('aa', 'bb')
+    part_cc_dd FOR VALUES IN ('cc', 'dd')
+    part_ee_ff FOR VALUES IN ('ee', 'ff'), PARTITIONED
+    part_gg FOR VALUES IN ('gg'), PARTITIONED
+    part_null FOR VALUES IN (NULL)
+    part_xx_yy FOR VALUES IN ('xx', 'yy'), PARTITIONED
+    part_default DEFAULT, PARTITIONED
 
 -- cleanup
 drop table range_parted, list_parted;
@@ -972,14 +983,15 @@ create table mcrparted8_ge_d partition of mcrparted for values from ('d', minval
  a      | text    |           |          |         | extended |              | 
  b      | integer |           |          |         | plain    |              | 
 Partition key: RANGE (a, b)
-Partitions: mcrparted1_lt_b FOR VALUES FROM (MINVALUE, MINVALUE) TO ('b', MINVALUE),
-            mcrparted2_b FOR VALUES FROM ('b', MINVALUE) TO ('c', MINVALUE),
-            mcrparted3_c_to_common FOR VALUES FROM ('c', MINVALUE) TO ('common', MINVALUE),
-            mcrparted4_common_lt_0 FOR VALUES FROM ('common', MINVALUE) TO ('common', 0),
-            mcrparted5_common_0_to_10 FOR VALUES FROM ('common', 0) TO ('common', 10),
-            mcrparted6_common_ge_10 FOR VALUES FROM ('common', 10) TO ('common', MAXVALUE),
-            mcrparted7_gt_common_lt_d FOR VALUES FROM ('common', MAXVALUE) TO ('d', MINVALUE),
-            mcrparted8_ge_d FOR VALUES FROM ('d', MINVALUE) TO (MAXVALUE, MAXVALUE)
+Partitions:
+    mcrparted1_lt_b FOR VALUES FROM (MINVALUE, MINVALUE) TO ('b', MINVALUE)
+    mcrparted2_b FOR VALUES FROM ('b', MINVALUE) TO ('c', MINVALUE)
+    mcrparted3_c_to_common FOR VALUES FROM ('c', MINVALUE) TO ('common', MINVALUE)
+    mcrparted4_common_lt_0 FOR VALUES FROM ('common', MINVALUE) TO ('common', 0)
+    mcrparted5_common_0_to_10 FOR VALUES FROM ('common', 0) TO ('common', 10)
+    mcrparted6_common_ge_10 FOR VALUES FROM ('common', 10) TO ('common', MAXVALUE)
+    mcrparted7_gt_common_lt_d FOR VALUES FROM ('common', MAXVALUE) TO ('d', MINVALUE)
+    mcrparted8_ge_d FOR VALUES FROM ('d', MINVALUE) TO (MAXVALUE, MAXVALUE)
 
 \d+ mcrparted1_lt_b
                               Table "public.mcrparted1_lt_b"

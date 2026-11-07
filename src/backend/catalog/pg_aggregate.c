@@ -3,7 +3,7 @@
  * pg_aggregate.c
  *	  routines to support manipulation of the pg_aggregate relation
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -68,6 +68,7 @@ AggregateCreate(const char *aggName,
 				char finalfnModify,
 				char mfinalfnModify,
 				List *aggsortopName,
+				List *aggsupportfuncName,
 				Oid aggTransType,
 				int32 aggTransSpace,
 				Oid aggmTransType,
@@ -92,6 +93,7 @@ AggregateCreate(const char *aggName,
 	Oid			minvtransfn = InvalidOid;	/* can be omitted */
 	Oid			mfinalfn = InvalidOid;	/* can be omitted */
 	Oid			sortop = InvalidOid;	/* can be omitted */
+	Oid			supportfn = InvalidOid; /* can be omitted */
 	Oid		   *aggArgTypes = parameterTypes->values;
 	bool		mtransIsStrict = false;
 	Oid			rettype;
@@ -582,6 +584,35 @@ AggregateCreate(const char *aggName,
 	}
 
 	/*
+	 * Validate the planner support function, if present.
+	 */
+	if (aggsupportfuncName)
+	{
+		/* signature is always support(internal) returns internal */
+		fnArgs[0] = INTERNALOID;
+
+		supportfn = lookup_agg_function(aggsupportfuncName, 1,
+										fnArgs, InvalidOid,
+										&rettype);
+
+		if (rettype != INTERNALOID)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("return type of support function %s is not %s",
+							NameListToString(aggsupportfuncName),
+							format_type_be(INTERNALOID))));
+
+		/*
+		 * Specifying a support function requires superuser, same as in CREATE
+		 * FUNCTION.
+		 */
+		if (!superuser())
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("must be superuser to specify a support function")));
+	}
+
+	/*
 	 * permission checks on used types
 	 */
 	for (i = 0; i < numArgs; i++)
@@ -639,7 +670,7 @@ AggregateCreate(const char *aggName,
 							 PointerGetDatum(NULL), /* trftypes */
 							 NIL,	/* trfoids */
 							 PointerGetDatum(NULL), /* proconfig */
-							 InvalidOid,	/* no prosupport */
+							 supportfn, /* prosupport */
 							 1, /* procost */
 							 0);	/* prorows */
 	procOid = myself.objectId;
@@ -654,7 +685,7 @@ AggregateCreate(const char *aggName,
 	for (i = 0; i < Natts_pg_aggregate; i++)
 	{
 		nulls[i] = false;
-		values[i] = (Datum) NULL;
+		values[i] = (Datum) 0;
 		replaces[i] = true;
 	}
 	values[Anum_pg_aggregate_aggfnoid - 1] = ObjectIdGetDatum(procOid);
@@ -836,6 +867,7 @@ lookup_agg_function(List *fnName,
 	Oid			vatype;
 	Oid		   *true_oid_array;
 	FuncDetailCode fdresult;
+	int			fgc_flags;
 	AclResult	aclresult;
 	int			i;
 
@@ -848,6 +880,7 @@ lookup_agg_function(List *fnName,
 	 */
 	fdresult = func_get_detail(fnName, NIL, NIL,
 							   nargs, input_types, false, false, false,
+							   &fgc_flags,
 							   &fnOid, rettype, &retset,
 							   &nvargs, &vatype,
 							   &true_oid_array, NULL);

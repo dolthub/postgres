@@ -4,7 +4,7 @@
  *	Catalog routines used by pg_dump; long ago these were shared
  *	by another dump tool, but not anymore.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -244,8 +244,8 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 	pg_log_info("reading subscriptions");
 	getSubscriptions(fout);
 
-	pg_log_info("reading subscription membership of tables");
-	getSubscriptionTables(fout);
+	pg_log_info("reading subscription membership of relations");
+	getSubscriptionRelations(fout);
 
 	free(inhinfo);				/* not needed any longer */
 
@@ -253,7 +253,8 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 	return tblinfo;
 }
 
-/* flagInhTables -
+/*
+ * flagInhTables -
  *	 Fill in parent link fields of tables for which we need that information,
  *	 mark parents of target tables as interesting, and create
  *	 TableAttachInfo objects for partitioned tables with appropriate
@@ -353,7 +354,7 @@ flagInhTables(Archive *fout, TableInfo *tblinfo, int numTables,
 						 tblinfo[i].numParents,
 						 tblinfo[i].dobj.name);
 
-			attachinfo = (TableAttachInfo *) palloc(sizeof(TableAttachInfo));
+			attachinfo = palloc_object(TableAttachInfo);
 			attachinfo->dobj.objType = DO_TABLE_ATTACH;
 			attachinfo->dobj.catId.tableoid = 0;
 			attachinfo->dobj.catId.oid = 0;
@@ -448,7 +449,8 @@ flagInhIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 	}
 }
 
-/* flagInhAttrs -
+/*
+ * flagInhAttrs -
  *	 for each dumpable table in tblinfo, flag its inherited attributes
  *
  * What we need to do here is:

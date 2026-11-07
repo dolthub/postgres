@@ -4,7 +4,7 @@
  *	  Routines to determine which indexes are usable for scanning a
  *	  given relation, and create Paths accordingly.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -15,10 +15,9 @@
  */
 #include "postgres.h"
 
-#include <math.h>
-
 #include "access/stratnum.h"
 #include "access/sysattr.h"
+#include "access/transam.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_amop.h"
 #include "catalog/pg_operator.h"
@@ -1188,7 +1187,7 @@ typedef struct
 	Oid			inputcollid;	/* OID of the OpClause input collation */
 	int			argindex;		/* index of the clause in the list of
 								 * arguments */
-	int			groupindex;		/* value of argindex for the fist clause in
+	int			groupindex;		/* value of argindex for the first clause in
 								 * the group of similar clauses */
 } OrArgIndexMatch;
 
@@ -1291,7 +1290,7 @@ group_similar_or_args(PlannerInfo *root, RelOptInfo *rel, RestrictInfo *rinfo)
 	 * which will be used to sort these arguments at the next step.
 	 */
 	i = -1;
-	matches = (OrArgIndexMatch *) palloc(sizeof(OrArgIndexMatch) * n);
+	matches = palloc_array(OrArgIndexMatch, n);
 	foreach(lc, orargs)
 	{
 		Node	   *arg = lfirst(lc);
@@ -1853,8 +1852,7 @@ choose_bitmap_and(PlannerInfo *root, RelOptInfo *rel, List *paths)
 	 * same set of clauses; keep only the cheapest-to-scan of any such groups.
 	 * The surviving paths are put into an array for qsort'ing.
 	 */
-	pathinfoarray = (PathClauseUsage **)
-		palloc(npaths * sizeof(PathClauseUsage *));
+	pathinfoarray = palloc_array(PathClauseUsage *, npaths);
 	clauselist = NIL;
 	npaths = 0;
 	foreach(l, paths)
@@ -2090,7 +2088,7 @@ classify_index_clause_usage(Path *path, List **clauselist)
 	Bitmapset  *clauseids;
 	ListCell   *lc;
 
-	result = (PathClauseUsage *) palloc(sizeof(PathClauseUsage));
+	result = palloc_object(PathClauseUsage);
 	result->path = path;
 
 	/* Recursively find the quals and preds used by the path */
@@ -2233,8 +2231,8 @@ check_index_only(RelOptInfo *rel, IndexOptInfo *index)
 	ListCell   *lc;
 	int			i;
 
-	/* Index-only scans must be enabled */
-	if (!enable_indexonlyscan)
+	/* If we're not allowed to consider index-only scans, give up now */
+	if ((rel->pgs_mask & PGS_CONSIDER_INDEXONLY) == 0)
 		return false;
 
 	/*
@@ -4128,46 +4126,25 @@ ec_member_matches_indexcol(PlannerInfo *root, RelOptInfo *rel,
  *	  a set of equality conditions, because the conditions constrain all
  *	  columns of some unique index.
  *
- * The conditions can be represented in either or both of two ways:
- * 1. A list of RestrictInfo nodes, where the caller has already determined
- * that each condition is a mergejoinable equality with an expression in
- * this relation on one side, and an expression not involving this relation
- * on the other.  The transient outer_is_left flag is used to identify which
- * side we should look at: left side if outer_is_left is false, right side
- * if it is true.
- * 2. A list of expressions in this relation, and a corresponding list of
- * equality operators. The caller must have already checked that the operators
- * represent equality.  (Note: the operators could be cross-type; the
- * expressions should correspond to their RHS inputs.)
+ * The conditions are provided as a list of RestrictInfo nodes, where the
+ * caller has already determined that each condition is a mergejoinable
+ * equality with an expression in this relation on one side, and an
+ * expression not involving this relation on the other.  The transient
+ * outer_is_left flag is used to identify which side we should look at:
+ * left side if outer_is_left is false, right side if it is true.
  *
  * The caller need only supply equality conditions arising from joins;
  * this routine automatically adds in any usable baserestrictinfo clauses.
  * (Note that the passed-in restrictlist will be destructively modified!)
+ *
+ * If extra_clauses isn't NULL, return baserestrictinfo clauses which were used
+ * to derive uniqueness.
  */
 bool
 relation_has_unique_index_for(PlannerInfo *root, RelOptInfo *rel,
-							  List *restrictlist,
-							  List *exprlist, List *oprlist)
-{
-	return relation_has_unique_index_ext(root, rel, restrictlist,
-										 exprlist, oprlist, NULL);
-}
-
-/*
- * relation_has_unique_index_ext
- *	  Same as relation_has_unique_index_for(), but supports extra_clauses
- *	  parameter.  If extra_clauses isn't NULL, return baserestrictinfo clauses
- *	  which were used to derive uniqueness.
- */
-bool
-relation_has_unique_index_ext(PlannerInfo *root, RelOptInfo *rel,
-							  List *restrictlist,
-							  List *exprlist, List *oprlist,
-							  List **extra_clauses)
+							  List *restrictlist, List **extra_clauses)
 {
 	ListCell   *ic;
-
-	Assert(list_length(exprlist) == list_length(oprlist));
 
 	/* Short-circuit if no indexes... */
 	if (rel->indexlist == NIL)
@@ -4211,7 +4188,7 @@ relation_has_unique_index_ext(PlannerInfo *root, RelOptInfo *rel,
 	}
 
 	/* Short-circuit the easy case */
-	if (restrictlist == NIL && exprlist == NIL)
+	if (restrictlist == NIL)
 		return false;
 
 	/* Examine each index of the relation ... */
@@ -4233,14 +4210,12 @@ relation_has_unique_index_ext(PlannerInfo *root, RelOptInfo *rel,
 			continue;
 
 		/*
-		 * Try to find each index column in the lists of conditions.  This is
+		 * Try to find each index column in the list of conditions.  This is
 		 * O(N^2) or worse, but we expect all the lists to be short.
 		 */
 		for (c = 0; c < ind->nkeycolumns; c++)
 		{
-			bool		matched = false;
 			ListCell   *lc;
-			ListCell   *lc2;
 
 			foreach(lc, restrictlist)
 			{
@@ -4273,8 +4248,6 @@ relation_has_unique_index_ext(PlannerInfo *root, RelOptInfo *rel,
 
 				if (match_index_to_operand(rexpr, c, ind))
 				{
-					matched = true; /* column is unique */
-
 					if (bms_membership(rinfo->clause_relids) == BMS_SINGLETON)
 					{
 						MemoryContext oldMemCtx =
@@ -4292,46 +4265,11 @@ relation_has_unique_index_ext(PlannerInfo *root, RelOptInfo *rel,
 						MemoryContextSwitchTo(oldMemCtx);
 					}
 
-					break;
+					break;		/* found a match; column is unique */
 				}
 			}
 
-			if (matched)
-				continue;
-
-			forboth(lc, exprlist, lc2, oprlist)
-			{
-				Node	   *expr = (Node *) lfirst(lc);
-				Oid			opr = lfirst_oid(lc2);
-
-				/* See if the expression matches the index key */
-				if (!match_index_to_operand(expr, c, ind))
-					continue;
-
-				/*
-				 * The equality operator must be a member of the index
-				 * opfamily, else it is not asserting the right kind of
-				 * equality behavior for this index.  We assume the caller
-				 * determined it is an equality operator, so we don't need to
-				 * check any more tightly than this.
-				 */
-				if (!op_in_opfamily(opr, ind->opfamily[c]))
-					continue;
-
-				/*
-				 * The index's collation must agree with the operand's
-				 * collation on equality, else the index's uniqueness does not
-				 * imply uniqueness under the operator's equality semantics.
-				 */
-				if (!collations_agree_on_equality(ind->indexcollations[c],
-												  exprCollation(expr)))
-					continue;
-
-				matched = true; /* column is unique */
-				break;
-			}
-
-			if (!matched)
+			if (lc == NULL)
 				break;			/* no match; this index doesn't help us */
 		}
 
@@ -4489,19 +4427,6 @@ match_index_to_operand(Node *operand,
 	}
 
 	return false;
-}
-
-/*
- * strip_phvs_in_index_operand
- *
- * Retained as a backward-compatibility wrapper around strip_noop_phvs() to
- * avoid breaking third-party extensions that may reference this function.  New
- * code should call strip_noop_phvs() directly.
- */
-Node *
-strip_phvs_in_index_operand(Node *operand)
-{
-	return strip_noop_phvs(operand);
 }
 
 /*

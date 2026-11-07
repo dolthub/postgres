@@ -3,7 +3,7 @@
  * sequence.c
  *	  PostgreSQL sequences support code.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,39 +14,37 @@
  */
 #include "postgres.h"
 
-#include "access/bufmask.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
 #include "access/relation.h"
 #include "access/sequence.h"
-#include "access/doltcatalog.h"
 #include "access/table.h"
 #include "access/transam.h"
 #include "access/xact.h"
-#include "access/xlog.h"
 #include "access/xloginsert.h"
-#include "access/xlogutils.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_sequence.h"
-#include "catalog/catalogview.h"
 #include "catalog/pg_type.h"
 #include "catalog/storage_xlog.h"
 #include "commands/defrem.h"
 #include "commands/sequence.h"
+#include "commands/sequence_xlog.h"
 #include "commands/tablecmds.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "parser/parse_type.h"
+#include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "storage/proc.h"
 #include "storage/smgr.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/pg_lsn.h"
 #include "utils/resowner.h"
 #include "utils/syscache.h"
 #include "utils/varlena.h"
@@ -58,16 +56,6 @@
  * crash we can lose (skip over) as many values as we pre-logged.
  */
 #define SEQ_LOG_VALS	32
-
-/*
- * The "special area" of a sequence's buffer page looks like this.
- */
-#define SEQ_MAGIC	  0x1717
-
-typedef struct sequence_magic
-{
-	uint32		magic;
-} sequence_magic;
 
 /*
  * We store a SeqTable item for every sequence we have touched in the current
@@ -106,12 +94,13 @@ static void init_sequence(Oid relid, SeqTable *p_elm, Relation *p_rel);
 static Form_pg_sequence_data read_seq_tuple(Relation rel,
 											Buffer *buf, HeapTuple seqdatatuple);
 static void init_params(ParseState *pstate, List *options, bool for_identity,
-						bool isInit, bool check_state,
+						bool isInit,
 						Form_pg_sequence seqform,
-						Form_pg_sequence_data seqdataform,
+						int64 *last_value,
+						bool *reset_state,
+						bool *is_called,
 						bool *need_seq_rewrite,
 						List **owned_by);
-static void do_setval(Oid relid, int64 next, bool iscalled);
 static void process_owned_by(Relation seqrel, List *owned_by, bool for_identity);
 
 
@@ -123,7 +112,9 @@ ObjectAddress
 DefineSequence(ParseState *pstate, CreateSeqStmt *seq)
 {
 	FormData_pg_sequence seqform;
-	FormData_pg_sequence_data seqdataform;
+	int64		last_value;
+	bool		reset_state;
+	bool		is_called;
 	bool		need_seq_rewrite;
 	List	   *owned_by;
 	CreateStmt *stmt = makeNode(CreateStmt);
@@ -165,8 +156,8 @@ DefineSequence(ParseState *pstate, CreateSeqStmt *seq)
 	}
 
 	/* Check and set all option values */
-	init_params(pstate, seq->options, seq->for_identity, true, true,
-				&seqform, &seqdataform,
+	init_params(pstate, seq->options, seq->for_identity, true,
+				&seqform, &last_value, &reset_state, &is_called,
 				&need_seq_rewrite, &owned_by);
 
 	/*
@@ -181,7 +172,7 @@ DefineSequence(ParseState *pstate, CreateSeqStmt *seq)
 		{
 			case SEQ_COL_LASTVAL:
 				coldef = makeColumnDef("last_value", INT8OID, -1, InvalidOid);
-				value[i - 1] = Int64GetDatumFast(seqdataform.last_value);
+				value[i - 1] = Int64GetDatumFast(last_value);
 				break;
 			case SEQ_COL_LOG:
 				coldef = makeColumnDef("log_cnt", INT8OID, -1, InvalidOid);
@@ -216,8 +207,7 @@ DefineSequence(ParseState *pstate, CreateSeqStmt *seq)
 
 	/* now initialize the sequence's data */
 	tuple = heap_form_tuple(tupDesc, value, null);
-	if (!CatalogViewIsProvisional(rel->rd_catalogview))
-		fill_seq_with_data(rel, tuple);
+	fill_seq_with_data(rel, tuple);
 
 	/* process OWNED BY if given */
 	if (owned_by)
@@ -402,8 +392,7 @@ fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber forkNum)
 
 	MarkBufferDirty(buf);
 
-	offnum = PageAddItem(page, (Item) tuple->t_data, tuple->t_len,
-						 InvalidOffsetNumber, false, false);
+	offnum = PageAddItem(page, tuple->t_data, tuple->t_len, InvalidOffsetNumber, false, false);
 	if (offnum != FirstOffsetNumber)
 		elog(ERROR, "failed to add sequence tuple to page");
 
@@ -431,85 +420,6 @@ fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber forkNum)
 	UnlockReleaseBuffer(buf);
 }
 
-void
-SequenceSetOwnedBy(Relation rel, List *owned_by, bool for_identity)
-{
-	process_owned_by(rel, owned_by, for_identity);
-}
-
-/* Initialize and inspect a catalog-independent allocator using native WAL. */
-void
-SequenceInitializeResource(Relation rel, int64 start, bool called)
-{
-	TupleDesc	desc = CreateTemplateTupleDesc(3);
-	Datum		values[3] = {Int64GetDatum(start), Int64GetDatum(0), BoolGetDatum(called)};
-	bool		nulls[3] = {false};
-	HeapTuple	tuple;
-
-	TupleDescInitEntry(desc, 1, "last_value", INT8OID, -1, 0);
-	TupleDescInitEntry(desc, 2, "log_cnt", INT8OID, -1, 0);
-	TupleDescInitEntry(desc, 3, "is_called", BOOLOID, -1, 0);
-	tuple = heap_form_tuple(desc, values, nulls);
-	fill_seq_with_data(rel, tuple);
-	heap_freetuple(tuple);
-	FreeTupleDesc(desc);
-}
-
-void
-SequenceReadResource(Relation rel, int64 *last, bool *called)
-{
-	Buffer		buffer;
-	HeapTupleData tuple;
-	Form_pg_sequence_data data = read_seq_tuple(rel, &buffer, &tuple);
-
-	*last = data->last_value;
-	*called = data->is_called;
-	UnlockReleaseBuffer(buffer);
-}
-
-void
-SequenceCheckState(int64 last, int64 min, int64 max)
-{
-	if (last < min)
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			errmsg("RESTART value (%" PRId64 ") cannot be less than MINVALUE (%" PRId64 ")", last, min)));
-	if (last > max)
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			errmsg("RESTART value (%" PRId64 ") cannot be greater than MAXVALUE (%" PRId64 ")", last, max)));
-}
-
-/* Validate and change a provisional sequence definition without touching its
- * allocator. The branch publisher owns the transactional state replacement. */
-void
-SequenceAlterDefinition(ParseState *pstate, Oid id, AlterSeqStmt *stmt,
-						int64 *last, bool *called)
-{
-	Relation	seqrel = sequence_open(id, NoLock);
-	Relation	catalog = table_open(SequenceRelationId, RowExclusiveLock);
-	HeapTuple	tuple = SearchSysCacheCopy1(SEQRELID, ObjectIdGetDatum(id));
-	FormData_pg_sequence_data data = {0};
-	bool		rewrite;
-	List	   *owned;
-
-	Assert(CatalogViewIsProvisional(seqrel->rd_catalogview));
-	if (!object_ownercheck(RelationRelationId, id, GetUserId()))
-		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_SEQUENCE, RelationGetRelationName(seqrel));
-	if (!HeapTupleIsValid(tuple))
-		elog(ERROR, "sequence definition is missing");
-	data.last_value = *last;
-	data.is_called = *called;
-	init_params(pstate, stmt->options, stmt->for_identity, false, false,
-				(Form_pg_sequence) GETSTRUCT(tuple), &data, &rewrite, &owned);
-	if (owned)
-		process_owned_by(seqrel, owned, stmt->for_identity);
-	CatalogTupleUpdate(catalog, &tuple->t_self, tuple);
-	*last = data.last_value;
-	*called = data.is_called;
-	heap_freetuple(tuple);
-	table_close(catalog, RowExclusiveLock);
-	sequence_close(seqrel, NoLock);
-}
-
 /*
  * AlterSequence
  *
@@ -530,6 +440,9 @@ AlterSequence(ParseState *pstate, AlterSeqStmt *stmt)
 	ObjectAddress address;
 	Relation	rel;
 	HeapTuple	seqtuple;
+	bool		reset_state = false;
+	bool		is_called;
+	int64		last_value;
 	HeapTuple	newdatatuple;
 
 	/* Open and lock sequence, and check for ownership along the way. */
@@ -563,12 +476,14 @@ AlterSequence(ParseState *pstate, AlterSeqStmt *stmt)
 	/* copy the existing sequence data tuple, so it can be modified locally */
 	newdatatuple = heap_copytuple(&datatuple);
 	newdataform = (Form_pg_sequence_data) GETSTRUCT(newdatatuple);
+	last_value = newdataform->last_value;
+	is_called = newdataform->is_called;
 
 	UnlockReleaseBuffer(buf);
 
 	/* Check and set new values */
-	init_params(pstate, stmt->options, stmt->for_identity, false, true,
-				seqform, newdataform,
+	init_params(pstate, stmt->options, stmt->for_identity, false,
+				seqform, &last_value, &reset_state, &is_called,
 				&need_seq_rewrite, &owned_by);
 
 	/* If needed, rewrite the sequence relation itself */
@@ -595,6 +510,10 @@ AlterSequence(ParseState *pstate, AlterSeqStmt *stmt)
 		/*
 		 * Insert the modified tuple into the new storage file.
 		 */
+		newdataform->last_value = last_value;
+		newdataform->is_called = is_called;
+		if (reset_state)
+			newdataform->log_cnt = 0;
 		fill_seq_with_data(seqrel, newdatatuple);
 	}
 
@@ -735,8 +654,6 @@ nextval_internal(Oid relid, bool check_permissions)
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied for sequence %s",
 						RelationGetRelationName(seqrel))));
-
-	dg_catalog_sequence_check(seqrel);
 
 	/* read-only transactions may only modify temp sequences */
 	if (!seqrel->rd_islocaltemp)
@@ -1025,8 +942,8 @@ lastval(PG_FUNCTION_ARGS)
  * it is the only way to clear the is_called flag in an existing
  * sequence.
  */
-static void
-do_setval(Oid relid, int64 next, bool iscalled)
+void
+SetSequence(Oid relid, int64 next, bool iscalled)
 {
 	SeqTable	elm;
 	Relation	seqrel;
@@ -1054,8 +971,6 @@ do_setval(Oid relid, int64 next, bool iscalled)
 	maxv = pgsform->seqmax;
 	minv = pgsform->seqmin;
 	ReleaseSysCache(pgstuple);
-
-	dg_catalog_sequence_check(seqrel);
 
 	/* read-only transactions may only modify temp sequences */
 	if (!seqrel->rd_islocaltemp)
@@ -1129,7 +1044,7 @@ do_setval(Oid relid, int64 next, bool iscalled)
 
 /*
  * Implement the 2 arg setval procedure.
- * See do_setval for discussion.
+ * See SetSequence for discussion.
  */
 Datum
 setval_oid(PG_FUNCTION_ARGS)
@@ -1137,14 +1052,14 @@ setval_oid(PG_FUNCTION_ARGS)
 	Oid			relid = PG_GETARG_OID(0);
 	int64		next = PG_GETARG_INT64(1);
 
-	do_setval(relid, next, true);
+	SetSequence(relid, next, true);
 
 	PG_RETURN_INT64(next);
 }
 
 /*
  * Implement the 3 arg setval procedure.
- * See do_setval for discussion.
+ * See SetSequence for discussion.
  */
 Datum
 setval3_oid(PG_FUNCTION_ARGS)
@@ -1153,7 +1068,7 @@ setval3_oid(PG_FUNCTION_ARGS)
 	int64		next = PG_GETARG_INT64(1);
 	bool		iscalled = PG_GETARG_BOOL(2);
 
-	do_setval(relid, next, iscalled);
+	SetSequence(relid, next, iscalled);
 
 	PG_RETURN_INT64(next);
 }
@@ -1322,17 +1237,19 @@ read_seq_tuple(Relation rel, Buffer *buf, HeapTuple seqdatatuple)
 /*
  * init_params: process the options list of CREATE or ALTER SEQUENCE, and
  * store the values into appropriate fields of seqform, for changes that go
- * into the pg_sequence catalog, and fields of seqdataform for changes to the
- * sequence relation itself.  Set *need_seq_rewrite to true if we changed any
- * parameters that require rewriting the sequence's relation (interesting for
- * ALTER SEQUENCE).  Also set *owned_by to any OWNED BY option, or to NIL if
- * there is none.
+ * into the pg_sequence catalog, and fields for changes to the sequence
+ * relation itself (*is_called, *last_value and *reset_state).  Set
+ * *need_seq_rewrite to true if we changed any parameters that require
+ * rewriting the sequence's relation (interesting for ALTER SEQUENCE).  Also
+ * set *owned_by to any OWNED BY option, or to NIL if there is none.  Set
+ * *reset_state to true if the internal state of the sequence needs to be
+ * reset, affecting future nextval() calls, for example with WAL logging.
  *
  * If isInit is true, fill any unspecified options with default values;
  * otherwise, do not change existing options that aren't explicitly overridden.
  *
  * Note: we force a sequence rewrite whenever we change parameters that affect
- * generation of future sequence values, even if the seqdataform per se is not
+ * generation of future sequence values, even if the metadata per se is not
  * changed.  This allows ALTER SEQUENCE to behave transactionally.  Currently,
  * the only option that doesn't cause that is OWNED BY.  It's *necessary* for
  * ALTER SEQUENCE OWNED BY to not rewrite the sequence, because that would
@@ -1341,9 +1258,11 @@ read_seq_tuple(Relation rel, Buffer *buf, HeapTuple seqdatatuple)
  */
 static void
 init_params(ParseState *pstate, List *options, bool for_identity,
-			bool isInit, bool check_state,
+			bool isInit,
 			Form_pg_sequence seqform,
-			Form_pg_sequence_data seqdataform,
+			int64 *last_value,
+			bool *reset_state,
+			bool *is_called,
 			bool *need_seq_rewrite,
 			List **owned_by)
 {
@@ -1449,11 +1368,11 @@ init_params(ParseState *pstate, List *options, bool for_identity,
 	}
 
 	/*
-	 * We must reset log_cnt when isInit or when changing any parameters that
-	 * would affect future nextval allocations.
+	 * We must reset the state of the sequence when isInit or when changing
+	 * any parameters that would affect future nextval allocations.
 	 */
 	if (isInit)
-		seqdataform->log_cnt = 0;
+		*reset_state = true;
 
 	/* AS type */
 	if (as_type != NULL)
@@ -1502,7 +1421,7 @@ init_params(ParseState *pstate, List *options, bool for_identity,
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("INCREMENT must not be zero")));
-		seqdataform->log_cnt = 0;
+		*reset_state = true;
 	}
 	else if (isInit)
 	{
@@ -1514,7 +1433,7 @@ init_params(ParseState *pstate, List *options, bool for_identity,
 	{
 		seqform->seqcycle = boolVal(is_cycled->arg);
 		Assert(BoolIsValid(seqform->seqcycle));
-		seqdataform->log_cnt = 0;
+		*reset_state = true;
 	}
 	else if (isInit)
 	{
@@ -1525,7 +1444,7 @@ init_params(ParseState *pstate, List *options, bool for_identity,
 	if (max_value != NULL && max_value->arg)
 	{
 		seqform->seqmax = defGetInt64(max_value);
-		seqdataform->log_cnt = 0;
+		*reset_state = true;
 	}
 	else if (isInit || max_value != NULL || reset_max_value)
 	{
@@ -1541,7 +1460,7 @@ init_params(ParseState *pstate, List *options, bool for_identity,
 		}
 		else
 			seqform->seqmax = -1;	/* descending seq */
-		seqdataform->log_cnt = 0;
+		*reset_state = true;
 	}
 
 	/* Validate maximum value.  No need to check INT8 as seqmax is an int64 */
@@ -1557,7 +1476,7 @@ init_params(ParseState *pstate, List *options, bool for_identity,
 	if (min_value != NULL && min_value->arg)
 	{
 		seqform->seqmin = defGetInt64(min_value);
-		seqdataform->log_cnt = 0;
+		*reset_state = true;
 	}
 	else if (isInit || min_value != NULL || reset_min_value)
 	{
@@ -1573,7 +1492,7 @@ init_params(ParseState *pstate, List *options, bool for_identity,
 		}
 		else
 			seqform->seqmin = 1;	/* ascending seq */
-		seqdataform->log_cnt = 0;
+		*reset_state = true;
 	}
 
 	/* Validate minimum value.  No need to check INT8 as seqmin is an int64 */
@@ -1624,22 +1543,31 @@ init_params(ParseState *pstate, List *options, bool for_identity,
 	if (restart_value != NULL)
 	{
 		if (restart_value->arg != NULL)
-			seqdataform->last_value = defGetInt64(restart_value);
+			*last_value = defGetInt64(restart_value);
 		else
-			seqdataform->last_value = seqform->seqstart;
-		seqdataform->is_called = false;
-		seqdataform->log_cnt = 0;
+			*last_value = seqform->seqstart;
+		*is_called = false;
+		*reset_state = true;
 	}
 	else if (isInit)
 	{
-		seqdataform->last_value = seqform->seqstart;
-		seqdataform->is_called = false;
+		*last_value = seqform->seqstart;
+		*is_called = false;
 	}
 
-	/* Provisional ALTER checks the effective allocator after choosing whether
-	 * to join an existing definition or initialize a new counter. */
-	if (check_state)
-		SequenceCheckState(seqdataform->last_value, seqform->seqmin, seqform->seqmax);
+	/* crosscheck RESTART (or current value, if changing MIN/MAX) */
+	if (*last_value < seqform->seqmin)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("RESTART value (%" PRId64 ") cannot be less than MINVALUE (%" PRId64 ")",
+						*last_value,
+						seqform->seqmin)));
+	if (*last_value > seqform->seqmax)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("RESTART value (%" PRId64 ") cannot be greater than MAXVALUE (%" PRId64 ")",
+						*last_value,
+						seqform->seqmax)));
 
 	/* CACHE */
 	if (cache_value != NULL)
@@ -1650,7 +1578,7 @@ init_params(ParseState *pstate, List *options, bool for_identity,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("CACHE (%" PRId64 ") must be greater than zero",
 							seqform->seqcache)));
-		seqdataform->log_cnt = 0;
+		*reset_state = true;
 	}
 	else if (isInit)
 	{
@@ -1855,15 +1783,16 @@ pg_sequence_parameters(PG_FUNCTION_ARGS)
 
 
 /*
- * Return the sequence tuple.
+ * Return the sequence tuple along with its page LSN.
  *
- * This is primarily intended for use by pg_dump to gather sequence data
- * without needing to individually query each sequence relation.
+ * This is primarily used by pg_dump to efficiently collect sequence data
+ * without querying each sequence individually, and is also leveraged by
+ * logical replication while synchronizing sequences.
  */
 Datum
 pg_get_sequence_data(PG_FUNCTION_ARGS)
 {
-#define PG_GET_SEQUENCE_DATA_COLS	2
+#define PG_GET_SEQUENCE_DATA_COLS	3
 	Oid			relid = PG_GETARG_OID(0);
 	Relation	seqrel;
 	Datum		values[PG_GET_SEQUENCE_DATA_COLS] = {0};
@@ -1877,6 +1806,9 @@ pg_get_sequence_data(PG_FUNCTION_ARGS)
 					   INT8OID, -1, 0);
 	TupleDescInitEntry(resultTupleDesc, (AttrNumber) 2, "is_called",
 					   BOOLOID, -1, 0);
+	TupleDescInitEntry(resultTupleDesc, (AttrNumber) 3, "page_lsn",
+					   LSNOID, -1, 0);
+	TupleDescFinalize(resultTupleDesc);
 	resultTupleDesc = BlessTupleDesc(resultTupleDesc);
 
 	seqrel = try_relation_open(relid, AccessShareLock);
@@ -1894,22 +1826,16 @@ pg_get_sequence_data(PG_FUNCTION_ARGS)
 		Buffer		buf;
 		HeapTupleData seqtuple;
 		Form_pg_sequence_data seq;
+		Page		page;
 
-		int64		last;
-		bool		called;
+		seq = read_seq_tuple(seqrel, &buf, &seqtuple);
+		page = BufferGetPage(buf);
 
-		if (dg_catalog_sequence_retained(seqrel, &last, &called))
-		{
-			values[0] = Int64GetDatum(last);
-			values[1] = BoolGetDatum(called);
-		}
-		else
-		{
-			seq = read_seq_tuple(seqrel, &buf, &seqtuple);
-			values[0] = Int64GetDatum(seq->last_value);
-			values[1] = BoolGetDatum(seq->is_called);
-			UnlockReleaseBuffer(buf);
-		}
+		values[0] = Int64GetDatum(seq->last_value);
+		values[1] = BoolGetDatum(seq->is_called);
+		values[2] = LSNGetDatum(PageGetLSN(page));
+
+		UnlockReleaseBuffer(buf);
 	}
 	else
 		memset(isnull, true, sizeof(isnull));
@@ -1958,13 +1884,12 @@ pg_sequence_last_value(PG_FUNCTION_ARGS)
 		HeapTupleData seqtuple;
 		Form_pg_sequence_data seq;
 
-		if (!dg_catalog_sequence_retained(seqrel, &result, &is_called))
-		{
-			seq = read_seq_tuple(seqrel, &buf, &seqtuple);
-			is_called = seq->is_called;
-			result = seq->last_value;
-			UnlockReleaseBuffer(buf);
-		}
+		seq = read_seq_tuple(seqrel, &buf, &seqtuple);
+
+		is_called = seq->is_called;
+		result = seq->last_value;
+
+		UnlockReleaseBuffer(buf);
 	}
 	sequence_close(seqrel, NoLock);
 
@@ -1972,58 +1897,6 @@ pg_sequence_last_value(PG_FUNCTION_ARGS)
 		PG_RETURN_INT64(result);
 	else
 		PG_RETURN_NULL();
-}
-
-
-void
-seq_redo(XLogReaderState *record)
-{
-	XLogRecPtr	lsn = record->EndRecPtr;
-	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
-	Buffer		buffer;
-	Page		page;
-	Page		localpage;
-	char	   *item;
-	Size		itemsz;
-	xl_seq_rec *xlrec = (xl_seq_rec *) XLogRecGetData(record);
-	sequence_magic *sm;
-
-	if (info != XLOG_SEQ_LOG)
-		elog(PANIC, "seq_redo: unknown op code %u", info);
-
-	buffer = XLogInitBufferForRedo(record, 0);
-	page = (Page) BufferGetPage(buffer);
-
-	/*
-	 * We always reinit the page.  However, since this WAL record type is also
-	 * used for updating sequences, it's possible that a hot-standby backend
-	 * is examining the page concurrently; so we mustn't transiently trash the
-	 * buffer.  The solution is to build the correct new page contents in
-	 * local workspace and then memcpy into the buffer.  Then only bytes that
-	 * are supposed to change will change, even transiently. We must palloc
-	 * the local page for alignment reasons.
-	 */
-	localpage = (Page) palloc(BufferGetPageSize(buffer));
-
-	PageInit(localpage, BufferGetPageSize(buffer), sizeof(sequence_magic));
-	sm = (sequence_magic *) PageGetSpecialPointer(localpage);
-	sm->magic = SEQ_MAGIC;
-
-	item = (char *) xlrec + sizeof(xl_seq_rec);
-	itemsz = XLogRecGetDataLen(record) - sizeof(xl_seq_rec);
-
-	if (PageAddItem(localpage, (Item) item, itemsz,
-					FirstOffsetNumber, false, false) == InvalidOffsetNumber)
-		elog(PANIC, "seq_redo: failed to add item to page");
-
-	PageSetLSN(localpage, lsn);
-
-	memcpy(page, localpage, BufferGetPageSize(buffer));
-	MarkBufferDirty(buffer);
-	XLogFlushBufferForRedoIfInit(record, 0, buffer);
-	UnlockReleaseBuffer(buffer);
-
-	pfree(localpage);
 }
 
 /*
@@ -2039,15 +1912,4 @@ ResetSequenceCaches(void)
 	}
 
 	last_used_seq = NULL;
-}
-
-/*
- * Mask a Sequence page before performing consistency checks on it.
- */
-void
-seq_mask(char *page, BlockNumber blkno)
-{
-	mask_page_lsn_and_checksum(page);
-
-	mask_unused_space(page);
 }

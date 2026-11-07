@@ -3,7 +3,7 @@
  * nbtpreprocesskeys.c
  *	  Preprocessing for Postgres btree scan keys.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -16,11 +16,13 @@
 #include "postgres.h"
 
 #include "access/nbtree.h"
+#include "access/relscan.h"
 #include "common/int.h"
 #include "lib/qunique.h"
 #include "utils/array.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
 
 typedef struct BTScanKeyPreproc
 {
@@ -65,7 +67,7 @@ static int	_bt_num_array_keys(IndexScanDesc scan, Oid *skip_eq_ops_out,
 							   int *numSkipArrayKeys_out);
 static Datum _bt_find_extreme_element(IndexScanDesc scan, ScanKey skey,
 									  Oid elemtype, StrategyNumber strat,
-									  Datum *elems, int nelems);
+									  const Datum *elems, int nelems);
 static void _bt_setup_array_cmp(IndexScanDesc scan, ScanKey skey, Oid elemtype,
 								FmgrInfo *orderproc, FmgrInfo **sortprocp);
 static int	_bt_sort_array_elements(ScanKey skey, FmgrInfo *sortproc,
@@ -731,14 +733,11 @@ _bt_fix_scankey_strategy(ScanKey skey, int16 *indoption)
 	/* If it's a row header, fix row member flags and strategies similarly */
 	if (skey->sk_flags & SK_ROW_HEADER)
 	{
+		bool		satisfiable;
 		ScanKey		subkey = (ScanKey) DatumGetPointer(skey->sk_argument);
 
-		if (subkey->sk_flags & SK_ISNULL)
-		{
-			/* First row member is NULL, so RowCompare is unsatisfiable */
-			Assert(subkey->sk_flags & SK_ROW_MEMBER);
-			return false;
-		}
+		/* If first row member is NULL, RowCompare is unsatisfiable */
+		satisfiable = !(subkey->sk_flags & SK_ISNULL);
 
 		for (;;)
 		{
@@ -751,6 +750,8 @@ _bt_fix_scankey_strategy(ScanKey skey, int16 *indoption)
 				break;
 			subkey++;
 		}
+
+		return satisfiable;
 	}
 
 	return true;
@@ -1196,7 +1197,7 @@ _bt_saoparray_shrink(IndexScanDesc scan, ScanKey arraysk, ScanKey skey,
 	{
 		case BTLessStrategyNumber:
 			cmpexact = 1;		/* exclude exact match, if any */
-			/* FALL THRU */
+			pg_fallthrough;
 		case BTLessEqualStrategyNumber:
 			if (cmpresult >= cmpexact)
 				matchelem++;
@@ -1218,7 +1219,7 @@ _bt_saoparray_shrink(IndexScanDesc scan, ScanKey arraysk, ScanKey skey,
 			break;
 		case BTGreaterEqualStrategyNumber:
 			cmpexact = 1;		/* include exact match, if any */
-			/* FALL THRU */
+			pg_fallthrough;
 		case BTGreaterStrategyNumber:
 			if (cmpresult >= cmpexact)
 				matchelem++;
@@ -1790,8 +1791,8 @@ _bt_unmark_keys(IndexScanDesc scan, int *keyDataMap)
 static int
 _bt_reorder_array_cmp(const void *a, const void *b)
 {
-	BTArrayKeyInfo *arraya = (BTArrayKeyInfo *) a;
-	BTArrayKeyInfo *arrayb = (BTArrayKeyInfo *) b;
+	const BTArrayKeyInfo *arraya = a;
+	const BTArrayKeyInfo *arrayb = b;
 
 	return pg_cmp_s32(arraya->scan_key, arrayb->scan_key);
 }
@@ -2576,7 +2577,7 @@ _bt_num_array_keys(IndexScanDesc scan, Oid *skip_eq_ops_out,
 static Datum
 _bt_find_extreme_element(IndexScanDesc scan, ScanKey skey, Oid elemtype,
 						 StrategyNumber strat,
-						 Datum *elems, int nelems)
+						 const Datum *elems, int nelems)
 {
 	Relation	rel = scan->indexRelation;
 	Oid			cmp_op;

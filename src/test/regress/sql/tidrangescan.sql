@@ -96,6 +96,74 @@ FETCH FIRST c;
 FETCH LAST c;
 COMMIT;
 
+-- Ensure TID Range Scans with scrollable cursors count blocks correctly.
+BEGIN;
+DECLARE c SCROLL CURSOR FOR SELECT ctid FROM tidrangescan WHERE ctid >= '(0,1)' AND ctid <= '(2,10)';
+MOVE FORWARD 25 c;
+MOVE BACKWARD 4 c;
+FETCH BACKWARD 1 c;
+MOVE BACKWARD ALL c;
+FETCH FORWARD 1 c;
+MOVE FORWARD ALL c;
+FETCH BACKWARD 1 c;
+COMMIT;
+
 DROP TABLE tidrangescan;
 
+-- Tests for parallel TID Range Scans
+BEGIN;
+
+SET LOCAL parallel_setup_cost TO 0;
+SET LOCAL parallel_tuple_cost TO 0;
+SET LOCAL min_parallel_table_scan_size TO 0;
+SET LOCAL max_parallel_workers_per_gather TO 4;
+
+CREATE TABLE parallel_tidrangescan (id integer, data text)
+WITH (fillfactor = 10);
+
+-- Insert enough tuples such that each page gets 5 tuples with fillfactor = 10
+INSERT INTO parallel_tidrangescan
+SELECT i, repeat('x', 100) FROM generate_series(1,200) AS s(i);
+
+-- Ensure there are 40 pages for parallel test
+SELECT min(ctid), max(ctid) FROM parallel_tidrangescan;
+
+-- Parallel range scans with upper bound
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM parallel_tidrangescan WHERE ctid < '(30,1)';
+SELECT count(*) FROM parallel_tidrangescan WHERE ctid < '(30,1)';
+
+-- Parallel range scans with lower bound
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM parallel_tidrangescan WHERE ctid > '(10,0)';
+SELECT count(*) FROM parallel_tidrangescan WHERE ctid > '(10,0)';
+
+-- Parallel range scans with both bounds
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM parallel_tidrangescan WHERE ctid > '(10,0)' AND ctid < '(30,1)';
+SELECT count(*) FROM parallel_tidrangescan WHERE ctid > '(10,0)' AND ctid < '(30,1)';
+
+-- Parallel rescans
+EXPLAIN (COSTS OFF)
+SELECT t.ctid,t2.c FROM parallel_tidrangescan t,
+LATERAL (SELECT count(*) c FROM parallel_tidrangescan t2 WHERE t2.ctid <= t.ctid) t2
+WHERE t.ctid < '(1,0)';
+
+SELECT t.ctid,t2.c FROM parallel_tidrangescan t,
+LATERAL (SELECT count(*) c FROM parallel_tidrangescan t2 WHERE t2.ctid <= t.ctid) t2
+WHERE t.ctid < '(1,0)';
+
+-- Parallel rescans with a different TID range on each rescan
+EXPLAIN (COSTS OFF)
+SELECT r.lo,
+       (SELECT count(*) FROM parallel_tidrangescan t
+        WHERE t.ctid >= (SELECT r.lo)) c
+FROM (VALUES ('(30,0)'::tid), ('(10,0)'), ('(0,0)')) r(lo);
+
+SELECT r.lo,
+       (SELECT count(*) FROM parallel_tidrangescan t
+        WHERE t.ctid >= (SELECT r.lo)) c
+FROM (VALUES ('(30,0)'::tid), ('(10,0)'), ('(0,0)')) r(lo);
+
+ROLLBACK;
 RESET enable_seqscan;

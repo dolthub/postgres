@@ -1,4 +1,5 @@
-/* dynamic SQL support routines
+/*
+ * dynamic SQL support routines
  *
  * src/interfaces/ecpg/ecpglib/descriptor.c
  */
@@ -113,7 +114,7 @@ get_int_item(int lineno, void *var, enum ECPGttype vartype, int value)
 			*(short *) var = (short) value;
 			break;
 		case ECPGt_int:
-			*(int *) var = (int) value;
+			*(int *) var = value;
 			break;
 		case ECPGt_long:
 			*(long *) var = (long) value;
@@ -231,7 +232,7 @@ get_char_item(int lineno, void *var, enum ECPGttype vartype, char *value, int va
 				}
 
 bool
-ECPGget_desc(int lineno, const char *desc_name, int index,...)
+ECPGget_desc(int lineno, const char *desc_name, int index, ...)
 {
 	va_list		args;
 	PGresult   *ECPGresult;
@@ -240,8 +241,9 @@ ECPGget_desc(int lineno, const char *desc_name, int index,...)
 				act_tuple;
 	struct variable data_var;
 	struct sqlca_t *sqlca = ECPGget_sqlca();
+	bool		alloc_failed = (sqlca == NULL);
 
-	if (sqlca == NULL)
+	if (alloc_failed)
 	{
 		ecpg_raise(lineno, ECPG_OUT_OF_MEMORY,
 				   ECPG_SQLSTATE_ECPG_OUT_OF_MEMORY, NULL);
@@ -503,7 +505,14 @@ ECPGget_desc(int lineno, const char *desc_name, int index,...)
 #ifdef WIN32
 		stmt.oldthreadlocale = _configthreadlocale(_ENABLE_PER_THREAD_LOCALE);
 #endif
-		stmt.oldlocale = ecpg_strdup(setlocale(LC_NUMERIC, NULL), lineno);
+		stmt.oldlocale = ecpg_strdup(setlocale(LC_NUMERIC, NULL),
+									 lineno, &alloc_failed);
+		if (alloc_failed)
+		{
+			va_end(args);
+			return false;
+		}
+
 		setlocale(LC_NUMERIC, "C");
 #endif
 
@@ -610,7 +619,7 @@ set_desc_attr(struct descriptor_item *desc_item, struct variable *var,
 
 
 bool
-ECPGset_desc(int lineno, const char *desc_name, int index,...)
+ECPGset_desc(int lineno, const char *desc_name, int index, ...)
 {
 	va_list		args;
 	struct descriptor *desc;
@@ -852,7 +861,7 @@ ecpg_find_desc(int line, const char *name)
 }
 
 bool
-ECPGdescribe(int line, int compat, bool input, const char *connection_name, const char *stmt_name,...)
+ECPGdescribe(int line, int compat, bool input, const char *connection_name, const char *stmt_name, ...)
 {
 	bool		ret = false;
 	struct connection *con;

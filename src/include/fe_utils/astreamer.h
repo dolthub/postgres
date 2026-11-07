@@ -21,7 +21,7 @@
  * make further decisions about how to process the data; for example,
  * it might choose to modify the archive contents.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/include/fe_utils/astreamer.h
@@ -67,6 +67,20 @@ typedef enum
 	ASTREAMER_MEMBER_TRAILER,
 	ASTREAMER_ARCHIVE_TRAILER,
 } astreamer_archive_context;
+
+/*
+ * State of the most recently processed compressed frame.  When decompression
+ * requires more input data to complete, or a bigger output buffer to store
+ * the result, the state is set to ASTREAMER_FRAME_INCOMPLETE.  Exactly how to
+ * resolve an incomplete state is compression library dependent.  Before a
+ * stream has decompressed any frames, its state is ASTREAMER_STREAM_NEW.
+ */
+typedef enum
+{
+	ASTREAMER_STREAM_NEW,
+	ASTREAMER_FRAME_INCOMPLETE,
+	ASTREAMER_FRAME_COMPLETE,
+} astreamer_decompression_state;
 
 /*
  * Each chunk of data that is classified as ASTREAMER_MEMBER_HEADER,

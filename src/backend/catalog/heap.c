@@ -3,7 +3,7 @@
  * heap.c
  *	  code to create and destroy POSTGRES heap relations
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -36,9 +36,6 @@
 #include "access/tableam.h"
 #include "catalog/binary_upgrade.h"
 #include "catalog/catalog.h"
-#include "catalog/namespace.h"
-#include "catalog/catalogview.h"
-#include "access/doltcatalog.h"
 #include "catalog/heap.h"
 #include "catalog/index.h"
 #include "catalog/objectaccess.h"
@@ -266,7 +263,8 @@ SystemAttributeByName(const char *attname)
 
 /* ----------------------------------------------------------------
  *				XXX END OF UGLY HARD CODED BADNESS XXX
- * ---------------------------------------------------------------- */
+ * ----------------------------------------------------------------
+ */
 
 
 /* ----------------------------------------------------------------
@@ -382,8 +380,6 @@ heap_create(const char *relname,
 	 * For others, only the main fork is created; the other forks will be
 	 * created on demand.
 	 */
-	if (CatalogViewCaptureStorage(rel, CATALOG_STORAGE_CREATE))
-		create_storage = false;
 	if (create_storage)
 	{
 		if (RELKIND_HAS_TABLE_AM(rel->rd_rel->relkind))
@@ -751,7 +747,7 @@ InsertPgAttributeTuples(Relation pg_attribute_rel,
 	/* Initialize the number of slots to use */
 	nslots = Min(tupdesc->natts,
 				 (MAX_CATALOG_MULTI_INSERT_BYTES / sizeof(FormData_pg_attribute)));
-	slot = palloc(sizeof(TupleTableSlot *) * nslots);
+	slot = palloc_array(TupleTableSlot *, nslots);
 	for (int i = 0; i < nslots; i++)
 		slot[i] = MakeSingleTupleTableSlot(td, &TTSOpsHeapTuple);
 
@@ -1195,11 +1191,6 @@ heap_create_with_catalog(const char *relname,
 	 * by catching it here we can emit a nicer error message.
 	 */
 	existing_relid = get_relname_relid(relname, relnamespace);
-	if (!OidIsValid(existing_relid) && CatalogViewCurrent())
-		existing_relid = get_relname_relid(relname,
-										 CatalogViewNamespace(CatalogViewCurrent(), relnamespace));
-	if (!OidIsValid(existing_relid))
-		existing_relid = BranchRelnameGetRelid(relname, relnamespace);
 	if (existing_relid != InvalidOid)
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_TABLE),
@@ -1289,9 +1280,6 @@ heap_create_with_catalog(const char *relname,
 			}
 		}
 
-		/* A relation created in a provisional branch catalog gets a handle. */
-		if (!OidIsValid(relid) && CatalogViewIsProvisional(CatalogViewCurrent()))
-			relid = CatalogViewNewObject(RelationRelationId);
 		if (!OidIsValid(relid))
 			relid = GetNewRelFileNumber(reltablespace, pg_class_desc,
 										relpersistence);
@@ -1815,7 +1803,6 @@ heap_drop_with_catalog(Oid relid)
 {
 	Relation	rel;
 	HeapTuple	tuple;
-	char		relkind;
 	Oid			parentOid = InvalidOid,
 				defaultPartOid = InvalidOid;
 
@@ -1832,7 +1819,6 @@ heap_drop_with_catalog(Oid relid)
 	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 	if (!HeapTupleIsValid(tuple))
 		elog(ERROR, "cache lookup failed for relation %u", relid);
-	relkind = ((Form_pg_class) GETSTRUCT(tuple))->relkind;
 	if (((Form_pg_class) GETSTRUCT(tuple))->relispartition)
 	{
 		/*
@@ -1926,12 +1912,7 @@ heap_drop_with_catalog(Oid relid)
 	/*
 	 * Remove any associated relation synchronization states.
 	 */
-	/* Sequences cannot have table synchronization state. Their branch-local
-	 * catalog handles must never be used to scan the physical subscription
-	 * catalog. */
-	/* Provisional definitions have no physical subscription state. */
-	if (relkind != RELKIND_SEQUENCE && !CatalogViewIsProvisional(CatalogViewObjectContext(relid)))
-		RemoveSubscriptionRel(InvalidOid, relid);
+	RemoveSubscriptionRel(InvalidOid, relid);
 
 	/*
 	 * Forget any ON COMMIT action for the rel
@@ -2299,6 +2280,16 @@ StoreRelNotNull(Relation rel, const char *nnname, AttrNumber attnum,
 
 	Assert(attnum > InvalidAttrNumber);
 
+	/*
+	 * Partitioned tables do not contain any rows themselves, so a NO INHERIT
+	 * constraint makes no sense.
+	 */
+	if (is_no_inherit &&
+		rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("not-null constraints on partitioned tables cannot be NO INHERIT"));
+
 	constrOid =
 		CreateConstraintEntry(nnname,
 							  RelationGetNamespace(rel),
@@ -2349,7 +2340,7 @@ StoreRelNotNull(Relation rel, const char *nnname, AttrNumber attnum,
 static void
 StoreConstraints(Relation rel, List *cooked_constraints, bool is_internal)
 {
-	int			numchecks = 0;
+	int16		numchecks = 0;
 	ListCell   *lc;
 
 	if (cooked_constraints == NIL)
@@ -2373,12 +2364,18 @@ StoreConstraints(Relation rel, List *cooked_constraints, bool is_internal)
 											   is_internal);
 				break;
 			case CONSTR_CHECK:
+				if (pg_add_s16_overflow(numchecks, 1, &numchecks))
+					ereport(ERROR,
+							errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+							errmsg("too many check constraints on relation \"%s\"",
+								   RelationGetRelationName(rel)));
+
 				con->conoid =
 					StoreRelCheck(rel, con->name, con->expr,
 								  con->is_enforced, !con->skip_validation,
 								  con->is_local, con->inhcount,
 								  con->is_no_inherit, is_internal);
-				numchecks++;
+
 				break;
 
 			default:
@@ -2436,7 +2433,7 @@ AddRelationNewConstraints(Relation rel,
 	int			numoldchecks;
 	ParseState *pstate;
 	ParseNamespaceItem *nsitem;
-	int			numchecks;
+	int16		numchecks;
 	List	   *checknames;
 	List	   *nnnames;
 	Node	   *expr;
@@ -2506,7 +2503,7 @@ AddRelationNewConstraints(Relation rel,
 
 		defOid = StoreAttrDefault(rel, colDef->attnum, expr, is_internal);
 
-		cooked = (CookedConstraint *) palloc(sizeof(CookedConstraint));
+		cooked = palloc_object(CookedConstraint);
 		cooked->contype = CONSTR_DEFAULT;
 		cooked->conoid = defOid;
 		cooked->name = NULL;
@@ -2638,6 +2635,16 @@ AddRelationNewConstraints(Relation rel,
 			}
 
 			/*
+			 * pg_class.relchecks stores this count in an int16, so we should
+			 * avoid overflowing that field
+			 */
+			if (pg_add_s16_overflow(numchecks, 1, &numchecks))
+				ereport(ERROR,
+						errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						errmsg("too many check constraints on relation \"%s\"",
+							   RelationGetRelationName(rel)));
+
+			/*
 			 * OK, store it.
 			 */
 			constrOid =
@@ -2646,9 +2653,7 @@ AddRelationNewConstraints(Relation rel,
 							  is_local ? 0 : 1, cdef->is_no_inherit,
 							  is_internal);
 
-			numchecks++;
-
-			cooked = (CookedConstraint *) palloc(sizeof(CookedConstraint));
+			cooked = palloc_object(CookedConstraint);
 			cooked->contype = CONSTR_CHECK;
 			cooked->conoid = constrOid;
 			cooked->name = ccname;
@@ -2725,7 +2730,7 @@ AddRelationNewConstraints(Relation rel,
 								inhcount,
 								cdef->is_no_inherit);
 
-			nncooked = (CookedConstraint *) palloc(sizeof(CookedConstraint));
+			nncooked = palloc_object(CookedConstraint);
 			nncooked->contype = CONSTR_NOTNULL;
 			nncooked->conoid = constrOid;
 			nncooked->name = nnname;
@@ -3217,6 +3222,10 @@ SetRelationNumChecks(Relation rel, int numchecks)
 
 	if (relStruct->relchecks != numchecks)
 	{
+		if (numchecks > INT16_MAX || numchecks < 0)
+			elog(ERROR, "invalid new relchecks %d for relation %u",
+				 numchecks, RelationGetRelid(rel));
+
 		relStruct->relchecks = numchecks;
 
 		CatalogTupleUpdate(relrel, &reltup->t_self, reltup);
@@ -3583,9 +3592,6 @@ RemoveStatistics(Oid relid, AttrNumber attnum)
 	systable_endscan(scan);
 
 	table_close(pgstatistic, RowExclusiveLock);
-
-	if (attnum == 0 && CatalogViewIsDurable(relid))
-		dg_remove_relation_stats(relid);
 }
 
 
@@ -3628,7 +3634,8 @@ RelationTruncateIndexes(Relation heapRelation)
 
 		/* Initialize the index and rebuild */
 		/* Note: we do not need to re-establish pkey setting */
-		index_build(heapRelation, currentIndex, indexInfo, true, false);
+		index_build(heapRelation, currentIndex, indexInfo, true, false,
+					true);
 
 		/* We're done with this index */
 		index_close(currentIndex, NoLock);

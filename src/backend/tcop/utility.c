@@ -5,7 +5,7 @@
  *	  commands.  At one time acted as an interface between the Lisp and C
  *	  systems.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -15,22 +15,17 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "access/doltcatalog.h"
-#include "access/doltbranch.h"
 
 #include "access/reloptions.h"
 #include "access/twophase.h"
 #include "access/xact.h"
-#include "access/doltsystem.h"
 #include "access/xlog.h"
-#include "catalog/catalogview.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/toasting.h"
 #include "commands/alter.h"
 #include "commands/async.h"
-#include "commands/cluster.h"
 #include "commands/collationcmds.h"
 #include "commands/comment.h"
 #include "commands/conversioncmds.h"
@@ -49,6 +44,7 @@
 #include "commands/prepare.h"
 #include "commands/proclang.h"
 #include "commands/publicationcmds.h"
+#include "commands/repack.h"
 #include "commands/schemacmds.h"
 #include "commands/seclabel.h"
 #include "commands/sequence.h"
@@ -60,6 +56,7 @@
 #include "commands/user.h"
 #include "commands/vacuum.h"
 #include "commands/view.h"
+#include "commands/wait.h"
 #include "miscadmin.h"
 #include "parser/parse_utilcmd.h"
 #include "postmaster/bgwriter.h"
@@ -270,6 +267,7 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_PrepareStmt:
 		case T_UnlistenStmt:
 		case T_VariableSetStmt:
+		case T_WaitStmt:
 			{
 				/*
 				 * These modify only backend-local state, so they're OK to run
@@ -281,9 +279,9 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 				return COMMAND_OK_IN_RECOVERY | COMMAND_OK_IN_READ_ONLY_TXN;
 			}
 
-		case T_ClusterStmt:
 		case T_ReindexStmt:
 		case T_VacuumStmt:
+		case T_RepackStmt:
 			{
 				/*
 				 * These commands write WAL, so they're not strictly
@@ -292,9 +290,9 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 				 *
 				 * However, they don't change the database state in a way that
 				 * would affect pg_dump output, so it's fine to run them in a
-				 * read-only transaction. (CLUSTER might change the order of
-				 * rows on disk, which could affect the ordering of pg_dump
-				 * output, but that's not semantically significant.)
+				 * read-only transaction. (REPACK/CLUSTER might change the
+				 * order of rows on disk, which could affect the ordering of
+				 * pg_dump output, but that's not semantically significant.)
 				 */
 				return COMMAND_OK_IN_READ_ONLY_TXN;
 			}
@@ -574,15 +572,6 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 		pstmt = copyObject(pstmt);
 	parsetree = pstmt->utilityStmt;
 
-	/*
-	 * Provisional native ALTER invokes its controller directly. Nested
-	 * utility work needs its own declared publication/storage effects before
-	 * admission.
-	 */
-	if (CatalogViewIsProvisional(CatalogViewCurrent()))
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("nested utility commands during native catalog mutation are not supported")));
-
 	/* Prohibit read/write commands in read-only states. */
 	readonly_flags = ClassifyUtilityCommandAsReadOnly(parsetree);
 	if (readonly_flags != COMMAND_IS_STRICTLY_READ_ONLY &&
@@ -598,83 +587,9 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			PreventCommandDuringRecovery(GetCommandTagName(commandtag));
 	}
 
-	dg_system_check_ddl(parsetree);
 	pstate = make_parsestate(NULL);
 	pstate->p_sourcetext = queryString;
 	pstate->p_queryEnv = queryEnv;
-
-	/*
-	 * Versioned definitions belong to a branch. An extension's script creates
-	 * server objects instead, as the extension itself is one.
-	 */
-	if (!creating_extension)
-	{
-		if (dg_catalog_view_ddl(pstate, parsetree, pstmt->stmt_location, pstmt->stmt_len))
-		{
-			free_parsestate(pstate);
-			CommandCounterIncrement();
-			return;
-		}
-		if (dg_catalog_rename(pstate, parsetree))
-		{
-			free_parsestate(pstate);
-			CommandCounterIncrement();
-			return;
-		}
-		if (dg_catalog_schema_object_ddl(pstate, parsetree) || dg_catalog_routine_ddl(pstate, parsetree))
-		{
-			free_parsestate(pstate);
-			CommandCounterIncrement();
-			return;
-		}
-		if (dg_catalog_trigger_ddl(pstate, parsetree))
-		{
-			free_parsestate(pstate);
-			CommandCounterIncrement();
-			return;
-		}
-		if (dg_catalog_sequence_ddl(pstate, parsetree))
-		{
-			free_parsestate(pstate);
-			CommandCounterIncrement();
-			return;
-		}
-		if (dg_catalog_type_ddl(pstate, parsetree))
-		{
-			free_parsestate(pstate);
-			CommandCounterIncrement();
-			return;
-		}
-		if (dg_catalog_grant(parsetree))
-		{
-			if (qc)
-				SetQueryCompletion(qc, CreateCommandTag(parsetree), 0);
-			free_parsestate(pstate);
-			CommandCounterIncrement();
-			return;
-		}
-		if (dg_catalog_drop(parsetree))
-		{
-			if (qc)
-				SetQueryCompletion(qc, CreateCommandTag(parsetree), 0);
-			free_parsestate(pstate);
-			return;
-		}
-		if (dg_catalog_alter(parsetree))
-		{
-			if (qc)
-				SetQueryCompletion(qc, CreateCommandTag(parsetree), 0);
-			free_parsestate(pstate);
-			CommandCounterIncrement();
-			return;
-		}
-		if (dg_catalog_create(parsetree, queryString))
-		{
-			free_parsestate(pstate);
-			CommandCounterIncrement();
-			return;
-		}
-	}
 
 	switch (nodeTag(parsetree))
 	{
@@ -941,12 +856,12 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			ExecuteCallStmt(castNode(CallStmt, parsetree), params, isAtomicContext, dest);
 			break;
 
-		case T_ClusterStmt:
-			cluster(pstate, (ClusterStmt *) parsetree, isTopLevel);
-			break;
-
 		case T_VacuumStmt:
 			ExecVacuum(pstate, (VacuumStmt *) parsetree, isTopLevel);
+			break;
+
+		case T_RepackStmt:
+			ExecRepack(pstate, (RepackStmt *) parsetree, isTopLevel);
 			break;
 
 		case T_ExplainStmt:
@@ -1030,17 +945,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			break;
 
 		case T_CheckPointStmt:
-			if (!has_privs_of_role(GetUserId(), ROLE_PG_CHECKPOINT))
-				ereport(ERROR,
-						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				/* translator: %s is name of a SQL command, eg CHECKPOINT */
-						 errmsg("permission denied to execute %s command",
-								"CHECKPOINT"),
-						 errdetail("Only roles with privileges of the \"%s\" role may execute this command.",
-								   "pg_checkpoint")));
-
-			RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_WAIT |
-							  (RecoveryInProgress() ? 0 : CHECKPOINT_FORCE));
+			ExecCheckpoint(pstate, (CheckPointStmt *) parsetree);
 			break;
 
 			/*
@@ -1152,6 +1057,13 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 				break;
 			}
 
+		case T_WaitStmt:
+			{
+				ExecWaitStmt(pstate, (WaitStmt *) parsetree, isTopLevel,
+							 dest);
+			}
+			break;
+
 		default:
 			/* All other statement types have event trigger support */
 			ProcessUtilitySlow(pstate, pstmt, queryString,
@@ -1208,15 +1120,10 @@ ProcessUtilitySlow(ParseState *pstate,
 				 * relation and attribute manipulation
 				 */
 			case T_CreateSchemaStmt:
-				{
-					Oid			schema = CreateSchemaCommand((CreateSchemaStmt *) parsetree,
-															 queryString,
-															 pstmt->stmt_location,
-															 pstmt->stmt_len);
-
-					if (OidIsValid(schema))
-						dg_catalog_schema_created(schema);
-				}
+				CreateSchemaCommand(pstate,
+									(CreateSchemaStmt *) parsetree,
+									pstmt->stmt_location,
+									pstmt->stmt_len);
 
 				/*
 				 * EventTriggerCollectSimpleCommand called by
@@ -1336,6 +1243,7 @@ ProcessUtilitySlow(ParseState *pstate,
 							wrapper->utilityStmt = stmt;
 							wrapper->stmt_location = pstmt->stmt_location;
 							wrapper->stmt_len = pstmt->stmt_len;
+							wrapper->planOrigin = PLAN_STMT_INTERNAL;
 
 							ProcessUtility(wrapper,
 										   queryString,
@@ -1435,7 +1343,7 @@ ProcessUtilitySlow(ParseState *pstate,
 					 */
 					switch (stmt->subtype)
 					{
-						case 'T':	/* ALTER DOMAIN DEFAULT */
+						case AD_AlterDefault:
 
 							/*
 							 * Recursively alter column default for table and,
@@ -1445,31 +1353,31 @@ ProcessUtilitySlow(ParseState *pstate,
 								AlterDomainDefault(stmt->typeName,
 												   stmt->def);
 							break;
-						case 'N':	/* ALTER DOMAIN DROP NOT NULL */
+						case AD_DropNotNull:
 							address =
 								AlterDomainNotNull(stmt->typeName,
 												   false);
 							break;
-						case 'O':	/* ALTER DOMAIN SET NOT NULL */
+						case AD_SetNotNull:
 							address =
 								AlterDomainNotNull(stmt->typeName,
 												   true);
 							break;
-						case 'C':	/* ADD CONSTRAINT */
+						case AD_AddConstraint:
 							address =
 								AlterDomainAddConstraint(stmt->typeName,
 														 stmt->def,
 														 &secondaryObject,
 														 false);
 							break;
-						case 'X':	/* DROP CONSTRAINT */
+						case AD_DropConstraint:
 							address =
 								AlterDomainDropConstraint(stmt->typeName,
 														  stmt->name,
 														  stmt->behavior,
 														  stmt->missing_ok);
 							break;
-						case 'V':	/* VALIDATE CONSTRAINT */
+						case AD_ValidateConstraint:
 							address =
 								AlterDomainValidateConstraint(stmt->typeName,
 															  stmt->name);
@@ -1635,7 +1543,8 @@ ProcessUtilitySlow(ParseState *pstate,
 					/* ... and do it */
 					EventTriggerAlterTableStart(parsetree);
 					address =
-						DefineIndex(relid,	/* OID of heap relation */
+						DefineIndex(pstate,
+									relid,	/* OID of heap relation */
 									stmt,
 									InvalidOid, /* no predefined OID */
 									InvalidOid, /* no parent index */
@@ -2082,6 +1991,7 @@ ProcessUtilityForAlterTable(Node *stmt, AlterTableUtilityContext *context)
 	wrapper->utilityStmt = stmt;
 	wrapper->stmt_location = context->pstmt->stmt_location;
 	wrapper->stmt_len = context->pstmt->stmt_len;
+	wrapper->planOrigin = PLAN_STMT_INTERNAL;
 
 	ProcessUtility(wrapper,
 				   context->queryString,
@@ -2108,7 +2018,7 @@ ExecDropStmt(DropStmt *stmt, bool isTopLevel)
 			if (stmt->concurrent)
 				PreventInTransactionBlock(isTopLevel,
 										  "DROP INDEX CONCURRENTLY");
-			/* fall through */
+			pg_fallthrough;
 
 		case OBJECT_TABLE:
 		case OBJECT_SEQUENCE:
@@ -2175,6 +2085,9 @@ UtilityReturnsTuples(Node *parsetree)
 		case T_VariableShowStmt:
 			return true;
 
+		case T_WaitStmt:
+			return true;
+
 		default:
 			return false;
 	}
@@ -2229,6 +2142,9 @@ UtilityTupleDescriptor(Node *parsetree)
 
 				return GetPGVariableResultDesc(n->name);
 			}
+
+		case T_WaitStmt:
+			return WaitStmtResultDesc((WaitStmt *) parsetree);
 
 		default:
 			return NULL;
@@ -2966,15 +2882,18 @@ CreateCommandTag(Node *parsetree)
 			tag = CMDTAG_CALL;
 			break;
 
-		case T_ClusterStmt:
-			tag = CMDTAG_CLUSTER;
-			break;
-
 		case T_VacuumStmt:
 			if (((VacuumStmt *) parsetree)->is_vacuumcmd)
 				tag = CMDTAG_VACUUM;
 			else
 				tag = CMDTAG_ANALYZE;
+			break;
+
+		case T_RepackStmt:
+			if (((RepackStmt *) parsetree)->command == REPACK_COMMAND_CLUSTER)
+				tag = CMDTAG_CLUSTER;
+			else
+				tag = CMDTAG_REPACK;
 			break;
 
 		case T_ExplainStmt:
@@ -3205,6 +3124,10 @@ CreateCommandTag(Node *parsetree)
 				else
 					tag = CMDTAG_DEALLOCATE;
 			}
+			break;
+
+		case T_WaitStmt:
+			tag = CMDTAG_WAIT;
 			break;
 
 			/* already-planned queries */
@@ -3614,7 +3537,7 @@ GetCommandLogLevel(Node *parsetree)
 			lev = LOGSTMT_ALL;
 			break;
 
-		case T_ClusterStmt:
+		case T_RepackStmt:
 			lev = LOGSTMT_DDL;
 			break;
 
@@ -3803,6 +3726,10 @@ GetCommandLogLevel(Node *parsetree)
 
 		case T_AlterCollationStmt:
 			lev = LOGSTMT_DDL;
+			break;
+
+		case T_WaitStmt:
+			lev = LOGSTMT_ALL;
 			break;
 
 			/* already-planned queries */

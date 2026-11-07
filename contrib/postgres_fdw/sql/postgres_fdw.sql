@@ -4,24 +4,17 @@
 
 CREATE EXTENSION postgres_fdw;
 
-CREATE SERVER testserver1 FOREIGN DATA WRAPPER postgres_fdw;
-DO $d$
-    BEGIN
-        EXECUTE $$CREATE SERVER loopback FOREIGN DATA WRAPPER postgres_fdw
-            OPTIONS (dbname '$$||current_database()||$$',
-                     port '$$||current_setting('port')||$$'
-            )$$;
-        EXECUTE $$CREATE SERVER loopback2 FOREIGN DATA WRAPPER postgres_fdw
-            OPTIONS (dbname '$$||current_database()||$$',
-                     port '$$||current_setting('port')||$$'
-            )$$;
-        EXECUTE $$CREATE SERVER loopback3 FOREIGN DATA WRAPPER postgres_fdw
-            OPTIONS (dbname '$$||current_database()||$$',
-                     port '$$||current_setting('port')||$$'
-            )$$;
-    END;
-$d$;
+SELECT current_database() AS current_database,
+  current_setting('port') AS current_port
+\gset
 
+CREATE SERVER testserver1 FOREIGN DATA WRAPPER postgres_fdw;
+CREATE SERVER loopback FOREIGN DATA WRAPPER postgres_fdw
+	OPTIONS (dbname :'current_database', port :'current_port');
+CREATE SERVER loopback2 FOREIGN DATA WRAPPER postgres_fdw
+	OPTIONS (dbname :'current_database', port :'current_port');
+CREATE SERVER loopback3 FOREIGN DATA WRAPPER postgres_fdw
+	OPTIONS (dbname :'current_database', port :'current_port');
 CREATE USER MAPPING FOR public SERVER testserver1
 	OPTIONS (user 'value', password 'value');
 CREATE USER MAPPING FOR CURRENT_USER SERVER loopback;
@@ -233,12 +226,7 @@ ALTER FOREIGN TABLE ft2 ALTER COLUMN c1 OPTIONS (column_name 'C 1');
 SELECT c3, c4 FROM ft1 ORDER BY c3, c1 LIMIT 1;  -- should work
 ALTER SERVER loopback OPTIONS (SET dbname 'no such database');
 SELECT c3, c4 FROM ft1 ORDER BY c3, c1 LIMIT 1;  -- should fail
-DO $d$
-    BEGIN
-        EXECUTE $$ALTER SERVER loopback
-            OPTIONS (SET dbname '$$||current_database()||$$')$$;
-    END;
-$d$;
+ALTER SERVER loopback OPTIONS (SET dbname :'current_database');
 SELECT c3, c4 FROM ft1 ORDER BY c3, c1 LIMIT 1;  -- should work again
 
 -- Test that alteration of user mapping options causes reconnection
@@ -255,6 +243,13 @@ SELECT c3, c4 FROM ft1 ORDER BY c3, c1 LIMIT 1;  -- should work again
 -- and remote-estimate mode on ft2.
 ANALYZE ft1;
 ALTER FOREIGN TABLE ft2 OPTIONS (use_remote_estimate 'true');
+
+-- ===================================================================
+-- test subscription
+-- ===================================================================
+CREATE SUBSCRIPTION regress_pgfdw_subscription SERVER testserver1
+  PUBLICATION pub1 WITH (slot_name = NONE, connect = false);
+DROP SUBSCRIPTION regress_pgfdw_subscription;
 
 -- ===================================================================
 -- test error case for create publication on foreign table
@@ -352,7 +347,7 @@ EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE c3 IS NULL;        -- Nu
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE c3 IS NOT NULL;    -- NullTest
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE round(abs(c1), 0) = 1; -- FuncExpr
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE c1 = -c1;          -- OpExpr(l)
-EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE (c1 IS NOT NULL) IS DISTINCT FROM (c1 IS NOT NULL); -- DistinctExpr
+EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE c3 IS DISTINCT FROM c3; -- DistinctExpr
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE c1 = ANY(ARRAY[c2, 1, c1 + 0]); -- ScalarArrayOpExpr
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE c1 = (ARRAY[c1,c2,3])[1]; -- SubscriptingRef
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE c6 = E'foo''s\\bar';  -- check special chars
@@ -458,6 +453,50 @@ SELECT * FROM ft1 WHERE CASE c3 WHEN c6 THEN true ELSE c3 < 'bar' END;
 EXPLAIN (VERBOSE, COSTS OFF)
 SELECT * FROM ft1 WHERE CASE c3 COLLATE "C" WHEN c6 THEN true ELSE c3 < 'bar' END;
 
+-- Test array type conversion pushdown
+SET plan_cache_mode = force_generic_plan;
+PREPARE s(varchar[]) AS SELECT count(*) FROM ft2 WHERE c6 = ANY ($1);
+EXPLAIN (VERBOSE, COSTS OFF)
+EXECUTE s(ARRAY['1','2']);
+EXECUTE s(ARRAY['1','2']);
+DEALLOCATE s;
+RESET plan_cache_mode;
+
+-- An ArrayCoerceExpr is pushed down only when its per-element coercion is
+-- a plain relabeling.  An element cast function, an I/O conversion, or a
+-- domain coercion is instead evaluated locally.
+CREATE TABLE loct_acx (id int, ta text[], f8 float8[], txt text[], t text, ia int[], vc varchar[]);
+INSERT INTO loct_acx VALUES (1, '{12345}', '{0.30000000000000004}', '{0.3}', '5', '{5}', '{5}');
+CREATE FOREIGN TABLE ft_acx (id int, ta text[], f8 float8[], txt text[], t text, ia int[], vc varchar[])
+  SERVER loopback OPTIONS (table_name 'loct_acx');
+-- element coercion via a cast function: not shippable, stays local
+CREATE FUNCTION acx_text2int(text) RETURNS int
+  LANGUAGE plpgsql IMMUTABLE STRICT AS 'BEGIN RETURN length($1); END';
+CREATE CAST (text AS integer) WITH FUNCTION acx_text2int(text);
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT id FROM ft_acx WHERE ta::int[] = ARRAY[5];
+DROP CAST (text AS integer);
+DROP FUNCTION acx_text2int(text);
+-- implicit-format element coercion (a cast function): stays local, and the
+-- coercion is not silently dropped from an otherwise pushed-down qual
+CREATE CAST (integer AS text) WITH FUNCTION pg_catalog.to_hex(integer) AS IMPLICIT;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT id FROM ft_acx WHERE t = ANY (ia);
+DROP CAST (integer AS text);
+-- element coercion via a GUC-sensitive I/O conversion: stays local, so the
+-- result matches local evaluation despite the forced remote extra_float_digits
+SET extra_float_digits = 0;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT id FROM ft_acx WHERE f8::text[] = txt;
+SELECT id FROM ft_acx WHERE f8::text[] = txt;
+RESET extra_float_digits;
+-- a plain relabeling element coercion (varchar[] to text[]) is still pushed down
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT id FROM ft_acx WHERE t = ANY (vc);
+SELECT id FROM ft_acx WHERE t = ANY (vc);
+DROP FOREIGN TABLE ft_acx;
+DROP TABLE loct_acx;
+
 -- a regconfig constant referring to this text search configuration
 -- is initially unshippable
 CREATE TEXT SEARCH CONFIGURATION public.custom_search
@@ -502,6 +541,15 @@ SELECT * FROM (
     UNION ALL
     SELECT 2 AS type,c1 FROM ft2
 ) a ORDER BY type;
+
+-- Ensure the code works correctly when sort_pathkeys is empty due to
+-- a redundant pathkey.
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM (
+    (SELECT c1, c2 FROM ft1 WHERE c1 = 0 ORDER BY c1 LIMIT 1)
+    UNION
+    (SELECT c1, c2 FROM ft1 WHERE c1 = 0 ORDER BY c1)
+) a;
 
 -- ===================================================================
 -- JOIN queries
@@ -1127,6 +1175,11 @@ explain (verbose, costs off)
 select sum(q.a), count(q.b) from ft4 left join (select 13, avg(ft1.c1), sum(ft2.c1) from ft1 right join ft2 on (ft1.c1 = ft2.c1)) q(a, b, c) on (ft4.c1 <= q.b);
 select sum(q.a), count(q.b) from ft4 left join (select 13, avg(ft1.c1), sum(ft2.c1) from ft1 right join ft2 on (ft1.c1 = ft2.c1)) q(a, b, c) on (ft4.c1 <= q.b);
 
+-- Eager aggregation: a partially grouped rel must not be joined remotely
+explain (verbose, costs off)
+select t1.c2, sum(t2.c1) from ft1 t1 inner join ft2 t2 on (t1.c2 = t2.c2) where t1.c1 < 20 group by t1.c2 order by 1;
+select t1.c2, sum(t2.c1) from ft1 t1 inner join ft2 t2 on (t1.c2 = t2.c2) where t1.c1 < 20 group by t1.c2 order by 1;
+
 
 -- Not supported cases
 -- Grouping sets
@@ -1168,20 +1221,28 @@ PREPARE st1(int, int) AS SELECT t1.c3, t2.c3 FROM ft1 t1, ft2 t2 WHERE t1.c1 = $
 EXPLAIN (VERBOSE, COSTS OFF) EXECUTE st1(1, 2);
 EXECUTE st1(1, 1);
 EXECUTE st1(101, 101);
-SET enable_hashjoin TO off;
+
+-- These next tests require choosing between remote and local sort, which is
+-- a coin flip so long as cost_sort() gives the same results on both sides.
+-- To stabilize the expected plans, disable sorting locally.
 SET enable_sort TO off;
+
 -- subquery using stable function (can't be sent to remote)
+SET enable_hashjoin TO off;  -- this one needs even more help to be stable
 PREPARE st2(int) AS SELECT * FROM ft1 t1 WHERE t1.c1 < $2 AND t1.c3 IN (SELECT c3 FROM ft2 t2 WHERE c1 > $1 AND date(c4) = '1970-01-17'::date) ORDER BY c1;
 EXPLAIN (VERBOSE, COSTS OFF) EXECUTE st2(10, 20);
 EXECUTE st2(10, 20);
 EXECUTE st2(101, 121);
 RESET enable_hashjoin;
-RESET enable_sort;
+
 -- subquery using immutable function (can be sent to remote)
 PREPARE st3(int) AS SELECT * FROM ft1 t1 WHERE t1.c1 < $2 AND t1.c3 IN (SELECT c3 FROM ft2 t2 WHERE c1 > $1 AND date(c5) = '1970-01-17'::date) ORDER BY c1;
 EXPLAIN (VERBOSE, COSTS OFF) EXECUTE st3(10, 20);
 EXECUTE st3(10, 20);
 EXECUTE st3(20, 30);
+
+RESET enable_sort;
+
 -- custom plan should be chosen initially
 PREPARE st4(int) AS SELECT * FROM ft1 t1 WHERE t1.c1 = $1;
 EXPLAIN (VERBOSE, COSTS OFF) EXECUTE st4(1);
@@ -3407,14 +3468,8 @@ SET ROLE regress_nosuper;
 SHOW is_superuser;
 
 -- This will be OK, we can create the FDW
-DO $d$
-    BEGIN
-        EXECUTE $$CREATE SERVER loopback_nopw FOREIGN DATA WRAPPER postgres_fdw
-            OPTIONS (dbname '$$||current_database()||$$',
-                     port '$$||current_setting('port')||$$'
-            )$$;
-    END;
-$d$;
+CREATE SERVER loopback_nopw FOREIGN DATA WRAPPER postgres_fdw
+	OPTIONS (dbname :'current_database', port :'current_port');
 
 -- But creation of user mappings for non-superusers should fail
 CREATE USER MAPPING FOR public SERVER loopback_nopw;
@@ -4001,6 +4056,9 @@ EXPLAIN (VERBOSE, COSTS OFF)
 SELECT o.x FROM (VALUES (2505), (3505)) o(x), LATERAL (SELECT a FROM async_pt WHERE a = o.x OR (a = 1505 AND o.x = 2505) LIMIT 1) s ORDER BY o.x;
 SELECT o.x FROM (VALUES (2505), (3505)) o(x), LATERAL (SELECT a FROM async_pt WHERE a = o.x OR (a = 1505 AND o.x = 2505) LIMIT 1) s ORDER BY o.x;
 
+-- Test COPY TO when foreign table is partition
+COPY async_pt TO stdout; --error
+
 DROP FOREIGN TABLE async_p3;
 DROP TABLE base_tbl3;
 
@@ -4330,6 +4388,108 @@ DROP FOREIGN TABLE remote_application_name;
 DROP VIEW my_application_name;
 
 -- ===================================================================
+-- test read-only and/or deferrable transactions
+-- ===================================================================
+CREATE TABLE loct (f1 int, f2 text);
+INSERT INTO loct VALUES (1, 'foo'), (2, 'bar');
+
+CREATE FUNCTION locf() RETURNS SETOF loct LANGUAGE SQL AS
+  'UPDATE public.loct SET f2 = f2 || f2 RETURNING *';
+CREATE VIEW locv AS SELECT t.* FROM locf() t;
+CREATE FOREIGN TABLE remt (f1 int, f2 text)
+  SERVER loopback OPTIONS (table_name 'locv');
+CREATE FOREIGN TABLE remt2 (f1 int, f2 text)
+  SERVER loopback2 OPTIONS (table_name 'locv');
+
+START TRANSACTION READ ONLY;
+SAVEPOINT s;
+SELECT * FROM remt;  -- should fail
+ROLLBACK TO s;
+RELEASE SAVEPOINT s;
+SELECT * FROM remt;  -- should fail
+ROLLBACK;
+
+START TRANSACTION;
+SAVEPOINT s;
+SET transaction_read_only = on;
+SELECT * FROM remt;  -- should fail
+ROLLBACK TO s;
+RELEASE SAVEPOINT s;
+SET transaction_read_only = on;
+SELECT * FROM remt;  -- should fail
+ROLLBACK;
+
+START TRANSACTION;
+SAVEPOINT s;
+SELECT * FROM remt;  -- should work
+SET transaction_read_only = on;
+SELECT * FROM remt;  -- should fail
+ROLLBACK TO s;
+RELEASE SAVEPOINT s;
+SELECT * FROM remt;  -- should work
+SET transaction_read_only = on;
+SELECT * FROM remt;  -- should fail
+ROLLBACK;
+
+-- Exercise abort code paths in pgfdw_xact_callback/pgfdw_subxact_callback
+-- in situations where multiple connections are involved
+START TRANSACTION;
+SAVEPOINT s;
+SELECT * FROM remt;  -- should work
+SET transaction_read_only = on;
+SELECT * FROM remt2;  -- should fail
+ROLLBACK TO s;
+RELEASE SAVEPOINT s;
+SELECT * FROM remt;  -- should work
+SET transaction_read_only = on;
+SELECT * FROM remt2;  -- should fail
+ROLLBACK;
+
+-- Clean up
+DROP FOREIGN TABLE remt;
+DROP FOREIGN TABLE remt2;
+DROP VIEW locv;
+DROP FUNCTION locf();
+
+CREATE FOREIGN TABLE remt (f1 int, f2 text)
+  SERVER loopback OPTIONS (table_name 'loct');
+
+CREATE FUNCTION defer_trig_func() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.f2 IS NOT NULL THEN
+    UPDATE public.loct SET f2 = f2 || f2 WHERE f1 = NEW.f1;
+  END IF;
+  RETURN NULL;
+END;
+$$;
+CREATE CONSTRAINT TRIGGER defer_trig AFTER INSERT ON loct
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE PROCEDURE defer_trig_func();
+
+START TRANSACTION;
+INSERT INTO remt VALUES (3, 'baz');
+SET TRANSACTION READ ONLY;
+COMMIT;
+
+START TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY;
+SELECT * FROM remt;
+COMMIT;
+
+START TRANSACTION ISOLATION LEVEL SERIALIZABLE DEFERRABLE;
+SELECT * FROM remt;
+COMMIT;
+
+START TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE;
+SELECT * FROM remt;
+COMMIT;
+
+-- Clean up
+DROP FOREIGN TABLE remt;
+DROP TRIGGER defer_trig ON loct;
+DROP FUNCTION defer_trig_func;
+DROP TABLE loct;
+
+-- ===================================================================
 -- test parallel commit and parallel abort
 -- ===================================================================
 ALTER SERVER loopback OPTIONS (ADD parallel_commit 'true');
@@ -4435,6 +4595,138 @@ ANALYZE analyze_ftable;
 -- cleanup
 DROP FOREIGN TABLE analyze_ftable;
 DROP TABLE analyze_table;
+
+-- ===================================================================
+-- test for statistics import
+-- ===================================================================
+
+CREATE TABLE simport_table (c1 int, c2 text);
+CREATE FOREIGN TABLE simport_ftable (c1 int, c2 text, cx int)
+       SERVER loopback OPTIONS (table_name 'simport_table');
+ALTER FOREIGN TABLE simport_ftable ALTER COLUMN cx OPTIONS (ADD column_name 'c1');
+ALTER FOREIGN TABLE simport_ftable OPTIONS (ADD import_stats 'true');
+
+ANALYZE simport_ftable;                   -- should fail
+
+ANALYZE simport_table;
+
+SELECT pg_stat_reset_single_table_counters('public.simport_ftable'::regclass);
+ANALYZE VERBOSE simport_ftable;           -- should work
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_get_live_tuples('public.simport_ftable'::regclass),
+       pg_stat_get_dead_tuples('public.simport_ftable'::regclass),
+       pg_stat_get_analyze_count('public.simport_ftable'::regclass);
+
+ALTER TABLE simport_table ALTER COLUMN c1 SET STATISTICS 0;
+ALTER TABLE simport_table ALTER COLUMN c2 SET STATISTICS 0;
+INSERT INTO simport_table VALUES (1, 'foo'), (1, 'foo'), (2, 'bar'), (2, 'bar');
+ANALYZE simport_table;
+
+ANALYZE simport_ftable;                   -- should fail
+
+ALTER TABLE simport_table ALTER COLUMN c1 SET STATISTICS DEFAULT;
+ANALYZE simport_table;
+
+ANALYZE simport_ftable;                   -- should fail
+
+ALTER TABLE simport_table ALTER COLUMN c2 SET STATISTICS DEFAULT;
+ANALYZE simport_table;
+
+SELECT pg_stat_reset_single_table_counters('public.simport_ftable'::regclass);
+ANALYZE VERBOSE simport_ftable;           -- should work
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_get_live_tuples('public.simport_ftable'::regclass),
+       pg_stat_get_dead_tuples('public.simport_ftable'::regclass),
+       pg_stat_get_analyze_count('public.simport_ftable'::regclass);
+
+ANALYZE VERBOSE simport_ftable (c1);      -- should work
+
+ANALYZE VERBOSE simport_ftable (c2);      -- should work
+
+ANALYZE VERBOSE simport_ftable (c1, cx);  -- should work
+
+ANALYZE VERBOSE simport_ftable (c2, cx);  -- should work
+
+CREATE STATISTICS stats (dependencies) ON c1, c2 FROM simport_ftable;
+
+ANALYZE simport_ftable;                   -- should fail
+
+DROP STATISTICS stats;
+
+ANALYZE simport_ftable (cid);             -- should fail
+
+ANALYZE simport_ftable (c1, c1);          -- should fail
+
+CREATE VIEW simport_view AS SELECT * FROM simport_table;
+CREATE FOREIGN TABLE simport_fview (c1 int, c2 text)
+       SERVER loopback OPTIONS (table_name 'simport_view');
+ALTER FOREIGN TABLE simport_fview OPTIONS (ADD import_stats 'true');
+
+ANALYZE simport_fview;                    -- should fail
+
+CREATE TABLE simport_pt (c1 int not null, c2 text) PARTITION BY LIST (c1);
+CREATE TABLE simport_p1 PARTITION OF simport_pt FOR VALUES IN (1);
+CREATE TABLE simport_p2 PARTITION OF simport_pt FOR VALUES IN (2);
+CREATE FOREIGN TABLE simport_fpt (c1 int not null, c2 text)
+       SERVER loopback OPTIONS (table_name 'simport_pt');
+INSERT INTO simport_pt VALUES (1, 'foo'), (1, 'foo'), (2, 'bar'), (2, 'bar');
+
+-- Check that we have relpages = 0 for simport_fpt regardless of the method
+ANALYZE simport_fpt;
+SELECT relpages FROM pg_class WHERE oid = 'public.simport_fpt'::regclass;
+ALTER FOREIGN TABLE simport_fpt OPTIONS (ADD import_stats 'true');
+ANALYZE simport_pt;
+ANALYZE VERBOSE simport_fpt;              -- should work
+SELECT relpages FROM pg_class WHERE oid = 'public.simport_fpt'::regclass;
+
+-- This tests build_remattrmap()'s deparsing of column names that include
+-- single quotes or backslashes
+CREATE TABLE dtest_table ("col'quote" int, "col\backslash" int);
+CREATE FOREIGN TABLE dtest_ftable ("col'quote" int, "col\backslash" int)
+       SERVER loopback OPTIONS (table_name 'dtest_table', import_stats 'true');
+
+INSERT INTO dtest_table SELECT g, g FROM generate_series(1, 10) g;
+ANALYZE dtest_table;
+
+ANALYZE VERBOSE dtest_ftable;             -- should work
+
+-- dtest_ftable's stats should now exactly match dtest_table's
+-- compare values, should match
+SELECT relpages, reltuples FROM pg_class
+WHERE oid = 'public.dtest_table'::regclass
+EXCEPT
+SELECT relpages, reltuples FROM pg_class
+WHERE oid = 'public.dtest_ftable'::regclass;
+
+-- compare the rowcounts, should get 0 rows back
+SELECT COUNT(*) FROM pg_stats
+WHERE schemaname = 'public' AND tablename = 'dtest_table'
+EXCEPT
+SELECT COUNT(*) FROM pg_stats
+WHERE schemaname = 'public' AND tablename = 'dtest_ftable';
+
+-- test only a few stats columns common to integer types
+SELECT attname, inherited, null_frac, avg_width, n_distinct,
+  most_common_vals::text as mcv, most_common_freqs,
+  histogram_bounds::text as hb, correlation
+FROM pg_stats
+WHERE schemaname = 'public' AND tablename = 'dtest_table'
+EXCEPT
+SELECT attname, inherited, null_frac, avg_width, n_distinct,
+  most_common_vals::text as mcv, most_common_freqs,
+  histogram_bounds::text as hb, correlation
+FROM pg_stats
+WHERE schemaname = 'public' AND tablename = 'dtest_ftable';
+
+-- cleanup
+DROP FOREIGN TABLE simport_ftable;
+DROP FOREIGN TABLE simport_fview;
+DROP VIEW simport_view;
+DROP TABLE simport_table;
+DROP FOREIGN TABLE simport_fpt;
+DROP TABLE simport_pt;
+DROP FOREIGN TABLE dtest_ftable;
+DROP TABLE dtest_table;
 
 -- ===================================================================
 -- test for postgres_fdw_get_connections function with check_conn = true

@@ -414,6 +414,28 @@ SELECT nummultirange(numrange(1,3), numrange(4,5)) - nummultirange(numrange(2,9)
 SELECT nummultirange(numrange(1,2), numrange(4,5)) - nummultirange(numrange(8,9));
 SELECT nummultirange(numrange(1,2), numrange(4,5)) - nummultirange(numrange(-2,0), numrange(8,9));
 
+-- multirange_minus_multi
+SELECT multirange_minus_multi(nummultirange(), nummultirange());
+SELECT multirange_minus_multi(nummultirange(), nummultirange(numrange(1,2)));
+SELECT multirange_minus_multi(nummultirange(numrange(1,2)), nummultirange());
+SELECT multirange_minus_multi(nummultirange(numrange(1,2), numrange(3,4)), nummultirange());
+SELECT multirange_minus_multi(nummultirange(numrange(1,2)), nummultirange(numrange(1,2)));
+SELECT multirange_minus_multi(nummultirange(numrange(1,2)), nummultirange(numrange(2,4)));
+SELECT multirange_minus_multi(nummultirange(numrange(1,2)), nummultirange(numrange(3,4)));
+SELECT multirange_minus_multi(nummultirange(numrange(1,4)), nummultirange(numrange(1,2)));
+SELECT multirange_minus_multi(nummultirange(numrange(1,4)), nummultirange(numrange(2,3)));
+SELECT multirange_minus_multi(nummultirange(numrange(1,4)), nummultirange(numrange(0,8)));
+SELECT multirange_minus_multi(nummultirange(numrange(1,4)), nummultirange(numrange(0,2)));
+SELECT multirange_minus_multi(nummultirange(numrange(1,8)), nummultirange(numrange(0,2), numrange(3,4)));
+SELECT multirange_minus_multi(nummultirange(numrange(1,8)), nummultirange(numrange(2,3), numrange(5,null)));
+SELECT multirange_minus_multi(nummultirange(numrange(1,2), numrange(4,5)), nummultirange(numrange(-2,0)));
+SELECT multirange_minus_multi(nummultirange(numrange(1,2), numrange(4,5)), nummultirange(numrange(2,4)));
+SELECT multirange_minus_multi(nummultirange(numrange(1,2), numrange(4,5)), nummultirange(numrange(3,5)));
+SELECT multirange_minus_multi(nummultirange(numrange(1,2), numrange(4,5)), nummultirange(numrange(0,9)));
+SELECT multirange_minus_multi(nummultirange(numrange(1,3), numrange(4,5)), nummultirange(numrange(2,9)));
+SELECT multirange_minus_multi(nummultirange(numrange(1,2), numrange(4,5)), nummultirange(numrange(8,9)));
+SELECT multirange_minus_multi(nummultirange(numrange(1,2), numrange(4,5)), nummultirange(numrange(-2,0), numrange(8,9)));
+
 -- intersection
 SELECT nummultirange() * nummultirange();
 SELECT nummultirange() * nummultirange(numrange(1,2));
@@ -901,3 +923,12 @@ create function mr_inoutparam_fail(inout i anyelement, out r anymultirange)
 --should fail
 create function mr_table_fail(i anyelement) returns table(i anyelement, r anymultirange)
   as $$ select $1, '[1,10]' $$ language sql;
+
+--
+-- Check that numeric overflow during analyze does not make it fail
+--
+
+create table multirange_analyze_test (r nummultirange);
+insert into multirange_analyze_test values ('{[1e1000, 2e1000], [-9e131071, 9e131071]}'::nummultirange);
+analyze multirange_analyze_test;
+drop table multirange_analyze_test;

@@ -5,7 +5,7 @@
  *	  (pg_parameter_acl).
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_parameter_acl.h
@@ -27,7 +27,9 @@
  *		typedef struct FormData_pg_parameter_acl
  * ----------------
  */
-CATALOG(pg_parameter_acl,6243,ParameterAclRelationId) BKI_SHARED_RELATION
+BEGIN_CATALOG_STRUCT
+
+CATALOG(pg_parameter_acl,6243,ParameterAclRelationId) BKI_SHARED_RELATION BKI_ROWTYPE_OID(2173,ParameterAclRelation_Rowtype_Id) BKI_SCHEMA_MACRO
 {
 	Oid			oid;			/* oid */
 
@@ -39,6 +41,8 @@ CATALOG(pg_parameter_acl,6243,ParameterAclRelationId) BKI_SHARED_RELATION
 	aclitem		paracl[1] BKI_DEFAULT(_null_);
 #endif
 } FormData_pg_parameter_acl;
+
+END_CATALOG_STRUCT
 
 
 /* ----------------

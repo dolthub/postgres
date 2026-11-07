@@ -31,7 +31,7 @@
  * constraint changes are also tracked properly.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -40,7 +40,6 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "catalog/catalogview.h"
 
 #include <limits.h>
 
@@ -236,8 +235,8 @@ shared_record_table_compare(const void *a, const void *b, size_t size,
 							void *arg)
 {
 	dsa_area   *area = (dsa_area *) arg;
-	SharedRecordTableKey *k1 = (SharedRecordTableKey *) a;
-	SharedRecordTableKey *k2 = (SharedRecordTableKey *) b;
+	const SharedRecordTableKey *k1 = a;
+	const SharedRecordTableKey *k2 = b;
 	TupleDesc	t1;
 	TupleDesc	t2;
 
@@ -260,8 +259,8 @@ shared_record_table_compare(const void *a, const void *b, size_t size,
 static uint32
 shared_record_table_hash(const void *a, size_t size, void *arg)
 {
-	dsa_area   *area = (dsa_area *) arg;
-	SharedRecordTableKey *k = (SharedRecordTableKey *) a;
+	dsa_area   *area = arg;
+	const SharedRecordTableKey *k = a;
 	TupleDesc	t;
 
 	if (k->shared)
@@ -338,9 +337,12 @@ static bool multirange_element_has_hashing(TypeCacheEntry *typentry);
 static bool multirange_element_has_extended_hashing(TypeCacheEntry *typentry);
 static void cache_multirange_element_properties(TypeCacheEntry *typentry);
 static void TypeCacheRelCallback(Datum arg, Oid relid);
-static void TypeCacheTypCallback(Datum arg, int cacheid, uint32 hashvalue);
-static void TypeCacheOpcCallback(Datum arg, int cacheid, uint32 hashvalue);
-static void TypeCacheConstrCallback(Datum arg, int cacheid, uint32 hashvalue);
+static void TypeCacheTypCallback(Datum arg, SysCacheIdentifier cacheid,
+								 uint32 hashvalue);
+static void TypeCacheOpcCallback(Datum arg, SysCacheIdentifier cacheid,
+								 uint32 hashvalue);
+static void TypeCacheConstrCallback(Datum arg, SysCacheIdentifier cacheid,
+									uint32 hashvalue);
 static void load_enum_cache_data(TypeCacheEntry *tcache);
 static EnumItem *find_enumitem(TypeCacheEnumData *enumdata, Oid arg);
 static int	enum_oid_cmp(const void *left, const void *right);
@@ -383,81 +385,66 @@ type_cache_syshash(const void *key, Size keysize)
  * TypeCacheEntry items for TYPTYPE_COMPOSITE.  So, tupdesc can't get
  * invalidated during the lookup_type_cache() call.
  */
-static TypeCacheEntry *lookup_type_cacheInContext(Oid type_id, int flags);
-
 TypeCacheEntry *
 lookup_type_cache(Oid type_id, int flags)
-{
-	CatalogView *view = CatalogViewObjectContext(type_id);
-	CatalogView *previous;
-	TypeCacheEntry *result;
-
-	if (!view)
-		return lookup_type_cacheInContext(type_id, flags);
-	previous = CatalogViewSwitch(view);
-	PG_TRY();
-	{
-		result = lookup_type_cacheInContext(type_id, flags);
-	}
-	PG_FINALLY();
-	{
-		CatalogViewSwitch(previous);
-	}
-	PG_END_TRY();
-	return result;
-}
-
-static TypeCacheEntry *
-lookup_type_cacheInContext(Oid type_id, int flags)
 {
 	TypeCacheEntry *typentry;
 	bool		found;
 	int			in_progress_offset;
 
-	if (TypeCacheHash == NULL)
+	if (in_progress_list == NULL)
 	{
 		/* First time through: initialize the hash table */
 		HASHCTL		ctl;
 		int			allocsize;
 
-		ctl.keysize = sizeof(Oid);
-		ctl.entrysize = sizeof(TypeCacheEntry);
+		if (TypeCacheHash == NULL)
+		{
+			ctl.keysize = sizeof(Oid);
+			ctl.entrysize = sizeof(TypeCacheEntry);
 
-		/*
-		 * TypeCacheEntry takes hash value from the system cache. For
-		 * TypeCacheHash we use the same hash in order to speedup search by
-		 * hash value. This is used by hash_seq_init_with_hash_value().
-		 */
-		ctl.hash = type_cache_syshash;
+			/*
+			 * TypeCacheEntry takes hash value from the system cache. For
+			 * TypeCacheHash we use the same hash in order to speedup search
+			 * by hash value. This is used by hash_seq_init_with_hash_value().
+			 */
+			ctl.hash = type_cache_syshash;
 
-		TypeCacheHash = hash_create("Type information cache", 64,
-									&ctl, HASH_ELEM | HASH_FUNCTION);
+			TypeCacheHash = hash_create("Type information cache", 64,
+										&ctl, HASH_ELEM | HASH_FUNCTION);
+		}
 
-		Assert(RelIdToTypeIdCacheHash == NULL);
-
-		ctl.keysize = sizeof(Oid);
-		ctl.entrysize = sizeof(RelIdToTypeIdCacheEntry);
-		RelIdToTypeIdCacheHash = hash_create("Map from relid to OID of cached composite type", 64,
-											 &ctl, HASH_ELEM | HASH_BLOBS);
-
-		/* Also set up callbacks for SI invalidations */
-		CacheRegisterRelcacheCallback(TypeCacheRelCallback, (Datum) 0);
-		CacheRegisterSyscacheCallback(TYPEOID, TypeCacheTypCallback, (Datum) 0);
-		CacheRegisterSyscacheCallback(CLAOID, TypeCacheOpcCallback, (Datum) 0);
-		CacheRegisterSyscacheCallback(CONSTROID, TypeCacheConstrCallback, (Datum) 0);
+		if (RelIdToTypeIdCacheHash == NULL)
+		{
+			ctl.keysize = sizeof(Oid);
+			ctl.entrysize = sizeof(RelIdToTypeIdCacheEntry);
+			RelIdToTypeIdCacheHash = hash_create("Map from relid to OID of cached composite type", 64,
+												 &ctl, HASH_ELEM | HASH_BLOBS);
+		}
 
 		/* Also make sure CacheMemoryContext exists */
 		if (!CacheMemoryContext)
 			CreateCacheMemoryContext();
 
 		/*
-		 * reserve enough in_progress_list slots for many cases
+		 * Reserve enough in_progress_list slots for many cases.  This is the
+		 * last allocation on purpose, done after the two others.
 		 */
 		allocsize = 4;
 		in_progress_list =
 			MemoryContextAlloc(CacheMemoryContext,
 							   allocsize * sizeof(*in_progress_list));
 		in_progress_list_maxlen = allocsize;
+
+		/*
+		 * Set up callbacks for SI invalidations.  These steps are done last,
+		 * once all the other initializations are done, and can fail only with
+		 * a FATAL error.
+		 */
+		CacheRegisterRelcacheCallback(TypeCacheRelCallback, (Datum) 0);
+		CacheRegisterSyscacheCallback(TYPEOID, TypeCacheTypCallback, (Datum) 0);
+		CacheRegisterSyscacheCallback(CLAOID, TypeCacheOpcCallback, (Datum) 0);
+		CacheRegisterSyscacheCallback(CONSTROID, TypeCacheConstrCallback, (Datum) 0);
 	}
 
 	Assert(TypeCacheHash != NULL && RelIdToTypeIdCacheHash != NULL);
@@ -513,15 +500,6 @@ lookup_type_cacheInContext(Oid type_id, int flags)
 
 		/* These fields can never change, by definition */
 		typentry->type_id = type_id;
-
-		/*
-		 * Native type entries have backend lifetime; keep their immutable
-		 * definitions alive as long as their OID and tuple descriptors can be
-		 * reused.
-		 */
-		typentry->catalogview = CatalogViewObjectContext(type_id);
-		if (typentry->catalogview)
-			CatalogViewRetain(typentry->catalogview);
 		typentry->type_id_hash = get_hash_value(TypeCacheHash, &type_id);
 
 		/* Keep this part in sync with the code below */
@@ -1198,9 +1176,6 @@ load_domaintype_info(TypeCacheEntry *typentry)
 				elog(ERROR, "domain \"%s\" constraint \"%s\" has NULL conbin",
 					 NameStr(typTup->typname), NameStr(c->conname));
 
-			/* Convert conbin to C string in caller context */
-			constring = TextDatumGetCString(val);
-
 			/* Create the DomainConstraintCache object and context if needed */
 			if (dcc == NULL)
 			{
@@ -1216,9 +1191,8 @@ load_domaintype_info(TypeCacheEntry *typentry)
 				dcc->dccRefCount = 0;
 			}
 
-			/* Create node trees in DomainConstraintCache's context */
-			oldcxt = MemoryContextSwitchTo(dcc->dccContext);
-
+			/* Convert conbin to a node tree, still in caller's context */
+			constring = TextDatumGetCString(val);
 			check_expr = (Expr *) stringToNode(constring);
 
 			/*
@@ -1233,10 +1207,13 @@ load_domaintype_info(TypeCacheEntry *typentry)
 			 */
 			check_expr = expression_planner(check_expr);
 
+			/* Create only the minimally needed stuff in dccContext */
+			oldcxt = MemoryContextSwitchTo(dcc->dccContext);
+
 			r = makeNode(DomainConstraintState);
 			r->constrainttype = DOM_CONSTRAINT_CHECK;
 			r->name = pstrdup(NameStr(c->conname));
-			r->check_expr = check_expr;
+			r->check_expr = copyObject(check_expr);
 			r->check_exprstate = NULL;
 
 			MemoryContextSwitchTo(oldcxt);
@@ -1510,10 +1487,14 @@ UpdateDomainConstraintRef(DomainConstraintRef *ref)
 /*
  * DomainHasConstraints --- utility routine to check if a domain has constraints
  *
+ * Returns true if the domain has any constraints at all.  If has_volatile
+ * is not NULL, also checks whether any CHECK constraint contains a volatile
+ * expression and sets *has_volatile accordingly.
+ *
  * This is defined to return false, not fail, if type is not a domain.
  */
 bool
-DomainHasConstraints(Oid type_id)
+DomainHasConstraints(Oid type_id, bool *has_volatile)
 {
 	TypeCacheEntry *typentry;
 
@@ -1523,7 +1504,26 @@ DomainHasConstraints(Oid type_id)
 	 */
 	typentry = lookup_type_cache(type_id, TYPECACHE_DOMAIN_CONSTR_INFO);
 
-	return (typentry->domainData != NULL);
+	if (typentry->domainData == NULL)
+		return false;
+
+	if (has_volatile)
+	{
+		*has_volatile = false;
+
+		foreach_node(DomainConstraintState, constrstate,
+					 typentry->domainData->constraints)
+		{
+			if (constrstate->constrainttype == DOM_CONSTRAINT_CHECK &&
+				contain_volatile_functions((Node *) constrstate->check_expr))
+			{
+				*has_volatile = true;
+				break;
+			}
+		}
+	}
+
+	return true;
 }
 
 
@@ -2041,7 +2041,7 @@ lookup_rowtype_tupdesc_domain(Oid type_id, int32 typmod, bool noError)
 static uint32
 record_type_typmod_hash(const void *data, size_t size)
 {
-	RecordCacheEntry *entry = (RecordCacheEntry *) data;
+	const RecordCacheEntry *entry = data;
 
 	return hashRowType(entry->tupdesc);
 }
@@ -2052,8 +2052,8 @@ record_type_typmod_hash(const void *data, size_t size)
 static int
 record_type_typmod_compare(const void *a, const void *b, size_t size)
 {
-	RecordCacheEntry *left = (RecordCacheEntry *) a;
-	RecordCacheEntry *right = (RecordCacheEntry *) b;
+	const RecordCacheEntry *left = a;
+	const RecordCacheEntry *right = b;
 
 	return equalRowTypes(left->tupdesc, right->tupdesc) ? 0 : 1;
 }
@@ -2399,16 +2399,6 @@ InvalidateCompositeTypeCacheEntry(TypeCacheEntry *typentry)
 	hadTupDescOrOpclass = (typentry->tupDesc != NULL) ||
 		(typentry->flags & TCFLAGS_OPERATOR_FLAGS);
 
-	/*
-	 * A branch object's durable OID finds its branch's current view without
-	 * a pin; the pin would keep the view the type was first seen in.
-	 */
-	if (typentry->catalogview && CatalogViewIsDurable(typentry->type_id))
-	{
-		CatalogViewRelease(typentry->catalogview);
-		typentry->catalogview = NULL;
-	}
-
 	/* Delete tupdesc if we have it */
 	if (typentry->tupDesc != NULL)
 	{
@@ -2467,7 +2457,7 @@ TypeCacheRelCallback(Datum arg, Oid relid)
 		RelIdToTypeIdCacheEntry *relentry;
 
 		/*
-		 * Find an RelIdToTypeIdCacheHash entry, which should exist as soon as
+		 * Find a RelIdToTypeIdCacheHash entry, which should exist as soon as
 		 * corresponding typcache entry has something to clean.
 		 */
 		relentry = (RelIdToTypeIdCacheEntry *) hash_search(RelIdToTypeIdCacheHash,
@@ -2542,32 +2532,6 @@ TypeCacheRelCallback(Datum arg, Oid relid)
 }
 
 /*
- * TypeCacheForgetCatalogView
- *		Forget the types of a provisional catalog view that DDL has retired:
- *		their handles are never valid again.
- */
-void
-TypeCacheForgetCatalogView(struct CatalogView *view)
-{
-	HASH_SEQ_STATUS status;
-	TypeCacheEntry *typentry;
-
-	if (TypeCacheHash == NULL)
-		return;
-	hash_seq_init(&status, TypeCacheHash);
-	while ((typentry = (TypeCacheEntry *) hash_seq_search(&status)) != NULL)
-	{
-		if (typentry->catalogview != view)
-			continue;
-		if (typentry->typtype == TYPTYPE_COMPOSITE && OidIsValid(typentry->typrelid))
-			InvalidateCompositeTypeCacheEntry(typentry);
-		typentry->flags &= ~(TCFLAGS_HAVE_PG_TYPE_DATA | TCFLAGS_CHECKED_DOMAIN_CONSTRAINTS);
-		CatalogViewRelease(view);
-		typentry->catalogview = NULL;
-	}
-}
-
-/*
  * TypeCacheTypCallback
  *		Syscache inval callback function
  *
@@ -2576,7 +2540,7 @@ TypeCacheForgetCatalogView(struct CatalogView *view)
  * it as needing to be reloaded.
  */
 static void
-TypeCacheTypCallback(Datum arg, int cacheid, uint32 hashvalue)
+TypeCacheTypCallback(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 {
 	HASH_SEQ_STATUS status;
 	TypeCacheEntry *typentry;
@@ -2633,7 +2597,7 @@ TypeCacheTypCallback(Datum arg, int cacheid, uint32 hashvalue)
  * of members are not going to get cached here.
  */
 static void
-TypeCacheOpcCallback(Datum arg, int cacheid, uint32 hashvalue)
+TypeCacheOpcCallback(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 {
 	HASH_SEQ_STATUS status;
 	TypeCacheEntry *typentry;
@@ -2671,7 +2635,7 @@ TypeCacheOpcCallback(Datum arg, int cacheid, uint32 hashvalue)
  * approach to domain constraints.
  */
 static void
-TypeCacheConstrCallback(Datum arg, int cacheid, uint32 hashvalue)
+TypeCacheConstrCallback(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 {
 	TypeCacheEntry *typentry;
 
@@ -2828,7 +2792,7 @@ load_enum_cache_data(TypeCacheEntry *tcache)
 	 * through.
 	 */
 	maxitems = 64;
-	items = (EnumItem *) palloc(sizeof(EnumItem) * maxitems);
+	items = palloc_array(EnumItem, maxitems);
 	numitems = 0;
 
 	/* Scan pg_enum for the members of the target enum type. */

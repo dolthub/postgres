@@ -6,7 +6,7 @@
  * This includes the fallback implementation for SHA2 cryptographic
  * hashes.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -152,7 +152,8 @@
 #define sigma1_512(x)	(S64(19, (x)) ^ S64(61, (x)) ^ R( 6,   (x)))
 
 /*** INTERNAL FUNCTION PROTOTYPES *************************************/
-/* NOTE: These should not be accessed directly from outside this
+/*
+ * NOTE: These should not be accessed directly from outside this
  * library -- they are intended for private internal visibility/use
  * only.
  */

@@ -5,7 +5,7 @@
  * Basically this is stuff that is useful in both pg_dump and pg_dumpall.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/bin/pg_dump/dumputils.c
@@ -160,7 +160,7 @@ buildACLCommands(const char *name, const char *subname, const char *nspname,
 	 * Besides, a false mismatch will just cause the output to be a little
 	 * more verbose than it really needed to be.
 	 */
-	grantitems = (char **) pg_malloc(naclitems * sizeof(char *));
+	grantitems = pg_malloc_array(char *, naclitems);
 	for (i = 0; i < naclitems; i++)
 	{
 		bool		found = false;
@@ -176,7 +176,7 @@ buildACLCommands(const char *name, const char *subname, const char *nspname,
 		if (!found)
 			grantitems[ngrantitems++] = aclitems[i];
 	}
-	revokeitems = (char **) pg_malloc(nbaseitems * sizeof(char *));
+	revokeitems = pg_malloc_array(char *, nbaseitems);
 	for (i = 0; i < nbaseitems; i++)
 	{
 		bool		found = false;
@@ -724,7 +724,7 @@ emitShSecLabels(PGconn *conn, PGresult *res, PQExpBuffer buffer,
  * currently known to guc.c, so that it'd be unsafe for extensions to declare
  * GUC_LIST_QUOTE variables anyway.  Lacking a solution for that, it doesn't
  * seem worth the work to do more than have this list, which must be kept in
- * sync with the variables actually marked GUC_LIST_QUOTE in guc_tables.c.
+ * sync with the variables actually marked GUC_LIST_QUOTE in guc_parameters.dat.
  */
 bool
 variable_is_guc_list_quote(const char *name)
@@ -786,6 +786,7 @@ makeAlterConfigCommand(PGconn *conn, const char *configitem,
 	 * elements as string literals.  (The elements may be double-quoted as-is,
 	 * but we can't just feed them to the SQL parser; it would do the wrong
 	 * thing with elements that are zero-length or longer than NAMEDATALEN.)
+	 * Also, we need a special case for empty lists.
 	 *
 	 * Variables that are not so marked should just be emitted as simple
 	 * string literals.  If the variable is not known to
@@ -801,6 +802,9 @@ makeAlterConfigCommand(PGconn *conn, const char *configitem,
 		/* this shouldn't fail really */
 		if (SplitGUCList(pos, ',', &namelist))
 		{
+			/* Special case: represent an empty list as NULL */
+			if (*namelist == NULL)
+				appendPQExpBufferStr(buf, "NULL");
 			for (nameptr = namelist; *nameptr; nameptr++)
 			{
 				if (nameptr != namelist)

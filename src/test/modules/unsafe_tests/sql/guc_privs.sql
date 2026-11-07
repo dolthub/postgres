@@ -263,6 +263,8 @@ DROP OWNED BY regress_host_resource_admin;  -- ok
 DROP ROLE regress_host_resource_admin;  -- ok
 
 -- Test for GUC synchronized standby slots
+-- Cannot set synchronized_standby_slots to a reserved slot name
+ALTER SYSTEM SET synchronized_standby_slots='pg_conflict_detection';
 -- Cannot set synchronized_standby_slots to an invalid slot name
 ALTER SYSTEM SET synchronized_standby_slots='invalid*';
 -- Can set synchronized_standby_slots to a non-existent slot name

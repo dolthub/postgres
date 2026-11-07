@@ -23,23 +23,27 @@ PostgreSQL documentation
   <cmdsynopsis>
    <command>pg_createsubscriber</command>
    <arg rep="repeat"><replaceable>option</replaceable></arg>
-   <group choice="plain">
+   <arg choice="plain">
     <group choice="req">
      <arg choice="plain"><option>-d</option></arg>
      <arg choice="plain"><option>--database</option></arg>
     </group>
     <replaceable>dbname</replaceable>
+   </arg>
+   <arg choice="plain">
     <group choice="req">
-     <arg choice="plain"><option>-D</option> </arg>
+     <arg choice="plain"><option>-D</option></arg>
      <arg choice="plain"><option>--pgdata</option></arg>
     </group>
     <replaceable>datadir</replaceable>
+   </arg>
+   <arg choice="plain">
     <group choice="req">
      <arg choice="plain"><option>-P</option></arg>
      <arg choice="plain"><option>--publisher-server</option></arg>
     </group>
     <replaceable>connstr</replaceable>
-   </group>
+   </arg>
   </cmdsynopsis>
  </refsynopsisdiv>
 
@@ -126,12 +130,46 @@ PostgreSQL documentation
     </varlistentry>
 
     <varlistentry>
-     <term><option>-D <replaceable class="parameter">directory</replaceable></option></term>
-     <term><option>--pgdata=<replaceable class="parameter">directory</replaceable></option></term>
+     <term><option>-D <replaceable class="parameter">datadir</replaceable></option></term>
+     <term><option>--pgdata=<replaceable class="parameter">datadir</replaceable></option></term>
      <listitem>
       <para>
        The target directory that contains a cluster directory from a physical
        replica.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry>
+     <term><option>-l <replaceable class="parameter">directory</replaceable></option></term>
+     <term><option>--logdir=<replaceable class="parameter">directory</replaceable></option></term>
+     <listitem>
+      <para>
+       Specify the name of the log directory. A new directory is created with
+       this name if it does not exist. A subdirectory with a timestamp
+       indicating the time at which <application>pg_createsubscriber</application>
+       was run will be created. The following two log files will be created in
+       the subdirectory.
+       <itemizedlist>
+        <listitem>
+         <para>
+          <filename>pg_createsubscriber_server.log</filename> which captures logs
+          related to stopping and starting the standby server,
+         </para>
+        </listitem>
+        <listitem>
+         <para>
+          <filename>pg_createsubscriber_internal.log</filename> which captures
+          internal diagnostic output (validations, checks, etc.)
+         </para>
+        </listitem>
+       </itemizedlist>
+       By default, the <systemitem>umask</systemitem> is set to 077 so that the
+       log files are only readable by the user running the command. However, if
+       the target data directory is configured to allow group-read access,
+       <application>pg_createsubscriber</application> will adjust the log file
+       permissions to match. This ensures that the log file security remains
+       consistent with the database cluster itself.
       </para>
      </listitem>
     </varlistentry>
@@ -285,6 +323,14 @@ PostgreSQL documentation
        a generated name is assigned to the publication name. This option cannot
        be used together with <option>--all</option>.
       </para>
+      <para>
+       If a specified publication already exists on the publisher, it is reused.
+       It is useful to partially replicate the database if the specified
+       publication includes a list of tables. If the publication does not exist,
+       it is automatically created with <literal>FOR ALL TABLES</literal>. Use
+       <option>--dry-run</option> option to preview which publications will be
+       reused and which will be created.
+      </para>
      </listitem>
     </varlistentry>
 
@@ -379,12 +425,12 @@ PostgreSQL documentation
    <para>
     The source server must accept connections from the target server.  The
     source server must not be in recovery. The source server must have <xref
-    linkend="guc-wal-level"/> as <literal>logical</literal>.  The source server
-    must have <xref linkend="guc-max-replication-slots"/> configured to a value
-    greater than or equal to the number of specified databases plus existing
-    replication slots.  The source server must have <xref
-    linkend="guc-max-wal-senders"/> configured to a value greater than or equal
-    to the number of specified databases and existing WAL sender processes.
+    linkend="guc-wal-level"/> as <literal>replica</literal> or <literal>logical</literal>.
+    The source server must have <xref linkend="guc-max-replication-slots"/>
+    configured to a value greater than or equal to the number of specified
+    databases plus existing replication slots.  The source server must have
+    <xref linkend="guc-max-wal-senders"/> configured to a value greater than or
+    equal to the number of specified databases and existing WAL sender processes.
    </para>
   </refsect2>
 
@@ -510,8 +556,11 @@ PostgreSQL documentation
 
     <step>
      <para>
-      Write recovery parameters into the target data directory and restart the
-      target server.  It specifies an LSN (<xref
+      Write recovery parameters into the separate configuration file
+      <filename>pg_createsubscriber.conf</filename> that is included from
+      <filename>postgresql.auto.conf</filename> using
+      <literal>include_if_exists</literal> in the target data directory, then
+      restart the target server.  It specifies an LSN (<xref
       linkend="guc-recovery-target-lsn"/>) of the write-ahead log location up
       to which recovery will proceed.  It also specifies
       <literal>promote</literal> as the action that the server should take
@@ -524,7 +573,10 @@ PostgreSQL documentation
       server ends standby mode and is accepting read-write transactions.  If
       <option>--recovery-timeout</option> option is set,
       <application>pg_createsubscriber</application> terminates if recovery
-      does not end until the given number of seconds.
+      does not end until the given number of seconds.  Upon completion, the
+      included configuration file is renamed to
+      <filename>pg_createsubscriber.conf.disabled</filename> so as it is no
+      longer loaded on subsequent restarts.
      </para>
     </step>
 

@@ -236,26 +236,30 @@
   </indexterm>
 
   <para>
-   By default, data pages are protected by checksums, but this can
-   optionally be disabled for a cluster. When enabled, each data page includes
-   a checksum that is updated when the page is written and verified each time
-   the page is read. Only data pages are protected by checksums; internal data
-   structures and temporary files are not.
+   By default, data pages are protected by checksums, but this can optionally
+   be disabled for a cluster. When enabled, each data page includes a checksum
+   that is updated when the page is written and verified each time the page is
+   read. Only data pages are protected by checksums; internal data structures
+   and temporary files are not.
   </para>
 
   <para>
    Checksums can be disabled when the cluster is initialized using <link
    linkend="app-initdb-data-checksums"><application>initdb</application></link>.
    They can also be enabled or disabled at a later time as an offline
-   operation. Data checksums are enabled or disabled at the full cluster
-   level, and cannot be specified individually for databases or tables.
+   operation.  Data checksums are enabled or disabled at the full cluster
+   level, and cannot be specified individually for databases, tables or
+   replicated cluster members.
   </para>
 
   <para>
    The current state of checksums in the cluster can be verified by viewing the
    value of the read-only configuration variable <xref
    linkend="guc-data-checksums" /> by issuing the command <command>SHOW
-   data_checksums</command>.
+   data_checksums</command>.  <link linkend="functions-pg-control-init">
+   <literal>pg_control_init</literal></link>
+    can also be used for
+   inspecting the data checksum state at cluster initialization.
   </para>
 
   <para>
@@ -265,12 +269,14 @@
   </para>
 
   <sect2 id="checksums-offline-enable-disable">
-   <title>Off-line Enabling of Checksums</title>
+   <title>Offline Enabling of Checksums</title>
 
    <para>
     The <link linkend="app-pgchecksums"><application>pg_checksums</application></link>
     application can be used to enable or disable data checksums, as well as
-    verify checksums, on an offline cluster.
+    verify checksums, on an offline cluster.  The same operation must be
+    executed on every node in a replicated cluster before the cluster is
+    restarted.
    </para>
 
   </sect2>

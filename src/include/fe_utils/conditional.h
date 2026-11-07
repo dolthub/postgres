@@ -14,7 +14,7 @@
  * a true branch?) so that the interpreter knows whether to execute
  * code and whether to evaluate conditions.
  *
- * Copyright (c) 2000-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2026, PostgreSQL Global Development Group
  *
  * src/include/fe_utils/conditional.h
  *
@@ -52,21 +52,20 @@ typedef enum ifState
  * but that would be very invasive.)  We also need to save and restore some
  * lexer state, such as parenthesis nesting depth, when throwing away text.
  */
-struct PsqlScanStateSave;		/* opaque outside lexer */
+typedef struct PsqlScanStateSave PsqlScanStateSave; /* opaque outside lexer */
 
 typedef struct IfStackElem
 {
 	ifState		if_state;		/* current state, see enum above */
 	int			query_len;		/* length of query_buf at last branch start */
-	int			paren_depth;	/* (obsolete, not used anymore) */
+	PsqlScanStateSave *lex_state;	/* lexer state at last branch start */
 	struct IfStackElem *next;	/* next surrounding \if, if any */
-	struct PsqlScanStateSave *lex_state;	/* lexer state at last branch start */
 } IfStackElem;
 
 typedef struct ConditionalStackData
 {
 	IfStackElem *head;
-}			ConditionalStackData;
+} ConditionalStackData;
 
 typedef struct ConditionalStackData *ConditionalStack;
 
@@ -96,12 +95,8 @@ extern void conditional_stack_set_query_len(ConditionalStack cstack, int len);
 extern int	conditional_stack_get_query_len(ConditionalStack cstack);
 
 extern void conditional_stack_set_lex_state(ConditionalStack cstack,
-											struct PsqlScanStateSave *lex_state);
+											PsqlScanStateSave *lex_state);
 
-extern struct PsqlScanStateSave *conditional_stack_get_lex_state(ConditionalStack cstack);
-
-extern void conditional_stack_set_paren_depth(ConditionalStack cstack, int depth);
-
-extern int	conditional_stack_get_paren_depth(ConditionalStack cstack);
+extern PsqlScanStateSave *conditional_stack_get_lex_state(ConditionalStack cstack);
 
 #endif							/* CONDITIONAL_H */

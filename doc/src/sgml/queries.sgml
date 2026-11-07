@@ -143,11 +143,13 @@ FROM <replaceable>table_reference</replaceable> <optional>, <replaceable>table_r
    </para>
 
    <para>
-    Instead of writing <literal>ONLY</literal> before the table name, you can write
-    <literal>*</literal> after the table name to explicitly specify that descendant
-    tables are included.  There is no real reason to use this syntax any more,
-    because searching descendant tables is now always the default behavior.
-    However, it is supported for compatibility with older releases.
+    You can write <literal>*</literal> after the table name to explicitly
+    specify that descendant tables are included, which is the opposite of
+    <literal>ONLY</literal>.  There is no real reason to write
+    <literal>*</literal> any more, because searching descendant tables has
+    been the default behavior since <productname>PostgreSQL</productname>
+    version 10.  However, it remains supported for compatibility with older
+    releases.
    </para>
 
    <sect3 id="queries-join">
@@ -410,7 +412,7 @@ FROM <replaceable>table_reference</replaceable> <optional>, <replaceable>table_r
     </variablelist>
 
     <para>
-     To put this together, assume we have tables <literal>t1</literal>:
+     To put this together, assume we have tables <structname>t1</structname>:
 <programlisting>
  num | name
 -----+------
@@ -418,7 +420,7 @@ FROM <replaceable>table_reference</replaceable> <optional>, <replaceable>table_r
    2 | b
    3 | c
 </programlisting>
-     and <literal>t2</literal>:
+     and <structname>t2</structname>:
 <programlisting>
  num | value
 -----+-------
@@ -1079,7 +1081,7 @@ SELECT <replaceable>select_list</replaceable>
    <para>
     In the second query, we could not have written <literal>SELECT *
     FROM test1 GROUP BY x</literal>, because there is no single value
-    for the column <literal>y</literal> that could be associated with each
+    for the column <structfield>y</structfield> that could be associated with each
     group.  The grouped-by columns can be referenced in the select list since
     they have a single value in each group.
    </para>
@@ -1145,10 +1147,11 @@ SELECT product_id, p.name, (sum(s.units) * p.price) AS sales
 
    <para>
     In strict SQL, <literal>GROUP BY</literal> can only group by columns of
-    the source table but <productname>PostgreSQL</productname> extends
+    the source table, but <productname>PostgreSQL</productname> extends
     this to also allow <literal>GROUP BY</literal> to group by columns in the
     select list.  Grouping by value expressions instead of simple
-    column names is also allowed.
+    column names is also allowed (but <literal>GROUP BY</literal>
+    expressions cannot contain aggregate functions or window functions).
    </para>
 
    <indexterm>
@@ -2206,7 +2209,7 @@ WITH RECURSIVE included_parts(sub_part, part, quantity) AS (
     FROM included_parts pr, parts p
     WHERE p.part = pr.sub_part
 )
-SELECT sub_part, SUM(quantity) as total_quantity
+SELECT sub_part, SUM(quantity) AS total_quantity
 FROM included_parts
 GROUP BY sub_part
 </programlisting>
@@ -2577,7 +2580,7 @@ WHERE w2.key = 123;
    undesirable is
 <programlisting>
 WITH w AS (
-    SELECT key, very_expensive_function(val) as f FROM some_table
+    SELECT key, very_expensive_function(val) AS f FROM some_table
 )
 SELECT * FROM w AS w1 JOIN w AS w2 ON w1.f = w2.f;
 </programlisting>

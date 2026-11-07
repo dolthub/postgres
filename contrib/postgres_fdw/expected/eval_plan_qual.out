@@ -113,10 +113,10 @@ step s1_tuplock_a_1: <... completed>
 QUERY PLAN                                                                                                                              
 ----------------------------------------------------------------------------------------------------------------------------------------
 LockRows                                                                                                                                
-  Output: a.i, ((SubPlan 1)), a.ctid                                                                                                    
+  Output: a.i, ((SubPlan expr_1)), a.ctid                                                                                               
   ->  Seq Scan on public.a                                                                                                              
-        Output: a.i, (SubPlan 1), a.ctid                                                                                                
-        SubPlan 1                                                                                                                       
+        Output: a.i, (SubPlan expr_1), a.ctid                                                                                           
+        SubPlan expr_1                                                                                                                  
           ->  Foreign Scan                                                                                                              
                 Output: 1                                                                                                               
                 Relations: (public.fb) INNER JOIN (public.fc)                                                                           

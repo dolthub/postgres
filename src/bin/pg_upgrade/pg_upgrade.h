@@ -1,7 +1,7 @@
 /*
  *	pg_upgrade.h
  *
- *	Copyright (c) 2010-2025, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *	src/bin/pg_upgrade/pg_upgrade.h
  */
 
@@ -113,6 +113,13 @@ extern char *output_files[];
  * server versions are both newer than this, or only the new one is.
  */
 #define MULTIXACT_FORMATCHANGE_CAT_VER 201301231
+
+/*
+ * MultiXactOffset was changed from 32-bit to 64-bit in version 19, at this
+ * catalog version.  pg_multixact files need to be converted when upgrading
+ * across this version.
+ */
+#define MULTIXACTOFFSET_FORMATCHANGE_CAT_VER 202512091
 
 /*
  * large object chunk size added to pg_controldata,
@@ -235,7 +242,7 @@ typedef struct
 	uint32		chkpnt_nxtepoch;
 	uint32		chkpnt_nxtoid;
 	uint32		chkpnt_nxtmulti;
-	uint32		chkpnt_nxtmxoff;
+	uint64		chkpnt_nxtmxoff;
 	uint32		chkpnt_oldstMulti;
 	uint32		chkpnt_oldstxid;
 	uint32		align;
@@ -298,16 +305,20 @@ typedef struct
 	char	   *sockdir;		/* directory for Unix Domain socket, if any */
 	unsigned short port;		/* port number where postmaster is waiting */
 	uint32		major_version;	/* PG_VERSION of cluster */
-	char		major_version_str[64];	/* string PG_VERSION of cluster */
+	char	   *major_version_str;	/* string PG_VERSION of cluster */
 	uint32		bin_version;	/* version returned from pg_ctl */
+	char	  **tablespaces;	/* tablespace directories */
+	int			num_tablespaces;
 	const char *tablespace_suffix;	/* directory specification */
 	int			nsubs;			/* number of subscriptions */
+	bool		sub_retain_dead_tuples; /* whether a subscription enables
+										 * retain_dead_tuples. */
 } ClusterInfo;
 
 
 /*
  *	LogOpts
-*/
+ */
 typedef struct
 {
 	FILE	   *internal;		/* internal log FILE */
@@ -324,7 +335,7 @@ typedef struct
 
 /*
  *	UserOpts
-*/
+ */
 typedef struct
 {
 	bool		check;			/* check clusters only, don't change any data */
@@ -354,8 +365,6 @@ typedef struct
 	const char *progname;		/* complete pathname for this program */
 	char	   *user;			/* username for clusters */
 	bool		user_specified; /* user specified on command-line */
-	char	  **old_tablespaces;	/* tablespaces */
-	int			num_old_tablespaces;
 	LibraryInfo *libraries;		/* loadable libraries */
 	int			num_libraries;
 	ClusterInfo *running_cluster;
@@ -405,7 +414,7 @@ void		generate_old_dump(void);
 #define EXEC_PSQL_ARGS "--echo-queries --set ON_ERROR_STOP=on --no-psqlrc --dbname=template1"
 
 bool		exec_prog(const char *log_filename, const char *opt_log_file,
-					  bool report_error, bool exit_on_error, const char *fmt,...) pg_attribute_printf(5, 6);
+					  bool report_error, bool exit_on_error, const char *fmt, ...) pg_attribute_printf(5, 6);
 void		verify_directories(void);
 bool		pid_lock_file_exists(const char *datadir);
 
@@ -441,7 +450,7 @@ FileNameMap *gen_db_file_maps(DbInfo *old_db,
 							  const char *new_pgdata);
 void		get_db_rel_and_slot_infos(ClusterInfo *cluster);
 int			count_old_cluster_logical_slots(void);
-void		get_subscription_count(ClusterInfo *cluster);
+void		get_subscription_info(ClusterInfo *cluster);
 
 /* option.c */
 
@@ -455,7 +464,7 @@ void		transfer_all_new_tablespaces(DbInfoArr *old_db_arr,
 										 DbInfoArr *new_db_arr, char *old_pgdata, char *new_pgdata);
 void		transfer_all_new_dbs(DbInfoArr *old_db_arr,
 								 DbInfoArr *new_db_arr, char *old_pgdata, char *new_pgdata,
-								 char *old_tablespace);
+								 char *old_tablespace, char *new_tablespace);
 
 /* tablespace.c */
 
@@ -465,13 +474,12 @@ void		init_tablespaces(void);
 /* server.c */
 
 PGconn	   *connectToServer(ClusterInfo *cluster, const char *db_name);
-PGresult   *executeQueryOrDie(PGconn *conn, const char *fmt,...) pg_attribute_printf(2, 3);
+PGresult   *executeQueryOrDie(PGconn *conn, const char *fmt, ...) pg_attribute_printf(2, 3);
 
 char	   *cluster_conn_opts(ClusterInfo *cluster);
 
 bool		start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error);
 void		stop_postmaster(bool in_atexit);
-uint32		get_major_server_version(ClusterInfo *cluster);
 void		check_pghost_envvar(void);
 
 
@@ -480,14 +488,15 @@ void		check_pghost_envvar(void);
 char	   *quote_identifier(const char *s);
 int			get_user_info(char **user_name_p);
 void		check_ok(void);
-void		report_status(eLogType type, const char *fmt,...) pg_attribute_printf(2, 3);
-void		pg_log(eLogType type, const char *fmt,...) pg_attribute_printf(2, 3);
-pg_noreturn void pg_fatal(const char *fmt,...) pg_attribute_printf(1, 2);
+void		report_status(eLogType type, const char *fmt, ...) pg_attribute_printf(2, 3);
+void		pg_log(eLogType type, const char *fmt, ...) pg_attribute_printf(2, 3);
+pg_noreturn void pg_fatal(const char *fmt, ...) pg_attribute_printf(1, 2);
 void		end_progress_output(void);
 void		cleanup_output_dirs(void);
-void		prep_status(const char *fmt,...) pg_attribute_printf(1, 2);
-void		prep_status_progress(const char *fmt,...) pg_attribute_printf(1, 2);
+void		prep_status(const char *fmt, ...) pg_attribute_printf(1, 2);
+void		prep_status_progress(const char *fmt, ...) pg_attribute_printf(1, 2);
 unsigned int str2uint(const char *str);
+uint64		str2uint64(const char *str);
 
 
 /* version.c */
@@ -499,12 +508,15 @@ void		old_9_6_invalidate_hash_indexes(ClusterInfo *cluster,
 
 void		report_extension_updates(ClusterInfo *cluster);
 
+/* multixact_rewrite.c */
+MultiXactOffset rewrite_multixacts(MultiXactId from_multi, MultiXactId to_multi);
+
 /* parallel.c */
 void		parallel_exec_prog(const char *log_file, const char *opt_log_file,
-							   const char *fmt,...) pg_attribute_printf(3, 4);
+							   const char *fmt, ...) pg_attribute_printf(3, 4);
 void		parallel_transfer_all_new_dbs(DbInfoArr *old_db_arr, DbInfoArr *new_db_arr,
 										  char *old_pgdata, char *new_pgdata,
-										  char *old_tablespace);
+										  char *old_tablespace, char *new_tablespace);
 bool		reap_child(bool wait_for_child);
 
 /* task.c */

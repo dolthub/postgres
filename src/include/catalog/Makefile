@@ -2,7 +2,7 @@
 #
 # Makefile for src/include/catalog
 #
-# Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
 # src/include/catalog/Makefile
@@ -81,23 +81,7 @@ CATALOG_HEADERS := \
 	pg_publication_namespace.h \
 	pg_publication_rel.h \
 	pg_subscription.h \
-	pg_subscription_rel.h \
-	pg_dolt_object.h \
-	pg_dolt_ref.h \
-	pg_dolt_binding.h \
-	pg_dolt_storage.h \
-	pg_dolt_remote.h \
-	pg_dolt_reflog.h \
-	pg_dolt_rebase.h \
-	pg_dolt_backup.h \
-	pg_dolt_branch_control.h \
-	pg_dolt_branch_namespace_control.h \
-	pg_dolt_root.h \
-	pg_dolt_lock.h \
-	pg_dolt_handle.h \
-	pg_dolt_sequence.h \
-	pg_dolt_relation_stats.h \
-	pg_dolt_identity.h
+	pg_subscription_rel.h
 
 GENERATED_HEADERS := $(CATALOG_HEADERS:%.h=%_d.h)
 
@@ -110,6 +94,7 @@ POSTGRES_BKI_DATA = \
 	pg_amop.dat \
 	pg_amproc.dat \
 	pg_authid.dat \
+	pg_auth_members.dat \
 	pg_cast.dat \
 	pg_class.dat \
 	pg_collation.dat \
@@ -165,6 +150,7 @@ install: all installdirs
 ifeq ($(vpath_build),yes)
 	$(INSTALL_DATA) schemapg.h '$(DESTDIR)$(includedir_server)'/catalog/schemapg.h
 	$(INSTALL_DATA) syscache_ids.h '$(DESTDIR)$(includedir_server)'/catalog/syscache_ids.h
+	$(INSTALL_DATA) syscache_info.h '$(DESTDIR)$(includedir_server)'/catalog/syscache_info.h
 	$(INSTALL_DATA) system_fk_info.h '$(DESTDIR)$(includedir_server)'/catalog/system_fk_info.h
 	for file in $(GENERATED_HEADERS); do \
 	  $(INSTALL_DATA) $$file '$(DESTDIR)$(includedir_server)'/catalog/$$file || exit; \
@@ -176,7 +162,7 @@ installdirs:
 
 uninstall:
 	rm -f $(addprefix '$(DESTDIR)$(datadir)'/, postgres.bki system_constraints.sql)
-	rm -f $(addprefix '$(DESTDIR)$(includedir_server)'/catalog/, schemapg.h syscache_ids.h system_fk_info.h $(GENERATED_HEADERS))
+	rm -f $(addprefix '$(DESTDIR)$(includedir_server)'/catalog/, schemapg.h syscache_ids.h syscache_info.h system_fk_info.h $(GENERATED_HEADERS))
 
 clean:
 	rm -f bki-stamp $(GENBKI_OUTPUT_FILES)

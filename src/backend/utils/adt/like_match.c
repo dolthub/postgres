@@ -16,7 +16,7 @@
  * do_like_escape - name of function if wanted - needs CHAREQ and CopyAdvChar
  * MATCH_LOWER - define for case (4) to specify case folding for 1-byte chars
  *
- * Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	src/backend/utils/adt/like_match.c
@@ -70,10 +70,15 @@
  *--------------------
  */
 
+/*
+ * MATCH_LOWER is defined for ILIKE in the C locale as an optimization. Other
+ * locales must casefold the inputs before matching.
+ */
 #ifdef MATCH_LOWER
-#define GETCHAR(t, locale) MATCH_LOWER(t, locale)
+/* cast to char to match data types in caller */
+#define GETCHAR(t) ((char) pg_ascii_tolower(t))
 #else
-#define GETCHAR(t, locale) (t)
+#define GETCHAR(t) (t)
 #endif
 
 static int
@@ -162,14 +167,14 @@ MatchText(const char *t, int tlen, const char *p, int plen, pg_locale_t locale)
 					ereport(ERROR,
 							(errcode(ERRCODE_INVALID_ESCAPE_SEQUENCE),
 							 errmsg("LIKE pattern must not end with escape character")));
-				firstpat = GETCHAR(p[1], locale);
+				firstpat = GETCHAR(p[1]);
 			}
 			else
-				firstpat = GETCHAR(*p, locale);
+				firstpat = GETCHAR(*p);
 
 			while (tlen > 0)
 			{
-				if (GETCHAR(*t, locale) == firstpat || nondeterministic)
+				if (GETCHAR(*t) == firstpat || nondeterministic)
 				{
 					int			matched = MatchText(t, tlen, p, plen, locale);
 
@@ -350,10 +355,10 @@ MatchText(const char *t, int tlen, const char *p, int plen, pg_locale_t locale)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_ESCAPE_SEQUENCE),
 						 errmsg("LIKE pattern must not end with escape character")));
-			if (GETCHAR(*p, locale) != GETCHAR(*t, locale))
+			if (GETCHAR(*p) != GETCHAR(*t))
 				return LIKE_FALSE;
 		}
-		else if (GETCHAR(*p, locale) != GETCHAR(*t, locale))
+		else if (GETCHAR(*p) != GETCHAR(*t))
 		{
 			/* non-wildcard pattern char fails to match text char */
 			return LIKE_FALSE;

@@ -13,7 +13,7 @@
  * function call will be dealing with.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -22,7 +22,6 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "catalog/catalogview.h"
 
 #include "catalog/pg_proc.h"
 #include "commands/event_trigger.h"
@@ -243,6 +242,9 @@ cfunc_hashtable_delete(CachedFunction *function)
  * The hashkey is returned into the caller-provided storage at *hashkey.
  * Note however that if a callResultType is incorporated, we've not done
  * anything about copying that.
+ *
+ * See comments for cached_function_compile() about how much of *fcinfo
+ * we're allowed to consider when forValidator is true.
  */
 static void
 compute_function_hashkey(FunctionCallInfo fcinfo,
@@ -286,7 +288,6 @@ compute_function_hashkey(FunctionCallInfo fcinfo,
 
 	/* get input collation, if known */
 	hashkey->inputCollation = fcinfo->fncollation;
-	hashkey->catalogContext = CatalogViewCacheId(CatalogViewCurrent());
 
 	/*
 	 * We include only input arguments in the hash key, since output argument
@@ -328,9 +329,12 @@ compute_function_hashkey(FunctionCallInfo fcinfo,
 	 * a function returning RECORD may depend on a column definition list to
 	 * determine its output rowtype.  If the caller needs the exact result
 	 * type to be part of the hash lookup key, we must run
-	 * get_call_result_type() to find that out.
+	 * get_call_result_type() to find that out.  However, in validation mode
+	 * the supplied fcinfo will likely not be complete enough for that to
+	 * work, so leave callResultType unfilled (implying that the resulting
+	 * hash entry will never match any actual calls for such functions).
 	 */
-	if (includeResultType)
+	if (includeResultType && !forValidator)
 	{
 		Oid			resultTypeId;
 		TupleDesc	tupdesc;
@@ -422,6 +426,7 @@ cfunc_resolve_polymorphic_argtypes(int numargs,
 					argtypes[i] = INT4RANGEOID;
 					break;
 				case ANYMULTIRANGEOID:
+				case ANYCOMPATIBLEMULTIRANGEOID:
 					argtypes[i] = INT4MULTIRANGEOID;
 					break;
 				default:
@@ -483,7 +488,10 @@ delete_function(CachedFunction *func)
  * include the actual result descriptor in the cache lookup key.
  *
  * If forValidator is true, we're only compiling for validation purposes,
- * and so some checks are skipped.
+ * and so some checks are skipped.  In this case the passed fcinfo need
+ * only provide the function OID and indications of whether the function
+ * is a trigger or event trigger (as tested via CALLED_AS_TRIGGER or
+ * CALLED_AS_EVENT_TRIGGER).
  *
  * Note: it's important for this to fall through quickly if the function
  * has already been compiled.
@@ -512,7 +520,7 @@ cached_function_compile(FunctionCallInfo fcinfo,
 	/*
 	 * Lookup the pg_proc tuple by Oid; we'll need it in any case
 	 */
-	procTup = CatalogViewFunctionTuple(funcOid);
+	procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcOid));
 	if (!HeapTupleIsValid(procTup))
 		elog(ERROR, "cache lookup failed for function %u", funcOid);
 	procStruct = (Form_pg_proc) GETSTRUCT(procTup);
@@ -522,8 +530,6 @@ cached_function_compile(FunctionCallInfo fcinfo,
 	 * to find one in the hash table.
 	 */
 recheck:
-	if (function && (!function->fn_hashkey || function->fn_hashkey->catalogContext != CatalogViewCacheId(CatalogViewCurrent())))
-		function = NULL;
 	if (!function)
 	{
 		/* Compute hashkey using function signature and actual arg types */

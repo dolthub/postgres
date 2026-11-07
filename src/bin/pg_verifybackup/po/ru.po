@@ -3,7 +3,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: pg_verifybackup (PostgreSQL) 13\n"
 "Report-Msgid-Bugs-To: pgsql-bugs@lists.postgresql.org\n"
-"POT-Creation-Date: 2026-08-08 08:46+0300\n"
+"POT-Creation-Date: 2026-08-05 06:37+0300\n"
 "PO-Revision-Date: 2026-08-05 07:51+0300\n"
 "Last-Translator: Alexander Lakhin <a.lakhin@postgrespro.ru>\n"
 "Language-Team: Russian <pgsql-ru-general@postgresql.org>\n"
@@ -875,7 +875,7 @@ msgstr ""
 msgid "%s home page: <%s>\n"
 msgstr "Домашняя страница %s: <%s>\n"
 
-#, fuzzy, c-format
+#, c-format
 #~ msgid "tar file trailer exceeds 2 blocks"
 #~ msgstr "окончание файла tar занимает больше 2 блоков"
 

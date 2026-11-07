@@ -13,7 +13,7 @@
  * we must return a tuples-processed count in the QueryCompletion.  (We no
  * longer do that for CTAS ... WITH NO DATA, however.)
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -24,7 +24,6 @@
  */
 #include "postgres.h"
 
-#include "access/doltcatalog.h"
 #include "access/heapam.h"
 #include "access/reloptions.h"
 #include "access/tableam.h"
@@ -32,7 +31,6 @@
 #include "catalog/namespace.h"
 #include "catalog/toasting.h"
 #include "commands/createas.h"
-#include "commands/extension.h"
 #include "commands/matview.h"
 #include "commands/prepare.h"
 #include "commands/tablecmds.h"
@@ -58,7 +56,7 @@ typedef struct
 	Relation	rel;			/* relation to write to */
 	ObjectAddress reladdr;		/* address of rel, for ExecCreateTableAs */
 	CommandId	output_cid;		/* cmin to insert in output tuples */
-	int			ti_options;		/* table_tuple_insert performance options */
+	uint32		ti_options;		/* table_tuple_insert performance options */
 	BulkInsertState bistate;	/* bulk insert state */
 } DR_intorel;
 
@@ -108,19 +106,6 @@ create_ctas_internal(List *attrList, IntoClause *into)
 	create->tablespacename = into->tableSpaceName;
 	create->if_not_exists = false;
 	create->accessMethod = into->accessMethod;
-
-	/*
-	 * A versioned table is created in its branch's schema, like any other
-	 * CREATE TABLE; its rows are then inserted as usual.
-	 */
-	if (!creating_extension &&
-		(is_matview ? dg_catalog_create_matview(create, into->viewQuery) : dg_catalog_create((Node *) create, NULL)))
-	{
-		CommandCounterIncrement();
-		ObjectAddressSet(intoRelationAddr, RelationRelationId,
-						 RangeVarGetRelid(into->rel, NoLock, false));
-		return intoRelationAddr;
-	}
 
 	/*
 	 * Create the relation.  (This will error out if there's an existing view,
@@ -336,7 +321,7 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 
 		/* plan the query */
 		plan = pg_plan_query(query, pstate->p_sourcetext,
-							 CURSOR_OPT_PARALLEL_OK, params);
+							 CURSOR_OPT_PARALLEL_OK, params, NULL);
 
 		/*
 		 * Use a snapshot with an updated command ID to ensure this query sees
@@ -415,10 +400,6 @@ CreateTableAsRelExists(CreateTableAsStmt *ctas)
 	nspid = RangeVarGetCreationNamespace(into->rel);
 
 	oldrelid = get_relname_relid(into->rel->relname, nspid);
-
-	/* A versioned table is found in its branch's schema, by name. */
-	if (!OidIsValid(oldrelid))
-		(void) RangeVarGetAndCheckCreationNamespace(into->rel, NoLock, &oldrelid);
 	if (OidIsValid(oldrelid))
 	{
 		if (!ctas->if_not_exists)
@@ -458,7 +439,7 @@ CreateTableAsRelExists(CreateTableAsStmt *ctas)
 DestReceiver *
 CreateIntoRelDestReceiver(IntoClause *intoClause)
 {
-	DR_intorel *self = (DR_intorel *) palloc0(sizeof(DR_intorel));
+	DR_intorel *self = palloc0_object(DR_intorel);
 
 	self->pub.receiveSlot = intorel_receive;
 	self->pub.rStartup = intorel_startup;

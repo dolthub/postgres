@@ -2,7 +2,7 @@
  * reorderbuffer.h
  *	  PostgreSQL logical replay/reorder buffer management.
  *
- * Copyright (c) 2012-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2012-2026, PostgreSQL Global Development Group
  *
  * src/include/replication/reorderbuffer.h
  */
@@ -83,7 +83,7 @@ typedef struct ReorderBufferChange
 	/* Transaction this change belongs to. */
 	struct ReorderBufferTXN *txn;
 
-	RepOriginId origin_id;
+	ReplOriginId origin_id;
 
 	/*
 	 * Context data for the change. Which part of the union is valid depends
@@ -136,8 +136,12 @@ typedef struct ReorderBufferChange
 		CommandId	command_id;
 
 		/*
-		 * New cid mapping for catalog changing transaction, set when action
-		 * == *_INTERNAL_TUPLECID.
+		 * tuplecid changes are used to follow catalog tuple movements (i.e.,
+		 * DDL changes); we need them to create the HistoricTupleCidHash table
+		 * used with historical snapshots.  For historical reasons we store
+		 * these with the toplevel txn, not each subtxn; and yet we need to
+		 * remove them on subxact aborts, so we record the subxid separately.
+		 * Set when action == *_INTERNAL_TUPLECID.
 		 */
 		struct
 		{
@@ -146,6 +150,7 @@ typedef struct ReorderBufferChange
 			CommandId	cmin;
 			CommandId	cmax;
 			CommandId	combocid;
+			TransactionId subxid;
 		}			tuplecid;
 
 		/* Invalidation. */
@@ -293,7 +298,7 @@ typedef struct ReorderBufferChange
 typedef struct ReorderBufferTXN
 {
 	/* See above */
-	bits32		txn_flags;
+	uint32		txn_flags;
 
 	/* The transaction's transaction id, can be a toplevel or sub xid. */
 	TransactionId xid;
@@ -347,7 +352,7 @@ typedef struct ReorderBufferTXN
 	XLogRecPtr	restart_decoding_lsn;
 
 	/* origin of the change that caused this transaction */
-	RepOriginId origin_id;
+	ReplOriginId origin_id;
 	XLogRecPtr	origin_lsn;
 
 	/*
@@ -359,7 +364,7 @@ typedef struct ReorderBufferTXN
 		TimestampTz commit_time;
 		TimestampTz prepare_time;
 		TimestampTz abort_time;
-	}			xact_time;
+	};
 
 	/*
 	 * The base snapshot is used to decode all changes until either this
@@ -690,6 +695,9 @@ struct ReorderBuffer
 	int64		streamCount;	/* streaming invocation counter */
 	int64		streamBytes;	/* amount of data decoded */
 
+	/* Number of times the logical_decoding_work_mem limit has been reached */
+	int64		memExceededCount;
+
 	/*
 	 * Statistics about all the transactions sent to the decoding output
 	 * plugin
@@ -721,12 +729,12 @@ extern void ReorderBufferQueueMessage(ReorderBuffer *rb, TransactionId xid,
 									  Size message_size, const char *message);
 extern void ReorderBufferCommit(ReorderBuffer *rb, TransactionId xid,
 								XLogRecPtr commit_lsn, XLogRecPtr end_lsn,
-								TimestampTz commit_time, RepOriginId origin_id, XLogRecPtr origin_lsn);
+								TimestampTz commit_time, ReplOriginId origin_id, XLogRecPtr origin_lsn);
 extern void ReorderBufferFinishPrepared(ReorderBuffer *rb, TransactionId xid,
 										XLogRecPtr commit_lsn, XLogRecPtr end_lsn,
 										XLogRecPtr two_phase_at,
 										TimestampTz commit_time,
-										RepOriginId origin_id, XLogRecPtr origin_lsn,
+										ReplOriginId origin_id, XLogRecPtr origin_lsn,
 										char *gid, bool is_commit);
 extern void ReorderBufferAssignChild(ReorderBuffer *rb, TransactionId xid,
 									 TransactionId subxid, XLogRecPtr lsn);
@@ -737,6 +745,10 @@ extern void ReorderBufferAbort(ReorderBuffer *rb, TransactionId xid, XLogRecPtr 
 							   TimestampTz abort_time);
 extern void ReorderBufferAbortOld(ReorderBuffer *rb, TransactionId oldestRunningXid);
 extern void ReorderBufferForget(ReorderBuffer *rb, TransactionId xid, XLogRecPtr lsn);
+extern void ReorderBufferCleanupAbortedTupleCids(ReorderBuffer *rb,
+												 TransactionId xid,
+												 int nsubxacts,
+												 TransactionId *subxacts);
 extern void ReorderBufferInvalidate(ReorderBuffer *rb, TransactionId xid, XLogRecPtr lsn);
 
 extern void ReorderBufferSetBaseSnapshot(ReorderBuffer *rb, TransactionId xid,
@@ -746,6 +758,7 @@ extern void ReorderBufferAddSnapshot(ReorderBuffer *rb, TransactionId xid,
 extern void ReorderBufferAddNewCommandId(ReorderBuffer *rb, TransactionId xid,
 										 XLogRecPtr lsn, CommandId cid);
 extern void ReorderBufferAddNewTupleCids(ReorderBuffer *rb, TransactionId xid,
+										 TransactionId subxid,
 										 XLogRecPtr lsn, RelFileLocator locator,
 										 ItemPointerData tid,
 										 CommandId cmin, CommandId cmax, CommandId combocid);
@@ -765,7 +778,7 @@ extern bool ReorderBufferXidHasBaseSnapshot(ReorderBuffer *rb, TransactionId xid
 extern bool ReorderBufferRememberPrepareInfo(ReorderBuffer *rb, TransactionId xid,
 											 XLogRecPtr prepare_lsn, XLogRecPtr end_lsn,
 											 TimestampTz prepare_time,
-											 RepOriginId origin_id, XLogRecPtr origin_lsn);
+											 ReplOriginId origin_id, XLogRecPtr origin_lsn);
 extern void ReorderBufferSkipPrepare(ReorderBuffer *rb, TransactionId xid);
 extern void ReorderBufferPrepare(ReorderBuffer *rb, TransactionId xid, char *gid);
 extern ReorderBufferTXN *ReorderBufferGetOldestTXN(ReorderBuffer *rb);

@@ -3,7 +3,7 @@
  * slotsync.h
  *	  Exports for slot synchronization.
  *
- * Portions Copyright (c) 2016-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2016-2026, PostgreSQL Global Development Group
  *
  * src/include/replication/slotsync.h
  *
@@ -36,8 +36,6 @@ pg_noreturn extern void ReplSlotSyncWorkerMain(const void *startup_data, size_t 
 extern void ShutDownSlotSync(void);
 extern bool SlotSyncWorkerCanRestart(void);
 extern bool IsSyncingReplicationSlots(void);
-extern Size SlotSyncShmemSize(void);
-extern void SlotSyncShmemInit(void);
 extern void SyncReplicationSlots(WalReceiverConn *wrconn);
 extern void HandleSlotSyncMessageInterrupt(void);
 extern void ProcessSlotSyncMessage(void);

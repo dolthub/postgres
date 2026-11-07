@@ -3,7 +3,7 @@
  * percentrepl.c
  *	  Common routines to replace percent placeholders in strings
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -56,7 +56,7 @@
  * revised.
  */
 char *
-replace_percent_placeholders(const char *instr, const char *param_name, const char *letters,...)
+replace_percent_placeholders(const char *instr, const char *param_name, const char *letters, ...)
 {
 	StringInfoData result;
 

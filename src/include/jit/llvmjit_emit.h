@@ -2,7 +2,7 @@
  * llvmjit_emit.h
  *	  Helpers to make emitting LLVM IR a bit more concise and pgindent proof.
  *
- * Copyright (c) 2018-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2018-2026, PostgreSQL Global Development Group
  *
  * src/include/jit/llvmjit_emit.h
  */
@@ -87,6 +87,15 @@ l_sizet_const(size_t i)
 }
 
 /*
+ * Emit constant integer.
+ */
+static inline LLVMValueRef
+l_datum_const(Datum i)
+{
+	return LLVMConstInt(TypeDatum, i, false);
+}
+
+/*
  * Emit constant boolean, as used for storage (e.g. global vars, structs).
  */
 static inline LLVMValueRef
@@ -150,14 +159,14 @@ l_load_gep1(LLVMBuilderRef b, LLVMTypeRef t, LLVMValueRef v, LLVMValueRef idx, c
 }
 
 /* separate, because pg_attribute_printf(2, 3) can't appear in definition */
-static inline LLVMBasicBlockRef l_bb_before_v(LLVMBasicBlockRef r, const char *fmt,...) pg_attribute_printf(2, 3);
+static inline LLVMBasicBlockRef l_bb_before_v(LLVMBasicBlockRef r, const char *fmt, ...) pg_attribute_printf(2, 3);
 
 /*
  * Insert a new basic block, just before r, the name being determined by fmt
  * and arguments.
  */
 static inline LLVMBasicBlockRef
-l_bb_before_v(LLVMBasicBlockRef r, const char *fmt,...)
+l_bb_before_v(LLVMBasicBlockRef r, const char *fmt, ...)
 {
 	char		buf[512];
 	va_list		args;
@@ -173,14 +182,14 @@ l_bb_before_v(LLVMBasicBlockRef r, const char *fmt,...)
 }
 
 /* separate, because pg_attribute_printf(2, 3) can't appear in definition */
-static inline LLVMBasicBlockRef l_bb_append_v(LLVMValueRef f, const char *fmt,...) pg_attribute_printf(2, 3);
+static inline LLVMBasicBlockRef l_bb_append_v(LLVMValueRef f, const char *fmt, ...) pg_attribute_printf(2, 3);
 
 /*
  * Insert a new basic block after previous basic blocks, the name being
  * determined by fmt and arguments.
  */
 static inline LLVMBasicBlockRef
-l_bb_append_v(LLVMValueRef f, const char *fmt,...)
+l_bb_append_v(LLVMValueRef f, const char *fmt, ...)
 {
 	char		buf[512];
 	va_list		args;
@@ -313,7 +322,7 @@ l_funcnull(LLVMBuilderRef b, LLVMValueRef v_fcinfo, size_t argno)
 static inline LLVMValueRef
 l_funcvalue(LLVMBuilderRef b, LLVMValueRef v_fcinfo, size_t argno)
 {
-	return l_load(b, TypeSizeT, l_funcvaluep(b, v_fcinfo, argno), "");
+	return l_load(b, TypeDatum, l_funcvaluep(b, v_fcinfo, argno), "");
 }
 
 #endif							/* USE_LLVM */

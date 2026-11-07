@@ -25,7 +25,7 @@
  *
  * See gen_partprune_steps_internal() for more details on step generation.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -46,6 +46,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/appendinfo.h"
+#include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
@@ -159,7 +160,7 @@ static PartitionPruneStep *gen_prune_step_combine(GeneratePruningStepsContext *c
 static List *gen_prune_steps_from_opexps(GeneratePruningStepsContext *context,
 										 List **keyclauses, Bitmapset *nullkeys);
 static PartClauseMatchStatus match_clause_to_partition_key(GeneratePruningStepsContext *context,
-														   Expr *clause, Expr *partkey, int partkeyidx,
+														   Expr *clause, const Expr *partkey, int partkeyidx,
 														   bool *clause_is_not_null,
 														   PartClauseInfo **pc, List **clause_steps);
 static List *get_steps_using_prefix(GeneratePruningStepsContext *context,
@@ -180,13 +181,13 @@ static List *get_steps_using_prefix_recurse(GeneratePruningStepsContext *context
 											List *step_exprs,
 											List *step_cmpfns);
 static PruneStepResult *get_matching_hash_bounds(PartitionPruneContext *context,
-												 StrategyNumber opstrategy, Datum *values, int nvalues,
+												 StrategyNumber opstrategy, const Datum *values, int nvalues,
 												 FmgrInfo *partsupfunc, Bitmapset *nullkeys);
 static PruneStepResult *get_matching_list_bounds(PartitionPruneContext *context,
 												 StrategyNumber opstrategy, Datum value, int nvalues,
 												 FmgrInfo *partsupfunc, Bitmapset *nullkeys);
 static PruneStepResult *get_matching_range_bounds(PartitionPruneContext *context,
-												  StrategyNumber opstrategy, Datum *values, int nvalues,
+												  StrategyNumber opstrategy, const Datum *values, int nvalues,
 												  FmgrInfo *partsupfunc, Bitmapset *nullkeys);
 static Bitmapset *pull_exec_paramids(Expr *expr);
 static bool pull_exec_paramids_walker(Node *node, Bitmapset **context);
@@ -198,7 +199,7 @@ static PruneStepResult *perform_pruning_combine_step(PartitionPruneContext *cont
 													 PruneStepResult **step_results);
 static PartClauseMatchStatus match_boolean_partition_clause(Oid partopfamily,
 															Expr *clause,
-															Expr *partkey,
+															const Expr *partkey,
 															Expr **outconst,
 															bool *notclause);
 static void partkey_datum_from_expr(PartitionPruneContext *context,
@@ -247,7 +248,7 @@ make_partition_pruneinfo(PlannerInfo *root, RelOptInfo *parentrel,
 	 * that zero can represent an un-filled array entry.
 	 */
 	allpartrelids = NIL;
-	relid_subplan_map = palloc0(sizeof(int) * root->simple_rel_array_size);
+	relid_subplan_map = palloc0_array(int, root->simple_rel_array_size);
 
 	i = 1;
 	foreach(lc, subpaths)
@@ -466,7 +467,7 @@ make_partitionedrel_pruneinfo(PlannerInfo *root, RelOptInfo *parentrel,
 	 * In this phase we discover whether runtime pruning is needed at all; if
 	 * not, we can avoid doing further work.
 	 */
-	relid_subpart_map = palloc0(sizeof(int) * root->simple_rel_array_size);
+	relid_subpart_map = palloc0_array(int, root->simple_rel_array_size);
 
 	i = 1;
 	rti = -1;
@@ -819,9 +820,8 @@ prune_append_rel_partitions(RelOptInfo *rel)
 	context.boundinfo = rel->boundinfo;
 	context.partcollation = rel->part_scheme->partcollation;
 	context.partsupfunc = rel->part_scheme->partsupfunc;
-	context.stepcmpfuncs = (FmgrInfo *) palloc0(sizeof(FmgrInfo) *
-												context.partnatts *
-												list_length(pruning_steps));
+	context.stepcmpfuncs = palloc0_array(FmgrInfo,
+										 context.partnatts * list_length(pruning_steps));
 	context.ppccontext = CurrentMemoryContext;
 
 	/* These are not valid when being called from the planner */
@@ -1827,7 +1827,7 @@ gen_prune_steps_from_opexps(GeneratePruningStepsContext *context,
  */
 static PartClauseMatchStatus
 match_clause_to_partition_key(GeneratePruningStepsContext *context,
-							  Expr *clause, Expr *partkey, int partkeyidx,
+							  Expr *clause, const Expr *partkey, int partkeyidx,
 							  bool *clause_is_not_null, PartClauseInfo **pc,
 							  List **clause_steps)
 {
@@ -1900,7 +1900,7 @@ match_clause_to_partition_key(GeneratePruningStepsContext *context,
 			return PARTCLAUSE_MATCH_STEPS;
 		}
 
-		partclause = (PartClauseInfo *) palloc(sizeof(PartClauseInfo));
+		partclause = palloc_object(PartClauseInfo);
 		partclause->keyno = partkeyidx;
 		/* Do pruning with the Boolean equality operator. */
 		partclause->opno = BooleanEqualOperator;
@@ -2075,12 +2075,21 @@ match_clause_to_partition_key(GeneratePruningStepsContext *context,
 
 			/*
 			 * See if there are any exec Params.  If so, we can only use this
-			 * expression during per-scan pruning.
+			 * expression during per-scan pruning.  The same is true if it
+			 * contains a SubPlan, as evaluating that requires the parent
+			 * node's PlanState, which startup-time pruning hasn't got.  (A
+			 * SubPlan's testexpr normally contains exec Params, so we'd have
+			 * caught it above, but the testexpr can be folded to a Const.)
 			 */
 			paramids = pull_exec_paramids(expr);
 			if (!bms_is_empty(paramids))
 			{
 				context->has_exec_param = true;
+				if (context->target != PARTTARGET_EXEC)
+					return PARTCLAUSE_UNSUPPORTED;
+			}
+			else if (contain_subplans((Node *) expr))
+			{
 				if (context->target != PARTTARGET_EXEC)
 					return PARTCLAUSE_UNSUPPORTED;
 			}
@@ -2159,7 +2168,7 @@ match_clause_to_partition_key(GeneratePruningStepsContext *context,
 		/*
 		 * Build the clause, passing the negator if applicable.
 		 */
-		partclause = (PartClauseInfo *) palloc(sizeof(PartClauseInfo));
+		partclause = palloc_object(PartClauseInfo);
 		partclause->keyno = partkeyidx;
 		if (is_opne_listp)
 		{
@@ -2555,6 +2564,8 @@ get_steps_using_prefix_recurse(GeneratePruningStepsContext *context,
 	/* Actually, recursion would be limited by PARTITION_MAX_KEYS. */
 	check_stack_depth();
 
+	CHECK_FOR_INTERRUPTS();
+
 	Assert(start != NULL);
 	cur_keyno = ((PartClauseInfo *) lfirst(start))->keyno;
 	final_keyno = ((PartClauseInfo *) llast(prefix))->keyno;
@@ -2704,10 +2715,10 @@ get_steps_using_prefix_recurse(GeneratePruningStepsContext *context,
  */
 static PruneStepResult *
 get_matching_hash_bounds(PartitionPruneContext *context,
-						 StrategyNumber opstrategy, Datum *values, int nvalues,
+						 StrategyNumber opstrategy, const Datum *values, int nvalues,
 						 FmgrInfo *partsupfunc, Bitmapset *nullkeys)
 {
-	PruneStepResult *result = (PruneStepResult *) palloc0(sizeof(PruneStepResult));
+	PruneStepResult *result = palloc0_object(PruneStepResult);
 	PartitionBoundInfo boundinfo = context->boundinfo;
 	int		   *partindices = boundinfo->indexes;
 	int			partnatts = context->partnatts;
@@ -2784,7 +2795,7 @@ get_matching_list_bounds(PartitionPruneContext *context,
 						 StrategyNumber opstrategy, Datum value, int nvalues,
 						 FmgrInfo *partsupfunc, Bitmapset *nullkeys)
 {
-	PruneStepResult *result = (PruneStepResult *) palloc0(sizeof(PruneStepResult));
+	PruneStepResult *result = palloc0_object(PruneStepResult);
 	PartitionBoundInfo boundinfo = context->boundinfo;
 	int			off,
 				minoff,
@@ -2895,7 +2906,7 @@ get_matching_list_bounds(PartitionPruneContext *context,
 
 		case BTGreaterEqualStrategyNumber:
 			inclusive = true;
-			/* fall through */
+			pg_fallthrough;
 		case BTGreaterStrategyNumber:
 			off = partition_list_bsearch(partsupfunc,
 										 partcollation,
@@ -2930,7 +2941,7 @@ get_matching_list_bounds(PartitionPruneContext *context,
 
 		case BTLessEqualStrategyNumber:
 			inclusive = true;
-			/* fall through */
+			pg_fallthrough;
 		case BTLessStrategyNumber:
 			off = partition_list_bsearch(partsupfunc,
 										 partcollation,
@@ -2992,10 +3003,10 @@ get_matching_list_bounds(PartitionPruneContext *context,
  */
 static PruneStepResult *
 get_matching_range_bounds(PartitionPruneContext *context,
-						  StrategyNumber opstrategy, Datum *values, int nvalues,
+						  StrategyNumber opstrategy, const Datum *values, int nvalues,
 						  FmgrInfo *partsupfunc, Bitmapset *nullkeys)
 {
-	PruneStepResult *result = (PruneStepResult *) palloc0(sizeof(PruneStepResult));
+	PruneStepResult *result = palloc0_object(PruneStepResult);
 	PartitionBoundInfo boundinfo = context->boundinfo;
 	Oid		   *partcollation = context->partcollation;
 	int			partnatts = context->partnatts;
@@ -3145,9 +3156,17 @@ get_matching_range_bounds(PartitionPruneContext *context,
 
 					/*
 					 * off + 1, then would be the offset of the greatest bound
-					 * to be included in the result.
+					 * to be included in the result.  The exception is the
+					 * mirror image of the MINVALUE case above: if the matched
+					 * bound is exactly (prefix, MAXVALUE), no row carrying
+					 * this prefix can sort above it, so the key space beyond
+					 * it need not be considered.
 					 */
-					maxoff = off + 1;
+					if (boundinfo->kind[off][nvalues] ==
+						PARTITION_RANGE_DATUM_MAXVALUE)
+						maxoff = off;
+					else
+						maxoff = off + 1;
 				}
 
 				Assert(minoff >= 0 && maxoff >= 0);
@@ -3171,7 +3190,7 @@ get_matching_range_bounds(PartitionPruneContext *context,
 
 		case BTGreaterEqualStrategyNumber:
 			inclusive = true;
-			/* fall through */
+			pg_fallthrough;
 		case BTGreaterStrategyNumber:
 
 			/*
@@ -3208,12 +3227,15 @@ get_matching_range_bounds(PartitionPruneContext *context,
 					 * of smallest such bound) or find the smallest one that's
 					 * greater than the lookup values and set minoff to that.
 					 */
-					while (off >= 1 && off < boundinfo->ndatums - 1)
+					while (true)
 					{
 						int32		cmpval;
 						int			nextoff;
 
 						nextoff = inclusive ? off - 1 : off + 1;
+
+						if (nextoff < 0 || nextoff >= boundinfo->ndatums)
+							break;
 						cmpval =
 							partition_rbound_datum_cmp(partsupfunc,
 													   partcollation,
@@ -3252,7 +3274,7 @@ get_matching_range_bounds(PartitionPruneContext *context,
 
 		case BTLessEqualStrategyNumber:
 			inclusive = true;
-			/* fall through */
+			pg_fallthrough;
 		case BTLessStrategyNumber:
 
 			/*
@@ -3267,16 +3289,21 @@ get_matching_range_bounds(PartitionPruneContext *context,
 			if (off >= 0)
 			{
 				/*
-				 * See the comment above.
+				 * As above, check adjacent bounds to see if the bound is
+				 * equal to the lookup value.
 				 */
 				if (is_equal && nvalues < partnatts)
 				{
-					while (off >= 1 && off < boundinfo->ndatums - 1)
+					while (true)
 					{
 						int32		cmpval;
 						int			nextoff;
 
 						nextoff = inclusive ? off + 1 : off - 1;
+
+						if (nextoff < 0 || nextoff >= boundinfo->ndatums)
+							break;
+
 						cmpval = partition_rbound_datum_cmp(partsupfunc,
 															partcollation,
 															boundinfo->datums[nextoff],
@@ -3330,43 +3357,45 @@ get_matching_range_bounds(PartitionPruneContext *context,
 	Assert(minoff >= 0 && minoff <= boundinfo->ndatums);
 	Assert(maxoff >= 0 && maxoff <= boundinfo->ndatums);
 
-	/*
-	 * If the smallest partition to return has MINVALUE (negative infinity) as
-	 * its lower bound, increment it to point to the next finite bound
-	 * (supposedly its upper bound), so that we don't inadvertently end up
-	 * scanning the default partition.
-	 */
-	if (minoff < boundinfo->ndatums && partindices[minoff] < 0)
-	{
-		int			lastkey = nvalues - 1;
 
-		if (boundinfo->kind[minoff][lastkey] ==
-			PARTITION_RANGE_DATUM_MINVALUE)
+	/*
+	 * Check for cases that we're scanning the DEFAULT partition when no rows
+	 * can exist there for the given value.  This can happen when the first or
+	 * final bound for partitions we're scanning have a MINVALUE or MAXVALUE
+	 * clause respectively.  We needn't scan the DEFAULT partition for values
+	 * beyond the bound since the MINVALUE / MAXVALUE bound handles up to
+	 * negative or positive infinity.  The BTEqualStrategyNumber code above
+	 * handled doing this for subsequent partition keys, so all that's left to
+	 * handle here is the same for the first partition key.  We needn't
+	 * perform this for all steps as the intersected results from the
+	 * recursive processing of pruning steps for leading keys means we only
+	 * scan the partitions common to all steps in the intersected set of
+	 * steps.
+	 */
+	if (nvalues == 1)
+	{
+		/*
+		 * Check if we're scanning the default and if a MINVALUE bound covers
+		 * the key space for the lower end.
+		 */
+		if (minoff < boundinfo->ndatums && partindices[minoff] < 0 &&
+			boundinfo->kind[minoff][0] == PARTITION_RANGE_DATUM_MINVALUE)
 		{
 			minoff++;
 			Assert(boundinfo->indexes[minoff] >= 0);
 		}
-	}
 
-	/*
-	 * If the previous greatest partition has MAXVALUE (positive infinity) as
-	 * its upper bound (something only possible to do with multi-column range
-	 * partitioning), we scan switch to it as the greatest partition to
-	 * return.  Again, so that we don't inadvertently end up scanning the
-	 * default partition.
-	 */
-	if (maxoff >= 1 && partindices[maxoff] < 0)
-	{
-		int			lastkey = nvalues - 1;
-
-		if (boundinfo->kind[maxoff - 1][lastkey] ==
-			PARTITION_RANGE_DATUM_MAXVALUE)
+		/*
+		 * Likewise, do the same check for the upper range partition if the
+		 * prior bound is a MAXVALUE kind.
+		 */
+		if (maxoff >= 1 && partindices[maxoff] < 0 &&
+			boundinfo->kind[maxoff - 1][0] == PARTITION_RANGE_DATUM_MAXVALUE)
 		{
 			maxoff--;
 			Assert(boundinfo->indexes[maxoff] >= 0);
 		}
 	}
-
 	Assert(minoff >= 0 && maxoff >= 0);
 	if (minoff <= maxoff)
 		result->bound_offsets = bms_add_range(NULL, minoff, maxoff);
@@ -3512,7 +3541,7 @@ perform_pruning_base_step(PartitionPruneContext *context,
 			{
 				PruneStepResult *result;
 
-				result = (PruneStepResult *) palloc(sizeof(PruneStepResult));
+				result = palloc_object(PruneStepResult);
 				result->bound_offsets = NULL;
 				result->scan_default = false;
 				result->scan_null = false;
@@ -3601,7 +3630,7 @@ perform_pruning_combine_step(PartitionPruneContext *context,
 							 PartitionPruneStepCombine *cstep,
 							 PruneStepResult **step_results)
 {
-	PruneStepResult *result = (PruneStepResult *) palloc0(sizeof(PruneStepResult));
+	PruneStepResult *result = palloc0_object(PruneStepResult);
 	bool		firststep;
 	ListCell   *lc1;
 
@@ -3706,7 +3735,7 @@ perform_pruning_combine_step(PartitionPruneContext *context,
  * 'partkey'.
  */
 static PartClauseMatchStatus
-match_boolean_partition_clause(Oid partopfamily, Expr *clause, Expr *partkey,
+match_boolean_partition_clause(Oid partopfamily, Expr *clause, const Expr *partkey,
 							   Expr **outconst, bool *notclause)
 {
 	Expr	   *leftop;
@@ -3736,19 +3765,19 @@ match_boolean_partition_clause(Oid partopfamily, Expr *clause, Expr *partkey,
 			{
 				case IS_NOT_TRUE:
 					*notclause = true;
-					/* fall through */
+					pg_fallthrough;
 				case IS_TRUE:
 					*outconst = (Expr *) makeBoolConst(true, false);
 					return PARTCLAUSE_MATCH_CLAUSE;
 				case IS_NOT_FALSE:
 					*notclause = true;
-					/* fall through */
+					pg_fallthrough;
 				case IS_FALSE:
 					*outconst = (Expr *) makeBoolConst(false, false);
 					return PARTCLAUSE_MATCH_CLAUSE;
 				case IS_NOT_UNKNOWN:
 					*notclause = true;
-					/* fall through */
+					pg_fallthrough;
 				case IS_UNKNOWN:
 					return PARTCLAUSE_MATCH_NULLNESS;
 				default:

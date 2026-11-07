@@ -4,7 +4,7 @@
  *	  creator functions for various nodes. The functions here are for the
  *	  most frequently created nodes.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -145,9 +145,6 @@ makeWholeRowVar(RangeTblEntry *rte,
 
 	switch (rte->rtekind)
 	{
-		case RTE_DOLT:
-			result = makeVar(varno, InvalidAttrNumber, rte->dolt_rowtype ? rte->dolt_rowtype : RECORDOID, -1, InvalidOid, varlevelsup);
-			break;
 		case RTE_RELATION:
 			/* relation: the rowtype is a named composite type */
 			toid = get_rel_type_id(rte->relid);
@@ -987,7 +984,7 @@ makeJsonKeyValue(Node *key, Node *value)
  */
 Node *
 makeJsonIsPredicate(Node *expr, JsonFormat *format, JsonValueType item_type,
-					bool unique_keys, int location)
+					bool unique_keys, Oid exprBaseType, int location)
 {
 	JsonIsPredicate *n = makeNode(JsonIsPredicate);
 
@@ -997,6 +994,7 @@ makeJsonIsPredicate(Node *expr, JsonFormat *format, JsonValueType item_type,
 	n->format = format;
 	n->item_type = item_type;
 	n->unique_keys = unique_keys;
+	n->exprBaseType = exprBaseType;
 	n->location = location;
 
 	return (Node *) n;

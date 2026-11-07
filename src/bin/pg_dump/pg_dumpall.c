@@ -2,7 +2,7 @@
  *
  * pg_dumpall.c
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * pg_dumpall forces all pg_dump output to be text, since it also outputs
@@ -204,7 +204,6 @@ main(int argc, char *argv[])
 	bool		tablespaces_only = false;
 	PGconn	   *conn;
 	int			encoding;
-	const char *std_strings;
 	int			c,
 				ret;
 	int			optindex;
@@ -427,6 +426,11 @@ main(int argc, char *argv[])
 		pg_fatal("option %s requires option %s",
 				 "--if-exists", "-c/--clean");
 
+	/* --clean and --data-only are incompatible */
+	if (output_clean && data_only)
+		pg_fatal("options %s and %s cannot be used together",
+				 "-c/--clean", "-a/--data-only");
+
 	if (roles_only && tablespaces_only)
 	{
 		pg_log_error("options %s and %s cannot be used together",
@@ -568,14 +572,17 @@ main(int argc, char *argv[])
 	}
 
 	/*
-	 * Get the active encoding and the standard_conforming_strings setting, so
-	 * we know how to escape strings.
+	 * Force standard_conforming_strings on, just in case we are dumping from
+	 * an old server that has it disabled.  Without this, literals in views,
+	 * expressions, etc, would be incorrect for modern servers.
+	 */
+	executeCommand(conn, "SET standard_conforming_strings = on");
+
+	/*
+	 * Get the active encoding, so we know how to escape strings.
 	 */
 	encoding = PQclientEncoding(conn);
 	setFmtEncoding(encoding);
-	std_strings = PQparameterStatus(conn, "standard_conforming_strings");
-	if (!std_strings)
-		std_strings = "off";
 
 	/* Set the role if requested */
 	if (use_role)
@@ -615,12 +622,10 @@ main(int argc, char *argv[])
 	/* Restore will need to write to the target cluster */
 	fprintf(OPF, "SET default_transaction_read_only = off;\n\n");
 
-	/* Replicate encoding and std_strings in output */
+	/* Replicate encoding and standard_conforming_strings in output */
 	fprintf(OPF, "SET client_encoding = '%s';\n",
 			pg_encoding_to_char(encoding));
-	fprintf(OPF, "SET standard_conforming_strings = %s;\n", std_strings);
-	if (strcmp(std_strings, "off") == 0)
-		fprintf(OPF, "SET escape_string_warning = off;\n");
+	fprintf(OPF, "SET standard_conforming_strings = on;\n");
 	fprintf(OPF, "\n");
 
 	if (!data_only && !statistics_only && !no_schema)
@@ -1140,7 +1145,7 @@ dumpRoleMembership(PGconn *conn)
 		}
 
 		remaining = end - start;
-		done = pg_malloc0(remaining * sizeof(bool));
+		done = pg_malloc0_array(bool, remaining);
 
 		/*
 		 * We use a hashtable to track the member names that have been granted

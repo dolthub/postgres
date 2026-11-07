@@ -4,7 +4,7 @@
  *	  solution to the query optimization problem
  *	  by means of a Genetic Algorithm (GA)
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/optimizer/geqo/geqo_main.c
@@ -12,12 +12,13 @@
  *-------------------------------------------------------------------------
  */
 
-/* contributed by:
-   =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
-   *  Martin Utesch				 * Institute of Automatic Control	   *
-   =							 = University of Mining and Technology =
-   *  utesch@aut.tu-freiberg.de  * Freiberg, Germany				   *
-   =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
+/*
+ * contributed by:
+ * =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
+ * *  Martin Utesch				 * Institute of Automatic Control	   *
+ * =							 = University of Mining and Technology =
+ * *  utesch@aut.tu-freiberg.de  * Freiberg, Germany				   *
+ * =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
  */
 
 /* -- parts of this are adapted from D. Whitley's Genitor algorithm -- */
@@ -47,6 +48,8 @@ int			Geqo_generations;
 double		Geqo_selection_bias;
 double		Geqo_seed;
 
+/* GEQO is treated as an in-core planner extension */
+int			Geqo_planner_extension_id = -1;
 
 static int	gimme_pool_size(int nr_rel);
 static int	gimme_number_generations(int pool_size);
@@ -98,9 +101,15 @@ geqo(PlannerInfo *root, int number_of_rels, List *initial_rels)
 	int			mutations = 0;
 #endif
 
+	if (Geqo_planner_extension_id < 0)
+		Geqo_planner_extension_id = GetPlannerExtensionId("geqo");
+
 /* set up private information */
-	root->join_search_private = &private;
+	SetPlannerInfoExtensionState(root, Geqo_planner_extension_id, &private);
 	private.initial_rels = initial_rels;
+
+/* inform core planner that we may replan */
+	root->assumeReplanning = true;
 
 /* initialize private number generator */
 	geqo_set_seed(root, Geqo_seed);
@@ -124,10 +133,12 @@ geqo(PlannerInfo *root, int number_of_rels, List *initial_rels)
 								 * future (-> geqo_pool.c:spread_chromo ) */
 
 #ifdef GEQO_DEBUG
-	elog(DEBUG1, "GEQO selected %d pool entries, best %.2f, worst %.2f",
+	elog(DEBUG1, "GEQO selected %d pool entries, best %.2f<%d>, worst %.2f<%d>",
 		 pool_size,
-		 pool->data[0].worth,
-		 pool->data[pool_size - 1].worth);
+		 pool->data[0].worth.cost,
+		 pool->data[0].worth.disabled_nodes,
+		 pool->data[pool_size - 1].worth.cost,
+		 pool->data[pool_size - 1].worth.disabled_nodes);
 #endif
 
 /* allocate chromosome momma and daddy memory */
@@ -258,8 +269,9 @@ geqo(PlannerInfo *root, int number_of_rels, List *initial_rels)
 #endif
 
 #ifdef GEQO_DEBUG
-	elog(DEBUG1, "GEQO best is %.2f after %d generations",
-		 pool->data[0].worth, number_generations);
+	elog(DEBUG1, "GEQO best is %.2f<%d> after %d generations",
+		 pool->data[0].worth.cost, pool->data[0].worth.disabled_nodes,
+		 number_generations);
 #endif
 
 
@@ -304,7 +316,7 @@ geqo(PlannerInfo *root, int number_of_rels, List *initial_rels)
 	free_pool(root, pool);
 
 	/* ... clear root pointer to our private storage */
-	root->join_search_private = NULL;
+	SetPlannerInfoExtensionState(root, Geqo_planner_extension_id, NULL);
 
 	return best_rel;
 }

@@ -4,7 +4,7 @@
  *	  This file contains routines to support indexes defined on system
  *	  catalogs.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -20,7 +20,6 @@
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/index.h"
-#include "catalog/catalogview.h"
 #include "catalog/indexing.h"
 #include "executor/executor.h"
 #include "utils/rel.h"
@@ -202,7 +201,7 @@ CatalogTupleCheckConstraints(Relation heapRel, HeapTuple tup)
 	if (HeapTupleHasNulls(tup))
 	{
 		TupleDesc	tupdesc = RelationGetDescr(heapRel);
-		bits8	   *bp = tup->t_data->t_bits;
+		uint8	   *bp = tup->t_data->t_bits;
 
 		for (int attnum = 0; attnum < tupdesc->natts; attnum++)
 		{
@@ -235,10 +234,6 @@ CatalogTupleInsert(Relation heapRel, HeapTuple tup)
 {
 	CatalogIndexState indstate;
 
-	if (CatalogViewCaptureInsert(heapRel, tup))
-		return;
-	CatalogViewRejectPhysicalAccess(heapRel);
-	CatalogViewRejectBranchWrite(heapRel, NULL, tup);
 	CatalogTupleCheckConstraints(heapRel, tup);
 
 	indstate = CatalogOpenIndexes(heapRel);
@@ -261,10 +256,6 @@ void
 CatalogTupleInsertWithInfo(Relation heapRel, HeapTuple tup,
 						   CatalogIndexState indstate)
 {
-	if (CatalogViewCaptureInsert(heapRel, tup))
-		return;
-	CatalogViewRejectPhysicalAccess(heapRel);
-	CatalogViewRejectBranchWrite(heapRel, NULL, tup);
 	CatalogTupleCheckConstraints(heapRel, tup);
 
 	simple_heap_insert(heapRel, tup);
@@ -282,40 +273,9 @@ void
 CatalogTuplesMultiInsertWithInfo(Relation heapRel, TupleTableSlot **slot,
 								 int ntuples, CatalogIndexState indstate)
 {
-	if (ntuples > 0)
-	{
-		bool		should_free;
-		HeapTuple	tuple = ExecFetchSlotHeapTuple(slot[0], true, &should_free);
-		bool		captured = CatalogViewCaptureInsert(heapRel, tuple);
-
-		if (should_free)
-			heap_freetuple(tuple);
-		if (captured)
-		{
-			for (int i = 1; i < ntuples; i++)
-			{
-				tuple = ExecFetchSlotHeapTuple(slot[i], true, &should_free);
-				if (!CatalogViewCaptureInsert(heapRel, tuple))
-					elog(ERROR, "inconsistent provisional multi-insert");
-				if (should_free)
-					heap_freetuple(tuple);
-			}
-			return;
-		}
-	}
-	CatalogViewRejectPhysicalAccess(heapRel);
 	/* Nothing to do */
 	if (ntuples <= 0)
 		return;
-	for (int i = 0; i < ntuples; i++)
-	{
-		bool		should_free;
-		HeapTuple	tuple = ExecFetchSlotHeapTuple(slot[i], true, &should_free);
-
-		CatalogViewRejectBranchWrite(heapRel, NULL, tuple);
-		if (should_free)
-			heap_freetuple(tuple);
-	}
 
 	heap_multi_insert(heapRel, slot, ntuples,
 					  GetCurrentCommandId(true), 0, NULL);
@@ -350,15 +310,11 @@ CatalogTuplesMultiInsertWithInfo(Relation heapRel, TupleTableSlot **slot,
  * (Use CatalogTupleUpdateWithInfo in such cases.)
  */
 void
-CatalogTupleUpdate(Relation heapRel, ItemPointer otid, HeapTuple tup)
+CatalogTupleUpdate(Relation heapRel, const ItemPointerData *otid, HeapTuple tup)
 {
 	CatalogIndexState indstate;
 	TU_UpdateIndexes updateIndexes = TU_All;
 
-	if (CatalogViewCaptureUpdate(heapRel, otid, tup))
-		return;
-	CatalogViewRejectPhysicalAccess(heapRel);
-	CatalogViewRejectBranchWrite(heapRel, otid, tup);
 	CatalogTupleCheckConstraints(heapRel, tup);
 
 	indstate = CatalogOpenIndexes(heapRel);
@@ -378,15 +334,11 @@ CatalogTupleUpdate(Relation heapRel, ItemPointer otid, HeapTuple tup)
  * so that callers needn't trouble over this ... but we don't do so today.
  */
 void
-CatalogTupleUpdateWithInfo(Relation heapRel, ItemPointer otid, HeapTuple tup,
+CatalogTupleUpdateWithInfo(Relation heapRel, const ItemPointerData *otid, HeapTuple tup,
 						   CatalogIndexState indstate)
 {
 	TU_UpdateIndexes updateIndexes = TU_All;
 
-	if (CatalogViewCaptureUpdate(heapRel, otid, tup))
-		return;
-	CatalogViewRejectPhysicalAccess(heapRel);
-	CatalogViewRejectBranchWrite(heapRel, otid, tup);
 	CatalogTupleCheckConstraints(heapRel, tup);
 
 	simple_heap_update(heapRel, otid, tup, &updateIndexes);
@@ -410,11 +362,7 @@ CatalogTupleUpdateWithInfo(Relation heapRel, ItemPointer otid, HeapTuple tup,
  * it might be better to do something about caching CatalogIndexState.
  */
 void
-CatalogTupleDelete(Relation heapRel, ItemPointer tid)
+CatalogTupleDelete(Relation heapRel, const ItemPointerData *tid)
 {
-	if (CatalogViewCaptureDelete(heapRel, tid))
-		return;
-	CatalogViewRejectPhysicalAccess(heapRel);
-	CatalogViewRejectBranchWrite(heapRel, tid, NULL);
 	simple_heap_delete(heapRel, tid);
 }

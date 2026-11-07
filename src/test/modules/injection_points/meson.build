@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2025, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 if not get_option('injection_points')
   subdir_done()
@@ -6,8 +6,6 @@ endif
 
 injection_points_sources = files(
   'injection_points.c',
-  'injection_stats.c',
-  'injection_stats_fixed.c',
   'regress_injection.c',
 )
 
@@ -28,6 +26,34 @@ test_install_data += files(
   'injection_points--1.0.sql',
 )
 
+injection_points_isolation = [
+  'basic',
+  'inplace',
+  'reindex_concurrently_deferred',
+  'reindex_concurrently_toast',
+  'repack',
+  'repack_commit_race',
+  'repack_decode',
+  'repack_dropped',
+  'repack_missingval',
+  'repack_temporal',
+  'repack_temporal_multirange',
+  'repack_toast',
+  'ri_fastpath_reindex',
+  'ri_fastpath_snapshot',
+  'syscache-update-pruned',
+  'heap_lock_update',
+  'on_conflict_probe_window',
+  'multixact-aborted-updater',
+]
+
+# wait_cleanup terminates another backend, whose FATAL message can be lost
+# on Windows, making the test unstable there.
+# See https://postgr.es/m/088AB35D-0860-494A-A9CF-8B301543AA51@yandex-team.ru
+if host_system != 'windows'
+  injection_points_isolation += 'wait_cleanup'
+endif
+
 tests += {
   'name': 'injection_points',
   'sd': meson.current_source_dir(),
@@ -39,27 +65,18 @@ tests += {
       'reindex_conc',
       'vacuum',
     ],
-    'regress_args': ['--dlpath', meson.build_root() / 'src/test/regress'],
+    'regress_args': ['--dlpath', meson.project_build_root() / 'src/test/regress'],
     # The injection points are cluster-wide, so disable installcheck
     'runningcheck': false,
   },
   'isolation': {
-    'specs': [
-      'basic',
-      'inplace',
-      'reindex_concurrently_deferred',
-      'syscache-update-pruned',
-      'wait_cleanup',
-      'heap_lock_update',
-    ],
+    'specs': injection_points_isolation,
     'runningcheck': false, # see syscache-update-pruned
-  },
-  'tap': {
-    'env': {
-      'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
-    },
-    'tests': [
-      't/001_stats.pl',
+    # Some tests wait for all snapshots, so avoid parallel execution
+    'runningcheck-parallel': false,
+    # some tests require wal_level=replica
+    'regress_args': [
+      '--temp-config', files('extra.conf'),
     ],
   },
 }

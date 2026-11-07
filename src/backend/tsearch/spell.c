@@ -3,7 +3,7 @@
  * spell.c
  *		Normalizing word with ISpell
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * Ispell dictionary
  * -----------------
@@ -210,8 +210,8 @@ cmpspellaffix(const void *s1, const void *s2)
 static int
 cmpcmdflag(const void *f1, const void *f2)
 {
-	CompoundAffixFlag *fv1 = (CompoundAffixFlag *) f1,
-			   *fv2 = (CompoundAffixFlag *) f2;
+	const CompoundAffixFlag *fv1 = f1;
+	const CompoundAffixFlag *fv2 = f2;
 
 	Assert(fv1->flagMode == fv2->flagMode);
 
@@ -349,7 +349,7 @@ cmpaffix(const void *s1, const void *s2)
 static void
 getNextFlagFromString(IspellDict *Conf, const char **sflagset, char *sflag)
 {
-	int32		s;
+	long		sval;
 	char	   *next;
 	const char *sbuf = *sflagset;
 	int			maxstep;
@@ -377,17 +377,17 @@ getNextFlagFromString(IspellDict *Conf, const char **sflagset, char *sflag)
 				break;
 			case FM_NUM:
 				errno = 0;
-				s = strtol(*sflagset, &next, 10);
+				sval = strtol(*sflagset, &next, 10);
 				if (*sflagset == next || errno == ERANGE)
 					ereport(ERROR,
 							(errcode(ERRCODE_CONFIG_FILE_ERROR),
 							 errmsg("invalid affix flag \"%s\"", *sflagset)));
-				if (s < 0 || s > FLAGNUM_MAXSIZE)
+				if (sval < 0 || sval > FLAGNUM_MAXSIZE)
 					ereport(ERROR,
 							(errcode(ERRCODE_CONFIG_FILE_ERROR),
 							 errmsg("affix flag \"%s\" is out of range",
 									*sflagset)));
-				sflag += sprintf(sflag, "%0d", s);
+				sflag += sprintf(sflag, "%0d", (int) sval);
 
 				/* Go to start of the next flag */
 				*sflagset = next;
@@ -692,7 +692,7 @@ NIAddAffix(IspellDict *Conf, const char *flag, char flagflags, const char *mask,
 		else
 		{
 			Conf->maffixes = 16;
-			Conf->Affix = (AFFIX *) palloc(Conf->maffixes * sizeof(AFFIX));
+			Conf->Affix = palloc_array(AFFIX, Conf->maffixes);
 		}
 	}
 
@@ -738,7 +738,7 @@ NIAddAffix(IspellDict *Conf, const char *flag, char flagflags, const char *mask,
 		 * allocated in the dictionary's memory context, and will be freed
 		 * automatically when it is destroyed.
 		 */
-		Affix->reg.pregex = palloc(sizeof(regex_t));
+		Affix->reg.pregex = palloc_object(regex_t);
 		err = pg_regcomp(Affix->reg.pregex, wmask, wmasklen,
 						 REG_ADVANCED | REG_NOSUB,
 						 DEFAULT_COLLATION_OID);
@@ -1034,30 +1034,40 @@ parse_affentry(const char *str, char *mask, char *find, char *repl)
 }
 
 /*
+ * Parse an affix flag written in the "num" flag mode.
+ */
+static uint32
+parseNumericAffixFlag(const char *s)
+{
+	char	   *next;
+	long		i;
+
+	errno = 0;
+	i = strtol(s, &next, 10);
+	if (s == next || errno == ERANGE)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONFIG_FILE_ERROR),
+				 errmsg("invalid affix flag \"%s\"", s)));
+	if (i < 0 || i > FLAGNUM_MAXSIZE)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONFIG_FILE_ERROR),
+				 errmsg("affix flag \"%s\" is out of range", s)));
+
+	return (uint32) i;
+}
+
+/*
  * Sets a Hunspell options depending on flag type.
+ *
+ * Conf->flagMode must already have its final value, since it decides which
+ * member of the entry's union is written.  See finalizeCompoundAffixFlags().
  */
 static void
 setCompoundAffixFlagValue(IspellDict *Conf, CompoundAffixFlag *entry,
-						  char *s, uint32 val)
+						  const char *s, uint32 val)
 {
 	if (Conf->flagMode == FM_NUM)
-	{
-		char	   *next;
-		int			i;
-
-		errno = 0;
-		i = strtol(s, &next, 10);
-		if (s == next || errno == ERANGE)
-			ereport(ERROR,
-					(errcode(ERRCODE_CONFIG_FILE_ERROR),
-					 errmsg("invalid affix flag \"%s\"", s)));
-		if (i < 0 || i > FLAGNUM_MAXSIZE)
-			ereport(ERROR,
-					(errcode(ERRCODE_CONFIG_FILE_ERROR),
-					 errmsg("affix flag \"%s\" is out of range", s)));
-
-		entry->flag.i = i;
-	}
+		entry->flag.i = parseNumericAffixFlag(s);
 	else
 		entry->flag.s = cpstrdup(Conf, s);
 
@@ -1120,10 +1130,52 @@ addCompoundAffixFlagValue(IspellDict *Conf, const char *s, uint32 val)
 
 	newValue = Conf->CompoundAffixFlags + Conf->nCompoundAffixFlag;
 
-	setCompoundAffixFlagValue(Conf, newValue, sbuf, val);
+	/*
+	 * Only remember the flag as a string for now.  The FLAG option that says
+	 * how flags are spelled may appear anywhere in the affix file, including
+	 * after the compound flags themselves, so the final representation cannot
+	 * be chosen until the whole file has been read.  See
+	 * finalizeCompoundAffixFlags(), which fills in flagMode as well.
+	 *
+	 * The interim copy goes in the short-lived build context, since the final
+	 * representation may well not be a string at all.
+	 */
+	newValue->flag.s = MemoryContextStrdup(Conf->buildCxt, sbuf);
+	newValue->value = val;
 
 	Conf->usecompound = true;
 	Conf->nCompoundAffixFlag++;
+}
+
+/*
+ * Convert the compound flags collected by addCompoundAffixFlagValue() to the
+ * representation implied by the flag mode the affix file ended up declaring.
+ *
+ * This must run before the flags are sorted or searched.  Doing the conversion
+ * here rather than while reading the file makes the position of the FLAG line
+ * irrelevant, which is how the flags on AF, SFX and PFX lines are already
+ * treated: those are parsed in a second pass over the file, and so always use
+ * the final flag mode.
+ */
+static void
+finalizeCompoundAffixFlags(IspellDict *Conf)
+{
+	for (int i = 0; i < Conf->nCompoundAffixFlag; i++)
+	{
+		CompoundAffixFlag *entry = Conf->CompoundAffixFlags + i;
+
+		/*
+		 * Replace the interim string with the representation the flag mode
+		 * calls for.  In both cases the old value is read before the new one
+		 * is stored, so overwriting the union in place is safe.
+		 */
+		if (Conf->flagMode == FM_NUM)
+			entry->flag.i = parseNumericAffixFlag(entry->flag.s);
+		else
+			entry->flag.s = cpstrdup(Conf, entry->flag.s);
+
+		entry->flagMode = Conf->flagMode;
+	}
 }
 
 /*
@@ -1171,7 +1223,7 @@ getAffixFlagSet(IspellDict *Conf, char *s)
 {
 	if (Conf->useFlagAliases && *s != '\0')
 	{
-		int			curaffix;
+		long		curaffix;
 		char	   *end;
 
 		errno = 0;
@@ -1302,6 +1354,9 @@ NIImportOOAffixes(IspellDict *Conf, const char *filename)
 	}
 	tsearch_readline_end(&trst);
 
+	/* Conf->flagMode is final now, so the compound flags can be converted */
+	finalizeCompoundAffixFlags(Conf);
+
 	if (Conf->nCompoundAffixFlag > 1)
 		qsort(Conf->CompoundAffixFlags, Conf->nCompoundAffixFlag,
 			  sizeof(CompoundAffixFlag), cmpcmdflag);
@@ -1341,7 +1396,7 @@ NIImportOOAffixes(IspellDict *Conf, const char *filename)
 				/* Also reserve place for empty flag set */
 				naffix++;
 
-				Conf->AffixData = (const char **) palloc0(naffix * sizeof(char *));
+				Conf->AffixData = palloc0_array(const char *, naffix);
 				Conf->lenAffixData = Conf->nAffixData = naffix;
 
 				/* Add empty flag set into AffixData */
@@ -1576,6 +1631,12 @@ nextline:
 		pfree(pstr);
 	}
 	tsearch_readline_end(&trst);
+
+	/*
+	 * The old file format has no FLAG command, so the mode is still FM_CHAR
+	 * here, but the flags collected above must be converted all the same.
+	 */
+	finalizeCompoundAffixFlags(Conf);
 	return;
 
 isnewformat:
@@ -1749,7 +1810,7 @@ NISortDictionary(IspellDict *Conf)
 {
 	int			i;
 	int			naffix;
-	int			curaffix;
+	long		curaffix;
 
 	/* compress affixes */
 
@@ -1792,7 +1853,7 @@ NISortDictionary(IspellDict *Conf)
 				curaffix = 0;
 			}
 
-			Conf->Spell[i]->p.d.affix = curaffix;
+			Conf->Spell[i]->p.d.affix = (int) curaffix;
 			Conf->Spell[i]->p.d.len = strlen(Conf->Spell[i]->word);
 		}
 	}
@@ -1816,7 +1877,7 @@ NISortDictionary(IspellDict *Conf)
 		 * dictionary. Replace textual flag-field of Conf->Spell entries with
 		 * indexes into Conf->AffixData array.
 		 */
-		Conf->AffixData = (const char **) palloc0(naffix * sizeof(const char *));
+		Conf->AffixData = palloc0_array(const char *, naffix);
 
 		curaffix = -1;
 		for (i = 0; i < Conf->nspell; i++)
@@ -1830,7 +1891,7 @@ NISortDictionary(IspellDict *Conf)
 													 Conf->Spell[i]->p.flag);
 			}
 
-			Conf->Spell[i]->p.d.affix = curaffix;
+			Conf->Spell[i]->p.d.affix = (int) curaffix;
 			Conf->Spell[i]->p.d.len = strlen(Conf->Spell[i]->word);
 		}
 
@@ -2205,7 +2266,7 @@ CheckAffix(const char *word, size_t len, AFFIX *Affix, int flagflags, char *neww
 
 		/* Convert data string to wide characters */
 		newword_len = strlen(newword);
-		data = (pg_wchar *) palloc((newword_len + 1) * sizeof(pg_wchar));
+		data = palloc_array(pg_wchar, newword_len + 1);
 		data_len = pg_mb2wchar_with_len(newword, data, newword_len);
 
 		if (pg_regexec(Affix->reg.pregex, data, data_len,
@@ -2255,7 +2316,7 @@ NormalizeSubWord(IspellDict *Conf, const char *word, int flag)
 
 	if (wrdlen > MAXNORMLEN)
 		return NULL;
-	cur = forms = (char **) palloc(MAX_NORM * sizeof(char *));
+	cur = forms = palloc_array(char *, MAX_NORM);
 	*cur = NULL;
 
 
@@ -2398,7 +2459,7 @@ CheckCompoundAffixes(CMPDAffix **ptr, const char *word, int len, bool CheckInPla
 static SplitVar *
 CopyVar(SplitVar *s, int makedup)
 {
-	SplitVar   *v = (SplitVar *) palloc(sizeof(SplitVar));
+	SplitVar   *v = palloc_object(SplitVar);
 
 	v->next = NULL;
 	if (s)
@@ -2406,7 +2467,7 @@ CopyVar(SplitVar *s, int makedup)
 		int			i;
 
 		v->lenstem = s->lenstem;
-		v->stem = (char **) palloc(sizeof(char *) * v->lenstem);
+		v->stem = palloc_array(char *, v->lenstem);
 		v->nstem = s->nstem;
 		for (i = 0; i < s->nstem; i++)
 			v->stem[i] = (makedup) ? pstrdup(s->stem[i]) : s->stem[i];
@@ -2414,7 +2475,7 @@ CopyVar(SplitVar *s, int makedup)
 	else
 	{
 		v->lenstem = 16;
-		v->stem = (char **) palloc(sizeof(char *) * v->lenstem);
+		v->stem = palloc_array(char *, v->lenstem);
 		v->nstem = 0;
 	}
 	return v;
@@ -2521,9 +2582,9 @@ SplitToVariants(IspellDict *Conf, SPNode *snode, SplitVar *orig, const char *wor
 		while (StopLow < StopHigh)
 		{
 			StopMiddle = StopLow + ((StopHigh - StopLow) >> 1);
-			if (StopMiddle->val == ((uint8 *) (word))[level])
+			if (StopMiddle->val == ((const uint8 *) (word))[level])
 				break;
-			else if (StopMiddle->val < ((uint8 *) (word))[level])
+			else if (StopMiddle->val < ((const uint8 *) (word))[level])
 				StopLow = StopMiddle + 1;
 			else
 				StopHigh = StopMiddle;
@@ -2587,7 +2648,7 @@ static void
 addNorm(TSLexeme **lres, TSLexeme **lcur, char *word, int flags, uint16 NVariant)
 {
 	if (*lres == NULL)
-		*lcur = *lres = (TSLexeme *) palloc(MAX_NORM * sizeof(TSLexeme));
+		*lcur = *lres = palloc_array(TSLexeme, MAX_NORM);
 
 	if (*lcur - *lres < MAX_NORM - 1)
 	{

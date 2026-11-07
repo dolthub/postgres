@@ -3,7 +3,7 @@
  * hashfunc.c
  *	  Support functions for hash access method.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -310,7 +310,7 @@ hashtext(PG_FUNCTION_ARGS)
 		 * character in the hash, but it was done before and the behavior must
 		 * be preserved.
 		 */
-		result = hash_any((uint8_t *) buf, bsize + 1);
+		result = hash_any((uint8_t *) buf, rsize + 1);
 
 		pfree(buf);
 	}
@@ -365,7 +365,7 @@ hashtextextended(PG_FUNCTION_ARGS)
 		 * character in the hash, but it was done before and the behavior must
 		 * be preserved.
 		 */
-		result = hash_any_extended((uint8_t *) buf, bsize + 1,
+		result = hash_any_extended((uint8_t *) buf, rsize + 1,
 								   PG_GETARG_INT64(1));
 
 		pfree(buf);
@@ -388,7 +388,7 @@ hashtextextended(PG_FUNCTION_ARGS)
 Datum
 hashvarlena(PG_FUNCTION_ARGS)
 {
-	struct varlena *key = PG_GETARG_VARLENA_PP(0);
+	varlena    *key = PG_GETARG_VARLENA_PP(0);
 	Datum		result;
 
 	result = hash_any((unsigned char *) VARDATA_ANY(key),
@@ -403,7 +403,7 @@ hashvarlena(PG_FUNCTION_ARGS)
 Datum
 hashvarlenaextended(PG_FUNCTION_ARGS)
 {
-	struct varlena *key = PG_GETARG_VARLENA_PP(0);
+	varlena    *key = PG_GETARG_VARLENA_PP(0);
 	Datum		result;
 
 	result = hash_any_extended((unsigned char *) VARDATA_ANY(key),

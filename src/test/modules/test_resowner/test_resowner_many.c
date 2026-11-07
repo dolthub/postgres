@@ -3,7 +3,7 @@
  * test_resowner_many.c
  *		Test ResourceOwner functionality with lots of resources
  *
- * Copyright (c) 2022-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2022-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/test/modules/test_resowner/test_resowner_many.c
@@ -43,11 +43,10 @@ typedef struct
 } ManyTestResource;
 
 /*
- * Current release phase, and priority of last call to the release callback.
+ * Priority of last call to the release callback.
  * This is used to check that the resources are released in correct order.
  */
-static ResourceReleasePhase current_release_phase;
-static uint32 last_release_priority = 0;
+static uint32 last_release_priority PG_USED_FOR_ASSERTS_ONLY = 0;
 
 /* prototypes for local functions */
 static void ReleaseManyTestResource(Datum res);
@@ -121,7 +120,7 @@ RememberManyTestResources(ResourceOwner owner,
 
 	for (int i = 0; i < nresources; i++)
 	{
-		ManyTestResource *mres = palloc(sizeof(ManyTestResource));
+		ManyTestResource *mres = palloc_object(ManyTestResource);
 
 		mres->kind = &kinds[kind_idx];
 		dlist_node_init(&mres->node);
@@ -272,18 +271,15 @@ test_resowner_many(PG_FUNCTION_ARGS)
 
 	/* Start releasing */
 	elog(NOTICE, "releasing resources before locks");
-	current_release_phase = RESOURCE_RELEASE_BEFORE_LOCKS;
 	last_release_priority = 0;
 	ResourceOwnerRelease(resowner, RESOURCE_RELEASE_BEFORE_LOCKS, false, false);
 	Assert(GetTotalResourceCount(before_kinds, nkinds) == 0);
 
 	elog(NOTICE, "releasing locks");
-	current_release_phase = RESOURCE_RELEASE_LOCKS;
 	last_release_priority = 0;
 	ResourceOwnerRelease(resowner, RESOURCE_RELEASE_LOCKS, false, false);
 
 	elog(NOTICE, "releasing resources after locks");
-	current_release_phase = RESOURCE_RELEASE_AFTER_LOCKS;
 	last_release_priority = 0;
 	ResourceOwnerRelease(resowner, RESOURCE_RELEASE_AFTER_LOCKS, false, false);
 	Assert(GetTotalResourceCount(before_kinds, nkinds) == 0);

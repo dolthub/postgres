@@ -8,7 +8,7 @@
  * signal handler sets a flag variable.  See latch.h for more information
  * on how to use them.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -80,10 +80,10 @@ InitLatch(Latch *latch)
  * current process.
  *
  * InitSharedLatch needs to be called in postmaster before forking child
- * processes, usually right after allocating the shared memory block
- * containing the latch with ShmemInitStruct. (The Unix implementation
- * doesn't actually require that, but the Windows one does.) Because of
- * this restriction, we have no concurrency issues to worry about here.
+ * processes, usually right after initializing the shared memory block
+ * containing the latch. (The Unix implementation doesn't actually require
+ * that, but the Windows one does.) Because of this restriction, we have no
+ * concurrency issues to worry about here.
  *
  * Note that other handles created in this module are never marked as
  * inheritable.  Thus we do not need to worry about cleaning up child

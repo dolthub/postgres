@@ -3,7 +3,7 @@
  * geqo_eval.c
  *	  Routines to evaluate query trees
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/optimizer/geqo/geqo_eval.c
@@ -11,19 +11,19 @@
  *-------------------------------------------------------------------------
  */
 
-/* contributed by:
-   =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
-   *  Martin Utesch				 * Institute of Automatic Control	   *
-   =							 = University of Mining and Technology =
-   *  utesch@aut.tu-freiberg.de  * Freiberg, Germany				   *
-   =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
+/*
+ * contributed by:
+ * =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
+ * *  Martin Utesch				 * Institute of Automatic Control	   *
+ * =							 = University of Mining and Technology =
+ * *  utesch@aut.tu-freiberg.de  * Freiberg, Germany				   *
+ * =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
  */
 
 #include "postgres.h"
 
 #include <float.h>
 #include <limits.h>
-#include <math.h>
 
 #include "optimizer/geqo.h"
 #include "optimizer/joininfo.h"
@@ -48,18 +48,18 @@ static bool desirable_join(PlannerInfo *root,
 /*
  * geqo_eval
  *
- * Returns cost of a query tree as an individual of the population.
+ * Returns the fitness of a query tree as an individual of the population.
  *
- * If no legal join order can be extracted from the proposed tour,
- * returns DBL_MAX.
+ * If no legal join order can be extracted from the proposed tour, returns
+ * the invalid fitness described in geqo_gene.h.
  */
-Cost
+Fitness
 geqo_eval(PlannerInfo *root, Gene *tour, int num_gene)
 {
 	MemoryContext mycontext;
 	MemoryContext oldcxt;
 	RelOptInfo *joinrel;
-	Cost		fitness;
+	Fitness		fitness;
 	int			savelength;
 	struct HTAB *savehash;
 
@@ -112,10 +112,14 @@ geqo_eval(PlannerInfo *root, Gene *tour, int num_gene)
 	{
 		Path	   *best_path = joinrel->cheapest_total_path;
 
-		fitness = best_path->total_cost;
+		fitness.disabled_nodes = best_path->disabled_nodes;
+		fitness.cost = best_path->total_cost;
 	}
 	else
-		fitness = DBL_MAX;
+	{
+		fitness.disabled_nodes = INT_MAX;
+		fitness.cost = DBL_MAX;
+	}
 
 	/*
 	 * Restore join_rel_list to its former state, and put back original
@@ -162,7 +166,7 @@ geqo_eval(PlannerInfo *root, Gene *tour, int num_gene)
 RelOptInfo *
 gimme_tree(PlannerInfo *root, Gene *tour, int num_gene)
 {
-	GeqoPrivateData *private = (GeqoPrivateData *) root->join_search_private;
+	GeqoPrivateData *private = GetGeqoPrivateData(root);
 	List	   *clumps;
 	int			rel_count;
 
@@ -191,7 +195,7 @@ gimme_tree(PlannerInfo *root, Gene *tour, int num_gene)
 										  cur_rel_index - 1);
 
 		/* Make it into a single-rel clump */
-		cur_clump = (Clump *) palloc(sizeof(Clump));
+		cur_clump = palloc_object(Clump);
 		cur_clump->joinrel = cur_rel;
 		cur_clump->size = 1;
 
@@ -264,6 +268,9 @@ merge_clump(PlannerInfo *root, List *clumps, Clump *new_clump, int num_gene,
 			/* Keep searching if join order is not valid */
 			if (joinrel)
 			{
+				bool		is_top_rel = bms_equal(joinrel->relids,
+												   root->all_query_rels);
+
 				/* Create paths for partitionwise joins. */
 				generate_partitionwise_join_paths(root, joinrel);
 
@@ -273,11 +280,27 @@ merge_clump(PlannerInfo *root, List *clumps, Clump *new_clump, int num_gene,
 				 * rel once we know the final targetlist (see
 				 * grouping_planner).
 				 */
-				if (!bms_equal(joinrel->relids, root->all_query_rels))
+				if (!is_top_rel)
 					generate_useful_gather_paths(root, joinrel, false);
 
 				/* Find and save the cheapest paths for this joinrel */
 				set_cheapest(joinrel);
+
+				/*
+				 * Except for the topmost scan/join rel, consider generating
+				 * partial aggregation paths for the grouped relation on top
+				 * of the paths of this rel.  After that, we're done creating
+				 * paths for the grouped relation, so run set_cheapest().
+				 */
+				if (joinrel->grouped_rel != NULL && !is_top_rel)
+				{
+					RelOptInfo *grouped_rel = joinrel->grouped_rel;
+
+					Assert(IS_GROUPED_REL(grouped_rel));
+
+					generate_grouped_paths(root, grouped_rel, joinrel);
+					set_cheapest(grouped_rel);
+				}
 
 				/* Absorb new clump into old */
 				old_clump->joinrel = joinrel;

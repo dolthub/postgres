@@ -3,7 +3,7 @@
  * bufpage.c
  *	  POSTGRES standard buffer page code.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -151,6 +151,9 @@ PageIsVerified(PageData *page, BlockNumber blkno, int flags, bool *checksum_fail
 		if ((flags & (PIV_LOG_WARNING | PIV_LOG_LOG)) != 0)
 			ereport(flags & PIV_LOG_WARNING ? WARNING : LOG,
 					(errcode(ERRCODE_DATA_CORRUPTED),
+					 (flags & PIV_ZERO_BUFFERS_ON_ERROR) ?
+					 errmsg("page verification failed, calculated checksum %u but expected %u, buffer will be zeroed",
+							checksum, p->pd_checksum) :
 					 errmsg("page verification failed, calculated checksum %u but expected %u",
 							checksum, p->pd_checksum)));
 
@@ -191,7 +194,7 @@ PageIsVerified(PageData *page, BlockNumber blkno, int flags, bool *checksum_fail
  */
 OffsetNumber
 PageAddItemExtended(Page page,
-					Item item,
+					const void *item,
 					Size size,
 					OffsetNumber offsetNumber,
 					int flags)
@@ -785,8 +788,8 @@ PageRepairFragmentation(Page page)
 		if (totallen > (Size) (pd_special - pd_lower))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("corrupted item lengths: total %u, available space %u",
-							(unsigned int) totallen, pd_special - pd_lower)));
+					 errmsg("corrupted item lengths: total %zu, available space %u",
+							totallen, pd_special - pd_lower)));
 
 		compactify_tuples(itemidbase, nstorage, page, presorted);
 	}
@@ -1088,8 +1091,8 @@ PageIndexTupleDelete(Page page, OffsetNumber offnum)
 		offset != MAXALIGN(offset))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("corrupted line pointer: offset = %u, size = %u",
-						offset, (unsigned int) size)));
+				 errmsg("corrupted line pointer: offset = %u, size = %zu",
+						offset, size)));
 
 	/* Amount of space to actually be deleted */
 	size = MAXALIGN(size);
@@ -1229,8 +1232,8 @@ PageIndexMultiDelete(Page page, OffsetNumber *itemnos, int nitems)
 			offset != MAXALIGN(offset))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("corrupted line pointer: offset = %u, size = %u",
-							offset, (unsigned int) size)));
+					 errmsg("corrupted line pointer: offset = %u, size = %zu",
+							offset, size)));
 
 		if (nextitm < nitems && offnum == itemnos[nextitm])
 		{
@@ -1262,8 +1265,8 @@ PageIndexMultiDelete(Page page, OffsetNumber *itemnos, int nitems)
 	if (totallen > (Size) (pd_special - pd_lower))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("corrupted item lengths: total %u, available space %u",
-						(unsigned int) totallen, pd_special - pd_lower)));
+				 errmsg("corrupted item lengths: total %zu, available space %u",
+						totallen, pd_special - pd_lower)));
 
 	/*
 	 * Looks good. Overwrite the line pointers with the copy, from which we've
@@ -1326,8 +1329,8 @@ PageIndexTupleDeleteNoCompact(Page page, OffsetNumber offnum)
 		offset != MAXALIGN(offset))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("corrupted line pointer: offset = %u, size = %u",
-						offset, (unsigned int) size)));
+				 errmsg("corrupted line pointer: offset = %u, size = %zu",
+						offset, size)));
 
 	/* Amount of space to actually be deleted */
 	size = MAXALIGN(size);
@@ -1402,7 +1405,7 @@ PageIndexTupleDeleteNoCompact(Page page, OffsetNumber offnum)
  */
 bool
 PageIndexTupleOverwrite(Page page, OffsetNumber offnum,
-						Item newtup, Size newsize)
+						const void *newtup, Size newsize)
 {
 	PageHeader	phdr = (PageHeader) page;
 	ItemId		tupid;
@@ -1438,8 +1441,8 @@ PageIndexTupleOverwrite(Page page, OffsetNumber offnum,
 		offset != MAXALIGN(offset))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("corrupted line pointer: offset = %u, size = %u",
-						offset, (unsigned int) oldsize)));
+				 errmsg("corrupted line pointer: offset = %u, size = %d",
+						offset, oldsize)));
 
 	/*
 	 * Determine actual change in space requirement, check for page overflow.
@@ -1492,53 +1495,20 @@ PageIndexTupleOverwrite(Page page, OffsetNumber offnum,
 
 
 /*
- * Set checksum for a page in shared buffers.
+ * Set checksum on a page.
  *
- * If checksums are disabled, or if the page is not initialized, just return
- * the input.  Otherwise, we must make a copy of the page before calculating
- * the checksum, to prevent concurrent modifications (e.g. setting hint bits)
- * from making the final checksum invalid.  It doesn't matter if we include or
- * exclude hints during the copy, as long as we write a valid page and
- * associated checksum.
+ * If the page is in shared buffers, it needs to be locked in at least
+ * share-exclusive mode.
  *
- * Returns a pointer to the block-sized data that needs to be written. Uses
- * statically-allocated memory, so the caller must immediately write the
- * returned page and not refer to it again.
- */
-char *
-PageSetChecksumCopy(Page page, BlockNumber blkno)
-{
-	static char *pageCopy = NULL;
-
-	/* If we don't need a checksum, just return the passed-in data */
-	if (PageIsNew(page) || !DataChecksumsEnabled())
-		return page;
-
-	/*
-	 * We allocate the copy space once and use it over on each subsequent
-	 * call.  The point of palloc'ing here, rather than having a static char
-	 * array, is first to ensure adequate alignment for the checksumming code
-	 * and second to avoid wasting space in processes that never call this.
-	 */
-	if (pageCopy == NULL)
-		pageCopy = MemoryContextAllocAligned(TopMemoryContext,
-											 BLCKSZ,
-											 PG_IO_ALIGN_SIZE,
-											 0);
-
-	memcpy(pageCopy, page, BLCKSZ);
-	((PageHeader) pageCopy)->pd_checksum = pg_checksum_page(pageCopy, blkno);
-	return pageCopy;
-}
-
-/*
- * Set checksum for a page in private memory.
+ * If checksums are disabled, or if the page is not initialized, just
+ * return. Otherwise compute and set the checksum.
  *
- * This must only be used when we know that no other process can be modifying
- * the page buffer.
+ * In the past this needed to be done on a copy of the page, due to the
+ * possibility of e.g., hint bits being set concurrently. However, this is not
+ * necessary anymore as hint bits won't be set while IO is going on.
  */
 void
-PageSetChecksumInplace(Page page, BlockNumber blkno)
+PageSetChecksum(Page page, BlockNumber blkno)
 {
 	/* If we don't need a checksum, just return */
 	if (PageIsNew(page) || !DataChecksumsEnabled())

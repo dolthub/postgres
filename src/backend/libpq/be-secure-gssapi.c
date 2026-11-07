@@ -3,7 +3,7 @@
  * be-secure-gssapi.c
  *  GSSAPI encryption support
  *
- * Portions Copyright (c) 2018-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2018-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *  src/backend/libpq/be-secure-gssapi.c
@@ -21,8 +21,10 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "port/pg_bswap.h"
+#include "storage/latch.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
+#include "utils/wait_event.h"
 
 
 /*

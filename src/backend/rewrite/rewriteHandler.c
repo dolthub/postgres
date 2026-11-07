@@ -3,7 +3,7 @@
  * rewriteHandler.c
  *		Primary module of query rewriter.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -19,9 +19,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "access/doltsystem.h"
 
-#include "access/doltcatalog.h"
 #include "access/relation.h"
 #include "access/sysattr.h"
 #include "access/table.h"
@@ -96,33 +94,6 @@ static void markQueryForLocking(Query *qry, Node *jtnode,
 								bool pushedDown);
 static List *matchLocks(CmdType event, Relation relation,
 						int varno, Query *parsetree, bool *hasUpdate);
-
-/* Inherit immutable context into copied view actions, including nested queries.
- * Never modify the relcache's stored rule tree or a sibling view reference. */
-static bool
-inherit_catalog_context(Node *node, const RangeTblEntry *context)
-{
-	if (!node)
-		return false;
-	if (IsA(node, Query))
-		return query_tree_walker((Query *) node, inherit_catalog_context,
-								 (void *) context, QTW_EXAMINE_RTES_BEFORE);
-	if (IsA(node, FuncExpr))
-		dg_system_function_context((FuncExpr *) node, context->dolt_database, context->dolt_branch);
-	if (IsA(node, RangeTblEntry))
-	{
-		RangeTblEntry *rte = (RangeTblEntry *) node;
-
-		if (rte->rtekind == RTE_RELATION && !rte->dolt_database)
-		{
-			rte->dolt_database = pstrdup(context->dolt_database);
-			rte->dolt_branch = context->dolt_branch ? pstrdup(context->dolt_branch) : NULL;
-		}
-		return false;
-	}
-	return expression_tree_walker(node, inherit_catalog_context, (void *) context);
-}
-
 static Query *fireRIRrules(Query *parsetree, List *activeRIRs);
 static Bitmapset *adjust_view_column_set(Bitmapset *cols, List *targetlist);
 static List *get_generated_columns(Relation rel, int rt_index, bool include_stored);
@@ -223,7 +194,7 @@ AcquireRewriteLocks(Query *parsetree,
 				else
 					lockmode = rte->rellockmode;
 
-				rel = table_open(rte->relid, lockmode);
+				rel = relation_open(rte->relid, lockmode);
 
 				/*
 				 * While we have the relation open, update the RTE's relkind,
@@ -231,7 +202,7 @@ AcquireRewriteLocks(Query *parsetree,
 				 */
 				rte->relkind = rel->rd_rel->relkind;
 
-				table_close(rel, NoLock);
+				relation_close(rel, NoLock);
 				break;
 
 			case RTE_JOIN:
@@ -721,6 +692,19 @@ rewriteRuleAction(Query *parsetree,
 	}
 
 	/*
+	 * If rule_action is INSERT .. ON CONFLICT DO SELECT, the parser should
+	 * have verified that it has a RETURNING clause, but we must also check
+	 * that the triggering query has a RETURNING clause.
+	 */
+	if (rule_action->onConflict &&
+		rule_action->onConflict->action == ONCONFLICT_SELECT &&
+		(!rule_action->returningList || !parsetree->returningList))
+		ereport(ERROR,
+				errcode(ERRCODE_SYNTAX_ERROR),
+				errmsg("ON CONFLICT DO SELECT requires a RETURNING clause"),
+				errdetail("A rule action is INSERT ... ON CONFLICT DO SELECT, which requires a RETURNING clause."));
+
+	/*
 	 * If rule_action has a RETURNING clause, then either throw it away if the
 	 * triggering query has no RETURNING clause, or rewrite it to emit what
 	 * the triggering query's RETURNING clause asks for.  Throw an error if
@@ -988,8 +972,9 @@ rewriteTargetListIU(List *targetList,
 				apply_default = true;
 
 			/*
-			 * Can only insert DEFAULT into generated columns, regardless of
-			 * any OVERRIDING clauses.
+			 * Can only insert DEFAULT into generated columns.  (The
+			 * OVERRIDING clause does not apply to generated columns, so we
+			 * don't consider it here.)
 			 */
 			if (att_tup->attgenerated && !apply_default)
 			{
@@ -1783,7 +1768,7 @@ ApplyRetrieveRule(Query *parsetree,
 	RowMarkClause *rc;
 	int			numCols;
 
-	if (list_length(RewriteRuleActions(relation, rule)) != 1)
+	if (list_length(rule->actions) != 1)
 		elog(ERROR, "expected just one rule action");
 	if (rule->qual != NULL)
 		elog(ERROR, "cannot handle qualified ON SELECT rule");
@@ -1880,9 +1865,6 @@ ApplyRetrieveRule(Query *parsetree,
 	 * rels if there's a FOR [KEY] UPDATE/SHARE clause affecting this view.
 	 */
 	rule_action = copyObject(linitial(rule->actions));
-	rte = rt_fetch(rt_index, parsetree->rtable);
-	if (rte->dolt_database)
-		inherit_catalog_context((Node *) rule_action, rte);
 
 	AcquireRewriteLocks(rule_action, true, (rc != NULL));
 
@@ -2096,9 +2078,6 @@ fireRIRrules(Query *parsetree, List *activeRIRs)
 
 		rte = rt_fetch(rt_index, parsetree->rtable);
 
-		/* Stored view actions bypass parser RangeVar binding. */
-		dg_catalog_rewrite_relation(rte);
-
 		/*
 		 * A subquery RTE can't have associated rules, so there's nothing to
 		 * do to this level of the query, but we must recurse into the
@@ -2170,7 +2149,7 @@ fireRIRrules(Query *parsetree, List *activeRIRs)
 		 * We can use NoLock here since either the parser or
 		 * AcquireRewriteLocks should have locked the rel already.
 		 */
-		rel = table_open(rte->relid, NoLock);
+		rel = relation_open(rte->relid, NoLock);
 
 		/*
 		 * Collect the RIR rules that we must apply
@@ -2280,7 +2259,7 @@ fireRIRrules(Query *parsetree, List *activeRIRs)
 			 rte->relkind != RELKIND_PARTITIONED_TABLE))
 			continue;
 
-		rel = table_open(rte->relid, NoLock);
+		rel = relation_open(rte->relid, NoLock);
 
 		/*
 		 * Fetch any new security quals that must be applied to this RTE.
@@ -2572,32 +2551,6 @@ fireRules(Query *parsetree,
 
 
 /*
- * RewriteRuleActions - the actions of |relation|'s rule |rule|.
- *
- * A versioned view's rule holds the view's SQL until analyzed; analyze it
- * now, as the relcache would have, and keep the result with the relation.
- */
-List *
-RewriteRuleActions(Relation relation, RewriteRule *rule)
-{
-	List	   *actions;
-	MemoryContext previous;
-
-	if (!(list_length(rule->actions) == 1 && IsA(linitial(rule->actions), String)))
-		return rule->actions;
-	actions = dg_rule_actions(RelationGetRelid(relation), rule->actions);
-	if (rule->event == CMD_SELECT && relation->rd_rel->relkind == RELKIND_VIEW &&
-		RelationHasSecurityInvoker(relation))
-		setRuleCheckAsUser((Node *) actions, InvalidOid);
-	else
-		setRuleCheckAsUser((Node *) actions, relation->rd_rel->relowner);
-	previous = MemoryContextSwitchTo(relation->rd_rulescxt);
-	rule->actions = copyObject(actions);
-	MemoryContextSwitchTo(previous);
-	return rule->actions;
-}
-
-/*
  * get_view_query - get the Query from a view's _RETURN rule.
  *
  * Caller should have verified that the relation is a view, and therefore
@@ -2620,7 +2573,7 @@ get_view_query(Relation view)
 		if (rule->event == CMD_SELECT)
 		{
 			/* A _RETURN rule should have only one action */
-			if (list_length(RewriteRuleActions(view, rule)) != 1)
+			if (list_length(rule->actions) != 1)
 				elog(ERROR, "invalid _RETURN rule action specification");
 
 			return (Query *) linitial(rule->actions);
@@ -2745,7 +2698,7 @@ view_col_is_auto_updatable(RangeTblRef *rtr, TargetEntry *tle)
  * view_query_is_auto_updatable - test whether the specified view definition
  * represents an auto-updatable view. Returns NULL (if the view can be updated)
  * or a message string giving the reason that it cannot be.
-
+ *
  * The returned string has not been translated; if it is shown as an error
  * message, the caller should apply _() to translate it.
  *
@@ -3557,7 +3510,7 @@ rewriteTargetView(Query *parsetree, Relation view)
 	 * already have the right lock!)  Since it will become the query target
 	 * relation, RowExclusiveLock is always the right thing.
 	 */
-	base_rel = table_open(base_rte->relid, RowExclusiveLock);
+	base_rel = relation_open(base_rte->relid, RowExclusiveLock);
 
 	/*
 	 * While we have the relation open, update the RTE's relkind, just in case
@@ -3768,11 +3721,12 @@ rewriteTargetView(Query *parsetree, Relation view)
 	}
 
 	/*
-	 * For INSERT .. ON CONFLICT .. DO UPDATE, we must also update assorted
-	 * stuff in the onConflict data structure.
+	 * For INSERT .. ON CONFLICT .. DO SELECT/UPDATE, we must also update
+	 * assorted stuff in the onConflict data structure.
 	 */
 	if (parsetree->onConflict &&
-		parsetree->onConflict->action == ONCONFLICT_UPDATE)
+		(parsetree->onConflict->action == ONCONFLICT_UPDATE ||
+		 parsetree->onConflict->action == ONCONFLICT_SELECT))
 	{
 		Index		old_exclRelIndex,
 					new_exclRelIndex;
@@ -3781,9 +3735,8 @@ rewriteTargetView(Query *parsetree, Relation view)
 		List	   *tmp_tlist;
 
 		/*
-		 * Like the INSERT/UPDATE code above, update the resnos in the
-		 * auxiliary UPDATE targetlist to refer to columns of the base
-		 * relation.
+		 * For ON CONFLICT DO UPDATE, update the resnos in the auxiliary
+		 * UPDATE targetlist to refer to columns of the base relation.
 		 */
 		foreach(lc, parsetree->onConflict->onConflictSet)
 		{
@@ -3802,7 +3755,7 @@ rewriteTargetView(Query *parsetree, Relation view)
 		}
 
 		/*
-		 * Also, create a new RTE for the EXCLUDED pseudo-relation, using the
+		 * Create a new RTE for the EXCLUDED pseudo-relation, using the
 		 * query's new base rel (which may well have a different column list
 		 * from the view, hence we need a new column alias list).  This should
 		 * match transformOnConflictClause.  In particular, note that the
@@ -3909,7 +3862,7 @@ rewriteTargetView(Query *parsetree, Relation view)
 				parsetree->hasSubLinks = checkExprHasSubLink(viewqual);
 		}
 		else
-			AddQual(parsetree, (Node *) viewqual);
+			AddQual(parsetree, viewqual);
 	}
 
 	/*
@@ -4133,7 +4086,7 @@ RewriteQuery(Query *parsetree, List *rewrite_events, int orig_rt_length,
 		 * We can use NoLock here since either the parser or
 		 * AcquireRewriteLocks should have locked the rel already.
 		 */
-		rt_entry_relation = table_open(rt_entry->relid, NoLock);
+		rt_entry_relation = relation_open(rt_entry->relid, NoLock);
 
 		/*
 		 * Rewrite the targetlist as needed for the command type.
@@ -4412,7 +4365,7 @@ RewriteQuery(Query *parsetree, List *rewrite_events, int orig_rt_length,
 									RelationGetRelationName(rt_entry_relation))));
 			}
 
-			rev = (rewrite_event *) palloc(sizeof(rewrite_event));
+			rev = palloc_object(rewrite_event);
 			rev->relation = RelationGetRelid(rt_entry_relation);
 			rev->event = event;
 			rewrite_events = lappend(rewrite_events, rev);

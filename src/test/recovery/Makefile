@@ -2,7 +2,7 @@
 #
 # Makefile for src/test/recovery
 #
-# Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
 # src/test/recovery/Makefile
@@ -12,7 +12,8 @@
 EXTRA_INSTALL=contrib/pg_prewarm \
 	contrib/pg_stat_statements \
 	contrib/test_decoding \
-	src/test/modules/injection_points
+	src/test/modules/injection_points \
+	src/test/modules/test_wait_lsn
 
 subdir = src/test/recovery
 top_builddir = ../../..

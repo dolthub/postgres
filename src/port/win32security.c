@@ -3,7 +3,7 @@
  * win32security.c
  *	  Microsoft Windows Win32 Security Support Functions
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/port/win32security.c
@@ -17,7 +17,7 @@
 #include "postgres_fe.h"
 #endif
 
-static void log_error(const char *fmt,...) pg_attribute_printf(1, 2);
+static void log_error(const char *fmt, ...) pg_attribute_printf(1, 2);
 
 
 /*
@@ -25,7 +25,7 @@ static void log_error(const char *fmt,...) pg_attribute_printf(1, 2);
  * message.
  */
 static void
-log_error(const char *fmt,...)
+log_error(const char *fmt, ...)
 {
 	va_list		ap;
 

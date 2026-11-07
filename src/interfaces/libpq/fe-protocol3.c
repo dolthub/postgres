@@ -3,7 +3,7 @@
  * fe-protocol3.c
  *	  functions that are specific to frontend/backend protocol version 3
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -1452,7 +1452,19 @@ pqGetNegotiateProtocolVersion3(PGconn *conn)
 	if (pqGetInt(&num, 4, conn) != 0)
 		goto eof;
 
-	/* Check the protocol version */
+	/*
+	 * Check the protocol version.
+	 *
+	 * PG_PROTOCOL_GREASE is intentionally unsupported and reserved. It's
+	 * higher than any real version, so check for that first, to get the most
+	 * specific error message. Then check the upper and lower bounds.
+	 */
+	if (their_version == PG_PROTOCOL_GREASE)
+	{
+		libpq_append_conn_error(conn, "received invalid protocol negotiation message: server requested \"grease\" protocol version 3.9999");
+		goto failure;
+	}
+
 	if (their_version > conn->pversion)
 	{
 		libpq_append_conn_error(conn, "received invalid protocol negotiation message: server requested downgrade to a higher-numbered version");
@@ -1466,7 +1478,7 @@ pqGetNegotiateProtocolVersion3(PGconn *conn)
 	}
 
 	/* 3.1 never existed, we went straight from 3.0 to 3.2 */
-	if (their_version == PG_PROTOCOL(3, 1))
+	if (their_version == PG_PROTOCOL_RESERVED_31)
 	{
 		libpq_append_conn_error(conn, "received invalid protocol negotiation message: server requested downgrade to non-existent 3.1 protocol version");
 		goto failure;
@@ -1514,7 +1526,8 @@ pqGetNegotiateProtocolVersion3(PGconn *conn)
 			libpq_append_conn_error(conn, "received invalid protocol negotiation message: server reported unsupported parameter name without a \"%s\" prefix (\"%s\")", "_pq_.", conn->workBuffer.data);
 			goto failure;
 		}
-		libpq_append_conn_error(conn, "received invalid protocol negotiation message: server reported an unsupported parameter that was not requested (\"%s\")", conn->workBuffer.data);
+		libpq_append_conn_error(conn, "received invalid protocol negotiation message: server reported an unsupported parameter that was not requested (\"%s\")",
+								conn->workBuffer.data);
 		goto failure;
 	}
 
@@ -1564,7 +1577,7 @@ getParameterStatus(PGconn *conn)
 
 /*
  * parseInput subroutine to read a BackendKeyData message.
- * Entry: 'v' message type and length have already been consumed.
+ * Entry: 'K' message type and length have already been consumed.
  * Exit: returns 0 if successfully consumed message.
  *		 returns EOF if not enough data.
  */
@@ -2285,7 +2298,7 @@ pqFunctionCall3(PGconn *conn, Oid fnid,
 		 */
 		switch (id)
 		{
-			case 'V':			/* function result */
+			case PqMsg_FunctionCallResponse:
 				if (pqGetInt(actual_result_len, 4, conn))
 					continue;
 				if (*actual_result_len != -1)
@@ -2317,22 +2330,22 @@ pqFunctionCall3(PGconn *conn, Oid fnid,
 				/* correctly finished function result message */
 				status = PGRES_COMMAND_OK;
 				break;
-			case 'E':			/* error return */
+			case PqMsg_ErrorResponse:
 				if (pqGetErrorNotice3(conn, true))
 					continue;
 				status = PGRES_FATAL_ERROR;
 				break;
-			case 'A':			/* notify message */
+			case PqMsg_NotificationResponse:
 				/* handle notify and go back to processing return values */
 				if (getNotify(conn))
 					continue;
 				break;
-			case 'N':			/* notice */
+			case PqMsg_NoticeResponse:
 				/* handle notice and go back to processing return values */
 				if (pqGetErrorNotice3(conn, false))
 					continue;
 				break;
-			case 'Z':			/* backend is ready for new query */
+			case PqMsg_ReadyForQuery:
 				if (getReadyForQuery(conn))
 					continue;
 
@@ -2364,7 +2377,7 @@ pqFunctionCall3(PGconn *conn, Oid fnid,
 				}
 				/* and we're out */
 				return pqPrepareAsyncResult(conn);
-			case 'S':			/* parameter status */
+			case PqMsg_ParameterStatus:
 				if (getParameterStatus(conn))
 					continue;
 				break;

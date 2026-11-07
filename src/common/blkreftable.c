@@ -18,7 +18,7 @@
  * later be marked as modified again; if that happens, it means the relation
  * was re-extended.
  *
- * Portions Copyright (c) 2010-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *
  * src/common/blkreftable.c
  *
@@ -234,7 +234,7 @@ static void BlockRefTableFileTerminate(BlockRefTableBuffer *buffer);
 BlockRefTable *
 CreateEmptyBlockRefTable(void)
 {
-	BlockRefTable *brtab = palloc(sizeof(BlockRefTable));
+	BlockRefTable *brtab = palloc_object(BlockRefTable);
 
 	/*
 	 * Even completely empty database has a few hundred relation forks, so it
@@ -584,7 +584,7 @@ CreateBlockRefTableReader(io_callback_fn read_callback,
 	uint32		magic;
 
 	/* Initialize data structure. */
-	reader = palloc0(sizeof(BlockRefTableReader));
+	reader = palloc0_object(BlockRefTableReader);
 	reader->buffer.io_callback = read_callback;
 	reader->buffer.io_callback_arg = read_callback_arg;
 	reader->error_filename = error_filename;
@@ -830,7 +830,7 @@ CreateBlockRefTableWriter(io_callback_fn write_callback,
 	uint32		magic = BLOCKREFTABLE_MAGIC;
 
 	/* Prepare buffer and CRC check and save callbacks. */
-	writer = palloc0(sizeof(BlockRefTableWriter));
+	writer = palloc0_object(BlockRefTableWriter);
 	writer->buffer.io_callback = write_callback;
 	writer->buffer.io_callback_arg = write_callback_arg;
 	INIT_CRC32C(writer->buffer.crc);
@@ -910,7 +910,7 @@ DestroyBlockRefTableWriter(BlockRefTableWriter *writer)
 BlockRefTableEntry *
 CreateBlockRefTableEntry(RelFileLocator rlocator, ForkNumber forknum)
 {
-	BlockRefTableEntry *entry = palloc0(sizeof(BlockRefTableEntry));
+	BlockRefTableEntry *entry = palloc0_object(BlockRefTableEntry);
 
 	memcpy(&entry->key.rlocator, &rlocator, sizeof(RelFileLocator));
 	entry->key.forknum = forknum;

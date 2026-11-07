@@ -2,7 +2,7 @@
  * relation.c
  *	   PostgreSQL logical replication relation mapping cache
  *
- * Copyright (c) 2016-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/replication/logical/relation.c
@@ -29,6 +29,7 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
+#include "utils/typcache.h"
 
 
 static MemoryContext LogicalRepRelMapContext = NULL;
@@ -55,7 +56,7 @@ typedef struct LogicalRepPartMapEntry
 } LogicalRepPartMapEntry;
 
 static Oid	FindLogicalRepLocalIndex(Relation localrel, LogicalRepRelation *remoterel,
-									 AttrMap *attrMap);
+									 AttrMap *attrMap, bool *idxisreplident);
 
 /*
  * Relcache invalidation callback for our relation map cache.
@@ -188,14 +189,25 @@ logicalrep_relmap_update(LogicalRepRelation *remoterel)
 	entry->remoterel.nspname = pstrdup(remoterel->nspname);
 	entry->remoterel.relname = pstrdup(remoterel->relname);
 	entry->remoterel.natts = remoterel->natts;
-	entry->remoterel.attnames = palloc(remoterel->natts * sizeof(char *));
-	entry->remoterel.atttyps = palloc(remoterel->natts * sizeof(Oid));
+	entry->remoterel.attnames = palloc_array(char *, remoterel->natts);
+	entry->remoterel.atttyps = palloc_array(Oid, remoterel->natts);
 	for (i = 0; i < remoterel->natts; i++)
 	{
 		entry->remoterel.attnames[i] = pstrdup(remoterel->attnames[i]);
 		entry->remoterel.atttyps[i] = remoterel->atttyps[i];
 	}
 	entry->remoterel.replident = remoterel->replident;
+
+	/*
+	 * XXX The walsender currently does not transmit the relkind of the remote
+	 * relation when replicating changes. Since we support replicating only
+	 * table changes at present, we default to initializing relkind as
+	 * RELKIND_RELATION. This is needed in CheckSubscriptionRelkind() to check
+	 * if the publisher and subscriber relation kinds are compatible.
+	 */
+	entry->remoterel.relkind =
+		(remoterel->relkind == 0) ? RELKIND_RELATION : remoterel->relkind;
+
 	entry->remoterel.attkeys = bms_copy(remoterel->attkeys);
 	MemoryContextSwitchTo(oldctx);
 }
@@ -227,7 +239,7 @@ static char *
 logicalrep_get_attrs_str(LogicalRepRelation *remoterel, Bitmapset *atts)
 {
 	StringInfoData attsbuf;
-	int			attcnt = 0;
+	bool		first = true;
 	int			i = -1;
 
 	Assert(!bms_is_empty(atts));
@@ -236,11 +248,11 @@ logicalrep_get_attrs_str(LogicalRepRelation *remoterel, Bitmapset *atts)
 
 	while ((i = bms_next_member(atts, i)) >= 0)
 	{
-		attcnt++;
-		if (attcnt > 1)
-			appendStringInfoString(&attsbuf, _(", "));
-
-		appendStringInfo(&attsbuf, _("\"%s\""), remoterel->attnames[i]);
+		if (first)
+			appendStringInfo(&attsbuf, _("\"%s\""), remoterel->attnames[i]);
+		else
+			appendStringInfo(&attsbuf, _(", \"%s\""), remoterel->attnames[i]);
+		first = false;
 	}
 
 	return attsbuf.data;
@@ -425,6 +437,7 @@ logicalrep_rel_open(LogicalRepRelId remoteid, LOCKMODE lockmode)
 
 		/* Check for supported relkind. */
 		CheckSubscriptionRelkind(entry->localrel->rd_rel->relkind,
+								 remoterel->relkind,
 								 remoterel->nspname, remoterel->relname);
 
 		/*
@@ -484,7 +497,8 @@ logicalrep_rel_open(LogicalRepRelId remoteid, LOCKMODE lockmode)
 		 * on the relation).
 		 */
 		entry->localindexoid = FindLogicalRepLocalIndex(entry->localrel, remoterel,
-														entry->attrmap);
+														entry->attrmap,
+														&entry->idxisreplident);
 
 		entry->localrelvalid = true;
 	}
@@ -691,8 +705,8 @@ logicalrep_partition_open(LogicalRepRelMapEntry *root,
 		entry->remoterel.nspname = pstrdup(remoterel->nspname);
 		entry->remoterel.relname = pstrdup(remoterel->relname);
 		entry->remoterel.natts = remoterel->natts;
-		entry->remoterel.attnames = palloc(remoterel->natts * sizeof(char *));
-		entry->remoterel.atttyps = palloc(remoterel->natts * sizeof(Oid));
+		entry->remoterel.attnames = palloc_array(char *, remoterel->natts);
+		entry->remoterel.atttyps = palloc_array(Oid, remoterel->natts);
 		for (i = 0; i < remoterel->natts; i++)
 		{
 			entry->remoterel.attnames[i] = pstrdup(remoterel->attnames[i]);
@@ -756,7 +770,8 @@ logicalrep_partition_open(LogicalRepRelMapEntry *root,
 	 * anything in the LogicalRepPartMapContext (hence CacheMemoryContext).
 	 */
 	entry->localindexoid = FindLogicalRepLocalIndex(partrel, remoterel,
-													entry->attrmap);
+													entry->attrmap,
+													&entry->idxisreplident);
 
 	entry->localrelvalid = true;
 
@@ -783,7 +798,17 @@ FindUsableIndexForReplicaIdentityFull(Relation localrel, AttrMap *attrmap)
 		Relation	idxRel;
 
 		idxRel = index_open(idxoid, AccessShareLock);
-		isUsableIdx = IsIndexUsableForReplicaIdentityFull(idxRel, attrmap);
+
+		/*
+		 * indisvalid is checked here, not in
+		 * IsIndexUsableForReplicaIdentityFull(), since that function's other
+		 * caller (an assertion) must tolerate an index made transiently
+		 * invalid by a concurrent DROP INDEX CONCURRENTLY, whereas a
+		 * permanently invalid leftover of a failed CREATE INDEX CONCURRENTLY
+		 * must never be chosen here.
+		 */
+		isUsableIdx = idxRel->rd_index->indisvalid &&
+			IsIndexUsableForReplicaIdentityFull(idxRel, attrmap);
 		index_close(idxRel, AccessShareLock);
 
 		/* Return the first eligible index found */
@@ -805,6 +830,10 @@ FindUsableIndexForReplicaIdentityFull(Relation localrel, AttrMap *attrmap)
  * attrmap is a map of local attributes to remote ones. We can consult this
  * map to check whether the local index attribute has a corresponding remote
  * attribute.
+ *
+ * Note that this function does not check indisvalid. Callers that are
+ * selecting an index to use for future lookups must check indisvalid
+ * themselves and reject invalid indexes.
  *
  * Note that the limitations of index scans for replica identity full only
  * adheres to a subset of the limitations of PK/RI. For example, we support
@@ -903,12 +932,17 @@ GetRelationIdentityOrPK(Relation rel)
 /*
  * Returns the index oid if we can use an index for subscriber. Otherwise,
  * returns InvalidOid.
+ *
+ * '*idxisreplident' is true if the returned index is the relation's replica
+ * identity or primary key, and false otherwise.
  */
 static Oid
 FindLogicalRepLocalIndex(Relation localrel, LogicalRepRelation *remoterel,
-						 AttrMap *attrMap)
+						 AttrMap *attrMap, bool *idxisreplident)
 {
 	Oid			idxoid;
+
+	*idxisreplident = false;
 
 	/*
 	 * We never need index oid for partitioned tables, always rely on leaf
@@ -922,7 +956,10 @@ FindLogicalRepLocalIndex(Relation localrel, LogicalRepRelation *remoterel,
 	 */
 	idxoid = GetRelationIdentityOrPK(localrel);
 	if (OidIsValid(idxoid))
+	{
+		*idxisreplident = true;
 		return idxoid;
+	}
 
 	if (remoterel->replident == REPLICA_IDENTITY_FULL)
 	{

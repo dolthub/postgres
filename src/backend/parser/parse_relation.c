@@ -3,7 +3,7 @@
  * parse_relation.c
  *	  parser support routines dealing with relations
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -13,19 +13,14 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "access/doltcatalog.h"
-#include "access/doltbranch.h"
-#include "catalog/pg_am_d.h"
 
 #include <ctype.h>
 
 #include "access/htup_details.h"
 #include "access/relation.h"
-#include "access/sysattr.h"
 #include "access/table.h"
 #include "catalog/heap.h"
 #include "catalog/namespace.h"
-#include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -35,9 +30,7 @@
 #include "parser/parsetree.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
-#include "catalog/catalogview.h"
 #include "utils/lsyscache.h"
-#include "utils/rel.h"
 #include "utils/syscache.h"
 #include "utils/varlena.h"
 
@@ -107,7 +100,6 @@ static void expandTupleDesc(TupleDesc tupdesc, Alias *eref,
 static int	specialAttNum(const char *attname);
 static bool rte_visible_if_lateral(ParseState *pstate, RangeTblEntry *rte);
 static bool rte_visible_if_qualified(ParseState *pstate, RangeTblEntry *rte);
-static bool isQueryUsingTempRelation_walker(Node *node, void *context);
 
 
 /*
@@ -1004,7 +996,7 @@ searchRangeTableForCol(ParseState *pstate, const char *alias, const char *colnam
 					   int location)
 {
 	ParseState *orig_pstate = pstate;
-	FuzzyAttrMatchState *fuzzystate = palloc(sizeof(FuzzyAttrMatchState));
+	FuzzyAttrMatchState *fuzzystate = palloc_object(FuzzyAttrMatchState);
 
 	fuzzystate->distance = MAX_FUZZY_DISTANCE + 1;
 	fuzzystate->rfirst = NULL;
@@ -1376,7 +1368,7 @@ buildNSItemFromTupleDesc(RangeTblEntry *rte, Index rtindex,
 	}
 
 	/* ... and build the nsitem */
-	nsitem = (ParseNamespaceItem *) palloc(sizeof(ParseNamespaceItem));
+	nsitem = palloc_object(ParseNamespaceItem);
 	nsitem->p_names = rte->eref;
 	nsitem->p_rte = rte;
 	nsitem->p_rtindex = rtindex;
@@ -1440,7 +1432,7 @@ buildNSItemFromLists(RangeTblEntry *rte, Index rtindex,
 	}
 
 	/* ... and build the nsitem */
-	nsitem = (ParseNamespaceItem *) palloc(sizeof(ParseNamespaceItem));
+	nsitem = palloc_object(ParseNamespaceItem);
 	nsitem->p_names = rte->eref;
 	nsitem->p_rte = rte;
 	nsitem->p_rtindex = rtindex;
@@ -1462,13 +1454,9 @@ buildNSItemFromLists(RangeTblEntry *rte, Index rtindex,
  * This is essentially just the same as table_openrv(), except that it caters
  * to some parser-specific error reporting needs, notably that it arranges
  * to include the RangeVar's parse location in any resulting error.
- *
- * Note: properly, lockmode should be declared LOCKMODE not int, but that
- * would require importing storage/lock.h into parse_relation.h.  Since
- * LOCKMODE is typedef'd as int anyway, that seems like overkill.
  */
 Relation
-parserOpenTable(ParseState *pstate, const RangeVar *relation, int lockmode)
+parserOpenTable(ParseState *pstate, const RangeVar *relation, LOCKMODE lockmode)
 {
 	Relation	rel;
 	ParseCallbackState pcbstate;
@@ -1505,8 +1493,6 @@ parserOpenTable(ParseState *pstate, const RangeVar *relation, int lockmode)
 								relation->relname)));
 		}
 	}
-	if (rel->rd_rel->relam == DOLT_PROLLY_TABLE_AM_OID)
-		dg_catalog_check_relation(rel, dg_current_branch(), NULL);
 	cancel_parser_errposition_callback(&pcbstate);
 	return rel;
 }
@@ -1613,15 +1599,11 @@ addRangeTableEntry(ParseState *pstate,
  * of AccessShareLock, RowShareLock, or RowExclusiveLock depending on the
  * RTE's role within the query.  The caller must hold that lock mode
  * or a stronger one.
- *
- * Note: properly, lockmode should be declared LOCKMODE not int, but that
- * would require importing storage/lock.h into parse_relation.h.  Since
- * LOCKMODE is typedef'd as int anyway, that seems like overkill.
  */
 ParseNamespaceItem *
 addRangeTableEntryForRelation(ParseState *pstate,
 							  Relation rel,
-							  int lockmode,
+							  LOCKMODE lockmode,
 							  Alias *alias,
 							  bool inh,
 							  bool inFromCl)
@@ -1635,7 +1617,7 @@ addRangeTableEntryForRelation(ParseState *pstate,
 	Assert(lockmode == AccessShareLock ||
 		   lockmode == RowShareLock ||
 		   lockmode == RowExclusiveLock);
-	Assert(rel->rd_catalogview || CheckRelationLockedByMe(rel, lockmode, true));
+	Assert(CheckRelationLockedByMe(rel, lockmode, true));
 
 	rte->rtekind = RTE_RELATION;
 	rte->alias = alias;
@@ -1833,7 +1815,7 @@ addRangeTableEntryForFunction(ParseState *pstate,
 	rte->eref = eref;
 
 	/* Process each function ... */
-	functupdescs = (TupleDesc *) palloc(nfuncs * sizeof(TupleDesc));
+	functupdescs = palloc_array(TupleDesc, nfuncs);
 
 	totalatts = 0;
 	funcno = 0;
@@ -1933,6 +1915,7 @@ addRangeTableEntryForFunction(ParseState *pstate,
 			TupleDescInitEntryCollation(tupdesc,
 										(AttrNumber) 1,
 										exprCollation(funcexpr));
+			TupleDescFinalize(tupdesc);
 		}
 		else if (functypclass == TYPEFUNC_RECORD)
 		{
@@ -1990,6 +1973,7 @@ addRangeTableEntryForFunction(ParseState *pstate,
 
 				i++;
 			}
+			TupleDescFinalize(tupdesc);
 
 			/*
 			 * Ensure that the coldeflist defines a legal set of names (no
@@ -2058,7 +2042,7 @@ addRangeTableEntryForFunction(ParseState *pstate,
 							   0);
 			/* no need to set collation */
 		}
-
+		TupleDescFinalize(tupdesc);
 		Assert(natts == totalatts);
 	}
 	else
@@ -2344,7 +2328,7 @@ addRangeTableEntryForJoin(ParseState *pstate,
 	 * Build a ParseNamespaceItem, but don't add it to the pstate's namespace
 	 * list --- caller must do that if appropriate.
 	 */
-	nsitem = (ParseNamespaceItem *) palloc(sizeof(ParseNamespaceItem));
+	nsitem = palloc_object(ParseNamespaceItem);
 	nsitem->p_names = rte->eref;
 	nsitem->p_rte = rte;
 	nsitem->p_perminfo = NULL;
@@ -2518,77 +2502,6 @@ addRangeTableEntryForCTE(ParseState *pstate,
  * This is much like addRangeTableEntry() except that it makes an RTE for an
  * ephemeral named relation.
  */
-ParseNamespaceItem *
-addRangeTableEntryForDolt(ParseState *pstate, RangeVar *rv)
-{
-	RangeTblEntry *rte = makeNode(RangeTblEntry);
-	TupleDesc	desc = dg_catalog_bind(pstate, rv, rte);
-	int			i;
-
-	if (!desc)
-		return NULL;
-
-	/*
-	 * A table is an ordinary relation: on a branch head it has a durable OID,
-	 * in a revision a leased one. Plan and execute it like any other table.
-	 */
-	if (OidIsValid(rte->dolt_rowtype) && !rte->dolt_catalog && rte->relkind != RELKIND_VIEW)
-	{
-		Relation	rel = table_open(get_typ_typrelid(rte->dolt_rowtype), AccessShareLock);
-		ParseNamespaceItem *item;
-
-		item = addRangeTableEntryForRelation(pstate, rel, AccessShareLock, rv->alias, rv->inh, true);
-		item->p_rte->dolt_ref = rte->dolt_ref;
-		item->p_rte->dolt_ref_target = rte->dolt_ref_target;
-		table_close(rel, NoLock);
-		FreeTupleDesc(desc);
-		return item;
-	}
-	if ((rte->relkind == RELKIND_VIEW || rte->relkind == RELKIND_SEQUENCE) && !rte->dolt_catalog)
-	{
-		/* A versioned view, as its revision has it. */
-		Relation	rel = relation_open(rte->relid, AccessShareLock);
-		ParseNamespaceItem *item = addRangeTableEntryForRelation(pstate, rel, AccessShareLock, rv->alias, rv->inh, true);
-
-		item->p_rte->dolt_ref = rte->dolt_ref;
-		item->p_rte->dolt_ref_target = rte->dolt_ref_target;
-		relation_close(rel, NoLock);
-		FreeTupleDesc(desc);
-		return item;
-	}
-	if (rte->relkind == RELKIND_VIEW)
-	{
-		RangeVar   *native = copyObject(rv);
-		ParseNamespaceItem *item;
-
-		native->catalogname = NULL;
-		native->dolt_revision = NULL;
-		native->schemaname = get_namespace_name(get_rel_namespace(rte->relid));
-		item = addRangeTableEntry(pstate, native, rv->alias, false, true);
-		item->p_rte->dolt_database = rte->dolt_database;
-		item->p_rte->dolt_branch = rte->dolt_branch;
-		item->p_rte->dolt_ref = rte->dolt_ref;
-		item->p_rte->dolt_ref_target = rte->dolt_ref_target;
-		FreeTupleDesc(desc);
-		return item;
-	}
-	rte->rtekind = RTE_DOLT;
-	rte->alias = rv->alias;
-	rte->eref = makeAlias(rv->alias ? rv->alias->aliasname : rv->relname, NIL);
-	buildRelationAliases(desc, rv->alias, rte->eref);
-	for (i = 0; i < desc->natts; i++)
-	{
-		Form_pg_attribute att = TupleDescAttr(desc, i);
-
-		rte->coltypes = lappend_oid(rte->coltypes, att->atttypid);
-		rte->coltypmods = lappend_int(rte->coltypmods, att->atttypmod);
-		rte->colcollations = lappend_oid(rte->colcollations, att->attcollation);
-	}
-	rte->inFromCl = true;
-	pstate->p_rtable = lappend(pstate->p_rtable, rte);
-	return buildNSItemFromTupleDesc(rte, list_length(pstate->p_rtable), NULL, desc);
-}
-
 ParseNamespaceItem *
 addRangeTableEntryForENR(ParseState *pstate,
 						 RangeVar *rv,
@@ -3147,7 +3060,6 @@ expandRTE(RangeTblEntry *rte, int rtindex, int sublevels_up,
 		case RTE_TABLEFUNC:
 		case RTE_VALUES:
 		case RTE_CTE:
-		case RTE_DOLT:
 		case RTE_NAMEDTUPLESTORE:
 			{
 				/* Tablefunc, Values, CTE, or ENR RTE */
@@ -3540,7 +3452,6 @@ get_rte_attribute_is_dropped(RangeTblEntry *rte, AttrNumber attnum)
 			 */
 			result = false;
 			break;
-		case RTE_DOLT:
 		case RTE_NAMEDTUPLESTORE:
 			{
 				/* Check dropped-ness by testing for valid coltype */
@@ -3600,13 +3511,13 @@ get_rte_attribute_is_dropped(RangeTblEntry *rte, AttrNumber attnum)
 						if (tupdesc)
 						{
 							/* Composite data type, e.g. a table's row type */
-							Form_pg_attribute att_tup;
+							CompactAttribute *att;
 
 							Assert(tupdesc);
 							Assert(attnum - atts_done <= tupdesc->natts);
-							att_tup = TupleDescAttr(tupdesc,
-													attnum - atts_done - 1);
-							return att_tup->attisdropped;
+							att = TupleDescCompactAttr(tupdesc,
+													   attnum - atts_done - 1);
+							return att->attisdropped;
 						}
 						/* Otherwise, it can't have any dropped columns */
 						return false;
@@ -3719,7 +3630,8 @@ attnameAttNum(Relation rd, const char *attname, bool sysColOK)
 	return InvalidAttrNumber;
 }
 
-/* specialAttNum()
+/*
+ * specialAttNum()
  *
  * Check attribute name to see if it is "special", e.g. "xmin".
  * - thomas 2000-02-07
@@ -4032,53 +3944,6 @@ rte_visible_if_qualified(ParseState *pstate, RangeTblEntry *rte)
 	return false;
 }
 
-
-/*
- * Examine a fully-parsed query, and return true iff any relation underlying
- * the query is a temporary relation (table, view, or materialized view).
- */
-bool
-isQueryUsingTempRelation(Query *query)
-{
-	return isQueryUsingTempRelation_walker((Node *) query, NULL);
-}
-
-static bool
-isQueryUsingTempRelation_walker(Node *node, void *context)
-{
-	if (node == NULL)
-		return false;
-
-	if (IsA(node, Query))
-	{
-		Query	   *query = (Query *) node;
-		ListCell   *rtable;
-
-		foreach(rtable, query->rtable)
-		{
-			RangeTblEntry *rte = lfirst(rtable);
-
-			if (rte->rtekind == RTE_RELATION)
-			{
-				Relation	rel = table_open(rte->relid, AccessShareLock);
-				char		relpersistence = rel->rd_rel->relpersistence;
-
-				table_close(rel, AccessShareLock);
-				if (relpersistence == RELPERSISTENCE_TEMP)
-					return true;
-			}
-		}
-
-		return query_tree_walker(query,
-								 isQueryUsingTempRelation_walker,
-								 context,
-								 QTW_IGNORE_JOINALIASES);
-	}
-
-	return expression_tree_walker(node,
-								  isQueryUsingTempRelation_walker,
-								  context);
-}
 
 /*
  * addRTEPermissionInfo

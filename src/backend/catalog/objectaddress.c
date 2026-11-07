@@ -3,7 +3,7 @@
  * objectaddress.c
  *	  functions for working with ObjectAddresses
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -62,7 +62,6 @@
 #include "catalog/pg_ts_template.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_user_mapping.h"
-#include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
 #include "commands/extension.h"
@@ -100,10 +99,11 @@ typedef struct
 								 * error messages */
 	Oid			class_oid;		/* oid of catalog */
 	Oid			oid_index_oid;	/* oid of index on system oid column */
-	int			oid_catcache_id;	/* id of catcache on system oid column	*/
-	int			name_catcache_id;	/* id of catcache on (name,namespace), or
-									 * (name) if the object does not live in a
-									 * namespace */
+	SysCacheIdentifier oid_catcache_id; /* id of catcache on system oid column	*/
+	SysCacheIdentifier name_catcache_id;	/* id of catcache on
+											 * (name,namespace), or (name) if
+											 * the object does not live in a
+											 * namespace */
 	AttrNumber	attnum_oid;		/* attribute number of oid column */
 	AttrNumber	attnum_name;	/* attnum of name field */
 	AttrNumber	attnum_namespace;	/* attnum of namespace field */
@@ -136,8 +136,8 @@ static const ObjectPropertyType ObjectProperty[] =
 		"access method operator",
 		AccessMethodOperatorRelationId,
 		AccessMethodOperatorOidIndexId,
-		-1,
-		-1,
+		SYSCACHEID_INVALID,
+		SYSCACHEID_INVALID,
 		Anum_pg_amop_oid,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
@@ -150,8 +150,8 @@ static const ObjectPropertyType ObjectProperty[] =
 		"access method procedure",
 		AccessMethodProcedureRelationId,
 		AccessMethodProcedureOidIndexId,
-		-1,
-		-1,
+		SYSCACHEID_INVALID,
+		SYSCACHEID_INVALID,
 		Anum_pg_amproc_oid,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
@@ -164,8 +164,8 @@ static const ObjectPropertyType ObjectProperty[] =
 		"cast",
 		CastRelationId,
 		CastOidIndexId,
-		-1,
-		-1,
+		SYSCACHEID_INVALID,
+		SYSCACHEID_INVALID,
 		Anum_pg_cast_oid,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
@@ -179,7 +179,7 @@ static const ObjectPropertyType ObjectProperty[] =
 		CollationRelationId,
 		CollationOidIndexId,
 		COLLOID,
-		-1,						/* COLLNAMEENCNSP also takes encoding */
+		SYSCACHEID_INVALID,		/* COLLNAMEENCNSP also takes encoding */
 		Anum_pg_collation_oid,
 		Anum_pg_collation_collname,
 		Anum_pg_collation_collnamespace,
@@ -193,7 +193,7 @@ static const ObjectPropertyType ObjectProperty[] =
 		ConstraintRelationId,
 		ConstraintOidIndexId,
 		CONSTROID,
-		-1,
+		SYSCACHEID_INVALID,
 		Anum_pg_constraint_oid,
 		Anum_pg_constraint_conname,
 		Anum_pg_constraint_connamespace,
@@ -221,7 +221,7 @@ static const ObjectPropertyType ObjectProperty[] =
 		DatabaseRelationId,
 		DatabaseOidIndexId,
 		DATABASEOID,
-		-1,
+		SYSCACHEID_INVALID,
 		Anum_pg_database_oid,
 		Anum_pg_database_datname,
 		InvalidAttrNumber,
@@ -234,8 +234,8 @@ static const ObjectPropertyType ObjectProperty[] =
 		"default ACL",
 		DefaultAclRelationId,
 		DefaultAclOidIndexId,
-		-1,
-		-1,
+		SYSCACHEID_INVALID,
+		SYSCACHEID_INVALID,
 		Anum_pg_default_acl_oid,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
@@ -248,8 +248,8 @@ static const ObjectPropertyType ObjectProperty[] =
 		"extension",
 		ExtensionRelationId,
 		ExtensionOidIndexId,
-		-1,
-		-1,
+		SYSCACHEID_INVALID,
+		SYSCACHEID_INVALID,
 		Anum_pg_extension_oid,
 		Anum_pg_extension_extname,
 		InvalidAttrNumber,		/* extension doesn't belong to extnamespace */
@@ -291,7 +291,7 @@ static const ObjectPropertyType ObjectProperty[] =
 		ProcedureRelationId,
 		ProcedureOidIndexId,
 		PROCOID,
-		-1,						/* PROCNAMEARGSNSP also takes argument types */
+		SYSCACHEID_INVALID,		/* PROCNAMEARGSNSP also takes argument types */
 		Anum_pg_proc_oid,
 		Anum_pg_proc_proname,
 		Anum_pg_proc_pronamespace,
@@ -318,8 +318,8 @@ static const ObjectPropertyType ObjectProperty[] =
 		"large object metadata",
 		LargeObjectMetadataRelationId,
 		LargeObjectMetadataOidIndexId,
-		-1,
-		-1,
+		SYSCACHEID_INVALID,
+		SYSCACHEID_INVALID,
 		Anum_pg_largeobject_metadata_oid,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
@@ -333,7 +333,7 @@ static const ObjectPropertyType ObjectProperty[] =
 		OperatorClassRelationId,
 		OpclassOidIndexId,
 		CLAOID,
-		-1,						/* CLAAMNAMENSP also takes opcmethod */
+		SYSCACHEID_INVALID,		/* CLAAMNAMENSP also takes opcmethod */
 		Anum_pg_opclass_oid,
 		Anum_pg_opclass_opcname,
 		Anum_pg_opclass_opcnamespace,
@@ -347,7 +347,7 @@ static const ObjectPropertyType ObjectProperty[] =
 		OperatorRelationId,
 		OperatorOidIndexId,
 		OPEROID,
-		-1,						/* OPERNAMENSP also takes left and right type */
+		SYSCACHEID_INVALID,		/* OPERNAMENSP also takes left and right type */
 		Anum_pg_operator_oid,
 		Anum_pg_operator_oprname,
 		Anum_pg_operator_oprnamespace,
@@ -361,7 +361,7 @@ static const ObjectPropertyType ObjectProperty[] =
 		OperatorFamilyRelationId,
 		OpfamilyOidIndexId,
 		OPFAMILYOID,
-		-1,						/* OPFAMILYAMNAMENSP also takes opfmethod */
+		SYSCACHEID_INVALID,		/* OPFAMILYAMNAMENSP also takes opfmethod */
 		Anum_pg_opfamily_oid,
 		Anum_pg_opfamily_opfname,
 		Anum_pg_opfamily_opfnamespace,
@@ -388,8 +388,8 @@ static const ObjectPropertyType ObjectProperty[] =
 		"role membership",
 		AuthMemRelationId,
 		AuthMemOidIndexId,
-		-1,
-		-1,
+		SYSCACHEID_INVALID,
+		SYSCACHEID_INVALID,
 		Anum_pg_auth_members_oid,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
@@ -402,8 +402,8 @@ static const ObjectPropertyType ObjectProperty[] =
 		"rule",
 		RewriteRelationId,
 		RewriteOidIndexId,
-		-1,
-		-1,
+		SYSCACHEID_INVALID,
+		SYSCACHEID_INVALID,
 		Anum_pg_rewrite_oid,
 		Anum_pg_rewrite_rulename,
 		InvalidAttrNumber,
@@ -445,7 +445,7 @@ static const ObjectPropertyType ObjectProperty[] =
 		TableSpaceRelationId,
 		TablespaceOidIndexId,
 		TABLESPACEOID,
-		-1,
+		SYSCACHEID_INVALID,
 		Anum_pg_tablespace_oid,
 		Anum_pg_tablespace_spcname,
 		InvalidAttrNumber,
@@ -459,7 +459,7 @@ static const ObjectPropertyType ObjectProperty[] =
 		TransformRelationId,
 		TransformOidIndexId,
 		TRFOID,
-		-1,
+		SYSCACHEID_INVALID,
 		Anum_pg_transform_oid,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
@@ -472,8 +472,8 @@ static const ObjectPropertyType ObjectProperty[] =
 		"trigger",
 		TriggerRelationId,
 		TriggerOidIndexId,
-		-1,
-		-1,
+		SYSCACHEID_INVALID,
+		SYSCACHEID_INVALID,
 		Anum_pg_trigger_oid,
 		Anum_pg_trigger_tgname,
 		InvalidAttrNumber,
@@ -486,8 +486,8 @@ static const ObjectPropertyType ObjectProperty[] =
 		"policy",
 		PolicyRelationId,
 		PolicyOidIndexId,
-		-1,
-		-1,
+		SYSCACHEID_INVALID,
+		SYSCACHEID_INVALID,
 		Anum_pg_policy_oid,
 		Anum_pg_policy_polname,
 		InvalidAttrNumber,
@@ -627,7 +627,7 @@ static const ObjectPropertyType ObjectProperty[] =
 		UserMappingRelationId,
 		UserMappingOidIndexId,
 		USERMAPPINGOID,
-		-1,
+		SYSCACHEID_INVALID,
 		Anum_pg_user_mapping_oid,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
@@ -824,6 +824,9 @@ static const struct object_type_map
 		"publication relation", OBJECT_PUBLICATION_REL
 	},
 	{
+		"publication excluded relation", OBJECT_PUBLICATION_EXCLUDED_REL
+	},
+	{
 		"subscription", OBJECT_SUBSCRIPTION
 	},
 	{
@@ -863,7 +866,8 @@ static ObjectAddress get_object_address_opf_member(ObjectType objtype,
 
 static ObjectAddress get_object_address_usermapping(List *object,
 													bool missing_ok);
-static ObjectAddress get_object_address_publication_rel(List *object,
+static ObjectAddress get_object_address_publication_rel(ObjectType objtype,
+														List *object,
 														Relation *relp,
 														bool missing_ok);
 static ObjectAddress get_object_address_publication_schema(List *object,
@@ -880,6 +884,9 @@ static void getRelationTypeDescription(StringInfo buffer, Oid relid,
 									   int32 objectSubId, bool missing_ok);
 static void getProcedureTypeDescription(StringInfo buffer, Oid procid,
 										bool missing_ok);
+static void getPublicationRelationTypeDescription(StringInfo buffer,
+												  Oid pubreloid,
+												  bool missing_ok);
 static void getConstraintTypeDescription(StringInfo buffer, Oid constroid,
 										 bool missing_ok);
 static void getOpFamilyIdentity(StringInfo buffer, Oid opfid, List **object,
@@ -1112,8 +1119,10 @@ get_object_address(ObjectType objtype, Node *object,
 				address = get_object_address_publication_schema(castNode(List, object),
 																missing_ok);
 				break;
+			case OBJECT_PUBLICATION_EXCLUDED_REL:
 			case OBJECT_PUBLICATION_REL:
-				address = get_object_address_publication_rel(castNode(List, object),
+				address = get_object_address_publication_rel(objtype,
+															 castNode(List, object),
 															 &relation,
 															 missing_ok);
 				break;
@@ -1860,12 +1869,12 @@ get_object_address_usermapping(List *object, bool missing_ok)
 }
 
 /*
- * Find the ObjectAddress for a publication relation.  The first element of
- * the object parameter is the relation name, the second is the
- * publication name.
+ * Find the ObjectAddress for a published or excluded publication relation.
+ * The first element of the object parameter is the relation name, the second
+ * is the publication name.
  */
 static ObjectAddress
-get_object_address_publication_rel(List *object,
+get_object_address_publication_rel(ObjectType objtype, List *object,
 								   Relation *relp, bool missing_ok)
 {
 	ObjectAddress address;
@@ -1873,6 +1882,12 @@ get_object_address_publication_rel(List *object,
 	List	   *relname;
 	char	   *pubname;
 	Publication *pub;
+	Form_pg_publication_rel prform;
+	HeapTuple	tup;
+	bool		isexcept;
+
+	Assert(objtype == OBJECT_PUBLICATION_REL ||
+		   objtype == OBJECT_PUBLICATION_EXCLUDED_REL);
 
 	ObjectAddressSet(address, PublicationRelRelationId, InvalidOid);
 
@@ -1893,21 +1908,53 @@ get_object_address_publication_rel(List *object,
 		return address;
 	}
 
-	/* Find the publication relation mapping in syscache. */
-	address.objectId =
-		GetSysCacheOid2(PUBLICATIONRELMAP, Anum_pg_publication_rel_oid,
-						ObjectIdGetDatum(RelationGetRelid(relation)),
-						ObjectIdGetDatum(pub->oid));
-	if (!OidIsValid(address.objectId))
+	/*
+	 * Find the publication relation mapping in syscache.  Fetch the tuple
+	 * rather than just its OID, so that prexcept can be checked without a
+	 * second lookup.
+	 */
+	tup = SearchSysCache2(PUBLICATIONRELMAP,
+						  ObjectIdGetDatum(RelationGetRelid(relation)),
+						  ObjectIdGetDatum(pub->oid));
+	if (!HeapTupleIsValid(tup))
 	{
 		if (!missing_ok)
-			ereport(ERROR,
-					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("publication relation \"%s\" in publication \"%s\" does not exist",
-							RelationGetRelationName(relation), pubname)));
+		{
+			if (objtype == OBJECT_PUBLICATION_EXCLUDED_REL)
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_OBJECT),
+						 errmsg("publication excluded relation \"%s\" in publication \"%s\" does not exist",
+								RelationGetRelationName(relation), pubname)));
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_OBJECT),
+						 errmsg("publication relation \"%s\" in publication \"%s\" does not exist",
+								RelationGetRelationName(relation), pubname)));
+		}
 		relation_close(relation, AccessShareLock);
 		return address;
 	}
+
+	prform = (Form_pg_publication_rel) GETSTRUCT(tup);
+	address.objectId = prform->oid;
+	isexcept = prform->prexcept;
+	ReleaseSysCache(tup);
+
+	/*
+	 * The same relation and publication pair identifies either a published or
+	 * an excluded relation, so reject an entry of the kind that was not asked
+	 * for.
+	 */
+	if (objtype == OBJECT_PUBLICATION_EXCLUDED_REL && !isexcept)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not an excluded relation of publication \"%s\"",
+						RelationGetRelationName(relation), pubname)));
+	else if (objtype == OBJECT_PUBLICATION_REL && isexcept)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a published relation of publication \"%s\"",
+						RelationGetRelationName(relation), pubname)));
 
 	*relp = relation;
 	return address;
@@ -2232,9 +2279,10 @@ pg_get_object_address(PG_FUNCTION_ARGS)
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("name list length must be exactly %d", 1)));
 			/* fall through to check args length */
-			/* FALLTHROUGH */
+			pg_fallthrough;
 		case OBJECT_DOMCONSTRAINT:
 		case OBJECT_CAST:
+		case OBJECT_PUBLICATION_EXCLUDED_REL:
 		case OBJECT_PUBLICATION_REL:
 		case OBJECT_DEFACL:
 		case OBJECT_TRANSFORM:
@@ -2257,7 +2305,7 @@ pg_get_object_address(PG_FUNCTION_ARGS)
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("name list length must be at least %d", 3)));
 			/* fall through to check args length */
-			/* FALLTHROUGH */
+			pg_fallthrough;
 		case OBJECT_OPERATOR:
 			if (list_length(args) != 2)
 				ereport(ERROR,
@@ -2326,6 +2374,7 @@ pg_get_object_address(PG_FUNCTION_ARGS)
 		case OBJECT_TRANSFORM:
 			objnode = (Node *) list_make2(typename, linitial(args));
 			break;
+		case OBJECT_PUBLICATION_EXCLUDED_REL:
 		case OBJECT_PUBLICATION_REL:
 			objnode = (Node *) list_make2(name, linitial(args));
 			break;
@@ -2554,6 +2603,7 @@ check_object_ownership(Oid roleid, ObjectType objtype, ObjectAddress address,
 		case OBJECT_AMPROC:
 		case OBJECT_DEFAULT:
 		case OBJECT_DEFACL:
+		case OBJECT_PUBLICATION_EXCLUDED_REL:
 		case OBJECT_PUBLICATION_NAMESPACE:
 		case OBJECT_PUBLICATION_REL:
 		case OBJECT_USER_MAPPING:
@@ -2572,7 +2622,7 @@ check_object_ownership(Oid roleid, ObjectType objtype, ObjectAddress address,
 Oid
 get_object_namespace(const ObjectAddress *address)
 {
-	int			cache;
+	SysCacheIdentifier cache;
 	HeapTuple	tuple;
 	Oid			oid;
 	const ObjectPropertyType *property;
@@ -2584,7 +2634,7 @@ get_object_namespace(const ObjectAddress *address)
 
 	/* Currently, we can only handle object types with system caches. */
 	cache = property->oid_catcache_id;
-	Assert(cache != -1);
+	Assert(cache != SYSCACHEID_INVALID);
 
 	/* Fetch tuple from syscache and extract namespace attribute. */
 	tuple = SearchSysCache1(cache, ObjectIdGetDatum(address->objectId));
@@ -2641,7 +2691,7 @@ get_object_oid_index(Oid class_id)
 	return prop->oid_index_oid;
 }
 
-int
+SysCacheIdentifier
 get_object_catcache_oid(Oid class_id)
 {
 	const ObjectPropertyType *prop = get_object_property_data(class_id);
@@ -2649,7 +2699,7 @@ get_object_catcache_oid(Oid class_id)
 	return prop->oid_catcache_id;
 }
 
-int
+SysCacheIdentifier
 get_object_catcache_name(Oid class_id)
 {
 	const ObjectPropertyType *prop = get_object_property_data(class_id);
@@ -2807,9 +2857,9 @@ get_catalog_object_by_oid_extended(Relation catalog,
 {
 	HeapTuple	tuple;
 	Oid			classId = RelationGetRelid(catalog);
-	int			oidCacheId = get_object_catcache_oid(classId);
+	SysCacheIdentifier oidCacheId = get_object_catcache_oid(classId);
 
-	if (oidCacheId > 0)
+	if (oidCacheId >= 0)
 	{
 		if (locktup)
 			tuple = SearchSysCacheLockedCopy1(oidCacheId,
@@ -2942,7 +2992,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 
 		case ProcedureRelationId:
 			{
-				bits16		flags = FORMAT_PROC_INVALID_AS_NULL;
+				uint16		flags = FORMAT_PROC_INVALID_AS_NULL;
 				char	   *proname = format_procedure_extended(object->objectId,
 																flags);
 
@@ -2955,7 +3005,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 
 		case TypeRelationId:
 			{
-				bits16		flags = FORMAT_TYPE_INVALID_AS_NULL;
+				uint16		flags = FORMAT_TYPE_INVALID_AS_NULL;
 				char	   *typname = format_type_extended(object->objectId, -1,
 														   flags);
 
@@ -3148,7 +3198,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 
 		case OperatorRelationId:
 			{
-				bits16		flags = FORMAT_OPERATOR_INVALID_AS_NULL;
+				uint16		flags = FORMAT_OPERATOR_INVALID_AS_NULL;
 				char	   *oprname = format_operator_extended(object->objectId,
 															   flags);
 
@@ -4025,9 +4075,18 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				initStringInfo(&rel);
 				getRelationDescription(&rel, prform->prrelid, false);
 
-				/* translator: first %s is, e.g., "table %s" */
-				appendStringInfo(&buffer, _("publication of %s in publication %s"),
-								 rel.data, pubname);
+				if (prform->prexcept)
+				{
+					/* translator: first %s is, e.g., "table %s" */
+					appendStringInfo(&buffer, _("exclusion of %s from publication %s"),
+									 rel.data, pubname);
+				}
+				else
+				{
+					/* translator: first %s is, e.g., "table %s" */
+					appendStringInfo(&buffer, _("publication of %s in publication %s"),
+									 rel.data, pubname);
+				}
 				pfree(rel.data);
 				ReleaseSysCache(tup);
 				break;
@@ -4283,8 +4342,8 @@ pg_identify_object(PG_FUNCTION_ARGS)
 			nspAttnum = get_object_attnum_namespace(address.classId);
 			if (nspAttnum != InvalidAttrNumber)
 			{
-				schema_oid = heap_getattr(objtup, nspAttnum,
-										  RelationGetDescr(catalog), &isnull);
+				schema_oid = DatumGetObjectId(heap_getattr(objtup, nspAttnum,
+														   RelationGetDescr(catalog), &isnull));
 				if (isnull)
 					elog(ERROR, "invalid null namespace in object %u/%u/%d",
 						 address.classId, address.objectId, address.objectSubId);
@@ -4325,15 +4384,18 @@ pg_identify_object(PG_FUNCTION_ARGS)
 	objidentity = getObjectIdentity(&address, true);
 
 	/* schema name */
+	nulls[1] = true;
 	if (OidIsValid(schema_oid) && objidentity)
 	{
-		const char *schema = quote_identifier(get_namespace_name(schema_oid));
+		char	   *nspname = get_namespace_name(schema_oid);
 
-		values[1] = CStringGetTextDatum(schema);
-		nulls[1] = false;
+		/* The schema may have been dropped concurrently; report it as NULL */
+		if (nspname != NULL)
+		{
+			values[1] = CStringGetTextDatum(quote_identifier(nspname));
+			nulls[1] = false;
+		}
 	}
-	else
-		nulls[1] = true;
 
 	/* object name */
 	if (objname && objidentity)
@@ -4659,7 +4721,8 @@ getObjectTypeDescription(const ObjectAddress *object, bool missing_ok)
 			break;
 
 		case PublicationRelRelationId:
-			appendStringInfoString(&buffer, "publication relation");
+			getPublicationRelationTypeDescription(&buffer, object->objectId,
+												  missing_ok);
 			break;
 
 		case SubscriptionRelationId:
@@ -4814,6 +4877,41 @@ getProcedureTypeDescription(StringInfo buffer, Oid procid,
 }
 
 /*
+ * subroutine for getObjectTypeDescription: describe a publication relation
+ *
+ * Appends "publication excluded relation" for EXCEPT entries, or
+ * "publication relation" for published relations, to buffer.
+ */
+static void
+getPublicationRelationTypeDescription(StringInfo buffer, Oid pubreloid,
+									  bool missing_ok)
+{
+	HeapTuple	tup;
+	Form_pg_publication_rel prform;
+
+	tup = SearchSysCache1(PUBLICATIONREL, ObjectIdGetDatum(pubreloid));
+	if (!HeapTupleIsValid(tup))
+	{
+		if (!missing_ok)
+			elog(ERROR, "cache lookup failed for publication table %u",
+				 pubreloid);
+
+		/* fallback to "publication relation" for an undefined object */
+		appendStringInfoString(buffer, "publication relation");
+		return;
+	}
+
+	prform = (Form_pg_publication_rel) GETSTRUCT(tup);
+
+	if (prform->prexcept)
+		appendStringInfoString(buffer, "publication excluded relation");
+	else
+		appendStringInfoString(buffer, "publication relation");
+
+	ReleaseSysCache(tup);
+}
+
+/*
  * Obtain a given object's identity, as a palloc'ed string.
  *
  * This is for machine consumption, so it's not translated.  All elements are
@@ -4850,7 +4948,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 	 * will be initialized in all cases inside the switch; but we do it anyway
 	 * so that we can test below that no branch leaves it unset.
 	 */
-	Assert(PointerIsValid(objname) == PointerIsValid(objargs));
+	Assert((objname != NULL) == (objargs != NULL));
 	if (objname)
 	{
 		*objname = NIL;
@@ -4894,7 +4992,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 
 		case ProcedureRelationId:
 			{
-				bits16		flags = FORMAT_PROC_FORCE_QUALIFY | FORMAT_PROC_INVALID_AS_NULL;
+				uint16		flags = FORMAT_PROC_FORCE_QUALIFY | FORMAT_PROC_INVALID_AS_NULL;
 				char	   *proname = format_procedure_extended(object->objectId,
 																flags);
 
@@ -4910,7 +5008,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 
 		case TypeRelationId:
 			{
-				bits16		flags = FORMAT_TYPE_INVALID_AS_NULL | FORMAT_TYPE_FORCE_QUALIFY;
+				uint16		flags = FORMAT_TYPE_INVALID_AS_NULL | FORMAT_TYPE_FORCE_QUALIFY;
 				char	   *typeout;
 
 				typeout = format_type_extended(object->objectId, -1, flags);
@@ -5117,7 +5215,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 
 		case OperatorRelationId:
 			{
-				bits16		flags = FORMAT_OPERATOR_FORCE_QUALIFY | FORMAT_OPERATOR_INVALID_AS_NULL;
+				uint16		flags = FORMAT_OPERATOR_FORCE_QUALIFY | FORMAT_OPERATOR_INVALID_AS_NULL;
 				char	   *oprname = format_operator_extended(object->objectId,
 															   flags);
 
@@ -5954,7 +6052,11 @@ getObjectIdentityParts(const ObjectAddress *object,
 				pubname = get_publication_name(prform->prpubid, false);
 
 				getRelationIdentity(&buffer, prform->prrelid, objname, false);
-				appendStringInfo(&buffer, " in publication %s", pubname);
+				if (prform->prexcept)
+					appendStringInfo(&buffer, " excluded from publication %s",
+									 pubname);
+				else
+					appendStringInfo(&buffer, " in publication %s", pubname);
 
 				if (objargs)
 					*objargs = list_make1(pubname);
@@ -6145,8 +6247,8 @@ strlist_to_textarray(List *list)
 								   ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(memcxt);
 
-	datums = (Datum *) palloc(sizeof(Datum) * list_length(list));
-	nulls = palloc(sizeof(bool) * list_length(list));
+	datums = palloc_array(Datum, list_length(list));
+	nulls = palloc_array(bool, list_length(list));
 
 	foreach(cell, list)
 	{

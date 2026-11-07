@@ -3,7 +3,7 @@
  * llvmjit_expr.c
  *	  JIT compile expressions.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -299,7 +299,7 @@ llvm_compile_expr(ExprState *state)
 								   "v.econtext.aggnulls");
 
 	/* allocate blocks for each op upfront, so we can do jumps easily */
-	opblocks = palloc(sizeof(LLVMBasicBlockRef) * state->steps_len);
+	opblocks = palloc_array(LLVMBasicBlockRef, state->steps_len);
 	for (int opno = 0; opno < state->steps_len; opno++)
 		opblocks[opno] = l_bb_append_v(eval_fn, "b.op.%d.start", opno);
 
@@ -318,7 +318,7 @@ llvm_compile_expr(ExprState *state)
 		op = &state->steps[opno];
 		opcode = ExecEvalStepOp(state, op);
 
-		v_resvaluep = l_ptr_const(op->resvalue, l_ptr(TypeSizeT));
+		v_resvaluep = l_ptr_const(op->resvalue, l_ptr(TypeDatum));
 		v_resnullp = l_ptr_const(op->resnull, l_ptr(TypeStorageBool));
 
 		switch (opcode)
@@ -328,7 +328,7 @@ llvm_compile_expr(ExprState *state)
 					LLVMValueRef v_tmpisnull;
 					LLVMValueRef v_tmpvalue;
 
-					v_tmpvalue = l_load(b, TypeSizeT, v_tmpvaluep, "");
+					v_tmpvalue = l_load(b, TypeDatum, v_tmpvaluep, "");
 					v_tmpisnull = l_load(b, TypeStorageBool, v_tmpisnullp, "");
 
 					LLVMBuildStore(b, v_tmpisnull, v_isnullp);
@@ -338,7 +338,7 @@ llvm_compile_expr(ExprState *state)
 				}
 
 			case EEOP_DONE_NO_RETURN:
-				LLVMBuildRet(b, l_sizet_const(0));
+				LLVMBuildRet(b, l_datum_const(0));
 				break;
 
 			case EEOP_INNER_FETCHSOME:
@@ -480,7 +480,7 @@ llvm_compile_expr(ExprState *state)
 					}
 
 					v_attnum = l_int32_const(lc, op->d.var.attnum);
-					value = l_load_gep1(b, TypeSizeT, v_values, v_attnum, "");
+					value = l_load_gep1(b, TypeDatum, v_values, v_attnum, "");
 					isnull = l_load_gep1(b, TypeStorageBool, v_nulls, v_attnum, "");
 					LLVMBuildStore(b, value, v_resvaluep);
 					LLVMBuildStore(b, isnull, v_resnullp);
@@ -564,13 +564,13 @@ llvm_compile_expr(ExprState *state)
 
 					/* load data */
 					v_attnum = l_int32_const(lc, op->d.assign_var.attnum);
-					v_value = l_load_gep1(b, TypeSizeT, v_values, v_attnum, "");
+					v_value = l_load_gep1(b, TypeDatum, v_values, v_attnum, "");
 					v_isnull = l_load_gep1(b, TypeStorageBool, v_nulls, v_attnum, "");
 
 					/* compute addresses of targets */
 					v_resultnum = l_int32_const(lc, op->d.assign_var.resultnum);
 					v_rvaluep = l_gep(b,
-									  TypeSizeT,
+									  TypeDatum,
 									  v_resultvalues,
 									  &v_resultnum, 1, "");
 					v_risnullp = l_gep(b,
@@ -597,13 +597,13 @@ llvm_compile_expr(ExprState *state)
 					size_t		resultnum = op->d.assign_tmp.resultnum;
 
 					/* load data */
-					v_value = l_load(b, TypeSizeT, v_tmpvaluep, "");
+					v_value = l_load(b, TypeDatum, v_tmpvaluep, "");
 					v_isnull = l_load(b, TypeStorageBool, v_tmpisnullp, "");
 
 					/* compute addresses of targets */
 					v_resultnum = l_int32_const(lc, resultnum);
 					v_rvaluep =
-						l_gep(b, TypeSizeT, v_resultvalues, &v_resultnum, 1, "");
+						l_gep(b, TypeDatum, v_resultvalues, &v_resultnum, 1, "");
 					v_risnullp =
 						l_gep(b, TypeStorageBool, v_resultnulls, &v_resultnum, 1, "");
 
@@ -652,7 +652,7 @@ llvm_compile_expr(ExprState *state)
 					LLVMValueRef v_constvalue,
 								v_constnull;
 
-					v_constvalue = l_sizet_const(op->d.constval.value);
+					v_constvalue = l_datum_const(op->d.constval.value);
 					v_constnull = l_sbool_const(op->d.constval.isnull);
 
 					LLVMBuildStore(b, v_constvalue, v_resvaluep);
@@ -800,7 +800,7 @@ llvm_compile_expr(ExprState *state)
 						LLVMBuildStore(b, l_sbool_const(0), v_boolanynullp);
 
 					v_boolnull = l_load(b, TypeStorageBool, v_resnullp, "");
-					v_boolvalue = l_load(b, TypeSizeT, v_resvaluep, "");
+					v_boolvalue = l_load(b, TypeDatum, v_resvaluep, "");
 
 					/* check if current input is NULL */
 					LLVMBuildCondBr(b,
@@ -820,7 +820,7 @@ llvm_compile_expr(ExprState *state)
 					LLVMPositionBuilderAtEnd(b, b_boolcheckfalse);
 					LLVMBuildCondBr(b,
 									LLVMBuildICmp(b, LLVMIntEQ, v_boolvalue,
-												  l_sizet_const(0), ""),
+												  l_datum_const(0), ""),
 									b_boolisfalse,
 									b_boolcont);
 
@@ -848,7 +848,7 @@ llvm_compile_expr(ExprState *state)
 					/* set resnull to true */
 					LLVMBuildStore(b, l_sbool_const(1), v_resnullp);
 					/* reset resvalue */
-					LLVMBuildStore(b, l_sizet_const(0), v_resvaluep);
+					LLVMBuildStore(b, l_datum_const(0), v_resvaluep);
 
 					LLVMBuildBr(b, opblocks[opno + 1]);
 					break;
@@ -891,7 +891,7 @@ llvm_compile_expr(ExprState *state)
 					if (opcode == EEOP_BOOL_OR_STEP_FIRST)
 						LLVMBuildStore(b, l_sbool_const(0), v_boolanynullp);
 					v_boolnull = l_load(b, TypeStorageBool, v_resnullp, "");
-					v_boolvalue = l_load(b, TypeSizeT, v_resvaluep, "");
+					v_boolvalue = l_load(b, TypeDatum, v_resvaluep, "");
 
 					LLVMBuildCondBr(b,
 									LLVMBuildICmp(b, LLVMIntEQ, v_boolnull,
@@ -910,7 +910,7 @@ llvm_compile_expr(ExprState *state)
 					LLVMPositionBuilderAtEnd(b, b_boolchecktrue);
 					LLVMBuildCondBr(b,
 									LLVMBuildICmp(b, LLVMIntEQ, v_boolvalue,
-												  l_sizet_const(1), ""),
+												  l_datum_const(1), ""),
 									b_boolistrue,
 									b_boolcont);
 
@@ -938,7 +938,7 @@ llvm_compile_expr(ExprState *state)
 					/* set resnull to true */
 					LLVMBuildStore(b, l_sbool_const(1), v_resnullp);
 					/* reset resvalue */
-					LLVMBuildStore(b, l_sizet_const(0), v_resvaluep);
+					LLVMBuildStore(b, l_datum_const(0), v_resvaluep);
 
 					LLVMBuildBr(b, opblocks[opno + 1]);
 					break;
@@ -950,13 +950,13 @@ llvm_compile_expr(ExprState *state)
 					LLVMValueRef v_negbool;
 
 					/* compute !boolvalue */
-					v_boolvalue = l_load(b, TypeSizeT, v_resvaluep, "");
+					v_boolvalue = l_load(b, TypeDatum, v_resvaluep, "");
 					v_negbool = LLVMBuildZExt(b,
 											  LLVMBuildICmp(b, LLVMIntEQ,
 															v_boolvalue,
-															l_sizet_const(0),
+															l_datum_const(0),
 															""),
-											  TypeSizeT, "");
+											  TypeDatum, "");
 
 					/*
 					 * Store it back in resvalue.  We can ignore resnull here;
@@ -979,7 +979,7 @@ llvm_compile_expr(ExprState *state)
 					b_qualfail = l_bb_before_v(opblocks[opno + 1],
 											   "op.%d.qualfail", opno);
 
-					v_resvalue = l_load(b, TypeSizeT, v_resvaluep, "");
+					v_resvalue = l_load(b, TypeDatum, v_resvaluep, "");
 					v_resnull = l_load(b, TypeStorageBool, v_resnullp, "");
 
 					v_nullorfalse =
@@ -987,7 +987,7 @@ llvm_compile_expr(ExprState *state)
 									LLVMBuildICmp(b, LLVMIntEQ, v_resnull,
 												  l_sbool_const(1), ""),
 									LLVMBuildICmp(b, LLVMIntEQ, v_resvalue,
-												  l_sizet_const(0), ""),
+												  l_datum_const(0), ""),
 									"");
 
 					LLVMBuildCondBr(b,
@@ -1000,7 +1000,7 @@ llvm_compile_expr(ExprState *state)
 					/* set resnull to false */
 					LLVMBuildStore(b, l_sbool_const(0), v_resnullp);
 					/* set resvalue to false */
-					LLVMBuildStore(b, l_sizet_const(0), v_resvaluep);
+					LLVMBuildStore(b, l_datum_const(0), v_resvaluep);
 					/* and jump out */
 					LLVMBuildBr(b, opblocks[op->d.qualexpr.jumpdone]);
 					break;
@@ -1053,7 +1053,7 @@ llvm_compile_expr(ExprState *state)
 
 					/* Transfer control if current result is null or false */
 
-					v_resvalue = l_load(b, TypeSizeT, v_resvaluep, "");
+					v_resvalue = l_load(b, TypeDatum, v_resvaluep, "");
 					v_resnull = l_load(b, TypeStorageBool, v_resnullp, "");
 
 					v_nullorfalse =
@@ -1061,7 +1061,7 @@ llvm_compile_expr(ExprState *state)
 									LLVMBuildICmp(b, LLVMIntEQ, v_resnull,
 												  l_sbool_const(1), ""),
 									LLVMBuildICmp(b, LLVMIntEQ, v_resvalue,
-												  l_sizet_const(0), ""),
+												  l_datum_const(0), ""),
 									"");
 
 					LLVMBuildCondBr(b,
@@ -1080,8 +1080,8 @@ llvm_compile_expr(ExprState *state)
 						LLVMBuildSelect(b,
 										LLVMBuildICmp(b, LLVMIntEQ, v_resnull,
 													  l_sbool_const(1), ""),
-										l_sizet_const(1),
-										l_sizet_const(0),
+										l_datum_const(1),
+										l_datum_const(0),
 										"");
 					LLVMBuildStore(b, v_resvalue, v_resvaluep);
 					LLVMBuildStore(b, l_sbool_const(0), v_resnullp);
@@ -1099,8 +1099,8 @@ llvm_compile_expr(ExprState *state)
 						LLVMBuildSelect(b,
 										LLVMBuildICmp(b, LLVMIntEQ, v_resnull,
 													  l_sbool_const(1), ""),
-										l_sizet_const(0),
-										l_sizet_const(1),
+										l_datum_const(0),
+										l_datum_const(1),
 										"");
 					LLVMBuildStore(b, v_resvalue, v_resvaluep);
 					LLVMBuildStore(b, l_sbool_const(0), v_resnullp);
@@ -1150,11 +1150,11 @@ llvm_compile_expr(ExprState *state)
 					if (opcode == EEOP_BOOLTEST_IS_TRUE ||
 						opcode == EEOP_BOOLTEST_IS_FALSE)
 					{
-						LLVMBuildStore(b, l_sizet_const(0), v_resvaluep);
+						LLVMBuildStore(b, l_datum_const(0), v_resvaluep);
 					}
 					else
 					{
-						LLVMBuildStore(b, l_sizet_const(1), v_resvaluep);
+						LLVMBuildStore(b, l_datum_const(1), v_resvaluep);
 					}
 
 					LLVMBuildBr(b, opblocks[opno + 1]);
@@ -1172,14 +1172,14 @@ llvm_compile_expr(ExprState *state)
 					else
 					{
 						LLVMValueRef v_value =
-							l_load(b, TypeSizeT, v_resvaluep, "");
+							l_load(b, TypeDatum, v_resvaluep, "");
 
 						v_value = LLVMBuildZExt(b,
 												LLVMBuildICmp(b, LLVMIntEQ,
 															  v_value,
-															  l_sizet_const(0),
+															  l_datum_const(0),
 															  ""),
-												TypeSizeT, "");
+												TypeDatum, "");
 						LLVMBuildStore(b, v_value, v_resvaluep);
 					}
 					LLVMBuildBr(b, opblocks[opno + 1]);
@@ -1281,11 +1281,11 @@ llvm_compile_expr(ExprState *state)
 								v_casenull;
 
 					v_casevaluep = l_ptr_const(op->d.casetest.value,
-											   l_ptr(TypeSizeT));
+											   l_ptr(TypeDatum));
 					v_casenullp = l_ptr_const(op->d.casetest.isnull,
 											  l_ptr(TypeStorageBool));
 
-					v_casevalue = l_load(b, TypeSizeT, v_casevaluep, "");
+					v_casevalue = l_load(b, TypeDatum, v_casevaluep, "");
 					v_casenull = l_load(b, TypeStorageBool, v_casenullp, "");
 					LLVMBuildStore(b, v_casevalue, v_resvaluep);
 					LLVMBuildStore(b, v_casenull, v_resnullp);
@@ -1347,9 +1347,9 @@ llvm_compile_expr(ExprState *state)
 					LLVMPositionBuilderAtEnd(b, b_notnull);
 
 					v_valuep = l_ptr_const(op->d.make_readonly.value,
-										   l_ptr(TypeSizeT));
+										   l_ptr(TypeDatum));
 
-					v_value = l_load(b, TypeSizeT, v_valuep, "");
+					v_value = l_load(b, TypeDatum, v_valuep, "");
 
 					v_params[0] = v_value;
 					v_ret =
@@ -1417,11 +1417,11 @@ llvm_compile_expr(ExprState *state)
 									b_calloutput);
 
 					LLVMPositionBuilderAtEnd(b, b_skipoutput);
-					v_output_skip = l_sizet_const(0);
+					v_output_skip = l_datum_const(0);
 					LLVMBuildBr(b, b_input);
 
 					LLVMPositionBuilderAtEnd(b, b_calloutput);
-					v_resvalue = l_load(b, TypeSizeT, v_resvaluep, "");
+					v_resvalue = l_load(b, TypeDatum, v_resvaluep, "");
 
 					/* set arg[0] */
 					LLVMBuildStore(b,
@@ -1451,7 +1451,7 @@ llvm_compile_expr(ExprState *state)
 						incoming_values[1] = v_output;
 						incoming_blocks[1] = b_calloutput;
 
-						v_output = LLVMBuildPhi(b, TypeSizeT, "output");
+						v_output = LLVMBuildPhi(b, TypeDatum, "output");
 						LLVMAddIncoming(v_output,
 										incoming_values, incoming_blocks,
 										lengthof(incoming_blocks));
@@ -1465,7 +1465,7 @@ llvm_compile_expr(ExprState *state)
 					{
 						LLVMBuildCondBr(b,
 										LLVMBuildICmp(b, LLVMIntEQ, v_output,
-													  l_sizet_const(0), ""),
+													  l_datum_const(0), ""),
 										opblocks[opno + 1],
 										b_inputcall);
 					}
@@ -1566,9 +1566,9 @@ llvm_compile_expr(ExprState *state)
 					LLVMPositionBuilderAtEnd(b, b_bothargnull);
 					LLVMBuildStore(b, l_sbool_const(0), v_resnullp);
 					if (opcode == EEOP_NOT_DISTINCT)
-						LLVMBuildStore(b, l_sizet_const(1), v_resvaluep);
+						LLVMBuildStore(b, l_datum_const(1), v_resvaluep);
 					else
-						LLVMBuildStore(b, l_sizet_const(0), v_resvaluep);
+						LLVMBuildStore(b, l_datum_const(0), v_resvaluep);
 
 					LLVMBuildBr(b, opblocks[opno + 1]);
 
@@ -1576,9 +1576,9 @@ llvm_compile_expr(ExprState *state)
 					LLVMPositionBuilderAtEnd(b, b_anyargnull);
 					LLVMBuildStore(b, l_sbool_const(0), v_resnullp);
 					if (opcode == EEOP_NOT_DISTINCT)
-						LLVMBuildStore(b, l_sizet_const(0), v_resvaluep);
+						LLVMBuildStore(b, l_datum_const(0), v_resvaluep);
 					else
-						LLVMBuildStore(b, l_sizet_const(1), v_resvaluep);
+						LLVMBuildStore(b, l_datum_const(1), v_resvaluep);
 					LLVMBuildBr(b, opblocks[opno + 1]);
 
 					/* neither argument is null: compare */
@@ -1594,8 +1594,8 @@ llvm_compile_expr(ExprState *state)
 							LLVMBuildZExt(b,
 										  LLVMBuildICmp(b, LLVMIntEQ,
 														v_result,
-														l_sizet_const(0), ""),
-										  TypeSizeT, "");
+														l_datum_const(0), ""),
+										  TypeDatum, "");
 					}
 
 					LLVMBuildStore(b, v_fcinfo_isnull, v_resnullp);
@@ -1693,7 +1693,7 @@ llvm_compile_expr(ExprState *state)
 															 ""),
 											   LLVMBuildICmp(b, LLVMIntEQ,
 															 v_retval,
-															 l_sizet_const(1),
+															 l_datum_const(1),
 															 ""),
 											   "");
 					LLVMBuildCondBr(b, v_argsequal, b_argsequal, b_hasnull);
@@ -1701,7 +1701,7 @@ llvm_compile_expr(ExprState *state)
 					/* build block setting result to NULL, if args are equal */
 					LLVMPositionBuilderAtEnd(b, b_argsequal);
 					LLVMBuildStore(b, l_sbool_const(1), v_resnullp);
-					LLVMBuildStore(b, l_sizet_const(0), v_resvaluep);
+					LLVMBuildStore(b, l_datum_const(0), v_resvaluep);
 
 					LLVMBuildBr(b, opblocks[opno + 1]);
 					break;
@@ -1757,7 +1757,7 @@ llvm_compile_expr(ExprState *state)
 
 					LLVMPositionBuilderAtEnd(b, b_isnull);
 
-					LLVMBuildStore(b, l_sizet_const(0), v_resvaluep);
+					LLVMBuildStore(b, l_datum_const(0), v_resvaluep);
 					LLVMBuildStore(b, l_sbool_const(1), v_resnullp);
 
 					LLVMBuildBr(b, opblocks[op->d.returningexpr.jumpdone]);
@@ -1863,7 +1863,7 @@ llvm_compile_expr(ExprState *state)
 									LLVMBuildICmp(b,
 												  LLVMIntEQ,
 												  v_retval,
-												  l_sizet_const(0), ""),
+												  l_datum_const(0), ""),
 									opblocks[opno + 1],
 									opblocks[op->d.rowcompare_step.jumpdone]);
 
@@ -1893,7 +1893,7 @@ llvm_compile_expr(ExprState *state)
 					 */
 					v_cmpresult =
 						LLVMBuildTrunc(b,
-									   l_load(b, TypeSizeT, v_resvaluep, ""),
+									   l_load(b, TypeDatum, v_resvaluep, ""),
 									   LLVMInt32TypeInContext(lc), "");
 
 					switch (cmptype)
@@ -1922,7 +1922,7 @@ llvm_compile_expr(ExprState *state)
 											 v_cmpresult,
 											 l_int32_const(lc, 0),
 											 "");
-					v_result = LLVMBuildZExt(b, v_result, TypeSizeT, "");
+					v_result = LLVMBuildZExt(b, v_result, TypeDatum, "");
 
 					LLVMBuildStore(b, l_sbool_const(0), v_resnullp);
 					LLVMBuildStore(b, v_result, v_resvaluep);
@@ -1963,11 +1963,11 @@ llvm_compile_expr(ExprState *state)
 								v_casenull;
 
 					v_casevaluep = l_ptr_const(op->d.casetest.value,
-											   l_ptr(TypeSizeT));
+											   l_ptr(TypeDatum));
 					v_casenullp = l_ptr_const(op->d.casetest.isnull,
 											  l_ptr(TypeStorageBool));
 
-					v_casevalue = l_load(b, TypeSizeT, v_casevaluep, "");
+					v_casevalue = l_load(b, TypeDatum, v_casevaluep, "");
 					v_casenull = l_load(b, TypeStorageBool, v_casenullp, "");
 					LLVMBuildStore(b, v_casevalue, v_resvaluep);
 					LLVMBuildStore(b, v_casenull, v_resnullp);
@@ -2016,7 +2016,7 @@ llvm_compile_expr(ExprState *state)
 				{
 					LLVMValueRef v_initvalue;
 
-					v_initvalue = l_sizet_const(op->d.hashdatum_initvalue.init_value);
+					v_initvalue = l_datum_const(op->d.hashdatum_initvalue.init_value);
 
 					LLVMBuildStore(b, v_initvalue, v_resvaluep);
 					LLVMBuildStore(b, l_sbool_const(0), v_resnullp);
@@ -2055,24 +2055,24 @@ llvm_compile_expr(ExprState *state)
 						LLVMValueRef tmp;
 
 						tmp = l_ptr_const(&op->d.hashdatum.iresult->value,
-										  l_ptr(TypeSizeT));
+										  l_ptr(TypeDatum));
 
 						/*
 						 * Fetch the previously hashed value from where the
 						 * previous hash operation stored it.
 						 */
-						v_prevhash = l_load(b, TypeSizeT, tmp, "prevhash");
+						v_prevhash = l_load(b, TypeDatum, tmp, "prevhash");
 
 						/*
 						 * Rotate bits left by 1 bit.  Be careful not to
-						 * overflow uint32 when working with size_t.
+						 * overflow uint32 when working with Datum.
 						 */
-						v_tmp1 = LLVMBuildShl(b, v_prevhash, l_sizet_const(1),
+						v_tmp1 = LLVMBuildShl(b, v_prevhash, l_datum_const(1),
 											  "");
 						v_tmp1 = LLVMBuildAnd(b, v_tmp1,
-											  l_sizet_const(0xffffffff), "");
+											  l_datum_const(0xffffffff), "");
 						v_tmp2 = LLVMBuildLShr(b, v_prevhash,
-											   l_sizet_const(31), "");
+											   l_datum_const(31), "");
 						v_prevhash = LLVMBuildOr(b, v_tmp1, v_tmp2,
 												 "rotatedhash");
 					}
@@ -2116,7 +2116,7 @@ llvm_compile_expr(ExprState *state)
 						 * directly, then goto jumpdone.
 						 */
 						LLVMBuildStore(b, l_sbool_const(1), v_tmpisnullp);
-						LLVMBuildStore(b, l_sizet_const(0), v_tmpvaluep);
+						LLVMBuildStore(b, l_datum_const(0), v_tmpvaluep);
 						LLVMBuildBr(b, opblocks[op->d.hashdatum.jumpdone]);
 					}
 					else
@@ -2148,7 +2148,7 @@ llvm_compile_expr(ExprState *state)
 							 * Store a zero Datum when the Datum to hash is
 							 * NULL
 							 */
-							LLVMBuildStore(b, l_sizet_const(0), v_resvaluep);
+							LLVMBuildStore(b, l_datum_const(0), v_resvaluep);
 						}
 
 						LLVMBuildBr(b, opblocks[opno + 1]);
@@ -2181,24 +2181,24 @@ llvm_compile_expr(ExprState *state)
 						LLVMValueRef tmp;
 
 						tmp = l_ptr_const(&op->d.hashdatum.iresult->value,
-										  l_ptr(TypeSizeT));
+										  l_ptr(TypeDatum));
 
 						/*
 						 * Fetch the previously hashed value from where the
 						 * previous hash operation stored it.
 						 */
-						v_prevhash = l_load(b, TypeSizeT, tmp, "prevhash");
+						v_prevhash = l_load(b, TypeDatum, tmp, "prevhash");
 
 						/*
 						 * Rotate bits left by 1 bit.  Be careful not to
-						 * overflow uint32 when working with size_t.
+						 * overflow uint32 when working with Datum.
 						 */
-						v_tmp1 = LLVMBuildShl(b, v_prevhash, l_sizet_const(1),
+						v_tmp1 = LLVMBuildShl(b, v_prevhash, l_datum_const(1),
 											  "");
 						v_tmp1 = LLVMBuildAnd(b, v_tmp1,
-											  l_sizet_const(0xffffffff), "");
+											  l_datum_const(0xffffffff), "");
 						v_tmp2 = LLVMBuildLShr(b, v_prevhash,
-											   l_sizet_const(31), "");
+											   l_datum_const(31), "");
 						v_prevhash = LLVMBuildOr(b, v_tmp1, v_tmp2,
 												 "rotatedhash");
 					}
@@ -2376,7 +2376,7 @@ llvm_compile_expr(ExprState *state)
 					v_aggno = l_int32_const(lc, op->d.aggref.aggno);
 
 					/* load agg value / null */
-					value = l_load_gep1(b, TypeSizeT, v_aggvalues, v_aggno, "aggvalue");
+					value = l_load_gep1(b, TypeDatum, v_aggvalues, v_aggno, "aggvalue");
 					isnull = l_load_gep1(b, TypeStorageBool, v_aggnulls, v_aggno, "aggnull");
 
 					/* and store result */
@@ -2411,7 +2411,7 @@ llvm_compile_expr(ExprState *state)
 					v_wfuncno = l_load(b, LLVMInt32TypeInContext(lc), v_wfuncnop, "v_wfuncno");
 
 					/* load window func value / null */
-					value = l_load_gep1(b, TypeSizeT, v_aggvalues, v_wfuncno,
+					value = l_load_gep1(b, TypeDatum, v_aggvalues, v_wfuncno,
 										"windowvalue");
 					isnull = l_load_gep1(b, TypeStorageBool, v_aggnulls, v_wfuncno,
 										 "windownull");
@@ -2508,7 +2508,7 @@ llvm_compile_expr(ExprState *state)
 					v_nullsp = l_ptr_const(nulls, l_ptr(TypeStorageBool));
 
 					/* create blocks for checking args */
-					b_checknulls = palloc(sizeof(LLVMBasicBlockRef) * nargs);
+					b_checknulls = palloc_array(LLVMBasicBlockRef, nargs);
 					for (int argno = 0; argno < nargs; argno++)
 					{
 						b_checknulls[argno] =
@@ -2588,8 +2588,8 @@ llvm_compile_expr(ExprState *state)
 
 					LLVMBuildCondBr(b,
 									LLVMBuildICmp(b, LLVMIntEQ,
-												  LLVMBuildPtrToInt(b, v_pergroup_allaggs, TypeSizeT, ""),
-												  l_sizet_const(0), ""),
+												  LLVMBuildPtrToInt(b, v_pergroup_allaggs, TypeDatum, ""),
+												  l_datum_const(0), ""),
 									opblocks[jumpnull],
 									opblocks[opno + 1]);
 					break;
@@ -2791,7 +2791,7 @@ llvm_compile_expr(ExprState *state)
 									 "transnullp");
 					LLVMBuildStore(b,
 								   l_load(b,
-										  TypeSizeT,
+										  TypeDatum,
 										  v_transvaluep,
 										  "transvalue"),
 								   l_funcvaluep(b, v_fcinfo, 0));
@@ -2829,7 +2829,7 @@ llvm_compile_expr(ExprState *state)
 						b_nocall = l_bb_before_v(opblocks[opno + 1],
 												 "op.%d.transnocall", opno);
 
-						v_transvalue = l_load(b, TypeSizeT, v_transvaluep, "");
+						v_transvalue = l_load(b, TypeDatum, v_transvaluep, "");
 						v_transnull = l_load(b, TypeStorageBool, v_transnullp, "");
 
 						/*
@@ -2959,7 +2959,7 @@ llvm_compile_expr(ExprState *state)
 	 */
 	{
 
-		CompiledExprState *cstate = palloc0(sizeof(CompiledExprState));
+		CompiledExprState *cstate = palloc0_object(CompiledExprState);
 
 		cstate->context = context;
 		cstate->funcname = funcname;
@@ -3072,7 +3072,7 @@ build_EvalXFuncInt(LLVMBuilderRef b, LLVMModuleRef mod, const char *funcname,
 		elog(ERROR, "parameter mismatch: %s expects %d passed %d",
 			 funcname, LLVMCountParams(v_fn), nargs + 2);
 
-	params = palloc(sizeof(LLVMValueRef) * (2 + nargs));
+	params = palloc_array(LLVMValueRef, (2 + nargs));
 
 	params[argno++] = v_state;
 	params[argno++] = l_ptr_const(op, l_ptr(StructExprEvalStep));

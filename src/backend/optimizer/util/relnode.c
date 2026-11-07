@@ -3,7 +3,7 @@
  * relnode.c
  *	  Relation-node lookup/construction routines
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -16,6 +16,8 @@
 
 #include <limits.h>
 
+#include "access/nbtree.h"
+#include "catalog/pg_constraint.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/appendinfo.h"
@@ -27,12 +29,16 @@
 #include "optimizer/paths.h"
 #include "optimizer/placeholder.h"
 #include "optimizer/plancat.h"
+#include "optimizer/planner.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/tlist.h"
+#include "parser/parse_oper.h"
 #include "parser/parse_relation.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
+#include "utils/selfuncs.h"
+#include "utils/typcache.h"
 
 
 typedef struct JoinHashEntry
@@ -40,6 +46,12 @@ typedef struct JoinHashEntry
 	Relids		join_relids;	/* hash key --- MUST BE FIRST */
 	RelOptInfo *join_rel;
 } JoinHashEntry;
+
+/* Hook for plugins to get control in build_simple_rel() */
+build_simple_rel_hook_type build_simple_rel_hook = NULL;
+
+/* Hook for plugins to get control during joinrel setup */
+joinrel_setup_hook_type joinrel_setup_hook = NULL;
 
 static void build_joinrel_tlist(PlannerInfo *root, RelOptInfo *joinrel,
 								RelOptInfo *input_rel,
@@ -83,6 +95,14 @@ static void build_child_join_reltarget(PlannerInfo *root,
 									   RelOptInfo *childrel,
 									   int nappinfos,
 									   AppendRelInfo **appinfos);
+static bool eager_aggregation_possible_for_relation(PlannerInfo *root,
+													RelOptInfo *rel);
+static bool init_grouping_targets(PlannerInfo *root, RelOptInfo *rel,
+								  PathTarget *target, PathTarget *agg_input,
+								  List **group_clauses, List **group_exprs);
+static bool is_var_in_aggref_only(PlannerInfo *root, Var *var);
+static bool is_var_needed_by_join(PlannerInfo *root, Var *var, RelOptInfo *rel);
+static Index get_expression_sortgroupref(PlannerInfo *root, Expr *expr);
 
 
 /*
@@ -106,11 +126,11 @@ setup_simple_rel_arrays(PlannerInfo *root)
 	 * exist yet.  It'll be filled by later calls to build_simple_rel().
 	 */
 	root->simple_rel_array = (RelOptInfo **)
-		palloc0(size * sizeof(RelOptInfo *));
+		palloc0_array(RelOptInfo *, size);
 
 	/* simple_rte_array is an array equivalent of the rtable list */
 	root->simple_rte_array = (RangeTblEntry **)
-		palloc0(size * sizeof(RangeTblEntry *));
+		palloc0_array(RangeTblEntry *, size);
 	rti = 1;
 	foreach(lc, root->parse->rtable)
 	{
@@ -127,7 +147,7 @@ setup_simple_rel_arrays(PlannerInfo *root)
 	}
 
 	root->append_rel_array = (AppendRelInfo **)
-		palloc0(size * sizeof(AppendRelInfo *));
+		palloc0_array(AppendRelInfo *, size);
 
 	/*
 	 * append_rel_array is filled with any already-existing AppendRelInfos,
@@ -211,13 +231,13 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 	rel->consider_startup = (root->tuple_fraction > 0);
 	rel->consider_param_startup = false;	/* might get changed later */
 	rel->consider_parallel = false; /* might get changed later */
+	rel->pgs_mask = root->glob->default_pgs_mask;
 	rel->reltarget = create_empty_pathtarget();
 	rel->pathlist = NIL;
 	rel->ppilist = NIL;
 	rel->partial_pathlist = NIL;
 	rel->cheapest_startup_path = NULL;
 	rel->cheapest_total_path = NULL;
-	rel->cheapest_unique_path = NULL;
 	rel->cheapest_parameterized_paths = NIL;
 	rel->relid = relid;
 	rel->rtekind = rte->rtekind;
@@ -269,6 +289,9 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 	rel->fdw_private = NULL;
 	rel->unique_for_rels = NIL;
 	rel->non_unique_for_rels = NIL;
+	rel->unique_rel = NULL;
+	rel->unique_pathkeys = NIL;
+	rel->unique_groupclause = NIL;
 	rel->baserestrictinfo = NIL;
 	rel->baserestrictcost.startup = 0;
 	rel->baserestrictcost.per_tuple = 0;
@@ -276,6 +299,8 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 	rel->joininfo = NIL;
 	rel->has_eclass_joins = false;
 	rel->consider_partitionwise_join = false;	/* might get changed later */
+	rel->agg_info = NULL;
+	rel->grouped_rel = NULL;
 	rel->part_scheme = NULL;
 	rel->nparts = -1;
 	rel->boundinfo = NULL;
@@ -344,7 +369,6 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 		case RTE_TABLEFUNC:
 		case RTE_VALUES:
 		case RTE_CTE:
-		case RTE_DOLT:
 		case RTE_NAMEDTUPLESTORE:
 
 			/*
@@ -356,9 +380,9 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 			rel->min_attr = 0;
 			rel->max_attr = list_length(rte->eref->colnames);
 			rel->attr_needed = (Relids *)
-				palloc0((rel->max_attr - rel->min_attr + 1) * sizeof(Relids));
+				palloc0_array(Relids, rel->max_attr - rel->min_attr + 1);
 			rel->attr_widths = (int32 *)
-				palloc0((rel->max_attr - rel->min_attr + 1) * sizeof(int32));
+				palloc0_array(int32, rel->max_attr - rel->min_attr + 1);
 			break;
 		case RTE_RESULT:
 			/* RTE_RESULT has no columns, nor could it have whole-row Var */
@@ -374,20 +398,24 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 	}
 
 	/*
-	 * We must apply the partially filled in RelOptInfo before calling
-	 * apply_child_basequals due to some transformations within that function
-	 * which require the RelOptInfo to be available in the simple_rel_array.
+	 * Allow a plugin to editorialize on the new RelOptInfo. This could
+	 * involve editorializing on the information which get_relation_info
+	 * obtained from the catalogs, such as altering the assumed relation size,
+	 * removing an index, or adding a hypothetical index to the indexlist.
+	 *
+	 * An extension can also modify rel->pgs_mask here to control path
+	 * generation.
 	 */
-	root->simple_rel_array[relid] = rel;
+	if (build_simple_rel_hook)
+		(*build_simple_rel_hook) (root, rel, rte);
 
 	/*
 	 * Apply the parent's quals to the child, with appropriate substitution of
-	 * variables.  If the resulting clause is constant-FALSE or NULL after
-	 * applying transformations, apply_child_basequals returns false to
-	 * indicate that scanning this relation won't yield any rows.  In this
-	 * case, we mark the child as dummy right away.  (We must do this
-	 * immediately so that pruning works correctly when recursing in
-	 * expand_partitioned_rtentry.)
+	 * variables.  If any resulting clause is reduced to constant FALSE or
+	 * NULL, apply_child_basequals returns false to indicate that scanning
+	 * this relation won't yield any rows.  In this case, we mark the child as
+	 * dummy right away.  (We must do this immediately so that pruning works
+	 * correctly when recursing in expand_partitioned_rtentry.)
 	 */
 	if (parent)
 	{
@@ -397,14 +425,122 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 		if (!apply_child_basequals(root, parent, rel, rte, appinfo))
 		{
 			/*
-			 * Restriction clause reduced to constant FALSE or NULL.  Mark as
-			 * dummy so we won't scan this relation.
+			 * A restriction clause reduced to constant FALSE or NULL after
+			 * substitution.  Mark the child as dummy so that it need not be
+			 * scanned.
 			 */
 			mark_dummy_rel(rel);
 		}
 	}
 
+	/* Save the finished struct in the query's simple_rel_array */
+	root->simple_rel_array[relid] = rel;
+
 	return rel;
+}
+
+/*
+ * build_simple_grouped_rel
+ *	  Construct a new RelOptInfo representing a grouped version of the input
+ *	  simple relation.
+ */
+RelOptInfo *
+build_simple_grouped_rel(PlannerInfo *root, RelOptInfo *rel)
+{
+	RelOptInfo *grouped_rel;
+	RelAggInfo *agg_info;
+
+	/*
+	 * We should have available aggregate expressions and grouping
+	 * expressions, otherwise we cannot reach here.
+	 */
+	Assert(root->agg_clause_list != NIL);
+	Assert(root->group_expr_list != NIL);
+
+	/* nothing to do for dummy rel */
+	if (IS_DUMMY_REL(rel))
+		return NULL;
+
+	/*
+	 * Prepare the information needed to create grouped paths for this simple
+	 * relation.
+	 */
+	agg_info = create_rel_agg_info(root, rel, true);
+	if (agg_info == NULL)
+		return NULL;
+
+	/*
+	 * If grouped paths for the given simple relation are not considered
+	 * useful, skip building the grouped relation.
+	 */
+	if (!agg_info->agg_useful)
+		return NULL;
+
+	/* Track the set of relids at which partial aggregation is applied */
+	agg_info->apply_agg_at = bms_copy(rel->relids);
+
+	/* build the grouped relation */
+	grouped_rel = build_grouped_rel(root, rel);
+	grouped_rel->reltarget = agg_info->target;
+	grouped_rel->rows = agg_info->grouped_rows;
+	grouped_rel->agg_info = agg_info;
+
+	rel->grouped_rel = grouped_rel;
+
+	return grouped_rel;
+}
+
+/*
+ * build_grouped_rel
+ *	  Build a grouped relation by flat copying the input relation and resetting
+ *	  the necessary fields.
+ */
+RelOptInfo *
+build_grouped_rel(PlannerInfo *root, RelOptInfo *rel)
+{
+	RelOptInfo *grouped_rel;
+
+	grouped_rel = makeNode(RelOptInfo);
+	memcpy(grouped_rel, rel, sizeof(RelOptInfo));
+
+	/*
+	 * clear path info
+	 */
+	grouped_rel->pathlist = NIL;
+	grouped_rel->ppilist = NIL;
+	grouped_rel->partial_pathlist = NIL;
+	grouped_rel->cheapest_startup_path = NULL;
+	grouped_rel->cheapest_total_path = NULL;
+	grouped_rel->cheapest_parameterized_paths = NIL;
+
+	/*
+	 * clear partition info
+	 */
+	grouped_rel->part_scheme = NULL;
+	grouped_rel->nparts = -1;
+	grouped_rel->boundinfo = NULL;
+	grouped_rel->partbounds_merged = false;
+	grouped_rel->partition_qual = NIL;
+	grouped_rel->part_rels = NULL;
+	grouped_rel->live_parts = NULL;
+	grouped_rel->all_partrels = NULL;
+	grouped_rel->partexprs = NULL;
+	grouped_rel->nullable_partexprs = NULL;
+	grouped_rel->consider_partitionwise_join = false;
+
+	/*
+	 * clear FDW info; FDWs don't know how to handle grouped relations
+	 */
+	grouped_rel->serverid = InvalidOid;
+	grouped_rel->fdwroutine = NULL;
+	grouped_rel->fdw_private = NULL;
+
+	/*
+	 * clear size estimates
+	 */
+	grouped_rel->rows = 0;
+
+	return grouped_rel;
 }
 
 /*
@@ -708,13 +844,13 @@ build_join_rel(PlannerInfo *root,
 	joinrel->consider_startup = (root->tuple_fraction > 0);
 	joinrel->consider_param_startup = false;
 	joinrel->consider_parallel = false;
+	joinrel->pgs_mask = root->glob->default_pgs_mask;
 	joinrel->reltarget = create_empty_pathtarget();
 	joinrel->pathlist = NIL;
 	joinrel->ppilist = NIL;
 	joinrel->partial_pathlist = NIL;
 	joinrel->cheapest_startup_path = NULL;
 	joinrel->cheapest_total_path = NULL;
-	joinrel->cheapest_unique_path = NULL;
 	joinrel->cheapest_parameterized_paths = NIL;
 	/* init direct_lateral_relids from children; we'll finish it up below */
 	joinrel->direct_lateral_relids =
@@ -749,6 +885,9 @@ build_join_rel(PlannerInfo *root,
 	joinrel->fdw_private = NULL;
 	joinrel->unique_for_rels = NIL;
 	joinrel->non_unique_for_rels = NIL;
+	joinrel->unique_rel = NULL;
+	joinrel->unique_pathkeys = NIL;
+	joinrel->unique_groupclause = NIL;
 	joinrel->baserestrictinfo = NIL;
 	joinrel->baserestrictcost.startup = 0;
 	joinrel->baserestrictcost.per_tuple = 0;
@@ -756,6 +895,8 @@ build_join_rel(PlannerInfo *root,
 	joinrel->joininfo = NIL;
 	joinrel->has_eclass_joins = false;
 	joinrel->consider_partitionwise_join = false;	/* might get changed later */
+	joinrel->agg_info = NULL;
+	joinrel->grouped_rel = NULL;
 	joinrel->parent = NULL;
 	joinrel->top_parent = NULL;
 	joinrel->top_parent_relids = NULL;
@@ -816,10 +957,6 @@ build_join_rel(PlannerInfo *root,
 	 */
 	joinrel->has_eclass_joins = has_relevant_eclass_joinclause(root, joinrel);
 
-	/* Store the partition information. */
-	build_joinrel_partition_info(root, joinrel, outer_rel, inner_rel, sjinfo,
-								 restrictlist);
-
 	/*
 	 * Set estimates of the joinrel's size.
 	 */
@@ -844,6 +981,19 @@ build_join_rel(PlannerInfo *root,
 		is_parallel_safe(root, (Node *) restrictlist) &&
 		is_parallel_safe(root, (Node *) joinrel->reltarget->exprs))
 		joinrel->consider_parallel = true;
+
+	/*
+	 * Allow a plugin to editorialize on the new joinrel's properties. Actions
+	 * might include altering the size estimate, clearing consider_parallel,
+	 * or adjusting pgs_mask.
+	 */
+	if (joinrel_setup_hook)
+		(*joinrel_setup_hook) (root, joinrel, outer_rel, inner_rel, sjinfo,
+							   restrictlist);
+
+	/* Store the partition information. */
+	build_joinrel_partition_info(root, joinrel, outer_rel, inner_rel, sjinfo,
+								 restrictlist);
 
 	/* Add the joinrel to the PlannerInfo. */
 	add_join_rel(root, joinrel);
@@ -901,13 +1051,13 @@ build_child_join_rel(PlannerInfo *root, RelOptInfo *outer_rel,
 	joinrel->consider_startup = (root->tuple_fraction > 0);
 	joinrel->consider_param_startup = false;
 	joinrel->consider_parallel = false;
+	joinrel->pgs_mask = root->glob->default_pgs_mask;
 	joinrel->reltarget = create_empty_pathtarget();
 	joinrel->pathlist = NIL;
 	joinrel->ppilist = NIL;
 	joinrel->partial_pathlist = NIL;
 	joinrel->cheapest_startup_path = NULL;
 	joinrel->cheapest_total_path = NULL;
-	joinrel->cheapest_unique_path = NULL;
 	joinrel->cheapest_parameterized_paths = NIL;
 	joinrel->direct_lateral_relids = NULL;
 	joinrel->lateral_relids = NULL;
@@ -934,12 +1084,17 @@ build_child_join_rel(PlannerInfo *root, RelOptInfo *outer_rel,
 	joinrel->useridiscurrent = false;
 	joinrel->fdwroutine = NULL;
 	joinrel->fdw_private = NULL;
+	joinrel->unique_rel = NULL;
+	joinrel->unique_pathkeys = NIL;
+	joinrel->unique_groupclause = NIL;
 	joinrel->baserestrictinfo = NIL;
 	joinrel->baserestrictcost.startup = 0;
 	joinrel->baserestrictcost.per_tuple = 0;
 	joinrel->joininfo = NIL;
 	joinrel->has_eclass_joins = false;
 	joinrel->consider_partitionwise_join = false;	/* might get changed later */
+	joinrel->agg_info = NULL;
+	joinrel->grouped_rel = NULL;
 	joinrel->parent = parent_joinrel;
 	joinrel->top_parent = parent_joinrel->top_parent ? parent_joinrel->top_parent : parent_joinrel;
 	joinrel->top_parent_relids = joinrel->top_parent->relids;
@@ -980,16 +1135,26 @@ build_child_join_rel(PlannerInfo *root, RelOptInfo *outer_rel,
 	 */
 	joinrel->has_eclass_joins = parent_joinrel->has_eclass_joins;
 
-	/* Is the join between partitions itself partitioned? */
-	build_joinrel_partition_info(root, joinrel, outer_rel, inner_rel, sjinfo,
-								 restrictlist);
-
 	/* Child joinrel is parallel safe if parent is parallel safe. */
 	joinrel->consider_parallel = parent_joinrel->consider_parallel;
 
 	/* Set estimates of the child-joinrel's size. */
 	set_joinrel_size_estimates(root, joinrel, outer_rel, inner_rel,
 							   sjinfo, restrictlist);
+
+	/*
+	 * Allow a plugin to editorialize on the new joinrel's properties. Actions
+	 * might include altering the size estimate, clearing consider_parallel,
+	 * or adjusting pgs_mask. (However, note that clearing consider_parallel
+	 * would be better done in the parent joinrel rather than here.)
+	 */
+	if (joinrel_setup_hook)
+		(*joinrel_setup_hook) (root, joinrel, outer_rel, inner_rel, sjinfo,
+							   restrictlist);
+
+	/* Is the join between partitions itself partitioned? */
+	build_joinrel_partition_info(root, joinrel, outer_rel, inner_rel, sjinfo,
+								 restrictlist);
 
 	/* We build the join only once. */
 	Assert(!find_join_rel(root, joinrel->relids));
@@ -1480,6 +1645,7 @@ fetch_upper_rel(PlannerInfo *root, UpperRelationKind kind, Relids relids)
 	upperrel = makeNode(RelOptInfo);
 	upperrel->reloptkind = RELOPT_UPPER_REL;
 	upperrel->relids = bms_copy(relids);
+	upperrel->pgs_mask = root->glob->default_pgs_mask;
 
 	/* cheap startup cost is interesting iff not all tuples to be retrieved */
 	upperrel->consider_startup = (root->tuple_fraction > 0);
@@ -1489,7 +1655,6 @@ fetch_upper_rel(PlannerInfo *root, UpperRelationKind kind, Relids relids)
 	upperrel->pathlist = NIL;
 	upperrel->cheapest_startup_path = NULL;
 	upperrel->cheapest_total_path = NULL;
-	upperrel->cheapest_unique_path = NULL;
 	upperrel->cheapest_parameterized_paths = NIL;
 
 	root->upper_rels[kind] = lappend(root->upper_rels[kind], upperrel);
@@ -1573,27 +1738,60 @@ get_baserel_parampathinfo(PlannerInfo *root, RelOptInfo *baserel,
 	 */
 	joinrelids = bms_union(baserel->relids, required_outer);
 	pclauses = NIL;
+	pserials = NULL;
 	foreach(lc, baserel->joininfo)
 	{
 		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
 
-		if (join_clause_is_movable_into(rinfo,
-										baserel->relids,
-										joinrelids))
-			pclauses = lappend(pclauses, rinfo);
+		if (!join_clause_is_movable_into(rinfo,
+										 baserel->relids,
+										 joinrelids))
+			continue;
+
+		/*
+		 * If it's a clone clause, drop variants that are incompatible with an
+		 * outer join already computed below the point of evaluation; some
+		 * other variant is the right one to apply.
+		 *
+		 * Multiple variants can survive that test under one parameterization,
+		 * but only when they are parse-tree identical, which happens when a
+		 * commuting outer join nulls no Var actually referenced by the
+		 * clause.  (Otherwise, a variant's extra nullingrels put that outer
+		 * join into its clause_relids, so being movable here means the join
+		 * is part of the parameterization, and the lesser variant is rejected
+		 * above.)  Identical variants still differ in required_relids and
+		 * incompatible_relids, and join-level clause selection needs all of
+		 * them: each is the sole legal choice in some join order.  Here,
+		 * though, that distinction is not meaningful, since the same
+		 * ParamPathInfo serves every join order that can use the path, and an
+		 * identical variant is correct in any of them.  So enforce just the
+		 * first survivor, identifying later ones by matching rinfo_serial;
+		 * enforcing them too would waste execution effort and apply the
+		 * clause's selectivity multiple times.
+		 */
+		if (rinfo->has_clone || rinfo->is_clone)
+		{
+			if (bms_overlap(rinfo->incompatible_relids, joinrelids))
+				continue;
+			if (bms_is_member(rinfo->rinfo_serial, pserials))
+				continue;
+		}
+
+		pclauses = lappend(pclauses, rinfo);
+		pserials = bms_add_member(pserials, rinfo->rinfo_serial);
 	}
 
 	/*
-	 * Add in joinclauses generated by EquivalenceClasses, too.  (These
-	 * necessarily satisfy join_clause_is_movable_into; but in assert-enabled
-	 * builds, let's verify that.)
+	 * Add in joinclauses generated by EquivalenceClasses, too, folding their
+	 * serial numbers into pserials.  (These clauses necessarily satisfy
+	 * join_clause_is_movable_into; but in assert-enabled builds, let's verify
+	 * that.)
 	 */
 	eqclauses = generate_join_implied_equalities(root,
 												 joinrelids,
 												 required_outer,
 												 baserel,
 												 NULL);
-#ifdef USE_ASSERT_CHECKING
 	foreach(lc, eqclauses)
 	{
 		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
@@ -1601,18 +1799,9 @@ get_baserel_parampathinfo(PlannerInfo *root, RelOptInfo *baserel,
 		Assert(join_clause_is_movable_into(rinfo,
 										   baserel->relids,
 										   joinrelids));
-	}
-#endif
-	pclauses = list_concat(pclauses, eqclauses);
-
-	/* Compute set of serial numbers of the enforced clauses */
-	pserials = NULL;
-	foreach(lc, pclauses)
-	{
-		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
-
 		pserials = bms_add_member(pserials, rinfo->rinfo_serial);
 	}
+	pclauses = list_concat(pclauses, eqclauses);
 
 	/* Estimate the number of rows returned by the parameterized scan */
 	rows = get_parameterized_baserel_size(root, baserel, pclauses);
@@ -1669,6 +1858,7 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 	Relids		outer_and_req;
 	Relids		inner_and_req;
 	List	   *pclauses;
+	Bitmapset  *pserials;
 	List	   *eclauses;
 	List	   *dropped_ecs;
 	double		rows;
@@ -1705,20 +1895,33 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 		inner_and_req = NULL;	/* inner path does not accept parameters */
 
 	pclauses = NIL;
+	pserials = NULL;
 	foreach(lc, joinrel->joininfo)
 	{
 		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
 
-		if (join_clause_is_movable_into(rinfo,
-										joinrel->relids,
-										join_and_req) &&
-			!join_clause_is_movable_into(rinfo,
-										 outer_path->parent->relids,
-										 outer_and_req) &&
-			!join_clause_is_movable_into(rinfo,
-										 inner_path->parent->relids,
-										 inner_and_req))
-			pclauses = lappend(pclauses, rinfo);
+		if (!join_clause_is_movable_into(rinfo,
+										 joinrel->relids,
+										 join_and_req) ||
+			join_clause_is_movable_into(rinfo,
+										outer_path->parent->relids,
+										outer_and_req) ||
+			join_clause_is_movable_into(rinfo,
+										inner_path->parent->relids,
+										inner_and_req))
+			continue;
+
+		/* As above, apply only one variant of a clone clause */
+		if (rinfo->has_clone || rinfo->is_clone)
+		{
+			if (bms_overlap(rinfo->incompatible_relids, join_and_req))
+				continue;
+			if (bms_is_member(rinfo->rinfo_serial, pserials))
+				continue;
+		}
+
+		pclauses = lappend(pclauses, rinfo);
+		pserials = bms_add_member(pserials, rinfo->rinfo_serial);
 	}
 
 	/* Consider joinclauses generated by EquivalenceClasses, too */
@@ -1777,6 +1980,12 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 	 * has nothing that needs to be enforced here, while if the clause can be
 	 * moved into the LHS then it should have been enforced within that path.)
 	 *
+	 * In cases where an EC needs to constrain EC members that are newly
+	 * computable at this join, it can emit clauses that it already returned
+	 * above and we accepted into pclauses.  Hence, do a final list-membership
+	 * check before accepting more clauses.  (Pointer comparison should be
+	 * enough to detect duplicates, since ECs cache derived clauses.)
+	 *
 	 * Note that we don't need similar processing for ECs whose clause was
 	 * considered to be movable into the LHS, because the LHS can't refer to
 	 * the RHS so there is no comparable ambiguity about what it might
@@ -1801,10 +2010,13 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 			Assert(join_clause_is_movable_into(rinfo,
 											   outer_path->parent->relids,
 											   real_outer_and_req));
-			if (!join_clause_is_movable_into(rinfo,
-											 outer_path->parent->relids,
-											 outer_and_req))
-				pclauses = lappend(pclauses, rinfo);
+			if (join_clause_is_movable_into(rinfo,
+											outer_path->parent->relids,
+											outer_and_req))
+				continue;		/* drop if movable into LHS */
+			if (list_member_ptr(pclauses, rinfo))
+				continue;		/* drop if already accepted */
+			pclauses = lappend(pclauses, rinfo);
 		}
 	}
 
@@ -1883,6 +2095,27 @@ get_appendrel_parampathinfo(RelOptInfo *appendrel, Relids required_outer)
 }
 
 /*
+ * get_wrapper_parampathinfo
+ *		Get the ParamPathInfo for a parameterized wrapper path.
+ *
+ * If a wrapper-type path, such as a MaterialPath, might be parameterized,
+ * use this function to compute its param_info.  This is suitable only when
+ * the wrapper path cannot add or remove any parameterization from its
+ * subpath, which typically means that it evaluates no quals nor tlist
+ * expressions.
+ */
+ParamPathInfo *
+get_wrapper_parampathinfo(Path *subpath)
+{
+	/*
+	 * Currently we just re-use the subpath's ParamPathInfo, if any.  The
+	 * ppi_req_outer value is correct given the assumption stated above, and
+	 * none of the other fields are required to be valid for a wrapper path.
+	 */
+	return subpath->param_info;
+}
+
+/*
  * Returns a ParamPathInfo for the parameterization given by required_outer, if
  * already available in the given rel. Returns NULL otherwise.
  */
@@ -1906,6 +2139,8 @@ find_param_path_info(RelOptInfo *rel, Relids required_outer)
  * get_param_path_clause_serials
  *		Given a parameterized Path, return the set of pushed-down clauses
  *		(identified by rinfo_serial numbers) enforced within the Path.
+ *
+ * Callers should use this in preference to fetching ppi_serials themselves.
  */
 Bitmapset *
 get_param_path_clause_serials(Path *path)
@@ -1913,72 +2148,114 @@ get_param_path_clause_serials(Path *path)
 	if (path->param_info == NULL)
 		return NULL;			/* not parameterized */
 
-	/*
-	 * We don't currently support parameterized MergeAppend paths, as
-	 * explained in the comments for generate_orderedappend_paths.
-	 */
-	Assert(!IsA(path, MergeAppendPath));
-
-	if (IsA(path, NestPath) ||
-		IsA(path, MergePath) ||
-		IsA(path, HashPath))
+	switch (nodeTag(path))
 	{
-		/*
-		 * For a join path, combine clauses enforced within either input path
-		 * with those enforced as joinrestrictinfo in this path.  Note that
-		 * joinrestrictinfo may include some non-pushed-down clauses, but for
-		 * current purposes it's okay if we include those in the result. (To
-		 * be more careful, we could check for clause_relids overlapping the
-		 * path parameterization, but it's not worth the cycles for now.)
-		 */
-		JoinPath   *jpath = (JoinPath *) path;
-		Bitmapset  *pserials;
-		ListCell   *lc;
+		case T_NestPath:
+		case T_MergePath:
+		case T_HashPath:
+			{
+				/*
+				 * For a join path, combine clauses enforced within either
+				 * input path with those enforced as joinrestrictinfo in this
+				 * path.  Note that joinrestrictinfo may include some
+				 * non-pushed-down clauses, but for current purposes it's okay
+				 * if we include those in the result.  (To be more careful, we
+				 * could check for clause_relids overlapping the path
+				 * parameterization, but it's not worth the cycles for now.)
+				 */
+				JoinPath   *jpath = (JoinPath *) path;
+				Bitmapset  *pserials;
+				ListCell   *lc;
 
-		pserials = NULL;
-		pserials = bms_add_members(pserials,
-								   get_param_path_clause_serials(jpath->outerjoinpath));
-		pserials = bms_add_members(pserials,
-								   get_param_path_clause_serials(jpath->innerjoinpath));
-		foreach(lc, jpath->joinrestrictinfo)
-		{
-			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+				pserials = NULL;
+				pserials = bms_add_members(pserials,
+										   get_param_path_clause_serials(jpath->outerjoinpath));
+				pserials = bms_add_members(pserials,
+										   get_param_path_clause_serials(jpath->innerjoinpath));
+				foreach(lc, jpath->joinrestrictinfo)
+				{
+					RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
 
-			pserials = bms_add_member(pserials, rinfo->rinfo_serial);
-		}
-		return pserials;
-	}
-	else if (IsA(path, AppendPath))
-	{
-		/*
-		 * For an appendrel, take the intersection of the sets of clauses
-		 * enforced in each input path.
-		 */
-		AppendPath *apath = (AppendPath *) path;
-		Bitmapset  *pserials;
-		ListCell   *lc;
+					pserials = bms_add_member(pserials, rinfo->rinfo_serial);
+				}
+				return pserials;
+			}
+		case T_AppendPath:
+			{
+				/*
+				 * For an appendrel, take the intersection of the sets of
+				 * clauses enforced in each input path.
+				 */
+				AppendPath *apath = (AppendPath *) path;
+				Bitmapset  *pserials;
+				ListCell   *lc;
 
-		pserials = NULL;
-		foreach(lc, apath->subpaths)
-		{
-			Path	   *subpath = (Path *) lfirst(lc);
-			Bitmapset  *subserials;
+				pserials = NULL;
+				foreach(lc, apath->subpaths)
+				{
+					Path	   *subpath = (Path *) lfirst(lc);
+					Bitmapset  *subserials;
 
-			subserials = get_param_path_clause_serials(subpath);
-			if (lc == list_head(apath->subpaths))
-				pserials = bms_copy(subserials);
-			else
-				pserials = bms_int_members(pserials, subserials);
-		}
-		return pserials;
-	}
-	else
-	{
-		/*
-		 * Otherwise, it's a baserel path and we can use the
-		 * previously-computed set of serial numbers.
-		 */
-		return path->param_info->ppi_serials;
+					subserials = get_param_path_clause_serials(subpath);
+					if (lc == list_head(apath->subpaths))
+						pserials = bms_copy(subserials);
+					else
+						pserials = bms_int_members(pserials, subserials);
+					if (bms_is_empty(pserials))
+						break;	/* no point in continuing */
+				}
+				return pserials;
+			}
+		case T_MergeAppendPath:
+
+			/*
+			 * We don't currently support parameterized MergeAppend paths, as
+			 * explained in the comments for generate_orderedappend_paths.
+			 */
+			Assert(false);
+			return NULL;
+		case T_GatherPath:
+		case T_GatherMergePath:
+
+			/*
+			 * Gather and GatherMerge paths are never parameterized, since we
+			 * don't generate parameterized partial paths (see
+			 * add_partial_path).
+			 */
+			Assert(false);
+			return NULL;
+
+			/*
+			 * A path that merely wraps another path enforces no clauses of
+			 * its own, so recurse through such paths.  We can't just use its
+			 * ppi_serials, as that is the same as the subpath's, and won't be
+			 * valid for join or append subpaths.  The set of path types
+			 * listed here should match the set for which pathnode.c uses
+			 * get_wrapper_parampathinfo().
+			 */
+		case T_MaterialPath:
+			return get_param_path_clause_serials(((MaterialPath *) path)->subpath);
+		case T_MemoizePath:
+			return get_param_path_clause_serials(((MemoizePath *) path)->subpath);
+		case T_ProjectionPath:
+			return get_param_path_clause_serials(((ProjectionPath *) path)->subpath);
+		case T_SortPath:
+			return get_param_path_clause_serials(((SortPath *) path)->subpath);
+		case T_IncrementalSortPath:
+			return get_param_path_clause_serials(((IncrementalSortPath *) path)->spath.subpath);
+		case T_UniquePath:
+			return get_param_path_clause_serials(((UniquePath *) path)->subpath);
+		case T_AggPath:
+			return get_param_path_clause_serials(((AggPath *) path)->subpath);
+		case T_GroupingSetsPath:
+			return get_param_path_clause_serials(((GroupingSetsPath *) path)->subpath);
+		default:
+
+			/*
+			 * Otherwise, it's a baserel path and we can use the
+			 * previously-computed set of serial numbers.
+			 */
+			return path->param_info->ppi_serials;
 	}
 }
 
@@ -1997,7 +2274,7 @@ build_joinrel_partition_info(PlannerInfo *root,
 	PartitionScheme part_scheme;
 
 	/* Nothing to do if partitionwise join technique is disabled. */
-	if (!enable_partitionwise_join)
+	if ((joinrel->pgs_mask & PGS_CONSIDER_PARTITIONWISE) == 0)
 	{
 		Assert(!IS_PARTITIONED_REL(joinrel));
 		return;
@@ -2365,9 +2642,8 @@ set_joinrel_partition_key_exprs(RelOptInfo *joinrel,
 	PartitionScheme part_scheme = joinrel->part_scheme;
 	int			partnatts = part_scheme->partnatts;
 
-	joinrel->partexprs = (List **) palloc0(sizeof(List *) * partnatts);
-	joinrel->nullable_partexprs =
-		(List **) palloc0(sizeof(List *) * partnatts);
+	joinrel->partexprs = palloc0_array(List *, partnatts);
+	joinrel->nullable_partexprs = palloc0_array(List *, partnatts);
 
 	/*
 	 * The joinrel's partition expressions are the same as those of the input
@@ -2518,4 +2794,586 @@ build_child_join_reltarget(PlannerInfo *root,
 	childrel->reltarget->cost.startup = parentrel->reltarget->cost.startup;
 	childrel->reltarget->cost.per_tuple = parentrel->reltarget->cost.per_tuple;
 	childrel->reltarget->width = parentrel->reltarget->width;
+}
+
+/*
+ * create_rel_agg_info
+ *	  Create the RelAggInfo structure for the given relation if it can produce
+ *	  grouped paths.  The given relation is the non-grouped one which has the
+ *	  reltarget already constructed.
+ *
+ * calculate_grouped_rows: if true, calculate the estimated number of grouped
+ * rows for the relation.  If false, skip the estimation to avoid unnecessary
+ * planning overhead.
+ */
+RelAggInfo *
+create_rel_agg_info(PlannerInfo *root, RelOptInfo *rel,
+					bool calculate_grouped_rows)
+{
+	ListCell   *lc;
+	RelAggInfo *result;
+	PathTarget *agg_input;
+	PathTarget *target;
+	List	   *group_clauses = NIL;
+	List	   *group_exprs = NIL;
+
+	/*
+	 * The lists of aggregate expressions and grouping expressions should have
+	 * been constructed.
+	 */
+	Assert(root->agg_clause_list != NIL);
+	Assert(root->group_expr_list != NIL);
+
+	/*
+	 * If this is a child rel, the grouped rel for its parent rel must have
+	 * been created if it can.  So we can just use parent's RelAggInfo if
+	 * there is one, with appropriate variable substitutions.
+	 */
+	if (IS_OTHER_REL(rel))
+	{
+		RelOptInfo *grouped_rel;
+		RelAggInfo *agg_info;
+
+		grouped_rel = rel->top_parent->grouped_rel;
+		if (grouped_rel == NULL)
+			return NULL;
+
+		Assert(IS_GROUPED_REL(grouped_rel));
+
+		/* Must do multi-level transformation */
+		agg_info = (RelAggInfo *)
+			adjust_appendrel_attrs_multilevel(root,
+											  (Node *) grouped_rel->agg_info,
+											  rel,
+											  rel->top_parent);
+
+		agg_info->apply_agg_at = NULL;	/* caller will change this later */
+
+		if (calculate_grouped_rows)
+		{
+			agg_info->grouped_rows =
+				estimate_num_groups(root, agg_info->group_exprs,
+									rel->rows, NULL, NULL);
+
+			/*
+			 * The grouped paths for the given relation are considered useful
+			 * iff the average group size is no less than
+			 * min_eager_agg_group_size.
+			 */
+			agg_info->agg_useful =
+				(rel->rows / agg_info->grouped_rows) >= min_eager_agg_group_size;
+		}
+
+		return agg_info;
+	}
+
+	/* Check if it's possible to produce grouped paths for this relation. */
+	if (!eager_aggregation_possible_for_relation(root, rel))
+		return NULL;
+
+	/*
+	 * Create targets for the grouped paths and for the input paths of the
+	 * grouped paths.
+	 */
+	target = create_empty_pathtarget();
+	agg_input = create_empty_pathtarget();
+
+	/* ... and initialize these targets */
+	if (!init_grouping_targets(root, rel, target, agg_input,
+							   &group_clauses, &group_exprs))
+		return NULL;
+
+	/*
+	 * Eager aggregation is not applicable if there are no available grouping
+	 * expressions.
+	 */
+	if (group_clauses == NIL)
+		return NULL;
+
+	/* Add aggregates to the grouping target */
+	foreach(lc, root->agg_clause_list)
+	{
+		AggClauseInfo *ac_info = lfirst_node(AggClauseInfo, lc);
+		Aggref	   *aggref;
+
+		Assert(IsA(ac_info->aggref, Aggref));
+
+		aggref = (Aggref *) copyObject(ac_info->aggref);
+		mark_partial_aggref(aggref, AGGSPLIT_INITIAL_SERIAL);
+
+		add_column_to_pathtarget(target, (Expr *) aggref, 0);
+	}
+
+	/* Set the estimated eval cost and output width for both targets */
+	set_pathtarget_cost_width(root, target);
+	set_pathtarget_cost_width(root, agg_input);
+
+	/* build the RelAggInfo result */
+	result = makeNode(RelAggInfo);
+	result->target = target;
+	result->agg_input = agg_input;
+	result->group_clauses = group_clauses;
+	result->group_exprs = group_exprs;
+	result->apply_agg_at = NULL;	/* caller will change this later */
+
+	if (calculate_grouped_rows)
+	{
+		result->grouped_rows = estimate_num_groups(root, result->group_exprs,
+												   rel->rows, NULL, NULL);
+
+		/*
+		 * The grouped paths for the given relation are considered useful iff
+		 * the average group size is no less than min_eager_agg_group_size.
+		 */
+		result->agg_useful =
+			(rel->rows / result->grouped_rows) >= min_eager_agg_group_size;
+	}
+
+	return result;
+}
+
+/*
+ * eager_aggregation_possible_for_relation
+ * 	  Check if it's possible to produce grouped paths for the given relation.
+ */
+static bool
+eager_aggregation_possible_for_relation(PlannerInfo *root, RelOptInfo *rel)
+{
+	ListCell   *lc;
+	int			cur_relid;
+
+	/*
+	 * Check to see if the given relation is in the nullable side of an outer
+	 * join.  In this case, we cannot push a partial aggregation down to the
+	 * relation, because the NULL-extended rows produced by the outer join
+	 * would not be available when we perform the partial aggregation, while
+	 * with a non-eager-aggregation plan these rows are available for the
+	 * top-level aggregation.  Doing so may result in the rows being grouped
+	 * differently than expected, or produce incorrect values from the
+	 * aggregate functions.
+	 */
+	cur_relid = -1;
+	while ((cur_relid = bms_next_member(rel->relids, cur_relid)) >= 0)
+	{
+		RelOptInfo *baserel = find_base_rel_ignore_join(root, cur_relid);
+
+		if (baserel == NULL)
+			continue;			/* ignore outer joins in rel->relids */
+
+		if (!bms_is_subset(baserel->nulling_relids, rel->relids))
+			return false;
+	}
+
+	/*
+	 * Similarly, we cannot push a partial aggregation down to a relation on
+	 * the inner (RHS) side of a semi/anti join.  A semi/anti join does not
+	 * preserve its inner rows in the join output, so a partial aggregate
+	 * computed on the inner side would not survive the join and could not be
+	 * combined by the final aggregation.
+	 *
+	 * Note that the inner side of an anti join already carries nulling_relids
+	 * and so is handled by the outer-join check above.  The case this check
+	 * adds is a semi join, which has no relid.
+	 */
+	foreach(lc, root->join_info_list)
+	{
+		SpecialJoinInfo *sjinfo = lfirst_node(SpecialJoinInfo, lc);
+
+		if (sjinfo->jointype != JOIN_SEMI && sjinfo->jointype != JOIN_ANTI)
+			continue;
+
+		/* rel includes inner-side rels of this join but not its outer side */
+		if (bms_overlap(rel->relids, sjinfo->min_righthand) &&
+			!bms_is_subset(sjinfo->min_lefthand, rel->relids))
+			return false;
+	}
+
+	/*
+	 * We cannot push a partial aggregation down below a join clause that
+	 * contains volatile functions, because the clause would then be evaluated
+	 * once per group rather than once per input row.
+	 */
+	foreach(lc, rel->joininfo)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+		if (contain_volatile_functions((Node *) rinfo))
+			return false;
+	}
+
+	/*
+	 * For now we don't try to support PlaceHolderVars.
+	 */
+	foreach(lc, rel->reltarget->exprs)
+	{
+		Expr	   *expr = lfirst(lc);
+
+		if (IsA(expr, PlaceHolderVar))
+			return false;
+	}
+
+	/* Caller should only pass base relations or joins. */
+	Assert(rel->reloptkind == RELOPT_BASEREL ||
+		   rel->reloptkind == RELOPT_JOINREL);
+
+	/*
+	 * Check if all aggregate expressions can be evaluated on this relation
+	 * level.
+	 */
+	foreach(lc, root->agg_clause_list)
+	{
+		AggClauseInfo *ac_info = lfirst_node(AggClauseInfo, lc);
+
+		Assert(IsA(ac_info->aggref, Aggref));
+
+		/*
+		 * Give up if any aggregate requires relations other than the current
+		 * one.  If the aggregate requires the current relation plus
+		 * additional relations, grouping the current relation could make some
+		 * input rows unavailable for the higher aggregate and may reduce the
+		 * number of input rows it receives.  If the aggregate does not
+		 * require the current relation at all, it should not be grouped, as
+		 * we do not support joining two grouped relations.
+		 */
+		if (!bms_is_subset(ac_info->agg_eval_at, rel->relids))
+			return false;
+	}
+
+	return true;
+}
+
+/*
+ * init_grouping_targets
+ *	  Initialize the target for grouped paths (target) as well as the target
+ *	  for paths that generate input for the grouped paths (agg_input).
+ *
+ * We also construct the list of SortGroupClauses and the list of grouping
+ * expressions for the partial aggregation, and return them in *group_clause
+ * and *group_exprs.
+ *
+ * Return true if the targets could be initialized, false otherwise.
+ */
+static bool
+init_grouping_targets(PlannerInfo *root, RelOptInfo *rel,
+					  PathTarget *target, PathTarget *agg_input,
+					  List **group_clauses, List **group_exprs)
+{
+	ListCell   *lc;
+	List	   *possibly_dependent = NIL;
+	Index		maxSortGroupRef;
+
+	/* Identify the max sortgroupref */
+	maxSortGroupRef = 0;
+	foreach(lc, root->processed_tlist)
+	{
+		Index		ref = ((TargetEntry *) lfirst(lc))->ressortgroupref;
+
+		if (ref > maxSortGroupRef)
+			maxSortGroupRef = ref;
+	}
+
+	/*
+	 * At this point, all Vars from this relation that are needed by upper
+	 * joins or are required in the final targetlist should already be present
+	 * in its reltarget.  Therefore, we can safely iterate over this
+	 * relation's reltarget->exprs to construct the PathTarget and grouping
+	 * clauses for the grouped paths.
+	 */
+	foreach(lc, rel->reltarget->exprs)
+	{
+		Expr	   *expr = (Expr *) lfirst(lc);
+		Index		sortgroupref;
+
+		/*
+		 * Given that PlaceHolderVar currently prevents us from doing eager
+		 * aggregation, the source target cannot contain anything more complex
+		 * than a Var.
+		 */
+		Assert(IsA(expr, Var));
+
+		/*
+		 * Get the sortgroupref of the expr if it is found among, or can be
+		 * deduced from, the original grouping expressions.
+		 */
+		sortgroupref = get_expression_sortgroupref(root, expr);
+		if (sortgroupref > 0)
+		{
+			SortGroupClause *sgc;
+
+			/* Find the matching SortGroupClause */
+			sgc = get_sortgroupref_clause(sortgroupref, root->processed_groupClause);
+			Assert(sgc->tleSortGroupRef <= maxSortGroupRef);
+
+			/*
+			 * If the target expression is to be used as a grouping key, it
+			 * should be emitted by the grouped paths that have been pushed
+			 * down to this relation level.
+			 */
+			add_column_to_pathtarget(target, expr, sortgroupref);
+
+			/*
+			 * ... and it also should be emitted by the input paths.
+			 */
+			add_column_to_pathtarget(agg_input, expr, sortgroupref);
+
+			/*
+			 * Record this SortGroupClause and grouping expression.  Note that
+			 * this SortGroupClause might have already been recorded.
+			 */
+			if (!list_member(*group_clauses, sgc))
+			{
+				*group_clauses = lappend(*group_clauses, sgc);
+				*group_exprs = lappend(*group_exprs, expr);
+			}
+		}
+		else if (is_var_needed_by_join(root, (Var *) expr, rel))
+		{
+			/*
+			 * The expression is needed for an upper join but is neither in
+			 * the GROUP BY clause nor derivable from it using EC (otherwise,
+			 * it would have already been included in the targets above).  We
+			 * need to create a special SortGroupClause for this expression.
+			 *
+			 * It is important to include such expressions in the grouping
+			 * keys.  This is essential to ensure that an aggregated row from
+			 * the partial aggregation matches the other side of the join if
+			 * and only if each row in the partial group does.  This ensures
+			 * that all rows within the same partial group share the same
+			 * 'destiny', which is crucial for maintaining correctness.
+			 */
+			SortGroupClause *sgc;
+			TypeCacheEntry *tce;
+			Oid			equalimageproc;
+
+			/*
+			 * But first, check if equality implies image equality for this
+			 * expression.  If not, we cannot use it as a grouping key.  See
+			 * comments in create_grouping_expr_infos().
+			 */
+			tce = lookup_type_cache(exprType((Node *) expr),
+									TYPECACHE_BTREE_OPFAMILY);
+			if (!OidIsValid(tce->btree_opf) ||
+				!OidIsValid(tce->btree_opintype))
+				return false;
+
+			equalimageproc = get_opfamily_proc(tce->btree_opf,
+											   tce->btree_opintype,
+											   tce->btree_opintype,
+											   BTEQUALIMAGE_PROC);
+
+			/*
+			 * If there is no BTEQUALIMAGE_PROC, eager aggregation is assumed
+			 * to be unsafe.  Otherwise, we call the procedure to check.  We
+			 * must be careful to pass the expression's actual collation,
+			 * rather than the data type's default collation, to ensure that
+			 * non-deterministic collations are correctly handled.
+			 */
+			if (!OidIsValid(equalimageproc) ||
+				!DatumGetBool(OidFunctionCall1Coll(equalimageproc,
+												   exprCollation((Node *) expr),
+												   ObjectIdGetDatum(tce->btree_opintype))))
+				return false;
+
+			/* Create the SortGroupClause. */
+			sgc = makeNode(SortGroupClause);
+
+			/* Initialize the SortGroupClause. */
+			sgc->tleSortGroupRef = ++maxSortGroupRef;
+			get_sort_group_operators(exprType((Node *) expr),
+									 false, true, false,
+									 &sgc->sortop, &sgc->eqop, NULL,
+									 &sgc->hashable);
+
+			/* This expression should be emitted by the grouped paths */
+			add_column_to_pathtarget(target, expr, sgc->tleSortGroupRef);
+
+			/* ... and it also should be emitted by the input paths. */
+			add_column_to_pathtarget(agg_input, expr, sgc->tleSortGroupRef);
+
+			/* Record this SortGroupClause and grouping expression */
+			*group_clauses = lappend(*group_clauses, sgc);
+			*group_exprs = lappend(*group_exprs, expr);
+		}
+		else if (is_var_in_aggref_only(root, (Var *) expr))
+		{
+			/*
+			 * The expression is referenced by an aggregate function pushed
+			 * down to this relation and does not appear elsewhere in the
+			 * targetlist or havingQual.  Add it to 'agg_input' but not to
+			 * 'target'.
+			 */
+			add_new_column_to_pathtarget(agg_input, expr);
+		}
+		else
+		{
+			/*
+			 * The expression may be functionally dependent on other
+			 * expressions in the target, but we cannot verify this until all
+			 * target expressions have been constructed.
+			 */
+			possibly_dependent = lappend(possibly_dependent, expr);
+		}
+	}
+
+	/*
+	 * Now we can verify whether an expression is functionally dependent on
+	 * others.
+	 */
+	foreach(lc, possibly_dependent)
+	{
+		Var		   *tvar;
+		List	   *deps = NIL;
+		RangeTblEntry *rte;
+
+		tvar = lfirst_node(Var, lc);
+		rte = root->simple_rte_array[tvar->varno];
+
+		if (check_functional_grouping(rte->relid, tvar->varno,
+									  tvar->varlevelsup,
+									  target->exprs, &deps))
+		{
+			/*
+			 * The expression is functionally dependent on other target
+			 * expressions, so it can be included in the targets.  Since it
+			 * will not be used as a grouping key, a sortgroupref is not
+			 * needed for it.
+			 */
+			add_new_column_to_pathtarget(target, (Expr *) tvar);
+			add_new_column_to_pathtarget(agg_input, (Expr *) tvar);
+		}
+		else
+		{
+			/*
+			 * We may arrive here with a grouping expression that is proven
+			 * redundant by EquivalenceClass processing, such as 't1.a' in the
+			 * query below.
+			 *
+			 * select max(t1.c) from t t1, t t2 where t1.a = 1 group by t1.a,
+			 * t1.b;
+			 *
+			 * For now we just give up in this case.
+			 */
+			return false;
+		}
+	}
+
+	return true;
+}
+
+/*
+ * is_var_in_aggref_only
+ *	  Check whether the given Var appears in aggregate expressions and not
+ *	  elsewhere in the targetlist or havingQual.
+ */
+static bool
+is_var_in_aggref_only(PlannerInfo *root, Var *var)
+{
+	ListCell   *lc;
+
+	/*
+	 * Search the list of aggregate expressions for the Var.
+	 */
+	foreach(lc, root->agg_clause_list)
+	{
+		AggClauseInfo *ac_info = lfirst_node(AggClauseInfo, lc);
+		List	   *vars;
+
+		Assert(IsA(ac_info->aggref, Aggref));
+
+		if (!bms_is_member(var->varno, ac_info->agg_eval_at))
+			continue;
+
+		vars = pull_var_clause((Node *) ac_info->aggref,
+							   PVC_RECURSE_AGGREGATES |
+							   PVC_RECURSE_WINDOWFUNCS |
+							   PVC_RECURSE_PLACEHOLDERS);
+
+		if (list_member(vars, var))
+		{
+			list_free(vars);
+			break;
+		}
+
+		list_free(vars);
+	}
+
+	return (lc != NULL && !list_member(root->tlist_vars, var));
+}
+
+/*
+ * is_var_needed_by_join
+ *	  Check if the given Var is needed by joins above the current rel.
+ */
+static bool
+is_var_needed_by_join(PlannerInfo *root, Var *var, RelOptInfo *rel)
+{
+	Relids		relids;
+	int			attno;
+	RelOptInfo *baserel;
+
+	/*
+	 * Note that when checking if the Var is needed by joins above, we want to
+	 * exclude cases where the Var is only needed in the final targetlist.  So
+	 * include "relation 0" in the check.
+	 */
+	relids = bms_copy(rel->relids);
+	relids = bms_add_member(relids, 0);
+
+	baserel = find_base_rel(root, var->varno);
+	attno = var->varattno - baserel->min_attr;
+
+	return bms_nonempty_difference(baserel->attr_needed[attno], relids);
+}
+
+/*
+ * get_expression_sortgroupref
+ *	  Return the sortgroupref of the given "expr" if it is found among the
+ *	  original grouping expressions, or is known equal to any of the original
+ *	  grouping expressions due to equivalence relationships.  Return 0 if no
+ *	  match is found.
+ */
+static Index
+get_expression_sortgroupref(PlannerInfo *root, Expr *expr)
+{
+	ListCell   *lc;
+
+	Assert(IsA(expr, Var));
+
+	foreach(lc, root->group_expr_list)
+	{
+		GroupingExprInfo *ge_info = lfirst_node(GroupingExprInfo, lc);
+		ListCell   *lc1;
+
+		Assert(IsA(ge_info->expr, Var));
+		Assert(ge_info->sortgroupref > 0);
+
+		if (equal(expr, ge_info->expr))
+			return ge_info->sortgroupref;
+
+		if (ge_info->ec == NULL ||
+			!bms_is_member(((Var *) expr)->varno, ge_info->ec->ec_relids))
+			continue;
+
+		/* The grouping operators can't be applied to a cross-type member */
+		if (exprType((Node *) expr) != exprType((Node *) ge_info->expr))
+			continue;
+
+		/*
+		 * Scan the EquivalenceClass, looking for a match to the given
+		 * expression.  We ignore child members here.
+		 */
+		foreach(lc1, ge_info->ec->ec_members)
+		{
+			EquivalenceMember *em = (EquivalenceMember *) lfirst(lc1);
+
+			/* Child members should not exist in ec_members */
+			Assert(!em->em_is_child);
+
+			if (equal(expr, em->em_expr))
+				return ge_info->sortgroupref;
+		}
+	}
+
+	/* no match is found */
+	return 0;
 }

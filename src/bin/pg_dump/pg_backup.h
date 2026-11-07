@@ -68,6 +68,7 @@ enum _dumpPreparedQueries
 	PREPQUERY_DUMPCOMPOSITETYPE,
 	PREPQUERY_DUMPDOMAIN,
 	PREPQUERY_DUMPENUMTYPE,
+	PREPQUERY_DUMPEXTSTATSOBJSTATS,
 	PREPQUERY_DUMPFUNC,
 	PREPQUERY_DUMPOPR,
 	PREPQUERY_DUMPRANGETYPE,
@@ -338,7 +339,7 @@ extern void SortTocFromFile(Archive *AHX);
 
 /* Convenience functions used only when writing DATA */
 extern void archputs(const char *s, Archive *AH);
-extern int	archprintf(Archive *AH, const char *fmt,...) pg_attribute_printf(2, 3);
+extern int	archprintf(Archive *AH, const char *fmt, ...) pg_attribute_printf(2, 3);
 
 #define appendStringLiteralAH(buf,str,AH) \
 	appendStringLiteral(buf, str, (AH)->encoding, (AH)->std_strings)

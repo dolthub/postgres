@@ -3,7 +3,7 @@
  * compress_gzip.c
  *	 Routines for archivers to read or write a gzip compressed data stream.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -57,8 +57,8 @@ DeflateCompressorInit(CompressorState *cs)
 	GzipCompressorState *gzipcs;
 	z_streamp	zp;
 
-	gzipcs = (GzipCompressorState *) pg_malloc0(sizeof(GzipCompressorState));
-	zp = gzipcs->zp = (z_streamp) pg_malloc(sizeof(z_stream));
+	gzipcs = pg_malloc0_object(GzipCompressorState);
+	zp = gzipcs->zp = pg_malloc_object(z_stream);
 	zp->zalloc = Z_NULL;
 	zp->zfree = Z_NULL;
 	zp->opaque = Z_NULL;
@@ -178,7 +178,7 @@ ReadDataFromArchiveGzip(ArchiveHandle *AH, CompressorState *cs)
 	char	   *buf;
 	size_t		buflen;
 
-	zp = (z_streamp) pg_malloc(sizeof(z_stream));
+	zp = pg_malloc_object(z_stream);
 	zp->zalloc = Z_NULL;
 	zp->zfree = Z_NULL;
 	zp->opaque = Z_NULL;
@@ -205,7 +205,8 @@ ReadDataFromArchiveGzip(ArchiveHandle *AH, CompressorState *cs)
 
 			res = inflate(zp, 0);
 			if (res != Z_OK && res != Z_STREAM_END)
-				pg_fatal("could not uncompress data: %s", zp->msg);
+				pg_fatal("could not uncompress data: %s",
+						 zp->msg ? zp->msg : "unknown error");
 
 			out[DEFAULT_IO_BUFFER_SIZE - zp->avail_out] = '\0';
 			ahwrite(out, 1, DEFAULT_IO_BUFFER_SIZE - zp->avail_out, AH);
@@ -220,7 +221,8 @@ ReadDataFromArchiveGzip(ArchiveHandle *AH, CompressorState *cs)
 		zp->avail_out = DEFAULT_IO_BUFFER_SIZE;
 		res = inflate(zp, 0);
 		if (res != Z_OK && res != Z_STREAM_END)
-			pg_fatal("could not uncompress data: %s", zp->msg);
+			pg_fatal("could not uncompress data: %s",
+					 zp->msg ? zp->msg : "unknown error");
 
 		out[DEFAULT_IO_BUFFER_SIZE - zp->avail_out] = '\0';
 		ahwrite(out, 1, DEFAULT_IO_BUFFER_SIZE - zp->avail_out, AH);
@@ -386,12 +388,24 @@ Gzip_open(const char *path, int fd, const char *mode, CompressFileHandle *CFH)
 		strcpy(mode_compression, mode);
 
 	if (fd >= 0)
-		gzfp = gzdopen(dup(fd), mode_compression);
-	else
-		gzfp = gzopen(path, mode_compression);
+	{
+		int			dup_fd = dup(fd);
 
-	if (gzfp == NULL)
-		return false;
+		if (dup_fd < 0)
+			return false;
+		gzfp = gzdopen(dup_fd, mode_compression);
+		if (gzfp == NULL)
+		{
+			close(dup_fd);
+			return false;
+		}
+	}
+	else
+	{
+		gzfp = gzopen(path, mode_compression);
+		if (gzfp == NULL)
+			return false;
+	}
 
 	CFH->private_data = gzfp;
 

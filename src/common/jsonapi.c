@@ -3,7 +3,7 @@
  * jsonapi.c
  *		JSON parser and lexer interfaces
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -300,7 +300,7 @@ static JsonIncrementalState failed_inc_oom;
  * lex_peek
  *
  * what is the current look_ahead token?
-*/
+ */
 static inline JsonTokenType
 lex_peek(JsonLexContext *lex)
 {
@@ -2216,9 +2216,9 @@ json_lex_string(JsonLexContext *lex)
 			 * can batch calls to jsonapi_appendBinaryStringInfo.
 			 */
 			while (p < end - sizeof(Vector8) &&
-				   !pg_lfind8('\\', (uint8 *) p, sizeof(Vector8)) &&
-				   !pg_lfind8('"', (uint8 *) p, sizeof(Vector8)) &&
-				   !pg_lfind8_le(31, (uint8 *) p, sizeof(Vector8)))
+				   !pg_lfind8('\\', (const uint8 *) p, sizeof(Vector8)) &&
+				   !pg_lfind8('"', (const uint8 *) p, sizeof(Vector8)) &&
+				   !pg_lfind8_le(31, (const uint8 *) p, sizeof(Vector8)))
 				p += sizeof(Vector8);
 
 			for (; p < end; p++)

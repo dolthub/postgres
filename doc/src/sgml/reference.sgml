@@ -195,6 +195,7 @@
    &refreshMaterializedView;
    &reindex;
    &releaseSavepoint;
+   &repack;
    &reset;
    &revoke;
    &rollback;
@@ -216,6 +217,7 @@
    &update;
    &vacuum;
    &values;
+   &wait;
 
  </reference>
 

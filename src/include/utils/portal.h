@@ -36,7 +36,7 @@
  * to look like NO SCROLL cursors.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/portal.h
@@ -208,13 +208,12 @@ typedef struct PortalData
  * PortalIsValid
  *		True iff portal is valid.
  */
-#define PortalIsValid(p) PointerIsValid(p)
+#define PortalIsValid(p) ((p) != NULL)
 
 
 /* Prototypes for functions in utils/mmgr/portalmem.c */
 extern void EnablePortalManager(void);
 extern bool PreCommit_Portals(bool isPrepare);
-extern bool PreCommit_PortalsForVersionCommit(void);
 extern void AtAbort_Portals(void);
 extern void AtCleanup_Portals(void);
 extern void PortalErrorCleanup(void);

@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2026, PostgreSQL Global Development Group
  *
  * src/bin/psql/common.h
  */
@@ -35,6 +35,8 @@ extern PGresult *PSQLexec(const char *query);
 extern int	PSQLexecWatch(const char *query, const printQueryOpt *opt, FILE *printQueryFout, int min_rows);
 
 extern bool SendQuery(const char *query, int num_copy_from_stdin);
+
+extern void addQueryComment(PQExpBuffer buf, const char *label);
 
 extern bool is_superuser(void);
 extern bool standard_strings(void);

@@ -1,15 +1,17 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2026, PostgreSQL Global Development Group
  *
  * src/bin/psql/stringutils.h
  */
 #ifndef STRINGUTILS_H
 #define STRINGUTILS_H
 
-/* The cooler version of strtok() which knows about quotes and doesn't
- * overwrite your input */
+/*
+ * The cooler version of strtok() which knows about quotes and doesn't
+ * overwrite your input
+ */
 extern char *strtokx(const char *s,
 					 const char *whitespace,
 					 const char *delim,

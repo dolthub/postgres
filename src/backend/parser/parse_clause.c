@@ -3,7 +3,7 @@
  * parse_clause.c
  *	  handle clauses in parser
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,8 +14,6 @@
  */
 
 #include "postgres.h"
-#include "access/doltcatalog.h"
-#include "access/doltsystem.h"
 
 #include "access/htup_details.h"
 #include "access/nbtree.h"
@@ -181,7 +179,6 @@ setTargetTable(ParseState *pstate, RangeVar *relation,
 			   bool inh, bool alsoSource, AclMode requiredPerms)
 {
 	ParseNamespaceItem *nsitem;
-	RangeTblEntry *binding = makeNode(RangeTblEntry);
 
 	/*
 	 * ENRs hide tables of the same name, so we need to check for them first.
@@ -205,9 +202,8 @@ setTargetTable(ParseState *pstate, RangeVar *relation,
 	 * free_parsestate() will eventually do the corresponding table_close(),
 	 * but *not* release the lock.
 	 */
-	pstate->p_target_relation = dg_catalog_target(pstate, relation, binding);
-	if (!pstate->p_target_relation)
-		pstate->p_target_relation = parserOpenTable(pstate, relation, RowExclusiveLock);
+	pstate->p_target_relation = parserOpenTable(pstate, relation,
+												RowExclusiveLock);
 
 	/*
 	 * Now build an RTE and a ParseNamespaceItem.
@@ -215,16 +211,6 @@ setTargetTable(ParseState *pstate, RangeVar *relation,
 	nsitem = addRangeTableEntryForRelation(pstate, pstate->p_target_relation,
 										   RowExclusiveLock,
 										   relation->alias, inh, false);
-
-	nsitem->p_rte->dolt_ref = binding->dolt_ref;
-	nsitem->p_rte->dolt_ref_target = binding->dolt_ref_target;
-	if (binding->dolt_branch)
-	{
-		nsitem->p_rte->dolt_branch = binding->dolt_branch;
-		nsitem->p_rte->dolt_database = binding->dolt_database;
-		nsitem->p_rte->dolt_relid = binding->dolt_relid;
-		nsitem->p_rte->inh = false;
-	}
 
 	/* remember the RTE/nsitem as being the query target */
 	pstate->p_target_nsitem = nsitem;
@@ -311,7 +297,8 @@ extractRemainingColumns(ParseState *pstate,
 	return colcount;
 }
 
-/* transformJoinUsingClause()
+/*
+ * transformJoinUsingClause()
  *	  Build a complete ON clause from a partially-transformed USING list.
  *	  We are given lists of nodes representing left and right match columns.
  *	  Result is a transformed qualification expression.
@@ -371,7 +358,8 @@ transformJoinUsingClause(ParseState *pstate,
 	return result;
 }
 
-/* transformJoinOnClause()
+/*
+ * transformJoinOnClause()
  *	  Transform the qual conditions for JOIN/ON.
  *	  Result is a transformed qualification expression.
  */
@@ -522,12 +510,6 @@ transformRangeFunction(ParseState *pstate, RangeFunction *r)
 		Assert(list_length(pair) == 2);
 		fexpr = (Node *) linitial(pair);
 		coldeflist = (List *) lsecond(pair);
-
-		/* Derive columns only when neither SQL spelling supplies them. Stored
-		 * view definitions deparse a single function's descriptor at the
-		 * RangeFunction level; regenerating it here creates conflicting lists. */
-		if (coldeflist == NIL && r->coldeflist == NIL && IsA(fexpr, FuncCall))
-			coldeflist = dg_system_function_columns(pstate, (FuncCall *) fexpr);
 
 		/*
 		 * If we find a function call unnest() with more than one argument and
@@ -753,7 +735,7 @@ transformRangeTableFunc(ParseState *pstate, RangeTableFunc *rtf)
 	tf->ordinalitycol = -1;
 
 	/* Process column specs */
-	names = palloc(sizeof(char *) * list_length(rtf->columns));
+	names = palloc_array(char *, list_length(rtf->columns));
 
 	colno = 0;
 	foreach(col, rtf->columns)
@@ -1037,7 +1019,7 @@ getNSItemForSpecialRelationTypes(ParseState *pstate, RangeVar *rv)
 	/*
 	 * if it is a qualified name, it can't be a CTE or tuplestore reference
 	 */
-	if (rv->schemaname || rv->catalogname || rv->dolt_revision)
+	if (rv->schemaname)
 		return NULL;
 
 	cte = scanNameSpaceForCTE(pstate, rv->relname, &levelsup);
@@ -1087,16 +1069,6 @@ transformFromClauseItem(ParseState *pstate, Node *n,
 
 		/* Check if it's a CTE or tuplestore reference */
 		nsitem = getNSItemForSpecialRelationTypes(pstate, rv);
-		if (!nsitem)
-		{
-			/* dolt_diff_<table> and friends are generated from functions */
-			RangeFunction *generated = dg_system_table(pstate, rv);
-
-			if (generated)
-				nsitem = transformRangeFunction(pstate, generated);
-		}
-		if (!nsitem)
-			nsitem = addRangeTableEntryForDolt(pstate, rv);
 
 		/* if not found above, must be a table reference */
 		if (!nsitem)
@@ -1603,7 +1575,7 @@ transformFromClauseItem(ParseState *pstate, Node *n,
 		{
 			ParseNamespaceItem *jnsitem;
 
-			jnsitem = (ParseNamespaceItem *) palloc(sizeof(ParseNamespaceItem));
+			jnsitem = palloc_object(ParseNamespaceItem);
 			jnsitem->p_names = j->join_using_alias;
 			jnsitem->p_rte = nsitem->p_rte;
 			jnsitem->p_rtindex = nsitem->p_rtindex;
@@ -3244,24 +3216,29 @@ resolve_unique_index_expr(ParseState *pstate, InferClause *infer,
 		 * Raw grammar re-uses CREATE INDEX infrastructure for unique index
 		 * inference clause, and so will accept opclasses by name and so on.
 		 *
-		 * Make no attempt to match ASC or DESC ordering or NULLS FIRST/NULLS
-		 * LAST ordering, since those are not significant for inference
-		 * purposes (any unique index matching the inference specification in
-		 * other regards is accepted indifferently).  Actively reject this as
-		 * wrong-headed.
+		 * Make no attempt to match ASC or DESC ordering, NULLS FIRST/NULLS
+		 * LAST ordering or opclass options, since those are not significant
+		 * for inference purposes (any unique index matching the inference
+		 * specification in other regards is accepted indifferently). Actively
+		 * reject this as wrong-headed.
 		 */
 		if (ielem->ordering != SORTBY_DEFAULT)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
-					 errmsg("ASC/DESC is not allowed in ON CONFLICT clause"),
-					 parser_errposition(pstate,
-										exprLocation((Node *) infer))));
+					 errmsg("%s is not allowed in ON CONFLICT clause",
+							"ASC/DESC"),
+					 parser_errposition(pstate, ielem->location)));
 		if (ielem->nulls_ordering != SORTBY_NULLS_DEFAULT)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
-					 errmsg("NULLS FIRST/LAST is not allowed in ON CONFLICT clause"),
-					 parser_errposition(pstate,
-										exprLocation((Node *) infer))));
+					 errmsg("%s is not allowed in ON CONFLICT clause",
+							"NULLS FIRST/LAST"),
+					 parser_errposition(pstate, ielem->location)));
+		if (ielem->opclassopts)
+			ereport(ERROR,
+					errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
+					errmsg("operator class options are not allowed in ON CONFLICT clause"),
+					parser_errposition(pstate, ielem->location));
 
 		if (!ielem->expr)
 		{
@@ -3301,7 +3278,7 @@ resolve_unique_index_expr(ParseState *pstate, InferClause *infer,
 			pInfer->infercollid = InvalidOid;
 		else
 			pInfer->infercollid = LookupCollation(pstate, ielem->collation,
-												  exprLocation(pInfer->expr));
+												  ielem->location);
 
 		if (!ielem->opclass)
 			pInfer->inferopclass = InvalidOid;
@@ -3335,13 +3312,15 @@ transformOnConflictArbiter(ParseState *pstate,
 	*arbiterWhere = NULL;
 	*constraint = InvalidOid;
 
-	if (onConflictClause->action == ONCONFLICT_UPDATE && !infer)
+	if ((onConflictClause->action == ONCONFLICT_UPDATE ||
+		 onConflictClause->action == ONCONFLICT_SELECT) && !infer)
 		ereport(ERROR,
-				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("ON CONFLICT DO UPDATE requires inference specification or constraint name"),
-				 errhint("For example, ON CONFLICT (column_name)."),
-				 parser_errposition(pstate,
-									exprLocation((Node *) onConflictClause))));
+				errcode(ERRCODE_SYNTAX_ERROR),
+				errmsg("ON CONFLICT DO %s requires inference specification or constraint name",
+					   onConflictClause->action == ONCONFLICT_UPDATE ? "UPDATE" : "SELECT"),
+				errhint("For example, ON CONFLICT (column_name)."),
+				parser_errposition(pstate,
+								   exprLocation((Node *) onConflictClause)));
 
 	/*
 	 * To simplify certain aspects of its design, speculative insertion into

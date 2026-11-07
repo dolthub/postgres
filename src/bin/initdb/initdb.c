@@ -38,7 +38,7 @@
  *
  * This code is released under the terms of the PostgreSQL License.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/bin/initdb/initdb.c
@@ -94,7 +94,7 @@ typedef struct _stringlist
 } _stringlist;
 
 static const char *const auth_methods_host[] = {
-	"trust", "reject", "scram-sha-256", "md5", "password", "ident", "radius",
+	"trust", "reject", "scram-sha-256", "md5", "password", "ident",
 #ifdef ENABLE_GSS
 	"gss",
 #endif
@@ -116,7 +116,7 @@ static const char *const auth_methods_host[] = {
 	NULL
 };
 static const char *const auth_methods_local[] = {
-	"trust", "reject", "scram-sha-256", "md5", "password", "peer", "radius",
+	"trust", "reject", "scram-sha-256", "md5", "password", "peer",
 #ifdef USE_PAM
 	"pam",
 #endif
@@ -177,6 +177,7 @@ static int	encodingid;
 static char *bki_file;
 static char *hba_file;
 static char *ident_file;
+static char *hosts_file;
 static char *conf_file;
 static char *dictionary_file;
 static char *info_schema_file;
@@ -286,7 +287,6 @@ static void setup_run_file(FILE *cmdfd, const char *filename);
 static void setup_description(FILE *cmdfd);
 static void setup_collation(FILE *cmdfd);
 static void setup_privileges(FILE *cmdfd);
-static void setup_dolt_repository(FILE *cmdfd);
 static void set_info_version(void);
 static void setup_schema(FILE *cmdfd);
 static void load_plpgsql(FILE *cmdfd);
@@ -445,7 +445,7 @@ escape_quotes_bki(const char *src)
 static void
 add_stringlist_item(_stringlist **listhead, const char *str)
 {
-	_stringlist *newentry = pg_malloc(sizeof(_stringlist));
+	_stringlist *newentry = pg_malloc_object(_stringlist);
 	_stringlist *oldentry;
 
 	newentry->str = pg_strdup(str);
@@ -462,7 +462,8 @@ add_stringlist_item(_stringlist **listhead, const char *str)
 
 /*
  * Modify the array of lines, replacing "token" by "replacement"
- * the first time it occurs on each line.
+ * the first time it occurs on each line.  To prevent false matches, the
+ * occurrence of "token" must be surrounded by whitespace or line start/end.
  *
  * The array must be a malloc'd array of individually malloc'd strings.
  * We free any discarded strings.
@@ -484,11 +485,23 @@ replace_token(char **lines, const char *token, const char *replacement)
 	for (int i = 0; lines[i]; i++)
 	{
 		char	   *where;
+		char	   *endwhere;
 		char	   *newline;
 		int			pre;
 
 		/* nothing to do if no change needed */
 		if ((where = strstr(lines[i], token)) == NULL)
+			continue;
+
+		/*
+		 * Reject false match.  Note a blind spot: we don't check for a valid
+		 * match following a false match.  That case can't occur at present,
+		 * so not worth complicating this code for it.
+		 */
+		if (!(where == lines[i] || isspace((unsigned char) where[-1])))
+			continue;
+		endwhere = where + strlen(token);
+		if (!(*endwhere == '\0' || isspace((unsigned char) *endwhere)))
 			continue;
 
 		/* if we get here a change is needed - set up new line */
@@ -574,37 +587,16 @@ replace_guc_value(char **lines, const char *guc_name, const char *guc_value,
 		{
 			/*
 			 * We try to preserve original indentation, which is tedious.
-			 * oldindent and newindent are measured in de-tab-ified columns.
 			 */
-			const char *ptr;
-			int			oldindent = 0;
-			int			newindent;
+			int			oldindent = (int) (where - lines[i]);
+			int			newindent = newline->len;
 
-			for (ptr = lines[i]; ptr < where; ptr++)
-			{
-				if (*ptr == '\t')
-					oldindent += 8 - (oldindent % 8);
-				else
-					oldindent++;
-			}
-			/* ignore the possibility of tabs in guc_value */
-			newindent = newline->len;
-			/* append appropriate tabs and spaces, forcing at least one */
+			/* append appropriate spaces, forcing at least one */
 			oldindent = Max(oldindent, newindent + 1);
 			while (newindent < oldindent)
 			{
-				int			newindent_if_tab = newindent + 8 - (newindent % 8);
-
-				if (newindent_if_tab <= oldindent)
-				{
-					appendPQExpBufferChar(newline, '\t');
-					newindent = newindent_if_tab;
-				}
-				else
-				{
-					appendPQExpBufferChar(newline, ' ');
-					newindent++;
-				}
+				appendPQExpBufferChar(newline, ' ');
+				newindent++;
 			}
 			/* and finally append the old comment */
 			appendPQExpBufferStr(newline, where);
@@ -688,7 +680,7 @@ readfile(const char *path)
 	initStringInfo(&line);
 
 	maxlines = 1024;
-	result = (char **) pg_malloc(maxlines * sizeof(char *));
+	result = pg_malloc_array(char *, maxlines);
 
 	n = 0;
 	while (pg_get_line_buf(infile, &line))
@@ -697,7 +689,7 @@ readfile(const char *path)
 		if (n >= maxlines - 1)
 		{
 			maxlines *= 2;
-			result = (char **) pg_realloc(result, maxlines * sizeof(char *));
+			result = pg_realloc_array(result, char *, maxlines);
 		}
 
 		result[n++] = pg_strdup(line.data);
@@ -911,6 +903,8 @@ static const struct tsearch_config_match tsearch_config_languages[] =
 	{"nepali", "Nepali"},
 	{"norwegian", "no"},
 	{"norwegian", "Norwegian"},
+	{"polish", "pl"},
+	{"polish", "Polish"},
 	{"portuguese", "pt"},
 	{"portuguese", "Portuguese"},
 	{"romanian", "ro"},
@@ -1425,6 +1419,11 @@ setup_config(void)
 									  "0640", false);
 	}
 
+#if USE_LZ4
+	conflines = replace_guc_value(conflines, "default_toast_compression",
+								  "lz4", true);
+#endif
+
 	/*
 	 * Now replace anything that's overridden via -c switches.
 	 */
@@ -1462,9 +1461,6 @@ setup_config(void)
 
 	conflines = readfile(hba_file);
 
-	conflines = replace_token(conflines, "@remove-line-for-nolocal@", "");
-
-
 	/*
 	 * Probe to see if there is really any platform support for IPv6, and
 	 * comment out the relevant pg_hba line if not.  This avoids runtime
@@ -1498,11 +1494,11 @@ setup_config(void)
 			getaddrinfo("::1", NULL, &hints, &gai_result) != 0)
 		{
 			conflines = replace_token(conflines,
-									  "host    all             all             ::1",
-									  "#host    all             all             ::1");
+									  "host    all             all             ::1/128",
+									  "#host    all             all             ::1/128");
 			conflines = replace_token(conflines,
-									  "host    replication     all             ::1",
-									  "#host    replication     all             ::1");
+									  "host    replication     all             ::1/128",
+									  "#host    replication     all             ::1/128");
 		}
 	}
 
@@ -1530,6 +1526,14 @@ setup_config(void)
 	conflines = readfile(ident_file);
 
 	snprintf(path, sizeof(path), "%s/pg_ident.conf", pg_data);
+
+	writefile(path, conflines);
+	if (chmod(path, pg_file_create_mode) != 0)
+		pg_fatal("could not change permissions of \"%s\": %m", path);
+
+	/* pg_hosts.conf */
+	conflines = readfile(hosts_file);
+	snprintf(path, sizeof(path), "%s/pg_hosts.conf", pg_data);
 
 	writefile(path, conflines);
 	if (chmod(path, pg_file_create_mode) != 0)
@@ -1580,9 +1584,6 @@ bootstrap_template1(void)
 
 	bki_lines = replace_token(bki_lines, "ALIGNOF_POINTER",
 							  (sizeof(Pointer) == 4) ? "i" : "d");
-
-	bki_lines = replace_token(bki_lines, "FLOAT8PASSBYVAL",
-							  FLOAT8PASSBYVAL ? "true" : "false");
 
 	bki_lines = replace_token(bki_lines, "POSTGRES",
 							  escape_quotes_bki(username));
@@ -1818,46 +1819,6 @@ setup_privileges(FILE *cmdfd)
 				  escape_quotes(username));
 	PG_CMD_PUTS("GRANT USAGE ON SCHEMA pg_catalog, public TO PUBLIC;\n\n");
 	PG_CMD_PUTS("REVOKE ALL ON pg_largeobject FROM PUBLIC;\n\n");
-
-	/* Diagnostic bypasses SQL row selection; preserve restricted access. */
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_prolly_root(regclass) FROM PUBLIC;\n\n");
-	PG_CMD_PUTS("REVOKE ALL ON pg_catalog.pg_dolt_object, pg_catalog.pg_dolt_ref, pg_catalog.pg_dolt_binding, pg_catalog.pg_dolt_storage, pg_catalog.dolt_log, pg_catalog.dolt_tags FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_manifest_put(text, bytea, bytea[]) FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_root_put(text[], text[], bytea[], bytea[]) FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_chunk_list() FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_chunk_read(bytea) FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_chunk_stats() FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_root_members(bytea) FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_root_nodes(bytea) FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_root_find(bytea, text, text) FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_root_json(bytea) FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_manifest_get(bytea) FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_manifest_read(text) FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_manifest_cas(text, bytea, bytea) FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_manifest_export(regclass) FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_add() FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_add(text[]) FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_commit() FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_commit(text[]) FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_branch() FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_branch(text[]) FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_tag() FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_tag(text[]) FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_log() FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_log(text[]) FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_diff_summary(text, text) FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_diff_summary(text, text, text) FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_checkout(text[]), pg_catalog.dolt_merge(text[]), pg_catalog.dolt_conflicts_resolve(text[]), pg_catalog.dolt_conflict_rows(text) FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON pg_catalog.dolt_conflicts, pg_catalog.dolt_merge_status FROM PUBLIC;\n");
-	PG_CMD_PUTS("GRANT USAGE ON SCHEMA dolt TO PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_init(), pg_catalog.dolt_hashof(text), pg_catalog.hashof(text) FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_reset(), pg_catalog.dolt_reset(text[]), pg_catalog.dolt_clean(), pg_catalog.dolt_clean(text[]), pg_catalog.dolt_rm(text[]), pg_catalog.dolt_revert(text[]), pg_catalog.dolt_cherry_pick(text[]), pg_catalog.dolt_count_commits(text[]), pg_catalog.dolt_branch_status(text[]), pg_catalog.dolt_merge_base(text,text), pg_catalog.dolt_hashof_table(text), pg_catalog.dolt_hashof_db(), pg_catalog.dolt_hashof_db(text), pg_catalog.dolt_reflog(), pg_catalog.dolt_reflog(text[]) FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_conflicts_table(text), pg_catalog.dolt_constraint_violations_table(text), pg_catalog.dolt_conflicts_clear(text), pg_catalog.dolt_constraint_violations_clear(text), pg_catalog.dolt_preview_merge_conflicts(text[]), pg_catalog.dolt_preview_merge_conflicts_summary(text[]), pg_catalog.dolt_verify_constraints(), pg_catalog.dolt_verify_constraints(text[]) FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_patch(text,text), pg_catalog.dolt_patch(text,text,text), pg_catalog.dolt_schema_diff(text,text), pg_catalog.dolt_schema_diff(text,text,text), pg_catalog.dolt_ignore_table(text), pg_catalog.dolt_schemas_table(text), pg_catalog.dolt_procedures_table(text), pg_catalog.dolt_gc(), pg_catalog.dolt_gc(text[]), pg_catalog.dolt_purge_dropped_databases(), pg_catalog.dolt_undrop(text[]), pg_catalog.dolt_thread_dump() FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_rebase(text[]), pg_catalog.dolt_stash(text[]), pg_catalog.dolt_query_diff(text,text), pg_catalog.dolt_help(), pg_catalog.dolt_test_run(), pg_catalog.dolt_test_run(text) FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_stats_once(), pg_catalog.dolt_stats_wait(), pg_catalog.dolt_stats_flush(), pg_catalog.dolt_stats_stop(), pg_catalog.dolt_stats_restart(), pg_catalog.dolt_stats_gc(), pg_catalog.dolt_stats_purge(), pg_catalog.dolt_stats_info(), pg_catalog.dolt_stats_timers(text[]), pg_catalog.dolt_backup(text[]), pg_catalog.dolt_fetch(text[]), pg_catalog.dolt_push(text[]), pg_catalog.dolt_pull(text[]), pg_catalog.dolt_clone(text[]), pg_catalog.dolt_assume_cluster_role(text[]), pg_catalog.dolt_cluster_transition_to_standby(text[]) FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_diff(text,text,text), pg_catalog.dolt_diff(text,text), pg_catalog.dolt_diff_table(text,text,text), pg_catalog.dolt_commit_diff_table(text,text,text), pg_catalog.dolt_history_table(text), pg_catalog.dolt_blame_table(text), pg_catalog.dolt_workspace_table(text), pg_catalog.dolt_column_diff(), pg_catalog.dolt_diff_stat(text,text), pg_catalog.dolt_diff_stat(text,text,text) FROM PUBLIC;\n");
-	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_branches(), pg_catalog.dolt_status(), pg_catalog.dolt_merge_status(), pg_catalog.dolt_diff_changes(), pg_catalog.dolt_remote(), pg_catalog.dolt_remote(text[]) FROM PUBLIC;\n");
 	PG_CMD_PUTS("INSERT INTO pg_init_privs "
 				"  (objoid, classoid, objsubid, initprivs, privtype)"
 				"    SELECT"
@@ -1976,17 +1937,6 @@ setup_privileges(FILE *cmdfd)
 				"        pg_foreign_server"
 				"    WHERE"
 				"        srvacl IS NOT NULL;\n\n");
-}
-
-/*
- * Initialize the Dolt version-control repository in template1 so that every
- * database starts with a main branch whose initial commit records the
- * initial namespaces.
- */
-static void
-setup_dolt_repository(FILE *cmdfd)
-{
-	PG_CMD_PUTS("SELECT pg_catalog.dolt_init();\n\n");
 }
 
 /*
@@ -2846,6 +2796,7 @@ setup_data_file_paths(void)
 	set_input(&bki_file, "postgres.bki");
 	set_input(&hba_file, "pg_hba.conf.sample");
 	set_input(&ident_file, "pg_ident.conf.sample");
+	set_input(&hosts_file, "pg_hosts.conf.sample");
 	set_input(&conf_file, "postgresql.conf.sample");
 	set_input(&dictionary_file, "snowball_create.sql");
 	set_input(&info_schema_file, "information_schema.sql");
@@ -2861,12 +2812,12 @@ setup_data_file_paths(void)
 				"PGDATA=%s\nshare_path=%s\nPGPATH=%s\n"
 				"POSTGRES_SUPERUSERNAME=%s\nPOSTGRES_BKI=%s\n"
 				"POSTGRESQL_CONF_SAMPLE=%s\n"
-				"PG_HBA_SAMPLE=%s\nPG_IDENT_SAMPLE=%s\n",
+				"PG_HBA_SAMPLE=%s\nPG_IDENT_SAMPLE=%s\nPG_HOSTS_SAMPLE=%s\n",
 				PG_VERSION,
 				pg_data, share_path, bin_path,
 				username, bki_file,
 				conf_file,
-				hba_file, ident_file);
+				hba_file, ident_file, hosts_file);
 		if (show_setting)
 			exit(0);
 	}
@@ -2874,6 +2825,7 @@ setup_data_file_paths(void)
 	check_input(bki_file);
 	check_input(hba_file);
 	check_input(ident_file);
+	check_input(hosts_file);
 	check_input(conf_file);
 	check_input(dictionary_file);
 	check_input(info_schema_file);
@@ -2930,10 +2882,10 @@ setup_signals(void)
 	pqsignal(SIGQUIT, trapsig);
 
 	/* Ignore SIGPIPE when writing to backend, so we can clean up */
-	pqsignal(SIGPIPE, SIG_IGN);
+	pqsignal(SIGPIPE, PG_SIG_IGN);
 
 	/* Prevent SIGSYS so we can probe for kernel calls that might not work */
-	pqsignal(SIGSYS, SIG_IGN);
+	pqsignal(SIGSYS, PG_SIG_IGN);
 #endif
 }
 
@@ -3188,8 +3140,6 @@ initialize_data_directory(void)
 	setup_run_file(cmdfd, dictionary_file);
 
 	setup_privileges(cmdfd);
-
-	setup_dolt_repository(cmdfd);
 
 	setup_schema(cmdfd);
 

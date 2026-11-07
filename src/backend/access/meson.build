@@ -1,8 +1,7 @@
-# Copyright (c) 2022-2025, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 subdir('brin')
 subdir('common')
-subdir('dolt_prolly')
 subdir('gin')
 subdir('gist')
 subdir('hash')

@@ -3,7 +3,7 @@
  * nodeSort.c
  *	  Routines to handle sorting of relations.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -279,10 +279,14 @@ ExecInitSort(Sort *node, EState *estate, int eflags)
 	outerTupDesc = ExecGetResultType(outerPlanState(sortstate));
 
 	/*
-	 * We perform a Datum sort when we're sorting just a single column,
-	 * otherwise we perform a tuple sort.
+	 * We perform a Datum sort when we're sorting just a single column by a
+	 * single key, otherwise we perform a tuple sort.  You might think that
+	 * only 1 sort key would be relevant if there's only 1 output column since
+	 * all keys must be on that column, but the sort keys may differ in
+	 * collation, and if the first key's collation is nondeterministic then
+	 * ignoring subsequent keys could lead to an incorrect sort order.
 	 */
-	if (outerTupDesc->natts == 1)
+	if (outerTupDesc->natts == 1 && node->numCols == 1)
 		sortstate->datumSort = true;
 	else
 		sortstate->datumSort = false;

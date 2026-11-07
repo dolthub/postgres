@@ -19,7 +19,7 @@
  * routines.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -238,8 +238,8 @@ pqGetInt(int *result, size_t bytes, PGconn *conn)
 			break;
 		default:
 			pqInternalNotice(&conn->noticeHooks,
-							 "integer of size %lu not supported by pqGetInt",
-							 (unsigned long) bytes);
+							 "integer of size %zu not supported by pqGetInt",
+							 bytes);
 			return EOF;
 	}
 
@@ -271,8 +271,8 @@ pqPutInt(int value, size_t bytes, PGconn *conn)
 			break;
 		default:
 			pqInternalNotice(&conn->noticeHooks,
-							 "integer of size %lu not supported by pqPutInt",
-							 (unsigned long) bytes);
+							 "integer of size %zu not supported by pqPutInt",
+							 bytes);
 			return EOF;
 	}
 
@@ -1516,7 +1516,7 @@ libpq_ngettext(const char *msgid, const char *msgid_plural, unsigned long n)
  * newline.
  */
 void
-libpq_append_error(PQExpBuffer errorMessage, const char *fmt,...)
+libpq_append_error(PQExpBuffer errorMessage, const char *fmt, ...)
 {
 	int			save_errno = errno;
 	bool		done;
@@ -1545,7 +1545,7 @@ libpq_append_error(PQExpBuffer errorMessage, const char *fmt,...)
  * format should not end with a newline.
  */
 void
-libpq_append_conn_error(PGconn *conn, const char *fmt,...)
+libpq_append_conn_error(PGconn *conn, const char *fmt, ...)
 {
 	int			save_errno = errno;
 	bool		done;

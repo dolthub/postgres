@@ -135,51 +135,45 @@ select amname, prop, pg_indexam_has_property(a.oid, prop) as p
          with ordinality as u(prop,ord)
  where amtype = 'i'
  order by amname, ord;
-      amname       |     prop      | p 
--------------------+---------------+---
- brin              | can_order     | f
- brin              | can_unique    | f
- brin              | can_multi_col | t
- brin              | can_exclude   | f
- brin              | can_include   | f
- brin              | bogus         | 
- btree             | can_order     | t
- btree             | can_unique    | t
- btree             | can_multi_col | t
- btree             | can_exclude   | t
- btree             | can_include   | t
- btree             | bogus         | 
- dolt_prolly_index | can_order     | t
- dolt_prolly_index | can_unique    | t
- dolt_prolly_index | can_multi_col | t
- dolt_prolly_index | can_exclude   | t
- dolt_prolly_index | can_include   | t
- dolt_prolly_index | bogus         | 
- gin               | can_order     | f
- gin               | can_unique    | f
- gin               | can_multi_col | t
- gin               | can_exclude   | f
- gin               | can_include   | f
- gin               | bogus         | 
- gist              | can_order     | f
- gist              | can_unique    | f
- gist              | can_multi_col | t
- gist              | can_exclude   | t
- gist              | can_include   | t
- gist              | bogus         | 
- hash              | can_order     | f
- hash              | can_unique    | f
- hash              | can_multi_col | f
- hash              | can_exclude   | t
- hash              | can_include   | f
- hash              | bogus         | 
- spgist            | can_order     | f
- spgist            | can_unique    | f
- spgist            | can_multi_col | f
- spgist            | can_exclude   | t
- spgist            | can_include   | t
- spgist            | bogus         | 
-(42 rows)
+ amname |     prop      | p 
+--------+---------------+---
+ brin   | can_order     | f
+ brin   | can_unique    | f
+ brin   | can_multi_col | t
+ brin   | can_exclude   | f
+ brin   | can_include   | f
+ brin   | bogus         | 
+ btree  | can_order     | t
+ btree  | can_unique    | t
+ btree  | can_multi_col | t
+ btree  | can_exclude   | t
+ btree  | can_include   | t
+ btree  | bogus         | 
+ gin    | can_order     | f
+ gin    | can_unique    | f
+ gin    | can_multi_col | t
+ gin    | can_exclude   | f
+ gin    | can_include   | f
+ gin    | bogus         | 
+ gist   | can_order     | f
+ gist   | can_unique    | f
+ gist   | can_multi_col | t
+ gist   | can_exclude   | t
+ gist   | can_include   | t
+ gist   | bogus         | 
+ hash   | can_order     | f
+ hash   | can_unique    | f
+ hash   | can_multi_col | f
+ hash   | can_exclude   | t
+ hash   | can_include   | f
+ hash   | bogus         | 
+ spgist | can_order     | f
+ spgist | can_unique    | f
+ spgist | can_multi_col | f
+ spgist | can_exclude   | t
+ spgist | can_include   | t
+ spgist | bogus         | 
+(36 rows)
 
 --
 -- additional checks for pg_index_column_has_property

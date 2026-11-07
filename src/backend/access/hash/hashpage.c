@@ -3,7 +3,7 @@
  * hashpage.c
  *	  Hash table page management code for the Postgres hash access method
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -35,6 +35,7 @@
 #include "port/pg_bitutils.h"
 #include "storage/predicate.h"
 #include "storage/smgr.h"
+#include "utils/injection_point.h"
 #include "utils/rel.h"
 
 static bool _hash_alloc_buckets(Relation rel, BlockNumber firstblock,
@@ -630,6 +631,7 @@ _hash_expandtable(Relation rel, Buffer metabuf)
 	uint32		lowmask;
 	bool		metap_update_masks = false;
 	bool		metap_update_splitpoint = false;
+	XLogRecPtr	recptr;
 
 restart_expand:
 
@@ -900,7 +902,6 @@ restart_expand:
 	if (RelationNeedsWAL(rel))
 	{
 		xl_hash_split_allocate_page xlrec;
-		XLogRecPtr	recptr;
 
 		xlrec.new_bucket = maxbucket;
 		xlrec.old_bucket_flag = oopaque->hasho_flag;
@@ -933,11 +934,13 @@ restart_expand:
 		XLogRegisterData(&xlrec, SizeOfHashSplitAllocPage);
 
 		recptr = XLogInsert(RM_HASH_ID, XLOG_HASH_SPLIT_ALLOCATE_PAGE);
-
-		PageSetLSN(BufferGetPage(buf_oblkno), recptr);
-		PageSetLSN(BufferGetPage(buf_nblkno), recptr);
-		PageSetLSN(BufferGetPage(metabuf), recptr);
 	}
+	else
+		recptr = XLogGetFakeLSN(rel);
+
+	PageSetLSN(BufferGetPage(buf_oblkno), recptr);
+	PageSetLSN(BufferGetPage(buf_nblkno), recptr);
+	PageSetLSN(BufferGetPage(metabuf), recptr);
 
 	END_CRIT_SECTION();
 
@@ -1029,7 +1032,7 @@ _hash_alloc_buckets(Relation rel, BlockNumber firstblock, uint32 nblocks)
 					zerobuf.data,
 					true);
 
-	PageSetChecksumInplace(page, lastblock);
+	PageSetChecksum(page, lastblock);
 	smgrextend(RelationGetSmgr(rel), MAIN_FORKNUM, lastblock, zerobuf.data,
 			   false);
 
@@ -1092,6 +1095,7 @@ _hash_splitbucket(Relation rel,
 	Size		all_tups_size = 0;
 	int			i;
 	uint16		nitups = 0;
+	XLogRecPtr	recptr;
 
 	bucket_obuf = obuf;
 	opage = BufferGetPage(obuf);
@@ -1105,6 +1109,8 @@ _hash_splitbucket(Relation rel,
 	PredicateLockPageSplit(rel,
 						   BufferGetBlockNumber(bucket_obuf),
 						   BufferGetBlockNumber(bucket_nbuf));
+
+	INJECTION_POINT("hash-split-before-relocation", NULL);
 
 	/*
 	 * Partition the tuples in the old bucket between the old bucket and the
@@ -1296,7 +1302,6 @@ _hash_splitbucket(Relation rel,
 
 	if (RelationNeedsWAL(rel))
 	{
-		XLogRecPtr	recptr;
 		xl_hash_split_complete xlrec;
 
 		xlrec.old_bucket_flag = oopaque->hasho_flag;
@@ -1310,10 +1315,12 @@ _hash_splitbucket(Relation rel,
 		XLogRegisterBuffer(1, bucket_nbuf, REGBUF_STANDARD);
 
 		recptr = XLogInsert(RM_HASH_ID, XLOG_HASH_SPLIT_COMPLETE);
-
-		PageSetLSN(BufferGetPage(bucket_obuf), recptr);
-		PageSetLSN(BufferGetPage(bucket_nbuf), recptr);
 	}
+	else
+		recptr = XLogGetFakeLSN(rel);
+
+	PageSetLSN(BufferGetPage(bucket_obuf), recptr);
+	PageSetLSN(BufferGetPage(bucket_nbuf), recptr);
 
 	END_CRIT_SECTION();
 
@@ -1439,12 +1446,14 @@ _hash_finish_split(Relation rel, Buffer metabuf, Buffer obuf, Bucket obucket,
 	 */
 	if (!ConditionalLockBufferForCleanup(obuf))
 	{
+		_hash_dropbuf(rel, bucket_nbuf);
 		hash_destroy(tidhtab);
 		return;
 	}
 	if (!ConditionalLockBufferForCleanup(bucket_nbuf))
 	{
 		LockBuffer(obuf, BUFFER_LOCK_UNLOCK);
+		_hash_dropbuf(rel, bucket_nbuf);
 		hash_destroy(tidhtab);
 		return;
 	}
@@ -1452,6 +1461,8 @@ _hash_finish_split(Relation rel, Buffer metabuf, Buffer obuf, Bucket obucket,
 	npage = BufferGetPage(bucket_nbuf);
 	npageopaque = HashPageGetOpaque(npage);
 	nbucket = npageopaque->hasho_bucket;
+
+	INJECTION_POINT("hash-finish-incomplete-split", NULL);
 
 	_hash_splitbucket(rel, metabuf, obucket,
 					  nbucket, obuf, bucket_nbuf, tidhtab,
@@ -1473,18 +1484,20 @@ _hash_finish_split(Relation rel, Buffer metabuf, Buffer obuf, Bucket obucket,
 static void
 log_split_page(Relation rel, Buffer buf)
 {
+	XLogRecPtr	recptr;
+
 	if (RelationNeedsWAL(rel))
 	{
-		XLogRecPtr	recptr;
-
 		XLogBeginInsert();
 
 		XLogRegisterBuffer(0, buf, REGBUF_FORCE_IMAGE | REGBUF_STANDARD);
 
 		recptr = XLogInsert(RM_HASH_ID, XLOG_HASH_SPLIT_PAGE);
-
-		PageSetLSN(BufferGetPage(buf), recptr);
 	}
+	else
+		recptr = XLogGetFakeLSN(rel);
+
+	PageSetLSN(BufferGetPage(buf), recptr);
 }
 
 /*

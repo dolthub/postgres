@@ -2,7 +2,7 @@
  * brin_minmax_multi.c
  *		Implementation of Multi Min/Max opclass for BRIN
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -69,6 +69,7 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_amop.h"
 #include "catalog/pg_type.h"
+#include "nodes/miscnodes.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
@@ -77,6 +78,7 @@
 #include "utils/inet.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/numeric.h"
 #include "utils/pg_lsn.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
@@ -130,8 +132,6 @@ typedef struct MinMaxMultiOptions
 		((opts) && (((MinMaxMultiOptions *) (opts))->valuesPerRange != 0) ? \
 		 ((MinMaxMultiOptions *) (opts))->valuesPerRange : \
 		 MINMAX_MULTI_DEFAULT_VALUES_PER_PAGE)
-
-#define SAMESIGN(a,b) (((a) < 0) == ((b) < 0))
 
 /*
  * The summary of minmax-multi indexes has two representations - Ranges for
@@ -276,7 +276,7 @@ static int	compare_values(const void *a, const void *b, void *arg);
  * function (which should be BTLessStrategyNumber).
  */
 static void
-AssertArrayOrder(FmgrInfo *cmp, Oid colloid, Datum *values, int nvalues)
+AssertArrayOrder(FmgrInfo *cmp, Oid colloid, const Datum *values, int nvalues)
 {
 	int			i;
 	Datum		lt;
@@ -624,7 +624,7 @@ brin_range_serialize(Ranges *range)
 
 		for (i = 0; i < nvalues; i++)
 		{
-			len += VARSIZE_ANY(range->values[i]);
+			len += VARSIZE_ANY(DatumGetPointer(range->values[i]));
 		}
 	}
 	else if (typlen == -2)		/* cstring */
@@ -712,7 +712,7 @@ brin_range_serialize(Ranges *range)
 
 /*
  * brin_range_deserialize
- *	  Serialize the in-memory representation into a compact varlena value.
+ *	  Deserialize a compact varlena value into the in-memory representation.
  *
  * Simply copy the header and then also the individual values, as stored
  * in the in-memory value array.
@@ -857,8 +857,8 @@ brin_range_deserialize(int maxvalues, SerializedRanges *serialized)
 static int
 compare_expanded_ranges(const void *a, const void *b, void *arg)
 {
-	ExpandedRange *ra = (ExpandedRange *) a;
-	ExpandedRange *rb = (ExpandedRange *) b;
+	const ExpandedRange *ra = a;
+	const ExpandedRange *rb = b;
 	Datum		r;
 
 	compare_context *cxt = (compare_context *) arg;
@@ -895,8 +895,8 @@ compare_expanded_ranges(const void *a, const void *b, void *arg)
 static int
 compare_values(const void *a, const void *b, void *arg)
 {
-	Datum	   *da = (Datum *) a;
-	Datum	   *db = (Datum *) b;
+	const Datum *da = a;
+	const Datum *db = b;
 	Datum		r;
 
 	compare_context *cxt = (compare_context *) arg;
@@ -1304,8 +1304,8 @@ merge_overlapping_ranges(FmgrInfo *cmp, Oid colloid,
 static int
 compare_distances(const void *a, const void *b)
 {
-	DistanceValue *da = (DistanceValue *) a;
-	DistanceValue *db = (DistanceValue *) b;
+	const DistanceValue *da = a;
+	const DistanceValue *db = b;
 
 	if (da->value < db->value)
 		return 1;
@@ -1340,7 +1340,7 @@ build_distances(FmgrInfo *distanceFn, Oid colloid,
 		return NULL;
 
 	ndistances = (neranges - 1);
-	distances = (DistanceValue *) palloc0(sizeof(DistanceValue) * ndistances);
+	distances = palloc0_array(DistanceValue, ndistances);
 
 	/*
 	 * Walk through the ranges once and compute the distance between the
@@ -1504,7 +1504,7 @@ reduce_expanded_ranges(ExpandedRange *eranges, int neranges,
 
 	/* allocate space for the boundary values */
 	nvalues = 0;
-	values = (Datum *) palloc(sizeof(Datum) * max_values);
+	values = palloc_array(Datum, max_values);
 
 	/* add the global min/max values, from the first/last range */
 	values[nvalues++] = eranges[0].minval;
@@ -1992,8 +1992,8 @@ brin_minmax_multi_distance_tid(PG_FUNCTION_ARGS)
 	double		da1,
 				da2;
 
-	ItemPointer pa1 = (ItemPointer) PG_GETARG_DATUM(0);
-	ItemPointer pa2 = (ItemPointer) PG_GETARG_DATUM(1);
+	ItemPointer pa1 = (ItemPointer) PG_GETARG_POINTER(0);
+	ItemPointer pa2 = (ItemPointer) PG_GETARG_POINTER(1);
 
 	/*
 	 * We know the values are range boundaries, but the range may be collapsed
@@ -2005,10 +2005,10 @@ brin_minmax_multi_distance_tid(PG_FUNCTION_ARGS)
 	 * We use the no-check variants here, because user-supplied values may
 	 * have (ip_posid == 0). See ItemPointerCompare.
 	 */
-	da1 = ItemPointerGetBlockNumberNoCheck(pa1) * MaxHeapTuplesPerPage +
+	da1 = (double) ItemPointerGetBlockNumberNoCheck(pa1) * MaxHeapTuplesPerPage +
 		ItemPointerGetOffsetNumberNoCheck(pa1);
 
-	da2 = ItemPointerGetBlockNumberNoCheck(pa2) * MaxHeapTuplesPerPage +
+	da2 = (double) ItemPointerGetBlockNumberNoCheck(pa2) * MaxHeapTuplesPerPage +
 		ItemPointerGetOffsetNumberNoCheck(pa2);
 
 	PG_RETURN_FLOAT8(da2 - da1);
@@ -2020,19 +2020,45 @@ brin_minmax_multi_distance_tid(PG_FUNCTION_ARGS)
 Datum
 brin_minmax_multi_distance_numeric(PG_FUNCTION_ARGS)
 {
-	Datum		d;
-	Datum		a1 = PG_GETARG_DATUM(0);
-	Datum		a2 = PG_GETARG_DATUM(1);
+	Numeric		d;
+	Numeric		a1 = PG_GETARG_NUMERIC(0);
+	Numeric		a2 = PG_GETARG_NUMERIC(1);
+	float8		distance;
+	ErrorSaveContext escontext = {T_ErrorSaveContext};
+
+	/* if both values are NaN, then we consider them the same */
+	if (numeric_is_nan(a1) && numeric_is_nan(a2))
+		PG_RETURN_FLOAT8(0.0);
+
+	/* if one value is NaN, use infinite distance */
+	if (numeric_is_nan(a1) || numeric_is_nan(a2))
+		PG_RETURN_FLOAT8(get_float8_infinity());
 
 	/*
 	 * We know the values are range boundaries, but the range may be collapsed
 	 * (i.e. single points), with equal values.
 	 */
-	Assert(DatumGetBool(DirectFunctionCall2(numeric_le, a1, a2)));
+	Assert(DatumGetBool(DirectFunctionCall2(numeric_le, NumericGetDatum(a1),
+											NumericGetDatum(a2))));
 
-	d = DirectFunctionCall2(numeric_sub, a2, a1);	/* a2 - a1 */
+	/*
+	 * Calculate the float8 distance in an overflow-safe way. Return infinity
+	 * instead of error-ing out.
+	 */
+	d = numeric_sub_safe(a2, a1, (Node *) &escontext);
+	if (SOFT_ERROR_OCCURRED(&escontext))
+		distance = get_float8_infinity();
+	else
+	{
+		distance = DatumGetFloat8(DirectFunctionCall1(numeric_float8_no_overflow,
+													  NumericGetDatum(d)));
+		pfree(d);
+	}
 
-	PG_RETURN_DATUM(DirectFunctionCall1(numeric_float8, d));
+	PG_FREE_IF_COPY(a1, 0);
+	PG_FREE_IF_COPY(a2, 1);
+
+	PG_RETURN_FLOAT8(distance);
 }
 
 /*
@@ -2414,7 +2440,7 @@ brin_minmax_multi_add_value(PG_FUNCTION_ARGS)
 	BrinDesc   *bdesc = (BrinDesc *) PG_GETARG_POINTER(0);
 	BrinValues *column = (BrinValues *) PG_GETARG_POINTER(1);
 	Datum		newval = PG_GETARG_DATUM(2);
-	bool		isnull PG_USED_FOR_ASSERTS_ONLY = PG_GETARG_DATUM(3);
+	bool		isnull PG_USED_FOR_ASSERTS_ONLY = PG_GETARG_BOOL(3);
 	MinMaxMultiOptions *opts = (MinMaxMultiOptions *) PG_GET_OPCLASS_OPTIONS();
 	Oid			colloid = PG_GET_COLLATION();
 	bool		modified = false;
@@ -2932,7 +2958,7 @@ minmax_multi_get_strategy_procinfo(BrinDesc *bdesc, uint16 attno, Oid subtype,
 		tuple = SearchSysCache4(AMOPSTRATEGY, ObjectIdGetDatum(opfamily),
 								ObjectIdGetDatum(attr->atttypid),
 								ObjectIdGetDatum(subtype),
-								Int16GetDatum(strategynum));
+								UInt16GetDatum(strategynum));
 		if (!HeapTupleIsValid(tuple))
 			elog(ERROR, "missing operator %d(%u,%u) in opfamily %u",
 				 strategynum, attr->atttypid, subtype, opfamily);

@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2025, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 use strict;
 use warnings FATAL => 'all';
@@ -51,8 +51,15 @@ my $SERVERHOSTCIDR = '127.0.0.1/32';
 my $supports_sslcertmode_require =
   check_pg_config("#define HAVE_SSL_CTX_SET_CERT_CB 1");
 
+# Set of default settings for SSL parameters in connection string.  This
+# makes the tests protected against any defaults the environment may have
+# in ~/.postgresql/.
+my $default_ssl_connstr =
+  "sslkey=invalid sslcert=invalid sslrootcert=invalid sslcrl=invalid sslcrldir=invalid";
+
 # Allocation of base connection string shared among multiple tests.
-my $common_connstr;
+my $common_connstr =
+  "$default_ssl_connstr user=ssltestuser dbname=trustdb hostaddr=$SERVERHOSTADDR host=common-name.pg-ssltest.test";
 
 #### Set up the server.
 
@@ -72,11 +79,16 @@ $node->start;
 my $result = $node->safe_psql('postgres', "SHOW ssl_library");
 is($result, $ssl_server->ssl_library(), 'ssl_library parameter');
 
+my $exec_backend = $node->safe_psql('postgres', 'SHOW debug_exec_backend');
+chomp($exec_backend);
+
 $ssl_server->configure_test_server_for_ssl($node, $SERVERHOSTADDR,
 	$SERVERHOSTCIDR, 'trust');
 
 note "testing password-protected keys";
 
+# Test a passphrase command which fails to unlock the private key, the server
+# should not start at all.
 switch_server_cert(
 	$node,
 	certfile => 'server-cn-only',
@@ -85,20 +97,83 @@ switch_server_cert(
 	passphrase_cmd => 'echo wrongpassword',
 	restart => 'no');
 
-$result = $node->restart(fail_ok => 1);
+$result = $node->restart(
+	fail_ok => 1,
+	log_like => qr/could not load private key file/);
 is($result, 0,
 	'restart fails with password-protected key file with wrong password');
 
+# Test a passphrase command which successfully unlocks the private key but
+# which doesn't support reloading.  Unlocking the private key will fail when
+# reloading and the already existing SSL context will remain in place, with
+# connections still accepted.  EXEC_BACKEND builds will reload the SSL context
+# on each backend startup, so command reloading must be enabled or else
+# connections will fail.
 switch_server_cert(
 	$node,
 	certfile => 'server-cn-only',
 	cafile => 'root+client_ca',
 	keyfile => 'server-password',
 	passphrase_cmd => 'echo secret1',
+	passphrase_cmd_reload => 'off',
 	restart => 'no');
 
-$result = $node->restart(fail_ok => 1);
+$result = $node->restart(
+	fail_ok => 1,
+	log_unlike => qr/could not load private key file/);
 is($result, 1, 'restart succeeds with password-protected key file');
+
+if ($exec_backend =~ /on/)
+{
+	$node->connect_fails(
+		"$common_connstr sslrootcert=ssl/root+server_ca.crt sslmode=require",
+		"connect with correct server CA cert file sslmode=require",
+		expected_stderr => qr/\Qserver does not support SSL\E/);
+}
+else
+{
+	$node->connect_ok(
+		"$common_connstr sslrootcert=ssl/root+server_ca.crt sslmode=require",
+		"connect with correct server CA cert file sslmode=require");
+}
+
+# Reloading should fail since we cannot execute the passphrase command
+$node->reload();
+my $log_start = $node->wait_for_log(
+	qr/cannot be reloaded because it requires a passphrase/);
+
+# Test a passphrase command which successfully unlocks the private key, and
+# which can be reloaded.  The server should start and connections be accepted.
+switch_server_cert(
+	$node,
+	certfile => 'server-cn-only',
+	cafile => 'root+client_ca',
+	keyfile => 'server-password',
+	passphrase_cmd => 'echo secret1',
+	passphrase_cmd_reload => 'on',
+	restart => 'no');
+
+$result = $node->restart(
+	fail_ok => 1,
+	log_unlike => qr/could not load private key file/);
+is($result, 1, 'restart succeeds with password-protected key file');
+$node->connect_ok(
+	"$common_connstr sslrootcert=ssl/root+server_ca.crt sslmode=require",
+	"connect with correct server CA cert file sslmode=require");
+
+# Reloading the config should execute the passphrase reload command and
+# successfully reload the private key.
+$node->reload();
+$log_start =
+  $node->wait_for_log(qr/reloading configuration files/, $log_start);
+$node->log_check(
+	"passphrase could reload private key",
+	$log_start,
+	log_unlike => [ qr/cannot be reloaded because it requires a passphrase/, ]
+);
+$node->connect_ok(
+	"$common_connstr sslrootcert=ssl/root+server_ca.crt sslmode=require",
+	"connect with correct server CA cert file sslmode=require");
 
 # Test compatibility of SSL protocols.
 # TLSv1.1 is lower than TLSv1.2, so it won't work.
@@ -138,15 +213,6 @@ $result = $node->restart(fail_ok => 1);
 note "running client tests";
 
 switch_server_cert($node, certfile => 'server-cn-only');
-
-# Set of default settings for SSL parameters in connection string.  This
-# makes the tests protected against any defaults the environment may have
-# in ~/.postgresql/.
-my $default_ssl_connstr =
-  "sslkey=invalid sslcert=invalid sslrootcert=invalid sslcrl=invalid sslcrldir=invalid";
-
-$common_connstr =
-  "$default_ssl_connstr user=ssltestuser dbname=trustdb hostaddr=$SERVERHOSTADDR host=common-name.pg-ssltest.test";
 
 SKIP:
 {
@@ -314,11 +380,11 @@ switch_server_cert($node, certfile => 'server-ip-cn-only');
 $common_connstr =
   "$default_ssl_connstr user=ssltestuser dbname=trustdb sslrootcert=ssl/root+server_ca.crt hostaddr=$SERVERHOSTADDR sslmode=verify-full";
 
-$node->connect_ok("$common_connstr host=192.0.2.1",
+$node->connect_ok("$common_connstr host=192.0.2.1 sslsni=0",
 	"IP address in the Common Name");
 
 $node->connect_fails(
-	"$common_connstr host=192.000.002.001",
+	"$common_connstr host=192.000.002.001 sslsni=0",
 	"mismatch between host name and server certificate IP address",
 	expected_stderr =>
 	  qr/\Qserver certificate for "192.0.2.1" does not match host name "192.000.002.001"\E/
@@ -328,7 +394,7 @@ $node->connect_fails(
 # long-standing behavior.)
 switch_server_cert($node, certfile => 'server-ip-in-dnsname');
 
-$node->connect_ok("$common_connstr host=192.0.2.1",
+$node->connect_ok("$common_connstr host=192.0.2.1 sslsni=0",
 	"IP address in a dNSName");
 
 # Test Subject Alternative Names.
@@ -819,7 +885,8 @@ $node->connect_fails(
 	"$common_connstr user=ssltestuser sslcert=ssl/client-revoked.crt "
 	  . sslkey('client-revoked.key'),
 	"certificate authorization fails with revoked client cert",
-	expected_stderr => qr!SSL error: (ssl[a-z0-9/]*|tls) alert certificate revoked!,
+	expected_stderr =>
+	  qr!SSL error: (ssl[a-z0-9/]*|tls) alert certificate revoked!,
 	log_like => [
 		qr{Client certificate verification failed at depth 0: certificate revoked},
 		qr{Failed certificate data \(unverified\): subject "/CN=ssltestuser", serial number \d+, issuer "/CN=Test CA for PostgreSQL SSL regression test client certs"},
@@ -921,7 +988,8 @@ $node->connect_fails(
 	"$common_connstr user=ssltestuser sslcert=ssl/client-revoked.crt "
 	  . sslkey('client-revoked.key'),
 	"certificate authorization fails with revoked client cert with server-side CRL directory",
-	expected_stderr => qr!SSL error: (ssl[a-z0-9/]*|tls) alert certificate revoked!,
+	expected_stderr =>
+	  qr!SSL error: (ssl[a-z0-9/]*|tls) alert certificate revoked!,
 	log_like => [
 		qr{Client certificate verification failed at depth 0: certificate revoked},
 		qr{Failed certificate data \(unverified\): subject "/CN=ssltestuser", serial number \d+, issuer "/CN=Test CA for PostgreSQL SSL regression test client certs"},
@@ -932,10 +1000,67 @@ $node->connect_fails(
 	"$common_connstr user=ssltestuser sslcert=ssl/client-revoked-utf8.crt "
 	  . sslkey('client-revoked-utf8.key'),
 	"certificate authorization fails with revoked UTF-8 client cert with server-side CRL directory",
-	expected_stderr => qr!SSL error: (ssl[a-z0-9/]*|tls) alert certificate revoked!,
+	expected_stderr =>
+	  qr!SSL error: (ssl[a-z0-9/]*|tls) alert certificate revoked!,
 	log_like => [
 		qr{Client certificate verification failed at depth 0: certificate revoked},
 		qr{Failed certificate data \(unverified\): subject "/CN=\\xce\\x9f\\xce\\xb4\\xcf\\x85\\xcf\\x83\\xcf\\x83\\xce\\xad\\xce\\xb1\\xcf\\x82", serial number \d+, issuer "/CN=Test CA for PostgreSQL SSL regression test client certs"},
 	]);
+
+SKIP:
+{
+	skip "sslmode require not supported in this build", 4
+	  unless ($supports_sslcertmode_require);
+
+	# Test client CAs
+	my $connstr =
+	  "user=ssltestuser dbname=certdb hostaddr=$SERVERHOSTADDR sslmode=require sslsni=1";
+
+	switch_server_cert($node, certfile => 'server-cn-only', cafile => '');
+	# example.org is unconfigured and should fail.
+	$node->connect_fails(
+		"$connstr host=example.org sslcertmode=require sslcert=ssl/client.crt"
+		  . sslkey('client.key'),
+		"host: 'example.org', ca: '': connect with sslcert, no client CA configured",
+		expected_stderr =>
+		  qr/client certificates can only be checked if a root certificate store is available/
+	);
+
+	# example.com uses the client CA.
+	switch_server_cert(
+		$node,
+		certfile => 'server-cn-only',
+		cafile => 'root+client_ca');
+	# example.com is configured and should require a valid client cert.
+	$node->connect_fails(
+		"$connstr host=example.com sslcertmode=disable",
+		"host: 'example.com', ca: 'root+client_ca.crt': connect fails if no client certificate sent",
+		expected_stderr => qr/connection requires a valid client certificate/
+	);
+	$node->connect_ok(
+		"$connstr host=example.com sslcertmode=require sslcert=ssl/client.crt "
+		  . sslkey('client.key'),
+		"host: 'example.com', ca: 'root+client_ca.crt': connect with sslcert, client certificate sent"
+	);
+
+	# example.net uses the server CA (which is wrong).
+	switch_server_cert(
+		$node,
+		certfile => 'server-cn-only',
+		cafile => 'root+server_ca');
+	# example.net is configured and should require a client cert, but will
+	# always fail verification.
+	$node->connect_fails(
+		"$connstr host=example.net sslcertmode=disable",
+		"host: 'example.net', ca: 'root+server_ca.crt': connect fails if no client certificate sent",
+		expected_stderr => qr/connection requires a valid client certificate/
+	);
+
+	$node->connect_fails(
+		"$connstr host=example.net sslcertmode=require sslcert=ssl/client.crt "
+		  . sslkey('client.key'),
+		"host: 'example.net', ca: 'root+server_ca.crt': connect with sslcert, client certificate sent",
+		expected_stderr => qr/unknown ca/);
+}
 
 done_testing();

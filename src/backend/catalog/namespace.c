@@ -9,7 +9,7 @@
  * and implementing search-path-controlled searches.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -18,9 +18,6 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "catalog/catalogview.h"
-#include "access/doltcatalog.h"
-#include "access/doltsystem.h"
 
 #include "access/htup_details.h"
 #include "access/parallel.h"
@@ -44,7 +41,6 @@
 #include "catalog/pg_ts_parser.h"
 #include "catalog/pg_ts_template.h"
 #include "catalog/pg_type.h"
-#include "commands/dbcommands.h"
 #include "common/hashfn_unstable.h"
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
@@ -52,6 +48,7 @@
 #include "nodes/makefuncs.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
+#include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -213,9 +210,6 @@ static SubTransactionId myTempNamespaceSubID = InvalidSubTransactionId;
  */
 char	   *namespace_search_path = NULL;
 
-/* Opt-in experimental branch catalog projection; NULL in ordinary servers. */
-rangevar_projection_hook_type rangevar_projection_hook = NULL;
-
 
 /* Local functions */
 static bool RelationIsVisibleExt(Oid relid, bool *is_missing);
@@ -236,10 +230,11 @@ static void AccessTempTableNamespace(bool force);
 static void InitTempTableNamespace(void);
 static void RemoveTempRelations(Oid tempNamespaceId);
 static void RemoveTempRelationsCallback(int code, Datum arg);
-static void InvalidationCallback(Datum arg, int cacheid, uint32 hashvalue);
+static void InvalidationCallback(Datum arg, SysCacheIdentifier cacheid,
+								 uint32 hashvalue);
 static bool MatchNamedCall(HeapTuple proctup, int nargs, List *argnames,
 						   bool include_out_arguments, int pronargs,
-						   int **argnumbers);
+						   int **argnumbers, int *fgc_flags);
 
 /*
  * Recomputing the namespace path can be costly when done frequently, such as
@@ -454,43 +449,6 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 	bool		retry = false;
 	bool		missing_ok = (flags & RVR_MISSING_OK) != 0;
 
-	if (dg_catalog_lookup_relation(relation, missing_ok, &relId))
-	{
-		if (callback)
-			callback(relation, relId, InvalidOid, callback_arg);
-
-		/*
-		 * Branch-head relations have durable OIDs and lock like any other, as
-		 * do native relations found from a provisional view.
-		 */
-		if (OidIsValid(relId) && !CatalogViewIsLeased(relId) && lockmode != NoLock)
-		{
-			if (flags & (RVR_NOWAIT | RVR_SKIP_LOCKED))
-			{
-				if (!ConditionalLockRelationOid(relId, lockmode))
-				{
-					if (flags & RVR_SKIP_LOCKED)
-						return InvalidOid;
-					ereport(ERROR,
-							(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
-							 errmsg("could not obtain lock on relation \"%s\"",
-									relation->relname)));
-				}
-			}
-			else
-				LockRelationOid(relId, lockmode);
-		}
-		return relId;
-	}
-
-	/* Project names before lookup; retain the normal permission/lock path. */
-	if (rangevar_projection_hook)
-	{
-		relation = rangevar_projection_hook(relation);
-		if (relation == NULL)
-			elog(ERROR, "relation projection hook returned NULL");
-	}
-
 	/* verify that flags do no conflict */
 	Assert(!((flags & RVR_NOWAIT) && (flags & RVR_SKIP_LOCKED)));
 
@@ -575,9 +533,6 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 				relId = InvalidOid;
 			else
 				relId = get_relname_relid(relation->relname, namespaceId);
-			/* schema.dolt_<table> aliases the built-in system table. */
-			if (!OidIsValid(relId))
-				relId = dg_system_relation(relation);
 		}
 		else
 		{
@@ -826,14 +781,6 @@ RangeVarGetAndCheckCreationNamespace(RangeVar *relation,
 		else
 			relid = InvalidOid;
 
-		/* A catalog view names its schemas with OIDs of its own. */
-		if (existing_relation_id != NULL && !OidIsValid(relid) && CatalogViewCurrent())
-			relid = get_relname_relid(relation->relname, CatalogViewNamespace(CatalogViewCurrent(), nspid));
-
-		/* A native relation must not shadow a table on the session's branch. */
-		if (existing_relation_id != NULL && !OidIsValid(relid))
-			relid = BranchRelnameGetRelid(relation->relname, nspid);
-
 		/*
 		 * In bootstrap processing mode, we don't bother with permissions or
 		 * locking.  Permissions might not be working yet, and locking is
@@ -893,28 +840,6 @@ RangeVarGetAndCheckCreationNamespace(RangeVar *relation,
 }
 
 /*
- * BranchRelnameGetRelid
- *		The OID of the table or index |relname| in namespace |nspid| on the
- *		session's branch, or InvalidOid. Native relations must not take a
- *		name the branch uses.
- */
-Oid
-BranchRelnameGetRelid(const char *relname, Oid nspid)
-{
-	RangeVar   *qualified;
-	Oid			relid;
-
-	/* Provisional DDL resolves names in its own view of the branch. */
-	if (isTempOrTempToastNamespace(nspid) || IsCatalogNamespace(nspid) ||
-		CatalogViewIsProvisional(CatalogViewCurrent()))
-		return InvalidOid;
-	qualified = makeRangeVar(get_namespace_name(nspid), pstrdup(relname), -1);
-	if (dg_catalog_lookup_relation(qualified, true, &relid))
-		return relid;
-	return InvalidOid;
-}
-
-/*
  * Adjust the relpersistence for an about-to-be-created relation based on the
  * creation namespace, and throw an error for invalid combinations.
  */
@@ -967,7 +892,7 @@ RelnameGetRelid(const char *relname)
 
 	foreach(l, activeSearchPath)
 	{
-		Oid			namespaceId = CatalogViewNamespace(CatalogViewCurrent(), lfirst_oid(l));
+		Oid			namespaceId = lfirst_oid(l);
 
 		relid = get_relname_relid(relname, namespaceId);
 		if (OidIsValid(relid))
@@ -1016,12 +941,6 @@ RelationIsVisibleExt(Oid relid, bool *is_missing)
 		elog(ERROR, "cache lookup failed for relation %u", relid);
 	}
 	relform = (Form_pg_class) GETSTRUCT(reltup);
-	if (dg_catalog_relation_visible(relid, NameStr(relform->relname), &visible))
-	{
-		ReleaseSysCache(reltup);
-		return visible;
-	}
-
 
 	recomputeNamespacePath();
 
@@ -1092,9 +1011,6 @@ TypenameGetTypidExtended(const char *typname, bool temp_ok)
 	Oid			typid;
 	ListCell   *l;
 
-	if (dg_catalog_lookup_type(NULL, typname, temp_ok, &typid))
-		return typid;
-
 	recomputeNamespacePath();
 
 	foreach(l, activeSearchPath)
@@ -1153,12 +1069,6 @@ TypeIsVisibleExt(Oid typid, bool *is_missing)
 	}
 	typform = (Form_pg_type) GETSTRUCT(typtup);
 
-	if (dg_catalog_type_visible(typid, NameStr(typform->typname), &visible))
-	{
-		ReleaseSysCache(typtup);
-		return visible;
-	}
-
 	recomputeNamespacePath();
 
 	/*
@@ -1209,15 +1119,15 @@ TypeIsVisibleExt(Oid typid, bool *is_missing)
 
 /*
  * FuncnameGetCandidates
- *		Given a possibly-qualified function name and argument count,
+ *		Given a possibly-qualified routine name, argument count, and arg names,
  *		retrieve a list of the possible matches.
  *
- * If nargs is -1, we return all functions matching the given name,
+ * If nargs is -1, we return all routines matching the given name,
  * regardless of argument count.  (argnames must be NIL, and expand_variadic
  * and expand_defaults must be false, in this case.)
  *
  * If argnames isn't NIL, we are considering a named- or mixed-notation call,
- * and only functions having all the listed argument names will be returned.
+ * and only routines having all the listed argument names will be returned.
  * (We assume that length(argnames) <= nargs and all the passed-in names are
  * distinct.)  The returned structs will include an argnumbers array showing
  * the actual argument index for each logical argument position.
@@ -1275,40 +1185,21 @@ TypeIsVisibleExt(Oid typid, bool *is_missing)
  * The caller might end up discarding such an entry anyway, but if it selects
  * such an entry it should react as though the call were ambiguous.
  *
- * If missing_ok is true, an empty list (NULL) is returned if the name was
- * schema-qualified with a schema that does not exist.  Likewise if no
- * candidate is found for other reasons.
+ * We return an empty list (NULL) if no suitable matches can be found.
+ * If the function name was schema-qualified with a schema that does not
+ * exist, then we return an empty list if missing_ok is true and otherwise
+ * throw an error.  (missing_ok does not affect the behavior otherwise.)
+ *
+ * The output argument *fgc_flags is filled with a bitmask indicating how
+ * far we were able to match the supplied information.  This is not of much
+ * interest if any candidates were found, but if not, it can help callers
+ * produce an on-point error message.
  */
-static FuncCandidateList FuncnameGetCandidatesInContext(List *, int, List *, bool, bool, bool, bool);
-
 FuncCandidateList
 FuncnameGetCandidates(List *names, int nargs, List *argnames,
 					  bool expand_variadic, bool expand_defaults,
-					  bool include_out_arguments, bool missing_ok)
-{
-	CatalogView *previous = CatalogViewCurrent();
-	CatalogView *session = dg_catalog_session_view();
-	FuncCandidateList result;
-
-	/* The branch's view holds built-in, server and versioned routines alike. */
-	CatalogViewSwitch(session);
-	PG_TRY();
-	{
-		result = FuncnameGetCandidatesInContext(names, nargs, argnames, expand_variadic,
-												expand_defaults, include_out_arguments, missing_ok);
-	}
-	PG_FINALLY();
-	{
-		CatalogViewSwitch(previous);
-	}
-	PG_END_TRY();
-	return result;
-}
-
-static FuncCandidateList
-FuncnameGetCandidatesInContext(List *names, int nargs, List *argnames,
-							   bool expand_variadic, bool expand_defaults,
-							   bool include_out_arguments, bool missing_ok)
+					  bool include_out_arguments, bool missing_ok,
+					  int *fgc_flags)
 {
 	FuncCandidateList resultList = NULL;
 	bool		any_special = false;
@@ -1321,15 +1212,20 @@ FuncnameGetCandidatesInContext(List *names, int nargs, List *argnames,
 	/* check for caller error */
 	Assert(nargs >= 0 || !(expand_variadic | expand_defaults));
 
+	/* initialize output fgc_flags to empty */
+	*fgc_flags = 0;
+
 	/* deconstruct the name list */
 	DeconstructQualifiedName(names, &schemaname, &funcname);
 
 	if (schemaname)
 	{
 		/* use exact schema given */
-		namespaceId = CatalogViewNamespace(CatalogViewCurrent(), LookupExplicitNamespace(schemaname, missing_ok));
+		*fgc_flags |= FGC_SCHEMA_GIVEN; /* report that a schema is given */
+		namespaceId = LookupExplicitNamespace(schemaname, missing_ok);
 		if (!OidIsValid(namespaceId))
 			return NULL;
+		*fgc_flags |= FGC_SCHEMA_EXISTS;	/* report that the schema exists */
 	}
 	else
 	{
@@ -1355,6 +1251,8 @@ FuncnameGetCandidatesInContext(List *names, int nargs, List *argnames,
 		int		   *argnumbers = NULL;
 		FuncCandidateList newResult;
 
+		*fgc_flags |= FGC_NAME_EXISTS;	/* the name is present in pg_proc */
+
 		if (OidIsValid(namespaceId))
 		{
 			/* Consider only procs in specified namespace */
@@ -1371,7 +1269,7 @@ FuncnameGetCandidatesInContext(List *names, int nargs, List *argnames,
 
 			foreach(nsp, activeSearchPath)
 			{
-				if (procform->pronamespace == CatalogViewNamespace(CatalogViewCurrent(), lfirst_oid(nsp)) &&
+				if (procform->pronamespace == lfirst_oid(nsp) &&
 					procform->pronamespace != myTempNamespace)
 					break;
 				pathpos++;
@@ -1379,6 +1277,8 @@ FuncnameGetCandidatesInContext(List *names, int nargs, List *argnames,
 			if (nsp == NULL)
 				continue;		/* proc is not in search path */
 		}
+
+		*fgc_flags |= FGC_NAME_VISIBLE; /* routine is in the right schema */
 
 		/*
 		 * If we are asked to match to OUT arguments, then use the
@@ -1414,16 +1314,6 @@ FuncnameGetCandidatesInContext(List *names, int nargs, List *argnames,
 			/*
 			 * Call uses named or mixed notation
 			 *
-			 * Named or mixed notation can match a variadic function only if
-			 * expand_variadic is off; otherwise there is no way to match the
-			 * presumed-nameless parameters expanded from the variadic array.
-			 */
-			if (OidIsValid(procform->provariadic) && expand_variadic)
-				continue;
-			va_elem_type = InvalidOid;
-			variadic = false;
-
-			/*
 			 * Check argument count.
 			 */
 			Assert(nargs >= 0); /* -1 not supported with argnames */
@@ -1442,11 +1332,32 @@ FuncnameGetCandidatesInContext(List *names, int nargs, List *argnames,
 			if (pronargs != nargs && !use_defaults)
 				continue;
 
+			/* We found a routine with a suitable number of arguments */
+			*fgc_flags |= FGC_ARGCOUNT_MATCH;
+
 			/* Check for argument name match, generate positional mapping */
 			if (!MatchNamedCall(proctup, nargs, argnames,
 								include_out_arguments, pronargs,
-								&argnumbers))
+								&argnumbers, fgc_flags))
 				continue;
+
+			/*
+			 * Named or mixed notation can match a variadic function only if
+			 * expand_variadic is off; otherwise there is no way to match the
+			 * presumed-nameless parameters expanded from the variadic array.
+			 * However, we postpone the check until here because we want to
+			 * perform argument name matching anyway (using the variadic array
+			 * argument's name).  This allows us to give an on-point error
+			 * message if the user forgets to say VARIADIC in what would have
+			 * been a valid call with it.
+			 */
+			if (OidIsValid(procform->provariadic) && expand_variadic)
+				continue;
+			va_elem_type = InvalidOid;
+			variadic = false;
+
+			/* We found a fully-valid call using argument names */
+			*fgc_flags |= FGC_ARGNAMES_VALID;
 
 			/* Named argument matching is always "special" */
 			any_special = true;
@@ -1489,6 +1400,9 @@ FuncnameGetCandidatesInContext(List *names, int nargs, List *argnames,
 			/* Ignore if it doesn't match requested argument count */
 			if (nargs >= 0 && pronargs != nargs && !variadic && !use_defaults)
 				continue;
+
+			/* We found a routine with a suitable number of arguments */
+			*fgc_flags |= FGC_ARGCOUNT_MATCH;
 		}
 
 		/*
@@ -1697,11 +1611,13 @@ FuncnameGetCandidatesInContext(List *names, int nargs, List *argnames,
  * the mapping from call argument positions to actual function argument
  * numbers.  Defaulted arguments are included in this map, at positions
  * after the last supplied argument.
+ *
+ * We also add flag bits to *fgc_flags reporting on how far the match got.
  */
 static bool
 MatchNamedCall(HeapTuple proctup, int nargs, List *argnames,
 			   bool include_out_arguments, int pronargs,
-			   int **argnumbers)
+			   int **argnumbers, int *fgc_flags)
 {
 	Form_pg_proc procform = (Form_pg_proc) GETSTRUCT(proctup);
 	int			numposargs = nargs - list_length(argnames);
@@ -1710,6 +1626,7 @@ MatchNamedCall(HeapTuple proctup, int nargs, List *argnames,
 	char	  **p_argnames;
 	char	   *p_argmodes;
 	bool	   *arggiven;
+	bool		arg_filled_twice = false;
 	bool		isnull;
 	int			ap;				/* call args position */
 	int			pp;				/* proargs position */
@@ -1763,9 +1680,9 @@ MatchNamedCall(HeapTuple proctup, int nargs, List *argnames,
 				continue;
 			if (p_argnames[i] && strcmp(p_argnames[i], argname) == 0)
 			{
-				/* fail if argname matches a positional argument */
+				/* note if argname matches a positional argument */
 				if (arggiven[pp])
-					return false;
+					arg_filled_twice = true;
 				arggiven[pp] = true;
 				(*argnumbers)[ap] = pp;
 				found = true;
@@ -1781,6 +1698,16 @@ MatchNamedCall(HeapTuple proctup, int nargs, List *argnames,
 	}
 
 	Assert(ap == nargs);		/* processed all actual parameters */
+
+	/* If we get here, the function did match all the supplied argnames */
+	*fgc_flags |= FGC_ARGNAMES_MATCH;
+
+	/* ... however, some of them might have been placed wrong */
+	if (arg_filled_twice)
+		return false;			/* some argname matched a positional argument */
+
+	/* If we get here, the call doesn't have invalid mixed notation */
+	*fgc_flags |= FGC_ARGNAMES_NONDUP;
 
 	/* Check for default arguments */
 	if (nargs < pronargs)
@@ -1799,6 +1726,9 @@ MatchNamedCall(HeapTuple proctup, int nargs, List *argnames,
 	}
 
 	Assert(ap == pronargs);		/* processed all function parameters */
+
+	/* If we get here, the call supplies all the required arguments */
+	*fgc_flags |= FGC_ARGNAMES_ALL;
 
 	return true;
 }
@@ -1828,9 +1758,6 @@ FunctionIsVisibleExt(Oid funcid, bool *is_missing)
 	Form_pg_proc procform;
 	Oid			pronamespace;
 	bool		visible;
-	bool		inpath = false;
-	ListCell   *path;
-	CatalogView *view;
 
 	proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
 	if (!HeapTupleIsValid(proctup))
@@ -1852,14 +1779,8 @@ FunctionIsVisibleExt(Oid funcid, bool *is_missing)
 	 * list_member_oid() for them.
 	 */
 	pronamespace = procform->pronamespace;
-	view = dg_catalog_session_view();
-	foreach(path, activeSearchPath)
-		if (CatalogViewNamespace(view, lfirst_oid(path)) == pronamespace)
-	{
-		inpath = true;
-		break;
-	}
-	if (pronamespace != PG_CATALOG_NAMESPACE && !inpath)
+	if (pronamespace != PG_CATALOG_NAMESPACE &&
+		!list_member_oid(activeSearchPath, pronamespace))
 		visible = false;
 	else
 	{
@@ -1872,11 +1793,13 @@ FunctionIsVisibleExt(Oid funcid, bool *is_missing)
 		char	   *proname = NameStr(procform->proname);
 		int			nargs = procform->pronargs;
 		FuncCandidateList clist;
+		int			fgc_flags;
 
 		visible = false;
 
 		clist = FuncnameGetCandidates(list_make1(makeString(proname)),
-									  nargs, NIL, false, false, false, false);
+									  nargs, NIL, false, false, false, false,
+									  &fgc_flags);
 
 		for (; clist; clist = clist->next)
 		{
@@ -1907,37 +1830,8 @@ FunctionIsVisibleExt(Oid funcid, bool *is_missing)
  * namespace search path.  If the name is schema-qualified and the given
  * schema does not exist, InvalidOid is returned.
  */
-static Oid OpernameGetOpridInContext(List *names, Oid oprleft, Oid oprright);
-
 Oid
 OpernameGetOprid(List *names, Oid oprleft, Oid oprright)
-{
-	CatalogView *previous = CatalogViewCurrent();
-	CatalogView *view = CatalogViewObjectContext(oprleft);
-	Oid result;
-
-	if (!view) view = CatalogViewObjectContext(oprright);
-	if (!view) view = dg_catalog_session_view();
-	CatalogViewSwitch(view);
-	PG_TRY();
-	{
-		result = OpernameGetOpridInContext(names, oprleft, oprright);
-		if (!result && view)
-		{
-			CatalogViewSwitch(NULL);
-			result = OpernameGetOpridInContext(names, oprleft, oprright);
-		}
-	}
-	PG_FINALLY();
-	{
-		CatalogViewSwitch(previous);
-	}
-	PG_END_TRY();
-	return result;
-}
-
-static Oid
-OpernameGetOpridInContext(List *names, Oid oprleft, Oid oprright)
 {
 	char	   *schemaname;
 	char	   *opername;
@@ -1952,7 +1846,7 @@ OpernameGetOpridInContext(List *names, Oid oprleft, Oid oprright)
 		/* search only in exact schema given */
 		Oid			namespaceId;
 
-		namespaceId = CatalogViewNamespace(CatalogViewCurrent(), LookupExplicitNamespace(schemaname, true));
+		namespaceId = LookupExplicitNamespace(schemaname, true);
 		if (OidIsValid(namespaceId))
 		{
 			HeapTuple	opertup;
@@ -1997,7 +1891,7 @@ OpernameGetOpridInContext(List *names, Oid oprleft, Oid oprright)
 
 	foreach(l, activeSearchPath)
 	{
-		Oid			namespaceId = CatalogViewNamespace(CatalogViewCurrent(), lfirst_oid(l));
+		Oid			namespaceId = lfirst_oid(l);
 		int			i;
 
 		if (namespaceId == myTempNamespace)
@@ -2038,53 +1932,20 @@ OpernameGetOpridInContext(List *names, Oid oprleft, Oid oprright)
  *
  * The returned items always have two args[] entries --- the first will be
  * InvalidOid for a prefix oprkind.  nargs is always 2, too.
+ *
+ * We return an empty list (NULL) if no suitable matches can be found.  If the
+ * operator name was schema-qualified with a schema that does not exist, then
+ * we return an empty list if missing_schema_ok is true and otherwise throw an
+ * error.  (missing_schema_ok does not affect the behavior otherwise.)
+ *
+ * The output argument *fgc_flags is filled with a bitmask indicating how
+ * far we were able to match the supplied information.  This is not of much
+ * interest if any candidates were found, but if not, it can help callers
+ * produce an on-point error message.
  */
-static FuncCandidateList OpernameGetCandidatesInContext(List *, char, bool);
-
 FuncCandidateList
-OpernameGetCandidates(List *names, char oprkind, bool missing_schema_ok)
-{
-	CatalogView *previous = CatalogViewCurrent();
-	CatalogView *view = dg_catalog_session_view();
-	FuncCandidateList result;
-
-	CatalogViewSwitch(view);
-	PG_TRY();
-	{
-		result = OpernameGetCandidatesInContext(names, oprkind, missing_schema_ok);
-		if (view)
-		{
-			FuncCandidateList native;
-
-			CatalogViewSwitch(NULL);
-			native = OpernameGetCandidatesInContext(names, oprkind, true);
-			while (native)
-			{
-				FuncCandidateList next = native->next;
-				FuncCandidateList seen = result;
-
-				while (seen && seen->oid != native->oid &&
-					!(seen->args[0] == native->args[0] && seen->args[1] == native->args[1] && seen->pathpos <= native->pathpos))
-					seen = seen->next;
-				if (!seen && native->oid >= FirstNormalObjectId && native->oid < FirstDurableObjectId)
-				{
-					native->next = result;
-					result = native;
-				}
-				native = next;
-			}
-		}
-	}
-	PG_FINALLY();
-	{
-		CatalogViewSwitch(previous);
-	}
-	PG_END_TRY();
-	return result;
-}
-
-static FuncCandidateList
-OpernameGetCandidatesInContext(List *names, char oprkind, bool missing_schema_ok)
+OpernameGetCandidates(List *names, char oprkind, bool missing_schema_ok,
+					  int *fgc_flags)
 {
 	FuncCandidateList resultList = NULL;
 	char	   *resultSpace = NULL;
@@ -2095,15 +1956,20 @@ OpernameGetCandidatesInContext(List *names, char oprkind, bool missing_schema_ok
 	CatCList   *catlist;
 	int			i;
 
+	/* initialize output fgc_flags to empty */
+	*fgc_flags = 0;
+
 	/* deconstruct the name list */
 	DeconstructQualifiedName(names, &schemaname, &opername);
 
 	if (schemaname)
 	{
 		/* use exact schema given */
-		namespaceId = CatalogViewNamespace(CatalogViewCurrent(), LookupExplicitNamespace(schemaname, missing_schema_ok));
-		if (missing_schema_ok && !OidIsValid(namespaceId))
+		*fgc_flags |= FGC_SCHEMA_GIVEN; /* report that a schema is given */
+		namespaceId = LookupExplicitNamespace(schemaname, missing_schema_ok);
+		if (!OidIsValid(namespaceId))
 			return NULL;
+		*fgc_flags |= FGC_SCHEMA_EXISTS;	/* report that the schema exists */
 	}
 	else
 	{
@@ -2141,6 +2007,8 @@ OpernameGetCandidatesInContext(List *names, char oprkind, bool missing_schema_ok
 		if (oprkind && operform->oprkind != oprkind)
 			continue;
 
+		*fgc_flags |= FGC_NAME_EXISTS;	/* the name is present in pg_operator */
+
 		if (OidIsValid(namespaceId))
 		{
 			/* Consider only opers in specified namespace */
@@ -2158,7 +2026,7 @@ OpernameGetCandidatesInContext(List *names, char oprkind, bool missing_schema_ok
 
 			foreach(nsp, activeSearchPath)
 			{
-				if (operform->oprnamespace == CatalogViewNamespace(CatalogViewCurrent(), lfirst_oid(nsp)) &&
+				if (operform->oprnamespace == lfirst_oid(nsp) &&
 					operform->oprnamespace != myTempNamespace)
 					break;
 				pathpos++;
@@ -2214,6 +2082,8 @@ OpernameGetCandidatesInContext(List *names, char oprkind, bool missing_schema_ok
 			}
 		}
 
+		*fgc_flags |= FGC_NAME_VISIBLE; /* operator is in the right schema */
+
 		/*
 		 * Okay to add it to result list
 		 */
@@ -2263,8 +2133,6 @@ OperatorIsVisibleExt(Oid oprid, bool *is_missing)
 	Form_pg_operator oprform;
 	Oid			oprnamespace;
 	bool		visible;
-	bool in_path = false;
-	ListCell *path;
 
 	oprtup = SearchSysCache1(OPEROID, ObjectIdGetDatum(oprid));
 	if (!HeapTupleIsValid(oprtup))
@@ -2286,10 +2154,8 @@ OperatorIsVisibleExt(Oid oprid, bool *is_missing)
 	 * list_member_oid() for them.
 	 */
 	oprnamespace = oprform->oprnamespace;
-	foreach(path, activeSearchPath)
-		in_path |= CatalogViewNamespace(CatalogViewObjectContext(oprid), lfirst_oid(path)) == oprnamespace;
 	if (oprnamespace != PG_CATALOG_NAMESPACE &&
-		!in_path)
+		!list_member_oid(activeSearchPath, oprnamespace))
 		visible = false;
 	else
 	{
@@ -3728,8 +3594,7 @@ QualifiedNameGetCreationNamespace(const List *names, char **objname_p)
 					 errmsg("no schema has been selected to create in")));
 	}
 
-	/* The search path caches physical namespace OIDs, not revision handles. */
-	return CatalogViewNamespace(CatalogViewCurrent(), namespaceId);
+	return namespaceId;
 }
 
 /*
@@ -4066,7 +3931,7 @@ GetSearchPathMatcher(MemoryContext context)
 
 	oldcxt = MemoryContextSwitchTo(context);
 
-	result = (SearchPathMatcher *) palloc0(sizeof(SearchPathMatcher));
+	result = palloc0_object(SearchPathMatcher);
 	schemas = list_copy(activeSearchPath);
 	while (schemas && linitial_oid(schemas) != activeCreationNamespace)
 	{
@@ -4097,7 +3962,7 @@ CopySearchPathMatcher(SearchPathMatcher *path)
 {
 	SearchPathMatcher *result;
 
-	result = (SearchPathMatcher *) palloc(sizeof(SearchPathMatcher));
+	result = palloc_object(SearchPathMatcher);
 	result->schemas = list_copy(path->schemas);
 	result->addCatalog = path->addCatalog;
 	result->addTemp = path->addTemp;
@@ -4502,26 +4367,8 @@ cachedNamespacePath(const char *searchPath, Oid roleid)
 /*
  * recomputeNamespacePath - recompute path derived variables if needed.
  */
-static void recomputeNamespacePathPhysical(void);
-
 static void
 recomputeNamespacePath(void)
-{
-	CatalogView *previous = CatalogViewSwitch(NULL);
-
-	PG_TRY();
-	{
-		recomputeNamespacePathPhysical();
-	}
-	PG_FINALLY();
-	{
-		CatalogViewSwitch(previous);
-	}
-	PG_END_TRY();
-}
-
-static void
-recomputeNamespacePathPhysical(void)
 {
 	Oid			roleid = GetUserId();
 	bool		pathChanged;
@@ -4853,7 +4700,15 @@ RemoveTempRelationsCallback(int code, Datum arg)
 		/* Need to ensure we have a usable transaction. */
 		AbortOutOfAnyTransaction();
 		StartTransactionCommand();
-		PushActiveSnapshot(GetTransactionSnapshot());
+
+		/*
+		 * Need an active snapshot for toast fetches during deletion.  Do not
+		 * use GetTransactionSnapshot(): under SERIALIZABLE READ ONLY
+		 * DEFERRABLE it may wait in GetSafeSnapshot(), and proc_exit holds
+		 * off interrupts so that wait cannot be cancelled.  A catalog
+		 * snapshot is enough and avoids that path.
+		 */
+		PushActiveSnapshot(GetCatalogSnapshot(RelationRelationId));
 
 		RemoveTempRelations(myTempNamespace);
 
@@ -5018,7 +4873,7 @@ InitializeSearchPath(void)
  *		Syscache inval callback function
  */
 static void
-InvalidationCallback(Datum arg, int cacheid, uint32 hashvalue)
+InvalidationCallback(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 {
 	/*
 	 * Force search path to be recomputed on next use, also invalidating the

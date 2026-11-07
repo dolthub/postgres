@@ -3,7 +3,6 @@
  */
 #include "postgres.h"
 
-#include <math.h>
 #include <limits.h>
 #include <float.h>
 
@@ -11,6 +10,7 @@
 #include "btree_utils_var.h"
 #include "mb/pg_wchar.h"
 #include "utils/rel.h"
+#include "varatt.h"
 
 /* used for key sorting */
 typedef struct
@@ -39,7 +39,7 @@ gbt_var_decompress(PG_FUNCTION_ARGS)
 
 	if (key != (GBT_VARKEY *) DatumGetPointer(entry->key))
 	{
-		GISTENTRY  *retval = (GISTENTRY *) palloc(sizeof(GISTENTRY));
+		GISTENTRY  *retval = palloc_object(GISTENTRY);
 
 		gistentryinit(*retval, PointerGetDatum(key),
 					  entry->rel, entry->page,
@@ -70,7 +70,7 @@ gbt_var_key_readable(const GBT_VARKEY *k)
  * Create a leaf-entry to store in the index, from a single Datum.
  */
 static GBT_VARKEY *
-gbt_var_key_from_datum(const struct varlena *u)
+gbt_var_key_from_datum(const varlena *u)
 {
 	int32		lowersize = VARSIZE(u);
 	GBT_VARKEY *r;
@@ -118,7 +118,7 @@ gbt_var_leaf2node(GBT_VARKEY *leaf, const gbtree_vinfo *tinfo, FmgrInfo *flinfo)
  *
  * If the underlying type is character data, the prefix length may point in
  * the middle of a multibyte character.
-*/
+ */
 static int32
 gbt_var_node_cp_len(const GBT_VARKEY *node, const gbtree_vinfo *tinfo)
 {
@@ -207,9 +207,9 @@ gbt_var_node_pf_match(const GBT_VARKEY_R *node, const bytea *query, const gbtree
 
 
 /*
-*  truncates / compresses the node key
-*  cpf_length .. common prefix length
-*/
+ *  truncates / compresses the node key
+ *  cpf_length .. common prefix length
+ */
 static GBT_VARKEY *
 gbt_var_node_truncate(const GBT_VARKEY *node, int32 cpf_length, const gbtree_vinfo *tinfo)
 {
@@ -294,12 +294,12 @@ gbt_var_compress(GISTENTRY *entry, const gbtree_vinfo *tinfo)
 
 	if (entry->leafkey)
 	{
-		struct varlena *leaf = PG_DETOAST_DATUM(entry->key);
+		varlena    *leaf = PG_DETOAST_DATUM(entry->key);
 		GBT_VARKEY *r;
 
 		r = gbt_var_key_from_datum(leaf);
 
-		retval = palloc(sizeof(GISTENTRY));
+		retval = palloc_object(GISTENTRY);
 		gistentryinit(*retval, PointerGetDatum(r),
 					  entry->rel, entry->page,
 					  entry->offset, true);
@@ -319,7 +319,7 @@ gbt_var_fetch(PG_FUNCTION_ARGS)
 	GBT_VARKEY_R r = gbt_var_key_readable(key);
 	GISTENTRY  *retval;
 
-	retval = palloc(sizeof(GISTENTRY));
+	retval = palloc_object(GISTENTRY);
 	gistentryinit(*retval, PointerGetDatum(r.lower),
 				  entry->rel, entry->page,
 				  entry->offset, true);
@@ -477,7 +477,7 @@ gbt_var_picksplit(const GistEntryVector *entryvec, GIST_SPLITVEC *v,
 	GBT_VARKEY **sv = NULL;
 	gbt_vsrt_arg varg;
 
-	arr = (Vsrt *) palloc((maxoff + 1) * sizeof(Vsrt));
+	arr = palloc_array(Vsrt, maxoff + 1);
 	nbytes = (maxoff + 2) * sizeof(OffsetNumber);
 	v->spl_left = (OffsetNumber *) palloc(nbytes);
 	v->spl_right = (OffsetNumber *) palloc(nbytes);
@@ -486,7 +486,7 @@ gbt_var_picksplit(const GistEntryVector *entryvec, GIST_SPLITVEC *v,
 	v->spl_nleft = 0;
 	v->spl_nright = 0;
 
-	sv = palloc(sizeof(bytea *) * (maxoff + 1));
+	sv = palloc_array(GBT_VARKEY *, maxoff + 1);
 
 	/* Sort entries */
 

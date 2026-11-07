@@ -35,7 +35,7 @@
  * and munge the system catalogs of the new database.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -70,6 +70,9 @@
 #include "miscadmin.h"
 #include "postmaster/bgwriter.h"
 #include "storage/fd.h"
+#include "storage/lmgr.h"
+#include "storage/lwlock.h"
+#include "storage/procsignal.h"
 #include "storage/standby.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -240,6 +243,12 @@ CreateTableSpace(CreateTableSpaceStmt *stmt)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_NAME),
 				 errmsg("tablespace location cannot contain single quotes")));
+
+	/* Report error if name has \n or \r character. */
+	if (strpbrk(stmt->tablespacename, "\n\r"))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("tablespace name \"%s\" contains a newline or carriage return character", stmt->tablespacename)));
 
 	in_place = allow_in_place_tablespaces && strlen(location) == 0;
 
@@ -449,6 +458,10 @@ DropTableSpace(DropTableSpaceStmt *stmt)
 		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLESPACE,
 					   tablespacename);
 
+	/* Prevent new shared dependencies while we drop the tablespace. */
+	LockSharedObject(TableSpaceRelationId, tablespaceoid, 0,
+					 AccessExclusiveLock);
+
 	/* Check for pg_shdepend entries depending on this tablespace */
 	if (checkSharedDependencies(TableSpaceRelationId, tablespaceoid,
 								&detail, &detail_log))
@@ -500,7 +513,7 @@ DropTableSpace(DropTableSpaceStmt *stmt)
 		 * mustn't delete.  So instead, we force a checkpoint which will clean
 		 * out any lingering files, and try again.
 		 */
-		RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
+		RequestCheckpoint(CHECKPOINT_FAST | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
 
 		/*
 		 * On Windows, an unlinked file persists in the directory listing
@@ -959,6 +972,9 @@ RenameTableSpace(const char *oldname, const char *newname)
 
 	table_endscan(scan);
 
+	/* Lock the tablespace before updating its catalog tuple. */
+	shdepLockAndCheckObject(TableSpaceRelationId, tspId);
+
 	/* Must be owner */
 	if (!object_ownercheck(TableSpaceRelationId, tspId, GetUserId()))
 		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLESPACE, oldname);
@@ -969,6 +985,12 @@ RenameTableSpace(const char *oldname, const char *newname)
 				(errcode(ERRCODE_RESERVED_NAME),
 				 errmsg("unacceptable tablespace name \"%s\"", newname),
 				 errdetail("The prefix \"pg_\" is reserved for system tablespaces.")));
+
+	/* Report error if name has \n or \r character. */
+	if (strpbrk(newname, "\n\r"))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("tablespace name \"%s\" contains a newline or carriage return character", newname)));
 
 	/*
 	 * If built with appropriate switch, whine when regression-testing
@@ -1042,7 +1064,12 @@ AlterTableSpaceOptions(AlterTableSpaceOptionsStmt *stmt)
 				 errmsg("tablespace \"%s\" does not exist",
 						stmt->tablespacename)));
 
+	tup = heap_copytuple(tup);
 	tablespaceoid = ((Form_pg_tablespace) GETSTRUCT(tup))->oid;
+	table_endscan(scandesc);
+
+	/* Lock the tablespace before updating its catalog tuple. */
+	shdepLockAndCheckObject(TableSpaceRelationId, tablespaceoid);
 
 	/* Must be owner of the existing object */
 	if (!object_ownercheck(TableSpaceRelationId, tablespaceoid, GetUserId()))
@@ -1074,9 +1101,8 @@ AlterTableSpaceOptions(AlterTableSpaceOptionsStmt *stmt)
 	InvokeObjectPostAlterHook(TableSpaceRelationId, tablespaceoid, 0);
 
 	heap_freetuple(newtuple);
+	heap_freetuple(tup);
 
-	/* Conclude heap scan. */
-	table_endscan(scandesc);
 	table_close(rel, NoLock);
 
 	return tablespaceoid;

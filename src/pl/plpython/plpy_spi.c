@@ -28,7 +28,8 @@ static PyObject *PLy_spi_execute_fetch_result(SPITupleTable *tuptable,
 static void PLy_spi_exception_set(PyObject *excclass, ErrorData *edata);
 
 
-/* prepare(query="select * from foo")
+/*
+ * prepare(query="select * from foo")
  * prepare(query="select * from foo where bar = $1", params=["text"])
  * prepare(query="select * from foo where bar = $1", params=["text"], limit=5)
  */
@@ -65,8 +66,8 @@ PLy_spi_prepare(PyObject *self, PyObject *args)
 	nargs = list ? PySequence_Length(list) : 0;
 
 	plan->nargs = nargs;
-	plan->types = nargs ? palloc0(sizeof(Oid) * nargs) : NULL;
-	plan->args = nargs ? palloc0(sizeof(PLyObToDatum) * nargs) : NULL;
+	plan->types = nargs ? palloc0_array(Oid, nargs) : NULL;
+	plan->args = nargs ? palloc0_array(PLyObToDatum, nargs) : NULL;
 
 	MemoryContextSwitchTo(oldcontext);
 
@@ -148,7 +149,8 @@ PLy_spi_prepare(PyObject *self, PyObject *args)
 	return (PyObject *) plan;
 }
 
-/* execute(query="select * from foo", limit=5)
+/*
+ * execute(query="select * from foo", limit=5)
  * execute(plan=plan, values=(foo, bar), limit=5)
  */
 PyObject *

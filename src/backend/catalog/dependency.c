@@ -4,7 +4,7 @@
  *	  Routines to support inter-object dependencies.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -13,17 +13,16 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "catalog/catalogview.h"
 
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
-#include "access/doltcatalog.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/heap.h"
 #include "catalog/index.h"
+#include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_amop.h"
@@ -311,7 +310,6 @@ performDeletion(const ObjectAddress *object,
 						   behavior,
 						   flags,
 						   object);
-	dg_catalog_check_drop(targetObjects->refs, targetObjects->numrefs, object);
 
 	/* do the deed */
 	deleteObjectsInList(targetObjects, &depRel, flags);
@@ -388,8 +386,6 @@ performMultipleDeletions(const ObjectAddresses *objects,
 						   behavior,
 						   flags,
 						   (objects->numrefs == 1 ? objects->refs : NULL));
-	dg_catalog_check_drop(targetObjects->refs, targetObjects->numrefs,
-						  objects->numrefs == 1 ? objects->refs : NULL);
 
 	/* do the deed */
 	deleteObjectsInList(targetObjects, &depRel, flags);
@@ -398,45 +394,6 @@ performMultipleDeletions(const ObjectAddresses *objects,
 	free_object_addresses(targetObjects);
 
 	table_close(depRel, RowExclusiveLock);
-}
-
-/* Collect native RESTRICT/CASCADE closure without physical catalog deletion.
- * The caller holds the selected branch working-set lock throughout collection
- * and publication. Backend-local handles are not inter-backend lock identities. */
-#define PERFORM_DELETION_CATALOG_VIEW 0x10000
-
-List *
-collect_catalog_deletions(const ObjectAddresses *objects, DropBehavior behavior)
-{
-	CatalogView *view = CatalogViewCurrent();
-	ObjectAddresses *targets = new_object_addresses();
-	Relation	depRel;
-	List	   *result = NIL;
-
-	if (!view)
-		elog(ERROR, "canonical dependency collection requires a catalog view");
-	depRel = table_open(DependRelationId, AccessShareLock);
-	for (int i = 0; i < objects->numrefs; i++)
-	{
-		const ObjectAddress *object = &objects->refs[i];
-
-		if (!CatalogViewBinds(view, object->objectId))
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("deletion targets span incompatible catalog contexts")));
-		AcquireDeletionLock(object, PERFORM_DELETION_CATALOG_VIEW);
-		findDependentObjects(object, DEPFLAG_ORIGINAL, PERFORM_DELETION_CATALOG_VIEW,
-							 NULL, targets, objects, &depRel);
-	}
-	reportDependentObjects(targets, behavior, 0, objects->numrefs == 1 ? objects->refs : NULL);
-	for (int i = 0; i < targets->numrefs; i++)
-	{
-		ObjectAddress *copy = palloc(sizeof(*copy));
-
-		*copy = targets->refs[i];
-		result = lappend(result, copy);
-	}
-	free_object_addresses(targets);
-	table_close(depRel, AccessShareLock);
-	return result;
 }
 
 /*
@@ -634,7 +591,7 @@ findDependentObjects(const ObjectAddress *object,
 					break;
 
 				/* Otherwise, treat this like an internal dependency */
-				/* FALL THRU */
+				pg_fallthrough;
 
 			case DEPENDENCY_INTERNAL:
 
@@ -704,7 +661,7 @@ findDependentObjects(const ObjectAddress *object,
 				 * deletion of the owning object.)
 				 */
 				ReleaseDeletionLock(object);
-				AcquireDeletionLock(&otherObject, flags & PERFORM_DELETION_CATALOG_VIEW);
+				AcquireDeletionLock(&otherObject, 0);
 
 				/*
 				 * The owning object might have been deleted while we waited
@@ -844,8 +801,7 @@ findDependentObjects(const ObjectAddress *object,
 	 * regression testing.)
 	 */
 	maxDependentObjects = 128;	/* arbitrary initial allocation */
-	dependentObjects = (ObjectAddressAndFlags *)
-		palloc(maxDependentObjects * sizeof(ObjectAddressAndFlags));
+	dependentObjects = palloc_array(ObjectAddressAndFlags, maxDependentObjects);
 	numDependentObjects = 0;
 
 	ScanKeyInit(&key[0],
@@ -890,18 +846,9 @@ findDependentObjects(const ObjectAddress *object,
 			continue;
 
 		/*
-		 * A branch removes only its own objects. A server object in one of
-		 * its namespaces belongs to every branch, and stays.
-		 */
-		if ((flags & PERFORM_DELETION_CATALOG_VIEW) &&
-			otherObject.objectId >= FirstNormalObjectId && otherObject.objectId < FirstDurableObjectId &&
-			!CatalogViewBinds(CatalogViewCurrent(), otherObject.objectId))
-			continue;
-
-		/*
 		 * Must lock the dependent object before recursing to it.
 		 */
-		AcquireDeletionLock(&otherObject, flags & PERFORM_DELETION_CATALOG_VIEW);
+		AcquireDeletionLock(&otherObject, 0);
 
 		/*
 		 * The dependent object might have been deleted while we waited to
@@ -916,6 +863,22 @@ findDependentObjects(const ObjectAddress *object,
 			ReleaseDeletionLock(&otherObject);
 			/* and continue scanning for dependencies */
 			continue;
+		}
+
+		/*
+		 * Check that the dependent object is not in a shared catalog, which
+		 * is not supported by doDeletion().
+		 */
+		if (IsSharedRelation(otherObject.classId))
+		{
+			char	   *otherObjDesc = getObjectDescription(&otherObject,
+															false);
+
+			ereport(ERROR,
+					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+					 errmsg("cannot drop %s because %s depends on it",
+							getObjectDescription(object, false), otherObjDesc),
+					 errhint("Drop %s first.", otherObjDesc)));
 		}
 
 		/*
@@ -1241,7 +1204,7 @@ reportDependentObjects(const ObjectAddresses *targetObjects,
 static void
 DropObjectById(const ObjectAddress *object)
 {
-	int			cacheId;
+	SysCacheIdentifier cacheId;
 	Relation	rel;
 	HeapTuple	tup;
 
@@ -1548,13 +1511,6 @@ doDeletion(const ObjectAddress *object, int flags)
 void
 AcquireDeletionLock(const ObjectAddress *object, int flags)
 {
-	if (CatalogViewObjectContext(object->objectId))
-	{
-		if (!(flags & PERFORM_DELETION_CATALOG_VIEW) &&
-			!(CatalogViewIsProvisional(CatalogViewCurrent()) && CatalogViewObjectContext(object->objectId) == CatalogViewCurrent()))
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("canonical object deletion requires branch-scoped publication")));
-		return;
-	}
 	if (object->classId == RelationRelationId)
 	{
 		/*
@@ -1568,7 +1524,7 @@ AcquireDeletionLock(const ObjectAddress *object, int flags)
 		else
 			LockRelationOid(object->objectId, AccessExclusiveLock);
 	}
-	else if (object->classId == AuthMemRelationId)
+	else if (IsSharedRelation(object->classId))
 		LockSharedObject(object->classId, object->objectId, 0,
 						 AccessExclusiveLock);
 	else
@@ -1587,11 +1543,9 @@ AcquireDeletionLock(const ObjectAddress *object, int flags)
 void
 ReleaseDeletionLock(const ObjectAddress *object)
 {
-	if (CatalogViewObjectContext(object->objectId))
-		return;
 	if (object->classId == RelationRelationId)
 		UnlockRelationOid(object->objectId, AccessExclusiveLock);
-	else if (object->classId == AuthMemRelationId)
+	else if (IsSharedRelation(object->classId))
 		UnlockSharedObject(object->classId, object->objectId, 0,
 						   AccessExclusiveLock);
 	else
@@ -1619,25 +1573,57 @@ recordDependencyOnExpr(const ObjectAddress *depender,
 					   Node *expr, List *rtable,
 					   DependencyType behavior)
 {
+	ObjectAddresses *addrs;
+
+	addrs = new_object_addresses();
+
+	/* Collect all dependencies from the expression */
+	collectDependenciesOfExpr(addrs, expr, rtable);
+
+	/* Remove duplicates */
+	eliminate_duplicate_dependencies(addrs);
+
+	/* And record 'em */
+	recordMultipleDependencies(depender,
+							   addrs->refs, addrs->numrefs,
+							   behavior);
+
+	free_object_addresses(addrs);
+}
+
+/*
+ * collectDependenciesOfExpr - collect expression dependencies
+ *
+ * This function analyzes an expression or query in node-tree form to
+ * find all the objects it refers to (tables, columns, operators,
+ * functions, etc.) and adds them to the provided ObjectAddresses
+ * structure. Unlike recordDependencyOnExpr, this function does not
+ * immediately record the dependencies, allowing the caller to add to,
+ * filter, or modify the collected dependencies before recording them.
+ *
+ * rtable is the rangetable to be used to interpret Vars with varlevelsup=0.
+ * It can be NIL if no such variables are expected.
+ *
+ * Note: the returned list may well contain duplicates.  The caller should
+ * de-duplicate before recording the dependencies.  Within this file, callers
+ * must call eliminate_duplicate_dependencies().  External callers typically
+ * go through record_object_address_dependencies() which will see to that.
+ * This choice allows collecting dependencies from multiple sources without
+ * redundant de-duplication work.
+ */
+void
+collectDependenciesOfExpr(ObjectAddresses *addrs,
+						  Node *expr, List *rtable)
+{
 	find_expr_references_context context;
 
-	context.addrs = new_object_addresses();
+	context.addrs = addrs;
 
 	/* Set up interpretation for Vars at varlevelsup = 0 */
 	context.rtables = list_make1(rtable);
 
 	/* Scan the expression tree for referenceable objects */
 	find_expr_references_walker(expr, &context);
-
-	/* Remove any duplicates */
-	eliminate_duplicate_dependencies(context.addrs);
-
-	/* And record 'em */
-	recordMultipleDependencies(depender,
-							   context.addrs->refs, context.addrs->numrefs,
-							   behavior);
-
-	free_object_addresses(context.addrs);
 }
 
 /*
@@ -1786,17 +1772,12 @@ check_usage_on_types(ObjectAddresses *addrs, Oid roleid)
 void
 CheckUsageOnTypesInExpr(Node *expr, List *rtable, Oid roleid)
 {
-	find_expr_references_context context;
+	ObjectAddresses *addrs = new_object_addresses();
 
-	context.addrs = new_object_addresses();
-
-	/* Set up interpretation for Vars at varlevelsup = 0 */
-	context.rtables = list_make1(rtable);
-
-	find_expr_references_walker(expr, &context);
-	eliminate_duplicate_dependencies(context.addrs);
-	check_usage_on_types(context.addrs, roleid);
-	free_object_addresses(context.addrs);
+	collectDependenciesOfExpr(addrs, expr, rtable);
+	eliminate_duplicate_dependencies(addrs);
+	check_usage_on_types(addrs, roleid);
+	free_object_addresses(addrs);
 }
 
 /*
@@ -1995,6 +1976,17 @@ find_expr_references_walker(Node *node,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("constant of the type %s cannot be used here",
 									"regrole")));
+					break;
+
+					/*
+					 * Dependencies for regdatabase should be shared among all
+					 * databases, so explicitly inhibit to have dependencies.
+					 */
+				case REGDATABASEOID:
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("constant of the type %s cannot be used here",
+									"regdatabase")));
 					break;
 			}
 		}
@@ -2538,6 +2530,75 @@ process_function_rte_ref(RangeTblEntry *rte, AttrNumber attnum,
 }
 
 /*
+ * find_temp_object - search an array of dependency references for temp objects
+ *
+ * Scan an ObjectAddresses array for references to temporary objects (objects
+ * in temporary namespaces), ignoring those in our own temp namespace if
+ * local_temp_okay is true.  If one is found, return true after storing its
+ * address in *foundobj.
+ *
+ * Current callers only use this to deliver helpful notices, so reporting
+ * one such object seems sufficient.  We return the first one, which should
+ * be a stable result for a given query since it depends only on the order
+ * in which this module searches query trees.  (However, it's important to
+ * call this before de-duplicating the objects, else OID order would affect
+ * the result.)
+ */
+bool
+find_temp_object(const ObjectAddresses *addrs, bool local_temp_okay,
+				 ObjectAddress *foundobj)
+{
+	for (int i = 0; i < addrs->numrefs; i++)
+	{
+		const ObjectAddress *thisobj = addrs->refs + i;
+		Oid			objnamespace;
+
+		/*
+		 * Use get_object_namespace() to see if this object belongs to a
+		 * schema.  If not, we can skip it.
+		 */
+		objnamespace = get_object_namespace(thisobj);
+
+		/*
+		 * If the object is in a temporary namespace, complain, except if
+		 * local_temp_okay and it's our own temp namespace.
+		 */
+		if (OidIsValid(objnamespace) && isAnyTempNamespace(objnamespace) &&
+			!(local_temp_okay && isTempNamespace(objnamespace)))
+		{
+			*foundobj = *thisobj;
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * query_uses_temp_object - convenience wrapper for find_temp_object
+ *
+ * If the Query includes any use of a temporary object, fill *temp_object
+ * with the address of one such object and return true.
+ */
+bool
+query_uses_temp_object(Query *query, ObjectAddress *temp_object)
+{
+	bool		result;
+	ObjectAddresses *addrs;
+
+	addrs = new_object_addresses();
+
+	/* Collect all dependencies from the Query */
+	collectDependenciesOfExpr(addrs, (Node *) query, NIL);
+
+	/* Look for one that is temp */
+	result = find_temp_object(addrs, false, temp_object);
+
+	free_object_addresses(addrs);
+
+	return result;
+}
+
+/*
  * Given an array of dependency references, eliminate any duplicates.
  */
 static void
@@ -2649,12 +2710,11 @@ new_object_addresses(void)
 {
 	ObjectAddresses *addrs;
 
-	addrs = palloc(sizeof(ObjectAddresses));
+	addrs = palloc_object(ObjectAddresses);
 
 	addrs->numrefs = 0;
 	addrs->maxrefs = 32;
-	addrs->refs = (ObjectAddress *)
-		palloc(addrs->maxrefs * sizeof(ObjectAddress));
+	addrs->refs = palloc_array(ObjectAddress, addrs->maxrefs);
 	addrs->extras = NULL;		/* until/unless needed */
 
 	return addrs;

@@ -3,7 +3,7 @@
  * compress_io.h
  *	 Interface to compress_io.c routines
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -22,9 +22,9 @@
  *
  * When changing this value, it's necessary to check the relevant test cases
  * still exercise all the branches. This applies especially if the value is
- * increased, in which case the overflow buffer may not be needed.
+ * increased, in which case some loops may not get iterated.
  */
-#define DEFAULT_IO_BUFFER_SIZE	4096
+#define DEFAULT_IO_BUFFER_SIZE	(128 * 1024)
 
 extern char *supports_compression(const pg_compress_specification compression_spec);
 

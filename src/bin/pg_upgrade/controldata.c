@@ -3,7 +3,7 @@
  *
  *	controldata functions
  *
- *	Copyright (c) 2010-2025, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *	src/bin/pg_upgrade/controldata.c
  */
 
@@ -205,7 +205,7 @@ get_control_data(ClusterInfo *cluster)
 	/* Only in <= 9.2 */
 	if (GET_MAJOR_VERSION(cluster->major_version) <= 902)
 	{
-		cluster->controldata.data_checksum_version = 0;
+		cluster->controldata.data_checksum_version = PG_DATA_CHECKSUM_OFF;
 		got_data_checksum_version = true;
 	}
 
@@ -351,7 +351,7 @@ get_control_data(ClusterInfo *cluster)
 				pg_fatal("%d: controldata retrieval problem", __LINE__);
 
 			p++;				/* remove ':' char */
-			cluster->controldata.chkpnt_nxtmxoff = str2uint(p);
+			cluster->controldata.chkpnt_nxtmxoff = str2uint64(p);
 			got_mxoff = true;
 		}
 		else if ((p = strstr(bufin, "First log segment after reset:")) != NULL)
@@ -360,7 +360,7 @@ get_control_data(ClusterInfo *cluster)
 			p = strchr(p, ':');
 			if (p == NULL || strlen(p) <= 1)
 				pg_fatal("%d: controldata retrieval problem", __LINE__);
-			p = strpbrk(p, "01234567890ABCDEF");
+			p = strpbrk(p, "0123456789ABCDEF");
 			if (p == NULL || strlen(p) <= 1)
 				pg_fatal("%d: controldata retrieval problem", __LINE__);
 
@@ -740,11 +740,11 @@ check_control_data(ControlData *oldctrl,
 	 * We might eventually allow upgrades from checksum to no-checksum
 	 * clusters.
 	 */
-	if (oldctrl->data_checksum_version == 0 &&
-		newctrl->data_checksum_version != 0)
+	if (oldctrl->data_checksum_version == PG_DATA_CHECKSUM_OFF &&
+		newctrl->data_checksum_version != PG_DATA_CHECKSUM_OFF)
 		pg_fatal("old cluster does not use data checksums but the new one does");
-	else if (oldctrl->data_checksum_version != 0 &&
-			 newctrl->data_checksum_version == 0)
+	else if (oldctrl->data_checksum_version != PG_DATA_CHECKSUM_OFF &&
+			 newctrl->data_checksum_version == PG_DATA_CHECKSUM_OFF)
 		pg_fatal("old cluster uses data checksums but the new one does not");
 	else if (oldctrl->data_checksum_version != newctrl->data_checksum_version)
 		pg_fatal("old and new cluster pg_controldata checksum versions do not match");

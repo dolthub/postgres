@@ -4,7 +4,7 @@
  *	  prototypes for various files in optimizer/path
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/optimizer/paths.h
@@ -21,12 +21,21 @@
  * allpaths.c
  */
 extern PGDLLIMPORT bool enable_geqo;
+extern PGDLLIMPORT bool enable_eager_aggregate;
 extern PGDLLIMPORT int geqo_threshold;
+extern PGDLLIMPORT double min_eager_agg_group_size;
 extern PGDLLIMPORT int min_parallel_table_scan_size;
 extern PGDLLIMPORT int min_parallel_index_scan_size;
 extern PGDLLIMPORT bool enable_group_by_reordering;
 
-/* Hook for plugins to get control in set_rel_pathlist() */
+/* Hooks for plugins to get control in set_rel_pathlist() */
+typedef void (*join_path_setup_hook_type) (PlannerInfo *root,
+										   RelOptInfo *joinrel,
+										   RelOptInfo *outerrel,
+										   RelOptInfo *innerrel,
+										   JoinType jointype,
+										   JoinPathExtraData *extra);
+extern PGDLLIMPORT join_path_setup_hook_type join_path_setup_hook;
 typedef void (*set_rel_pathlist_hook_type) (PlannerInfo *root,
 											RelOptInfo *rel,
 											Index rti,
@@ -57,6 +66,8 @@ extern void generate_gather_paths(PlannerInfo *root, RelOptInfo *rel,
 								  bool override_rows);
 extern void generate_useful_gather_paths(PlannerInfo *root, RelOptInfo *rel,
 										 bool override_rows);
+extern void generate_grouped_paths(PlannerInfo *root, RelOptInfo *grouped_rel,
+								   RelOptInfo *rel);
 extern int	compute_parallel_worker(RelOptInfo *rel, double heap_pages,
 									double index_pages, int max_workers);
 extern void create_partial_bitmap_paths(PlannerInfo *root, RelOptInfo *rel,
@@ -71,16 +82,12 @@ extern void generate_partitionwise_join_paths(PlannerInfo *root,
 extern void create_index_paths(PlannerInfo *root, RelOptInfo *rel);
 extern bool relation_has_unique_index_for(PlannerInfo *root, RelOptInfo *rel,
 										  List *restrictlist,
-										  List *exprlist, List *oprlist);
-extern bool relation_has_unique_index_ext(PlannerInfo *root, RelOptInfo *rel,
-										  List *restrictlist, List *exprlist,
-										  List *oprlist, List **extra_clauses);
+										  List **extra_clauses);
 extern bool indexcol_is_bool_constant_for_query(PlannerInfo *root,
 												IndexOptInfo *index,
 												int indexcol);
 extern bool match_index_to_operand(Node *operand, int indexcol,
 								   IndexOptInfo *index);
-extern Node *strip_phvs_in_index_operand(Node *operand);
 extern void check_index_predicates(PlannerInfo *root, RelOptInfo *rel);
 
 /*
@@ -130,7 +137,6 @@ extern bool process_equivalence(PlannerInfo *root,
 extern Expr *canonicalize_ec_expression(Expr *expr,
 										Oid req_type, Oid req_collation);
 extern void reconsider_outer_join_clauses(PlannerInfo *root);
-extern void rebuild_eclass_attr_needed(PlannerInfo *root);
 extern EquivalenceClass *get_eclass_for_sort_expr(PlannerInfo *root,
 												  Expr *expr,
 												  List *opfamilies,
@@ -178,6 +184,9 @@ extern void add_child_join_rel_equivalences(PlannerInfo *root,
 											AppendRelInfo **appinfos,
 											RelOptInfo *parent_joinrel,
 											RelOptInfo *child_joinrel);
+extern void add_child_rel_pathkey_equivalences(PlannerInfo *root,
+											   RelOptInfo *child_rel,
+											   List *pathkeys);
 extern void add_setop_child_rel_equivalences(PlannerInfo *root,
 											 RelOptInfo *child_rel,
 											 List *child_tlist,
@@ -201,7 +210,6 @@ extern bool eclass_useful_for_merging(PlannerInfo *root,
 extern bool is_redundant_derived_clause(RestrictInfo *rinfo, List *clauselist);
 extern bool is_redundant_with_indexclauses(RestrictInfo *rinfo,
 										   List *indexclauses);
-extern void ec_clear_derived_clauses(EquivalenceClass *ec);
 
 /*
  * pathkeys.c

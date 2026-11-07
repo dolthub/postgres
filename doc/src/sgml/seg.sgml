@@ -46,7 +46,7 @@
    when you fetch it? Watch:
 
 <screen>
-test=&gt; select 6.50 :: float8 as "pH";
+test=&gt; SELECT 6.50::float8 AS "pH";
  pH
 ---
 6.5
@@ -72,7 +72,7 @@ test=&gt; select 6.50 :: float8 as "pH";
    Check this out:
 
 <screen>
-test=&gt; select '6.25 .. 6.50'::seg as "pH";
+test=&gt; SELECT '6.25 .. 6.50'::seg AS "pH";
           pH
 ------------
 6.25 .. 6.50
@@ -225,12 +225,12 @@ test=&gt; select '6.25 .. 6.50'::seg as "pH";
 
   <para>
    <type>seg</type> values are stored internally as pairs of 32-bit floating point
-   numbers. This means that numbers with more than 7 significant digits
+   numbers. This means that numbers with more than 6 significant digits
    will be truncated.
   </para>
 
   <para>
-   Numbers with 7 or fewer significant digits retain their
+   Numbers with 6 or fewer significant digits retain their
    original precision. That is, if your query returns 0.00, you will be
    sure that the trailing zeroes are not the artifacts of formatting: they
    reflect the precision of the original data. The number of leading
@@ -377,7 +377,7 @@ test=&gt; select '6.25 .. 6.50'::seg as "pH";
    boundary if the resulting interval includes a power of ten:
 
 <screen>
-postgres=&gt; select '10(+-)1'::seg as seg;
+postgres=&gt; SELECT '10(+-)1'::seg AS seg;
       seg
 ---------
 9.0 .. 11             -- should be: 9 .. 11

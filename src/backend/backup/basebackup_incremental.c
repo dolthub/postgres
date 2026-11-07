@@ -10,7 +10,7 @@
  * backup manifest supplied by the user taking the incremental backup
  * and extract the required information from it.
  *
- * Portions Copyright (c) 2010-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/backup/basebackup_incremental.c
@@ -140,8 +140,9 @@ static void manifest_process_wal_range(JsonManifestParseContext *context,
 									   XLogRecPtr start_lsn,
 									   XLogRecPtr end_lsn);
 pg_noreturn static void manifest_report_error(JsonManifestParseContext *context,
-											  const char *fmt,...)
+											  const char *fmt, ...)
 			pg_attribute_printf(2, 3);
+static int	compare_wal_summary_start_lsn(const ListCell *a, const ListCell *b);
 static int	compare_block_numbers(const void *a, const void *b);
 
 /*
@@ -157,7 +158,7 @@ CreateIncrementalBackupInfo(MemoryContext mcxt)
 
 	oldcontext = MemoryContextSwitchTo(mcxt);
 
-	ib = palloc0(sizeof(IncrementalBackupInfo));
+	ib = palloc0_object(IncrementalBackupInfo);
 	ib->mcxt = mcxt;
 	initStringInfo(&ib->buf);
 
@@ -169,7 +170,7 @@ CreateIncrementalBackupInfo(MemoryContext mcxt)
 	 */
 	ib->manifest_files = backup_file_create(mcxt, 10000, NULL);
 
-	context = palloc0(sizeof(JsonManifestParseContext));
+	context = palloc0_object(JsonManifestParseContext);
 	/* Parse the manifest. */
 	context->private_data = ib;
 	context->version_cb = manifest_process_version;
@@ -270,7 +271,6 @@ PrepareForIncrementalBackup(IncrementalBackupInfo *ib,
 	ListCell   *lc;
 	TimeLineHistoryEntry **tlep;
 	int			num_wal_ranges;
-	int			i;
 	bool		found_backup_start_tli = false;
 	TimeLineID	earliest_wal_range_tli = 0;
 	XLogRecPtr	earliest_wal_range_start_lsn = InvalidXLogRecPtr;
@@ -312,7 +312,7 @@ PrepareForIncrementalBackup(IncrementalBackupInfo *ib,
 	 */
 	expectedTLEs = readTimeLineHistory(backup_state->starttli);
 	tlep = palloc0(num_wal_ranges * sizeof(TimeLineHistoryEntry *));
-	for (i = 0; i < num_wal_ranges; ++i)
+	for (int i = 0; i < num_wal_ranges; ++i)
 	{
 		backup_wal_range *range = list_nth(ib->manifest_wal_ranges, i);
 		bool		saw_earliest_wal_range_tli = false;
@@ -400,7 +400,7 @@ PrepareForIncrementalBackup(IncrementalBackupInfo *ib,
 	 * anything here. However, if there's a problem staring us right in the
 	 * face, it's best to report it, so we do.
 	 */
-	for (i = 0; i < num_wal_ranges; ++i)
+	for (int i = 0; i < num_wal_ranges; ++i)
 	{
 		backup_wal_range *range = list_nth(ib->manifest_wal_ranges, i);
 
@@ -409,7 +409,7 @@ PrepareForIncrementalBackup(IncrementalBackupInfo *ib,
 			if (range->start_lsn < tlep[i]->begin)
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("manifest requires WAL from initial timeline %u starting at %X/%X, but that timeline begins at %X/%X",
+						 errmsg("manifest requires WAL from initial timeline %u starting at %X/%08X, but that timeline begins at %X/%08X",
 								range->tli,
 								LSN_FORMAT_ARGS(range->start_lsn),
 								LSN_FORMAT_ARGS(tlep[i]->begin))));
@@ -419,7 +419,7 @@ PrepareForIncrementalBackup(IncrementalBackupInfo *ib,
 			if (range->start_lsn != tlep[i]->begin)
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("manifest requires WAL from continuation timeline %u starting at %X/%X, but that timeline begins at %X/%X",
+						 errmsg("manifest requires WAL from continuation timeline %u starting at %X/%08X, but that timeline begins at %X/%08X",
 								range->tli,
 								LSN_FORMAT_ARGS(range->start_lsn),
 								LSN_FORMAT_ARGS(tlep[i]->begin))));
@@ -427,10 +427,23 @@ PrepareForIncrementalBackup(IncrementalBackupInfo *ib,
 
 		if (range->tli == latest_wal_range_tli)
 		{
+			/*
+			 * If the prior backup's final timeline is now historic, its WAL
+			 * range must not extend past the switch point. Otherwise, the
+			 * backup may contain changes outside this server's history.
+			 */
+			if (XLogRecPtrIsValid(tlep[i]->end) && range->end_lsn > tlep[i]->end)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("manifest requires WAL from final timeline %u ending at %X/%08X, but this server switched timelines at %X/%08X",
+								range->tli,
+								LSN_FORMAT_ARGS(range->end_lsn),
+								LSN_FORMAT_ARGS(tlep[i]->end))));
+
 			if (range->end_lsn > backup_state->startpoint)
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("manifest requires WAL from final timeline %u ending at %X/%X, but this backup starts at %X/%X",
+						 errmsg("manifest requires WAL from final timeline %u ending at %X/%08X, but this backup starts at %X/%08X",
 								range->tli,
 								LSN_FORMAT_ARGS(range->end_lsn),
 								LSN_FORMAT_ARGS(backup_state->startpoint)),
@@ -441,7 +454,7 @@ PrepareForIncrementalBackup(IncrementalBackupInfo *ib,
 			if (range->end_lsn != tlep[i]->end)
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("manifest requires WAL from non-final timeline %u ending at %X/%X, but this server switched timelines at %X/%X",
+						 errmsg("manifest requires WAL from non-final timeline %u ending at %X/%08X, but this server switched timelines at %X/%08X",
 								range->tli,
 								LSN_FORMAT_ARGS(range->end_lsn),
 								LSN_FORMAT_ARGS(tlep[i]->end))));
@@ -519,21 +532,21 @@ PrepareForIncrementalBackup(IncrementalBackupInfo *ib,
 		if (!WalSummariesAreComplete(tli_wslist, tli_start_lsn, tli_end_lsn,
 									 &tli_missing_lsn))
 		{
-			if (XLogRecPtrIsInvalid(tli_missing_lsn))
+			if (!XLogRecPtrIsValid(tli_missing_lsn))
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("WAL summaries are required on timeline %u from %X/%X to %X/%X, but no summaries for that timeline and LSN range exist",
+						 errmsg("WAL summaries are required on timeline %u from %X/%08X to %X/%08X, but no summaries for that timeline and LSN range exist",
 								tle->tli,
 								LSN_FORMAT_ARGS(tli_start_lsn),
 								LSN_FORMAT_ARGS(tli_end_lsn))));
 			else
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("WAL summaries are required on timeline %u from %X/%X to %X/%X, but the summaries for that timeline and LSN range are incomplete",
+						 errmsg("WAL summaries are required on timeline %u from %X/%08X to %X/%08X, but the summaries for that timeline and LSN range are incomplete",
 								tle->tli,
 								LSN_FORMAT_ARGS(tli_start_lsn),
 								LSN_FORMAT_ARGS(tli_end_lsn)),
-						 errdetail("The first unsummarized LSN in this range is %X/%X.",
+						 errdetail("The first unsummarized LSN in this range is %X/%08X.",
 								   LSN_FORMAT_ARGS(tli_missing_lsn))));
 		}
 
@@ -560,6 +573,12 @@ PrepareForIncrementalBackup(IncrementalBackupInfo *ib,
 		if (tle->tli == earliest_wal_range_tli)
 			break;
 	}
+
+	/*
+	 * Merge summaries in ascending start LSN order so that applying a limit
+	 * block does not discard block references from later summaries.
+	 */
+	list_sort(required_wslist, compare_wal_summary_start_lsn);
 
 	/*
 	 * Read all of the required block reference table files and merge all of
@@ -595,15 +614,14 @@ PrepareForIncrementalBackup(IncrementalBackupInfo *ib,
 
 			while (1)
 			{
-				unsigned	nblocks;
-				unsigned	i;
+				unsigned int nblocks;
 
 				nblocks = BlockRefTableReaderGetBlocks(reader, blocks,
 													   BLOCKS_PER_READ);
 				if (nblocks == 0)
 					break;
 
-				for (i = 0; i < nblocks; ++i)
+				for (unsigned int i = 0; i < nblocks; ++i)
 					BlockRefTableMarkBlockModified(ib->brtab, &rlocator,
 												   forknum, blocks[i]);
 			}
@@ -729,7 +747,11 @@ GetFileBackupMethod(IncrementalBackupInfo *ib, const char *path,
 		ipath = GetIncrementalFilePath(dboid, spcoid, relfilenumber,
 									   forknum, segno);
 		if (backup_file_lookup(ib->manifest_files, ipath) == NULL)
+		{
+			pfree(ipath);
 			return BACK_UP_FILE_FULLY;
+		}
+		pfree(ipath);
 	}
 
 	/*
@@ -930,7 +952,7 @@ GetIncrementalFileSize(unsigned num_blocks_required)
 static uint32
 hash_string_pointer(const char *s)
 {
-	unsigned char *ss = (unsigned char *) s;
+	const unsigned char *ss = (const unsigned char *) s;
 
 	return hash_bytes(ss, strlen(s));
 }
@@ -1007,7 +1029,7 @@ manifest_process_wal_range(JsonManifestParseContext *context,
 						   XLogRecPtr end_lsn)
 {
 	IncrementalBackupInfo *ib = context->private_data;
-	backup_wal_range *range = palloc(sizeof(backup_wal_range));
+	backup_wal_range *range = palloc_object(backup_wal_range);
 
 	range->tli = tli;
 	range->start_lsn = start_lsn;
@@ -1020,7 +1042,7 @@ manifest_process_wal_range(JsonManifestParseContext *context,
  * manifest.
  */
 static void
-manifest_report_error(JsonManifestParseContext *context, const char *fmt,...)
+manifest_report_error(JsonManifestParseContext *context, const char *fmt, ...)
 {
 	StringInfoData errbuf;
 
@@ -1044,13 +1066,25 @@ manifest_report_error(JsonManifestParseContext *context, const char *fmt,...)
 }
 
 /*
+ * List comparator for WAL summary files, ordered by ascending start LSN.
+ */
+static int
+compare_wal_summary_start_lsn(const ListCell *a, const ListCell *b)
+{
+	WalSummaryFile *ws1 = lfirst(a);
+	WalSummaryFile *ws2 = lfirst(b);
+
+	return pg_cmp_u64(ws1->start_lsn, ws2->start_lsn);
+}
+
+/*
  * Quicksort comparator for block numbers.
  */
 static int
 compare_block_numbers(const void *a, const void *b)
 {
-	BlockNumber aa = *(BlockNumber *) a;
-	BlockNumber bb = *(BlockNumber *) b;
+	BlockNumber aa = *(const BlockNumber *) a;
+	BlockNumber bb = *(const BlockNumber *) b;
 
 	return pg_cmp_u32(aa, bb);
 }

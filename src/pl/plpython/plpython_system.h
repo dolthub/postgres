@@ -7,7 +7,7 @@
  * declarations should be put here.  However, we do include some stuff
  * that is meant to prevent conflicts between our code and Python.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/pl/plpython/plpython_system.h
@@ -34,8 +34,10 @@
 #define HAVE_SNPRINTF 1
 
 #if defined(_MSC_VER) && defined(_DEBUG)
-/* Python uses #pragma to bring in a non-default libpython on VC++ if
- * _DEBUG is defined */
+/*
+ * Python uses #pragma to bring in a non-default libpython on VC++ if
+ * _DEBUG is defined
+ */
 #undef _DEBUG
 /* Also hide away errcode, since we load Python.h before postgres.h */
 #define errcode __msvc_errcode

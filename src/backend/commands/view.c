@@ -3,7 +3,7 @@
  * view.c
  *	  use rewrite rules to construct views
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -22,7 +22,6 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/analyze.h"
-#include "parser/parse_relation.h"
 #include "rewrite/rewriteDefine.h"
 #include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteSupport.h"
@@ -348,20 +347,6 @@ DefineViewRules(Oid viewOid, Query *viewParse, bool replace)
 	 */
 }
 
-/* Versioned bindings are statement-local until stored-query dependencies and
- * view-owner authorization have a versioned catalog contract. */
-static bool
-versioned_view_walker(Node *node, void *context)
-{
-	if (!node)
-		return false;
-	if (IsA(node, RangeTblEntry))
-		return ((RangeTblEntry *) node)->rtekind == RTE_DOLT;
-	if (IsA(node, Query))
-		return query_tree_walker((Query *) node, versioned_view_walker, context, QTW_EXAMINE_RTES_BEFORE);
-	return expression_tree_walker(node, versioned_view_walker, context);
-}
-
 /*
  * DefineView
  *		Execute a CREATE VIEW command.
@@ -376,6 +361,7 @@ DefineView(ViewStmt *stmt, const char *queryString,
 	ListCell   *cell;
 	bool		check_option;
 	ObjectAddress address;
+	ObjectAddress temp_object;
 
 	/*
 	 * Run parse analysis to convert the raw parse tree to a Query.  Note this
@@ -387,8 +373,6 @@ DefineView(ViewStmt *stmt, const char *queryString,
 	rawstmt->stmt_len = stmt_len;
 
 	viewParse = parse_analyze_fixedparams(rawstmt, queryString, NULL, 0, NULL);
-	if (versioned_view_walker((Node *) viewParse, NULL))
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("stored views over versioned bindings are not supported yet")));
 
 	/*
 	 * The grammar should ensure that the result is a single SELECT Query.
@@ -500,12 +484,14 @@ DefineView(ViewStmt *stmt, const char *queryString,
 	 */
 	view = copyObject(stmt->view);	/* don't corrupt original command */
 	if (view->relpersistence == RELPERSISTENCE_PERMANENT
-		&& isQueryUsingTempRelation(viewParse))
+		&& query_uses_temp_object(viewParse, &temp_object))
 	{
 		view->relpersistence = RELPERSISTENCE_TEMP;
 		ereport(NOTICE,
 				(errmsg("view \"%s\" will be a temporary view",
-						view->relname)));
+						view->relname),
+				 errdetail("It depends on temporary %s.",
+						   getObjectDescription(&temp_object, false))));
 	}
 
 	/*

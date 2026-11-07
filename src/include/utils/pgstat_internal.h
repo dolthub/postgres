@@ -5,7 +5,7 @@
  * only be needed by files implementing statistics support (rather than ones
  * reporting / querying stats).
  *
- * Copyright (c) 2001-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2026, PostgreSQL Global Development Group
  *
  * src/include/utils/pgstat_internal.h
  * ----------
@@ -48,7 +48,13 @@
  * PgStatShared_Common as the first element.
  */
 
-/* struct for shared statistics hash entry key. */
+/*
+ * Struct for shared statistics hash entry key.
+ *
+ * NB: We assume that this struct contains no padding.  Also, 8 bytes
+ * allocated for the object ID are good enough to ensure the uniqueness
+ * of the hash key, hence the addition of new fields is not recommended.
+ */
 typedef struct PgStat_HashKey
 {
 	PgStat_Kind kind;			/* statistics entry kind */
@@ -56,6 +62,29 @@ typedef struct PgStat_HashKey
 	uint64		objid;			/* object ID (table, function, etc.), or
 								 * identifier. */
 } PgStat_HashKey;
+
+/*
+ * Tracks if the stats file is being read, written or discarded, used in
+ * combination with the finish callback.
+ *
+ * These states allow plugins that create auxiliary data files to determine
+ * the current operation and perform any necessary file cleanup.
+ */
+typedef enum PgStat_StatsFileOp
+{
+	STATS_WRITE,
+	STATS_READ,
+	STATS_DISCARD,
+} PgStat_StatsFileOp;
+
+/*
+ * PgStat_HashKey should not have any padding.  Checking that the structure
+ * size matches with the sum of each field is a check simple enough to
+ * enforce this policy.
+ */
+StaticAssertDecl((sizeof(PgStat_Kind) + sizeof(uint64) + sizeof(Oid)) ==
+				 sizeof(PgStat_HashKey),
+				 "PgStat_HashKey should have no padding");
 
 /*
  * Shared statistics hash entry. Doesn't itself contain any stats, but points
@@ -217,6 +246,12 @@ typedef struct PgStat_KindInfo
 	bool		write_to_file:1;
 
 	/*
+	 * Should the number of entries be tracked?  For variable-numbered stats,
+	 * to update its PgStat_ShmemControl.entry_counts.
+	 */
+	bool		track_entry_count:1;
+
+	/*
 	 * The size of an entry in the shared stats hash table (pointed to by
 	 * PgStatShared_HashEntry->body).  For fixed-numbered statistics, this is
 	 * the size of an entry in PgStat_ShmemControl->custom_data.
@@ -281,6 +316,40 @@ typedef struct PgStat_KindInfo
 	void		(*to_serialized_name) (const PgStat_HashKey *key,
 									   const PgStatShared_Common *header, NameData *name);
 	bool		(*from_serialized_name) (const NameData *name, PgStat_HashKey *key);
+
+	/*
+	 * For variable-numbered stats: read or write additional data related to
+	 * an entry, in the stats file or optionally in a different file.
+	 * Optional.
+	 *
+	 * to_serialized_data: write auxiliary data for an entry.  Returns true on
+	 * success, false on write error.
+	 *
+	 * from_serialized_data: read auxiliary data for an entry.  Returns true
+	 * on success, false on read error.
+	 *
+	 * "statfile" is a pointer to the on-disk stats file, named
+	 * PGSTAT_STAT_PERMANENT_FILENAME.  "key" is the hash key of the entry
+	 * just written or read.  "header" is a pointer to the stats data; it may
+	 * be modified only in from_serialized_data to reconstruct an entry.
+	 */
+	bool		(*to_serialized_data) (const PgStat_HashKey *key,
+									   const PgStatShared_Common *header,
+									   FILE *statfile);
+	bool		(*from_serialized_data) (const PgStat_HashKey *key,
+										 PgStatShared_Common *header,
+										 FILE *statfile);
+
+	/*
+	 * For fixed-numbered or variable-numbered statistics.
+	 *
+	 * Perform custom actions when done processing the on-disk stats file
+	 * after all the stats entries have been processed.  Optional.
+	 *
+	 * "status" tracks the operation done for the on-disk stats file (read,
+	 * write, discard).
+	 */
+	void		(*finish) (PgStat_StatsFileOp status);
 
 	/*
 	 * For fixed-numbered statistics: Initialize shared memory state.
@@ -396,6 +465,13 @@ typedef struct PgStatShared_IO
 	PgStat_IO	stats;
 } PgStatShared_IO;
 
+typedef struct PgStatShared_Lock
+{
+	/* lock protects ->stats */
+	LWLock		lock;
+	PgStat_Lock stats;
+} PgStatShared_Lock;
+
 typedef struct PgStatShared_SLRU
 {
 	/* lock protects ->stats */
@@ -486,12 +562,23 @@ typedef struct PgStat_ShmemControl
 	pg_atomic_uint64 gc_request_count;
 
 	/*
+	 * Counters for the number of entries associated to a single stats kind
+	 * that uses variable-numbered objects stored in the shared hash table.
+	 * These counters can be enabled on a per-kind basis, when
+	 * track_entry_count is set.  This counter is incremented each time a new
+	 * entry is created (not reused) in the shared hash table, and is
+	 * decremented each time an entry is freed from the shared hash table.
+	 */
+	pg_atomic_uint64 entry_counts[PGSTAT_KIND_MAX];
+
+	/*
 	 * Stats data for fixed-numbered objects.
 	 */
 	PgStatShared_Archiver archiver;
 	PgStatShared_BgWriter bgwriter;
 	PgStatShared_Checkpointer checkpointer;
 	PgStatShared_IO io;
+	PgStatShared_Lock lock;
 	PgStatShared_SLRU slru;
 	PgStatShared_Wal wal;
 
@@ -523,6 +610,8 @@ typedef struct PgStat_Snapshot
 	PgStat_CheckpointerStats checkpointer;
 
 	PgStat_IO	io;
+
+	PgStat_Lock lock;
 
 	PgStat_SLRUStats slru[SLRU_NUM_ELEMENTS];
 
@@ -597,7 +686,8 @@ extern PgStat_EntryRef *pgstat_prep_pending_entry(PgStat_Kind kind, Oid dboid,
 extern PgStat_EntryRef *pgstat_fetch_pending_entry(PgStat_Kind kind,
 												   Oid dboid, uint64 objid);
 
-extern void *pgstat_fetch_entry(PgStat_Kind kind, Oid dboid, uint64 objid);
+extern void *pgstat_fetch_entry(PgStat_Kind kind, Oid dboid, uint64 objid,
+								bool *may_free);
 extern void pgstat_snapshot_fixed(PgStat_Kind kind);
 
 
@@ -618,7 +708,7 @@ extern void pgstat_archiver_snapshot_cb(void);
 #define PGSTAT_BACKEND_FLUSH_WAL   (1 << 1) /* Flush WAL statistics */
 #define PGSTAT_BACKEND_FLUSH_ALL   (PGSTAT_BACKEND_FLUSH_IO | PGSTAT_BACKEND_FLUSH_WAL)
 
-extern bool pgstat_flush_backend(bool nowait, bits32 flags);
+extern bool pgstat_flush_backend(bool nowait, uint32 flags);
 extern bool pgstat_backend_flush_cb(bool nowait);
 extern void pgstat_backend_reset_timestamp_cb(PgStatShared_Common *header,
 											  TimestampTz ts);
@@ -660,6 +750,7 @@ extern void pgstat_database_reset_timestamp_cb(PgStatShared_Common *header, Time
  */
 
 extern bool pgstat_function_flush_cb(PgStat_EntryRef *entry_ref, bool nowait);
+extern void pgstat_function_reset_timestamp_cb(PgStatShared_Common *header, TimestampTz ts);
 
 
 /*
@@ -673,6 +764,14 @@ extern void pgstat_io_init_shmem_cb(void *stats);
 extern void pgstat_io_reset_all_cb(TimestampTz ts);
 extern void pgstat_io_snapshot_cb(void);
 
+/*
+ * Functions in pgstat_lock.c
+ */
+
+extern bool pgstat_lock_flush_cb(bool nowait);
+extern void pgstat_lock_init_shmem_cb(void *stats);
+extern void pgstat_lock_reset_all_cb(TimestampTz ts);
+extern void pgstat_lock_snapshot_cb(void);
 
 /*
  * Functions in pgstat_relation.c
@@ -685,6 +784,7 @@ extern void PostPrepare_PgStat_Relations(PgStat_SubXactStatus *xact_state);
 
 extern bool pgstat_relation_flush_cb(PgStat_EntryRef *entry_ref, bool nowait);
 extern void pgstat_relation_delete_pending_cb(PgStat_EntryRef *entry_ref);
+extern void pgstat_relation_reset_timestamp_cb(PgStatShared_Common *header, TimestampTz ts);
 
 
 /*
@@ -708,9 +808,8 @@ extern PgStat_EntryRef *pgstat_get_entry_ref(PgStat_Kind kind, Oid dboid, uint64
 extern bool pgstat_lock_entry(PgStat_EntryRef *entry_ref, bool nowait);
 extern bool pgstat_lock_entry_shared(PgStat_EntryRef *entry_ref, bool nowait);
 extern void pgstat_unlock_entry(PgStat_EntryRef *entry_ref);
-extern bool pgstat_drop_entry(PgStat_Kind kind, Oid dboid, uint64 objid);
-extern bool pgstat_drop_entry_ext(PgStat_Kind kind, Oid dboid, uint64 objid,
-								  bool missing_ok);
+extern bool pgstat_drop_entry(PgStat_Kind kind, Oid dboid, uint64 objid,
+							  bool missing_ok);
 extern void pgstat_drop_all_entries(void);
 extern void pgstat_drop_matching_entries(bool (*do_drop) (PgStatShared_HashEntry *, Datum),
 										 Datum match_data);
@@ -786,6 +885,7 @@ extern PGDLLIMPORT bool pgstat_report_fixed;
 
 /* Backend-local stats state */
 extern PGDLLIMPORT PgStat_LocalState pgStatLocal;
+
 
 /*
  * Implementation of inline functions declared above.
@@ -910,6 +1010,17 @@ pgstat_get_entry_data(PgStat_Kind kind, PgStatShared_Common *entry)
 	Assert(off != 0 && off < PG_UINT32_MAX);
 
 	return ((char *) (entry)) + off;
+}
+
+/*
+ * Returns the number of entries counted for a stats kind.
+ */
+static inline uint64
+pgstat_get_entry_count(PgStat_Kind kind)
+{
+	Assert(pgstat_get_kind_info(kind)->track_entry_count);
+
+	return pg_atomic_read_u64(&pgStatLocal.shmem->entry_counts[kind - 1]);
 }
 
 /*

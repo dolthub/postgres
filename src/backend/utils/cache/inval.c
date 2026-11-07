@@ -98,11 +98,11 @@
  *	likewise send the invalidation immediately, before ending the change's
  *	critical section.  This includes inplace heap updates, relmap, and smgr.
  *
- *	When wal_level=logical, write invalidations into WAL at each command end to
- *	support the decoding of the in-progress transactions.  See
- *	CommandEndInvalidationMessages.
+ *	When effective_wal_level is 'logical', write invalidations into WAL at
+ *	each command end to support the decoding of the in-progress transactions.
+ *	See CommandEndInvalidationMessages.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -114,13 +114,11 @@
 
 #include <limits.h>
 
-#include "access/doltcatalog.h"
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "access/xloginsert.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_constraint.h"
-#include "catalog/pg_dolt_binding.h"
 #include "miscadmin.h"
 #include "storage/procnumber.h"
 #include "storage/sinval.h"
@@ -511,15 +509,15 @@ AddRelsyncInvalidationMessage(InvalidationMsgsGroup *group,
 
 	/* Don't add a duplicate item. */
 	ProcessMessageSubGroup(group, RelCacheMsgs,
-						   if (msg->rc.id == SHAREDINVALRELSYNC_ID &&
-							   (msg->rc.relId == relId ||
-								msg->rc.relId == InvalidOid))
+						   if (msg->rs.id == SHAREDINVALRELSYNC_ID &&
+							   (msg->rs.relid == relId ||
+								msg->rs.relid == InvalidOid))
 						   return);
 
 	/* OK, add the item */
-	msg.rc.id = SHAREDINVALRELSYNC_ID;
-	msg.rc.dbId = dbId;
-	msg.rc.relId = relId;
+	msg.rs.id = SHAREDINVALRELSYNC_ID;
+	msg.rs.dbId = dbId;
+	msg.rs.relid = relId;
 	/* check AddCatcacheInvalidationMessage() for an explanation */
 	VALGRIND_MAKE_MEM_DEFINED(&msg, sizeof(msg));
 
@@ -760,7 +758,7 @@ PrepareInplaceInvalidationState(void)
 	Assert(inplaceInvalInfo == NULL);
 
 	/* gone after WAL insertion CritSection ends, so use current context */
-	myInfo = (InvalidationInfo *) palloc0(sizeof(InvalidationInfo));
+	myInfo = palloc0_object(InvalidationInfo);
 
 	/* Stash our messages past end of the transactional messages, if any. */
 	if (transInvalInfo != NULL)
@@ -1193,9 +1191,6 @@ ProcessCommittedInvalidationMessages(SharedInvalidationMessage *msgs,
  * In any case, reset our state to empty.  We need not physically
  * free memory here, since TopTransactionContext is about to be emptied
  * anyway.
- *
- * Note:
- *		This should be called as the last step in processing a transaction.
  */
 void
 AtEOXact_Inval(bool isCommit)
@@ -1421,7 +1416,7 @@ CommandEndInvalidationMessages(void)
 	ProcessInvalidationMessages(&transInvalInfo->ii.CurrentCmdInvalidMsgs,
 								LocalExecuteInvalidationMessage);
 
-	/* WAL Log per-command invalidation messages for wal_level=logical */
+	/* WAL Log per-command invalidation messages for logical decoding */
 	if (XLogLogicalInfoActive())
 		LogLogicalInvalidations();
 
@@ -1482,7 +1477,7 @@ CacheInvalidateHeapTupleCommon(Relation relation,
 	else
 		PrepareToInvalidateCacheTuple(relation, tuple, newtuple,
 									  RegisterCatcacheInvalidation,
-									  (void *) info);
+									  info);
 
 	/*
 	 * Now, is this tuple one of the primary definers of a relcache entry? See
@@ -1548,17 +1543,6 @@ CacheInvalidateHeapTupleCommon(Relation relation,
 		}
 		else
 			return;
-	}
-	else if (tupleRelId == DoltBindingRelationId)
-	{
-		/*
-		 * A storage binding supplies a branch-head prolly relation's file, as
-		 * relfilenode does for others.
-		 */
-		relationId = dg_binding_identity(relation, tuple);
-		if (!OidIsValid(relationId))
-			return;
-		databaseId = MyDatabaseId;
 	}
 	else
 		return;
@@ -1713,18 +1697,6 @@ CacheInvalidateRelcacheByRelid(Oid relid)
 }
 
 /*
- * CacheInvalidateRelcacheInDatabase
- *		As CacheInvalidateRelcacheByRelid, for a relation of this database whose
- *		pg_class row need not be readable, such as a branch head's relation
- *		while its branch's schema is being replaced.
- */
-void
-CacheInvalidateRelcacheInDatabase(Oid relid)
-{
-	RegisterRelcacheInvalidation(PrepareInvalidationState(), MyDatabaseId, relid);
-}
-
-/*
  * CacheInvalidateRelSync
  *		Register invalidation of the cache in logical decoding output plugin
  *		for a database.
@@ -1782,7 +1754,7 @@ CacheInvalidateSmgr(RelFileLocatorBackend rlocator)
 	SharedInvalidationMessage msg;
 
 	/* verify optimization stated above stays valid */
-	StaticAssertStmt(MAX_BACKENDS_BITS <= 23,
+	StaticAssertDecl(MAX_BACKENDS_BITS <= 23,
 					 "MAX_BACKENDS_BITS is too big for inval.c");
 
 	msg.sm.id = SHAREDINVALSMGR_ID;
@@ -1838,7 +1810,7 @@ CacheInvalidateRelmap(Oid databaseId)
  * flush all cached state anyway.
  */
 void
-CacheRegisterSyscacheCallback(int cacheid,
+CacheRegisterSyscacheCallback(SysCacheIdentifier cacheid,
 							  SyscacheCallbackFunction func,
 							  Datum arg)
 {
@@ -1920,7 +1892,7 @@ CacheRegisterRelSyncCallback(RelSyncCallbackFunction func,
  * this module from knowing which catcache IDs correspond to which catalogs.
  */
 void
-CallSyscacheCallbacks(int cacheid, uint32 hashvalue)
+CallSyscacheCallbacks(SysCacheIdentifier cacheid, uint32 hashvalue)
 {
 	int			i;
 
@@ -1990,18 +1962,5 @@ LogLogicalInvalidations(void)
 									XLogRegisterData(msgs,
 													 n * sizeof(SharedInvalidationMessage)));
 		XLogInsert(RM_XACT_ID, XLOG_XACT_INVALIDATIONS);
-	}
-}
-
-/* Contextual runtime OIDs are local identities: never broadcast them. */
-void
-InvalidateLocalRelation(Oid relid)
-{
-	RelationCacheInvalidateEntry(relid);
-	for (int i = 0; i < relcache_callback_count; i++)
-	{
-		struct RELCACHECALLBACK *item = relcache_callback_list + i;
-
-		item->function(item->arg, relid);
 	}
 }

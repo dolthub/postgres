@@ -1,4 +1,4 @@
-# Copyright (c) 2021-2025, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 # This test case aims to verify that client-side backup compression work
 # properly, and it also aims to verify that pg_verifybackup can verify a base
@@ -32,7 +32,6 @@ print $jf $junk_data;
 close $jf;
 
 my $backup_path = $primary->backup_dir . '/client-backup';
-my $extract_path = $primary->backup_dir . '/extracted-backup';
 
 my @test_configuration = (
 	{
@@ -136,14 +135,23 @@ for my $tc (@test_configuration)
 
 		# Verify tar backup.
 		$primary->command_ok(
-			[
-				'pg_verifybackup', '--no-parse-wal',
-				'--exit-on-error', $backup_path,
-			],
+			[ 'pg_verifybackup', '--exit-on-error', $backup_path, ],
 			"verify backup, compression $method");
 
+		if ($method ne 'none')
+		{
+			my $flen = -s $backup_path . "/" . $tc->{'backup_archive'};
+			ok( truncate(
+					$backup_path . "/" . $tc->{'backup_archive'},
+					$flen - 1),
+				"file truncated");
+			$primary->command_fails_like(
+				[ 'pg_verifybackup', '--exit-on-error', $backup_path, ],
+				qr/could not decompress data/,
+				"backup is corrupted, compression $method");
+		}
+
 		# Cleanup.
-		rmtree($extract_path);
 		rmtree($backup_path);
 	}
 }

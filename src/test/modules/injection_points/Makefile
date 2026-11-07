@@ -4,24 +4,43 @@ MODULE_big = injection_points
 OBJS = \
 	$(WIN32RES) \
 	injection_points.o \
-	injection_stats.o \
-	injection_stats_fixed.o \
 	regress_injection.o
 EXTENSION = injection_points
 DATA = injection_points--1.0.sql
 PGFILEDESC = "injection_points - facility for injection points"
 
+EXTRA_INSTALL = contrib/test_decoding
+
 REGRESS = injection_points hashagg reindex_conc vacuum
 REGRESS_OPTS = --dlpath=$(top_builddir)/src/test/regress
+
+# wait_cleanup terminates another backend, whose FATAL message can be lost
+# on Windows, making the test unstable there.
+# See https://postgr.es/m/088AB35D-0860-494A-A9CF-8B301543AA51@yandex-team.ru
+WAIT_CLEANUP_TST = $(if $(filter win32,$(PORTNAME)),,wait_cleanup)
 
 ISOLATION = basic \
 	    inplace \
 	    reindex_concurrently_deferred \
+	    reindex_concurrently_toast \
+	    repack \
+	    repack_commit_race \
+	    repack_decode \
+	    repack_dropped \
+	    repack_missingval \
+	    repack_temporal \
+	    repack_temporal_multirange \
+	    repack_toast \
+	    ri_fastpath_reindex \
+	    ri_fastpath_snapshot \
 	    syscache-update-pruned \
-	    wait_cleanup \
-	    heap_lock_update
+	    $(WAIT_CLEANUP_TST) \
+	    heap_lock_update \
+	    on_conflict_probe_window \
+	    multixact-aborted-updater
 
-TAP_TESTS = 1
+# some isolation tests require wal_level=replica
+ISOLATION_OPTS = --temp-config $(top_srcdir)/src/test/modules/injection_points/extra.conf
 
 # The injection points are cluster-wide, so disable installcheck
 NO_INSTALLCHECK = 1

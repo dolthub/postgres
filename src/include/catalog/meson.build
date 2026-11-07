@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2025, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 # Note: the order of this list determines the order in which the catalog
 # header files are assembled into postgres.bki.  BKI_BOOTSTRAP catalogs
@@ -69,22 +69,6 @@ catalog_headers = [
   'pg_publication_rel.h',
   'pg_subscription.h',
   'pg_subscription_rel.h',
-  'pg_dolt_object.h',
-  'pg_dolt_ref.h',
-  'pg_dolt_binding.h',
-  'pg_dolt_storage.h',
-  'pg_dolt_remote.h',
-  'pg_dolt_reflog.h',
-  'pg_dolt_rebase.h',
-  'pg_dolt_backup.h',
-  'pg_dolt_branch_control.h',
-  'pg_dolt_branch_namespace_control.h',
-  'pg_dolt_root.h',
-  'pg_dolt_lock.h',
-  'pg_dolt_handle.h',
-  'pg_dolt_relation_stats.h',
-  'pg_dolt_identity.h',
-  'pg_dolt_sequence.h',
 ]
 
 # The .dat files we need can just be listed alphabetically.
@@ -94,6 +78,7 @@ bki_data = [
   'pg_amop.dat',
   'pg_amproc.dat',
   'pg_authid.dat',
+  'pg_auth_members.dat',
   'pg_cast.dat',
   'pg_class.dat',
   'pg_collation.dat',
@@ -131,7 +116,7 @@ output_install = [
   dir_data,
   dir_include_server / 'catalog',
   dir_include_server / 'catalog',
-  false,
+  dir_include_server / 'catalog',
   dir_include_server / 'catalog',
 ]
 

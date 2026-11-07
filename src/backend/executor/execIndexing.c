@@ -54,9 +54,9 @@
  * ---------------------
  *
  * Speculative insertion is a two-phase mechanism used to implement
- * INSERT ... ON CONFLICT DO UPDATE/NOTHING.  The tuple is first inserted
- * to the heap and update the indexes as usual, but if a constraint is
- * violated, we can still back out the insertion without aborting the whole
+ * INSERT ... ON CONFLICT.  The tuple is first inserted into the heap
+ * and the indexes are updated as usual, but if a constraint is violated,
+ * we can still back out of the insertion without aborting the whole
  * transaction.  In an INSERT ... ON CONFLICT statement, if a conflict is
  * detected, the inserted tuple is backed out and the ON CONFLICT action is
  * executed instead.
@@ -95,7 +95,7 @@
  * with the higher XID backs out.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -105,7 +105,6 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "access/doltcatalog.h"
 
 #include "access/genam.h"
 #include "access/relscan.h"
@@ -115,6 +114,7 @@
 #include "executor/executor.h"
 #include "nodes/nodeFuncs.h"
 #include "storage/lmgr.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/multirangetypes.h"
 #include "utils/rangetypes.h"
@@ -130,7 +130,7 @@ typedef enum
 
 static bool check_exclusion_or_unique_constraint(Relation heap, Relation index,
 												 IndexInfo *indexInfo,
-												 ItemPointer tupleid,
+												 const ItemPointerData *tupleid,
 												 const Datum *values, const bool *isnull,
 												 EState *estate, bool newIndex,
 												 CEOUC_WAIT_MODE waitMode,
@@ -189,8 +189,8 @@ ExecOpenIndices(ResultRelInfo *resultRelInfo, bool speculative)
 	/*
 	 * allocate space for result arrays
 	 */
-	relationDescs = (RelationPtr) palloc(len * sizeof(Relation));
-	indexInfoArray = (IndexInfo **) palloc(len * sizeof(IndexInfo *));
+	relationDescs = palloc_array(Relation, len);
+	indexInfoArray = palloc_array(IndexInfo *, len);
 
 	resultRelInfo->ri_NumIndices = len;
 	resultRelInfo->ri_IndexRelationDescs = relationDescs;
@@ -210,7 +210,7 @@ ExecOpenIndices(ResultRelInfo *resultRelInfo, bool speculative)
 		Relation	indexDesc;
 		IndexInfo  *ii;
 
-		indexDesc = dg_storage_bound(resultRelation) ? dg_storage_index(resultRelation, indexOid) : index_open(indexOid, RowExclusiveLock);
+		indexDesc = index_open(indexOid, RowExclusiveLock);
 
 		/* extract index key information from the index's pg_index info */
 		ii = BuildIndexInfo(indexDesc);
@@ -257,8 +257,7 @@ ExecCloseIndices(ResultRelInfo *resultRelInfo)
 		index_insert_cleanup(indexDescs[i], indexInfos[i]);
 
 		/* Drop lock acquired by ExecOpenIndices */
-		if (!dg_storage_bound(resultRelInfo->ri_RelationDesc))
-			index_close(indexDescs[i], RowExclusiveLock);
+		index_close(indexDescs[i], RowExclusiveLock);
 
 		/* Mark the index as closed */
 		indexDescs[i] = NULL;
@@ -278,18 +277,18 @@ ExecCloseIndices(ResultRelInfo *resultRelInfo)
  *		into all the relations indexing the result relation
  *		when a heap tuple is inserted into the result relation.
  *
- *		When 'update' is true and 'onlySummarizing' is false,
+ *		When EIIT_IS_UPDATE is set and EIIT_ONLY_SUMMARIZING isn't,
  *		executor is performing an UPDATE that could not use an
  *		optimization like heapam's HOT (in more general terms a
  *		call to table_tuple_update() took place and set
  *		'update_indexes' to TU_All).  Receiving this hint makes
  *		us consider if we should pass down the 'indexUnchanged'
  *		hint in turn.  That's something that we figure out for
- *		each index_insert() call iff 'update' is true.
- *		(When 'update' is false we already know not to pass the
+ *		each index_insert() call iff EIIT_IS_UPDATE is set.
+ *		(When that flag is not set we already know not to pass the
  *		hint to any index.)
  *
- *		If onlySummarizing is set, an equivalent optimization to
+ *		If EIIT_ONLY_SUMMARIZING is set, an equivalent optimization to
  *		HOT has been applied and any updated columns are indexed
  *		only by summarizing indexes (or in more general terms a
  *		call to table_tuple_update() took place and set
@@ -300,23 +299,21 @@ ExecCloseIndices(ResultRelInfo *resultRelInfo)
  *		Unique and exclusion constraints are enforced at the same
  *		time.  This returns a list of index OIDs for any unique or
  *		exclusion constraints that are deferred and that had
- *		potential (unconfirmed) conflicts.  (if noDupErr == true,
+ *		potential (unconfirmed) conflicts.  (if EIIT_NO_DUPE_ERROR,
  *		the same is done for non-deferred constraints, but report
  *		if conflict was speculative or deferred conflict to caller)
  *
- *		If 'arbiterIndexes' is nonempty, noDupErr applies only to
- *		those indexes.  NIL means noDupErr applies to all indexes.
+ *		If 'arbiterIndexes' is nonempty, EIIT_NO_DUPE_ERROR applies only to
+ *		those indexes.  NIL means EIIT_NO_DUPE_ERROR applies to all indexes.
  * ----------------------------------------------------------------
  */
 List *
 ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
-					  TupleTableSlot *slot,
 					  EState *estate,
-					  bool update,
-					  bool noDupErr,
-					  bool *specConflict,
+					  uint32 flags,
+					  TupleTableSlot *slot,
 					  List *arbiterIndexes,
-					  bool onlySummarizing)
+					  bool *specConflict)
 {
 	ItemPointer tupleid = &slot->tts_tid;
 	List	   *result = NIL;
@@ -376,7 +373,7 @@ ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
 		 * Skip processing of non-summarizing indexes if we only update
 		 * summarizing indexes
 		 */
-		if (onlySummarizing && !indexInfo->ii_Summarizing)
+		if ((flags & EIIT_ONLY_SUMMARIZING) && !indexInfo->ii_Summarizing)
 			continue;
 
 		/* Check for partial index */
@@ -411,7 +408,7 @@ ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
 					   isnull);
 
 		/* Check whether to apply noDupErr to this index */
-		applyNoDupErr = noDupErr &&
+		applyNoDupErr = (flags & EIIT_NO_DUPE_ERROR) &&
 			(arbiterIndexes == NIL ||
 			 list_member_oid(arbiterIndexes,
 							 indexRelation->rd_index->indexrelid));
@@ -443,10 +440,11 @@ ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
 		 * index.  If we're being called as part of an UPDATE statement,
 		 * consider if the 'indexUnchanged' = true hint should be passed.
 		 */
-		indexUnchanged = update && index_unchanged_by_update(resultRelInfo,
-															 estate,
-															 indexInfo,
-															 indexRelation);
+		indexUnchanged = ((flags & EIIT_IS_UPDATE) &&
+						  index_unchanged_by_update(resultRelInfo,
+													estate,
+													indexInfo,
+													indexRelation));
 
 		satisfiesConstraint =
 			index_insert(indexRelation, /* index relation */
@@ -544,7 +542,7 @@ ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
 bool
 ExecCheckIndexConstraints(ResultRelInfo *resultRelInfo, TupleTableSlot *slot,
 						  EState *estate, ItemPointer conflictTid,
-						  ItemPointer tupleid, List *arbiterIndexes)
+						  const ItemPointerData *tupleid, List *arbiterIndexes)
 {
 	int			i;
 	int			numIndices;
@@ -706,7 +704,7 @@ ExecCheckIndexConstraints(ResultRelInfo *resultRelInfo, TupleTableSlot *slot,
 static bool
 check_exclusion_or_unique_constraint(Relation heap, Relation index,
 									 IndexInfo *indexInfo,
-									 ItemPointer tupleid,
+									 const ItemPointerData *tupleid,
 									 const Datum *values, const bool *isnull,
 									 EState *estate, bool newIndex,
 									 CEOUC_WAIT_MODE waitMode,
@@ -825,7 +823,9 @@ check_exclusion_or_unique_constraint(Relation heap, Relation index,
 retry:
 	conflict = false;
 	found_self = false;
-	index_scan = index_beginscan(heap, index, &DirtySnapshot, NULL, indnkeyatts, 0);
+	index_scan = index_beginscan(heap, index,
+								 &DirtySnapshot, NULL, indnkeyatts, 0,
+								 SO_NONE);
 	index_rescan(index_scan, scankeys, indnkeyatts, NULL, 0);
 
 	while (index_getnext_slot(index_scan, ForwardScanDirection, existing_slot))
@@ -908,7 +908,32 @@ retry:
 		{
 			conflict = true;
 			if (conflictTid)
+			{
 				*conflictTid = existing_slot->tts_tid;
+
+				/*
+				 * The conflicting tuple decides the outcome of INSERT ... ON
+				 * CONFLICT, so for SSI purposes it has been read, even when
+				 * nothing gets written afterwards.  The dirty snapshot used
+				 * by the scan is not an MVCC snapshot, so SSI ignored that
+				 * read.  Read the tuple again with the query snapshot to
+				 * record it. The result is of no interest here, the caller
+				 * checks visibility itself.
+				 *
+				 * Some callers, such as the logical replication apply worker,
+				 * may have not set es_snapshot.  Since such callers are not
+				 * executing INSERT ... ON CONFLICT, there is nothing to
+				 * record for SSI; skip the read in that case.
+				 */
+				if (IsolationIsSerializable() &&
+					estate->es_snapshot != InvalidSnapshot)
+				{
+					INJECTION_POINT("check-exclusion-or-unique-constraint-conflict", NULL);
+					(void) table_tuple_fetch_row_version(heap, conflictTid,
+														 estate->es_snapshot,
+														 existing_slot);
+				}
+			}
 			break;
 		}
 
@@ -953,6 +978,11 @@ retry:
 
 	ExecDropSingleTupleTableSlot(existing_slot);
 
+#ifdef USE_INJECTION_POINTS
+	if (!conflict)
+		INJECTION_POINT("check-exclusion-or-unique-constraint-no-conflict", NULL);
+#endif
+
 	return !conflict;
 }
 
@@ -965,7 +995,7 @@ retry:
 void
 check_exclusion_constraint(Relation heap, Relation index,
 						   IndexInfo *indexInfo,
-						   ItemPointer tupleid,
+						   const ItemPointerData *tupleid,
 						   const Datum *values, const bool *isnull,
 						   EState *estate, bool newIndex)
 {

@@ -7,7 +7,7 @@
  *	  and join trees.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/primnodes.h
@@ -20,6 +20,7 @@
 #include "access/attnum.h"
 #include "access/cmptype.h"
 #include "nodes/bitmapset.h"
+#include "nodes/lockoptions.h"
 #include "nodes/pg_list.h"
 
 
@@ -90,12 +91,6 @@ typedef struct RangeVar
 
 	/* table alias & optional column aliases */
 	Alias	   *alias;
-
-	/*
-	 * Retained revision expression for AS OF; never a runtime object
-	 * identity.
-	 */
-	Node	   *dolt_revision;
 
 	/* token location, or -1 if unknown */
 	ParseLoc	location;
@@ -222,6 +217,9 @@ typedef struct Expr
  * row identity information during UPDATE/DELETE/MERGE.  This value should
  * never be seen outside the planner.
  *
+ * INVALID_VAR should never appear as anything's varno.  We use it in a
+ * few APIs to denote removal of an RTE.
+ *
  * varnullingrels is the set of RT indexes of outer joins that can force
  * the Var's value to null (at the point where it appears in the query).
  * See optimizer/README for discussion of that.
@@ -249,6 +247,7 @@ typedef struct Expr
 #define    OUTER_VAR		(-2)	/* reference to outer subplan */
 #define    INDEX_VAR		(-3)	/* reference to index column */
 #define    ROWID_VAR		(-4)	/* row identity column during planning */
+#define    INVALID_VAR		(-5)	/* this is not a valid varno! */
 
 #define IS_SPECIAL_VARNO(varno)		((int) (varno) < 0)
 
@@ -324,7 +323,10 @@ typedef struct Var
  * references).  This ensures that the Const node is self-contained and makes
  * it more likely that equal() will see logically identical values as equal.
  *
- * Only the constant type OID is relevant for the query jumbling.
+ * For query jumble, we don't want different const values changing the jumble
+ * result.  We only jumble consttype as different const types could result in
+ * very different plans and execution times, which is useful to distinguish in
+ * extensions such as pg_stat_statements.
  */
 typedef struct Const
 {
@@ -351,10 +353,7 @@ typedef struct Const
 	 */
 	bool		constbyval pg_node_attr(query_jumble_ignore);
 
-	/*
-	 * token location, or -1 if unknown.  All constants are tracked as
-	 * locations in query jumbling, to be marked as parameters.
-	 */
+	/* token location, or -1 if unknown. */
 	ParseLoc	location pg_node_attr(query_jumble_location);
 } Const;
 
@@ -457,9 +456,6 @@ typedef struct Param
  * and can share the result.  Aggregates with same 'transno' but different
  * 'aggno' can share the same transition state, only the final function needs
  * to be called separately.
- *
- * Information related to collations, transition types and internal states
- * are irrelevant for the query jumbling.
  */
 typedef struct Aggref
 {
@@ -555,9 +551,6 @@ typedef struct Aggref
  *
  * In raw parse output we have only the args list; parse analysis fills in the
  * refs list, and the planner fills in the cols list.
- *
- * All the fields used as information for an internal state are irrelevant
- * for the query jumbling.
  */
 typedef struct GroupingFunc
 {
@@ -580,11 +573,20 @@ typedef struct GroupingFunc
 } GroupingFunc;
 
 /*
- * WindowFunc
- *
- * Collation information is irrelevant for the query jumbling, as is the
- * internal state information of the node like "winstar" and "winagg".
+ * Null Treatment options. If specified, initially set to PARSER_IGNORE_NULLS
+ * which is then converted to IGNORE_NULLS if the window function allows the
+ * null treatment clause.
  */
+#define NO_NULLTREATMENT 0
+#define PARSER_IGNORE_NULLS 1
+#define PARSER_RESPECT_NULLS 2
+#define IGNORE_NULLS 3
+
+ /*
+  * WindowFunc
+  *
+  * Node type to represent a call to a window function.
+  */
 typedef struct WindowFunc
 {
 	Expr		xpr;
@@ -608,6 +610,8 @@ typedef struct WindowFunc
 	bool		winstar pg_node_attr(query_jumble_ignore);
 	/* is function a simple aggregate? */
 	bool		winagg pg_node_attr(query_jumble_ignore);
+	/* ignore nulls. One of the Null Treatment options */
+	int			ignore_nulls;
 	/* token location, or -1 if unknown */
 	ParseLoc	location;
 } WindowFunc;
@@ -695,8 +699,6 @@ typedef struct MergeSupportFunc
  * subscripting logic.  Likewise, reftypmod and refcollid will match the
  * container's properties in a store, but could be different in a fetch.
  *
- * Any internal state data is ignored for the query jumbling.
- *
  * Note: for the cases where a container is returned, if refexpr yields a R/W
  * expanded container, then the implementation is allowed to modify that
  * object in-place and return the same object.
@@ -764,9 +766,6 @@ typedef enum CoercionForm
 
 /*
  * FuncExpr - expression node for a function call
- *
- * Collation information is irrelevant for the query jumbling, only the
- * arguments and the function OID matter.
  */
 typedef struct FuncExpr
 {
@@ -783,9 +782,6 @@ typedef struct FuncExpr
 	 * argument
 	 */
 	bool		funcvariadic pg_node_attr(query_jumble_ignore);
-
-	/* Canonical function selected through the mutable session working set. */
-	bool		dolt_working;
 	/* how to display this function call */
 	CoercionForm funcformat pg_node_attr(query_jumble_ignore);
 	/* OID of collation of result */
@@ -834,9 +830,6 @@ typedef struct NamedArgExpr
  * of the node.  The planner makes sure it is valid before passing the node
  * tree to the executor, but during parsing/planning opfuncid can be 0.
  * Therefore, equal() will accept a zero value as being equal to other values.
- *
- * Internal state information and collation data is irrelevant for the query
- * jumbling.
  */
 typedef struct OpExpr
 {
@@ -914,9 +907,6 @@ typedef OpExpr NullIfExpr;
  * Similar to OpExpr, opfuncid, hashfuncid, and negfuncid are not necessarily
  * filled in right away, so will be ignored for equality if they are not set
  * yet.
- *
- * OID entries of the internal function types are irrelevant for the query
- * jumbling, but the operator OID and the arguments are.
  */
 typedef struct ScalarArrayOpExpr
 {
@@ -1104,6 +1094,7 @@ typedef struct SubPlan
 	Oid			firstColCollation;	/* Collation of first column of subplan
 									 * result */
 	/* Information about execution strategy: */
+	bool		isInitPlan;		/* true if it's an InitPlan */
 	bool		useHashTable;	/* true to store subselect output in a hash
 								 * table (implies we are doing "IN") */
 	bool		unknownEqFalse; /* true if it's okay to return FALSE when the
@@ -1118,6 +1109,7 @@ typedef struct SubPlan
 	List	   *parParam;		/* indices of input Params from parent plan */
 	List	   *args;			/* exprs to pass as parParam values */
 	/* Estimated execution costs: */
+	int			disabled_nodes; /* count of disabled nodes in the plan */
 	Cost		startup_cost;	/* one-time setup cost */
 	Cost		per_call_cost;	/* cost for each subplan evaluation */
 } SubPlan;
@@ -1368,11 +1360,11 @@ typedef struct CaseWhen
  *	* Placeholder for intermediate results in some SQL/JSON expression nodes,
  *	  such as JsonConstructorExpr.
  *
- * The uses in CaseExpr and ArrayCoerceExpr are safe only to the extent that
- * there is not any other CaseExpr or ArrayCoerceExpr between the value source
- * node and its child CaseTestExpr(s).  This is true in the parse analysis
- * output, but the planner's function-inlining logic has to be careful not to
- * break it.
+ * The uses in CaseExpr, ArrayCoerceExpr, and JsonConstructorExpr are safe
+ * only to the extent that there is not any other such node between the
+ * value source node and its child CaseTestExpr(s).  This is true in the
+ * parse analysis output, but the planner's constant-folding of simple CASE
+ * and its function-inlining logic have to be careful not to break it.
  *
  * The nested-assignment-expression case is safe because the only node types
  * that can be above such CaseTestExprs are FieldStore and SubscriptingRef.
@@ -1708,26 +1700,43 @@ typedef struct JsonValueExpr
 typedef enum JsonConstructorType
 {
 	JSCTOR_JSON_OBJECT = 1,
-	JSCTOR_JSON_ARRAY = 2,
-	JSCTOR_JSON_OBJECTAGG = 3,
-	JSCTOR_JSON_ARRAYAGG = 4,
-	JSCTOR_JSON_PARSE = 5,
-	JSCTOR_JSON_SCALAR = 6,
-	JSCTOR_JSON_SERIALIZE = 7,
+	JSCTOR_JSON_ARRAY,
+	JSCTOR_JSON_ARRAY_QUERY,
+	JSCTOR_JSON_OBJECTAGG,
+	JSCTOR_JSON_ARRAYAGG,
+	JSCTOR_JSON_PARSE,
+	JSCTOR_JSON_SCALAR,
+	JSCTOR_JSON_SERIALIZE,
 } JsonConstructorType;
 
 /*
  * JsonConstructorExpr -
  *		wrapper over FuncExpr/Aggref/WindowFunc for SQL/JSON constructors
+ *
+ * func is the executable expression:
+ * - Aggref/WindowFunc for JSON_OBJECTAGG/JSON_ARRAYAGG,
+ * - CoalesceExpr for JSON_ARRAY_QUERY,
+ * - NULL for other types (the executor calls the underlying json[b]_xxx()
+ *   functions directly).
+ *
+ * orig_query holds the user's original subquery for JSON_ARRAY(query), used
+ * only by ruleutils.c for deparsing; it is not walked because func is
+ * authoritative for all other purposes.
+ *
+ * format likewise holds the input FORMAT clause of JSON_ARRAY(query), which
+ * is otherwise only represented inside func; it is used only by ruleutils.c
+ * for deparsing.
  */
 typedef struct JsonConstructorExpr
 {
 	Expr		xpr;
 	JsonConstructorType type;	/* constructor type */
 	List	   *args;
-	Expr	   *func;			/* underlying json[b]_xxx() function call */
+	Expr	   *func;			/* executable expression or NULL */
 	Expr	   *coercion;		/* coercion to RETURNING type */
 	JsonReturning *returning;	/* RETURNING clause */
+	Node	   *orig_query;		/* original subquery for deparsing */
+	JsonFormat *format;			/* input FORMAT for JSON_ARRAY(query) */
 	bool		absent_on_null; /* ABSENT ON NULL? */
 	bool		unique;			/* WITH UNIQUE KEYS? (JSON_OBJECT[AGG] only) */
 	ParseLoc	location;
@@ -1756,6 +1765,7 @@ typedef struct JsonIsPredicate
 	JsonFormat *format;			/* FORMAT clause, if specified */
 	JsonValueType item_type;	/* JSON item type */
 	bool		unique_keys;	/* check key uniqueness? */
+	Oid			exprBaseType;	/* base type of the subject expression */
 	ParseLoc	location;		/* token location, or -1 if unknown */
 } JsonIsPredicate;
 
@@ -2314,8 +2324,9 @@ typedef struct RangeTblRef
  * During parse analysis, an RTE is created for the Join, and its index
  * is filled into rtindex.  This RTE is present mainly so that Vars can
  * be created that refer to the outputs of the join.  The planner sometimes
- * generates JoinExprs internally; these can have rtindex = 0 if there are
- * no join alias variables referencing such joins.
+ * generates JoinExprs internally.  Those for semijoins have rtindex = 0,
+ * since no join alias variables can reference them; but an antijoin is
+ * given an RTE anyway, because it needs a relid as other outer joins do.
  *----------
  */
 typedef struct JoinExpr
@@ -2365,7 +2376,7 @@ typedef struct FromExpr
 typedef struct OnConflictExpr
 {
 	NodeTag		type;
-	OnConflictAction action;	/* DO NOTHING or UPDATE? */
+	OnConflictAction action;	/* DO NOTHING, SELECT, or UPDATE */
 
 	/* Arbiter */
 	List	   *arbiterElems;	/* unique index arbiter list (of
@@ -2373,9 +2384,14 @@ typedef struct OnConflictExpr
 	Node	   *arbiterWhere;	/* unique index arbiter WHERE clause */
 	Oid			constraint;		/* pg_constraint OID for arbiter */
 
-	/* ON CONFLICT UPDATE */
+	/* ON CONFLICT DO SELECT */
+	LockClauseStrength lockStrength;	/* strength of lock for DO SELECT */
+
+	/* ON CONFLICT DO UPDATE */
 	List	   *onConflictSet;	/* List of ON CONFLICT SET TargetEntrys */
-	Node	   *onConflictWhere;	/* qualifiers to restrict UPDATE to */
+
+	/* both ON CONFLICT DO SELECT and UPDATE */
+	Node	   *onConflictWhere;	/* qualifiers to restrict SELECT/UPDATE */
 	int			exclRelIndex;	/* RT index of 'excluded' relation */
 	List	   *exclRelTlist;	/* tlist of the EXCLUDED pseudo relation */
 } OnConflictExpr;

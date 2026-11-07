@@ -13,7 +13,6 @@
 #include "crc32.h"
 #include "utils/pg_crc.h"
 #ifdef LOWER_NODE
-#include "catalog/pg_collation.h"
 #include "utils/pg_locale.h"
 #endif
 
@@ -28,37 +27,24 @@ ltree_crc32_sz(const char *buf, int size)
 	static pg_locale_t locale = NULL;
 
 	if (!locale)
-		locale = pg_newlocale_from_collation(DEFAULT_COLLATION_OID);
+		locale = pg_database_locale();
 
 	INIT_TRADITIONAL_CRC32(crc);
-	if (locale->ctype_is_c)
+	while (size > 0)
 	{
-		while (size > 0)
-		{
-			char		c = pg_ascii_tolower(*p);
+		/* max space required to map single codepoint, including NUL */
+		char		foldstr[UNICODE_CASEMAP_BUFSZ + 1];
+		int			srclen = pg_mblen_range(p, end);
+		size_t		foldlen;
 
-			COMP_TRADITIONAL_CRC32(crc, &c, 1);
-			size--;
-			p++;
-		}
-	}
-	else
-	{
-		while (size > 0)
-		{
-			char		foldstr[UNICODE_CASEMAP_BUFSZ];
-			int			srclen = pg_mblen_range(p, end);
-			size_t		foldlen;
+		/* fold one codepoint at a time */
+		foldlen = pg_strfold(foldstr, sizeof(foldstr), p, srclen, locale);
+		Assert(foldlen < sizeof(foldstr));
 
-			/* fold one codepoint at a time */
-			foldlen = pg_strfold(foldstr, UNICODE_CASEMAP_BUFSZ, p, srclen,
-								 locale);
+		COMP_TRADITIONAL_CRC32(crc, foldstr, foldlen);
 
-			COMP_TRADITIONAL_CRC32(crc, foldstr, foldlen);
-
-			size -= srclen;
-			p += srclen;
-		}
+		size -= srclen;
+		p += srclen;
 	}
 	FIN_TRADITIONAL_CRC32(crc);
 	return (unsigned int) crc;

@@ -9,7 +9,7 @@
  * could be easily added here, another module, or even an extension.
  *
  *
- * Copyright (c) 2022-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2022-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/sort/tuplesortvariants.c
@@ -33,6 +33,7 @@
 #include "utils/datum.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/rel.h"
 #include "utils/tuplesort.h"
 
 
@@ -266,7 +267,7 @@ tuplesort_begin_cluster(TupleDesc tupDesc,
 	Assert(indexRel->rd_rel->relam == BTREE_AM_OID);
 
 	oldcontext = MemoryContextSwitchTo(base->maincontext);
-	arg = (TuplesortClusterArg *) palloc0(sizeof(TuplesortClusterArg));
+	arg = palloc0_object(TuplesortClusterArg);
 
 	if (trace_sort)
 		elog(LOG,
@@ -373,7 +374,7 @@ tuplesort_begin_index_btree(Relation heapRel,
 	int			i;
 
 	oldcontext = MemoryContextSwitchTo(base->maincontext);
-	arg = (TuplesortIndexBTreeArg *) palloc(sizeof(TuplesortIndexBTreeArg));
+	arg = palloc_object(TuplesortIndexBTreeArg);
 
 	if (trace_sort)
 		elog(LOG,
@@ -454,7 +455,7 @@ tuplesort_begin_index_hash(Relation heapRel,
 	TuplesortIndexHashArg *arg;
 
 	oldcontext = MemoryContextSwitchTo(base->maincontext);
-	arg = (TuplesortIndexHashArg *) palloc(sizeof(TuplesortIndexHashArg));
+	arg = palloc_object(TuplesortIndexHashArg);
 
 	if (trace_sort)
 		elog(LOG,
@@ -503,7 +504,7 @@ tuplesort_begin_index_gist(Relation heapRel,
 	int			i;
 
 	oldcontext = MemoryContextSwitchTo(base->maincontext);
-	arg = (TuplesortIndexBTreeArg *) palloc(sizeof(TuplesortIndexBTreeArg));
+	arg = palloc_object(TuplesortIndexBTreeArg);
 
 	if (trace_sort)
 		elog(LOG,
@@ -678,7 +679,7 @@ tuplesort_begin_datum(Oid datumType, Oid sortOperator, Oid sortCollation,
 	bool		typbyval;
 
 	oldcontext = MemoryContextSwitchTo(base->maincontext);
-	arg = (TuplesortDatumArg *) palloc(sizeof(TuplesortDatumArg));
+	arg = palloc_object(TuplesortDatumArg);
 
 	if (trace_sort)
 		elog(LOG,
@@ -710,7 +711,7 @@ tuplesort_begin_datum(Oid datumType, Oid sortOperator, Oid sortCollation,
 	base->tuples = !typbyval;
 
 	/* Prepare SortSupport data */
-	base->sortKeys = (SortSupport) palloc0(sizeof(SortSupportData));
+	base->sortKeys = palloc0_object(SortSupportData);
 
 	base->sortKeys->ssup_cxt = CurrentMemoryContext;
 	base->sortKeys->ssup_collation = sortCollation;
@@ -832,7 +833,7 @@ tuplesort_putheaptuple(Tuplesortstate *state, HeapTuple tup)
  */
 void
 tuplesort_putindextuplevalues(Tuplesortstate *state, Relation rel,
-							  ItemPointer self, const Datum *values,
+							  const ItemPointerData *self, const Datum *values,
 							  const bool *isnull)
 {
 	SortTuple	stup;
@@ -882,7 +883,7 @@ tuplesort_putbrintuple(Tuplesortstate *state, BrinTuple *tuple, Size size)
 	memcpy(&bstup->tuple, tuple, size);
 
 	stup.tuple = bstup;
-	stup.datum1 = tuple->bt_blkno;
+	stup.datum1 = UInt32GetDatum(tuple->bt_blkno);
 	stup.isnull1 = false;
 
 	/* GetMemoryChunkSpace is not supported for bump contexts */
@@ -942,6 +943,7 @@ tuplesort_putdatum(Tuplesortstate *state, Datum val, bool isNull)
 	MemoryContext oldcontext = MemoryContextSwitchTo(base->tuplecontext);
 	TuplesortDatumArg *arg = (TuplesortDatumArg *) base->arg;
 	SortTuple	stup;
+	Size		tuplen;
 
 	/*
 	 * Pass-by-value types or null values are just stored directly in
@@ -964,17 +966,26 @@ tuplesort_putdatum(Tuplesortstate *state, Datum val, bool isNull)
 		stup.datum1 = !isNull ? val : (Datum) 0;
 		stup.isnull1 = isNull;
 		stup.tuple = NULL;		/* no separate storage */
+		tuplen = 0;
 	}
 	else
 	{
 		stup.isnull1 = false;
 		stup.datum1 = datumCopy(val, false, arg->datumTypeLen);
 		stup.tuple = DatumGetPointer(stup.datum1);
+
+		/* GetMemoryChunkSpace is not supported for bump contexts */
+		if (TupleSortUseBumpTupleCxt(base->sortopt))
+			tuplen = MAXALIGN(datumGetSize(PointerGetDatum(stup.tuple),
+										   false,
+										   arg->datumTypeLen));
+		else
+			tuplen = GetMemoryChunkSpace(stup.tuple);
 	}
 
 	tuplesort_puttuple_common(state, &stup,
 							  base->tuples &&
-							  base->sortKeys->abbrev_converter && !isNull, 0);
+							  base->sortKeys->abbrev_converter && !isNull, tuplen);
 
 	MemoryContextSwitchTo(oldcontext);
 }
@@ -1148,7 +1159,6 @@ tuplesort_getgintuple(Tuplesortstate *state, Size *len, bool forward)
  * efficient, but only safe for callers that are prepared to have any
  * subsequent manipulation of the tuplesort's state invalidate slot contents.
  * For byval Datums, the value of the 'copy' parameter has no effect.
-
  */
 bool
 tuplesort_getdatum(Tuplesortstate *state, bool forward, bool copy,
@@ -1853,7 +1863,7 @@ removeabbrev_index_brin(Tuplesortstate *state, SortTuple *stups, int count)
 		BrinSortTuple *tuple;
 
 		tuple = stups[i].tuple;
-		stups[i].datum1 = tuple->tuple.bt_blkno;
+		stups[i].datum1 = UInt32GetDatum(tuple->tuple.bt_blkno);
 	}
 }
 
@@ -1910,7 +1920,7 @@ readtup_index_brin(Tuplesortstate *state, SortTuple *stup,
 	stup->tuple = tuple;
 
 	/* set up first-column key value, which is block number */
-	stup->datum1 = tuple->tuple.bt_blkno;
+	stup->datum1 = UInt32GetDatum(tuple->tuple.bt_blkno);
 }
 
 /*
@@ -1970,7 +1980,7 @@ readtup_index_gin(Tuplesortstate *state, SortTuple *stup,
 	LogicalTapeReadExact(tape, tuple, tuplen);
 	if (base->sortopt & TUPLESORT_RANDOMACCESS) /* need trailing length word? */
 		LogicalTapeReadExact(tape, &tuplen, sizeof(tuplen));
-	stup->tuple = (void *) tuple;
+	stup->tuple = tuple;
 
 	/* no abbreviations (FIXME maybe use attrnum for this?) */
 	stup->datum1 = (Datum) 0;

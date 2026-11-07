@@ -152,6 +152,17 @@ SELECT JSON_OBJECT(1: 1, '2': NULL, '1': 1 ABSENT ON NULL WITH UNIQUE RETURNING 
 SELECT JSON_OBJECT(1: 1, '2': NULL, '1': 1 ABSENT ON NULL WITHOUT UNIQUE RETURNING jsonb);
 SELECT JSON_OBJECT(1: 1, '2': NULL, '3': 1, 4: NULL, '5': 'a' ABSENT ON NULL WITH UNIQUE RETURNING jsonb);
 
+-- the RETURNING coercion must not pick up the test value of an enclosing CASE
+SELECT CASE 'x' WHEN JSON_OBJECT('a': 'b' RETURNING text) THEN 1 ELSE 0 END;
+
+-- the RETURNING coercion must not prevent inlining of a SQL function
+CREATE FUNCTION json_object_inline_test(text) RETURNS text
+LANGUAGE sql IMMUTABLE AS $$ SELECT $1 || '!' $$;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT json_object_inline_test(JSON_OBJECT('a': 'b' RETURNING text));
+SELECT json_object_inline_test(JSON_OBJECT('a': 'b' RETURNING text));
+DROP FUNCTION json_object_inline_test(text);
+
 -- BUG: https://postgr.es/m/CADXhmgTJtJZK9A3Na_ry%2BXrq-ghjcejBRhcRMzWZvbd__QdgJA%40mail.gmail.com
 -- datum_to_jsonb_internal() didn't catch keys that are casts instead of a simple scalar
 CREATE TYPE mood AS ENUM ('happy', 'sad', 'neutral');
@@ -193,6 +204,7 @@ SELECT JSON_ARRAY(JSON_ARRAY('{ "a" : 123 }' RETURNING text));
 SELECT JSON_ARRAY(JSON_ARRAY('{ "a" : 123 }' FORMAT JSON RETURNING text));
 SELECT JSON_ARRAY(JSON_ARRAY('{ "a" : 123 }' FORMAT JSON RETURNING text) FORMAT JSON);
 
+-- JSON_ARRAY(subquery)
 SELECT JSON_ARRAY(SELECT i FROM (VALUES (1), (2), (NULL), (4)) foo(i));
 SELECT JSON_ARRAY(SELECT i FROM (VALUES (NULL::int[]), ('{1,2}'), (NULL), (NULL), ('{3,4}'), (NULL)) foo(i));
 SELECT JSON_ARRAY(SELECT i FROM (VALUES (NULL::int[]), ('{1,2}'), (NULL), (NULL), ('{3,4}'), (NULL)) foo(i) RETURNING jsonb);
@@ -200,6 +212,25 @@ SELECT JSON_ARRAY(SELECT i FROM (VALUES (NULL::int[]), ('{1,2}'), (NULL), (NULL)
 --SELECT JSON_ARRAY(SELECT i FROM (VALUES (NULL::int[]), ('{1,2}'), (NULL), (NULL), ('{3,4}'), (NULL)) foo(i) NULL ON NULL RETURNING jsonb);
 SELECT JSON_ARRAY(SELECT i FROM (VALUES (3), (1), (NULL), (2)) foo(i) ORDER BY i);
 SELECT JSON_ARRAY(WITH x AS (SELECT 1) VALUES (TRUE));
+
+-- JSON_ARRAY(subquery) with empty result set
+SELECT JSON_ARRAY(SELECT 1 WHERE FALSE);
+SELECT JSON_ARRAY(SELECT i FROM (VALUES (1), (2), (NULL), (4)) foo(i) WHERE i > 4);
+
+-- JSON_ARRAY(subquery) with a correlated subquery in the WHERE clause
+SELECT * FROM (VALUES (1), (2), (NULL), (4)) t1(a)
+WHERE JSON_ARRAY(
+    SELECT b FROM (VALUES (1), (2), (3)) t2(b) WHERE b = t1.a
+    RETURNING jsonb
+) = '[]'::jsonb;
+
+-- JSON_ARRAY(subquery) RETURNING with a length-restricted output type
+-- Should fail
+SELECT JSON_ARRAY(SELECT 1 RETURNING varchar(1));
+SELECT JSON_ARRAY(SELECT 1 WHERE FALSE RETURNING varchar(1));
+-- Should work
+SELECT JSON_ARRAY(SELECT 1 RETURNING varchar(3));
+SELECT JSON_ARRAY(SELECT 1 WHERE FALSE RETURNING varchar(2));
 
 -- Should fail
 SELECT JSON_ARRAY(SELECT FROM (VALUES (1)) foo(i));
@@ -384,6 +415,51 @@ SELECT JSON_ARRAY(SELECT i FROM (VALUES (1), (2), (NULL), (4)) foo(i) RETURNING 
 
 \sv json_array_subquery_view
 
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT JSON_ARRAY(SELECT i FROM (VALUES (1), (2), (NULL), (4)) foo(i) ORDER BY i LIMIT 3 RETURNING jsonb);
+
+CREATE OR REPLACE VIEW json_array_subquery_view AS
+SELECT JSON_ARRAY(SELECT i FROM (VALUES (1), (2), (NULL), (4)) foo(i) ORDER BY i LIMIT 3 RETURNING jsonb);
+
+\sv json_array_subquery_view
+
+DROP VIEW json_array_subquery_view;
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM (VALUES (1), (2), (NULL), (4)) t1(a)
+WHERE JSON_ARRAY(
+    SELECT b FROM (VALUES (1), (2), (3)) t2(b) WHERE b = t1.a
+    RETURNING jsonb
+) = '[]'::jsonb;
+
+CREATE VIEW json_array_subquery_view AS
+SELECT * FROM (VALUES (1), (2), (NULL), (4)) t1(a)
+WHERE JSON_ARRAY(
+    SELECT b FROM (VALUES (1), (2), (3)) t2(b) WHERE b = t1.a
+    RETURNING jsonb
+) = '[]'::jsonb;
+
+\sv json_array_subquery_view
+
+DROP VIEW json_array_subquery_view;
+
+-- JSON_ARRAY(subquery) with RETURNING text
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT JSON_ARRAY(SELECT i FROM (VALUES (1), (2), (NULL), (4)) foo(i) RETURNING text);
+
+CREATE VIEW json_array_subquery_view AS
+SELECT JSON_ARRAY(SELECT i FROM (VALUES (1), (2), (NULL), (4)) foo(i) RETURNING text);
+
+\sv json_array_subquery_view
+
+DROP VIEW json_array_subquery_view;
+
+-- JSON_ARRAY(subquery) with an input FORMAT clause
+CREATE VIEW json_array_subquery_view AS
+SELECT JSON_ARRAY(SELECT '{"a": 1}'::text FORMAT JSON);
+
+\sv json_array_subquery_view
+
 DROP VIEW json_array_subquery_view;
 
 -- IS JSON predicate
@@ -394,6 +470,24 @@ SELECT NULL::jsonb IS JSON;
 SELECT NULL::text IS JSON;
 SELECT NULL::bytea IS JSON;
 SELECT NULL::int IS JSON;
+
+-- IS JSON with domain types
+CREATE DOMAIN jd1 AS json CHECK ((VALUE ->'a')::text <> '3');
+CREATE DOMAIN jd2 AS jsonb CHECK ((VALUE ->'a') = '1'::jsonb);
+CREATE DOMAIN jd3 AS text CHECK (VALUE <> 'a');
+CREATE DOMAIN jd4 AS bytea CHECK (VALUE <> '\x61');
+CREATE DOMAIN jd5 AS date CHECK (VALUE <> NULL);
+
+-- NULLs through domains should return NULL (not error)
+SELECT NULL::jd1 IS JSON, NULL::jd2 IS JSON, NULL::jd3 IS JSON, NULL::jd4 IS JSON;
+SELECT NULL::jd1 IS NOT JSON;
+
+-- domain over unsupported base type should error
+SELECT NULL::jd5 IS JSON; -- error
+SELECT NULL::jd5 IS JSON WITH UNIQUE KEYS; -- error
+
+-- domain constraint violation during cast
+SELECT a::jd2 IS JSON WITH UNIQUE KEYS as col1 FROM (VALUES('{"a": 1, "a": 2}')) s(a); -- error
 
 -- A user-defined string-category type with no implicit cast to text must
 -- produce a clean error rather than crash for IS JSON / JSON() input
@@ -416,6 +510,19 @@ SELECT '{"a":1}'::sqljson_mystr IS JSON;
 \set VERBOSITY terse
 DROP TYPE sqljson_mystr CASCADE;
 \set VERBOSITY default
+
+-- view creation and deparsing with domain IS JSON
+CREATE VIEW domain_isjson AS
+WITH cte(a) AS (VALUES('{"a": 1, "a": 2}'))
+SELECT	a::jd1 IS JSON WITH UNIQUE KEYS as jd1,
+		a::jd3 IS JSON WITH UNIQUE KEYS as jd3,
+		a::jd4 IS JSON WITH UNIQUE KEYS as jd4
+FROM cte;
+\sv domain_isjson
+SELECT * FROM domain_isjson;
+
+DROP VIEW domain_isjson;
+DROP DOMAIN jd5, jd4, jd3, jd2, jd1;
 
 SELECT '' IS JSON;
 

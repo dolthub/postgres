@@ -3,7 +3,7 @@
  * fe-connect.c
  *	  functions related to setting up a connection to the backend
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -408,6 +408,10 @@ static const internalPQconninfoOption PQconninfoOptions[] = {
 		"OAuth-Scope", "", 15,
 	offsetof(struct pg_conn, oauth_scope)},
 
+	{"oauth_ca_file", "PGOAUTHCAFILE", NULL, NULL,
+		"OAuth-CA-File", "", 64,
+	offsetof(struct pg_conn, oauth_ca_file)},
+
 	{"sslkeylogfile", NULL, NULL, NULL,
 		"SSL-Key-Log-File", "D", 64,
 	offsetof(struct pg_conn, sslkeylogfile)},
@@ -498,8 +502,9 @@ static int	parseServiceFile(const char *serviceFile,
 							 PQExpBuffer errorMessage,
 							 bool *group_found);
 static char *pwdfMatchesString(char *buf, const char *token);
-static char *passwordFromFile(const char *hostname, const char *port, const char *dbname,
-							  const char *username, const char *pgpassfile);
+static char *passwordFromFile(const char *hostname, const char *port,
+							  const char *dbname, const char *username,
+							  const char *pgpassfile, const char **errmsg);
 static void pgpassfileWarning(PGconn *conn);
 static void default_threadlock(int acquire);
 static bool sslVerifyProtocolVersion(const char *version);
@@ -1451,6 +1456,7 @@ pqConnectOptions2(PGconn *conn)
 				 * least one of them is guaranteed nonempty by now).
 				 */
 				const char *pwhost = conn->connhost[i].host;
+				const char *password_errmsg = NULL;
 
 				if (pwhost == NULL || pwhost[0] == '\0')
 					pwhost = conn->connhost[i].hostaddr;
@@ -1460,7 +1466,15 @@ pqConnectOptions2(PGconn *conn)
 									 conn->connhost[i].port,
 									 conn->dbName,
 									 conn->pguser,
-									 conn->pgpassfile);
+									 conn->pgpassfile,
+									 &password_errmsg);
+
+				if (password_errmsg != NULL)
+				{
+					conn->status = CONNECTION_BAD;
+					libpq_append_conn_error(conn, "%s", password_errmsg);
+					return false;
+				}
 			}
 		}
 	}
@@ -3080,9 +3094,9 @@ keep_going:						/* We will come back to here until there is
 				UNIXSOCK_PATH(portstr, thisport, ch->host);
 				if (strlen(portstr) >= UNIXSOCK_PATH_BUFLEN)
 				{
-					libpq_append_conn_error(conn, "Unix-domain socket path \"%s\" is too long (maximum %d bytes)",
+					libpq_append_conn_error(conn, "Unix-domain socket path \"%s\" is too long (maximum %zu bytes)",
 											portstr,
-											(int) (UNIXSOCK_PATH_BUFLEN - 1));
+											(UNIXSOCK_PATH_BUFLEN - 1));
 					goto keep_going;
 				}
 
@@ -3265,7 +3279,8 @@ keep_going:						/* We will come back to here until there is
 						}
 						if (conn->gcred == GSS_C_NO_CREDENTIAL)
 						{
-							if (!pg_GSS_have_cred_cache(&conn->gcred))
+							conn->gcred = pg_GSS_get_cred_cache();
+							if (conn->gcred == GSS_C_NO_CREDENTIAL)
 							{
 								libpq_append_conn_error(conn,
 														"GSSAPI encryption required but no credential cache");
@@ -4820,15 +4835,16 @@ select_next_encryption_method(PGconn *conn, bool have_valid_connection)
 	if ((remaining_methods & ENC_GSSAPI) != 0)
 	{
 		/*
-		 * If GSSAPI encryption is enabled, then call pg_GSS_have_cred_cache()
-		 * which will return true if we can acquire credentials (and give us a
-		 * handle to use in conn->gcred), and then send a packet to the server
+		 * If GSSAPI encryption is enabled, then call pg_GSS_get_cred_cache()
+		 * to try to acquire credentials, and then send a packet to the server
 		 * asking for GSSAPI Encryption (and skip past SSL negotiation and
 		 * regular startup below).
 		 */
 		if (!conn->gctx)
 		{
-			if (!pg_GSS_have_cred_cache(&conn->gcred))
+			if (conn->gcred == GSS_C_NO_CREDENTIAL)
+				conn->gcred = pg_GSS_get_cred_cache();
+			if (conn->gcred == GSS_C_NO_CREDENTIAL)
 			{
 				conn->allowed_enc_methods &= ~ENC_GSSAPI;
 				remaining_methods &= ~ENC_GSSAPI;
@@ -4993,6 +5009,10 @@ pqMakeEmptyPGconn(void)
 	conn->altsock = PGINVALID_SOCKET;
 	conn->Pfdebug = NULL;
 
+#ifdef ENABLE_GSS
+	conn->gcred = GSS_C_NO_CREDENTIAL;	/* let's not assume this is 0 */
+#endif
+
 	/*
 	 * We try to send at least 8K at a time, which is the usual size of pipe
 	 * buffers on Unix systems.  That way, when we are sending a large amount
@@ -5110,6 +5130,7 @@ freePGconn(PGconn *conn)
 	free(conn->oauth_discovery_uri);
 	free(conn->oauth_client_id);
 	free(conn->oauth_client_secret);
+	free(conn->oauth_ca_file);
 	free(conn->oauth_scope);
 	/* Note that conn->Pfdebug is not ours to close or free */
 	free(conn->events);
@@ -5490,6 +5511,7 @@ ldapServiceLookup(const char *purl, PQconninfoOption *options,
 			   *entry;
 	struct berval **values;
 	LDAP_TIMEVAL time = {PGLDAP_TIMEOUT, 0};
+	int			ldapversion = LDAP_VERSION3;
 
 	if ((url = strdup(purl)) == NULL)
 	{
@@ -5618,6 +5640,15 @@ ldapServiceLookup(const char *purl, PQconninfoOption *options,
 	{
 		libpq_append_error(errorMessage, "could not create LDAP structure");
 		free(url);
+		return 3;
+	}
+
+	if ((rc = ldap_set_option(ld, LDAP_OPT_PROTOCOL_VERSION, &ldapversion)) != LDAP_SUCCESS)
+	{
+		libpq_append_error(errorMessage, "could not set LDAP protocol version: %s",
+						   ldap_err2string(rc));
+		free(url);
+		ldap_unbind(ld);
 		return 3;
 	}
 
@@ -7901,16 +7932,24 @@ pwdfMatchesString(char *buf, const char *token)
 	return NULL;
 }
 
-/* Get a password from the password file. Return value is malloc'd. */
+/*
+ * Get a password from the password file. Return value is malloc'd.
+ *
+ * On failure, *errmsg is set to an error to be returned.  It is
+ * left NULL on success, or if no password could be found.
+ */
 static char *
-passwordFromFile(const char *hostname, const char *port, const char *dbname,
-				 const char *username, const char *pgpassfile)
+passwordFromFile(const char *hostname, const char *port,
+				 const char *dbname, const char *username,
+				 const char *pgpassfile, const char **errmsg)
 {
 	FILE	   *fp;
 #ifndef WIN32
 	struct stat stat_buf;
 #endif
 	PQExpBufferData buf;
+
+	*errmsg = NULL;
 
 	if (dbname == NULL || dbname[0] == '\0')
 		return NULL;
@@ -7978,7 +8017,10 @@ passwordFromFile(const char *hostname, const char *port, const char *dbname,
 	{
 		/* Make sure there's a reasonable amount of room in the buffer */
 		if (!enlargePQExpBuffer(&buf, 128))
+		{
+			*errmsg = libpq_gettext("out of memory");
 			break;
+		}
 
 		/* Read some data, appending it to what we already have */
 		if (fgets(buf.data + buf.len, buf.maxlen - buf.len, fp) == NULL)
@@ -8017,7 +8059,7 @@ passwordFromFile(const char *hostname, const char *port, const char *dbname,
 
 				if (!ret)
 				{
-					/* Out of memory. XXX: an error message would be nice. */
+					*errmsg = libpq_gettext("out of memory");
 					return NULL;
 				}
 
@@ -8303,4 +8345,11 @@ PQregisterThreadLock(pgthreadlock_t newhandler)
 		pg_g_threadlock = default_threadlock;
 
 	return prev;
+}
+
+pgthreadlock_t
+PQgetThreadLock(void)
+{
+	Assert(pg_g_threadlock);
+	return pg_g_threadlock;
 }

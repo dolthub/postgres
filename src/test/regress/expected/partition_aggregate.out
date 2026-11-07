@@ -13,6 +13,8 @@ SET enable_partitionwise_join TO true;
 SET max_parallel_workers_per_gather TO 0;
 -- Disable incremental sort, which can influence selected plans due to fuzz factor.
 SET enable_incremental_sort TO off;
+-- Disable eager aggregation, which can interfere with the generation of partitionwise aggregation.
+SET enable_eager_aggregate TO off;
 --
 -- Tests for list partitioned tables.
 --
@@ -146,13 +148,14 @@ SELECT c, a, count(*) FROM pagg_tab GROUP BY a, c;
 -- Test when input relation for grouping is dummy
 EXPLAIN (COSTS OFF)
 SELECT c, sum(a) FROM pagg_tab WHERE 1 = 2 GROUP BY c;
-           QUERY PLAN           
---------------------------------
+             QUERY PLAN             
+------------------------------------
  HashAggregate
    Group Key: c
    ->  Result
+         Replaces: Scan on pagg_tab
          One-Time Filter: false
-(4 rows)
+(5 rows)
 
 SELECT c, sum(a) FROM pagg_tab WHERE 1 = 2 GROUP BY c;
  c | sum 
@@ -161,12 +164,13 @@ SELECT c, sum(a) FROM pagg_tab WHERE 1 = 2 GROUP BY c;
 
 EXPLAIN (COSTS OFF)
 SELECT c, sum(a) FROM pagg_tab WHERE c = 'x' GROUP BY c;
-           QUERY PLAN           
---------------------------------
+             QUERY PLAN             
+------------------------------------
  GroupAggregate
    ->  Result
+         Replaces: Scan on pagg_tab
          One-Time Filter: false
-(3 rows)
+(4 rows)
 
 SELECT c, sum(a) FROM pagg_tab WHERE c = 'x' GROUP BY c;
  c | sum 
@@ -835,15 +839,16 @@ SELECT a.x, b.y, count(*) FROM (SELECT * FROM pagg_tab1 WHERE x < 20) a FULL JOI
 -- Empty join relation because of empty outer side, no partitionwise agg plan
 EXPLAIN (COSTS OFF)
 SELECT a.x, a.y, count(*) FROM (SELECT * FROM pagg_tab1 WHERE x = 1 AND x = 2) a LEFT JOIN pagg_tab2 b ON a.x = b.y GROUP BY a.x, a.y ORDER BY 1, 2;
-              QUERY PLAN              
---------------------------------------
+                  QUERY PLAN                  
+----------------------------------------------
  GroupAggregate
    Group Key: pagg_tab1.y
    ->  Sort
          Sort Key: pagg_tab1.y
          ->  Result
+               Replaces: Join on b, pagg_tab1
                One-Time Filter: false
-(6 rows)
+(7 rows)
 
 SELECT a.x, a.y, count(*) FROM (SELECT * FROM pagg_tab1 WHERE x = 1 AND x = 2) a LEFT JOIN pagg_tab2 b ON a.x = b.y GROUP BY a.x, a.y ORDER BY 1, 2;
  x | y | count 
@@ -975,8 +980,8 @@ SET max_parallel_workers_per_gather TO 2;
 SET parallel_setup_cost = 0;
 -- Full aggregation at level 1 as GROUP BY clause matches with PARTITION KEY
 -- for level 1 only. For subpartitions, GROUP BY clause does not match with
--- PARTITION KEY, but still we do not see a partial aggregation as array_agg()
--- is not partial agg safe.
+-- PARTITION KEY, but still we do not see a partial aggregation as
+-- array_agg(distinct) is not partial agg safe.
 EXPLAIN (COSTS OFF)
 SELECT a, sum(b), array_agg(distinct c), count(*) FROM pagg_tab_ml GROUP BY a HAVING avg(b) < 3 ORDER BY 1, 2, 3;
                                       QUERY PLAN                                      
@@ -1114,13 +1119,14 @@ SELECT a, sum(b), count(*) FROM pagg_tab_ml GROUP BY a HAVING avg(b) < 3 ORDER B
 -- Partial aggregation at all levels as GROUP BY clause does not match with
 -- PARTITION KEY
 EXPLAIN (COSTS OFF)
-SELECT b, sum(a), count(*) FROM pagg_tab_ml GROUP BY b ORDER BY 1, 2, 3;
+SELECT b, sum(a), count(*) FROM pagg_tab_ml GROUP BY b HAVING avg(a) < 15 ORDER BY 1, 2, 3;
                                 QUERY PLAN                                 
 ---------------------------------------------------------------------------
  Sort
    Sort Key: pagg_tab_ml.b, (sum(pagg_tab_ml.a)), (count(*))
    ->  Finalize GroupAggregate
          Group Key: pagg_tab_ml.b
+         Filter: (avg(pagg_tab_ml.a) < '15'::numeric)
          ->  Sort
                Sort Key: pagg_tab_ml.b
                ->  Append
@@ -1139,7 +1145,7 @@ SELECT b, sum(a), count(*) FROM pagg_tab_ml GROUP BY b ORDER BY 1, 2, 3;
                      ->  Partial HashAggregate
                            Group Key: pagg_tab_ml_4.b
                            ->  Seq Scan on pagg_tab_ml_p3_s2 pagg_tab_ml_4
-(22 rows)
+(23 rows)
 
 SELECT b, sum(a), count(*) FROM pagg_tab_ml GROUP BY b HAVING avg(a) < 15 ORDER BY 1, 2, 3;
  b |  sum  | count 
@@ -1268,13 +1274,14 @@ SELECT a, sum(b), count(*) FROM pagg_tab_ml GROUP BY a HAVING avg(b) < 3 ORDER B
 -- Partial aggregation at all levels as GROUP BY clause does not match with
 -- PARTITION KEY
 EXPLAIN (COSTS OFF)
-SELECT b, sum(a), count(*) FROM pagg_tab_ml GROUP BY b ORDER BY 1, 2, 3;
+SELECT b, sum(a), count(*) FROM pagg_tab_ml GROUP BY b HAVING avg(a) < 15 ORDER BY 1, 2, 3;
                                         QUERY PLAN                                        
 ------------------------------------------------------------------------------------------
  Sort
    Sort Key: pagg_tab_ml.b, (sum(pagg_tab_ml.a)), (count(*))
    ->  Finalize GroupAggregate
          Group Key: pagg_tab_ml.b
+         Filter: (avg(pagg_tab_ml.a) < '15'::numeric)
          ->  Gather Merge
                Workers Planned: 2
                ->  Sort
@@ -1295,7 +1302,7 @@ SELECT b, sum(a), count(*) FROM pagg_tab_ml GROUP BY b ORDER BY 1, 2, 3;
                            ->  Partial HashAggregate
                                  Group Key: pagg_tab_ml_2.b
                                  ->  Parallel Seq Scan on pagg_tab_ml_p2_s2 pagg_tab_ml_2
-(24 rows)
+(25 rows)
 
 SELECT b, sum(a), count(*) FROM pagg_tab_ml GROUP BY b HAVING avg(a) < 15 ORDER BY 1, 2, 3;
  b |  sum  | count 

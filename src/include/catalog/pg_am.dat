@@ -3,7 +3,7 @@
 # pg_am.dat
 #    Initial contents of the pg_am system catalog.
 #
-# Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
 # src/include/catalog/pg_am.dat
@@ -33,13 +33,5 @@
 { oid => '3580', oid_symbol => 'BRIN_AM_OID',
   descr => 'block range index (BRIN) access method',
   amname => 'brin', amhandler => 'brinhandler', amtype => 'i' },
-
-# Native prolly access methods (additional to PostgreSQL defaults).
-{ oid => '9000', oid_symbol => 'DOLT_PROLLY_TABLE_AM_OID',
-  descr => 'prolly table access method', amname => 'dolt_prolly_table',
-  amhandler => 'dolt_prolly_table_handler', amtype => 't' },
-{ oid => '9001', oid_symbol => 'DOLT_PROLLY_INDEX_AM_OID',
-  descr => 'prolly ordered index access method', amname => 'dolt_prolly_index',
-  amhandler => 'dolt_prolly_index_handler', amtype => 'i' },
 
 ]

@@ -136,6 +136,19 @@ select a, b, grouping(a, b), sum(t1.v), max(t2.c)
   from gstest1 t1 join gstest2 t2 using (a,b)
  group by grouping sets ((a, b), ());
 
+select a, b, grouping(a, b), sum(t1.v), max(t2.c)
+  from gstest1 t1 full join gstest2 t2 using (a,b)
+ group by grouping sets ((a, b), ());
+
+-- references in subqueries should work too
+select (select a),
+       (select b),
+       (select grouping(a, b)),
+       (select sum(t1.v)),
+       (select max(t2.c))
+  from gstest1 t1 full join gstest2 t2 using (a,b)
+ group by grouping sets ((a, b), ());
+
 -- check that functionally dependent cols are not nulled
 select a, d, grouping(a,b,c)
   from gstest3
@@ -514,6 +527,15 @@ SET LOCAL enable_seqscan = false;
 EXPLAIN (COSTS OFF) SELECT a, b, count(*), max(a), max(b) FROM gstest3 GROUP BY GROUPING SETS(a, b,()) ORDER BY a, b;
 SELECT a, b, count(*), max(a), max(b) FROM gstest3 GROUP BY GROUPING SETS(a, b,()) ORDER BY a, b;
 COMMIT;
+
+-- Verify handling of injecting NULL values for the rollup row works correctly
+-- when additional columns need to be deformed from the tuple after the NULL
+-- is added.
+begin;
+insert into gstest3 values(3,4,null,5);
+set enable_hashagg = false;
+select b, c, d, grouping(b, c) AS g from gstest3 where a = 3 group by grouping sets ((a, b), (a, c));
+rollback;
 
 -- More rescan tests
 select * from (values (1),(2)) v(a) left join lateral (select v.a, four, ten, count(*) from onek group by cube(four,ten)) s on true order by v.a,four,ten;

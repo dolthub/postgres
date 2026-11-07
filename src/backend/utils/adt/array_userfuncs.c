@@ -3,7 +3,7 @@
  * array_userfuncs.c
  *	  Misc user-visible array support functions
  *
- * Copyright (c) 2003-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2003-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/adt/array_userfuncs.c
@@ -338,7 +338,7 @@ array_cat(PG_FUNCTION_ARGS)
 	int			i;
 	char	   *dat1,
 			   *dat2;
-	bits8	   *bitmap1,
+	uint8	   *bitmap1,
 			   *bitmap2;
 	Oid			element_type;
 	Oid			element_type1;
@@ -434,8 +434,8 @@ array_cat(PG_FUNCTION_ARGS)
 		 * themselves) of the input argument arrays
 		 */
 		ndims = ndims1;
-		dims = (int *) palloc(ndims * sizeof(int));
-		lbs = (int *) palloc(ndims * sizeof(int));
+		dims = palloc_array(int, ndims);
+		lbs = palloc_array(int, ndims);
 
 		dims[0] = dims1[0] + dims2[0];
 		lbs[0] = lbs1[0];
@@ -460,8 +460,8 @@ array_cat(PG_FUNCTION_ARGS)
 		 * the first argument inserted at the front of the outer dimension
 		 */
 		ndims = ndims2;
-		dims = (int *) palloc(ndims * sizeof(int));
-		lbs = (int *) palloc(ndims * sizeof(int));
+		dims = palloc_array(int, ndims);
+		lbs = palloc_array(int, ndims);
 		memcpy(dims, dims2, ndims * sizeof(int));
 		memcpy(lbs, lbs2, ndims * sizeof(int));
 
@@ -488,8 +488,8 @@ array_cat(PG_FUNCTION_ARGS)
 		 * second argument appended to the end of the outer dimension
 		 */
 		ndims = ndims1;
-		dims = (int *) palloc(ndims * sizeof(int));
-		lbs = (int *) palloc(ndims * sizeof(int));
+		dims = palloc_array(int, ndims);
+		lbs = palloc_array(int, ndims);
 		memcpy(dims, dims1, ndims * sizeof(int));
 		memcpy(lbs, lbs1, ndims * sizeof(int));
 
@@ -1014,7 +1014,7 @@ array_agg_array_combine(PG_FUNCTION_ARGS)
 		{
 			int			size = (state2->aitems + 7) / 8;
 
-			state1->nullbitmap = (bits8 *) palloc(size);
+			state1->nullbitmap = (uint8 *) palloc(size);
 			memcpy(state1->nullbitmap, state2->nullbitmap, size);
 		}
 
@@ -1096,7 +1096,7 @@ array_agg_array_combine(PG_FUNCTION_ARGS)
 				 * previous inputs by marking all their items non-null.
 				 */
 				state1->aitems = pg_nextpower2_32(Max(256, newnitems));
-				state1->nullbitmap = (bits8 *) palloc((state1->aitems + 7) / 8);
+				state1->nullbitmap = (uint8 *) palloc((state1->aitems + 7) / 8);
 				array_bitmap_copy(state1->nullbitmap, 0,
 								  NULL, 0,
 								  state1->nitems);
@@ -1104,7 +1104,7 @@ array_agg_array_combine(PG_FUNCTION_ARGS)
 			else if (newnitems > state1->aitems)
 			{
 				state1->aitems = pg_nextpower2_32(newnitems);
-				state1->nullbitmap = (bits8 *)
+				state1->nullbitmap = (uint8 *)
 					repalloc(state1->nullbitmap, (state1->aitems + 7) / 8);
 			}
 			/* This will do the right thing if state2->nullbitmap is NULL: */
@@ -1247,7 +1247,7 @@ array_agg_array_deserialize(PG_FUNCTION_ARGS)
 	{
 		int			size = (result->aitems + 7) / 8;
 
-		result->nullbitmap = (bits8 *) palloc(size);
+		result->nullbitmap = (uint8 *) palloc(size);
 		temp = pq_getmsgbytes(&buf, size);
 		memcpy(result->nullbitmap, temp, size);
 	}

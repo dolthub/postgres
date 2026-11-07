@@ -27,7 +27,8 @@ select length(42);
 ERROR:  function length(integer) does not exist
 LINE 1: select length(42);
                ^
-HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
+DETAIL:  No function of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
 -- But as a special exception for usability's sake, we still allow implicit
 -- casting to text in concatenations, so long as the other input is text or
 -- an unknown literal.  So these work:
@@ -48,7 +49,8 @@ select 3 || 4.0;
 ERROR:  operator does not exist: integer || numeric
 LINE 1: select 3 || 4.0;
                  ^
-HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
 /*
  * various string functions
  */
@@ -115,6 +117,14 @@ select i, left('ahoj', i), right('ahoj', i) from generate_series(-5, 5) t(i) ord
   4 | ahoj | ahoj
   5 | ahoj | ahoj
 (11 rows)
+
+-- the most negative value must skip the whole string, same as any other n
+-- whose absolute value exceeds its length
+select left('ahoj', (-2147483648)::int4), right('ahoj', (-2147483648)::int4);
+ left | right 
+------+-------
+      | 
+(1 row)
 
 select quote_literal('');
  quote_literal 

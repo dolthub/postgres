@@ -3,7 +3,7 @@
  * filter.c
  *		Implementation of simple filter file parser
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -151,7 +151,7 @@ get_object_type(const char *keyword, int size, FilterObjectType *objtype)
 
 
 void
-pg_log_filter_error(FilterStateData *fstate, const char *fmt,...)
+pg_log_filter_error(FilterStateData *fstate, const char *fmt, ...)
 {
 	va_list		argp;
 	char		buf[256];

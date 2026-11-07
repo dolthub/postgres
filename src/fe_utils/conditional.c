@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  * A stack of automaton states to handle nested conditionals.
  *
- * Copyright (c) 2000-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2026, PostgreSQL Global Development Group
  *
  * src/fe_utils/conditional.c
  *
@@ -17,7 +17,7 @@
 ConditionalStack
 conditional_stack_create(void)
 {
-	ConditionalStack cstack = pg_malloc(sizeof(ConditionalStackData));
+	ConditionalStack cstack = pg_malloc_object(ConditionalStackData);
 
 	cstack->head = NULL;
 	return cstack;
@@ -52,11 +52,10 @@ conditional_stack_destroy(ConditionalStack cstack)
 void
 conditional_stack_push(ConditionalStack cstack, ifState new_state)
 {
-	IfStackElem *p = (IfStackElem *) pg_malloc(sizeof(IfStackElem));
+	IfStackElem *p = pg_malloc_object(IfStackElem);
 
 	p->if_state = new_state;
 	p->query_len = -1;
-	p->paren_depth = -1;
 	p->lex_state = NULL;
 	p->next = cstack->head;
 	cstack->head = p;
@@ -177,7 +176,7 @@ conditional_stack_get_query_len(ConditionalStack cstack)
  */
 void
 conditional_stack_set_lex_state(ConditionalStack cstack,
-								struct PsqlScanStateSave *lex_state)
+								PsqlScanStateSave *lex_state)
 {
 	Assert(!conditional_stack_empty(cstack));
 	if (cstack->head->lex_state)	/* free old state, if any */
@@ -189,35 +188,10 @@ conditional_stack_set_lex_state(ConditionalStack cstack,
  * Fetch last-recorded lexer state from topmost stack entry.
  * Will return NULL if no stack or it was never saved.
  */
-struct PsqlScanStateSave *
+PsqlScanStateSave *
 conditional_stack_get_lex_state(ConditionalStack cstack)
 {
 	if (conditional_stack_empty(cstack))
 		return NULL;
 	return cstack->head->lex_state;
-}
-
-/*
- * Save current parenthesis nesting depth in topmost stack entry.
- *
- * (These functions are obsolete, and kept around only to avoid API/ABI
- * breakage in the back branches.)
- */
-void
-conditional_stack_set_paren_depth(ConditionalStack cstack, int depth)
-{
-	Assert(!conditional_stack_empty(cstack));
-	cstack->head->paren_depth = depth;
-}
-
-/*
- * Fetch last-recorded parenthesis nesting depth from topmost stack entry.
- * Will return -1 if no stack or it was never saved.
- */
-int
-conditional_stack_get_paren_depth(ConditionalStack cstack)
-{
-	if (conditional_stack_empty(cstack))
-		return -1;
-	return cstack->head->paren_depth;
 }

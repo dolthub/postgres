@@ -3,7 +3,7 @@
  * storage.c
  *	  code to create and destroy physical storage for relations
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -25,7 +25,6 @@
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
 #include "catalog/storage.h"
-#include "catalog/catalogview.h"
 #include "catalog/storage_xlog.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -208,14 +207,6 @@ void
 RelationDropStorage(Relation rel)
 {
 	PendingRelDelete *pending;
-
-	if (CatalogViewCaptureStorage(rel, CATALOG_STORAGE_DROP))
-		return;
-
-	/* Context handles describe retained definitions, not disposable files. */
-	if (CatalogViewObjectContext(RelationGetRelid(rel)))
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("physical storage deletion requires canonical publication")));
 
 	/* Add the relation to the list of stuff to delete at commit */
 	pending = (PendingRelDelete *)
@@ -595,7 +586,7 @@ RelFileLocatorSkippingWAL(RelFileLocator rlocator)
 Size
 EstimatePendingSyncsSpace(void)
 {
-	long		entries;
+	int64		entries;
 
 	entries = pendingSyncHash ? hash_get_num_entries(pendingSyncHash) : 0;
 	return mul_size(1 + entries, sizeof(RelFileLocator));
@@ -716,12 +707,12 @@ smgrDoPendingDeletes(bool isCommit)
 				if (maxrels == 0)
 				{
 					maxrels = 8;
-					srels = palloc(sizeof(SMgrRelation) * maxrels);
+					srels = palloc_array(SMgrRelation, maxrels);
 				}
 				else if (maxrels <= nrels)
 				{
 					maxrels *= 2;
-					srels = repalloc(srels, sizeof(SMgrRelation) * maxrels);
+					srels = repalloc_array(srels, SMgrRelation, maxrels);
 				}
 
 				srels[nrels++] = srel;
@@ -838,12 +829,12 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 			if (maxrels == 0)
 			{
 				maxrels = 8;
-				srels = palloc(sizeof(SMgrRelation) * maxrels);
+				srels = palloc_array(SMgrRelation, maxrels);
 			}
 			else if (maxrels <= nrels)
 			{
 				maxrels *= 2;
-				srels = repalloc(srels, sizeof(SMgrRelation) * maxrels);
+				srels = repalloc_array(srels, SMgrRelation, maxrels);
 			}
 
 			srels[nrels++] = srel;
@@ -918,7 +909,7 @@ smgrGetPendingDeletes(bool forCommit, RelFileLocator **ptr)
 		*ptr = NULL;
 		return 0;
 	}
-	rptr = (RelFileLocator *) palloc(nrels * sizeof(RelFileLocator));
+	rptr = palloc_array(RelFileLocator, nrels);
 	*ptr = rptr;
 	for (pending = pendingDeletes; pending != NULL; pending = pending->next)
 	{

@@ -3,7 +3,7 @@
  * pg_proc.c
  *	  routines to support manipulation of the pg_proc relation
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -13,9 +13,6 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "access/doltcatalog.h"
-#include "catalog/catalogview.h"
-#include "catalog/namespace.h"
 
 #include "access/htup_details.h"
 #include "access/table.h"
@@ -23,6 +20,7 @@
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
+#include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_namespace.h"
@@ -144,7 +142,8 @@ ProcedureCreate(const char *procedureName,
 	TupleDesc	tupDesc;
 	bool		is_update;
 	ObjectAddress myself,
-				referenced;
+				referenced,
+				temp_object;
 	char	   *detailmsg;
 	int			i;
 	ObjectAddresses *addrs;
@@ -152,7 +151,7 @@ ProcedureCreate(const char *procedureName,
 	/*
 	 * sanity checks
 	 */
-	Assert(PointerIsValid(prosrc));
+	Assert(prosrc);
 
 	parameterCount = parameterTypes->dim1;
 	if (parameterCount < 0 || parameterCount > FUNC_MAX_ARGS)
@@ -586,8 +585,7 @@ ProcedureCreate(const char *procedureName,
 
 		/* Okay, do it... */
 		tup = heap_modify_tuple(oldtup, tupDesc, values, nulls, replaces);
-		if (!dg_catalog_creating_routine())
-			CatalogTupleUpdate(rel, &tup->t_self, tup);
+		CatalogTupleUpdate(rel, &tup->t_self, tup);
 
 		ReleaseSysCache(oldtup);
 		is_update = true;
@@ -598,49 +596,21 @@ ProcedureCreate(const char *procedureName,
 		Oid			newOid;
 
 		/* First, get default permissions and set up proacl */
-		if (dg_catalog_creating_routine())
-		{
-			char	   *namespaceName = get_namespace_name(procNamespace);
-			CatalogView *previous = CatalogViewSwitch(NULL);
-
-			PG_TRY();
-			{
-				proacl = get_user_default_acl(OBJECT_FUNCTION, proowner,
-											  get_namespace_oid(namespaceName, true));
-			}
-			PG_FINALLY();
-			{
-				CatalogViewSwitch(previous);
-			}
-			PG_END_TRY();
-		}
-		else
-			proacl = get_user_default_acl(OBJECT_FUNCTION, proowner, procNamespace);
+		proacl = get_user_default_acl(OBJECT_FUNCTION, proowner,
+									  procNamespace);
 		if (proacl != NULL)
 			values[Anum_pg_proc_proacl - 1] = PointerGetDatum(proacl);
 		else
 			nulls[Anum_pg_proc_proacl - 1] = true;
 
-		newOid = dg_catalog_creating_routine() ? InvalidOid : GetNewOidWithIndex(rel, ProcedureOidIndexId,
-																				 Anum_pg_proc_oid);
+		newOid = GetNewOidWithIndex(rel, ProcedureOidIndexId,
+									Anum_pg_proc_oid);
 		values[Anum_pg_proc_oid - 1] = ObjectIdGetDatum(newOid);
 		tup = heap_form_tuple(tupDesc, values, nulls);
-		if (!dg_catalog_creating_routine())
-			CatalogTupleInsert(rel, tup);
+		CatalogTupleInsert(rel, tup);
 		is_update = false;
 	}
 
-
-	if (dg_catalog_creating_routine())
-	{
-		retval = dg_catalog_store_routine(tup, tupDesc);
-		ObjectAddressSet(myself, ProcedureRelationId, retval);
-		CatalogViewSwitch(CatalogViewObjectContext(retval));
-		InvokeObjectPostCreateHook(ProcedureRelationId, retval, 0);
-		heap_freetuple(tup);
-		table_close(rel, RowExclusiveLock);
-		goto validate_body;
-	}
 
 	retval = ((Form_pg_proc) GETSTRUCT(tup))->oid;
 
@@ -690,23 +660,46 @@ ProcedureCreate(const char *procedureName,
 		add_exact_object_address(&referenced, addrs);
 	}
 
-	record_object_address_dependencies(&myself, addrs, DEPENDENCY_NORMAL);
-	free_object_addresses(addrs);
-
-	/* dependency on SQL routine body */
+	/* dependencies appearing in new-style SQL routine body */
 	if (languageObjectId == SQLlanguageId && prosqlbody)
 	{
 		CheckUsageOnTypesInExpr(prosqlbody, NIL, GetUserId());
-		recordDependencyOnExpr(&myself, prosqlbody, NIL, DEPENDENCY_NORMAL);
+		collectDependenciesOfExpr(addrs, prosqlbody, NIL);
 	}
 
 	/* dependency on parameter default expressions */
 	if (parameterDefaults)
 	{
 		CheckUsageOnTypesInExpr((Node *) parameterDefaults, NIL, GetUserId());
-		recordDependencyOnExpr(&myself, (Node *) parameterDefaults,
-							   NIL, DEPENDENCY_NORMAL);
+		collectDependenciesOfExpr(addrs, (Node *) parameterDefaults, NIL);
 	}
+
+	/*
+	 * Now that we have all the normal dependencies, thumb through them and
+	 * warn if any are to temporary objects.  This informs the user if their
+	 * supposedly non-temp function will silently go away at session exit, due
+	 * to a dependency on a temp object.  However, do not complain when a
+	 * function created in our own pg_temp namespace refers to other objects
+	 * in that namespace, since then they'll have similar lifespans anyway.
+	 */
+	if (find_temp_object(addrs, isTempNamespace(procNamespace), &temp_object))
+		ereport(NOTICE,
+				(errmsg("function \"%s\" will be effectively temporary",
+						procedureName),
+				 errdetail("It depends on temporary %s.",
+						   getObjectDescription(&temp_object, false))));
+
+	/*
+	 * Now record all normal dependencies at once.  This will also remove any
+	 * duplicates in the list.  (Role and extension dependencies are handled
+	 * separately below.  Role dependencies would have to be separate anyway
+	 * since they are shared dependencies.  An extension dependency could be
+	 * folded into the addrs list, but pg_depend.c doesn't make that easy, and
+	 * it won't duplicate anything we've collected so far anyway.)
+	 */
+	record_object_address_dependencies(&myself, addrs, DEPENDENCY_NORMAL);
+
+	free_object_addresses(addrs);
 
 	/* dependency on owner */
 	if (!is_update)
@@ -727,7 +720,6 @@ ProcedureCreate(const char *procedureName,
 
 	table_close(rel, RowExclusiveLock);
 
-validate_body:
 	/* Verify function body */
 	if (OidIsValid(languageValidator))
 	{
@@ -767,7 +759,7 @@ validate_body:
 	}
 
 	/* ensure that stats are dropped if transaction aborts */
-	if (!is_update && !dg_catalog_creating_routine())
+	if (!is_update)
 		pgstat_create_function(retval);
 
 	return myself;
@@ -944,7 +936,7 @@ fmgr_sql_validator(PG_FUNCTION_ARGS)
 			Node	   *n;
 			List	   *stored_query_list;
 
-			n = dg_routine_body(tuple, stringToNode(TextDatumGetCString(tmp)));
+			n = stringToNode(TextDatumGetCString(tmp));
 			if (IsA(n, List))
 				stored_query_list = linitial(castNode(List, n));
 			else
@@ -1251,6 +1243,6 @@ oid_array_to_list(Datum datum)
 
 	deconstruct_array_builtin(array, OIDOID, &values, NULL, &nelems);
 	for (i = 0; i < nelems; i++)
-		result = lappend_oid(result, values[i]);
+		result = lappend_oid(result, DatumGetObjectId(values[i]));
 	return result;
 }

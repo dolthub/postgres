@@ -10,7 +10,7 @@
  *	  Index cost functions are located via the index AM's API struct,
  *	  which is obtained from the handler function registered in pg_am.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -103,7 +103,6 @@
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/visibilitymap.h"
-#include "catalog/pg_am.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_statistic.h"
@@ -144,26 +143,78 @@
 
 #define DEFAULT_PAGE_CPU_MULTIPLIER 50.0
 
+/*
+ * In production builds, switch to hash-based MCV matching when the lists are
+ * large enough to amortize hash setup cost.  (This threshold is compared to
+ * the sum of the lengths of the two MCV lists.  This is simplistic but seems
+ * to work well enough.)  In debug builds, we use a smaller threshold so that
+ * the regression tests cover both paths well.
+ */
+#ifndef USE_ASSERT_CHECKING
+#define EQJOINSEL_MCV_HASH_THRESHOLD 200
+#else
+#define EQJOINSEL_MCV_HASH_THRESHOLD 20
+#endif
+
+/* Entries in the simplehash hash table used by eqjoinsel_find_matches */
+typedef struct MCVHashEntry
+{
+	Datum		value;			/* the value represented by this entry */
+	int			index;			/* its index in the relevant AttStatsSlot */
+	uint32		hash;			/* hash code for the Datum */
+	char		status;			/* status code used by simplehash.h */
+} MCVHashEntry;
+
+/* private_data for the simplehash hash table */
+typedef struct MCVHashContext
+{
+	FunctionCallInfo equal_fcinfo;	/* the equality join operator */
+	FunctionCallInfo hash_fcinfo;	/* the hash function to use */
+	bool		op_is_reversed; /* equality compares hash type to probe type */
+	bool		insert_mode;	/* doing inserts or lookups? */
+	bool		hash_typbyval;	/* typbyval of hashed data type */
+	int16		hash_typlen;	/* typlen of hashed data type */
+} MCVHashContext;
+
+/* forward reference */
+typedef struct MCVHashTable_hash MCVHashTable_hash;
+
 /* Hooks for plugins to get control when we ask for stats */
 get_relation_stats_hook_type get_relation_stats_hook = NULL;
 get_index_stats_hook_type get_index_stats_hook = NULL;
 
 static double eqsel_internal(PG_FUNCTION_ARGS, bool negate);
-static double eqjoinsel_inner(Oid opfuncoid, Oid collation,
+static double eqjoinsel_inner(FmgrInfo *eqproc, Oid collation,
+							  Oid hashLeft, Oid hashRight,
 							  VariableStatData *vardata1, VariableStatData *vardata2,
 							  double nd1, double nd2,
 							  bool isdefault1, bool isdefault2,
 							  AttStatsSlot *sslot1, AttStatsSlot *sslot2,
 							  Form_pg_statistic stats1, Form_pg_statistic stats2,
-							  bool have_mcvs1, bool have_mcvs2);
-static double eqjoinsel_semi(Oid opfuncoid, Oid collation,
+							  bool have_mcvs1, bool have_mcvs2,
+							  bool *hasmatch1, bool *hasmatch2,
+							  int *p_nmatches);
+static double eqjoinsel_semi(FmgrInfo *eqproc, Oid collation,
+							 Oid hashLeft, Oid hashRight,
+							 bool op_is_reversed,
 							 VariableStatData *vardata1, VariableStatData *vardata2,
 							 double nd1, double nd2,
 							 bool isdefault1, bool isdefault2,
 							 AttStatsSlot *sslot1, AttStatsSlot *sslot2,
 							 Form_pg_statistic stats1, Form_pg_statistic stats2,
 							 bool have_mcvs1, bool have_mcvs2,
+							 bool *hasmatch1, bool *hasmatch2,
+							 int *p_nmatches,
 							 RelOptInfo *inner_rel);
+static void eqjoinsel_find_matches(FmgrInfo *eqproc, Oid collation,
+								   Oid hashLeft, Oid hashRight,
+								   bool op_is_reversed,
+								   AttStatsSlot *sslot1, AttStatsSlot *sslot2,
+								   int nvalues1, int nvalues2,
+								   bool *hasmatch1, bool *hasmatch2,
+								   int *p_nmatches, double *p_matchprodfreq);
+static uint32 hash_mcv(MCVHashTable_hash *tab, Datum key);
+static bool mcvs_equal(MCVHashTable_hash *tab, Datum key0, Datum key1);
 static bool estimate_multivariate_ndistinct(PlannerInfo *root,
 											RelOptInfo *rel, List **varinfos, double *ndistinct);
 static bool convert_to_scalar(Datum value, Oid valuetypid, Oid collid,
@@ -221,6 +272,20 @@ static bool get_actual_variable_endpoint(Relation heapRel,
 static RelOptInfo *find_join_input_rel(PlannerInfo *root, Relids relids);
 static double btcost_correlation(IndexOptInfo *index,
 								 VariableStatData *vardata);
+
+/* Define support routines for MCV hash tables */
+#define SH_PREFIX				MCVHashTable
+#define SH_ELEMENT_TYPE			MCVHashEntry
+#define SH_KEY_TYPE				Datum
+#define SH_KEY					value
+#define SH_HASH_KEY(tab,key)	hash_mcv(tab, key)
+#define SH_EQUAL(tab,key0,key1)	mcvs_equal(tab, key0, key1)
+#define SH_SCOPE				static inline
+#define SH_STORE_HASH
+#define SH_GET_HASH(tab,ent)	(ent)->hash
+#define SH_DEFINE
+#define SH_DECLARE
+#include "lib/simplehash.h"
 
 
 /*
@@ -1533,6 +1598,17 @@ boolvarsel(PlannerInfo *root, Node *arg, int varRelid)
 		selec = var_eq_const(&vardata, BooleanEqualOperator, InvalidOid,
 							 BoolGetDatum(true), false, true, false);
 	}
+	else if (is_funcclause(arg))
+	{
+		/*
+		 * If we have no stats and it's a function call, estimate 0.3333333.
+		 * This seems a pretty unprincipled choice, but Postgres has been
+		 * using that estimate for function calls since 1992.  The hoariness
+		 * of this behavior suggests that we should not be in too much hurry
+		 * to use another value.
+		 */
+		selec = 0.3333333;
+	}
 	else
 	{
 		/* Otherwise, the default estimate is 0.5 */
@@ -1943,6 +2019,15 @@ scalararraysel(PlannerInfo *root,
 		if (arrayisnull)		/* qual can't succeed if null array */
 			return (Selectivity) 0.0;
 		arrayval = DatumGetArrayTypeP(arraydatum);
+
+		/*
+		 * When the array contains a NULL constant, same as var_eq_const, we
+		 * assume the operator is strict and nothing will match, thus return
+		 * 0.0.
+		 */
+		if (!useOr && array_contains_nulls(arrayval))
+			return (Selectivity) 0.0;
+
 		get_typlenbyvalalign(ARR_ELEMTYPE(arrayval),
 							 &elmlen, &elmbyval, &elmalign);
 		deconstruct_array(arrayval,
@@ -2039,6 +2124,14 @@ scalararraysel(PlannerInfo *root,
 			Node	   *elem = (Node *) lfirst(l);
 			List	   *args;
 			Selectivity s2;
+
+			/*
+			 * When the array contains a NULL constant, same as var_eq_const,
+			 * we assume the operator is strict and nothing will match, thus
+			 * return 0.0.
+			 */
+			if (!useOr && IsA(elem, Const) && ((Const *) elem)->constisnull)
+				return (Selectivity) 0.0;
 
 			/*
 			 * Theoretically, if elem isn't of nominal_element_type we should
@@ -2310,12 +2403,18 @@ eqjoinsel(PG_FUNCTION_ARGS)
 	bool		isdefault1;
 	bool		isdefault2;
 	Oid			opfuncoid;
+	FmgrInfo	eqproc;
+	Oid			hashLeft = InvalidOid;
+	Oid			hashRight = InvalidOid;
 	AttStatsSlot sslot1;
 	AttStatsSlot sslot2;
 	Form_pg_statistic stats1 = NULL;
 	Form_pg_statistic stats2 = NULL;
 	bool		have_mcvs1 = false;
 	bool		have_mcvs2 = false;
+	bool	   *hasmatch1 = NULL;
+	bool	   *hasmatch2 = NULL;
+	int			nmatches = 0;
 	bool		get_mcv_stats;
 	bool		join_is_reversed;
 	RelOptInfo *inner_rel;
@@ -2366,14 +2465,36 @@ eqjoinsel(PG_FUNCTION_ARGS)
 										  ATTSTATSSLOT_VALUES | ATTSTATSSLOT_NUMBERS);
 	}
 
+	/* Prepare info usable by both eqjoinsel_inner and eqjoinsel_semi */
+	if (have_mcvs1 && have_mcvs2)
+	{
+		fmgr_info(opfuncoid, &eqproc);
+		hasmatch1 = (bool *) palloc0(sslot1.nvalues * sizeof(bool));
+		hasmatch2 = (bool *) palloc0(sslot2.nvalues * sizeof(bool));
+
+		/*
+		 * If the MCV lists are long enough to justify hashing, try to look up
+		 * hash functions for the join operator.
+		 */
+		if ((sslot1.nvalues + sslot2.nvalues) >= EQJOINSEL_MCV_HASH_THRESHOLD)
+			(void) get_op_hash_functions_ext(operator,
+											 exprType((Node *) linitial(args)),
+											 &hashLeft, &hashRight);
+	}
+	else
+		memset(&eqproc, 0, sizeof(eqproc)); /* silence uninit-var warnings */
+
 	/* We need to compute the inner-join selectivity in all cases */
-	selec_inner = eqjoinsel_inner(opfuncoid, collation,
+	selec_inner = eqjoinsel_inner(&eqproc, collation,
+								  hashLeft, hashRight,
 								  &vardata1, &vardata2,
 								  nd1, nd2,
 								  isdefault1, isdefault2,
 								  &sslot1, &sslot2,
 								  stats1, stats2,
-								  have_mcvs1, have_mcvs2);
+								  have_mcvs1, have_mcvs2,
+								  hasmatch1, hasmatch2,
+								  &nmatches);
 
 	switch (sjinfo->jointype)
 	{
@@ -2394,28 +2515,31 @@ eqjoinsel(PG_FUNCTION_ARGS)
 			inner_rel = find_join_input_rel(root, sjinfo->min_righthand);
 
 			if (!join_is_reversed)
-				selec = eqjoinsel_semi(opfuncoid, collation,
+				selec = eqjoinsel_semi(&eqproc, collation,
+									   hashLeft, hashRight,
+									   false,
 									   &vardata1, &vardata2,
 									   nd1, nd2,
 									   isdefault1, isdefault2,
 									   &sslot1, &sslot2,
 									   stats1, stats2,
 									   have_mcvs1, have_mcvs2,
+									   hasmatch1, hasmatch2,
+									   &nmatches,
 									   inner_rel);
 			else
-			{
-				Oid			commop = get_commutator(operator);
-				Oid			commopfuncoid = OidIsValid(commop) ? get_opcode(commop) : InvalidOid;
-
-				selec = eqjoinsel_semi(commopfuncoid, collation,
+				selec = eqjoinsel_semi(&eqproc, collation,
+									   hashLeft, hashRight,
+									   true,
 									   &vardata2, &vardata1,
 									   nd2, nd1,
 									   isdefault2, isdefault1,
 									   &sslot2, &sslot1,
 									   stats2, stats1,
 									   have_mcvs2, have_mcvs1,
+									   hasmatch2, hasmatch1,
+									   &nmatches,
 									   inner_rel);
-			}
 
 			/*
 			 * We should never estimate the output of a semijoin to be more
@@ -2443,6 +2567,11 @@ eqjoinsel(PG_FUNCTION_ARGS)
 	ReleaseVariableStats(vardata1);
 	ReleaseVariableStats(vardata2);
 
+	if (hasmatch1)
+		pfree(hasmatch1);
+	if (hasmatch2)
+		pfree(hasmatch2);
+
 	CLAMP_PROBABILITY(selec);
 
 	PG_RETURN_FLOAT8((float8) selec);
@@ -2451,17 +2580,24 @@ eqjoinsel(PG_FUNCTION_ARGS)
 /*
  * eqjoinsel_inner --- eqjoinsel for normal inner join
  *
+ * In addition to computing the selectivity estimate, this will fill
+ * hasmatch1[], hasmatch2[], and *p_nmatches (if have_mcvs1 && have_mcvs2).
+ * We may be able to re-use that data in eqjoinsel_semi.
+ *
  * We also use this for LEFT/FULL outer joins; it's not presently clear
  * that it's worth trying to distinguish them here.
  */
 static double
-eqjoinsel_inner(Oid opfuncoid, Oid collation,
+eqjoinsel_inner(FmgrInfo *eqproc, Oid collation,
+				Oid hashLeft, Oid hashRight,
 				VariableStatData *vardata1, VariableStatData *vardata2,
 				double nd1, double nd2,
 				bool isdefault1, bool isdefault2,
 				AttStatsSlot *sslot1, AttStatsSlot *sslot2,
 				Form_pg_statistic stats1, Form_pg_statistic stats2,
-				bool have_mcvs1, bool have_mcvs2)
+				bool have_mcvs1, bool have_mcvs2,
+				bool *hasmatch1, bool *hasmatch2,
+				int *p_nmatches)
 {
 	double		selec;
 
@@ -2479,10 +2615,6 @@ eqjoinsel_inner(Oid opfuncoid, Oid collation,
 		 * results", Technical Report 1018, Computer Science Dept., University
 		 * of Wisconsin, Madison, March 1991 (available from ftp.cs.wisc.edu).
 		 */
-		LOCAL_FCINFO(fcinfo, 2);
-		FmgrInfo	eqproc;
-		bool	   *hasmatch1;
-		bool	   *hasmatch2;
 		double		nullfrac1 = stats1->stanullfrac;
 		double		nullfrac2 = stats2->stanullfrac;
 		double		matchprodfreq,
@@ -2497,55 +2629,17 @@ eqjoinsel_inner(Oid opfuncoid, Oid collation,
 		int			i,
 					nmatches;
 
-		fmgr_info(opfuncoid, &eqproc);
-
-		/*
-		 * Save a few cycles by setting up the fcinfo struct just once. Using
-		 * FunctionCallInvoke directly also avoids failure if the eqproc
-		 * returns NULL, though really equality functions should never do
-		 * that.
-		 */
-		InitFunctionCallInfoData(*fcinfo, &eqproc, 2, collation,
-								 NULL, NULL);
-		fcinfo->args[0].isnull = false;
-		fcinfo->args[1].isnull = false;
-
-		hasmatch1 = (bool *) palloc0(sslot1->nvalues * sizeof(bool));
-		hasmatch2 = (bool *) palloc0(sslot2->nvalues * sizeof(bool));
-
-		/*
-		 * Note we assume that each MCV will match at most one member of the
-		 * other MCV list.  If the operator isn't really equality, there could
-		 * be multiple matches --- but we don't look for them, both for speed
-		 * and because the math wouldn't add up...
-		 */
-		matchprodfreq = 0.0;
-		nmatches = 0;
-		for (i = 0; i < sslot1->nvalues; i++)
-		{
-			int			j;
-
-			fcinfo->args[0].value = sslot1->values[i];
-
-			for (j = 0; j < sslot2->nvalues; j++)
-			{
-				Datum		fresult;
-
-				if (hasmatch2[j])
-					continue;
-				fcinfo->args[1].value = sslot2->values[j];
-				fcinfo->isnull = false;
-				fresult = FunctionCallInvoke(fcinfo);
-				if (!fcinfo->isnull && DatumGetBool(fresult))
-				{
-					hasmatch1[i] = hasmatch2[j] = true;
-					matchprodfreq += sslot1->numbers[i] * sslot2->numbers[j];
-					nmatches++;
-					break;
-				}
-			}
-		}
+		/* Fill the match arrays */
+		eqjoinsel_find_matches(eqproc, collation,
+							   hashLeft, hashRight,
+							   false,
+							   sslot1, sslot2,
+							   sslot1->nvalues, sslot2->nvalues,
+							   hasmatch1, hasmatch2,
+							   p_nmatches, &matchprodfreq);
+		nmatches = *p_nmatches;
 		CLAMP_PROBABILITY(matchprodfreq);
+
 		/* Sum up frequencies of matched and unmatched MCVs */
 		matchfreq1 = unmatchfreq1 = 0.0;
 		for (i = 0; i < sslot1->nvalues; i++)
@@ -2567,8 +2661,6 @@ eqjoinsel_inner(Oid opfuncoid, Oid collation,
 		}
 		CLAMP_PROBABILITY(matchfreq2);
 		CLAMP_PROBABILITY(unmatchfreq2);
-		pfree(hasmatch1);
-		pfree(hasmatch2);
 
 		/*
 		 * Compute total frequency of non-null values that are not in the MCV
@@ -2648,17 +2740,24 @@ eqjoinsel_inner(Oid opfuncoid, Oid collation,
  * eqjoinsel_semi --- eqjoinsel for semi join
  *
  * (Also used for anti join, which we are supposed to estimate the same way.)
- * Caller has ensured that vardata1 is the LHS variable.
- * Unlike eqjoinsel_inner, we have to cope with opfuncoid being InvalidOid.
+ * Caller has ensured that vardata1 is the LHS variable; however, eqproc
+ * is for the original join operator, which might now need to have the inputs
+ * swapped in order to apply correctly.  Also, if have_mcvs1 && have_mcvs2
+ * then hasmatch1[], hasmatch2[], and *p_nmatches were filled by
+ * eqjoinsel_inner.
  */
 static double
-eqjoinsel_semi(Oid opfuncoid, Oid collation,
+eqjoinsel_semi(FmgrInfo *eqproc, Oid collation,
+			   Oid hashLeft, Oid hashRight,
+			   bool op_is_reversed,
 			   VariableStatData *vardata1, VariableStatData *vardata2,
 			   double nd1, double nd2,
 			   bool isdefault1, bool isdefault2,
 			   AttStatsSlot *sslot1, AttStatsSlot *sslot2,
 			   Form_pg_statistic stats1, Form_pg_statistic stats2,
 			   bool have_mcvs1, bool have_mcvs2,
+			   bool *hasmatch1, bool *hasmatch2,
+			   int *p_nmatches,
 			   RelOptInfo *inner_rel)
 {
 	double		selec;
@@ -2696,7 +2795,7 @@ eqjoinsel_semi(Oid opfuncoid, Oid collation,
 		isdefault2 = false;
 	}
 
-	if (have_mcvs1 && have_mcvs2 && OidIsValid(opfuncoid))
+	if (have_mcvs1 && have_mcvs2)
 	{
 		/*
 		 * We have most-common-value lists for both relations.  Run through
@@ -2706,12 +2805,9 @@ eqjoinsel_semi(Oid opfuncoid, Oid collation,
 		 * lists.  We still have to estimate for the remaining population, but
 		 * in a skewed distribution this gives us a big leg up in accuracy.
 		 */
-		LOCAL_FCINFO(fcinfo, 2);
-		FmgrInfo	eqproc;
-		bool	   *hasmatch1;
-		bool	   *hasmatch2;
 		double		nullfrac1 = stats1->stanullfrac;
-		double		matchfreq1,
+		double		matchprodfreq,
+					matchfreq1,
 					uncertainfrac,
 					uncertain;
 		int			i,
@@ -2727,52 +2823,32 @@ eqjoinsel_semi(Oid opfuncoid, Oid collation,
 		 */
 		clamped_nvalues2 = Min(sslot2->nvalues, nd2);
 
-		fmgr_info(opfuncoid, &eqproc);
-
 		/*
-		 * Save a few cycles by setting up the fcinfo struct just once. Using
-		 * FunctionCallInvoke directly also avoids failure if the eqproc
-		 * returns NULL, though really equality functions should never do
-		 * that.
+		 * If we did not set clamped_nvalues2 to less than sslot2->nvalues,
+		 * then the hasmatch1[] and hasmatch2[] match flags computed by
+		 * eqjoinsel_inner are still perfectly applicable, so we need not
+		 * re-do the matching work.  Note that it does not matter if
+		 * op_is_reversed: we'd get the same answers.
+		 *
+		 * If we did clamp, then a different set of sslot2 values is to be
+		 * compared, so we have to re-do the matching.
 		 */
-		InitFunctionCallInfoData(*fcinfo, &eqproc, 2, collation,
-								 NULL, NULL);
-		fcinfo->args[0].isnull = false;
-		fcinfo->args[1].isnull = false;
-
-		hasmatch1 = (bool *) palloc0(sslot1->nvalues * sizeof(bool));
-		hasmatch2 = (bool *) palloc0(clamped_nvalues2 * sizeof(bool));
-
-		/*
-		 * Note we assume that each MCV will match at most one member of the
-		 * other MCV list.  If the operator isn't really equality, there could
-		 * be multiple matches --- but we don't look for them, both for speed
-		 * and because the math wouldn't add up...
-		 */
-		nmatches = 0;
-		for (i = 0; i < sslot1->nvalues; i++)
+		if (clamped_nvalues2 != sslot2->nvalues)
 		{
-			int			j;
-
-			fcinfo->args[0].value = sslot1->values[i];
-
-			for (j = 0; j < clamped_nvalues2; j++)
-			{
-				Datum		fresult;
-
-				if (hasmatch2[j])
-					continue;
-				fcinfo->args[1].value = sslot2->values[j];
-				fcinfo->isnull = false;
-				fresult = FunctionCallInvoke(fcinfo);
-				if (!fcinfo->isnull && DatumGetBool(fresult))
-				{
-					hasmatch1[i] = hasmatch2[j] = true;
-					nmatches++;
-					break;
-				}
-			}
+			/* Must re-zero the arrays */
+			memset(hasmatch1, 0, sslot1->nvalues * sizeof(bool));
+			memset(hasmatch2, 0, clamped_nvalues2 * sizeof(bool));
+			/* Re-fill the match arrays */
+			eqjoinsel_find_matches(eqproc, collation,
+								   hashLeft, hashRight,
+								   op_is_reversed,
+								   sslot1, sslot2,
+								   sslot1->nvalues, clamped_nvalues2,
+								   hasmatch1, hasmatch2,
+								   p_nmatches, &matchprodfreq);
 		}
+		nmatches = *p_nmatches;
+
 		/* Sum up frequencies of matched MCVs */
 		matchfreq1 = 0.0;
 		for (i = 0; i < sslot1->nvalues; i++)
@@ -2781,8 +2857,6 @@ eqjoinsel_semi(Oid opfuncoid, Oid collation,
 				matchfreq1 += sslot1->numbers[i];
 		}
 		CLAMP_PROBABILITY(matchfreq1);
-		pfree(hasmatch1);
-		pfree(hasmatch2);
 
 		/*
 		 * Now we need to estimate the fraction of relation 1 that has at
@@ -2834,6 +2908,273 @@ eqjoinsel_semi(Oid opfuncoid, Oid collation,
 	}
 
 	return selec;
+}
+
+/*
+ * Identify matching MCVs for eqjoinsel_inner or eqjoinsel_semi.
+ *
+ * Inputs:
+ *	eqproc: FmgrInfo for equality function to use (might be reversed)
+ *	collation: OID of collation to use
+ *	hashLeft, hashRight: OIDs of hash functions associated with equality op,
+ *		or InvalidOid if we're not to use hashing
+ *	op_is_reversed: indicates that eqproc compares right type to left type
+ *	sslot1, sslot2: MCV values for the lefthand and righthand inputs
+ *	nvalues1, nvalues2: number of values to be considered (can be less than
+ *		sslotN->nvalues, but not more)
+ * Outputs:
+ *	hasmatch1[], hasmatch2[]: pre-zeroed arrays of lengths nvalues1, nvalues2;
+ *		entries are set to true if that MCV has a match on the other side
+ *	*p_nmatches: receives number of MCV pairs that match
+ *	*p_matchprodfreq: receives sum(sslot1->numbers[i] * sslot2->numbers[j])
+ *		for matching MCVs
+ *
+ * Note that hashLeft is for the eqproc's left-hand input type, hashRight
+ * for its right, regardless of op_is_reversed.
+ *
+ * Note we assume that each MCV will match at most one member of the other
+ * MCV list.  If the operator isn't really equality, there could be multiple
+ * matches --- but we don't look for them, both for speed and because the
+ * math wouldn't add up...
+ */
+static void
+eqjoinsel_find_matches(FmgrInfo *eqproc, Oid collation,
+					   Oid hashLeft, Oid hashRight,
+					   bool op_is_reversed,
+					   AttStatsSlot *sslot1, AttStatsSlot *sslot2,
+					   int nvalues1, int nvalues2,
+					   bool *hasmatch1, bool *hasmatch2,
+					   int *p_nmatches, double *p_matchprodfreq)
+{
+	LOCAL_FCINFO(fcinfo, 2);
+	double		matchprodfreq = 0.0;
+	int			nmatches = 0;
+
+	/*
+	 * Save a few cycles by setting up the fcinfo struct just once.  Using
+	 * FunctionCallInvoke directly also avoids failure if the eqproc returns
+	 * NULL, though really equality functions should never do that.
+	 */
+	InitFunctionCallInfoData(*fcinfo, eqproc, 2, collation,
+							 NULL, NULL);
+	fcinfo->args[0].isnull = false;
+	fcinfo->args[1].isnull = false;
+
+	if (OidIsValid(hashLeft) && OidIsValid(hashRight))
+	{
+		/* Use a hash table to speed up the matching */
+		LOCAL_FCINFO(hash_fcinfo, 1);
+		FmgrInfo	hash_proc;
+		MCVHashContext hashContext;
+		MCVHashTable_hash *hashTable;
+		AttStatsSlot *statsProbe;
+		AttStatsSlot *statsHash;
+		bool	   *hasMatchProbe;
+		bool	   *hasMatchHash;
+		int			nvaluesProbe;
+		int			nvaluesHash;
+
+		/* Make sure we build the hash table on the smaller array. */
+		if (sslot1->nvalues >= sslot2->nvalues)
+		{
+			statsProbe = sslot1;
+			statsHash = sslot2;
+			hasMatchProbe = hasmatch1;
+			hasMatchHash = hasmatch2;
+			nvaluesProbe = nvalues1;
+			nvaluesHash = nvalues2;
+		}
+		else
+		{
+			/* We'll have to reverse the direction of use of the operator. */
+			op_is_reversed = !op_is_reversed;
+			statsProbe = sslot2;
+			statsHash = sslot1;
+			hasMatchProbe = hasmatch2;
+			hasMatchHash = hasmatch1;
+			nvaluesProbe = nvalues2;
+			nvaluesHash = nvalues1;
+		}
+
+		/*
+		 * Build the hash table on the smaller array, using the appropriate
+		 * hash function for its data type.
+		 */
+		fmgr_info(op_is_reversed ? hashLeft : hashRight, &hash_proc);
+		InitFunctionCallInfoData(*hash_fcinfo, &hash_proc, 1, collation,
+								 NULL, NULL);
+		hash_fcinfo->args[0].isnull = false;
+
+		hashContext.equal_fcinfo = fcinfo;
+		hashContext.hash_fcinfo = hash_fcinfo;
+		hashContext.op_is_reversed = op_is_reversed;
+		hashContext.insert_mode = true;
+		get_typlenbyval(statsHash->valuetype,
+						&hashContext.hash_typlen,
+						&hashContext.hash_typbyval);
+
+		hashTable = MCVHashTable_create(CurrentMemoryContext,
+										nvaluesHash,
+										&hashContext);
+
+		for (int i = 0; i < nvaluesHash; i++)
+		{
+			bool		found = false;
+			MCVHashEntry *entry = MCVHashTable_insert(hashTable,
+													  statsHash->values[i],
+													  &found);
+
+			/*
+			 * MCVHashTable_insert will only report "found" if the new value
+			 * is equal to some previous one per datum_image_eq().  That
+			 * probably shouldn't happen, since we're not expecting duplicates
+			 * in the MCV list.  If we do find a dup, just ignore it, leaving
+			 * the hash entry's index pointing at the first occurrence.  That
+			 * matches the behavior that the non-hashed code path would have.
+			 */
+			if (likely(!found))
+				entry->index = i;
+		}
+
+		/*
+		 * Prepare to probe the hash table.  If the probe values are of a
+		 * different data type, then we need to change hash functions.  (This
+		 * code relies on the assumption that since we defined SH_STORE_HASH,
+		 * simplehash.h will never need to compute hash values for existing
+		 * hash table entries.)
+		 */
+		hashContext.insert_mode = false;
+		if (hashLeft != hashRight)
+		{
+			fmgr_info(op_is_reversed ? hashRight : hashLeft, &hash_proc);
+			/* Resetting hash_fcinfo is probably unnecessary, but be safe */
+			InitFunctionCallInfoData(*hash_fcinfo, &hash_proc, 1, collation,
+									 NULL, NULL);
+			hash_fcinfo->args[0].isnull = false;
+		}
+
+		/* Look up each probe value in turn. */
+		for (int i = 0; i < nvaluesProbe; i++)
+		{
+			MCVHashEntry *entry = MCVHashTable_lookup(hashTable,
+													  statsProbe->values[i]);
+
+			/* As in the other code path, skip already-matched hash entries */
+			if (entry != NULL && !hasMatchHash[entry->index])
+			{
+				hasMatchHash[entry->index] = hasMatchProbe[i] = true;
+				nmatches++;
+				matchprodfreq += statsHash->numbers[entry->index] * statsProbe->numbers[i];
+			}
+		}
+
+		MCVHashTable_destroy(hashTable);
+	}
+	else
+	{
+		/* We're not to use hashing, so do it the O(N^2) way */
+		int			index1,
+					index2;
+
+		/* Set up to supply the values in the order the operator expects */
+		if (op_is_reversed)
+		{
+			index1 = 1;
+			index2 = 0;
+		}
+		else
+		{
+			index1 = 0;
+			index2 = 1;
+		}
+
+		for (int i = 0; i < nvalues1; i++)
+		{
+			fcinfo->args[index1].value = sslot1->values[i];
+
+			for (int j = 0; j < nvalues2; j++)
+			{
+				Datum		fresult;
+
+				if (hasmatch2[j])
+					continue;
+				fcinfo->args[index2].value = sslot2->values[j];
+				fcinfo->isnull = false;
+				fresult = FunctionCallInvoke(fcinfo);
+				if (!fcinfo->isnull && DatumGetBool(fresult))
+				{
+					hasmatch1[i] = hasmatch2[j] = true;
+					matchprodfreq += sslot1->numbers[i] * sslot2->numbers[j];
+					nmatches++;
+					break;
+				}
+			}
+		}
+	}
+
+	*p_nmatches = nmatches;
+	*p_matchprodfreq = matchprodfreq;
+}
+
+/*
+ * Support functions for the hash tables used by eqjoinsel_find_matches
+ */
+static uint32
+hash_mcv(MCVHashTable_hash *tab, Datum key)
+{
+	MCVHashContext *context = (MCVHashContext *) tab->private_data;
+	FunctionCallInfo fcinfo = context->hash_fcinfo;
+	Datum		fresult;
+
+	fcinfo->args[0].value = key;
+	fcinfo->isnull = false;
+	fresult = FunctionCallInvoke(fcinfo);
+	Assert(!fcinfo->isnull);
+	return DatumGetUInt32(fresult);
+}
+
+static bool
+mcvs_equal(MCVHashTable_hash *tab, Datum key0, Datum key1)
+{
+	MCVHashContext *context = (MCVHashContext *) tab->private_data;
+
+	if (context->insert_mode)
+	{
+		/*
+		 * During the insertion step, any comparisons will be between two
+		 * Datums of the hash table's data type, so if the given operator is
+		 * cross-type it will be the wrong thing to use.  Fortunately, we can
+		 * use datum_image_eq instead.  The MCV values should all be distinct
+		 * anyway, so it's mostly pro-forma to compare them at all.
+		 */
+		return datum_image_eq(key0, key1,
+							  context->hash_typbyval, context->hash_typlen);
+	}
+	else
+	{
+		FunctionCallInfo fcinfo = context->equal_fcinfo;
+		Datum		fresult;
+
+		/*
+		 * Apply the operator the correct way around.  Although simplehash.h
+		 * doesn't document this explicitly, during lookups key0 is from the
+		 * hash table while key1 is the probe value, so we should compare them
+		 * in that order only if op_is_reversed.
+		 */
+		if (context->op_is_reversed)
+		{
+			fcinfo->args[0].value = key0;
+			fcinfo->args[1].value = key1;
+		}
+		else
+		{
+			fcinfo->args[0].value = key1;
+			fcinfo->args[1].value = key0;
+		}
+		fcinfo->isnull = false;
+		fresult = FunctionCallInvoke(fcinfo);
+		return (!fcinfo->isnull && DatumGetBool(fresult));
+	}
 }
 
 /*
@@ -3377,7 +3718,7 @@ add_unique_group_var(PlannerInfo *root, List *varinfos,
 		}
 	}
 
-	varinfo = (GroupVarInfo *) palloc(sizeof(GroupVarInfo));
+	varinfo = palloc_object(GroupVarInfo);
 
 	varinfo->var = var;
 	varinfo->rel = vardata->rel;
@@ -3815,18 +4156,25 @@ estimate_multivariate_bucketsize(PlannerInfo *root, RelOptInfo *inner,
 								 List *hashclauses,
 								 Selectivity *innerbucketsize)
 {
-	List	   *clauses = list_copy(hashclauses);
-	List	   *otherclauses = NIL;
-	double		ndistinct = 1.0;
+	List	   *clauses;
+	List	   *otherclauses;
+	double		ndistinct;
 
 	if (list_length(hashclauses) <= 1)
-
+	{
 		/*
 		 * Nothing to do for a single clause.  Could we employ univariate
 		 * extended stat here?
 		 */
 		return hashclauses;
+	}
 
+	/* "clauses" is the list of hashclauses we've not dealt with yet */
+	clauses = list_copy(hashclauses);
+	/* "otherclauses" holds clauses we are going to return to caller */
+	otherclauses = NIL;
+	/* current estimate of ndistinct */
+	ndistinct = 1.0;
 	while (clauses != NIL)
 	{
 		ListCell   *lc;
@@ -3891,12 +4239,13 @@ estimate_multivariate_bucketsize(PlannerInfo *root, RelOptInfo *inner,
 					group_rel = root->simple_rel_array[relid];
 				}
 				else if (group_relid != relid)
-
+				{
 					/*
 					 * Being in the group forming state we don't need other
 					 * clauses.
 					 */
 					continue;
+				}
 
 				/*
 				 * We're going to add the new clause to the varinfos list.  We
@@ -3950,7 +4299,7 @@ estimate_multivariate_bucketsize(PlannerInfo *root, RelOptInfo *inner,
 				 * estimate_multivariate_ndistinct(), which doesn't care about
 				 * ndistinct and isdefault fields.  Thus, skip these fields.
 				 */
-				varinfo = (GroupVarInfo *) palloc0(sizeof(GroupVarInfo));
+				varinfo = palloc0_object(GroupVarInfo);
 				varinfo->var = expr;
 				varinfo->rel = root->simple_rel_array[relid];
 				varinfos = lappend(varinfos, varinfo);
@@ -4033,10 +4382,11 @@ estimate_multivariate_bucketsize(PlannerInfo *root, RelOptInfo *inner,
  * This attempts to determine two values:
  *
  * 1. The frequency of the most common value of the expression (returns
- * zero into *mcv_freq if we can't get that).
+ * zero into *mcv_freq if we can't get that).  This will be frequency
+ * relative to the entire underlying table.
  *
  * 2. The "bucketsize fraction", ie, average number of entries in a bucket
- * divided by total tuples in relation.
+ * divided by total number of tuples to be hashed.
  *
  * XXX This is really pretty bogus since we're effectively assuming that the
  * distribution of hash keys will be the same after applying restriction
@@ -4055,8 +4405,8 @@ estimate_multivariate_bucketsize(PlannerInfo *root, RelOptInfo *inner,
  * exactly those that will be probed most often.  Therefore, the "average"
  * bucket size for costing purposes should really be taken as something close
  * to the "worst case" bucket size.  We try to estimate this by adjusting the
- * fraction if there are too few distinct data values, and then scaling up
- * by the ratio of the most common value's frequency to the average frequency.
+ * fraction if there are too few distinct data values, and then clamping to
+ * at least the bucket size implied by the most common value's frequency.
  *
  * If no statistics are available, use a default estimate of 0.1.  This will
  * discourage use of a hash rather strongly if the inner relation is large,
@@ -4076,17 +4426,16 @@ estimate_hash_bucket_stats(PlannerInfo *root, Node *hashkey, double nbuckets,
 {
 	VariableStatData vardata;
 	double		estfract,
-				ndistinct,
-				stanullfrac,
-				avgfreq;
+				ndistinct;
 	bool		isdefault;
 	AttStatsSlot sslot;
 
 	examine_variable(root, hashkey, 0, &vardata);
 
-	/* Look up the frequency of the most common value, if available */
+	/* Initialize *mcv_freq to "unknown" */
 	*mcv_freq = 0.0;
 
+	/* Look up the frequency of the most common value, if available */
 	if (HeapTupleIsValid(vardata.statsTuple))
 	{
 		if (get_attstatsslot(&sslot, vardata.statsTuple,
@@ -4099,6 +4448,17 @@ estimate_hash_bucket_stats(PlannerInfo *root, Node *hashkey, double nbuckets,
 			if (sslot.nnumbers > 0)
 				*mcv_freq = sslot.numbers[0];
 			free_attstatsslot(&sslot);
+		}
+		else if (get_attstatsslot(&sslot, vardata.statsTuple,
+								  STATISTIC_KIND_HISTOGRAM, InvalidOid,
+								  0))
+		{
+			/*
+			 * If there are no recorded MCVs, but we do have a histogram, then
+			 * assume that ANALYZE determined that the column is unique.
+			 */
+			if (vardata.rel && vardata.rel->tuples > 0)
+				*mcv_freq = 1.0 / vardata.rel->tuples;
 		}
 	}
 
@@ -4115,20 +4475,6 @@ estimate_hash_bucket_stats(PlannerInfo *root, Node *hashkey, double nbuckets,
 		ReleaseVariableStats(vardata);
 		return;
 	}
-
-	/* Get fraction that are null */
-	if (HeapTupleIsValid(vardata.statsTuple))
-	{
-		Form_pg_statistic stats;
-
-		stats = (Form_pg_statistic) GETSTRUCT(vardata.statsTuple);
-		stanullfrac = stats->stanullfrac;
-	}
-	else
-		stanullfrac = 0.0;
-
-	/* Compute avg freq of all distinct data values in raw relation */
-	avgfreq = (1.0 - stanullfrac) / ndistinct;
 
 	/*
 	 * Adjust ndistinct to account for restriction clauses.  Observe we are
@@ -4155,20 +4501,11 @@ estimate_hash_bucket_stats(PlannerInfo *root, Node *hashkey, double nbuckets,
 		estfract = 1.0 / ndistinct;
 
 	/*
-	 * Adjust estimated bucketsize upward to account for skewed distribution.
+	 * Clamp the bucketsize fraction to be not less than the MCV frequency,
+	 * since whichever bucket the MCV values end up in will have at least that
+	 * size.  This has no effect if *mcv_freq is still zero.
 	 */
-	if (avgfreq > 0.0 && *mcv_freq > avgfreq)
-		estfract *= *mcv_freq / avgfreq;
-
-	/*
-	 * Clamp bucketsize to sane range (the above adjustment could easily
-	 * produce an out-of-range result).  We set the lower bound a little above
-	 * zero, since zero isn't a very sane result.
-	 */
-	if (estfract < 1.0e-6)
-		estfract = 1.0e-6;
-	else if (estfract > 1.0)
-		estfract = 1.0;
+	estfract = Max(estfract, *mcv_freq);
 
 	*bucketsize_frac = (Selectivity) estfract;
 
@@ -4636,6 +4973,7 @@ convert_to_scalar(Datum value, Oid valuetypid, Oid collid, double *scaledvalue,
 		case REGDICTIONARYOID:
 		case REGROLEOID:
 		case REGNAMESPACEOID:
+		case REGDATABASEOID:
 			*scaledvalue = convert_numeric_to_scalar(value, valuetypid,
 													 &failure);
 			*scaledlobound = convert_numeric_to_scalar(lobound, boundstypid,
@@ -4768,6 +5106,7 @@ convert_numeric_to_scalar(Datum value, Oid typid, bool *failure)
 		case REGDICTIONARYOID:
 		case REGROLEOID:
 		case REGNAMESPACEOID:
+		case REGDATABASEOID:
 			/* we can treat OIDs as integers... */
 			return (double) DatumGetObjectId(value);
 	}
@@ -5642,7 +5981,7 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
 /*
  * strip_all_phvs_deep
  *		Deeply strip all PlaceHolderVars in an expression.
-
+ *
  * As a performance optimization, we first use a lightweight walker to check
  * for the presence of any PlaceHolderVars.  The expensive mutator is invoked
  * only if a PlaceHolderVar is found, avoiding unnecessary memory allocation
@@ -6804,7 +7143,6 @@ get_actual_variable_endpoint(Relation heapRel,
 {
 	bool		have_data = false;
 	SnapshotData SnapshotNonVacuumable;
-	Snapshot	snapshot;
 	IndexScanDesc index_scan;
 	Buffer		vmbuffer = InvalidBuffer;
 	BlockNumber last_heap_block = InvalidBlockNumber;
@@ -6860,23 +7198,11 @@ get_actual_variable_endpoint(Relation heapRel,
 	 */
 	InitNonVacuumableSnapshot(SnapshotNonVacuumable,
 							  GlobalVisTestFor(heapRel));
-	snapshot = &SnapshotNonVacuumable;
-
-	/*
-	 * An AM that establishes index-only visibility itself reads only MVCC
-	 * snapshots, and its index holds no dead entries to skip: probe it with
-	 * the snapshot the query is being planned under.
-	 */
-	if (heapRel->rd_tableam->index_only_visible)
-	{
-		if (!ActiveSnapshotSet())
-			return false;
-		snapshot = GetActiveSnapshot();
-	}
 
 	index_scan = index_beginscan(heapRel, indexRel,
-								 snapshot, NULL,
-								 1, 0);
+								 &SnapshotNonVacuumable, NULL,
+								 1, 0,
+								 SO_NONE);
 	/* Set it up for index-only scan */
 	index_scan->xs_want_itup = true;
 	index_rescan(index_scan, scankeys, 1, NULL, 0);
@@ -6886,8 +7212,7 @@ get_actual_variable_endpoint(Relation heapRel,
 	{
 		BlockNumber block = ItemPointerGetBlockNumber(tid);
 
-		if (!heapRel->rd_tableam->index_only_visible &&
-			!VM_ALL_VISIBLE(heapRel,
+		if (!VM_ALL_VISIBLE(heapRel,
 							block,
 							&vmbuffer))
 		{
@@ -6930,7 +7255,7 @@ get_actual_variable_endpoint(Relation heapRel,
 		 * We expect that the index will return data in IndexTuple not
 		 * HeapTuple format.
 		 */
-		if (!index_scan->xs_itup && !index_scan->xs_hitup)
+		if (!index_scan->xs_itup)
 			elog(ERROR, "no data returned for index-only scan");
 
 		/*
@@ -6939,15 +7264,10 @@ get_actual_variable_endpoint(Relation heapRel,
 		if (index_scan->xs_recheck)
 			break;
 
-		/* OK to deconstruct the index tuple, which an AM may return as a heap tuple */
-		if (index_scan->xs_itup)
-			index_deform_tuple(index_scan->xs_itup,
-							   index_scan->xs_itupdesc,
-							   values, isnull);
-		else
-			heap_deform_tuple(index_scan->xs_hitup,
-							  index_scan->xs_hitupdesc,
-							  values, isnull);
+		/* OK to deconstruct the index tuple */
+		index_deform_tuple(index_scan->xs_itup,
+						   index_scan->xs_itupdesc,
+						   values, isnull);
 
 		/* Shouldn't have got a null, but be careful */
 		if (isnull[0])
@@ -7092,6 +7412,11 @@ index_other_operands_eval_cost(PlannerInfo *root, List *indexquals)
 	return qual_arg_cost;
 }
 
+/*
+ * Compute generic index access cost estimates.
+ *
+ * See struct GenericCosts in selfuncs.h for more info.
+ */
 void
 genericcostestimate(PlannerInfo *root,
 					IndexPath *path,
@@ -7187,16 +7512,18 @@ genericcostestimate(PlannerInfo *root,
 	 * Estimate the number of index pages that will be retrieved.
 	 *
 	 * We use the simplistic method of taking a pro-rata fraction of the total
-	 * number of index pages.  In effect, this counts only leaf pages and not
-	 * any overhead such as index metapage or upper tree levels.
+	 * number of index leaf pages.  We disregard any overhead such as index
+	 * metapages or upper tree levels.
 	 *
 	 * In practice access to upper index levels is often nearly free because
 	 * those tend to stay in cache under load; moreover, the cost involved is
 	 * highly dependent on index type.  We therefore ignore such costs here
 	 * and leave it to the caller to add a suitable charge if needed.
 	 */
-	if (index->pages > 1 && index->tuples > 1)
-		numIndexPages = ceil(numIndexTuples * index->pages / index->tuples);
+	if (index->pages > costs->numNonLeafPages && index->tuples > 1)
+		numIndexPages =
+			ceil(numIndexTuples * (index->pages - costs->numNonLeafPages)
+				 / index->tuples);
 	else
 		numIndexPages = 1.0;
 
@@ -7787,9 +8114,18 @@ btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 
 	/*
 	 * Now do generic index cost estimation.
+	 *
+	 * While we expended effort to make realistic estimates of numIndexTuples
+	 * and num_sa_scans, we are content to count only the btree metapage as
+	 * non-leaf.  btree fanout is typically high enough that upper pages are
+	 * few relative to leaf pages, so accounting for them would move the
+	 * estimates at most a percent or two.  Given the uncertainty in just how
+	 * many upper pages exist in a particular index, we'll skip trying to
+	 * handle that.
 	 */
 	costs.numIndexTuples = numIndexTuples;
 	costs.num_sa_scans = num_sa_scans;
+	costs.numNonLeafPages = 1;
 
 	genericcostestimate(root, path, loop_count, &costs);
 
@@ -7854,6 +8190,9 @@ hashcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 {
 	GenericCosts costs = {0};
 
+	/* As in btcostestimate, count only the metapage as non-leaf */
+	costs.numNonLeafPages = 1;
+
 	genericcostestimate(root, path, loop_count, &costs);
 
 	/*
@@ -7897,6 +8236,8 @@ gistcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	IndexOptInfo *index = path->indexinfo;
 	GenericCosts costs = {0};
 	Cost		descentCost;
+
+	/* GiST has no metapage, so we treat all pages as leaf pages */
 
 	genericcostestimate(root, path, loop_count, &costs);
 
@@ -7952,6 +8293,9 @@ spgcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	IndexOptInfo *index = path->indexinfo;
 	GenericCosts costs = {0};
 	Cost		descentCost;
+
+	/* As in btcostestimate, count only the metapage as non-leaf */
+	costs.numNonLeafPages = 1;
 
 	genericcostestimate(root, path, loop_count, &costs);
 

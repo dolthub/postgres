@@ -4,7 +4,7 @@
  *	  BTree-specific page management code for the Postgres btree access
  *	  method.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -33,6 +33,7 @@
 #include "storage/indexfsm.h"
 #include "storage/predicate.h"
 #include "storage/procarray.h"
+#include "utils/injection_point.h"
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
@@ -234,6 +235,7 @@ _bt_set_cleanup_info(Relation rel, BlockNumber num_delpages)
 	Buffer		metabuf;
 	Page		metapg;
 	BTMetaPageData *metad;
+	XLogRecPtr	recptr;
 
 	/*
 	 * On-disk compatibility note: The btm_last_cleanup_num_delpages metapage
@@ -285,7 +287,6 @@ _bt_set_cleanup_info(Relation rel, BlockNumber num_delpages)
 	if (RelationNeedsWAL(rel))
 	{
 		xl_btree_metadata md;
-		XLogRecPtr	recptr;
 
 		XLogBeginInsert();
 		XLogRegisterBuffer(0, metabuf, REGBUF_WILL_INIT | REGBUF_STANDARD);
@@ -302,9 +303,11 @@ _bt_set_cleanup_info(Relation rel, BlockNumber num_delpages)
 		XLogRegisterBufData(0, &md, sizeof(xl_btree_metadata));
 
 		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_META_CLEANUP);
-
-		PageSetLSN(metapg, recptr);
 	}
+	else
+		recptr = XLogGetFakeLSN(rel);
+
+	PageSetLSN(metapg, recptr);
 
 	END_CRIT_SECTION();
 
@@ -350,6 +353,7 @@ _bt_getroot(Relation rel, Relation heaprel, int access)
 	BlockNumber rootblkno;
 	uint32		rootlevel;
 	BTMetaPageData *metad;
+	XLogRecPtr	recptr;
 
 	Assert(access == BT_READ || heaprel != NULL);
 
@@ -472,7 +476,6 @@ _bt_getroot(Relation rel, Relation heaprel, int access)
 		if (RelationNeedsWAL(rel))
 		{
 			xl_btree_newroot xlrec;
-			XLogRecPtr	recptr;
 			xl_btree_metadata md;
 
 			XLogBeginInsert();
@@ -496,10 +499,12 @@ _bt_getroot(Relation rel, Relation heaprel, int access)
 			XLogRegisterData(&xlrec, SizeOfBtreeNewroot);
 
 			recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_NEWROOT);
-
-			PageSetLSN(rootpage, recptr);
-			PageSetLSN(metapg, recptr);
 		}
+		else
+			recptr = XLogGetFakeLSN(rel);
+
+		PageSetLSN(rootpage, recptr);
+		PageSetLSN(metapg, recptr);
 
 		END_CRIT_SECTION();
 
@@ -1006,24 +1011,47 @@ _bt_relandgetbuf(Relation rel, Buffer obuf, BlockNumber blkno, int access)
 
 	Assert(BlockNumberIsValid(blkno));
 	if (BufferIsValid(obuf))
-		_bt_unlockbuf(rel, obuf);
-	buf = ReleaseAndReadBuffer(obuf, rel, blkno);
-	_bt_lockbuf(rel, buf, access);
+	{
+		if (BufferGetBlockNumber(obuf) == blkno)
+		{
+			/* trade in old lock mode for new lock */
+			_bt_unlockbuf(rel, obuf);
+			buf = obuf;
+		}
+		else
+		{
+			/* release lock and pin at once, that's a bit more efficient */
+			_bt_relbuf(rel, obuf);
+			buf = ReadBuffer(rel, blkno);
+		}
+	}
+	else
+		buf = ReadBuffer(rel, blkno);
 
+	_bt_lockbuf(rel, buf, access);
 	_bt_checkpage(rel, buf);
+
 	return buf;
 }
 
 /*
  *	_bt_relbuf() -- release a locked buffer.
  *
- * Lock and pin (refcount) are both dropped.
+ * Lock and pin (refcount) are both dropped. This is a bit more efficient than
+ * doing the two operations separately.
  */
 void
 _bt_relbuf(Relation rel, Buffer buf)
 {
-	_bt_unlockbuf(rel, buf);
-	ReleaseBuffer(buf);
+	/*
+	 * Buffer is pinned and locked, which means that it is expected to be
+	 * defined and addressable.  Check that proactively.
+	 */
+	VALGRIND_CHECK_MEM_IS_DEFINED(BufferGetPage(buf), BLCKSZ);
+	if (!RelationUsesLocalBuffers(rel))
+		VALGRIND_MAKE_MEM_NOACCESS(BufferGetPage(buf), BLCKSZ);
+
+	UnlockReleaseBuffer(buf);
 }
 
 /*
@@ -1161,6 +1189,7 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
 	char	   *updatedbuf = NULL;
 	Size		updatedbuflen = 0;
 	OffsetNumber updatedoffsets[MaxIndexTuplesPerPage];
+	XLogRecPtr	recptr;
 
 	/* Shouldn't be called unless there's something to do */
 	Assert(ndeletable > 0 || nupdatable > 0);
@@ -1194,8 +1223,7 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
 
 		itup = updatable[i]->itup;
 		itemsz = MAXALIGN(IndexTupleSize(itup));
-		if (!PageIndexTupleOverwrite(page, updatedoffset, (Item) itup,
-									 itemsz))
+		if (!PageIndexTupleOverwrite(page, updatedoffset, itup, itemsz))
 			elog(PANIC, "failed to update partially dead item in block %u of index \"%s\"",
 				 BufferGetBlockNumber(buf), RelationGetRelationName(rel));
 	}
@@ -1226,7 +1254,6 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
 	/* XLOG stuff */
 	if (needswal)
 	{
-		XLogRecPtr	recptr;
 		xl_btree_vacuum xlrec_vacuum;
 
 		xlrec_vacuum.ndeleted = ndeletable;
@@ -1248,9 +1275,11 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
 		}
 
 		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_VACUUM);
-
-		PageSetLSN(page, recptr);
 	}
+	else
+		recptr = XLogGetFakeLSN(rel);
+
+	PageSetLSN(page, recptr);
 
 	END_CRIT_SECTION();
 
@@ -1292,6 +1321,7 @@ _bt_delitems_delete(Relation rel, Buffer buf,
 	char	   *updatedbuf = NULL;
 	Size		updatedbuflen = 0;
 	OffsetNumber updatedoffsets[MaxIndexTuplesPerPage];
+	XLogRecPtr	recptr;
 
 	/* Shouldn't be called unless there's something to do */
 	Assert(ndeletable > 0 || nupdatable > 0);
@@ -1314,8 +1344,7 @@ _bt_delitems_delete(Relation rel, Buffer buf,
 
 		itup = updatable[i]->itup;
 		itemsz = MAXALIGN(IndexTupleSize(itup));
-		if (!PageIndexTupleOverwrite(page, updatedoffset, (Item) itup,
-									 itemsz))
+		if (!PageIndexTupleOverwrite(page, updatedoffset, itup, itemsz))
 			elog(PANIC, "failed to update partially dead item in block %u of index \"%s\"",
 				 BufferGetBlockNumber(buf), RelationGetRelationName(rel));
 	}
@@ -1343,7 +1372,6 @@ _bt_delitems_delete(Relation rel, Buffer buf,
 	/* XLOG stuff */
 	if (needswal)
 	{
-		XLogRecPtr	recptr;
 		xl_btree_delete xlrec_delete;
 
 		xlrec_delete.snapshotConflictHorizon = snapshotConflictHorizon;
@@ -1367,9 +1395,11 @@ _bt_delitems_delete(Relation rel, Buffer buf,
 		}
 
 		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_DELETE);
-
-		PageSetLSN(page, recptr);
 	}
+	else
+		recptr = XLogGetFakeLSN(rel);
+
+	PageSetLSN(page, recptr);
 
 	END_CRIT_SECTION();
 
@@ -1463,8 +1493,8 @@ _bt_delitems_update(BTVacuumPosting *updatable, int nupdatable,
 static int
 _bt_delitems_cmp(const void *a, const void *b)
 {
-	TM_IndexDelete *indexdelete1 = (TM_IndexDelete *) a;
-	TM_IndexDelete *indexdelete2 = (TM_IndexDelete *) b;
+	const TM_IndexDelete *indexdelete1 = a;
+	const TM_IndexDelete *indexdelete2 = b;
 
 	Assert(indexdelete1->id != indexdelete2->id);
 
@@ -1887,11 +1917,11 @@ _bt_pagedel(Relation rel, Buffer leafbuf, BTVacState *vstate)
 		 * left half of an incomplete split, but ensuring that it's not the
 		 * right half is more complicated.  For that, we have to check that
 		 * the left sibling doesn't have its INCOMPLETE_SPLIT flag set using
-		 * _bt_leftsib_splitflag().  On the first iteration, we temporarily
-		 * release the lock on scanblkno/leafbuf, check the left sibling, and
-		 * construct a search stack to scanblkno.  On subsequent iterations,
-		 * we know we stepped right from a page that passed these tests, so
-		 * it's OK.
+		 * _bt_leftsib_splitflag().  The first time we reach a page that isn't
+		 * already half-dead (usually the scanblkno page), we temporarily
+		 * release the lock on leafbuf, check the left sibling, and construct
+		 * a search stack to leafbuf.  On subsequent iterations, we know we
+		 * stepped right from a page that passed these tests, so it's OK.
 		 */
 		if (P_RIGHTMOST(opaque) || P_ISROOT(opaque) ||
 			P_FIRSTDATAKEY(opaque) <= PageGetMaxOffsetNumber(page) ||
@@ -1946,7 +1976,6 @@ _bt_pagedel(Relation rel, Buffer leafbuf, BTVacState *vstate)
 				 * Check that the left sibling of leafbuf (if any) is not
 				 * marked with INCOMPLETE_SPLIT flag before proceeding
 				 */
-				Assert(leafblkno == scanblkno);
 				if (_bt_leftsib_splitflag(rel, leftsib, leafblkno))
 				{
 					ReleaseBuffer(leafbuf);
@@ -1967,7 +1996,7 @@ _bt_pagedel(Relation rel, Buffer leafbuf, BTVacState *vstate)
 				/* Set up a BTLessStrategyNumber-like insertion scan key */
 				itup_key->nextkey = false;
 				itup_key->backward = true;
-				stack = _bt_search(rel, NULL, itup_key, &sleafbuf, BT_READ);
+				stack = _bt_search(rel, NULL, itup_key, &sleafbuf, BT_READ, true);
 				/* won't need a second lock or pin on leafbuf */
 				_bt_relbuf(rel, sleafbuf);
 
@@ -2004,6 +2033,10 @@ _bt_pagedel(Relation rel, Buffer leafbuf, BTVacState *vstate)
 				_bt_relbuf(rel, leafbuf);
 				return;
 			}
+		}
+		else
+		{
+			INJECTION_POINT("nbtree-finish-half-dead-page-vacuum", NULL);
 		}
 
 		/*
@@ -2100,6 +2133,7 @@ _bt_mark_page_halfdead(Relation rel, Relation heaprel, Buffer leafbuf,
 	OffsetNumber nextoffset;
 	IndexTuple	itup;
 	IndexTupleData trunctuple;
+	XLogRecPtr	recptr;
 
 	page = BufferGetPage(leafbuf);
 	opaque = BTPageGetOpaque(page);
@@ -2239,8 +2273,7 @@ _bt_mark_page_halfdead(Relation rel, Relation heaprel, Buffer leafbuf,
 	else
 		BTreeTupleSetTopParent(&trunctuple, InvalidBlockNumber);
 
-	if (!PageIndexTupleOverwrite(page, P_HIKEY, (Item) &trunctuple,
-								 IndexTupleSize(&trunctuple)))
+	if (!PageIndexTupleOverwrite(page, P_HIKEY, &trunctuple, IndexTupleSize(&trunctuple)))
 		elog(ERROR, "could not overwrite high key in half-dead page");
 
 	/* Must mark buffers dirty before XLogInsert */
@@ -2251,7 +2284,6 @@ _bt_mark_page_halfdead(Relation rel, Relation heaprel, Buffer leafbuf,
 	if (RelationNeedsWAL(rel))
 	{
 		xl_btree_mark_page_halfdead xlrec;
-		XLogRecPtr	recptr;
 
 		xlrec.poffset = poffset;
 		xlrec.leafblk = leafblkno;
@@ -2272,12 +2304,14 @@ _bt_mark_page_halfdead(Relation rel, Relation heaprel, Buffer leafbuf,
 		XLogRegisterData(&xlrec, SizeOfBtreeMarkPageHalfDead);
 
 		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_MARK_PAGE_HALFDEAD);
-
-		page = BufferGetPage(subtreeparent);
-		PageSetLSN(page, recptr);
-		page = BufferGetPage(leafbuf);
-		PageSetLSN(page, recptr);
 	}
+	else
+		recptr = XLogGetFakeLSN(rel);
+
+	page = BufferGetPage(subtreeparent);
+	PageSetLSN(page, recptr);
+	page = BufferGetPage(leafbuf);
+	PageSetLSN(page, recptr);
 
 	END_CRIT_SECTION();
 
@@ -2335,6 +2369,7 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, BlockNumber scanblkno,
 	uint32		targetlevel;
 	IndexTuple	leafhikey;
 	BlockNumber leaftopparent;
+	XLogRecPtr	recptr;
 
 	page = BufferGetPage(leafbuf);
 	opaque = BTPageGetOpaque(page);
@@ -2351,6 +2386,8 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, BlockNumber scanblkno,
 	leafrightsib = opaque->btpo_next;
 
 	_bt_unlockbuf(rel, leafbuf);
+
+	INJECTION_POINT("nbtree-leave-page-half-dead", NULL);
 
 	/*
 	 * Check here, as calling loops will have locks held, preventing
@@ -2398,7 +2435,15 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, BlockNumber scanblkno,
 	 * right.
 	 */
 	if (target != leafblkno)
+	{
 		_bt_lockbuf(rel, leafbuf, BT_WRITE);
+
+		/* Leaf page's left sibling may have split while we held no lock */
+		page = BufferGetPage(leafbuf);
+		opaque = BTPageGetOpaque(page);
+		leafleftsib = opaque->btpo_prev;
+		leafrightsib = opaque->btpo_next;
+	}
 	if (leftsib != P_NONE)
 	{
 		lbuf = _bt_getbuf(rel, leftsib, BT_WRITE);
@@ -2618,9 +2663,9 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, BlockNumber scanblkno,
 	 *
 	 * Note: We rely on the fact that a buffer pin on the leaf page has been
 	 * held since leafhikey was initialized.  This is safe, though only
-	 * because the page was already half-dead at that point.  The leaf page
-	 * cannot have been modified by any other backend during the period when
-	 * no lock was held.
+	 * because the page was already half-dead at that point.  The leaf page's
+	 * items cannot have been modified by any other backend during the period
+	 * when no lock was held.
 	 */
 	if (target != leafblkno)
 		BTreeTupleSetTopParent(leafhikey, leaftopparent);
@@ -2672,7 +2717,6 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, BlockNumber scanblkno,
 		xl_btree_unlink_page xlrec;
 		xl_btree_metadata xlmeta;
 		uint8		xlinfo;
-		XLogRecPtr	recptr;
 
 		XLogBeginInsert();
 
@@ -2716,25 +2760,25 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, BlockNumber scanblkno,
 			xlinfo = XLOG_BTREE_UNLINK_PAGE;
 
 		recptr = XLogInsert(RM_BTREE_ID, xlinfo);
+	}
+	else
+		recptr = XLogGetFakeLSN(rel);
 
-		if (BufferIsValid(metabuf))
-		{
-			PageSetLSN(metapg, recptr);
-		}
-		page = BufferGetPage(rbuf);
+	if (BufferIsValid(metabuf))
+		PageSetLSN(metapg, recptr);
+	page = BufferGetPage(rbuf);
+	PageSetLSN(page, recptr);
+	page = BufferGetPage(buf);
+	PageSetLSN(page, recptr);
+	if (BufferIsValid(lbuf))
+	{
+		page = BufferGetPage(lbuf);
 		PageSetLSN(page, recptr);
-		page = BufferGetPage(buf);
+	}
+	if (target != leafblkno)
+	{
+		page = BufferGetPage(leafbuf);
 		PageSetLSN(page, recptr);
-		if (BufferIsValid(lbuf))
-		{
-			page = BufferGetPage(lbuf);
-			PageSetLSN(page, recptr);
-		}
-		if (target != leafblkno)
-		{
-			page = BufferGetPage(leafbuf);
-			PageSetLSN(page, recptr);
-		}
 	}
 
 	END_CRIT_SECTION();
@@ -2978,7 +3022,7 @@ _bt_pendingfsm_init(Relation rel, BTVacState *vstate, bool cleanuponly)
 	vstate->maxbufsize = (int) maxbufsize;
 
 	/* Allocate buffer, indicate that there are currently 0 pending pages */
-	vstate->pendingpages = palloc(sizeof(BTPendingFSM) * vstate->bufsize);
+	vstate->pendingpages = palloc_array(BTPendingFSM, vstate->bufsize);
 	vstate->npendingpages = 0;
 }
 

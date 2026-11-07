@@ -3,7 +3,7 @@
  *	  functions related to auxiliary processes.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <signal.h>
 
+#include "access/xlog.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/auxprocess.h"
@@ -24,6 +25,7 @@
 #include "storage/procsignal.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
+#include "utils/wait_event.h"
 
 
 static void ShutdownAuxiliaryProcess(int code, Datum arg);
@@ -67,6 +69,14 @@ AuxiliaryProcessMainCommon(void)
 	BaseInit();
 
 	ProcSignalInit(NULL, 0);
+
+	/*
+	 * Initialize the process-local logical info WAL logging state.
+	 *
+	 * This must be called after ProcSignalInit() so that the process can
+	 * participate in procsignal-based barriers that update this state.
+	 */
+	InitializeProcessXLogLogicalInfo();
 
 	/*
 	 * Auxiliary processes don't run transactions, but they may need a

@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2025, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 test_decoding_sources = files(
   'test_decoding.c',
@@ -15,6 +15,31 @@ test_decoding = shared_module('test_decoding',
   kwargs: contrib_mod_args,
 )
 contrib_targets += test_decoding
+
+test_decoding_isolation = [
+  'mxact',
+  'delayed_startup',
+  'ondisk_startup',
+  'catalog_change_snapshot',
+  'concurrent_ddl_dml',
+  'oldest_xmin',
+  'snapshot_transfer',
+  'subxact_without_top',
+  'concurrent_stream',
+  'twophase_snapshot',
+  'skip_snapshot_restore',
+  'invalidation_distribution',
+  'parallel_session_origin',
+  'tuplecid_nested',
+  'tuplecid_restart',
+]
+
+# slot_creation_error terminates another backend, whose FATAL message can be
+# lost on Windows, making the test unstable there.
+# See https://postgr.es/m/088AB35D-0860-494A-A9CF-8B301543AA51@yandex-team.ru
+if host_system != 'windows'
+  test_decoding_isolation += 'slot_creation_error'
+endif
 
 tests += {
   'name': 'test_decoding',
@@ -34,6 +59,7 @@ tests += {
       'replorigin',
       'time',
       'messages',
+      'repack',
       'spill',
       'slot',
       'truncate',
@@ -50,21 +76,7 @@ tests += {
     'runningcheck': false,
   },
   'isolation': {
-    'specs': [
-      'mxact',
-      'delayed_startup',
-      'ondisk_startup',
-      'catalog_change_snapshot',
-      'concurrent_ddl_dml',
-      'oldest_xmin',
-      'snapshot_transfer',
-      'subxact_without_top',
-      'concurrent_stream',
-      'twophase_snapshot',
-      'slot_creation_error',
-      'skip_snapshot_restore',
-      'invalidation_distribution',
-    ],
+    'specs': test_decoding_isolation,
     'regress_args': [
       '--temp-config', files('logical.conf'),
     ],

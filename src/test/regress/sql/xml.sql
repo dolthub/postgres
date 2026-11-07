@@ -185,6 +185,13 @@ SELECT xml '<abc/>' IS NOT DOCUMENT;
 SELECT xml 'abc' IS NOT DOCUMENT;
 SELECT '<>' IS NOT DOCUMENT;
 
+-- Check that IS DOCUMENT is known immutable, so that we don't reach the
+-- incorrect xpath() call at plan time.
+SELECT CASE WHEN ('2019-12-16T00:00:00.000'::xml) IS DOCUMENT
+    THEN (xpath('/*/text()', '2019-12-16T00:00:00.000'::xml))[1]
+    ELSE '2019-12-16T00:00:00.000'::xml
+END;
+
 
 SELECT xmlagg(data) FROM xmltest;
 SELECT xmlagg(data) FROM xmltest WHERE id > 10;
@@ -280,9 +287,7 @@ BEGIN
   END IF;
 EXCEPTION
   -- character with byte sequence 0xc2 0xb0 in encoding "UTF8" has no equivalent in encoding "LATIN8"
-  WHEN untranslatable_character
-  -- default conversion function for encoding "UTF8" to "MULE_INTERNAL" does not exist
-  OR undefined_function
+  WHEN undefined_function
   -- unsupported XML feature
   OR feature_not_supported THEN
     RAISE LOG 'skip: %', SQLERRM;

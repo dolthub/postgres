@@ -47,7 +47,7 @@
  * if the old one gets invalidated.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -56,9 +56,6 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "catalog/catalogview.h"
-#include "access/doltcatalog.h"
-#include "catalog/pg_dolt_ref.h"
 
 #include <limits.h>
 
@@ -113,9 +110,12 @@ static void ScanQueryForLocks(Query *parsetree, bool acquire);
 static bool ScanQueryWalker(Node *node, bool *acquire);
 static TupleDesc PlanCacheComputeResultDesc(List *stmt_list);
 static void PlanCacheRelCallback(Datum arg, Oid relid);
-static void PlanCacheObjectCallback(Datum arg, int cacheid, uint32 hashvalue);
-static void PlanCacheRoleCallback(Datum arg, int cacheid, uint32 hashvalue);
-static void PlanCacheSysCallback(Datum arg, int cacheid, uint32 hashvalue);
+static void PlanCacheObjectCallback(Datum arg, SysCacheIdentifier cacheid,
+									uint32 hashvalue);
+static void PlanCacheRoleCallback(Datum arg, SysCacheIdentifier cacheid,
+								  uint32 hashvalue);
+static void PlanCacheSysCallback(Datum arg, SysCacheIdentifier cacheid,
+								 uint32 hashvalue);
 
 /* ResourceOwner callbacks to track plancache references */
 static void ResOwnerReleaseCachedPlan(Datum res);
@@ -191,7 +191,7 @@ InitPlanCache(void)
  * commandTag: command tag for query, or UNKNOWN if empty query
  */
 CachedPlanSource *
-CreateCachedPlan(RawStmt *raw_parse_tree,
+CreateCachedPlan(const RawStmt *raw_parse_tree,
 				 const char *query_string,
 				 CommandTag commandTag)
 {
@@ -218,7 +218,7 @@ CreateCachedPlan(RawStmt *raw_parse_tree,
 	 */
 	oldcxt = MemoryContextSwitchTo(source_context);
 
-	plansource = (CachedPlanSource *) palloc0(sizeof(CachedPlanSource));
+	plansource = palloc0_object(CachedPlanSource);
 	plansource->magic = CACHEDPLANSOURCE_MAGIC;
 	plansource->raw_parse_tree = copyObject(raw_parse_tree);
 	plansource->analyzed_parse_tree = NULL;
@@ -238,7 +238,6 @@ CreateCachedPlan(RawStmt *raw_parse_tree,
 	plansource->query_list = NIL;
 	plansource->relationOids = NIL;
 	plansource->invalItems = NIL;
-	plansource->doltRefs = NIL;
 	plansource->search_path = NULL;
 	plansource->query_context = NULL;
 	plansource->rewriteRoleId = InvalidOid;
@@ -319,7 +318,7 @@ CreateOneShotCachedPlan(RawStmt *raw_parse_tree,
 	 * Create and fill the CachedPlanSource struct within the caller's memory
 	 * context.  Most fields are just left empty for the moment.
 	 */
-	plansource = (CachedPlanSource *) palloc0(sizeof(CachedPlanSource));
+	plansource = palloc0_object(CachedPlanSource);
 	plansource->magic = CACHEDPLANSOURCE_MAGIC;
 	plansource->raw_parse_tree = raw_parse_tree;
 	plansource->analyzed_parse_tree = NULL;
@@ -338,7 +337,6 @@ CreateOneShotCachedPlan(RawStmt *raw_parse_tree,
 	plansource->query_list = NIL;
 	plansource->relationOids = NIL;
 	plansource->invalItems = NIL;
-	plansource->doltRefs = NIL;
 	plansource->search_path = NULL;
 	plansource->query_context = NULL;
 	plansource->rewriteRoleId = InvalidOid;
@@ -458,7 +456,6 @@ CompleteCachedPlan(CachedPlanSource *plansource,
 		extract_query_dependencies((Node *) querytree_list,
 								   &plansource->relationOids,
 								   &plansource->invalItems,
-								   &plansource->doltRefs,
 								   &plansource->dependsOnRLS);
 
 		/* Update RLS info as well. */
@@ -477,14 +474,13 @@ CompleteCachedPlan(CachedPlanSource *plansource,
 
 	/*
 	 * Save the final parameter types (or other parameter specification data)
-	 * into the source_context, as well as our other parameters.  Also save
-	 * the result tuple descriptor.
+	 * into the source_context, as well as our other parameters.
 	 */
 	MemoryContextSwitchTo(source_context);
 
 	if (num_params > 0)
 	{
-		plansource->param_types = (Oid *) palloc(num_params * sizeof(Oid));
+		plansource->param_types = palloc_array(Oid, num_params);
 		memcpy(plansource->param_types, param_types, num_params * sizeof(Oid));
 	}
 	else
@@ -494,9 +490,25 @@ CompleteCachedPlan(CachedPlanSource *plansource,
 	plansource->parserSetupArg = parserSetupArg;
 	plansource->cursor_options = cursor_options;
 	plansource->fixed_result = fixed_result;
-	plansource->resultDesc = PlanCacheComputeResultDesc(querytree_list);
 
+	/*
+	 * Also save the result tuple descriptor.  PlanCacheComputeResultDesc may
+	 * leak some cruft; normally we just accept that to save a copy step, but
+	 * in USE_VALGRIND mode be tidy by running it in the caller's context.
+	 */
+#ifdef USE_VALGRIND
 	MemoryContextSwitchTo(oldcxt);
+	plansource->resultDesc = PlanCacheComputeResultDesc(querytree_list);
+	if (plansource->resultDesc)
+	{
+		MemoryContextSwitchTo(source_context);
+		plansource->resultDesc = CreateTupleDescCopy(plansource->resultDesc);
+		MemoryContextSwitchTo(oldcxt);
+	}
+#else
+	plansource->resultDesc = PlanCacheComputeResultDesc(querytree_list);
+	MemoryContextSwitchTo(oldcxt);
+#endif
 
 	plansource->is_complete = true;
 	plansource->is_valid = true;
@@ -702,20 +714,6 @@ RevalidateCachedQuery(CachedPlanSource *plansource,
 	}
 
 	/*
-	 * Versioned bindings depend on refs and local storage mappings that
-	 * relcache invalidation does not fully cover, and a plan rebuilt under an
-	 * older snapshot must not outlive it: compare what the query bound with
-	 * what the same names bind now, and rebind on any difference.
-	 */
-	if (plansource->is_valid && plansource->doltRefs != NIL &&
-		!dg_catalog_refs_current(plansource->doltRefs))
-	{
-		plansource->is_valid = false;
-		if (plansource->gplan)
-			plansource->gplan->is_valid = false;
-	}
-
-	/*
 	 * If the query is currently valid, we should have a saved search_path ---
 	 * check to see if that matches the current environment.  If not, we want
 	 * to force replan.  (We could almost ignore this consideration when
@@ -776,7 +774,6 @@ RevalidateCachedQuery(CachedPlanSource *plansource,
 	plansource->query_list = NIL;
 	plansource->relationOids = NIL;
 	plansource->invalItems = NIL;
-	plansource->doltRefs = NIL;
 	plansource->search_path = NULL;
 
 	/*
@@ -915,7 +912,6 @@ RevalidateCachedQuery(CachedPlanSource *plansource,
 	extract_query_dependencies((Node *) qlist,
 							   &plansource->relationOids,
 							   &plansource->invalItems,
-							   &plansource->doltRefs,
 							   &plansource->dependsOnRLS);
 
 	/* Update RLS info as well. */
@@ -1134,7 +1130,7 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 	/*
 	 * Create and fill the CachedPlan struct within the new context.
 	 */
-	plan = (CachedPlan *) palloc(sizeof(CachedPlan));
+	plan = palloc_object(CachedPlan);
 	plan->magic = CACHEDPLAN_MAGIC;
 	plan->stmt_list = plist;
 
@@ -1313,6 +1309,7 @@ GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 	CachedPlan *plan = NULL;
 	List	   *qlist;
 	bool		customplan;
+	ListCell   *lc;
 
 	/* Assert caller is doing things in a sane order */
 	Assert(plansource->magic == CACHEDPLANSOURCE_MAGIC);
@@ -1413,6 +1410,13 @@ GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 	{
 		MemoryContextSetParent(plan->context, CacheMemoryContext);
 		plan->is_saved = true;
+	}
+
+	foreach(lc, plan->stmt_list)
+	{
+		PlannedStmt *pstmt = (PlannedStmt *) lfirst(lc);
+
+		pstmt->planOrigin = customplan ? PLAN_STMT_CACHE_CUSTOM : PLAN_STMT_CACHE_GENERIC;
 	}
 
 	return plan;
@@ -1698,7 +1702,7 @@ CopyCachedPlan(CachedPlanSource *plansource)
 
 	oldcxt = MemoryContextSwitchTo(source_context);
 
-	newsource = (CachedPlanSource *) palloc0(sizeof(CachedPlanSource));
+	newsource = palloc0_object(CachedPlanSource);
 	newsource->magic = CACHEDPLANSOURCE_MAGIC;
 	newsource->raw_parse_tree = copyObject(plansource->raw_parse_tree);
 	newsource->analyzed_parse_tree = copyObject(plansource->analyzed_parse_tree);
@@ -1707,8 +1711,7 @@ CopyCachedPlan(CachedPlanSource *plansource)
 	newsource->commandTag = plansource->commandTag;
 	if (plansource->num_params > 0)
 	{
-		newsource->param_types = (Oid *)
-			palloc(plansource->num_params * sizeof(Oid));
+		newsource->param_types = palloc_array(Oid, plansource->num_params);
 		memcpy(newsource->param_types, plansource->param_types,
 			   plansource->num_params * sizeof(Oid));
 	}
@@ -1734,7 +1737,6 @@ CopyCachedPlan(CachedPlanSource *plansource)
 	newsource->query_list = copyObject(plansource->query_list);
 	newsource->relationOids = copyObject(plansource->relationOids);
 	newsource->invalItems = copyObject(plansource->invalItems);
-	newsource->doltRefs = copyObject(plansource->doltRefs);
 	if (plansource->search_path)
 		newsource->search_path = CopySearchPathMatcher(plansource->search_path);
 	newsource->query_context = querytree_context;
@@ -1848,7 +1850,7 @@ GetCachedExpression(Node *expr)
 
 	oldcxt = MemoryContextSwitchTo(cexpr_context);
 
-	cexpr = (CachedExpression *) palloc(sizeof(CachedExpression));
+	cexpr = palloc_object(CachedExpression);
 	cexpr->magic = CACHEDEXPR_MAGIC;
 	cexpr->expr = copyObject(expr);
 	cexpr->is_valid = true;
@@ -1948,9 +1950,6 @@ AcquireExecutorLocks(List *stmt_list, bool acquire)
 				  (rte->rtekind == RTE_SUBQUERY && OidIsValid(rte->relid))))
 				continue;
 
-			if (CatalogViewIsLeased(rte->relid))
-				continue;
-
 			/*
 			 * Acquire the appropriate type of lock on each relation OID. Note
 			 * that we don't actually try to open the rel, and hence will not
@@ -2016,8 +2015,6 @@ ScanQueryForLocks(Query *parsetree, bool acquire)
 		switch (rte->rtekind)
 		{
 			case RTE_RELATION:
-				if (CatalogViewIsLeased(rte->relid))
-					break;
 				/* Acquire or release the appropriate type of lock */
 				if (acquire)
 					LockRelationOid(rte->relid, rte->rellockmode);
@@ -2215,7 +2212,7 @@ PlanCacheRelCallback(Datum arg, Oid relid)
  * or all plans mentioning any member of this cache if hashvalue == 0.
  */
 static void
-PlanCacheObjectCallback(Datum arg, int cacheid, uint32 hashvalue)
+PlanCacheObjectCallback(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 {
 	dlist_iter	iter;
 
@@ -2328,7 +2325,7 @@ PlanCacheObjectCallback(Datum arg, int cacheid, uint32 hashvalue)
  * can ignore changes to other databases' pg_database rows.
  */
 static void
-PlanCacheRoleCallback(Datum arg, int cacheid, uint32 hashvalue)
+PlanCacheRoleCallback(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 {
 	dlist_iter	iter;
 
@@ -2374,7 +2371,7 @@ PlanCacheRoleCallback(Datum arg, int cacheid, uint32 hashvalue)
  * Just invalidate everything...
  */
 static void
-PlanCacheSysCallback(Datum arg, int cacheid, uint32 hashvalue)
+PlanCacheSysCallback(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 {
 	ResetPlanCache();
 }

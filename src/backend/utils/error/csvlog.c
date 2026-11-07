@@ -3,7 +3,7 @@
  * csvlog.c
  *	  CSV logging
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -253,7 +253,7 @@ write_csvlog(ErrorData *edata)
 	appendStringInfoChar(&buf, '\n');
 
 	/* If in the syslogger process, try to write messages direct to file */
-	if (MyBackendType == B_LOGGER)
+	if (syslogger_setup_done)
 		write_syslogger_file(buf.data, buf.len, LOG_DESTINATION_CSVLOG);
 	else
 		write_pipe_chunks(buf.data, buf.len, LOG_DESTINATION_CSVLOG);

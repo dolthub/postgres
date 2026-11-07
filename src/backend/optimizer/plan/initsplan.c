@@ -3,7 +3,7 @@
  * initsplan.c
  *	  Target list, group by, qualification, joininfo initialization routines
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,6 +14,8 @@
  */
 #include "postgres.h"
 
+#include "access/nbtree.h"
+#include "access/sysattr.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_type.h"
 #include "nodes/makefuncs.h"
@@ -27,7 +29,6 @@
 #include "optimizer/paths.h"
 #include "optimizer/placeholder.h"
 #include "optimizer/planmain.h"
-#include "optimizer/planner.h"
 #include "optimizer/restrictinfo.h"
 #include "parser/analyze.h"
 #include "rewrite/rewriteManip.h"
@@ -93,6 +94,12 @@ typedef struct GroupByColInfo
 } GroupByColInfo;
 
 
+static bool is_partial_agg_memory_risky(PlannerInfo *root);
+static void create_agg_clause_infos(PlannerInfo *root);
+static void create_grouping_expr_infos(PlannerInfo *root);
+static EquivalenceClass *get_eclass_for_sortgroupclause(PlannerInfo *root,
+														SortGroupClause *sgc,
+														Expr *expr);
 static void extract_lateral_references(PlannerInfo *root, RelOptInfo *brel,
 									   Index rtindex);
 static List *deconstruct_recurse(PlannerInfo *root, Node *jtnode,
@@ -138,7 +145,6 @@ static void distribute_qual_to_rels(PlannerInfo *root, Node *clause,
 									bool has_clone,
 									bool is_clone,
 									List **postponed_oj_qual_list);
-static bool check_redundant_nullability_qual(PlannerInfo *root, Node *clause);
 static Relids get_join_domain_min_rels(PlannerInfo *root, Relids domain_relids);
 static void check_mergejoinable(RestrictInfo *restrictinfo);
 static void check_hashjoinable(RestrictInfo *restrictinfo);
@@ -287,8 +293,6 @@ build_base_rel_tlists(PlannerInfo *root, List *final_tlist)
  *	  have a single owning relation; we keep their attr_needed info in
  *	  root->placeholder_list instead.  Find or create the associated
  *	  PlaceHolderInfo entry, and update its ph_needed.
- *
- *	  See also add_vars_to_attr_needed.
  */
 void
 add_vars_to_targetlist(PlannerInfo *root, List *vars,
@@ -326,63 +330,6 @@ add_vars_to_targetlist(PlannerInfo *root, List *vars,
 				rel->reltarget->exprs = lappend(rel->reltarget->exprs, var);
 				/* reltarget cost and width will be computed later */
 			}
-			rel->attr_needed[attno] = bms_add_members(rel->attr_needed[attno],
-													  where_needed);
-		}
-		else if (IsA(node, PlaceHolderVar))
-		{
-			PlaceHolderVar *phv = (PlaceHolderVar *) node;
-			PlaceHolderInfo *phinfo = find_placeholder_info(root, phv);
-
-			phinfo->ph_needed = bms_add_members(phinfo->ph_needed,
-												where_needed);
-		}
-		else
-			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(node));
-	}
-}
-
-/*
- * add_vars_to_attr_needed
- *	  This does a subset of what add_vars_to_targetlist does: it just
- *	  updates attr_needed for Vars and ph_needed for PlaceHolderVars.
- *	  We assume the Vars are already in their relations' targetlists.
- *
- *	  This is used to rebuild attr_needed/ph_needed sets after removal
- *	  of a useless outer join.  The removed join clause might have been
- *	  the only upper-level use of some other relation's Var, in which
- *	  case we can reduce that Var's attr_needed and thereby possibly
- *	  open the door to further join removals.  But we can't tell that
- *	  without tedious reconstruction of the attr_needed data.
- *
- *	  Note that if a Var's attr_needed is successfully reduced to empty,
- *	  it will still be in the relation's targetlist even though we do
- *	  not really need the scan plan node to emit it.  The extra plan
- *	  inefficiency seems tiny enough to not be worth spending planner
- *	  cycles to get rid of it.
- */
-void
-add_vars_to_attr_needed(PlannerInfo *root, List *vars,
-						Relids where_needed)
-{
-	ListCell   *temp;
-
-	Assert(!bms_is_empty(where_needed));
-
-	foreach(temp, vars)
-	{
-		Node	   *node = (Node *) lfirst(temp);
-
-		if (IsA(node, Var))
-		{
-			Var		   *var = (Var *) node;
-			RelOptInfo *rel = find_base_rel(root, var->varno);
-			int			attno = var->varattno;
-
-			if (bms_is_subset(where_needed, rel->relids))
-				continue;
-			Assert(attno >= rel->min_attr && attno <= rel->max_attr);
-			attno -= rel->min_attr;
 			rel->attr_needed[attno] = bms_add_members(rel->attr_needed[attno],
 													  where_needed);
 		}
@@ -448,8 +395,7 @@ remove_useless_groupby_columns(PlannerInfo *root)
 	 * index's notion of equality agrees with at least one GROUP BY item per
 	 * index column.
 	 */
-	groupbyattnos = (Bitmapset **) palloc0(sizeof(Bitmapset *) *
-										   (list_length(parse->rtable) + 1));
+	groupbyattnos = palloc0_array(Bitmapset *, list_length(parse->rtable) + 1);
 	groupbycols = palloc0_array(List *, list_length(parse->rtable) + 1);
 	foreach(lc, root->processed_groupClause)
 	{
@@ -641,8 +587,7 @@ remove_useless_groupby_columns(PlannerInfo *root)
 			 * allocate the surplusvars[] array until we find something.
 			 */
 			if (surplusvars == NULL)
-				surplusvars = (Bitmapset **) palloc0(sizeof(Bitmapset *) *
-													 (list_length(parse->rtable) + 1));
+				surplusvars = palloc0_array(Bitmapset *, list_length(parse->rtable) + 1);
 
 			/* Remember the attnos of the removable columns */
 			surplusvars[relid] = bms_difference(relattnos, best_keycolumns);
@@ -677,6 +622,387 @@ remove_useless_groupby_columns(PlannerInfo *root)
 
 		root->processed_groupClause = new_groupby;
 	}
+}
+
+/*
+ * setup_eager_aggregation
+ *	  Check if eager aggregation is applicable, and if so collect suitable
+ *	  aggregate expressions and grouping expressions in the query.
+ */
+void
+setup_eager_aggregation(PlannerInfo *root)
+{
+	/*
+	 * Don't apply eager aggregation if disabled by user.
+	 */
+	if (!enable_eager_aggregate)
+		return;
+
+	/*
+	 * Don't apply eager aggregation if there are no available GROUP BY
+	 * clauses.
+	 */
+	if (!root->processed_groupClause)
+		return;
+
+	/*
+	 * For now we don't try to support grouping sets.
+	 */
+	if (root->parse->groupingSets)
+		return;
+
+	/*
+	 * For now we don't try to support DISTINCT or ORDER BY aggregates.
+	 */
+	if (root->numOrderedAggs > 0)
+		return;
+
+	/*
+	 * If there are any aggregates that do not support partial mode, or any
+	 * partial aggregates that are non-serializable, do not apply eager
+	 * aggregation.
+	 */
+	if (root->hasNonPartialAggs || root->hasNonSerialAggs)
+		return;
+
+	/*
+	 * We don't try to apply eager aggregation if there are set-returning
+	 * functions in targetlist.
+	 */
+	if (root->parse->hasTargetSRFs)
+		return;
+
+	/*
+	 * Eager aggregation only makes sense if there are multiple base rels in
+	 * the query.
+	 */
+	if (bms_membership(root->all_baserels) != BMS_MULTIPLE)
+		return;
+
+	/*
+	 * Don't apply eager aggregation if any aggregate poses a risk of
+	 * excessive memory usage during partial aggregation.
+	 */
+	if (is_partial_agg_memory_risky(root))
+		return;
+
+	/*
+	 * Collect aggregate expressions and plain Vars that appear in the
+	 * targetlist and havingQual.
+	 */
+	create_agg_clause_infos(root);
+
+	/*
+	 * If there are no suitable aggregate expressions, we cannot apply eager
+	 * aggregation.
+	 */
+	if (root->agg_clause_list == NIL)
+		return;
+
+	/*
+	 * Collect grouping expressions that appear in grouping clauses.
+	 */
+	create_grouping_expr_infos(root);
+}
+
+/*
+ * is_partial_agg_memory_risky
+ *	  Check if any aggregate poses a risk of excessive memory usage during
+ *	  partial aggregation.
+ *
+ * We check if any aggregate has a negative aggtransspace value, which
+ * indicates that its transition state data can grow unboundedly in size.
+ * Applying eager aggregation in such cases risks high memory usage since
+ * partial aggregation results might be stored in join hash tables or
+ * materialized nodes.
+ */
+static bool
+is_partial_agg_memory_risky(PlannerInfo *root)
+{
+	ListCell   *lc;
+
+	foreach(lc, root->aggtransinfos)
+	{
+		AggTransInfo *transinfo = lfirst_node(AggTransInfo, lc);
+
+		if (transinfo->aggtransspace < 0)
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * create_agg_clause_infos
+ *	  Search the targetlist and havingQual for Aggrefs and plain Vars, and
+ *	  create an AggClauseInfo for each Aggref node.
+ */
+static void
+create_agg_clause_infos(PlannerInfo *root)
+{
+	List	   *tlist_exprs;
+	List	   *agg_clause_list = NIL;
+	List	   *tlist_vars = NIL;
+	Relids		aggregate_relids = NULL;
+	bool		eager_agg_applicable = true;
+	ListCell   *lc;
+
+	Assert(root->agg_clause_list == NIL);
+	Assert(root->tlist_vars == NIL);
+
+	tlist_exprs = pull_var_clause((Node *) root->processed_tlist,
+								  PVC_INCLUDE_AGGREGATES |
+								  PVC_RECURSE_WINDOWFUNCS |
+								  PVC_RECURSE_PLACEHOLDERS);
+
+	/*
+	 * Aggregates within the HAVING clause need to be processed in the same
+	 * way as those in the targetlist.  Note that HAVING can contain Aggrefs
+	 * but not WindowFuncs.
+	 */
+	if (root->parse->havingQual != NULL)
+	{
+		List	   *having_exprs;
+
+		having_exprs = pull_var_clause((Node *) root->parse->havingQual,
+									   PVC_INCLUDE_AGGREGATES |
+									   PVC_RECURSE_PLACEHOLDERS);
+		if (having_exprs != NIL)
+		{
+			tlist_exprs = list_concat(tlist_exprs, having_exprs);
+			list_free(having_exprs);
+		}
+	}
+
+	foreach(lc, tlist_exprs)
+	{
+		Expr	   *expr = (Expr *) lfirst(lc);
+		Aggref	   *aggref;
+		Relids		agg_eval_at;
+		AggClauseInfo *ac_info;
+
+		/* For now we don't try to support GROUPING() expressions */
+		if (IsA(expr, GroupingFunc))
+		{
+			eager_agg_applicable = false;
+			break;
+		}
+
+		/* Collect plain Vars for future reference */
+		if (IsA(expr, Var))
+		{
+			tlist_vars = list_append_unique(tlist_vars, expr);
+			continue;
+		}
+
+		aggref = castNode(Aggref, expr);
+
+		Assert(aggref->aggorder == NIL);
+		Assert(aggref->aggdistinct == NIL);
+
+		/*
+		 * We cannot push down aggregates that contain volatile functions.
+		 * Doing so would change the number of times the function is
+		 * evaluated.
+		 */
+		if (contain_volatile_functions((Node *) aggref))
+		{
+			eager_agg_applicable = false;
+			break;
+		}
+
+		/*
+		 * If there are any securityQuals, do not try to apply eager
+		 * aggregation if any non-leakproof aggregate functions are present.
+		 * This is overly strict, but for now...
+		 */
+		if (root->qual_security_level > 0 &&
+			!get_func_leakproof(aggref->aggfnoid))
+		{
+			eager_agg_applicable = false;
+			break;
+		}
+
+		agg_eval_at = pull_varnos(root, (Node *) aggref);
+
+		/*
+		 * If all base relations in the query are referenced by aggregate
+		 * functions, then eager aggregation is not applicable.
+		 */
+		aggregate_relids = bms_add_members(aggregate_relids, agg_eval_at);
+		if (bms_is_subset(root->all_baserels, aggregate_relids))
+		{
+			eager_agg_applicable = false;
+			break;
+		}
+
+		/* OK, create the AggClauseInfo node */
+		ac_info = makeNode(AggClauseInfo);
+		ac_info->aggref = aggref;
+		ac_info->agg_eval_at = agg_eval_at;
+
+		/* ... and add it to the list */
+		agg_clause_list = list_append_unique(agg_clause_list, ac_info);
+	}
+
+	list_free(tlist_exprs);
+
+	if (eager_agg_applicable)
+	{
+		root->agg_clause_list = agg_clause_list;
+		root->tlist_vars = tlist_vars;
+	}
+	else
+	{
+		list_free_deep(agg_clause_list);
+		list_free(tlist_vars);
+	}
+}
+
+/*
+ * create_grouping_expr_infos
+ *	  Create a GroupingExprInfo for each expression usable as grouping key.
+ *
+ * If any grouping expression is not suitable, we will just return with
+ * root->group_expr_list being NIL.
+ */
+static void
+create_grouping_expr_infos(PlannerInfo *root)
+{
+	List	   *exprs = NIL;
+	List	   *sortgrouprefs = NIL;
+	List	   *ecs = NIL;
+	ListCell   *lc,
+			   *lc1,
+			   *lc2,
+			   *lc3;
+
+	Assert(root->group_expr_list == NIL);
+
+	foreach(lc, root->processed_groupClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry *tle = get_sortgroupclause_tle(sgc, root->processed_tlist);
+		TypeCacheEntry *tce;
+		Oid			equalimageproc;
+
+		Assert(tle->ressortgroupref > 0);
+
+		/*
+		 * For now we only support plain Vars as grouping expressions.
+		 */
+		if (!IsA(tle->expr, Var))
+			return;
+
+		/*
+		 * Eager aggregation is only possible if equality implies image
+		 * equality for each grouping key.  Otherwise, placing keys with
+		 * different byte images into the same group may result in the loss of
+		 * information that could be necessary to evaluate upper qual clauses.
+		 *
+		 * For instance, the NUMERIC data type is not supported, as values
+		 * that are considered equal by the equality operator (e.g., 0 and
+		 * 0.0) can have different scales.
+		 */
+		tce = lookup_type_cache(exprType((Node *) tle->expr),
+								TYPECACHE_BTREE_OPFAMILY);
+		if (!OidIsValid(tce->btree_opf) ||
+			!OidIsValid(tce->btree_opintype))
+			return;
+
+		equalimageproc = get_opfamily_proc(tce->btree_opf,
+										   tce->btree_opintype,
+										   tce->btree_opintype,
+										   BTEQUALIMAGE_PROC);
+
+		/*
+		 * If there is no BTEQUALIMAGE_PROC, eager aggregation is assumed to
+		 * be unsafe.  Otherwise, we call the procedure to check.  We must be
+		 * careful to pass the expression's actual collation, rather than the
+		 * data type's default collation, to ensure that non-deterministic
+		 * collations are correctly handled.
+		 */
+		if (!OidIsValid(equalimageproc) ||
+			!DatumGetBool(OidFunctionCall1Coll(equalimageproc,
+											   exprCollation((Node *) tle->expr),
+											   ObjectIdGetDatum(tce->btree_opintype))))
+			return;
+
+		exprs = lappend(exprs, tle->expr);
+		sortgrouprefs = lappend_int(sortgrouprefs, tle->ressortgroupref);
+		ecs = lappend(ecs, get_eclass_for_sortgroupclause(root, sgc, tle->expr));
+	}
+
+	/*
+	 * Construct a GroupingExprInfo for each expression.
+	 */
+	forthree(lc1, exprs, lc2, sortgrouprefs, lc3, ecs)
+	{
+		Expr	   *expr = (Expr *) lfirst(lc1);
+		int			sortgroupref = lfirst_int(lc2);
+		EquivalenceClass *ec = (EquivalenceClass *) lfirst(lc3);
+		GroupingExprInfo *ge_info;
+
+		ge_info = makeNode(GroupingExprInfo);
+		ge_info->expr = (Expr *) copyObject(expr);
+		ge_info->sortgroupref = sortgroupref;
+		ge_info->ec = ec;
+
+		root->group_expr_list = lappend(root->group_expr_list, ge_info);
+	}
+}
+
+/*
+ * get_eclass_for_sortgroupclause
+ *	  Given a group clause and an expression, find an existing equivalence
+ *	  class that the expression is a member of; return NULL if none.
+ */
+static EquivalenceClass *
+get_eclass_for_sortgroupclause(PlannerInfo *root, SortGroupClause *sgc,
+							   Expr *expr)
+{
+	Oid			opfamily,
+				opcintype,
+				collation;
+	CompareType cmptype;
+	Oid			equality_op;
+	List	   *opfamilies;
+
+	/* Punt if the group clause is not sortable */
+	if (!OidIsValid(sgc->sortop))
+		return NULL;
+
+	/* Find the operator in pg_amop --- failure shouldn't happen */
+	if (!get_ordering_op_properties(sgc->sortop,
+									&opfamily, &opcintype, &cmptype))
+		elog(ERROR, "operator %u is not a valid ordering operator",
+			 sgc->sortop);
+
+	/* Because SortGroupClause doesn't carry collation, consult the expr */
+	collation = exprCollation((Node *) expr);
+
+	/*
+	 * EquivalenceClasses need to contain opfamily lists based on the family
+	 * membership of mergejoinable equality operators, which could belong to
+	 * more than one opfamily.  So we have to look up the opfamily's equality
+	 * operator and get its membership.
+	 */
+	equality_op = get_opfamily_member_for_cmptype(opfamily,
+												  opcintype,
+												  opcintype,
+												  COMPARE_EQ);
+	if (!OidIsValid(equality_op))	/* shouldn't happen */
+		elog(ERROR, "missing operator %d(%u,%u) in opfamily %u",
+			 COMPARE_EQ, opcintype, opcintype, opfamily);
+	opfamilies = get_mergejoin_opfamilies(equality_op);
+	if (!opfamilies)			/* certainly should find some */
+		elog(ERROR, "could not find opfamilies for equality operator %u",
+			 equality_op);
+
+	/* Now find a matching EquivalenceClass */
+	return get_eclass_for_sort_expr(root, expr, opfamilies, opcintype,
+									collation, sgc->tleSortGroupRef,
+									NULL, false);
 }
 
 /*****************************************************************************
@@ -805,17 +1131,13 @@ extract_lateral_references(PlannerInfo *root, RelOptInfo *brel, Index rtindex)
 			PlaceHolderVar *phv = (PlaceHolderVar *) node;
 			int			levelsup = phv->phlevelsup;
 
-			/* Have to work harder to adjust the contained expression too */
+			/*
+			 * Have to work harder to adjust the contained expression too.
+			 * (Its expression has already been preprocessed by
+			 * subquery_planner(), so we must not do that again here.)
+			 */
 			if (levelsup != 0)
 				IncrementVarSublevelsUp(node, -levelsup, 0);
-
-			/*
-			 * If we pulled the PHV out of a subquery RTE, its expression
-			 * needs to be preprocessed.  subquery_planner() already did this
-			 * for level-zero PHVs in function and values RTEs, though.
-			 */
-			if (levelsup > 0)
-				phv->phexpr = preprocess_phv_expression(root, phv->phexpr);
 		}
 		else
 			Assert(false);
@@ -839,52 +1161,8 @@ extract_lateral_references(PlannerInfo *root, RelOptInfo *brel, Index rtindex)
 	 */
 	add_vars_to_targetlist(root, newvars, where_needed);
 
-	/*
-	 * Remember the lateral references for rebuild_lateral_attr_needed and
-	 * create_lateral_join_info.
-	 */
+	/* Remember the lateral references for create_lateral_join_info */
 	brel->lateral_vars = newvars;
-}
-
-/*
- * rebuild_lateral_attr_needed
- *	  Put back attr_needed bits for Vars/PHVs needed for lateral references.
- *
- * This is used to rebuild attr_needed/ph_needed sets after removal of a
- * useless outer join.  It should match what find_lateral_references did,
- * except that we call add_vars_to_attr_needed not add_vars_to_targetlist.
- */
-void
-rebuild_lateral_attr_needed(PlannerInfo *root)
-{
-	Index		rti;
-
-	/* We need do nothing if the query contains no LATERAL RTEs */
-	if (!root->hasLateralRTEs)
-		return;
-
-	/* Examine the same baserels that find_lateral_references did */
-	for (rti = 1; rti < root->simple_rel_array_size; rti++)
-	{
-		RelOptInfo *brel = root->simple_rel_array[rti];
-		Relids		where_needed;
-
-		if (brel == NULL)
-			continue;
-		if (brel->reloptkind != RELOPT_BASEREL)
-			continue;
-
-		/*
-		 * We don't need to repeat all of extract_lateral_references, since it
-		 * kindly saved the extracted Vars/PHVs in lateral_vars.
-		 */
-		if (brel->lateral_vars == NIL)
-			continue;
-
-		where_needed = bms_make_singleton(rti);
-
-		add_vars_to_attr_needed(root, brel->lateral_vars, where_needed);
-	}
 }
 
 /*
@@ -1357,19 +1635,16 @@ deconstruct_recurse(PlannerInfo *root, Node *jtnode,
 									child_domain->jd_relids);
 				jtitem->qualscope = bms_union(left_item->qualscope,
 											  right_item->qualscope);
-				/* caution: ANTI join derived from SEMI will lack rtindex */
-				if (j->rtindex != 0)
-				{
-					parent_domain->jd_relids =
-						bms_add_member(parent_domain->jd_relids,
-									   j->rtindex);
-					jtitem->qualscope = bms_add_member(jtitem->qualscope,
+				Assert(j->rtindex != 0);
+				parent_domain->jd_relids =
+					bms_add_member(parent_domain->jd_relids,
+								   j->rtindex);
+				jtitem->qualscope = bms_add_member(jtitem->qualscope,
+												   j->rtindex);
+				root->outer_join_rels = bms_add_member(root->outer_join_rels,
 													   j->rtindex);
-					root->outer_join_rels = bms_add_member(root->outer_join_rels,
-														   j->rtindex);
-					mark_rels_nulled_by_join(root, j->rtindex,
-											 right_item->qualscope);
-				}
+				mark_rels_nulled_by_join(root, j->rtindex,
+										 right_item->qualscope);
 				jtitem->inner_join_rels = bms_union(left_item->inner_join_rels,
 													right_item->inner_join_rels);
 				jtitem->left_rels = left_item->qualscope;
@@ -1839,6 +2114,13 @@ make_outerjoininfo(PlannerInfo *root,
 	 */
 	strict_relids = find_nonnullable_rels((Node *) clause);
 
+	/*
+	 * find_nonnullable_rels looks inside PlaceHolderVars, so it can report
+	 * rels that the clause references only laterally.  Ignore those, since
+	 * like clause_relids we treat a PHV as computed at its ph_eval_at.
+	 */
+	strict_relids = bms_int_members(strict_relids, clause_relids);
+
 	/* Remember whether the clause is strict for any LHS relations */
 	sjinfo->lhs_strict = bms_overlap(strict_relids, left_rels);
 
@@ -2239,9 +2521,18 @@ compute_semijoin_info(PlannerInfo *root, SpecialJoinInfo *sjinfo, List *clause)
 		if (!(all_btree || all_hash))
 			return;
 
+		/*
+		 * Ensure the RHS expression exposes the join's input collation (its
+		 * type should be OK already); see comments for
+		 * canonicalize_ec_expression.
+		 */
+		right_expr = (Node *) canonicalize_ec_expression((Expr *) copyObject(right_expr),
+														 exprType(right_expr),
+														 op->inputcollid);
+
 		/* so far so good, keep building lists */
 		semi_operators = lappend_oid(semi_operators, opno);
-		semi_rhs_exprs = lappend(semi_rhs_exprs, copyObject(right_expr));
+		semi_rhs_exprs = lappend(semi_rhs_exprs, right_expr);
 	}
 
 	/* Punt if we didn't find at least one column to unique-ify */
@@ -2587,10 +2878,6 @@ distribute_quals_to_rels(PlannerInfo *root, List *clauses,
  * 'qualscope' identifies what level of JOIN the qual came from syntactically.
  * 'ojscope' is needed if we decide to force the qual up to the outer-join
  * level, which will be ojscope not necessarily qualscope.
- *
- * At the time this is called, root->join_info_list must contain entries for
- * at least those special joins that are syntactically below this qual.
- * (We now need that only for detection of redundant IS NULL quals.)
  */
 static void
 distribute_qual_to_rels(PlannerInfo *root, Node *clause,
@@ -2794,15 +3081,6 @@ distribute_qual_to_rels(PlannerInfo *root, Node *clause,
 		 */
 		is_pushed_down = true;
 
-		/*
-		 * It's possible that this is an IS NULL clause that's redundant with
-		 * a lower antijoin; if so we can just discard it.  We need not test
-		 * in any of the other cases, because this will only be possible for
-		 * pushed-down clauses.
-		 */
-		if (check_redundant_nullability_qual(root, clause))
-			return;
-
 		/* Feed qual to the equivalence machinery, if allowed by caller */
 		maybe_equivalence = allow_equivalence;
 
@@ -2839,9 +3117,6 @@ distribute_qual_to_rels(PlannerInfo *root, Node *clause,
 	 * joins, which would often be an overestimate.  For such clauses, correct
 	 * var propagation is ensured by making ojscope include input rels from
 	 * both sides of the join.
-	 *
-	 * See also rebuild_joinclause_attr_needed, which has to partially repeat
-	 * this work after removal of an outer join.
 	 *
 	 * Note: if the clause gets absorbed into an EquivalenceClass then this
 	 * may be unnecessary, but for now we have to do it to cover the case
@@ -2973,53 +3248,6 @@ distribute_qual_to_rels(PlannerInfo *root, Node *clause,
 }
 
 /*
- * check_redundant_nullability_qual
- *	  Check to see if the qual is an IS NULL qual that is redundant with
- *	  a lower JOIN_ANTI join.
- *
- * We want to suppress redundant IS NULL quals, not so much to save cycles
- * as to avoid generating bogus selectivity estimates for them.  So if
- * redundancy is detected here, distribute_qual_to_rels() just throws away
- * the qual.
- */
-static bool
-check_redundant_nullability_qual(PlannerInfo *root, Node *clause)
-{
-	Var		   *forced_null_var;
-	ListCell   *lc;
-
-	/* Check for IS NULL, and identify the Var forced to NULL */
-	forced_null_var = find_forced_null_var(clause);
-	if (forced_null_var == NULL)
-		return false;
-
-	/*
-	 * If the Var comes from the nullable side of a lower antijoin, the IS
-	 * NULL condition is necessarily true.  If it's not nulled by anything,
-	 * there is no point in searching the join_info_list.  Otherwise, we need
-	 * to find out whether the nulling rel is an antijoin.
-	 */
-	if (forced_null_var->varnullingrels == NULL)
-		return false;
-
-	foreach(lc, root->join_info_list)
-	{
-		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
-
-		/*
-		 * This test will not succeed if sjinfo->ojrelid is zero, which is
-		 * possible for an antijoin that was converted from a semijoin; but in
-		 * such a case the Var couldn't have come from its nullable side.
-		 */
-		if (sjinfo->jointype == JOIN_ANTI && sjinfo->ojrelid != 0 &&
-			bms_is_member(sjinfo->ojrelid, forced_null_var->varnullingrels))
-			return true;
-	}
-
-	return false;
-}
-
-/*
  * add_base_clause_to_rel
  *		Add 'restrictinfo' as a baserestrictinfo to the base relation denoted
  *		by 'relid'.  We offer some simple prechecks to try to determine if the
@@ -3096,42 +3324,6 @@ add_base_clause_to_rel(PlannerInfo *root, Index relid,
 }
 
 /*
- * expr_is_nonnullable
- *	  Check to see if the Expr cannot be NULL
- *
- * If the Expr is a simple Var that is defined NOT NULL and meanwhile is not
- * nulled by any outer joins, then we can know that it cannot be NULL.
- */
-static bool
-expr_is_nonnullable(PlannerInfo *root, Expr *expr)
-{
-	RelOptInfo *rel;
-	Var		   *var;
-
-	/* For now only check simple Vars */
-	if (!IsA(expr, Var))
-		return false;
-
-	var = (Var *) expr;
-
-	/* could the Var be nulled by any outer joins? */
-	if (!bms_is_empty(var->varnullingrels))
-		return false;
-
-	/* system columns cannot be NULL */
-	if (var->varattno < 0)
-		return true;
-
-	/* is the column defined NOT NULL? */
-	rel = find_base_rel(root, var->varno);
-	if (var->varattno > 0 &&
-		bms_is_member(var->varattno, rel->notnullattnums))
-		return true;
-
-	return false;
-}
-
-/*
  * restriction_is_always_true
  *	  Check to see if the RestrictInfo is always true.
  *
@@ -3167,7 +3359,7 @@ restriction_is_always_true(PlannerInfo *root,
 		if (nulltest->argisrow)
 			return false;
 
-		return expr_is_nonnullable(root, nulltest->arg);
+		return expr_is_nonnullable(root, nulltest->arg, NOTNULL_SOURCE_RELOPT);
 	}
 
 	/* If it's an OR, check its sub-clauses */
@@ -3232,7 +3424,7 @@ restriction_is_always_false(PlannerInfo *root,
 		if (nulltest->argisrow)
 			return false;
 
-		return expr_is_nonnullable(root, nulltest->arg);
+		return expr_is_nonnullable(root, nulltest->arg, NOTNULL_SOURCE_RELOPT);
 	}
 
 	/* If it's an OR, check its sub-clauses */
@@ -3452,11 +3644,6 @@ process_implied_equality(PlannerInfo *root,
 	 * some of the Vars could have missed having that done because they only
 	 * appeared in single-relation clauses originally.  So do it here for
 	 * safety.
-	 *
-	 * See also rebuild_joinclause_attr_needed, which has to partially repeat
-	 * this work after removal of an outer join.  (Since we will put this
-	 * clause into the joininfo lists, that function needn't do any extra work
-	 * to find it.)
 	 */
 	if (bms_membership(relids) == BMS_MULTIPLE)
 	{
@@ -3599,72 +3786,6 @@ get_join_domain_min_rels(PlannerInfo *root, Relids domain_relids)
 
 
 /*
- * rebuild_joinclause_attr_needed
- *	  Put back attr_needed bits for Vars/PHVs needed for join clauses.
- *
- * This is used to rebuild attr_needed/ph_needed sets after removal of a
- * useless outer join.  It should match what distribute_qual_to_rels did,
- * except that we call add_vars_to_attr_needed not add_vars_to_targetlist.
- */
-void
-rebuild_joinclause_attr_needed(PlannerInfo *root)
-{
-	/*
-	 * We must examine all join clauses, but there's no value in processing
-	 * any join clause more than once.  So it's slightly annoying that we have
-	 * to find them via the per-base-relation joininfo lists.  Avoid duplicate
-	 * processing by tracking the rinfo_serial numbers of join clauses we've
-	 * already seen.  (This doesn't work for is_clone clauses, so we must
-	 * waste effort on them.)
-	 */
-	Bitmapset  *seen_serials = NULL;
-	Index		rti;
-
-	/* Scan all baserels for join clauses */
-	for (rti = 1; rti < root->simple_rel_array_size; rti++)
-	{
-		RelOptInfo *brel = root->simple_rel_array[rti];
-		ListCell   *lc;
-
-		if (brel == NULL)
-			continue;
-		if (brel->reloptkind != RELOPT_BASEREL)
-			continue;
-
-		foreach(lc, brel->joininfo)
-		{
-			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
-			Relids		relids = rinfo->required_relids;
-
-			if (!rinfo->is_clone)	/* else serial number is not unique */
-			{
-				if (bms_is_member(rinfo->rinfo_serial, seen_serials))
-					continue;	/* saw it already */
-				seen_serials = bms_add_member(seen_serials,
-											  rinfo->rinfo_serial);
-			}
-
-			if (bms_membership(relids) == BMS_MULTIPLE)
-			{
-				List	   *vars = pull_var_clause((Node *) rinfo->clause,
-												   PVC_RECURSE_AGGREGATES |
-												   PVC_RECURSE_WINDOWFUNCS |
-												   PVC_INCLUDE_PLACEHOLDERS);
-				Relids		where_needed;
-
-				if (rinfo->is_clone)
-					where_needed = bms_intersect(relids, root->all_baserels);
-				else
-					where_needed = relids;
-				add_vars_to_attr_needed(root, vars, where_needed);
-				list_free(vars);
-			}
-		}
-	}
-}
-
-
-/*
  * match_foreign_keys_to_quals
  *		Match foreign-key constraints to equivalence classes and join quals
  *
@@ -3693,9 +3814,9 @@ match_foreign_keys_to_quals(PlannerInfo *root)
 
 		/*
 		 * Either relid might identify a rel that is in the query's rtable but
-		 * isn't referenced by the jointree, or has been removed by join
-		 * removal, so that it won't have a RelOptInfo.  Hence don't use
-		 * find_base_rel() here.  We can ignore such FKs.
+		 * isn't referenced by the jointree (typically because it's been
+		 * removed by join removal), so that it won't have a RelOptInfo. Hence
+		 * don't use find_base_rel() here.  We can ignore such FKs.
 		 */
 		if (fkinfo->con_relid >= root->simple_rel_array_size ||
 			fkinfo->ref_relid >= root->simple_rel_array_size)

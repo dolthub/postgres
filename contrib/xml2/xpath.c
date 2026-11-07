@@ -12,6 +12,7 @@
 #include "funcapi.h"
 #include "lib/stringinfo.h"
 #include "utils/builtins.h"
+#include "utils/tuplestore.h"
 #include "utils/xml.h"
 
 /* libxml includes */
@@ -51,8 +52,8 @@ static text *pgxml_result_to_text(xmlXPathObjectPtr res, xmlChar *toptag,
 
 static xmlChar *pgxml_texttoxmlchar(text *textstring);
 
-static xmlXPathObjectPtr pgxml_xpath(text *document, xmlChar *xpath,
-									 xpath_workspace *workspace);
+static xpath_workspace *pgxml_xpath(text *document, xmlChar *xpath,
+									PgXmlErrorContext *xmlerrcxt);
 
 static void cleanup_workspace(xpath_workspace *workspace);
 
@@ -88,19 +89,41 @@ Datum
 xml_encode_special_chars(PG_FUNCTION_ARGS)
 {
 	text	   *tin = PG_GETARG_TEXT_PP(0);
-	text	   *tout;
-	xmlChar    *ts,
-			   *tt;
+	text	   *volatile tout = NULL;
+	xmlChar    *volatile tt = NULL;
+	PgXmlErrorContext *xmlerrcxt;
 
-	ts = pgxml_texttoxmlchar(tin);
+	xmlerrcxt = pg_xml_init(PG_XML_STRICTNESS_ALL);
 
-	tt = xmlEncodeSpecialChars(NULL, ts);
+	PG_TRY();
+	{
+		xmlChar    *ts;
 
-	pfree(ts);
+		ts = pgxml_texttoxmlchar(tin);
 
-	tout = cstring_to_text((char *) tt);
+		tt = xmlEncodeSpecialChars(NULL, ts);
+		if (tt == NULL || pg_xml_error_occurred(xmlerrcxt))
+			xml_ereport(xmlerrcxt, ERROR, ERRCODE_OUT_OF_MEMORY,
+						"could not allocate xmlChar");
+		pfree(ts);
 
-	xmlFree(tt);
+		tout = cstring_to_text((char *) tt);
+	}
+	PG_CATCH();
+	{
+		if (tt != NULL)
+			xmlFree(tt);
+
+		pg_xml_done(xmlerrcxt, true);
+
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	if (tt != NULL)
+		xmlFree(tt);
+
+	pg_xml_done(xmlerrcxt, false);
 
 	PG_RETURN_TEXT_P(tout);
 }
@@ -122,74 +145,121 @@ pgxmlNodeSetToText(xmlNodeSetPtr nodeset,
 				   xmlChar *septagname,
 				   xmlChar *plainsep)
 {
-	xmlBufferPtr buf;
-	xmlChar    *result;
-	int			i;
+	volatile xmlBufferPtr buf = NULL;
+	xmlChar    *volatile result = NULL;
+	xmlChar    *volatile str = NULL;
+	PgXmlErrorContext *xmlerrcxt;
 
-	buf = xmlBufferCreate();
+	/* spin up some error handling */
+	xmlerrcxt = pg_xml_init(PG_XML_STRICTNESS_ALL);
 
-	if ((toptagname != NULL) && (xmlStrlen(toptagname) > 0))
+	PG_TRY();
 	{
-		xmlBufferWriteChar(buf, "<");
-		xmlBufferWriteCHAR(buf, toptagname);
-		xmlBufferWriteChar(buf, ">");
-	}
-	if (nodeset != NULL)
-	{
-		for (i = 0; i < nodeset->nodeNr; i++)
+		buf = xmlBufferCreate();
+
+		if (buf == NULL || pg_xml_error_occurred(xmlerrcxt))
+			xml_ereport(xmlerrcxt, ERROR, ERRCODE_OUT_OF_MEMORY,
+						"could not allocate xmlBuffer");
+
+		if ((toptagname != NULL) && (xmlStrlen(toptagname) > 0))
 		{
-			if (plainsep != NULL)
+			xmlBufferWriteChar(buf, "<");
+			xmlBufferWriteCHAR(buf, toptagname);
+			xmlBufferWriteChar(buf, ">");
+		}
+		if (nodeset != NULL)
+		{
+			for (int i = 0; i < nodeset->nodeNr; i++)
 			{
-				xmlBufferWriteCHAR(buf,
-								   xmlXPathCastNodeToString(nodeset->nodeTab[i]));
-
-				/* If this isn't the last entry, write the plain sep. */
-				if (i < (nodeset->nodeNr) - 1)
-					xmlBufferWriteChar(buf, (char *) plainsep);
-			}
-			else
-			{
-				xmlNodePtr	node = nodeset->nodeTab[i];
-
-				if ((septagname != NULL) && (xmlStrlen(septagname) > 0))
+				if (plainsep != NULL)
 				{
-					xmlBufferWriteChar(buf, "<");
-					xmlBufferWriteCHAR(buf, septagname);
-					xmlBufferWriteChar(buf, ">");
+					str = xmlXPathCastNodeToString(nodeset->nodeTab[i]);
+					if (str == NULL || pg_xml_error_occurred(xmlerrcxt))
+						xml_ereport(xmlerrcxt, ERROR, ERRCODE_OUT_OF_MEMORY,
+									"could not allocate node text");
+
+					xmlBufferWriteCHAR(buf, str);
+					xmlFree(str);
+					str = NULL;
+
+					/* If this isn't the last entry, write the plain sep. */
+					if (i < (nodeset->nodeNr) - 1)
+						xmlBufferWriteChar(buf, (char *) plainsep);
 				}
-
-				/*
-				 * XML_NAMESPACE_DECL nodes are xmlNs structs, that cannot
-				 * be processed by xmlNodeDump().
-				 */
-				if (node->type == XML_NAMESPACE_DECL)
-					xmlBufferWriteCHAR(buf, xmlXPathCastNodeToString(node));
 				else
-					xmlNodeDump(buf, node->doc, node, 1, 0);
-
-				if ((septagname != NULL) && (xmlStrlen(septagname) > 0))
 				{
-					xmlBufferWriteChar(buf, "</");
-					xmlBufferWriteCHAR(buf, septagname);
-					xmlBufferWriteChar(buf, ">");
+					xmlNodePtr	node = nodeset->nodeTab[i];
+
+					if ((septagname != NULL) && (xmlStrlen(septagname) > 0))
+					{
+						xmlBufferWriteChar(buf, "<");
+						xmlBufferWriteCHAR(buf, septagname);
+						xmlBufferWriteChar(buf, ">");
+					}
+
+					/*
+					 * XML_NAMESPACE_DECL nodes are xmlNs structs, that cannot
+					 * be processed by xmlNodeDump().
+					 */
+					if (node->type == XML_NAMESPACE_DECL)
+					{
+						str = xmlXPathCastNodeToString(node);
+						if (str == NULL || pg_xml_error_occurred(xmlerrcxt))
+							xml_ereport(xmlerrcxt, ERROR, ERRCODE_OUT_OF_MEMORY,
+										"could not allocate node text");
+						xmlBufferWriteCHAR(buf, str);
+						xmlFree(str);
+						str = NULL;
+					}
+					else
+						xmlNodeDump(buf, node->doc, node, 1, 0);
+
+					if ((septagname != NULL) && (xmlStrlen(septagname) > 0))
+					{
+						xmlBufferWriteChar(buf, "</");
+						xmlBufferWriteCHAR(buf, septagname);
+						xmlBufferWriteChar(buf, ">");
+					}
 				}
 			}
 		}
-	}
 
-	if ((toptagname != NULL) && (xmlStrlen(toptagname) > 0))
-	{
-		xmlBufferWriteChar(buf, "</");
-		xmlBufferWriteCHAR(buf, toptagname);
-		xmlBufferWriteChar(buf, ">");
+		if ((toptagname != NULL) && (xmlStrlen(toptagname) > 0))
+		{
+			xmlBufferWriteChar(buf, "</");
+			xmlBufferWriteCHAR(buf, toptagname);
+			xmlBufferWriteChar(buf, ">");
+		}
+
+		result = xmlStrdup(xmlBufferContent(buf));
+		if (result == NULL || pg_xml_error_occurred(xmlerrcxt))
+			xml_ereport(xmlerrcxt, ERROR, ERRCODE_OUT_OF_MEMORY,
+						"could not allocate result");
 	}
-	result = xmlStrdup(xmlBufferContent(buf));
+	PG_CATCH();
+	{
+		if (result)
+			xmlFree(result);
+		if (str)
+			xmlFree(str);
+		if (buf)
+			xmlBufferFree(buf);
+
+		pg_xml_done(xmlerrcxt, true);
+
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
 	xmlBufferFree(buf);
+	pg_xml_done(xmlerrcxt, false);
+
 	return result;
 }
 
 
-/* Translate a PostgreSQL "varlena" -i.e. a variable length parameter
+/*
+ * Translate a PostgreSQL "varlena" -i.e. a variable length parameter
  * into the libxml2 representation
  */
 static xmlChar *
@@ -214,17 +284,30 @@ xpath_nodeset(PG_FUNCTION_ARGS)
 	xmlChar    *toptag = pgxml_texttoxmlchar(PG_GETARG_TEXT_PP(2));
 	xmlChar    *septag = pgxml_texttoxmlchar(PG_GETARG_TEXT_PP(3));
 	xmlChar    *xpath;
-	text	   *xpres;
-	xmlXPathObjectPtr res;
-	xpath_workspace workspace;
+	text	   *volatile xpres = NULL;
+	xpath_workspace *volatile workspace = NULL;
+	PgXmlErrorContext *xmlerrcxt;
 
 	xpath = pgxml_texttoxmlchar(xpathsupp);
+	xmlerrcxt = pgxml_parser_init(PG_XML_STRICTNESS_LEGACY);
 
-	res = pgxml_xpath(document, xpath, &workspace);
+	PG_TRY();
+	{
+		workspace = pgxml_xpath(document, xpath, xmlerrcxt);
+		xpres = pgxml_result_to_text(workspace->res, toptag, septag, NULL);
+	}
+	PG_CATCH();
+	{
+		if (workspace)
+			cleanup_workspace(workspace);
 
-	xpres = pgxml_result_to_text(res, toptag, septag, NULL);
+		pg_xml_done(xmlerrcxt, true);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
-	cleanup_workspace(&workspace);
+	cleanup_workspace(workspace);
+	pg_xml_done(xmlerrcxt, false);
 
 	pfree(xpath);
 
@@ -246,17 +329,30 @@ xpath_list(PG_FUNCTION_ARGS)
 	text	   *xpathsupp = PG_GETARG_TEXT_PP(1);	/* XPath expression */
 	xmlChar    *plainsep = pgxml_texttoxmlchar(PG_GETARG_TEXT_PP(2));
 	xmlChar    *xpath;
-	text	   *xpres;
-	xmlXPathObjectPtr res;
-	xpath_workspace workspace;
+	text	   *volatile xpres = NULL;
+	xpath_workspace *volatile workspace = NULL;
+	PgXmlErrorContext *xmlerrcxt;
 
 	xpath = pgxml_texttoxmlchar(xpathsupp);
+	xmlerrcxt = pgxml_parser_init(PG_XML_STRICTNESS_LEGACY);
 
-	res = pgxml_xpath(document, xpath, &workspace);
+	PG_TRY();
+	{
+		workspace = pgxml_xpath(document, xpath, xmlerrcxt);
+		xpres = pgxml_result_to_text(workspace->res, NULL, NULL, plainsep);
+	}
+	PG_CATCH();
+	{
+		if (workspace)
+			cleanup_workspace(workspace);
 
-	xpres = pgxml_result_to_text(res, NULL, NULL, plainsep);
+		pg_xml_done(xmlerrcxt, true);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
-	cleanup_workspace(&workspace);
+	cleanup_workspace(workspace);
+	pg_xml_done(xmlerrcxt, false);
 
 	pfree(xpath);
 
@@ -275,9 +371,9 @@ xpath_string(PG_FUNCTION_ARGS)
 	text	   *xpathsupp = PG_GETARG_TEXT_PP(1);	/* XPath expression */
 	xmlChar    *xpath;
 	int32		pathsize;
-	text	   *xpres;
-	xmlXPathObjectPtr res;
-	xpath_workspace workspace;
+	text	   *volatile xpres = NULL;
+	xpath_workspace *volatile workspace = NULL;
+	PgXmlErrorContext *xmlerrcxt;
 
 	pathsize = VARSIZE_ANY_EXHDR(xpathsupp);
 
@@ -293,11 +389,25 @@ xpath_string(PG_FUNCTION_ARGS)
 	xpath[pathsize + 7] = ')';
 	xpath[pathsize + 8] = '\0';
 
-	res = pgxml_xpath(document, xpath, &workspace);
+	xmlerrcxt = pgxml_parser_init(PG_XML_STRICTNESS_LEGACY);
 
-	xpres = pgxml_result_to_text(res, NULL, NULL, NULL);
+	PG_TRY();
+	{
+		workspace = pgxml_xpath(document, xpath, xmlerrcxt);
+		xpres = pgxml_result_to_text(workspace->res, NULL, NULL, NULL);
+	}
+	PG_CATCH();
+	{
+		if (workspace)
+			cleanup_workspace(workspace);
 
-	cleanup_workspace(&workspace);
+		pg_xml_done(xmlerrcxt, true);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	cleanup_workspace(workspace);
+	pg_xml_done(xmlerrcxt, false);
 
 	pfree(xpath);
 
@@ -315,24 +425,38 @@ xpath_number(PG_FUNCTION_ARGS)
 	text	   *document = PG_GETARG_TEXT_PP(0);
 	text	   *xpathsupp = PG_GETARG_TEXT_PP(1);	/* XPath expression */
 	xmlChar    *xpath;
-	float4		fRes;
-	xmlXPathObjectPtr res;
-	xpath_workspace workspace;
+	volatile float4 fRes = 0.0;
+	volatile bool isNull = false;
+	xpath_workspace *volatile workspace = NULL;
+	PgXmlErrorContext *xmlerrcxt;
 
 	xpath = pgxml_texttoxmlchar(xpathsupp);
+	xmlerrcxt = pgxml_parser_init(PG_XML_STRICTNESS_LEGACY);
 
-	res = pgxml_xpath(document, xpath, &workspace);
+	PG_TRY();
+	{
+		workspace = pgxml_xpath(document, xpath, xmlerrcxt);
+		pfree(xpath);
 
-	pfree(xpath);
+		if (workspace->res == NULL)
+			isNull = true;
+		else
+			fRes = xmlXPathCastToNumber(workspace->res);
+	}
+	PG_CATCH();
+	{
+		if (workspace)
+			cleanup_workspace(workspace);
 
-	if (res == NULL)
-		PG_RETURN_NULL();
+		pg_xml_done(xmlerrcxt, true);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
-	fRes = xmlXPathCastToNumber(res);
+	cleanup_workspace(workspace);
+	pg_xml_done(xmlerrcxt, false);
 
-	cleanup_workspace(&workspace);
-
-	if (xmlXPathIsNaN(fRes))
+	if (isNull || xmlXPathIsNaN(fRes))
 		PG_RETURN_NULL();
 
 	PG_RETURN_FLOAT4(fRes);
@@ -347,22 +471,35 @@ xpath_bool(PG_FUNCTION_ARGS)
 	text	   *document = PG_GETARG_TEXT_PP(0);
 	text	   *xpathsupp = PG_GETARG_TEXT_PP(1);	/* XPath expression */
 	xmlChar    *xpath;
-	int			bRes;
-	xmlXPathObjectPtr res;
-	xpath_workspace workspace;
+	volatile int bRes = 0;
+	xpath_workspace *volatile workspace = NULL;
+	PgXmlErrorContext *xmlerrcxt;
 
 	xpath = pgxml_texttoxmlchar(xpathsupp);
+	xmlerrcxt = pgxml_parser_init(PG_XML_STRICTNESS_LEGACY);
 
-	res = pgxml_xpath(document, xpath, &workspace);
+	PG_TRY();
+	{
+		workspace = pgxml_xpath(document, xpath, xmlerrcxt);
+		pfree(xpath);
 
-	pfree(xpath);
+		if (workspace->res == NULL)
+			bRes = 0;
+		else
+			bRes = xmlXPathCastToBoolean(workspace->res);
+	}
+	PG_CATCH();
+	{
+		if (workspace)
+			cleanup_workspace(workspace);
 
-	if (res == NULL)
-		PG_RETURN_BOOL(false);
+		pg_xml_done(xmlerrcxt, true);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
-	bRes = xmlXPathCastToBoolean(res);
-
-	cleanup_workspace(&workspace);
+	cleanup_workspace(workspace);
+	pg_xml_done(xmlerrcxt, false);
 
 	PG_RETURN_BOOL(bRes);
 }
@@ -371,18 +508,16 @@ xpath_bool(PG_FUNCTION_ARGS)
 
 /* Core function to evaluate XPath query */
 
-static xmlXPathObjectPtr
-pgxml_xpath(text *document, xmlChar *xpath, xpath_workspace *workspace)
+static xpath_workspace *
+pgxml_xpath(text *document, xmlChar *xpath, PgXmlErrorContext *xmlerrcxt)
 {
 	int32		docsize = VARSIZE_ANY_EXHDR(document);
-	PgXmlErrorContext *xmlerrcxt;
-	xmlXPathCompExprPtr comppath;
+	xmlXPathCompExprPtr volatile comppath = NULL;
+	xpath_workspace *workspace = palloc0_object(xpath_workspace);
 
 	workspace->doctree = NULL;
 	workspace->ctxt = NULL;
 	workspace->res = NULL;
-
-	xmlerrcxt = pgxml_parser_init(PG_XML_STRICTNESS_LEGACY);
 
 	PG_TRY();
 	{
@@ -392,11 +527,15 @@ pgxml_xpath(text *document, xmlChar *xpath, xpath_workspace *workspace)
 		if (workspace->doctree != NULL)
 		{
 			workspace->ctxt = xmlXPathNewContext(workspace->doctree);
+			if (workspace->ctxt == NULL)
+				xml_ereport(xmlerrcxt, ERROR, ERRCODE_OUT_OF_MEMORY,
+							"could not allocate XPath context");
+
 			workspace->ctxt->node = xmlDocGetRootElement(workspace->doctree);
 
 			/* compile the path */
 			comppath = xmlXPathCtxtCompile(workspace->ctxt, xpath);
-			if (comppath == NULL)
+			if (comppath == NULL || pg_xml_error_occurred(xmlerrcxt))
 				xml_ereport(xmlerrcxt, ERROR, ERRCODE_INVALID_ARGUMENT_FOR_XQUERY,
 							"XPath Syntax Error");
 
@@ -404,24 +543,20 @@ pgxml_xpath(text *document, xmlChar *xpath, xpath_workspace *workspace)
 			workspace->res = xmlXPathCompiledEval(comppath, workspace->ctxt);
 
 			xmlXPathFreeCompExpr(comppath);
+			comppath = NULL;
 		}
 	}
 	PG_CATCH();
 	{
+		if (comppath != NULL)
+			xmlXPathFreeCompExpr(comppath);
 		cleanup_workspace(workspace);
-
-		pg_xml_done(xmlerrcxt, true);
 
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
-	if (workspace->res == NULL)
-		cleanup_workspace(workspace);
-
-	pg_xml_done(xmlerrcxt, false);
-
-	return workspace->res;
+	return workspace;
 }
 
 /* Clean up after processing the result of pgxml_xpath() */
@@ -445,34 +580,59 @@ pgxml_result_to_text(xmlXPathObjectPtr res,
 					 xmlChar *septag,
 					 xmlChar *plainsep)
 {
-	xmlChar    *xpresstr;
-	text	   *xpres;
+	xmlChar    *volatile xpresstr = NULL;
+	text	   *volatile xpres = NULL;
+	PgXmlErrorContext *xmlerrcxt;
 
 	if (res == NULL)
 		return NULL;
 
-	switch (res->type)
+	/* spin some error handling */
+	xmlerrcxt = pg_xml_init(PG_XML_STRICTNESS_ALL);
+
+	PG_TRY();
 	{
-		case XPATH_NODESET:
-			xpresstr = pgxmlNodeSetToText(res->nodesetval,
-										  toptag,
-										  septag, plainsep);
-			break;
+		switch (res->type)
+		{
+			case XPATH_NODESET:
+				xpresstr = pgxmlNodeSetToText(res->nodesetval,
+											  toptag,
+											  septag, plainsep);
+				break;
 
-		case XPATH_STRING:
-			xpresstr = xmlStrdup(res->stringval);
-			break;
+			case XPATH_STRING:
+				xpresstr = xmlStrdup(res->stringval);
+				if (xpresstr == NULL || pg_xml_error_occurred(xmlerrcxt))
+					xml_ereport(xmlerrcxt, ERROR, ERRCODE_OUT_OF_MEMORY,
+								"could not allocate result");
+				break;
 
-		default:
-			elog(NOTICE, "unsupported XQuery result: %d", res->type);
-			xpresstr = xmlStrdup((const xmlChar *) "<unsupported/>");
+			default:
+				elog(NOTICE, "unsupported XQuery result: %d", res->type);
+				xpresstr = xmlStrdup((const xmlChar *) "<unsupported/>");
+				if (xpresstr == NULL || pg_xml_error_occurred(xmlerrcxt))
+					xml_ereport(xmlerrcxt, ERROR, ERRCODE_OUT_OF_MEMORY,
+								"could not allocate result");
+		}
+
+		/* Now convert this result back to text */
+		xpres = cstring_to_text((char *) xpresstr);
 	}
+	PG_CATCH();
+	{
+		if (xpresstr != NULL)
+			xmlFree(xpresstr);
 
-	/* Now convert this result back to text */
-	xpres = cstring_to_text((char *) xpresstr);
+		pg_xml_done(xmlerrcxt, true);
+
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	/* Free various storage */
 	xmlFree(xpresstr);
+
+	pg_xml_done(xmlerrcxt, false);
 
 	return xpres;
 }
@@ -517,6 +677,10 @@ xpath_table(PG_FUNCTION_ARGS)
 	StringInfoData query_buf;
 	PgXmlErrorContext *xmlerrcxt;
 	volatile xmlDocPtr doctree = NULL;
+	xmlXPathContextPtr volatile ctxt = NULL;
+	xmlXPathObjectPtr volatile res = NULL;
+	xmlXPathCompExprPtr volatile comppath = NULL;
+	xmlChar    *volatile resstr = NULL;
 
 	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
 
@@ -536,7 +700,7 @@ xpath_table(PG_FUNCTION_ARGS)
 
 	attinmeta = TupleDescGetAttInMetadata(rsinfo->setDesc);
 
-	values = (char **) palloc(rsinfo->setDesc->natts * sizeof(char *));
+	values = (char **) palloc0(rsinfo->setDesc->natts * sizeof(char *));
 	xpaths = (xmlChar **) palloc(rsinfo->setDesc->natts * sizeof(xmlChar *));
 
 	/*
@@ -606,10 +770,6 @@ xpath_table(PG_FUNCTION_ARGS)
 		{
 			char	   *pkey;
 			char	   *xmldoc;
-			xmlXPathContextPtr ctxt;
-			xmlXPathObjectPtr res;
-			xmlChar    *resstr;
-			xmlXPathCompExprPtr comppath;
 			HeapTuple	ret_tuple;
 
 			/* Extract the row data as C Strings */
@@ -654,12 +814,22 @@ xpath_table(PG_FUNCTION_ARGS)
 					had_values = false;
 					for (j = 0; j < numpaths; j++)
 					{
+						ctxt = NULL;
+						res = NULL;
+						comppath = NULL;
+						resstr = NULL;
+
 						ctxt = xmlXPathNewContext(doctree);
+						if (ctxt == NULL || pg_xml_error_occurred(xmlerrcxt))
+							xml_ereport(xmlerrcxt,
+										ERROR, ERRCODE_OUT_OF_MEMORY,
+										"could not allocate XPath context");
+
 						ctxt->node = xmlDocGetRootElement(doctree);
 
 						/* compile the path */
 						comppath = xmlXPathCtxtCompile(ctxt, xpaths[j]);
-						if (comppath == NULL)
+						if (comppath == NULL || pg_xml_error_occurred(xmlerrcxt))
 							xml_ereport(xmlerrcxt, ERROR,
 										ERRCODE_INVALID_ARGUMENT_FOR_XQUERY,
 										"XPath Syntax Error");
@@ -667,6 +837,7 @@ xpath_table(PG_FUNCTION_ARGS)
 						/* Now evaluate the path expression. */
 						res = xmlXPathCompiledEval(comppath, ctxt);
 						xmlXPathFreeCompExpr(comppath);
+						comppath = NULL;
 
 						if (res != NULL)
 						{
@@ -678,6 +849,10 @@ xpath_table(PG_FUNCTION_ARGS)
 										rownr < res->nodesetval->nodeNr)
 									{
 										resstr = xmlXPathCastNodeToString(res->nodesetval->nodeTab[rownr]);
+										if (resstr == NULL || pg_xml_error_occurred(xmlerrcxt))
+											xml_ereport(xmlerrcxt,
+														ERROR, ERRCODE_OUT_OF_MEMORY,
+														"could not allocate result");
 										had_values = true;
 									}
 									else
@@ -687,11 +862,19 @@ xpath_table(PG_FUNCTION_ARGS)
 
 								case XPATH_STRING:
 									resstr = xmlStrdup(res->stringval);
+									if (resstr == NULL || pg_xml_error_occurred(xmlerrcxt))
+										xml_ereport(xmlerrcxt,
+													ERROR, ERRCODE_OUT_OF_MEMORY,
+													"could not allocate result");
 									break;
 
 								default:
 									elog(NOTICE, "unsupported XQuery result: %d", res->type);
 									resstr = xmlStrdup((const xmlChar *) "<unsupported/>");
+									if (resstr == NULL || pg_xml_error_occurred(xmlerrcxt))
+										xml_ereport(xmlerrcxt,
+													ERROR, ERRCODE_OUT_OF_MEMORY,
+													"could not allocate result");
 							}
 
 							/*
@@ -699,8 +882,16 @@ xpath_table(PG_FUNCTION_ARGS)
 							 * result tuple.
 							 */
 							values[j + 1] = (char *) resstr;
+							resstr = NULL;
+						}
+
+						if (res != NULL)
+						{
+							xmlXPathFreeObject(res);
+							res = NULL;
 						}
 						xmlXPathFreeContext(ctxt);
+						ctxt = NULL;
 					}
 
 					/* Now add the tuple to the output, if there is one. */
@@ -709,6 +900,16 @@ xpath_table(PG_FUNCTION_ARGS)
 						ret_tuple = BuildTupleFromCStrings(attinmeta, values);
 						tuplestore_puttuple(rsinfo->setResult, ret_tuple);
 						heap_freetuple(ret_tuple);
+					}
+
+					/* BuildTupleFromCStrings() has copied the values. */
+					for (j = 1; j < rsinfo->setDesc->natts; j++)
+					{
+						if (values[j] != NULL)
+						{
+							xmlFree((xmlChar *) values[j]);
+							values[j] = NULL;
+						}
 					}
 
 					rownr++;
@@ -727,6 +928,19 @@ xpath_table(PG_FUNCTION_ARGS)
 	}
 	PG_CATCH();
 	{
+		if (resstr != NULL)
+			xmlFree(resstr);
+		for (j = 1; j < rsinfo->setDesc->natts; j++)
+		{
+			if (values[j] != NULL)
+				xmlFree((xmlChar *) values[j]);
+		}
+		if (res != NULL)
+			xmlXPathFreeObject(res);
+		if (comppath != NULL)
+			xmlXPathFreeCompExpr(comppath);
+		if (ctxt != NULL)
+			xmlXPathFreeContext(ctxt);
 		if (doctree != NULL)
 			xmlFreeDoc(doctree);
 

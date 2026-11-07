@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2025, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 common_sources = files(
   'astreamer_inject.c',
@@ -93,13 +93,14 @@ tests += {
   'sd': meson.current_source_dir(),
   'bd': meson.current_build_dir(),
   'tap': {
-    'env': {'GZIP_PROGRAM': gzip.found() ? gzip.path() : '',
-            'TAR': tar.found() ? tar.path() : '',
-            'LZ4': program_lz4.found() ? program_lz4.path() : '',
+    'env': {'GZIP_PROGRAM': gzip.found() ? gzip.full_path() : '',
+            'TAR': tar.found() ? tar.full_path() : '',
+            'LZ4': program_lz4.found() ? program_lz4.full_path() : '',
     },
     'tests': [
       't/010_pg_basebackup.pl',
       't/011_in_place_tablespace.pl',
+      't/012_incremental_progress.pl',
       't/020_pg_receivewal.pl',
       't/030_pg_recvlogical.pl',
       't/040_pg_createsubscriber.pl',

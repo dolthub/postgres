@@ -4,7 +4,7 @@
  *	  This file contains routines to support creation of toast tables
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -14,6 +14,7 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/heapam.h"
 #include "access/toast_compression.h"
 #include "access/xact.h"
@@ -229,6 +230,12 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	TupleDescAttr(tupdesc, 1)->attcompression = InvalidCompressionMethod;
 	TupleDescAttr(tupdesc, 2)->attcompression = InvalidCompressionMethod;
 
+	populate_compact_attribute(tupdesc, 0);
+	populate_compact_attribute(tupdesc, 1);
+	populate_compact_attribute(tupdesc, 2);
+
+	TupleDescFinalize(tupdesc);
+
 	/*
 	 * Toast tables for regular relations go in pg_toast; those for temp
 	 * relations go into the per-backend temp-toast-table namespace.
@@ -318,6 +325,10 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	coloptions[0] = 0;
 	coloptions[1] = 0;
 
+	/*
+	 * Don't let index creation overwrite progress information for the command
+	 * that caused the TOAST table to be created.
+	 */
 	index_create(toast_rel, toast_idxname, toastIndexOid, InvalidOid,
 				 InvalidOid, InvalidOid,
 				 indexInfo,
@@ -325,7 +336,8 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 				 BTREE_AM_OID,
 				 rel->rd_rel->reltablespace,
 				 collationIds, opclassIds, NULL, coloptions, NULL, (Datum) 0,
-				 INDEX_CREATE_IS_PRIMARY, 0, true, true, NULL);
+				 INDEX_CREATE_IS_PRIMARY | INDEX_CREATE_SUPPRESS_PROGRESS,
+				 0, true, true, NULL);
 
 	table_close(toast_rel, NoLock);
 

@@ -16,7 +16,7 @@
  * bitcode.
  *
  *
- * Copyright (c) 2016-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/jit/llvm/llvmjit_types.c
@@ -44,9 +44,18 @@
  * List of types needed for JITing. These have to be non-static, otherwise
  * clang/LLVM will omit them.  As this file will never be linked into
  * anything, that's harmless.
+ *
+ * They are also excluded from AddressSanitizer instrumentation, so that they
+ * keep the types they are declared with (clang adds a wrapper struct with a
+ * redzone when using address sanitizer).  This file is only ever compiled by
+ * clang, so a clang pragma is fine here.
  */
+#pragma clang attribute push (pg_attribute_no_sanitize_address(), \
+							  apply_to = variable(is_global))
+
 PGFunction	TypePGFunction;
 size_t		TypeSizeT;
+Datum		TypeDatum;
 bool		TypeStorageBool;
 
 ExecEvalSubroutine TypeExecEvalSubroutine;
@@ -70,6 +79,8 @@ TupleDescData StructTupleDescData;
 PlanState	StructPlanState;
 MinimalTupleData StructMinimalTupleData;
 
+#pragma clang attribute pop
+
 
 /*
  * To determine which attributes functions need to have (depends e.g. on
@@ -80,7 +91,7 @@ extern Datum AttributeTemplate(PG_FUNCTION_ARGS);
 Datum
 AttributeTemplate(PG_FUNCTION_ARGS)
 {
-	AssertVariableIsOfType(&AttributeTemplate, PGFunction);
+	StaticAssertVariableIsOfType(&AttributeTemplate, PGFunction);
 
 	PG_RETURN_NULL();
 }
@@ -98,8 +109,8 @@ ExecEvalSubroutineTemplate(ExprState *state,
 						   struct ExprEvalStep *op,
 						   ExprContext *econtext)
 {
-	AssertVariableIsOfType(&ExecEvalSubroutineTemplate,
-						   ExecEvalSubroutine);
+	StaticAssertVariableIsOfType(&ExecEvalSubroutineTemplate,
+								 ExecEvalSubroutine);
 }
 
 extern bool ExecEvalBoolSubroutineTemplate(ExprState *state,
@@ -110,8 +121,8 @@ ExecEvalBoolSubroutineTemplate(ExprState *state,
 							   struct ExprEvalStep *op,
 							   ExprContext *econtext)
 {
-	AssertVariableIsOfType(&ExecEvalBoolSubroutineTemplate,
-						   ExecEvalBoolSubroutine);
+	StaticAssertVariableIsOfType(&ExecEvalBoolSubroutineTemplate,
+								 ExecEvalBoolSubroutine);
 
 	return false;
 }

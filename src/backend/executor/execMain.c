@@ -26,7 +26,7 @@
  *	before ExecutorEnd.  This can be omitted only in case of EXPLAIN,
  *	which should also omit ExecutorRun.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -36,12 +36,11 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "access/doltcatalog.h"
-#include "access/doltbranch.h"
 
 #include "access/sysattr.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "access/tupconvert.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "catalog/partition.h"
@@ -49,6 +48,7 @@
 #include "commands/trigger.h"
 #include "executor/executor.h"
 #include "executor/execPartition.h"
+#include "executor/instrument.h"
 #include "executor/nodeSubplan.h"
 #include "foreign/fdwapi.h"
 #include "mb/pg_wchar.h"
@@ -191,7 +191,7 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 
 		nParamExec = list_length(queryDesc->plannedstmt->paramExecTypes);
 		estate->es_param_exec_vals = (ParamExecData *)
-			palloc0(nParamExec * sizeof(ParamExecData));
+			palloc0_array(ParamExecData, nParamExec);
 	}
 
 	/* We now require all callers to provide sourceText */
@@ -249,6 +249,15 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	estate->es_top_eflags = eflags;
 	estate->es_instrument = queryDesc->instrument_options;
 	estate->es_jit_flags = queryDesc->plannedstmt->jitFlags;
+
+	/*
+	 * Set up query-level instrumentation if extensions have requested it via
+	 * query_instr_options. Ensure an extension has not allocated query_instr
+	 * itself.
+	 */
+	Assert(queryDesc->query_instr == NULL);
+	if (queryDesc->query_instr_options)
+		queryDesc->query_instr = InstrAlloc(queryDesc->query_instr_options);
 
 	/*
 	 * Set up an AFTER-trigger statement context, unless told not to, or
@@ -332,8 +341,8 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 	oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
 
 	/* Allow instrumentation of Executor overall runtime */
-	if (queryDesc->totaltime)
-		InstrStartNode(queryDesc->totaltime);
+	if (queryDesc->query_instr)
+		InstrStart(queryDesc->query_instr);
 
 	/*
 	 * extract information from the query descriptor and the query feature.
@@ -384,8 +393,8 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 	if (sendTuples)
 		dest->rShutdown(dest);
 
-	if (queryDesc->totaltime)
-		InstrStopNode(queryDesc->totaltime, estate->es_processed);
+	if (queryDesc->query_instr)
+		InstrStop(queryDesc->query_instr);
 
 	MemoryContextSwitchTo(oldcontext);
 }
@@ -434,8 +443,8 @@ standard_ExecutorFinish(QueryDesc *queryDesc)
 	oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
 
 	/* Allow instrumentation of Executor overall runtime */
-	if (queryDesc->totaltime)
-		InstrStartNode(queryDesc->totaltime);
+	if (queryDesc->query_instr)
+		InstrStart(queryDesc->query_instr);
 
 	/* Run ModifyTable nodes to completion */
 	ExecPostprocessPlan(estate);
@@ -444,8 +453,8 @@ standard_ExecutorFinish(QueryDesc *queryDesc)
 	if (!(estate->es_top_eflags & EXEC_FLAG_SKIP_TRIGGERS))
 		AfterTriggerEndQuery(estate);
 
-	if (queryDesc->totaltime)
-		InstrStopNode(queryDesc->totaltime, 0);
+	if (queryDesc->query_instr)
+		InstrStop(queryDesc->query_instr);
 
 	MemoryContextSwitchTo(oldcontext);
 
@@ -524,7 +533,7 @@ standard_ExecutorEnd(QueryDesc *queryDesc)
 	queryDesc->tupDesc = NULL;
 	queryDesc->estate = NULL;
 	queryDesc->planstate = NULL;
-	queryDesc->totaltime = NULL;
+	queryDesc->query_instr = NULL;
 }
 
 /* ----------------------------------------------------------------
@@ -601,11 +610,9 @@ ExecCheckPermissions(List *rangeTable, List *rteperminfos,
 
 			/*
 			 * Only relation RTEs and subquery RTEs that were once relation
-			 * RTEs (views), plus catalog RTEs bound during rewrite, have
-			 * their perminfoindex set.
+			 * RTEs (views) have their perminfoindex set.
 			 */
 			Assert(rte->rtekind == RTE_RELATION ||
-				   (rte->rtekind == RTE_DOLT && OidIsValid(rte->dolt_catalog)) ||
 				   (rte->rtekind == RTE_SUBQUERY &&
 					rte->relkind == RELKIND_VIEW));
 
@@ -880,7 +887,7 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 	if (plannedstmt->rowMarks)
 	{
 		estate->es_rowmarks = (ExecRowMark **)
-			palloc0(estate->es_range_table_size * sizeof(ExecRowMark *));
+			palloc0_array(ExecRowMark *, estate->es_range_table_size);
 		foreach(l, plannedstmt->rowMarks)
 		{
 			PlanRowMark *rc = (PlanRowMark *) lfirst(l);
@@ -928,7 +935,7 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 			if (relation)
 				CheckValidRowMarkRel(relation, rc->markType);
 
-			erm = (ExecRowMark *) palloc(sizeof(ExecRowMark));
+			erm = palloc_object(ExecRowMark);
 			erm->relation = relation;
 			erm->relid = relid;
 			erm->rti = rc->rti;
@@ -1270,11 +1277,11 @@ InitResultRelInfo(ResultRelInfo *resultRelInfo,
 		int			n = resultRelInfo->ri_TrigDesc->numtriggers;
 
 		resultRelInfo->ri_TrigFunctions = (FmgrInfo *)
-			palloc0(n * sizeof(FmgrInfo));
+			palloc0_array(FmgrInfo, n);
 		resultRelInfo->ri_TrigWhenExprs = (ExprState **)
-			palloc0(n * sizeof(ExprState *));
+			palloc0_array(ExprState *, n);
 		if (instrument_options)
-			resultRelInfo->ri_TrigInstrument = InstrAlloc(n, instrument_options, false);
+			resultRelInfo->ri_TrigInstrument = InstrAllocTrigger(n, instrument_options);
 	}
 	else
 	{
@@ -1348,7 +1355,7 @@ InitResultRelInfo(ResultRelInfo *resultRelInfo,
  * in es_trig_target_relations.
  */
 ResultRelInfo *
-ExecGetTriggerResultRel(EState *estate, Oid relid, const char *branch,
+ExecGetTriggerResultRel(EState *estate, Oid relid,
 						ResultRelInfo *rootRelInfo)
 {
 	ResultRelInfo *rInfo;
@@ -1369,8 +1376,7 @@ ExecGetTriggerResultRel(EState *estate, Oid relid, const char *branch,
 	{
 		rInfo = lfirst(l);
 		if (RelationGetRelid(rInfo->ri_RelationDesc) == relid &&
-			rInfo->ri_RootResultRelInfo == rootRelInfo &&
-			(!branch || !strcmp(dg_relation_branch(rInfo->ri_RelationDesc), branch)))
+			rInfo->ri_RootResultRelInfo == rootRelInfo)
 			return rInfo;
 	}
 
@@ -1382,8 +1388,7 @@ ExecGetTriggerResultRel(EState *estate, Oid relid, const char *branch,
 	{
 		rInfo = (ResultRelInfo *) lfirst(l);
 		if (RelationGetRelid(rInfo->ri_RelationDesc) == relid &&
-			rInfo->ri_RootResultRelInfo == rootRelInfo &&
-			(!branch || !strcmp(dg_relation_branch(rInfo->ri_RelationDesc), branch)))
+			rInfo->ri_RootResultRelInfo == rootRelInfo)
 			return rInfo;
 	}
 
@@ -1392,8 +1397,7 @@ ExecGetTriggerResultRel(EState *estate, Oid relid, const char *branch,
 	{
 		rInfo = (ResultRelInfo *) lfirst(l);
 		if (RelationGetRelid(rInfo->ri_RelationDesc) == relid &&
-			rInfo->ri_RootResultRelInfo == rootRelInfo &&
-			(!branch || !strcmp(dg_relation_branch(rInfo->ri_RelationDesc), branch)))
+			rInfo->ri_RootResultRelInfo == rootRelInfo)
 			return rInfo;
 	}
 	/* Nope, so we need a new one */
@@ -1404,7 +1408,7 @@ ExecGetTriggerResultRel(EState *estate, Oid relid, const char *branch,
 	 * event got queued, so we need take no new lock here.  Also, we need not
 	 * recheck the relkind, so no need for CheckValidResultRel.
 	 */
-	rel = branch ? dg_catalog_trigger_relation(relid, branch) : table_open(relid, NoLock);
+	rel = table_open(relid, NoLock);
 
 	/*
 	 * Make the new entry in the right context.
@@ -1615,6 +1619,22 @@ ExecCloseResultRelations(EState *estate)
 		}
 	}
 
+	/*
+	 * Now close any relations that we opened for trigger target
+	 * ResultRelInfos.
+	 */
+	ExecCloseTrigTargetRelations(estate);
+}
+
+/*
+ * Close any relations that have been opened for ResultRelInfos opened
+ * specifically for trigger target relations.
+ */
+void
+ExecCloseTrigTargetRelations(EState *estate)
+{
+	ListCell   *l;
+
 	/* Close any relations that have been opened by ExecGetTriggerResultRel(). */
 	foreach(l, estate->es_trig_target_relations)
 	{
@@ -1633,10 +1653,7 @@ ExecCloseResultRelations(EState *estate)
 		 */
 		Assert(resultRelInfo->ri_NumIndices == 0);
 
-		if (resultRelInfo->ri_RelationDesc->rd_refparent)
-			dg_storage_close_relation(resultRelInfo->ri_RelationDesc);
-		else
-			table_close(resultRelInfo->ri_RelationDesc, NoLock);
+		table_close(resultRelInfo->ri_RelationDesc, NoLock);
 	}
 }
 
@@ -1653,12 +1670,7 @@ ExecCloseRangeTableRelations(EState *estate)
 	for (i = 0; i < estate->es_range_table_size; i++)
 	{
 		if (estate->es_relations[i])
-		{
-			if (estate->es_relations[i]->rd_refparent)
-				dg_storage_close_relation(estate->es_relations[i]);
-			else
-				table_close(estate->es_relations[i], NoLock);
-		}
+			table_close(estate->es_relations[i], NoLock);
 	}
 }
 
@@ -1959,7 +1971,7 @@ ExecPartitionCheckEmitError(ResultRelInfo *resultRelInfo,
 		 */
 		if (map != NULL)
 			slot = execute_attr_map_slot(map, slot,
-										 MakeTupleTableSlot(tupdesc, &TTSOpsVirtual));
+										 MakeTupleTableSlot(tupdesc, &TTSOpsVirtual, 0));
 		modifiedCols = bms_union(ExecGetInsertedCols(rootrel, estate),
 								 ExecGetUpdatedCols(rootrel, estate));
 	}
@@ -2075,7 +2087,7 @@ ExecConstraints(ResultRelInfo *resultRelInfo,
 				 */
 				if (map != NULL)
 					slot = execute_attr_map_slot(map, slot,
-												 MakeTupleTableSlot(tupdesc, &TTSOpsVirtual));
+												 MakeTupleTableSlot(tupdesc, &TTSOpsVirtual, 0));
 				modifiedCols = bms_union(ExecGetInsertedCols(rootrel, estate),
 										 ExecGetUpdatedCols(rootrel, estate));
 				rel = rootrel->ri_RelationDesc;
@@ -2211,7 +2223,7 @@ ReportNotNullViolationError(ResultRelInfo *resultRelInfo, TupleTableSlot *slot,
 		 */
 		if (map != NULL)
 			slot = execute_attr_map_slot(map, slot,
-										 MakeTupleTableSlot(tupdesc, &TTSOpsVirtual));
+										 MakeTupleTableSlot(tupdesc, &TTSOpsVirtual, 0));
 		modifiedCols = bms_union(ExecGetInsertedCols(rootrel, estate),
 								 ExecGetUpdatedCols(rootrel, estate));
 		rel = rootrel->ri_RelationDesc;
@@ -2319,7 +2331,7 @@ ExecWithCheckOptions(WCOKind kind, ResultRelInfo *resultRelInfo,
 						 */
 						if (map != NULL)
 							slot = execute_attr_map_slot(map, slot,
-														 MakeTupleTableSlot(tupdesc, &TTSOpsVirtual));
+														 MakeTupleTableSlot(tupdesc, &TTSOpsVirtual, 0));
 
 						modifiedCols = bms_union(ExecGetInsertedCols(rootrel, estate),
 												 ExecGetUpdatedCols(rootrel, estate));
@@ -2597,7 +2609,7 @@ ExecFindRowMark(EState *estate, Index rti, bool missing_ok)
 ExecAuxRowMark *
 ExecBuildAuxRowMark(ExecRowMark *erm, List *targetlist)
 {
-	ExecAuxRowMark *aerm = (ExecAuxRowMark *) palloc0(sizeof(ExecAuxRowMark));
+	ExecAuxRowMark *aerm = palloc0_object(ExecAuxRowMark);
 	char		resname[32];
 
 	aerm->rowmark = erm;
@@ -2753,8 +2765,7 @@ EvalPlanQualInit(EPQState *epqstate, EState *parentestate,
 	 * EvalPlanQualBegin().
 	 */
 	epqstate->tuple_table = NIL;
-	epqstate->relsubs_slot = (TupleTableSlot **)
-		palloc0(rtsize * sizeof(TupleTableSlot *));
+	epqstate->relsubs_slot = palloc0_array(TupleTableSlot *, rtsize);
 
 	/* ... and remember data that EvalPlanQualBegin will need */
 	epqstate->plan = subplan;
@@ -3093,8 +3104,7 @@ EvalPlanQualStart(EPQState *epqstate, Plan *planTree)
 
 		/* now make the internal param workspace ... */
 		i = list_length(parentestate->es_plannedstmt->paramExecTypes);
-		rcestate->es_param_exec_vals = (ParamExecData *)
-			palloc0(i * sizeof(ParamExecData));
+		rcestate->es_param_exec_vals = palloc0_array(ParamExecData, i);
 		/* ... and copy down all values, whether really needed or not */
 		while (--i >= 0)
 		{
@@ -3119,11 +3129,16 @@ EvalPlanQualStart(EPQState *epqstate, Plan *planTree)
 	 * and MergeAppend subplans as the parent did.
 	 */
 	rcestate->es_part_prune_infos = parentestate->es_part_prune_infos;
-	rcestate->es_part_prune_states = parentestate->es_part_prune_states;
 	rcestate->es_part_prune_results = parentestate->es_part_prune_results;
 
 	/* We'll also borrow the es_partition_directory from the parent state */
 	rcestate->es_partition_directory = parentestate->es_partition_directory;
+
+	/*
+	 * The PartitionPruneStates can't be borrowed, though, since exec pruning
+	 * must see our own es_param_exec_vals.
+	 */
+	ExecCreatePartitionPruneStates(rcestate);
 
 	/*
 	 * Initialize private state information for each SubPlan.  We must do this
@@ -3149,8 +3164,7 @@ EvalPlanQualStart(EPQState *epqstate, Plan *planTree)
 	 * EvalPlanQualFetchRowMark() can efficiently access the to be fetched
 	 * rowmark.
 	 */
-	epqstate->relsubs_rowmark = (ExecAuxRowMark **)
-		palloc0(rtsize * sizeof(ExecAuxRowMark *));
+	epqstate->relsubs_rowmark = palloc0_array(ExecAuxRowMark *, rtsize);
 	foreach(l, epqstate->arowMarks)
 	{
 		ExecAuxRowMark *earm = (ExecAuxRowMark *) lfirst(l);

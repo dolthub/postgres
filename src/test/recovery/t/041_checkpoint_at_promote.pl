@@ -1,5 +1,5 @@
 
-# Copyright (c) 2024-2025, PostgreSQL Global Development Group
+# Copyright (c) 2024-2026, PostgreSQL Global Development Group
 
 use strict;
 use warnings FATAL => 'all';
@@ -91,7 +91,7 @@ $node_standby->wait_for_event('checkpointer', 'create-restart-point');
 # Check the logs that the restart point has started on standby.  This is
 # optional, but let's be sure.
 ok( $node_standby->log_contains(
-		"restartpoint starting: immediate wait", $logstart),
+		"restartpoint starting: fast wait", $logstart),
 	"restartpoint has started");
 
 # Trigger promotion during the restart point.
@@ -142,10 +142,13 @@ chomp($pid);
 $killme_stdout = '';
 $killme_stderr = '';
 
+# Record the log position before triggering crash recovery.
+my $crash_logstart = -s $node_standby->logfile;
+
 my $ret = PostgreSQL::Test::Utils::system_log('pg_ctl', 'kill', 'KILL', $pid);
 is($ret, 0, 'killed process with KILL');
 
-# Wait until the server restarts, finish consuming output.
+# Finish consuming output from the killed backend.
 $killme_stdin .= q[
 SELECT 1;
 ];
@@ -158,8 +161,15 @@ ok( pump_until(
 	"psql query died successfully after SIGKILL");
 $killme->finish;
 
-# Wait till server finishes restarting.
-$node_standby->poll_query_until('postgres', undef, '');
+# Wait until the postmaster has noticed the crash and begun restarting.
+# The killed backend's connection can fail before this happens.
+$node_standby->wait_for_log(
+	qr/all server processes terminated; reinitializing/,
+	$crash_logstart);
+
+# Wait until recovery finishes and connections are accepted.
+is($node_standby->poll_query_until('postgres', undef, ''),
+	1, 'reconnected after SIGKILL');
 
 # After recovery, the server should be able to start.
 my $stdout;

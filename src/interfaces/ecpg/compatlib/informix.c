@@ -520,11 +520,11 @@ rdatestr(date d, char *str)
 }
 
 /*
-*
-* the input for this function is mmddyyyy and any non-numeric
-* character can be used as a separator
-*
-*/
+ *
+ * the input for this function is mmddyyyy and any non-numeric
+ * character can be used as a separator
+ *
+ */
 int
 rstrdate(const char *str, date * d)
 {
@@ -807,8 +807,10 @@ rfmtlong(long lng_val, const char *fmt, char *outbuf)
 	if (strchr(fmt, (int) '(') && strchr(fmt, (int) ')'))
 		brackets_ok = 1;
 
-	/* get position of the right-most dot in the format-string */
-	/* and fill the temp-string wit '0's up to there. */
+	/*
+	 * get position of the right-most dot in the format-string and fill the
+	 * temp-string with '0's up to there.
+	 */
 	dotpos = getRightMostDot(fmt);
 
 	/* start to parse the format-string */

@@ -1,4 +1,4 @@
-# Copyright (c) 2024-2025, PostgreSQL Global Development Group
+# Copyright (c) 2024-2026, PostgreSQL Global Development Group
 
 # Test SCRAM authentication when opening a new connection with a foreign
 # server.
@@ -103,10 +103,10 @@ test_fdw_auth_with_invalid_overwritten_require_auth($fdw_invalid_server);
 {
 	my $connstr = $node1->connstr($db0) . qq' user=$user';
 
-	$node1->safe_psql($db0,
+	$node1->safe_psql(
+		$db0,
 		qq'ALTER USER MAPPING FOR $user SERVER $fdw_server3 OPTIONS(add use_scram_passthrough \'false\')',
-		connstr => $connstr
-	);
+		connstr => $connstr);
 
 	my ($ret, $stdout, $stderr) = $node1->psql(
 		$db0,
@@ -114,10 +114,9 @@ test_fdw_auth_with_invalid_overwritten_require_auth($fdw_invalid_server);
 		connstr => $connstr);
 
 	is($ret, 3, 'SCRAM passthrough disabled on user mapping should fail');
-	like(
-		$stderr,
-		qr/password/i,
-		'expected password-related error when scram passthrough disabled on user mapping');
+	like($stderr, qr/password/i,
+		'expected password-related error when scram passthrough disabled on user mapping'
+	);
 }
 
 # Ensure that trust connections fail without superuser opt-in.

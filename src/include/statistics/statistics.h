@@ -3,7 +3,7 @@
  * statistics.h
  *	  Extended statistics and selectivity estimation functions.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/statistics/statistics.h
@@ -101,6 +101,7 @@ extern MCVList *statext_mcv_load(Oid mvoid, bool inh);
 extern void BuildRelationExtStatistics(Relation onerel, bool inh, double totalrows,
 									   int numrows, HeapTuple *rows,
 									   int natts, VacAttrStats **vacattrstats);
+extern bool HasRelationExtStatistics(Relation onerel);
 extern int	ComputeExtStatisticsRows(Relation onerel,
 									 int natts, VacAttrStats **vacattrstats);
 extern bool statext_is_kind_built(HeapTuple htup, char type);
@@ -126,5 +127,30 @@ extern StatisticExtInfo *choose_best_statistics(List *stats, char requiredkind,
 												List **clause_exprs,
 												int nclauses);
 extern HeapTuple statext_expressions_load(Oid stxoid, bool inh, int idx);
+
+extern bool import_relation_statistics(Relation rel,
+									   const NullableDatum *version,
+									   const NullableDatum *relpages,
+									   const NullableDatum *reltuples,
+									   const NullableDatum *relallvisible,
+									   const NullableDatum *relallfrozen);
+extern bool import_attribute_statistics(Relation rel,
+										AttrNumber attnum, bool inherited,
+										const NullableDatum *version,
+										const NullableDatum *null_frac,
+										const NullableDatum *avg_width,
+										const NullableDatum *n_distinct,
+										const NullableDatum *most_common_vals,
+										const NullableDatum *most_common_freqs,
+										const NullableDatum *histogram_bounds,
+										const NullableDatum *correlation,
+										const NullableDatum *most_common_elems,
+										const NullableDatum *most_common_elem_freqs,
+										const NullableDatum *elem_count_histogram,
+										const NullableDatum *range_length_histogram,
+										const NullableDatum *range_empty_frac,
+										const NullableDatum *range_bounds_histogram);
+extern bool delete_attribute_statistics(Relation rel,
+										AttrNumber attnum, bool inherited);
 
 #endif							/* STATISTICS_H */

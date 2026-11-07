@@ -2,7 +2,7 @@
  * dbsize.c
  *		Database object size functions, and related inquiries
  *
- * Copyright (c) 2002-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/adt/dbsize.c
@@ -10,8 +10,6 @@
  */
 
 #include "postgres.h"
-
-#include "catalog/catalogview.h"
 
 #include <sys/stat.h>
 
@@ -21,12 +19,12 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_tablespace.h"
-#include "commands/dbcommands.h"
 #include "commands/tablespace.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/numeric.h"
 #include "utils/rel.h"
 #include "utils/relfilenumbermap.h"
@@ -370,12 +368,6 @@ pg_relation_size(PG_FUNCTION_ARGS)
 	Relation	rel;
 	int64		size;
 
-	/* A canonical descriptor is not a physical file locator. */
-	if (CatalogViewIsLeased(relOid))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("physical size is not defined for a revision-bound relation")));
-
 	rel = try_relation_open(relOid, AccessShareLock);
 
 	/*
@@ -515,12 +507,6 @@ pg_table_size(PG_FUNCTION_ARGS)
 	Relation	rel;
 	int64		size;
 
-	/* A canonical descriptor is not a physical file locator. */
-	if (CatalogViewIsLeased(relOid))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("physical size is not defined for a revision-bound relation")));
-
 	rel = try_relation_open(relOid, AccessShareLock);
 
 	if (rel == NULL)
@@ -539,12 +525,6 @@ pg_indexes_size(PG_FUNCTION_ARGS)
 	Oid			relOid = PG_GETARG_OID(0);
 	Relation	rel;
 	int64		size;
-
-	/* A canonical descriptor is not a physical file locator. */
-	if (CatalogViewIsLeased(relOid))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("physical size is not defined for a revision-bound relation")));
 
 	rel = try_relation_open(relOid, AccessShareLock);
 
@@ -587,12 +567,6 @@ pg_total_relation_size(PG_FUNCTION_ARGS)
 	Oid			relOid = PG_GETARG_OID(0);
 	Relation	rel;
 	int64		size;
-
-	/* A canonical descriptor is not a physical file locator. */
-	if (CatalogViewIsLeased(relOid))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("physical size is not defined for a revision-bound relation")));
 
 	rel = try_relation_open(relOid, AccessShareLock);
 

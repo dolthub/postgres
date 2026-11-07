@@ -3,7 +3,7 @@
  * pg_constraint.c
  *	  routines to support manipulation of the pg_constraint relation
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -182,7 +182,7 @@ CreateConstraintEntry(const char *constraintName,
 	for (i = 0; i < Natts_pg_constraint; i++)
 	{
 		nulls[i] = false;
-		values[i] = (Datum) NULL;
+		values[i] = (Datum) 0;
 	}
 
 	conOid = GetNewOidWithIndex(conDesc, ConstraintOidIndexId,
@@ -866,7 +866,7 @@ RelationGetNotNullConstraints(Oid relid, bool cooked, bool include_noinh)
 		{
 			CookedConstraint *cooked;
 
-			cooked = (CookedConstraint *) palloc(sizeof(CookedConstraint));
+			cooked = palloc_object(CookedConstraint);
 
 			cooked->contype = CONSTR_NOTNULL;
 			cooked->conoid = conForm->oid;
@@ -957,10 +957,12 @@ RemoveConstraintById(Oid conId)
 					 con->conrelid);
 			classForm = (Form_pg_class) GETSTRUCT(relTup);
 
-			if (classForm->relchecks == 0)	/* should not happen */
-				elog(ERROR, "relation \"%s\" has relchecks = 0",
-					 RelationGetRelationName(rel));
-			classForm->relchecks--;
+			if (classForm->relchecks > 0)
+				classForm->relchecks--;
+			else
+				/* should not happen */
+				elog(WARNING, "relation \"%s\" has relchecks = %d",
+					 RelationGetRelationName(rel), classForm->relchecks);
 
 			CatalogTupleUpdate(pgrel, &relTup->t_self, relTup);
 
@@ -1562,7 +1564,7 @@ DeconstructFkConstraintRow(HeapTuple tuple, int *numfks,
 	if (numkeys <= 0 || numkeys > INDEX_MAX_KEYS)
 		elog(ERROR, "foreign key constraint cannot have %d columns", numkeys);
 	memcpy(conkey, ARR_DATA_PTR(arr), numkeys * sizeof(int16));
-	if ((Pointer) arr != DatumGetPointer(adatum))
+	if (arr != DatumGetPointer(adatum))
 		pfree(arr);				/* free de-toasted copy, if any */
 
 	adatum = SysCacheGetAttrNotNull(CONSTROID, tuple,
@@ -1574,7 +1576,7 @@ DeconstructFkConstraintRow(HeapTuple tuple, int *numfks,
 		ARR_ELEMTYPE(arr) != INT2OID)
 		elog(ERROR, "confkey is not a 1-D smallint array");
 	memcpy(confkey, ARR_DATA_PTR(arr), numkeys * sizeof(int16));
-	if ((Pointer) arr != DatumGetPointer(adatum))
+	if (arr != DatumGetPointer(adatum))
 		pfree(arr);				/* free de-toasted copy, if any */
 
 	if (pf_eq_oprs)
@@ -1589,7 +1591,7 @@ DeconstructFkConstraintRow(HeapTuple tuple, int *numfks,
 			ARR_ELEMTYPE(arr) != OIDOID)
 			elog(ERROR, "conpfeqop is not a 1-D Oid array");
 		memcpy(pf_eq_oprs, ARR_DATA_PTR(arr), numkeys * sizeof(Oid));
-		if ((Pointer) arr != DatumGetPointer(adatum))
+		if (arr != DatumGetPointer(adatum))
 			pfree(arr);			/* free de-toasted copy, if any */
 	}
 
@@ -1604,7 +1606,7 @@ DeconstructFkConstraintRow(HeapTuple tuple, int *numfks,
 			ARR_ELEMTYPE(arr) != OIDOID)
 			elog(ERROR, "conppeqop is not a 1-D Oid array");
 		memcpy(pp_eq_oprs, ARR_DATA_PTR(arr), numkeys * sizeof(Oid));
-		if ((Pointer) arr != DatumGetPointer(adatum))
+		if (arr != DatumGetPointer(adatum))
 			pfree(arr);			/* free de-toasted copy, if any */
 	}
 
@@ -1619,7 +1621,7 @@ DeconstructFkConstraintRow(HeapTuple tuple, int *numfks,
 			ARR_ELEMTYPE(arr) != OIDOID)
 			elog(ERROR, "conffeqop is not a 1-D Oid array");
 		memcpy(ff_eq_oprs, ARR_DATA_PTR(arr), numkeys * sizeof(Oid));
-		if ((Pointer) arr != DatumGetPointer(adatum))
+		if (arr != DatumGetPointer(adatum))
 			pfree(arr);			/* free de-toasted copy, if any */
 	}
 
@@ -1642,7 +1644,7 @@ DeconstructFkConstraintRow(HeapTuple tuple, int *numfks,
 				elog(ERROR, "confdelsetcols is not a 1-D smallint array");
 			num_delete_cols = ARR_DIMS(arr)[0];
 			memcpy(fk_del_set_cols, ARR_DATA_PTR(arr), num_delete_cols * sizeof(int16));
-			if ((Pointer) arr != DatumGetPointer(adatum))
+			if (arr != DatumGetPointer(adatum))
 				pfree(arr);		/* free de-toasted copy, if any */
 
 			*num_fk_del_set_cols = num_delete_cols;

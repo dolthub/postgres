@@ -82,9 +82,10 @@ $node2->poll_query_until('postgres', "SELECT pg_is_in_recovery() = 'f';");
 # segment.  So the full segment should get archived on timeline 2, but not on
 # timeline 1. We do a CHECKPOINT here to make sure that the summarizer tries
 # to progress.
-my $node2_switch_lsn =
-	$node2->safe_psql('postgres', 'SELECT pg_switch_wal()');
-$node2->safe_psql('postgres', 'CHECKPOINT');
+$node2->safe_psql('postgres', <<EOM);
+SELECT pg_switch_wal();
+CHECKPOINT;
+EOM
 
 # Wait until replay has reached TLI 2 on node3, and then start the WAL
 # summarizer. If node3 is started with the summarizer already enabled, then
@@ -92,14 +93,10 @@ $node2->safe_psql('postgres', 'CHECKPOINT');
 # about timeline 2. If that happens, it will error out, wait 10 seconds, and
 # retry, slowing down the test. This avoids that.
 #
-# Since the pg_switch_wal() above was executed after promotion, its return
-# value is past the timeline switch point, so once replay reaches it, node3
-# must be replaying from TLI 2.
-#
 # We set log_min_messages=debug1 at the same time we enable WAL summarization
 # so that we get useful debug messages if there's any problem.
 $node3->poll_query_until('postgres',
-	"SELECT pg_last_wal_replay_lsn() >= '$node2_switch_lsn'::pg_lsn")
+	"SELECT replay_end_tli = 2 FROM pg_stat_get_recovery()")
 	or die "TLI 2 not reached on node3";
 $node3->append_conf('postgresql.conf', <<EOM);
 summarize_wal = on

@@ -4,7 +4,7 @@
  *	  Routines to support inter-object dependencies.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/dependency.h
@@ -107,14 +107,15 @@ extern void ReleaseDeletionLock(const ObjectAddress *object);
 extern void performDeletion(const ObjectAddress *object,
 							DropBehavior behavior, int flags);
 
-extern List *collect_catalog_deletions(const ObjectAddresses *objects, DropBehavior behavior);
-
 extern void performMultipleDeletions(const ObjectAddresses *objects,
 									 DropBehavior behavior, int flags);
 
 extern void recordDependencyOnExpr(const ObjectAddress *depender,
 								   Node *expr, List *rtable,
 								   DependencyType behavior);
+
+extern void collectDependenciesOfExpr(ObjectAddresses *addrs,
+									  Node *expr, List *rtable);
 
 extern void recordDependencyOnSingleRelExpr(const ObjectAddress *depender,
 											Node *expr, Oid relId,
@@ -125,6 +126,12 @@ extern void recordDependencyOnSingleRelExpr(const ObjectAddress *depender,
 extern void CheckUsageOnTypesInExpr(Node *expr, List *rtable, Oid roleid);
 
 extern void CheckUsageOnTypesInSingleRelExpr(Node *expr, Oid relId, Oid roleid);
+
+extern bool find_temp_object(const ObjectAddresses *addrs,
+							 bool local_temp_okay,
+							 ObjectAddress *foundobj);
+
+extern bool query_uses_temp_object(Query *query, ObjectAddress *temp_object);
 
 extern ObjectAddresses *new_object_addresses(void);
 

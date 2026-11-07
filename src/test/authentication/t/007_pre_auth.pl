@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2025, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 # Tests for connection behavior prior to authentication.
 
@@ -18,9 +18,14 @@ if ($ENV{enable_injection_points} ne 'yes')
 
 my $node = PostgreSQL::Test::Cluster->new('primary');
 $node->init;
+
+# Disable autovacuum and logical replication workers; these could reach
+# the injection point wait.
 $node->append_conf(
 	'postgresql.conf', q[
 log_connections = 'receipt,authentication'
+autovacuum = off
+max_logical_replication_workers = 0
 ]);
 
 $node->start;

@@ -8,10 +8,10 @@
 #
 msgid ""
 msgstr ""
-"Project-Id-Version: PostgreSQL 17\n"
+"Project-Id-Version: PostgreSQL 19\n"
 "Report-Msgid-Bugs-To: pgsql-bugs@lists.postgresql.org\n"
-"POT-Creation-Date: 2025-07-07 18:53+0000\n"
-"PO-Revision-Date: 2025-07-07 21:39+0200\n"
+"POT-Creation-Date: 2026-05-21 02:56+0000\n"
+"PO-Revision-Date: 2026-05-21 14:36+0200\n"
 "Last-Translator: Guillaume Lelarge <guillaume@lelarge.info>\n"
 "Language-Team: French <guillaume@lelarge.info>\n"
 "Language: fr\n"
@@ -19,38 +19,48 @@ msgstr ""
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=(n > 1);\n"
-"X-Generator: Poedit 3.6\n"
+"X-Generator: Poedit 3.9\n"
 
-#: ../../../src/common/logging.c:279
+#: ../../../src/common/logging.c:293 ../../../src/common/logging.c:295
 #, c-format
 msgid "error: "
 msgstr "erreur : "
 
-#: ../../../src/common/logging.c:286
+#: ../../../src/common/logging.c:302 ../../../src/common/logging.c:304
 #, c-format
 msgid "warning: "
 msgstr "attention : "
 
-#: ../../../src/common/logging.c:297
+#: ../../../src/common/logging.c:315 ../../../src/common/logging.c:317
 #, c-format
 msgid "detail: "
 msgstr "détail : "
 
-#: ../../../src/common/logging.c:304
+#: ../../../src/common/logging.c:324 ../../../src/common/logging.c:326
 #, c-format
 msgid "hint: "
 msgstr "astuce : "
 
-#: ../../common/fe_memutils.c:35 ../../common/fe_memutils.c:75
-#: ../../common/fe_memutils.c:98 ../../common/fe_memutils.c:161
+#: ../../common/fe_memutils.c:41 ../../common/fe_memutils.c:81
+#: ../../common/fe_memutils.c:104 ../../common/fe_memutils.c:167
 #, c-format
 msgid "out of memory\n"
 msgstr "mémoire épuisée\n"
 
-#: ../../common/fe_memutils.c:92 ../../common/fe_memutils.c:153
+#: ../../common/fe_memutils.c:98 ../../common/fe_memutils.c:159
 #, c-format
 msgid "cannot duplicate null pointer (internal error)\n"
 msgstr "ne peut pas dupliquer un pointeur nul (erreur interne)\n"
+
+#: ../../common/fe_memutils.c:209
+#, c-format
+msgid "invalid memory allocation request size %zu + %zu\n"
+msgstr "taille de la requête d'allocation mémoire invalide %zu + %zu\n"
+
+#: ../../common/fe_memutils.c:228
+#, c-format
+msgid "invalid memory allocation request size %zu * %zu\n"
+msgstr "taille de la requête d'allocation mémoire invalide %zu * %zu\n"
 
 #: pg_archivecleanup.c:69
 #, c-format
@@ -206,3 +216,12 @@ msgstr "doit spécifier le plus ancien journal de transactions conservé"
 #, c-format
 msgid "too many command-line arguments"
 msgstr "trop d'arguments en ligne de commande"
+
+#: pg_archivecleanup.c:379
+#, c-format
+msgid ""
+"Executing in dry-run mode.\n"
+"No files will be removed."
+msgstr ""
+"Exécution en mode test.\n"
+"Aucun fichier ne sera supprimé."

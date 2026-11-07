@@ -360,7 +360,7 @@ AND case proargtypes[array_length(proargtypes, 1)-1]
 	ELSE (SELECT t.oid
 		  FROM pg_type t
 		  WHERE t.typarray = proargtypes[array_length(proargtypes, 1)-1])
-	END  != provariadic;
+	END IS DISTINCT FROM provariadic;
 
 -- Check that all and only those functions with a variadic type have
 -- a variadic argument.
@@ -847,7 +847,7 @@ WHERE aggfnoid = 0 OR aggtransfn = 0 OR
     (aggkind = 'n' AND aggnumdirectargs > 0) OR
     aggfinalmodify NOT IN ('r', 's', 'w') OR
     aggmfinalmodify NOT IN ('r', 's', 'w') OR
-    aggtranstype = 0 OR aggtransspace < 0 OR aggmtransspace < 0;
+    aggtranstype = 0 OR aggmtransspace < 0;
 
 -- Make sure the matching pg_proc entry is sensible, too.
 

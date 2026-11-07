@@ -10,7 +10,7 @@
  * and GetExtensibleNodeMethods to get information about a previously
  * registered type of extensible node.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -19,7 +19,6 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "access/doltcatalog.h"
 
 #include "nodes/extensible.h"
 #include "utils/hsearch.h"
@@ -137,8 +136,6 @@ GetExtensibleNodeMethods(const char *extnodename, bool missing_ok)
 const CustomScanMethods *
 GetCustomScanMethods(const char *CustomName, bool missing_ok)
 {
-	if (!strcmp(CustomName, "DoltCatalogScan"))
-		return dg_catalog_scan_methods();
 	return (const CustomScanMethods *)
 		GetExtensibleNodeEntry(custom_scan_methods,
 							   CustomName,

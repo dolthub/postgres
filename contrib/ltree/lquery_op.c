@@ -96,28 +96,13 @@ ltree_label_match(const char *pred, size_t pred_len, const char *label,
 	else if (!ci)
 		return false;
 
-	if (!locale)
-		locale = pg_newlocale_from_collation(DEFAULT_COLLATION_OID);
-
-	if (locale->ctype_is_c)
-	{
-		if (pred_len > label_len || (!prefix && pred_len != label_len))
-			return false;
-
-		for (int i = 0; i < pred_len; i++)
-		{
-			if (pg_ascii_tolower(pred[i]) != pg_ascii_tolower(label[i]))
-				return false;
-		}
-
-		return true;
-	}
-
 	/*
 	 * Slow path for case-insensitive comparison: case fold and then compare.
 	 * This path is necessary even if pred_len > label_len, because the byte
 	 * lengths may change after casefolding.
 	 */
+	if (!locale)
+		locale = pg_database_locale();
 
 	fpred = palloc(fpred_len + 1);
 	len = pg_strfold(fpred, fpred_len + 1, pred, pred_len, locale);

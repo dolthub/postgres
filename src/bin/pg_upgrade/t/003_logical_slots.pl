@@ -1,4 +1,4 @@
-# Copyright (c) 2023-2025, PostgreSQL Global Development Group
+# Copyright (c) 2023-2026, PostgreSQL Global Development Group
 
 # Tests for upgrading logical replication slots
 
@@ -58,17 +58,18 @@ chdir ${PostgreSQL::Test::Utils::tmp_check};
 # TEST: Confirm pg_upgrade fails when the new cluster has wrong GUC values
 
 # Preparations for the subsequent test:
-# 1. Create two slots on the old cluster
+# 1. Create two slots in the old cluster
 $oldpub->start;
 $oldpub->safe_psql(
 	'postgres', qq[
 	SELECT pg_create_logical_replication_slot('test_slot1', 'pgoutput');
 	SELECT pg_create_logical_replication_slot('test_slot2', 'test_decoding');
+	SELECT pg_create_logical_replication_slot('test_slot3', 'test_decoding');
 ]);
 $oldpub->stop();
 
 # 2. Set 'max_replication_slots' to be less than the number of slots (2)
-#	 present on the old cluster.
+#	 present in the old cluster.
 $newpub->append_conf('postgresql.conf', "max_replication_slots = 1");
 
 # pg_upgrade will fail because the new cluster has insufficient
@@ -77,7 +78,7 @@ command_checks_all(
 	[@pg_upgrade_cmd],
 	1,
 	[
-		qr/"max_replication_slots" \(1\) must be greater than or equal to the number of logical replication slots \(2\) on the old cluster/
+		qr/"max_replication_slots" \(1\) must be greater than or equal to the number of logical replication slots \(3\) in the old cluster/
 	],
 	[qr//],
 	'run of pg_upgrade where the new cluster has insufficient "max_replication_slots"'
@@ -85,9 +86,9 @@ command_checks_all(
 ok(-d $newpub->data_dir . "/pg_upgrade_output.d",
 	"pg_upgrade_output.d/ not removed after pg_upgrade failure");
 
-# Set 'max_replication_slots' to match the number of slots (2) present on the
+# Set 'max_replication_slots' to match the number of slots (3) present on the
 # old cluster. Both slots will be used for subsequent tests.
-$newpub->append_conf('postgresql.conf', "max_replication_slots = 2");
+$newpub->append_conf('postgresql.conf', "max_replication_slots = 3");
 
 # ------------------------------
 # TEST: Confirm pg_upgrade fails when slot plugins are prohibited by the new cluster
@@ -125,6 +126,10 @@ like(
 	$content,
 	qr/The slot "test_slot2" uses plugin "test_decoding"/m,
 	'the previous test failed due to prohibited plugins');
+like(
+	$content,
+	qr/The slot "test_slot3" uses plugin "test_decoding"/m,
+	'the previous test failed due to prohibited plugins');
 unlike($content, qr/test_slot1/m, 'allowed plugin is not reported');
 
 # Fix things for the next tests.
@@ -136,20 +141,22 @@ $newpub->append_conf('postgresql.conf',
 # TEST: Confirm pg_upgrade fails when the slot still has unconsumed WAL records
 
 # Preparations for the subsequent test:
-# 1. Generate extra WAL records. At this point neither test_slot1 nor
-#	 test_slot2 has consumed them.
+# 1. Generate extra WAL records. At this point none of the slots has consumed them.
 #
 # 2. Advance the slot test_slot2 up to the current WAL location, but test_slot1
 #	 still has unconsumed WAL records.
 #
 # 3. Emit a non-transactional message. This will cause test_slot2 to detect the
 #	 unconsumed WAL record.
+#
+# 4. Advance the slot test_slots3 up to the current WAL location.
 $oldpub->start;
 $oldpub->safe_psql(
 	'postgres', qq[
 		CREATE TABLE tbl AS SELECT generate_series(1, 10) AS a;
 		SELECT pg_replication_slot_advance('test_slot2', pg_current_wal_lsn());
-		SELECT count(*) FROM pg_logical_emit_message('false', 'prefix', 'This is a non-transactional message');
+		SELECT count(*) FROM pg_logical_emit_message('false', 'prefix', 'This is a non-transactional message', true);
+		SELECT pg_replication_slot_advance('test_slot3', pg_current_wal_lsn());
 ]);
 $oldpub->stop;
 
@@ -175,8 +182,9 @@ find(
 	},
 	$newpub->data_dir . "/pg_upgrade_output.d");
 
-# Check the file content. Both slots should be reporting that they have
-# unconsumed WAL records.
+# Check the file content. While both test_slot1 and test_slot2 should be reporting
+# that they have unconsumed WAL records, test_slot3 should not be reported as
+# it has caught up.
 like(
 	slurp_file($slots_filename),
 	qr/The slot \"test_slot1\" has not consumed the WAL yet/m,
@@ -185,6 +193,8 @@ like(
 	slurp_file($slots_filename),
 	qr/The slot \"test_slot2\" has not consumed the WAL yet/m,
 	'the previous test failed due to unconsumed WALs');
+unlike(slurp_file($slots_filename),
+	qr/test_slot3/m, 'caught-up slot is not reported');
 
 
 # ------------------------------
@@ -199,6 +209,7 @@ $oldpub->safe_psql(
 	'postgres', qq[
 	SELECT * FROM pg_drop_replication_slot('test_slot1');
 	SELECT * FROM pg_drop_replication_slot('test_slot2');
+	SELECT * FROM pg_drop_replication_slot('test_slot3');
 	CREATE PUBLICATION regress_pub FOR ALL TABLES;
 ]);
 

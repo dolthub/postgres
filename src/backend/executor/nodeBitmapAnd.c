@@ -3,7 +3,7 @@
  * nodeBitmapAnd.c
  *	  routines to handle BitmapAnd nodes.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -12,7 +12,8 @@
  *
  *-------------------------------------------------------------------------
  */
-/* INTERFACE ROUTINES
+/*
+ * INTERFACE ROUTINES
  *		ExecInitBitmapAnd	- initialize the BitmapAnd node
  *		MultiExecBitmapAnd	- retrieve the result bitmap from the node
  *		ExecEndBitmapAnd	- shut down the BitmapAnd node
@@ -29,7 +30,9 @@
 #include "postgres.h"
 
 #include "executor/executor.h"
+#include "executor/instrument.h"
 #include "executor/nodeBitmapAnd.h"
+#include "nodes/tidbitmap.h"
 
 
 /* ----------------------------------------------------------------

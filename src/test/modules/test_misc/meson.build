@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2025, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 tests += {
   'name': 'test_misc',
@@ -17,8 +17,13 @@ tests += {
       't/006_signal_autovacuum.pl',
       't/007_catcache_inval.pl',
       't/008_replslot_single_user.pl',
+      't/009_log_temp_files.pl',
+      't/010_index_concurrently_upsert.pl',
+      't/011_lock_stats.pl',
       't/013_temp_obj_multisession.pl',
-      't/014_multixact_aborted_updater.pl',
+      't/015_temp_schema_exit_deferrable.pl',
     ],
+    # The injection points are cluster-wide, so disable installcheck
+    'runningcheck': false,
   },
 }

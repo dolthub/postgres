@@ -243,6 +243,9 @@ COPY gtest3 (a, b) FROM stdin;
 
 SELECT * FROM gtest3 ORDER BY a;
 
+-- COPY JSON should exclude generated columns, same as text/CSV
+COPY gtest1 TO stdout WITH (FORMAT json);
+
 -- null values
 CREATE TABLE gtest2 (a int PRIMARY KEY, b int GENERATED ALWAYS AS (NULL) STORED);
 INSERT INTO gtest2 VALUES (1);
@@ -342,18 +345,81 @@ CREATE TABLE gtest20c (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
 ALTER TABLE gtest20c ADD CONSTRAINT whole_row_check CHECK (gtest20c IS NOT NULL);
 INSERT INTO gtest20c VALUES (1);  -- ok
 INSERT INTO gtest20c VALUES (NULL);  -- fails
+ALTER TABLE gtest20c ALTER COLUMN b SET EXPRESSION AS (NULL::int);  -- violates constraint
+
+-- index with whole-row reference needs rebuild
+CREATE TABLE gtest20d (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+INSERT INTO gtest20d VALUES (1), (1);
+CREATE INDEX gtest20d_idx1 ON gtest20d (a) WHERE gtest20d = ROW (1, 2);
+
+ALTER TABLE gtest20d ALTER COLUMN b SET EXPRESSION AS (a * 2::bigint);  -- index rebuild
+CREATE INDEX gtest20d_idx2 ON gtest20d ((gtest20d = ROW (1, 2)));
+ALTER TABLE gtest20d ALTER COLUMN b SET EXPRESSION AS (a * 3);  -- index rebuild
 
 -- not-null constraints
 CREATE TABLE gtest21a (a int PRIMARY KEY, b int GENERATED ALWAYS AS (nullif(a, 0)) STORED NOT NULL);
 INSERT INTO gtest21a (a) VALUES (1);  -- ok
 INSERT INTO gtest21a (a) VALUES (0);  -- violates constraint
 
-CREATE TABLE gtest21b (a int PRIMARY KEY, b int GENERATED ALWAYS AS (nullif(a, 0)) STORED);
+-- also check with table constraint syntax
+CREATE TABLE gtest21ax (a int PRIMARY KEY, b int GENERATED ALWAYS AS (nullif(a, 0)) STORED, CONSTRAINT cc NOT NULL b);
+INSERT INTO gtest21ax (a) VALUES (0);  -- violates constraint
+INSERT INTO gtest21ax (a) VALUES (1);  --ok
+-- SET EXPRESSION supports not null constraint
+ALTER TABLE gtest21ax ALTER COLUMN b SET EXPRESSION AS (nullif(a, 1)); --error
+DROP TABLE gtest21ax;
+
+CREATE TABLE gtest21ax (a int PRIMARY KEY, b int GENERATED ALWAYS AS (nullif(a, 0)) STORED);
+ALTER TABLE gtest21ax ADD CONSTRAINT cc NOT NULL b;
+INSERT INTO gtest21ax (a) VALUES (0);  -- violates constraint
+DROP TABLE gtest21ax;
+
+CREATE TABLE gtest21b (a int, b int GENERATED ALWAYS AS (nullif(a, 0)) STORED);
 ALTER TABLE gtest21b ALTER COLUMN b SET NOT NULL;
 INSERT INTO gtest21b (a) VALUES (1);  -- ok
-INSERT INTO gtest21b (a) VALUES (0);  -- violates constraint
+INSERT INTO gtest21b (a) VALUES (2), (0);  -- violates constraint
+INSERT INTO gtest21b (a) VALUES (NULL);  -- error
 ALTER TABLE gtest21b ALTER COLUMN b DROP NOT NULL;
 INSERT INTO gtest21b (a) VALUES (0);  -- ok now
+
+-- virtual generated columns are not physically stored, even when not null
+--CREATE TABLE gtest21c (a int NOT NULL, b int GENERATED ALWAYS AS (a * 2) VIRTUAL NOT NULL, c int NOT NULL);
+--INSERT INTO gtest21c (a, c) VALUES (10, 42);
+--SELECT a, b, c FROM gtest21c;
+--DROP TABLE gtest21c;
+-- try adding a virtual generated column to an existing table with tuples,
+-- then try adding an atthasmissing column before adding a normal nullable
+-- column.
+--CREATE TABLE gtest21d (a int NOT NULL);
+--INSERT INTO gtest21d (a) VALUES(10);
+--ALTER TABLE gtest21d ADD COLUMN b INT GENERATED ALWAYS AS (a * 10) VIRTUAL NOT NULL;
+--SELECT * FROM gtest21d ORDER BY a;
+--INSERT INTO gtest21d (a) VALUES(20);
+--ALTER TABLE gtest21d ADD COLUMN c INT NOT NULL DEFAULT 1234;
+--SELECT * FROM gtest21d ORDER BY a;
+--ALTER TABLE gtest21d ADD COLUMN d INT;
+--INSERT INTO gtest21d (a, c, d) VALUES(30, 12345, 100);
+--SELECT * FROM gtest21d ORDER BY a;
+--DROP TABLE gtest21d;
+-- not-null constraint with partitioned table
+CREATE TABLE gtestnn_parent (
+    f1 int,
+    f2 bigint,
+    f3 bigint GENERATED ALWAYS AS (nullif(f1, 1) + nullif(f2, 10)) STORED NOT NULL
+) PARTITION BY RANGE (f1);
+CREATE TABLE gtestnn_child PARTITION OF gtestnn_parent FOR VALUES FROM (1) TO (5);
+CREATE TABLE gtestnn_childdef PARTITION OF gtestnn_parent default;
+-- check the error messages
+INSERT INTO gtestnn_parent VALUES (2, 2, default), (3, 5, default), (14, 12, default);  -- ok
+INSERT INTO gtestnn_parent VALUES (1, 2, default);  -- error
+INSERT INTO gtestnn_parent VALUES (2, 10, default);  -- error
+ALTER TABLE gtestnn_parent ALTER COLUMN f3 SET EXPRESSION AS (nullif(f1, 2) + nullif(f2, 11));  -- error
+INSERT INTO gtestnn_parent VALUES (10, 11, default);  -- ok
+SELECT * FROM gtestnn_parent ORDER BY f1, f2, f3;
+-- test ALTER TABLE ADD COLUMN
+ALTER TABLE gtestnn_parent ADD COLUMN c int NOT NULL GENERATED ALWAYS AS (nullif(f1, 14) + nullif(f2, 10)) STORED;  -- error
+ALTER TABLE gtestnn_parent ADD COLUMN c int NOT NULL GENERATED ALWAYS AS (nullif(f1, 13) + nullif(f2, 5)) STORED;  -- error
+ALTER TABLE gtestnn_parent ADD COLUMN c int NOT NULL GENERATED ALWAYS AS (nullif(f1, 4) + nullif(f2, 6)) STORED;  -- ok
 
 -- index constraints
 CREATE TABLE gtest22a (a int PRIMARY KEY, b int GENERATED ALWAYS AS (a / 2) STORED UNIQUE);
@@ -426,6 +492,11 @@ CREATE TYPE gtestdomain1range AS range (subtype = gtestdomain1);
 CREATE TABLE gtest24r (a int PRIMARY KEY, b gtestdomain1range GENERATED ALWAYS AS (gtestdomain1range(a, a + 5)) STORED);
 INSERT INTO gtest24r (a) VALUES (4);  -- ok
 INSERT INTO gtest24r (a) VALUES (6);  -- error
+
+CREATE TABLE gtest24at (a int PRIMARY KEY);
+ALTER TABLE gtest24at ADD COLUMN b gtestdomain1 GENERATED ALWAYS AS (a * 2) STORED;  -- ok
+CREATE TABLE gtest24ata (a int PRIMARY KEY, b int GENERATED ALWAYS AS (a * 2) STORED);
+ALTER TABLE gtest24ata ALTER COLUMN b TYPE gtestdomain1;  -- ok
 
 CREATE DOMAIN gtestdomainnn AS int CHECK (VALUE IS NOT NULL);
 CREATE TABLE gtest24nn (a int, b gtestdomainnn GENERATED ALWAYS AS (a * 2) STORED);
@@ -541,6 +612,14 @@ ALTER TABLE gtest27 ALTER COLUMN x TYPE numeric;
 SELECT * FROM gtest27;
 ALTER TABLE gtest27 ALTER COLUMN x TYPE boolean USING x <> 0;  -- error
 ALTER TABLE gtest27 ALTER COLUMN x DROP DEFAULT;  -- error
+-- test not-null checking during table rewrite
+INSERT INTO gtest27 (a, b) VALUES (NULL, NULL);
+ALTER TABLE gtest27
+  DROP COLUMN x,
+  ALTER COLUMN a TYPE bigint,
+  ALTER COLUMN b TYPE bigint,
+  ADD COLUMN x bigint GENERATED ALWAYS AS ((a + b) * 2) STORED NOT NULL;  -- error
+DELETE FROM gtest27 WHERE a IS NULL AND b IS NULL;
 -- It's possible to alter the column types this way:
 ALTER TABLE gtest27
   DROP COLUMN x,

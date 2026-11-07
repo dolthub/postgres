@@ -782,6 +782,32 @@ alter table atacc1 add column test2 int primary key;
 alter table atacc1 add column test2 int default 0 primary key;
 drop table atacc1;
 
+-- Replacing a NOT NULL column must create a new constraint for the primary key.
+create table atacc1 (id int not null);
+alter table atacc1 drop column id, add column id int, add primary key (id);
+drop table atacc1;
+-- A NOT NULL constraint dropped in the same ALTER TABLE must be replaced.
+create table atacc1 (id int not null);
+alter table atacc1 alter column id drop not null, add primary key (id);
+drop table atacc1;
+create table atacc1 (id int constraint atacc1_id_nn not null);
+alter table atacc1 drop constraint atacc1_id_nn, add primary key (id);
+drop table atacc1;
+-- ADD PRIMARY KEY must prefer an explicitly named replacement NOT NULL.
+create table atacc1 (id int not null);
+alter table atacc1 alter column id drop not null,
+  add primary key (id), add constraint atacc1_id_nn not null id;
+drop table atacc1;
+create table atacc1 (id int not null);
+alter table atacc1 alter column id drop not null,
+  add constraint atacc1_id_nn not null id, add primary key (id);
+drop table atacc1;
+-- The replacement NOT NULL constraint must propagate to the partitions too.
+create table atacc1 (id int not null) partition by range (id);
+create table atacc1_1 partition of atacc1 for values from (0) to (10);
+alter table atacc1 alter column id drop not null, add primary key (id);
+drop table atacc1;
+
 -- this combination used to have order-of-execution problems (bug #15580)
 create table atacc1 (a int);
 insert into atacc1 values(1);
@@ -2407,8 +2433,12 @@ CREATE TABLE nonpartitioned (
 	a int,
 	b int
 );
-ALTER TABLE partitioned INHERIT nonpartitioned;
-ALTER TABLE nonpartitioned INHERIT partitioned;
+ALTER TABLE partitioned INHERIT nonpartitioned; -- fail
+ALTER TABLE partitioned NO INHERIT nonpartitioned; -- fail
+ALTER TABLE nonpartitioned INHERIT partitioned; -- fail
+CREATE TABLE partitioned_p1 PARTITION OF partitioned FOR VALUES FROM (0, 0) TO (10, 100);
+ALTER TABLE partitioned_p1 INHERIT nonpartitioned; -- fail
+ALTER TABLE partitioned_p1 NO INHERIT nonpartitioned; -- fail
 
 -- cannot add NO INHERIT constraint to partitioned tables
 ALTER TABLE partitioned ADD CONSTRAINT chk_a CHECK (a > 0) NO INHERIT;
@@ -2836,12 +2866,6 @@ DROP TABLE part_rpd;
 -- works fine
 ALTER TABLE range_parted2 DETACH PARTITION part_rp CONCURRENTLY;
 \d+ range_parted2
--- constraint should be created
-\d part_rp
-CREATE TABLE part_rp100 PARTITION OF range_parted2 (CHECK (a>=123 AND a<133 AND a IS NOT NULL)) FOR VALUES FROM (100) to (200);
-ALTER TABLE range_parted2 DETACH PARTITION part_rp100 CONCURRENTLY;
--- redundant constraint should not be created
-\d part_rp100
 DROP TABLE range_parted2;
 
 -- Test that hash partitions continue to work after they're concurrently

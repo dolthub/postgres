@@ -3,7 +3,7 @@
  * test_json_parser_incremental.c
  *    Test program for incremental JSON parser
  *
- * Copyright (c) 2024-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2024-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *    src/test/modules/test_json_parser/test_json_parser_incremental.c
@@ -113,7 +113,7 @@ main(int argc, char **argv)
 		{
 			case 'r':			/* chunk range */
 				run_chunk_ranges = true;
-				/* fall through */
+				pg_fallthrough;
 			case 'c':			/* chunk size */
 				chunk_size = strtou64(optarg, NULL, 10);
 				if (chunk_size > BUFSIZE)
@@ -124,7 +124,7 @@ main(int argc, char **argv)
 				break;
 			case 's':			/* do semantic processing */
 				testsem = &sem;
-				sem.semstate = palloc(sizeof(struct DoState));
+				sem.semstate = palloc_object(struct DoState);
 				((struct DoState *) sem.semstate)->lex = lex;
 				((struct DoState *) sem.semstate)->buf = makeStringInfo();
 				need_strings = true;

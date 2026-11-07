@@ -702,7 +702,7 @@ SELECT calls, rows, query FROM pg_stat_statements ORDER BY query COLLATE "C";
      1 |   13 | CREATE MATERIALIZED VIEW pgss_matv AS SELECT * FROM pgss_ctas
      1 |   10 | CREATE TABLE pgss_ctas AS SELECT a, $1 b FROM generate_series($2, $3) a
      1 |    0 | DECLARE pgss_cursor CURSOR FOR SELECT * FROM pgss_matv
-     1 |    5 | FETCH FORWARD 5 pgss_cursor
+     1 |    5 | FETCH FORWARD $1 pgss_cursor
      1 |    7 | FETCH FORWARD ALL pgss_cursor
      1 |    1 | FETCH NEXT pgss_cursor
      1 |   13 | REFRESH MATERIALIZED VIEW pgss_matv
@@ -713,6 +713,47 @@ SELECT calls, rows, query FROM pg_stat_statements ORDER BY query COLLATE "C";
 DROP MATERIALIZED VIEW pgss_matv;
 DROP TABLE pgss_ctas;
 DROP TABLE pgss_select_into;
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
+ t 
+---
+ t
+(1 row)
+
+-- WAIT FOR LSN
+WAIT FOR LSN '0/0' WITH (MODE 'primary_flush');
+ status  
+---------
+ success
+(1 row)
+
+WAIT FOR LSN '0/1' WITH (MODE 'primary_flush');
+ status  
+---------
+ success
+(1 row)
+
+WAIT FOR LSN '0/0' WITH (MODE 'primary_flush', NO_THROW);
+ status  
+---------
+ success
+(1 row)
+
+WAIT FOR LSN '0/0' WITH (MODE 'primary_flush', TIMEOUT 1);
+ status  
+---------
+ success
+(1 row)
+
+SELECT calls, rows, query FROM pg_stat_statements
+  WHERE query LIKE 'WAIT FOR LSN%'
+  ORDER BY query COLLATE "C";
+ calls | rows |                         query                          
+-------+------+--------------------------------------------------------
+     2 |    0 | WAIT FOR LSN $1 WITH (MODE 'primary_flush')
+     1 |    0 | WAIT FOR LSN $1 WITH (MODE 'primary_flush', NO_THROW)
+     1 |    0 | WAIT FOR LSN $1 WITH (MODE 'primary_flush', TIMEOUT 1)
+(3 rows)
+
 SELECT pg_stat_statements_reset() IS NOT NULL AS t;
  t 
 ---

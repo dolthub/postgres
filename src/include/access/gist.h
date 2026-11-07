@@ -6,7 +6,7 @@
  *	  changes should be made with care.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/gist.h
@@ -48,8 +48,8 @@
  */
 #define F_LEAF				(1 << 0)	/* leaf page */
 #define F_DELETED			(1 << 1)	/* the page has been deleted */
-#define F_TUPLES_DELETED	(1 << 2)	/* some tuples on the page were
-										 * deleted */
+#define F_TUPLES_DELETED	(1 << 2)	/* old-style VACUUM FULL flag
+										 * (deprecated) */
 #define F_FOLLOW_RIGHT		(1 << 3)	/* page to the right has no downlink */
 #define F_HAS_GARBAGE		(1 << 4)	/* some tuples on the page are dead,
 										 * but not deleted yet */
@@ -174,10 +174,6 @@ typedef struct GISTENTRY
 
 #define GistPageIsDeleted(page) ( GistPageGetOpaque(page)->flags & F_DELETED)
 
-#define GistTuplesDeleted(page) ( GistPageGetOpaque(page)->flags & F_TUPLES_DELETED)
-#define GistMarkTuplesDeleted(page) ( GistPageGetOpaque(page)->flags |= F_TUPLES_DELETED)
-#define GistClearTuplesDeleted(page)	( GistPageGetOpaque(page)->flags &= ~F_TUPLES_DELETED)
-
 #define GistPageHasGarbage(page) ( GistPageGetOpaque(page)->flags & F_HAS_GARBAGE)
 #define GistMarkPageHasGarbage(page) ( GistPageGetOpaque(page)->flags |= F_HAS_GARBAGE)
 #define GistClearPageHasGarbage(page)	( GistPageGetOpaque(page)->flags &= ~F_HAS_GARBAGE)
@@ -186,8 +182,8 @@ typedef struct GISTENTRY
 #define GistMarkFollowRight(page) ( GistPageGetOpaque(page)->flags |= F_FOLLOW_RIGHT)
 #define GistClearFollowRight(page)	( GistPageGetOpaque(page)->flags &= ~F_FOLLOW_RIGHT)
 
-#define GistPageGetNSN(page) ( PageXLogRecPtrGet(GistPageGetOpaque(page)->nsn))
-#define GistPageSetNSN(page, val) ( PageXLogRecPtrSet(GistPageGetOpaque(page)->nsn, val))
+#define GistPageGetNSN(page) ( PageXLogRecPtrGet(&GistPageGetOpaque(page)->nsn))
+#define GistPageSetNSN(page, val) ( PageXLogRecPtrSet(&GistPageGetOpaque(page)->nsn, val))
 
 
 /*

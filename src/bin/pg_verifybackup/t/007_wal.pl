@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2025, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 # Test pg_verifybackup's WAL verification.
 
@@ -42,10 +42,10 @@ command_ok([ 'pg_verifybackup', '--no-parse-wal', $backup_path ],
 command_ok(
 	[
 		'pg_verifybackup',
-		'--wal-directory' => $relocated_pg_wal,
+		'--wal-path' => $relocated_pg_wal,
 		$backup_path
 	],
-	'--wal-directory can be used to specify WAL directory');
+	'--wal-path can be used to specify WAL directory');
 
 # Move directory back to original location.
 rename($relocated_pg_wal, $original_pg_wal) || die "rename pg_wal back: $!";
@@ -89,5 +89,42 @@ $primary->command_ok(
 command_ok(
 	[ 'pg_verifybackup', $backup_path2 ],
 	'valid base backup with timeline > 1');
+
+# Test WAL verification for a tar-format backup with a separate pg_wal.tar,
+# as produced by pg_basebackup --format=tar --wal-method=stream.
+my $backup_path3 = $primary->backup_dir . '/test_tar_wal';
+$primary->command_ok(
+	[
+		'pg_basebackup',
+		'--pgdata' => $backup_path3,
+		'--no-sync',
+		'--format' => 'tar',
+		'--checkpoint' => 'fast'
+	],
+	"tar backup with separate pg_wal.tar");
+command_ok([ 'pg_verifybackup', $backup_path3 ],
+	'WAL verification succeeds with separate pg_wal.tar');
+
+# Same with client-side gzip compression.  pg_basebackup writes pg_wal.tar.gz
+# as several concatenated gzip members.
+SKIP:
+{
+	skip "gzip compression not supported by this build", 2
+	  if !check_pg_config("#define HAVE_LIBZ 1");
+
+	my $backup_path4 = $primary->backup_dir . '/test_tar_gz_wal';
+	$primary->command_ok(
+		[
+			'pg_basebackup',
+			'--pgdata' => $backup_path4,
+			'--no-sync',
+			'--format' => 'tar',
+			'--gzip',
+			'--checkpoint' => 'fast'
+		],
+		"tar backup with separate pg_wal.tar.gz");
+	command_ok([ 'pg_verifybackup', $backup_path4 ],
+		'WAL verification succeeds with separate pg_wal.tar.gz');
+}
 
 done_testing();

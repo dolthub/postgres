@@ -1148,7 +1148,7 @@ drop function trigger_ddl_func();
 
 --
 -- Verify behavior of before and after triggers with INSERT...ON CONFLICT
--- DO UPDATE
+-- DO UPDATE and DO SELECT
 --
 create table upsert (key int4 primary key, color text);
 
@@ -1197,6 +1197,7 @@ insert into upsert values(5, 'purple') on conflict (key) do update set color = '
 insert into upsert values(6, 'white') on conflict (key) do update set color = 'updated ' || upsert.color;
 insert into upsert values(7, 'pink') on conflict (key) do update set color = 'updated ' || upsert.color;
 insert into upsert values(8, 'yellow') on conflict (key) do update set color = 'updated ' || upsert.color;
+insert into upsert values(8, 'blue') on conflict (key) do select for update where upsert.color = 'yellow trig modified' returning old.*, new.*, upsert.*;
 
 select * from upsert;
 
@@ -1577,6 +1578,44 @@ drop table parted;
 drop function parted_trigfunc();
 
 --
+-- Constraint triggers
+--
+create constraint trigger crtr
+  after insert on foo not valid
+  for each row execute procedure foo ();
+create constraint trigger crtr
+  after insert on foo no inherit
+  for each row execute procedure foo ();
+create constraint trigger crtr
+  after insert on foo not enforced
+  for each row execute procedure foo ();
+
+-- Test exception handling in a deferred constraint trigger at COMMIT.
+create table deferred_trigger_test (a int);
+create function deferred_trigger_func() returns trigger
+  language plpgsql as $$
+begin
+  perform 1 / 0;
+  return new;
+exception when division_by_zero then
+  raise notice 'caught division_by_zero';
+  return new;
+end;
+$$;
+create constraint trigger deferred_trigger
+  after insert on deferred_trigger_test
+  deferrable initially deferred
+  for each row execute function deferred_trigger_func();
+
+begin;
+insert into deferred_trigger_test values (1);
+commit;
+select * from deferred_trigger_test;
+
+drop table deferred_trigger_test;
+drop function deferred_trigger_func();
+
+--
 -- Constraint triggers and partitioned tables
 create table parted_constr_ancestor (a int, b text)
   partition by range (b);
@@ -1591,7 +1630,7 @@ create constraint trigger parted_trig after insert on parted_constr_ancestor
   deferrable
   for each row execute procedure trigger_notice_ab();
 create constraint trigger parted_trig_two after insert on parted_constr
-  deferrable initially deferred
+  deferrable initially deferred enforced
   for each row when (bark(new.b) AND new.a % 2 = 1)
   execute procedure trigger_notice_ab();
 

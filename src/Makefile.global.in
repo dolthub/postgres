@@ -267,7 +267,6 @@ endif # not PGXS
 
 CC = @CC@
 GCC = @GCC@
-SUN_STUDIO_CC = @SUN_STUDIO_CC@
 CXX = @CXX@
 CFLAGS = @CFLAGS@
 CFLAGS_SL = @CFLAGS_SL@
@@ -281,6 +280,8 @@ PERMIT_DECLARATION_AFTER_STATEMENT = @PERMIT_DECLARATION_AFTER_STATEMENT@
 PERMIT_MISSING_VARIABLE_DECLARATIONS = @PERMIT_MISSING_VARIABLE_DECLARATIONS@
 CXXFLAGS = @CXXFLAGS@
 
+have_cxx = @have_cxx@
+
 LLVM_CPPFLAGS = @LLVM_CPPFLAGS@
 LLVM_CFLAGS = @LLVM_CFLAGS@
 LLVM_CXXFLAGS = @LLVM_CXXFLAGS@
@@ -293,6 +294,7 @@ FLEX = @FLEX@
 FLEXFLAGS = @FLEXFLAGS@ $(LFLAGS)
 DTRACE = @DTRACE@
 DTRACEFLAGS = @DTRACEFLAGS@
+NM = @NM@
 ZIC = @ZIC@
 
 # Linking
@@ -374,10 +376,10 @@ DOWNLOAD = wget -O $@ --no-use-server-timestamps
 # Pick a release from here: <https://www.unicode.org/Public/>.  Note
 # that the most recent release listed there is often a pre-release;
 # don't pick that one, except for testing.
-UNICODE_VERSION = 16.0.0
+UNICODE_VERSION = 17.0.0
 
 # Pick a release from here: <http://cldr.unicode.org/index/downloads>
-CLDR_VERSION = 47
+CLDR_VERSION = 48.2
 
 
 # Tree-wide build support
@@ -796,9 +798,6 @@ ifeq ($(PORTNAME),win32)
 LIBS += -lws2_32
 endif
 
-# Not really standard libc functions, used by the backend.
-TAS         = @TAS@
-
 
 ##########################################################################
 #
@@ -1062,12 +1061,12 @@ LCOVFLAGS = -q --no-external
 all_gcno_files = $(shell find . -name '*.gcno' -print)
 
 lcov_base.info: $(all_gcno_files)
-	$(LCOV) $(LCOVFLAGS) -c -i -d . -d $(srcdir) -o $@
+	$(LCOV) $(LCOVFLAGS) -c -i -d . $(if $(filter yes,$(vpath_build)),-d $(srcdir)) -o $@
 
 all_gcda_files = $(shell find . -name '*.gcda' -print)
 
 lcov_test.info: $(all_gcda_files)
-	$(LCOV) $(LCOVFLAGS) -c -d . -d $(srcdir) -o $@
+	$(LCOV) $(LCOVFLAGS) -c -d . $(if $(filter yes,$(vpath_build)),-d $(srcdir)) -o $@
 
 
 # hook for clean-up

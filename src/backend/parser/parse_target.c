@@ -3,7 +3,7 @@
  * parse_target.c
  *	  handle target lists
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -16,7 +16,6 @@
 
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
-#include "commands/dbcommands.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -378,7 +377,6 @@ markTargetListOrigin(ParseState *pstate, TargetEntry *tle,
 		case RTE_FUNCTION:
 		case RTE_VALUES:
 		case RTE_TABLEFUNC:
-		case RTE_DOLT:
 		case RTE_NAMEDTUPLESTORE:
 		case RTE_RESULT:
 			/* not a simple relation, leave it unmarked */
@@ -440,6 +438,7 @@ markTargetListOrigin(ParseState *pstate, TargetEntry *tle,
  * pstate		parse state
  * expr			expression to be modified
  * exprKind		indicates which type of statement we're dealing with
+ *				(EXPR_KIND_INSERT_TARGET or EXPR_KIND_UPDATE_TARGET)
  * colname		target column name (ie, name of attribute to be assigned to)
  * attrno		target attribute number
  * indirection	subscripts/field names for target column, if any
@@ -473,7 +472,8 @@ transformAssignedExpr(ParseState *pstate,
 	 * set p_expr_kind here because we can parse subscripts without going
 	 * through transformExpr().
 	 */
-	Assert(exprKind != EXPR_KIND_NONE);
+	Assert(exprKind == EXPR_KIND_INSERT_TARGET ||
+		   exprKind == EXPR_KIND_UPDATE_TARGET);
 	sv_expr_kind = pstate->p_expr_kind;
 	pstate->p_expr_kind = exprKind;
 
@@ -532,7 +532,7 @@ transformAssignedExpr(ParseState *pstate,
 	{
 		Node	   *colVar;
 
-		if (pstate->p_is_insert)
+		if (exprKind == EXPR_KIND_INSERT_TARGET)
 		{
 			/*
 			 * The command is INSERT INTO table (col.something) ... so there
@@ -1572,6 +1572,8 @@ expandRecordVariable(ParseState *pstate, Var *var, int levelsup)
 		}
 		Assert(lname == NULL && lvar == NULL);	/* lists same length? */
 
+		TupleDescFinalize(tupleDesc);
+
 		return tupleDesc;
 	}
 
@@ -1581,7 +1583,6 @@ expandRecordVariable(ParseState *pstate, Var *var, int levelsup)
 	{
 		case RTE_RELATION:
 		case RTE_VALUES:
-		case RTE_DOLT:
 		case RTE_NAMEDTUPLESTORE:
 		case RTE_RESULT:
 
@@ -1612,10 +1613,9 @@ expandRecordVariable(ParseState *pstate, Var *var, int levelsup)
 					 * subselect must have that outer level as parent.
 					 */
 					ParseState	mypstate = {0};
-					Index		levelsup;
 
 					/* this loop must work, since GetRTEByRangeTablePosn did */
-					for (levelsup = 0; levelsup < netlevelsup; levelsup++)
+					for (Index level = 0; level < netlevelsup; level++)
 						pstate = pstate->parentParseState;
 					mypstate.parentParseState = pstate;
 					mypstate.p_rtable = rte->subquery->rtable;
@@ -1670,12 +1670,11 @@ expandRecordVariable(ParseState *pstate, Var *var, int levelsup)
 					 * could be an outer CTE (compare SUBQUERY case above).
 					 */
 					ParseState	mypstate = {0};
-					Index		levelsup;
 
 					/* this loop must work, since GetCTEForRTE did */
-					for (levelsup = 0;
-						 levelsup < rte->ctelevelsup + netlevelsup;
-						 levelsup++)
+					for (Index level = 0;
+						 level < rte->ctelevelsup + netlevelsup;
+						 level++)
 						pstate = pstate->parentParseState;
 					mypstate.parentParseState = pstate;
 					mypstate.p_rtable = ((Query *) cte->ctequery)->rtable;

@@ -6,7 +6,7 @@
  * astreamer_lz4_compressor applies lz4 compression to the input stream,
  * and astreamer_lz4_decompressor does the reverse.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/fe_utils/astreamer_lz4.c
@@ -35,6 +35,7 @@ typedef struct astreamer_lz4_frame
 
 	size_t		bytes_written;
 	bool		header_written;
+	astreamer_decompression_state state;
 } astreamer_lz4_frame;
 
 static void astreamer_lz4_compressor_content(astreamer *streamer,
@@ -78,7 +79,7 @@ astreamer_lz4_compressor_new(astreamer *next, pg_compress_specification *compres
 
 	Assert(next != NULL);
 
-	streamer = palloc0(sizeof(astreamer_lz4_frame));
+	streamer = palloc0_object(astreamer_lz4_frame);
 	*((const astreamer_ops **) &streamer->base.bbs_ops) =
 		&astreamer_lz4_compressor_ops;
 
@@ -121,14 +122,14 @@ astreamer_lz4_compressor_content(astreamer *streamer,
 								 astreamer_archive_context context)
 {
 	astreamer_lz4_frame *mystreamer;
-	uint8	   *next_in,
-			   *next_out;
+	const uint8 *next_in;
+	uint8	   *next_out;
 	size_t		out_bound,
 				compressed_size,
 				avail_out;
 
 	mystreamer = (astreamer_lz4_frame *) streamer;
-	next_in = (uint8 *) data;
+	next_in = (const uint8 *) data;
 
 	/* Write header before processing the first input chunk. */
 	if (!mystreamer->header_written)
@@ -282,12 +283,14 @@ astreamer_lz4_decompressor_new(astreamer *next)
 
 	Assert(next != NULL);
 
-	streamer = palloc0(sizeof(astreamer_lz4_frame));
+	streamer = palloc0_object(astreamer_lz4_frame);
 	*((const astreamer_ops **) &streamer->base.bbs_ops) =
 		&astreamer_lz4_decompressor_ops;
 
 	streamer->base.bbs_next = next;
 	initStringInfo(&streamer->base.bbs_buffer);
+	/* Use a buffer size comparable to the compressor's */
+	enlargeStringInfo(&streamer->base.bbs_buffer, 256 * 1024 - 1);
 
 	/* Initialize internal stream state for decompression */
 	ctxError = LZ4F_createDecompressionContext(&streamer->dctx, LZ4F_VERSION);
@@ -295,6 +298,7 @@ astreamer_lz4_decompressor_new(astreamer *next)
 		pg_fatal("could not initialize compression library: %s",
 				 LZ4F_getErrorName(ctxError));
 
+	streamer->state = ASTREAMER_STREAM_NEW;
 	return &streamer->base;
 #else
 	pg_fatal("this build does not support compression with %s", "LZ4");
@@ -315,13 +319,13 @@ astreamer_lz4_decompressor_content(astreamer *streamer,
 								   astreamer_archive_context context)
 {
 	astreamer_lz4_frame *mystreamer;
-	uint8	   *next_in,
-			   *next_out;
+	const uint8 *next_in;
+	uint8	   *next_out;
 	size_t		avail_in,
 				avail_out;
 
 	mystreamer = (astreamer_lz4_frame *) streamer;
-	next_in = (uint8 *) data;
+	next_in = (const uint8 *) data;
 	next_out = (uint8 *) mystreamer->base.bbs_buffer.data + mystreamer->bytes_written;
 	avail_in = len;
 	avail_out = mystreamer->base.bbs_buffer.maxlen - mystreamer->bytes_written;
@@ -355,6 +359,12 @@ astreamer_lz4_decompressor_content(astreamer *streamer,
 		if (LZ4F_isError(ret))
 			pg_fatal("could not decompress data: %s",
 					 LZ4F_getErrorName(ret));
+
+		/* The frame is only done when LZ4F_decompress returns 0 */
+		if (ret)
+			mystreamer->state = ASTREAMER_FRAME_INCOMPLETE;
+		else
+			mystreamer->state = ASTREAMER_FRAME_COMPLETE;
 
 		/* Update input buffer based on number of bytes consumed */
 		avail_in -= read_size;
@@ -392,6 +402,11 @@ astreamer_lz4_decompressor_finalize(astreamer *streamer)
 	astreamer_lz4_frame *mystreamer;
 
 	mystreamer = (astreamer_lz4_frame *) streamer;
+
+	if (unlikely(mystreamer->state == ASTREAMER_STREAM_NEW))
+		pg_fatal("could not decompress data: compressed stream is empty");
+	else if (mystreamer->state != ASTREAMER_FRAME_COMPLETE)
+		pg_fatal("could not decompress data: compressed stream is incomplete");
 
 	/*
 	 * End of the stream, if there is some pending data in output buffers then

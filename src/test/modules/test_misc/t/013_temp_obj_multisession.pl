@@ -25,7 +25,6 @@ use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('temp_lock');
 $node->init;
-$node->append_conf('postgresql.conf', 'log_lock_waits=on');
 $node->start;
 
 # Owner session.  Created via background_psql so it stays alive while
@@ -140,7 +139,8 @@ $node->psql('postgres', "VACUUM $tempschema.foo;", stderr => \$stderr);
 is($stderr, '', 'VACUUM is silently skipped');
 
 $node->psql('postgres', "CLUSTER $tempschema.foo;", stderr => \$stderr);
-like($stderr, qr/cannot cluster temporary tables of other sessions/,
+like($stderr,
+	qr/cannot execute CLUSTER on temporary tables of other sessions/,
 	'CLUSTER');
 
 # Now create an index to exercise the index-scan path.  nbtree calls
@@ -205,9 +205,16 @@ is($stderr, '', 'DROP TABLE is allowed');
 # created it.
 $psql1->query_safe(q(CREATE TEMP TABLE foo2 AS SELECT 42 AS val;));
 
-$node->safe_psql('postgres',
-		"CREATE FUNCTION public.cross_session_func(r $tempschema.foo2) "
-	  . "RETURNS int LANGUAGE SQL AS 'SELECT 1';");
+$node->psql(
+	'postgres',
+	"CREATE FUNCTION public.cross_session_func(r $tempschema.foo2) "
+	  . "RETURNS int LANGUAGE SQL AS 'SELECT 1';",
+	stderr => \$stderr);
+like(
+	$stderr,
+	qr/function "cross_session_func" will be effectively temporary/,
+	'CREATE FUNCTION using other session\'s row type is effectively temporary'
+);
 
 # A bare DROP TABLE on foo2 now fails because cross_session_func
 # depends on its row type.  This is normal SQL dependency behaviour

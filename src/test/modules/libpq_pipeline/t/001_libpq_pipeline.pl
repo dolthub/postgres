@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2025, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 use strict;
 use warnings FATAL => 'all';
@@ -52,8 +52,7 @@ for my $testname (@tests)
 	# Execute the test using the latest protocol version.
 	$node->command_ok(
 		[
-			'libpq_pipeline', @extraargs,
-			$testname,
+			'libpq_pipeline', @extraargs, $testname,
 			$node->connstr('postgres') . " max_protocol_version=latest"
 		],
 		"libpq_pipeline $testname");

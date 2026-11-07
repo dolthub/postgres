@@ -3,7 +3,7 @@
  * nodeMemoize.c
  *	  Routines to handle caching of results from parameterized nodes
  *
- * Portions Copyright (c) 2021-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2021-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -66,6 +66,7 @@
 
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "common/hashfn.h"
 #include "executor/executor.h"
 #include "executor/nodeMemoize.h"
@@ -554,7 +555,7 @@ cache_lookup(MemoizeState *mstate, bool *found)
 	oldcontext = MemoryContextSwitchTo(mstate->tableContext);
 
 	/* Allocate a new key */
-	entry->key = key = (MemoizeKey *) palloc(sizeof(MemoizeKey));
+	entry->key = key = palloc_object(MemoizeKey);
 	key->params = ExecCopySlotMinimalTuple(mstate->probeslot);
 
 	/* Update the total cache memory utilization */
@@ -633,7 +634,7 @@ cache_store_tuple(MemoizeState *mstate, TupleTableSlot *slot)
 
 	oldcontext = MemoryContextSwitchTo(mstate->tableContext);
 
-	tuple = (MemoizeTuple *) palloc(sizeof(MemoizeTuple));
+	tuple = palloc_object(MemoizeTuple);
 	tuple->mintuple = ExecCopySlotMinimalTuple(slot);
 	tuple->next = NULL;
 
@@ -1124,7 +1125,16 @@ ExecEndMemoize(MemoizeState *node)
 
 		Assert(ParallelWorkerNumber < node->shared_info->num_workers);
 		si = &node->shared_info->sinstrument[ParallelWorkerNumber];
-		memcpy(si, &node->stats, sizeof(MemoizeInstrumentation));
+
+		/*
+		 * Gather and GatherMerge spin up new workers on rescan, so add these
+		 * counters to accumulate the values over all scans.
+		 */
+		si->cache_hits += node->stats.cache_hits;
+		si->cache_misses += node->stats.cache_misses;
+		si->cache_evictions += node->stats.cache_evictions;
+		si->cache_overflows += node->stats.cache_overflows;
+		si->mem_peak = Max(si->mem_peak, node->stats.mem_peak);
 	}
 
 	/* Remove the cache context */

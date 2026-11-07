@@ -28,7 +28,7 @@ end;
 $$;
 
 -- Verify failures
-CREATE TABLE ext_stats_test (x text, y int, z int);
+CREATE TABLE ext_stats_test (x text, y int, z int, w xid);
 CREATE STATISTICS tst;
 CREATE STATISTICS tst ON a, b;
 CREATE STATISTICS tst FROM sometab;
@@ -58,21 +58,16 @@ DROP FUNCTION tftest;
 CREATE STATISTICS tst ON (y) FROM ext_stats_test; -- single column reference
 CREATE STATISTICS tst ON y + z FROM ext_stats_test; -- missing parentheses
 CREATE STATISTICS tst ON (x, y) FROM ext_stats_test; -- tuple expression
-DROP TABLE ext_stats_test;
--- statistics on virtual generated column not allowed
-CREATE TABLE ext_stats_test1 (x int, y int, z int GENERATED ALWAYS AS (x+y) VIRTUAL, w xid);
-CREATE STATISTICS tst on z from ext_stats_test1;
-CREATE STATISTICS tst on (z) from ext_stats_test1;
-CREATE STATISTICS tst on (z+1) from ext_stats_test1;
-CREATE STATISTICS tst (ndistinct) ON z from ext_stats_test1;
 -- statistics on system column not allowed
-CREATE STATISTICS tst on tableoid from ext_stats_test1;
-CREATE STATISTICS tst on (tableoid) from ext_stats_test1;
-CREATE STATISTICS tst on (tableoid::int+1) from ext_stats_test1;
-CREATE STATISTICS tst (ndistinct) ON xmin from ext_stats_test1;
--- statistics without a less-than operator not supported
-CREATE STATISTICS tst (ndistinct) ON w from ext_stats_test1;
-DROP TABLE ext_stats_test1;
+CREATE STATISTICS tst on tableoid from ext_stats_test;
+CREATE STATISTICS tst on (tableoid) from ext_stats_test;
+CREATE STATISTICS tst on (tableoid::int+1) from ext_stats_test;
+CREATE STATISTICS tst (ndistinct) ON xmin from ext_stats_test;
+-- statistics kinds are not allowed with univariate statistics
+CREATE STATISTICS tst (ndistinct) ON (y + z) FROM ext_stats_test;
+-- multivariate statistics without a less-than operator not supported
+CREATE STATISTICS tst (ndistinct) ON x, w from ext_stats_test;
+DROP TABLE ext_stats_test;
 
 -- Ensure stats are dropped sanely, and test IF NOT EXISTS while at it
 CREATE TABLE ab1 (a INTEGER, b INTEGER, c INTEGER);
@@ -127,7 +122,10 @@ ALTER TABLE ab1 ALTER a SET STATISTICS -1;
 ALTER STATISTICS ab1_a_b_stats SET STATISTICS 0;
 \d ab1
 ANALYZE ab1;
-SELECT stxname, stxdndistinct, stxddependencies, stxdmcv, stxdinherit
+SELECT stxname,
+       replace(d.stxdndistinct, '}, ', E'},\n') AS stxdndistinct,
+       replace(d.stxddependencies, '}, ', E'},\n') AS stxddependencies,
+       stxdmcv, stxdinherit
   FROM pg_statistic_ext s LEFT JOIN pg_statistic_ext_data d ON (d.stxoid = s.oid)
  WHERE s.stxname = 'ab1_a_b_stats';
 ALTER STATISTICS ab1_a_b_stats SET STATISTICS -1;
@@ -299,7 +297,7 @@ CREATE STATISTICS s10 ON a, b, c FROM ndistinct;
 
 ANALYZE ndistinct;
 
-SELECT s.stxkind, d.stxdndistinct
+SELECT s.stxkind, replace(d.stxdndistinct, '}, ', E'},\n') AS stxdndistinct
   FROM pg_statistic_ext s, pg_statistic_ext_data d
  WHERE s.stxrelid = 'ndistinct'::regclass
    AND d.stxoid = s.oid;
@@ -340,7 +338,7 @@ INSERT INTO ndistinct (a, b, c, filler1)
 
 ANALYZE ndistinct;
 
-SELECT s.stxkind, d.stxdndistinct
+SELECT s.stxkind, replace(d.stxdndistinct, '}, ', E'},\n') AS stxdndistinct
   FROM pg_statistic_ext s, pg_statistic_ext_data d
  WHERE s.stxrelid = 'ndistinct'::regclass
    AND d.stxoid = s.oid;
@@ -366,7 +364,7 @@ SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY a, (
 
 DROP STATISTICS s10;
 
-SELECT s.stxkind, d.stxdndistinct
+SELECT s.stxkind, replace(d.stxdndistinct, '}, ', E'},\n') AS stxdndistinct
   FROM pg_statistic_ext s, pg_statistic_ext_data d
  WHERE s.stxrelid = 'ndistinct'::regclass
    AND d.stxoid = s.oid;
@@ -401,7 +399,7 @@ CREATE STATISTICS s10 (ndistinct) ON (a+1), (b+100), (2*c) FROM ndistinct;
 
 ANALYZE ndistinct;
 
-SELECT s.stxkind, d.stxdndistinct
+SELECT s.stxkind, replace(d.stxdndistinct, '}, ', E'},\n') AS stxdndistinct
   FROM pg_statistic_ext s, pg_statistic_ext_data d
  WHERE s.stxrelid = 'ndistinct'::regclass
    AND d.stxoid = s.oid;
@@ -425,7 +423,7 @@ CREATE STATISTICS s10 (ndistinct) ON a, b, (2*c) FROM ndistinct;
 
 ANALYZE ndistinct;
 
-SELECT s.stxkind, d.stxdndistinct
+SELECT s.stxkind, replace(d.stxdndistinct, '}, ', E'},\n') AS stxdndistinct
   FROM pg_statistic_ext s, pg_statistic_ext_data d
  WHERE s.stxrelid = 'ndistinct'::regclass
    AND d.stxoid = s.oid;
@@ -710,7 +708,7 @@ CREATE STATISTICS func_deps_stat (dependencies) ON a, b, c FROM functional_depen
 ANALYZE functional_dependencies;
 
 -- print the detected dependencies
-SELECT dependencies FROM pg_stats_ext WHERE statistics_name = 'func_deps_stat';
+SELECT replace(dependencies, '}, ', E'},\n') AS dependencies FROM pg_stats_ext WHERE statistics_name = 'func_deps_stat';
 
 SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE a = 1 AND b = ''1''');
 
@@ -846,7 +844,7 @@ CREATE STATISTICS func_deps_stat (dependencies) ON (a * 2), upper(b), (c + 1) FR
 ANALYZE functional_dependencies;
 
 -- print the detected dependencies
-SELECT dependencies FROM pg_stats_ext WHERE statistics_name = 'func_deps_stat';
+SELECT replace(dependencies, '}, ', E'},\n') AS dependencies FROM pg_stats_ext WHERE statistics_name = 'func_deps_stat';
 
 SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE (a * 2) = 2 AND upper(b) = ''1''');
 
@@ -1583,6 +1581,35 @@ SELECT c0 FROM ONLY expr_stats_incompatible_test WHERE
 
 DROP TABLE expr_stats_incompatible_test;
 
+-- multivariate statistics on virtual generated columns
+CREATE TABLE virtual_gen_stats (a int, b int, c int GENERATED ALWAYS AS (2*a), d int GENERATED ALWAYS AS (a+b), w xid GENERATED ALWAYS AS (a::text::xid));
+INSERT INTO virtual_gen_stats SELECT mod(i,10), mod(i,10) FROM generate_series(1,100) s(i);
+ANALYZE virtual_gen_stats;
+
+SELECT * FROM check_estimated_rows('SELECT * FROM virtual_gen_stats WHERE c = 0 AND (3*b) = 0');
+SELECT * FROM check_estimated_rows('SELECT * FROM virtual_gen_stats WHERE d = 0 AND (d-2*a) = 0');
+
+CREATE STATISTICS virtual_gen_stats_1 (mcv) ON c, (3*b), d, (d-2*a) FROM virtual_gen_stats;
+ANALYZE virtual_gen_stats;
+
+SELECT * FROM check_estimated_rows('SELECT * FROM virtual_gen_stats WHERE c = 0 AND (3*b) = 0');
+SELECT * FROM check_estimated_rows('SELECT * FROM virtual_gen_stats WHERE d = 0 AND (d-2*a) = 0');
+
+-- univariate statistics on individual virtual generated columns
+DROP STATISTICS virtual_gen_stats_1;
+
+SELECT * FROM check_estimated_rows('SELECT * FROM virtual_gen_stats WHERE c = 0');
+SELECT * FROM check_estimated_rows('SELECT * FROM virtual_gen_stats WHERE w = 0');
+
+CREATE STATISTICS virtual_gen_stats_single ON c FROM virtual_gen_stats;
+CREATE STATISTICS virtual_gen_stats_single_without_less_than ON w FROM virtual_gen_stats;
+ANALYZE virtual_gen_stats;
+
+SELECT * FROM check_estimated_rows('SELECT * FROM virtual_gen_stats WHERE c = 0');
+SELECT * FROM check_estimated_rows('SELECT * FROM virtual_gen_stats WHERE w = 0');
+
+DROP TABLE virtual_gen_stats;
+
 -- Permission tests. Users should not be able to see specific data values in
 -- the extended statistics, if they lack permission to see those values in
 -- the underlying table.
@@ -1873,4 +1900,31 @@ SELECT FROM sb_1 LEFT JOIN sb_2
 RESET enable_nestloop;
 RESET enable_mergejoin;
 
+-- Check that we can use statistics on a bool-valued function.
+SELECT * FROM check_estimated_rows('SELECT * FROM sb_2 WHERE numeric_lt(y, 1.0)');
+
+CREATE STATISTICS extstat_sb_2_small ON numeric_lt(y, 1.0) FROM sb_2;
+ANALYZE sb_2;
+
+SELECT * FROM check_estimated_rows('SELECT * FROM sb_2 WHERE numeric_lt(y, 1.0)');
+
+-- Tidy up
 DROP TABLE sb_1, sb_2 CASCADE;
+
+-- Check statistics generated for range type and expressions.
+CREATE TABLE stats_ext_tbl_range(name text, irange int4range);
+INSERT INTO stats_ext_tbl_range VALUES
+   ('red', '[1,7)'::int4range),
+   ('blue', '[2,8]'::int4range),
+   ('green', '[3,9)'::int4range);
+CREATE STATISTICS stats_ext_range (mcv)
+   ON irange, (irange + '[4,10)'::int4range)
+   FROM stats_ext_tbl_range;
+ANALYZE stats_ext_tbl_range;
+SELECT attnames, most_common_vals
+   FROM pg_stats_ext
+   WHERE statistics_name = 'stats_ext_range';
+SELECT range_length_histogram, range_empty_frac, range_bounds_histogram
+   FROM pg_stats_ext_exprs
+   WHERE statistics_name = 'stats_ext_range';
+DROP TABLE stats_ext_tbl_range;

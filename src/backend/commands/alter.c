@@ -3,7 +3,7 @@
  * alter.c
  *	  Drivers for generic alter commands
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -117,27 +117,21 @@ report_namespace_conflict(Oid classId, const char *name, Oid nspOid)
 	switch (classId)
 	{
 		case ConversionRelationId:
-			Assert(OidIsValid(nspOid));
 			msgfmt = gettext_noop("conversion \"%s\" already exists in schema \"%s\"");
 			break;
 		case StatisticExtRelationId:
-			Assert(OidIsValid(nspOid));
 			msgfmt = gettext_noop("statistics object \"%s\" already exists in schema \"%s\"");
 			break;
 		case TSParserRelationId:
-			Assert(OidIsValid(nspOid));
 			msgfmt = gettext_noop("text search parser \"%s\" already exists in schema \"%s\"");
 			break;
 		case TSDictionaryRelationId:
-			Assert(OidIsValid(nspOid));
 			msgfmt = gettext_noop("text search dictionary \"%s\" already exists in schema \"%s\"");
 			break;
 		case TSTemplateRelationId:
-			Assert(OidIsValid(nspOid));
 			msgfmt = gettext_noop("text search template \"%s\" already exists in schema \"%s\"");
 			break;
 		case TSConfigRelationId:
-			Assert(OidIsValid(nspOid));
 			msgfmt = gettext_noop("text search configuration \"%s\" already exists in schema \"%s\"");
 			break;
 		default:
@@ -165,8 +159,8 @@ static void
 AlterObjectRename_internal(Relation rel, Oid objectId, const char *new_name)
 {
 	Oid			classId = RelationGetRelid(rel);
-	int			oidCacheId = get_object_catcache_oid(classId);
-	int			nameCacheId = get_object_catcache_name(classId);
+	SysCacheIdentifier oidCacheId = get_object_catcache_oid(classId);
+	SysCacheIdentifier nameCacheId = get_object_catcache_name(classId);
 	AttrNumber	Anum_name = get_object_attnum_name(classId);
 	AttrNumber	Anum_namespace = get_object_attnum_namespace(classId);
 	AttrNumber	Anum_owner = get_object_attnum_owner(classId);
@@ -220,7 +214,7 @@ AlterObjectRename_internal(Relation rel, Oid objectId, const char *new_name)
 		Assert(!isnull);
 		ownerId = DatumGetObjectId(datum);
 
-		if (!has_privs_of_role(GetUserId(), DatumGetObjectId(ownerId)))
+		if (!has_privs_of_role(GetUserId(), ownerId))
 			aclcheck_error(ACLCHECK_NOT_OWNER, get_object_type(classId, objectId),
 						   old_name);
 
@@ -692,8 +686,8 @@ static Oid
 AlterObjectNamespace_internal(Relation rel, Oid objid, Oid nspOid)
 {
 	Oid			classId = RelationGetRelid(rel);
-	int			oidCacheId = get_object_catcache_oid(classId);
-	int			nameCacheId = get_object_catcache_name(classId);
+	SysCacheIdentifier oidCacheId = get_object_catcache_oid(classId);
+	SysCacheIdentifier nameCacheId = get_object_catcache_name(classId);
 	AttrNumber	Anum_name = get_object_attnum_name(classId);
 	AttrNumber	Anum_namespace = get_object_attnum_namespace(classId);
 	AttrNumber	Anum_owner = get_object_attnum_owner(classId);

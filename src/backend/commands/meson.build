@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2025, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 backend_sources += files(
   'aggregatecmds.c',
@@ -6,7 +6,6 @@ backend_sources += files(
   'amcmds.c',
   'analyze.c',
   'async.c',
-  'cluster.c',
   'collationcmds.c',
   'comment.c',
   'constraint.c',
@@ -38,9 +37,12 @@ backend_sources += files(
   'prepare.c',
   'proclang.c',
   'publicationcmds.c',
+  'repack.c',
+  'repack_worker.c',
   'schemacmds.c',
   'seclabel.c',
   'sequence.c',
+  'sequence_xlog.c',
   'statscmds.c',
   'subscriptioncmds.c',
   'tablecmds.c',
@@ -53,4 +55,5 @@ backend_sources += files(
   'vacuumparallel.c',
   'variable.c',
   'view.c',
+  'wait.c',
 )

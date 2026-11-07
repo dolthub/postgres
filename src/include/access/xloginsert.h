@@ -3,7 +3,7 @@
  *
  * Functions for generating WAL records
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/xloginsert.h
@@ -38,12 +38,15 @@
 									 * will be skipped) */
 #define REGBUF_KEEP_DATA	0x10	/* include data even if a full-page image
 									 * is taken */
-#define REGBUF_NO_CHANGE	0x20	/* intentionally register clean buffer */
+#define REGBUF_NO_CHANGE	0x20	/* intentionally register clean buffer; no
+									 * image is forced for WAL consistency
+									 * checking */
 
 /* prototypes for public functions in xloginsert.c: */
 extern void XLogBeginInsert(void);
 extern void XLogSetRecordFlags(uint8 flags);
 extern XLogRecPtr XLogInsert(RmgrId rmid, uint8 info);
+extern XLogRecPtr XLogSimpleInsertInt64(RmgrId rmid, uint8 info, int64 value);
 extern void XLogEnsureRecordSpace(int max_block_id, int ndatas);
 extern void XLogRegisterData(const void *data, uint32 len);
 extern void XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags);
@@ -62,6 +65,8 @@ extern XLogRecPtr log_newpage_buffer(Buffer buffer, bool page_std);
 extern void log_newpage_range(Relation rel, ForkNumber forknum,
 							  BlockNumber startblk, BlockNumber endblk, bool page_std);
 extern XLogRecPtr XLogSaveBufferForHint(Buffer buffer, bool buffer_std);
+
+extern XLogRecPtr XLogGetFakeLSN(Relation rel);
 
 extern void InitXLogInsert(void);
 

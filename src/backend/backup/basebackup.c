@@ -3,7 +3,7 @@
  * basebackup.c
  *	  code for taking a base backup and streaming it to a standby
  *
- * Portions Copyright (c) 2010-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/backup/basebackup.c
@@ -23,9 +23,11 @@
 #include "backup/basebackup_incremental.h"
 #include "backup/basebackup_sink.h"
 #include "backup/basebackup_target.h"
+#include "catalog/pg_control.h"
 #include "catalog/pg_tablespace_d.h"
 #include "commands/defrem.h"
 #include "common/compression.h"
+#include "common/controldata_utils.h"
 #include "common/file_perm.h"
 #include "common/file_utils.h"
 #include "lib/stringinfo.h"
@@ -42,12 +44,14 @@
 #include "storage/checksum.h"
 #include "storage/dsm_impl.h"
 #include "storage/ipc.h"
+#include "storage/lwlock.h"
 #include "storage/reinit.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/ps_status.h"
 #include "utils/relcache.h"
 #include "utils/resowner.h"
+#include "utils/wait_event.h"
 
 /*
  * How much data do we want to send in one CopyData message? Note that
@@ -78,6 +82,11 @@ typedef struct
 	pg_checksum_type manifest_checksum_type;
 } basebackup_options;
 
+#define TAR_NUM_TERMINATION_BLOCKS 2
+
+StaticAssertDecl(TAR_NUM_TERMINATION_BLOCKS * TAR_BLOCK_SIZE <= BLCKSZ,
+				 "BLCKSZ too small for " CppAsString2(TAR_NUM_TERMINATION_BLOCKS) " tar termination blocks");
+
 static int64 sendTablespace(bbsink *sink, char *path, Oid spcoid, bool sizeonly,
 							struct backup_manifest_info *manifest,
 							IncrementalBackupInfo *ib);
@@ -86,7 +95,7 @@ static int64 sendDir(bbsink *sink, const char *path, int basepathlen, bool sizeo
 					 backup_manifest_info *manifest, Oid spcoid,
 					 IncrementalBackupInfo *ib);
 static bool sendFile(bbsink *sink, const char *readfilename, const char *tarfilename,
-					 struct stat *statbuf, bool missing_ok,
+					 const struct stat *statbuf, bool missing_ok,
 					 Oid dboid, Oid spcoid, RelFileNumber relfilenumber,
 					 unsigned segno,
 					 backup_manifest_info *manifest,
@@ -239,7 +248,7 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 	TimeLineID	endtli;
 	backup_manifest_info manifest;
 	BackupState *backup_state;
-	StringInfo	tablespace_map;
+	StringInfoData tablespace_map;
 
 	/* Initial backup state, insofar as we know it now. */
 	state.tablespaces = NIL;
@@ -262,12 +271,12 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 	total_checksum_failures = 0;
 
 	/* Allocate backup related variables. */
-	backup_state = (BackupState *) palloc0(sizeof(BackupState));
-	tablespace_map = makeStringInfo();
+	backup_state = palloc0_object(BackupState);
+	initStringInfo(&tablespace_map);
 
 	basebackup_progress_wait_checkpoint();
 	do_pg_backup_start(opt->label, opt->fastcheckpoint, &state.tablespaces,
-					   backup_state, tablespace_map);
+					   backup_state, &tablespace_map);
 
 	state.startptr = backup_state->startpoint;
 	state.starttli = backup_state->starttli;
@@ -289,7 +298,7 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 			PrepareForIncrementalBackup(ib, backup_state);
 
 		/* Add a node for the base directory at the end */
-		newti = palloc0(sizeof(tablespaceinfo));
+		newti = palloc0_object(tablespaceinfo);
 		newti->size = -1;
 		state.tablespaces = lappend(state.tablespaces, newti);
 
@@ -307,10 +316,10 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 
 				if (tmp->path == NULL)
 					tmp->size = sendDir(sink, ".", 1, true, state.tablespaces,
-										true, NULL, InvalidOid, NULL);
+										true, NULL, InvalidOid, ib);
 				else
 					tmp->size = sendTablespace(sink, tmp->path, tmp->oid, true,
-											   NULL, NULL);
+											   NULL, ib);
 				state.bytes_total += tmp->size;
 			}
 			state.bytes_total_is_valid = true;
@@ -326,9 +335,11 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 
 			if (ti->path == NULL)
 			{
-				struct stat statbuf;
 				bool		sendtblspclinks = true;
 				char	   *backup_label;
+				ControlFileData *controlData;
+				bool		crc_ok;
+				char	   *controlFile;
 
 				bbsink_begin_archive(sink, "base.tar");
 
@@ -342,7 +353,7 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 				if (opt->sendtblspcmapfile)
 				{
 					sendFileWithContent(sink, TABLESPACE_MAP,
-										tablespace_map->data, -1, &manifest);
+										tablespace_map.data, -1, &manifest);
 					sendtblspclinks = false;
 				}
 
@@ -351,14 +362,23 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 						sendtblspclinks, &manifest, InvalidOid, ib);
 
 				/* ... and pg_control after everything else. */
-				if (lstat(XLOG_CONTROL_FILE, &statbuf) != 0)
+				LWLockAcquire(ControlFileLock, LW_SHARED);
+				controlData = get_controlfile(DataDir, &crc_ok);
+				LWLockRelease(ControlFileLock);
+
+				if (!crc_ok)
 					ereport(ERROR,
-							(errcode_for_file_access(),
-							 errmsg("could not stat file \"%s\": %m",
-									XLOG_CONTROL_FILE)));
-				sendFile(sink, XLOG_CONTROL_FILE, XLOG_CONTROL_FILE, &statbuf,
-						 false, InvalidOid, InvalidOid,
-						 InvalidRelFileNumber, 0, &manifest, 0, NULL, 0);
+							(errmsg("calculated CRC checksum does not match value stored in file")));
+
+				/* Send the full file, zero-padded as it is on disk */
+				controlFile = palloc0(PG_CONTROL_FILE_SIZE);
+				memcpy(controlFile, controlData, sizeof(ControlFileData));
+				pfree(controlData);
+
+				sendFileWithContent(sink, XLOG_CONTROL_FILE,
+									controlFile, PG_CONTROL_FILE_SIZE,
+									&manifest);
+				pfree(controlFile);
 			}
 			else
 			{
@@ -382,10 +402,8 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 			else
 			{
 				/* Properly terminate the tarfile. */
-				StaticAssertDecl(2 * TAR_BLOCK_SIZE <= BLCKSZ,
-								 "BLCKSZ too small for 2 tar blocks");
-				memset(sink->bbs_buffer, 0, 2 * TAR_BLOCK_SIZE);
-				bbsink_archive_contents(sink, 2 * TAR_BLOCK_SIZE);
+				memset(sink->bbs_buffer, 0, TAR_NUM_TERMINATION_BLOCKS * TAR_BLOCK_SIZE);
+				bbsink_archive_contents(sink, TAR_NUM_TERMINATION_BLOCKS * TAR_BLOCK_SIZE);
 
 				/* OK, that's the end of the archive. */
 				bbsink_end_archive(sink);
@@ -399,7 +417,7 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 		endtli = backup_state->stoptli;
 
 		/* Deallocate backup-related variables. */
-		destroyStringInfo(tablespace_map);
+		pfree(tablespace_map.data);
 		pfree(backup_state);
 	}
 	PG_END_ENSURE_ERROR_CLEANUP(do_pg_abort_backup, BoolGetDatum(false));
@@ -635,10 +653,8 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 		}
 
 		/* Properly terminate the tar file. */
-		StaticAssertStmt(2 * TAR_BLOCK_SIZE <= BLCKSZ,
-						 "BLCKSZ too small for 2 tar blocks");
-		memset(sink->bbs_buffer, 0, 2 * TAR_BLOCK_SIZE);
-		bbsink_archive_contents(sink, 2 * TAR_BLOCK_SIZE);
+		memset(sink->bbs_buffer, 0, TAR_NUM_TERMINATION_BLOCKS * TAR_BLOCK_SIZE);
+		bbsink_archive_contents(sink, TAR_NUM_TERMINATION_BLOCKS * TAR_BLOCK_SIZE);
 
 		/* OK, that's the end of the archive. */
 		bbsink_end_archive(sink);
@@ -653,12 +669,11 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 
 	if (total_checksum_failures)
 	{
-		if (total_checksum_failures > 1)
-			ereport(WARNING,
-					(errmsg_plural("%lld total checksum verification failure",
-								   "%lld total checksum verification failures",
-								   total_checksum_failures,
-								   total_checksum_failures)));
+		ereport(WARNING,
+				(errmsg_plural("%lld total checksum verification failure",
+							   "%lld total checksum verification failures",
+							   total_checksum_failures,
+							   total_checksum_failures)));
 
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
@@ -806,8 +821,8 @@ parse_basebackup_options(List *options, basebackup_options *opt)
 			if (maxrate < MAX_RATE_LOWER || maxrate > MAX_RATE_UPPER)
 				ereport(ERROR,
 						(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-						 errmsg("%d is outside the valid range for parameter \"%s\" (%d .. %d)",
-								(int) maxrate, "MAX_RATE", MAX_RATE_LOWER, MAX_RATE_UPPER)));
+						 errmsg("%" PRId64 " is outside the valid range for parameter \"%s\" (%d .. %d)",
+								maxrate, "MAX_RATE", MAX_RATE_LOWER, MAX_RATE_UPPER)));
 
 			opt->maxrate = (uint32) maxrate;
 			o_maxrate = true;
@@ -1046,7 +1061,7 @@ SendBaseBackup(BaseBackupCmd *cmd, IncrementalBackupInfo *ib)
 		sink = bbsink_zstd_new(sink, &opt.compression_specification);
 
 	/* Set up progress reporting. */
-	sink = bbsink_progress_new(sink, opt.progress);
+	sink = bbsink_progress_new(sink, opt.progress, opt.incremental);
 
 	/*
 	 * Perform the base backup, but make sure we clean up the bbsink even if
@@ -1102,7 +1117,7 @@ sendFileWithContent(bbsink *sink, const char *filename, const char *content,
 
 	_tarWriteHeader(sink, filename, NULL, &statbuf, false);
 
-	if (pg_checksum_update(&checksum_ctx, (uint8 *) content, len) < 0)
+	if (pg_checksum_update(&checksum_ctx, (const uint8 *) content, len) < 0)
 		elog(ERROR, "could not update checksum of file \"%s\"",
 			 filename);
 
@@ -1174,7 +1189,8 @@ sendTablespace(bbsink *sink, char *path, Oid spcoid, bool sizeonly,
 /*
  * Include all files from the given directory in the output tar stream. If
  * 'sizeonly' is true, we just calculate a total length and return it, without
- * actually sending anything.
+ * actually sending anything. A file that will be sent incrementally is
+ * counted at the size of the incremental file.
  *
  * Omit any directory in the tablespaces list, to avoid backing up
  * tablespaces twice when they were created inside PGDATA.
@@ -1204,7 +1220,7 @@ sendDir(bbsink *sink, const char *path, int basepathlen, bool sizeonly,
 	 * But we don't need it at all if this is not an incremental backup.
 	 */
 	if (ib != NULL)
-		relative_block_numbers = palloc(sizeof(BlockNumber) * RELSEG_SIZE);
+		relative_block_numbers = palloc_array(BlockNumber, RELSEG_SIZE);
 
 	/*
 	 * Determine if the current path is a database directory that can contain
@@ -1565,12 +1581,15 @@ sendDir(bbsink *sink, const char *path, int basepathlen, bool sizeonly,
  * If the whole file is to be sent, then incremental_blocks should be NULL,
  * and num_incremental_blocks can have any value, as it will be ignored.
  *
+ * For non-relation files, the stat data of the opened file is used, not
+ * 'statbuf'.
+ *
  * Returns true if the file was successfully sent, false if 'missing_ok',
  * and the file did not exist.
  */
 static bool
 sendFile(bbsink *sink, const char *readfilename, const char *tarfilename,
-		 struct stat *statbuf, bool missing_ok, Oid dboid, Oid spcoid,
+		 const struct stat *statbuf, bool missing_ok, Oid dboid, Oid spcoid,
 		 RelFileNumber relfilenumber, unsigned segno,
 		 backup_manifest_info *manifest, unsigned num_incremental_blocks,
 		 BlockNumber *incremental_blocks, unsigned truncation_block_length)
@@ -1583,6 +1602,7 @@ sendFile(bbsink *sink, const char *readfilename, const char *tarfilename,
 	bool		verify_checksum = false;
 	pg_checksum_context checksum_ctx;
 	int			ibindex = 0;
+	struct stat filestat;
 
 	if (pg_checksum_init(&checksum_ctx, manifest->checksum_type) < 0)
 		elog(ERROR, "could not initialize checksum of file \"%s\"",
@@ -1598,7 +1618,18 @@ sendFile(bbsink *sink, const char *readfilename, const char *tarfilename,
 				 errmsg("could not open file \"%s\": %m", readfilename)));
 	}
 
-	_tarWriteHeader(sink, tarfilename, NULL, statbuf, false);
+	/*
+	 * Non-relation files may be replaced by a rename(), making irrelevant the
+	 * caller's stat data.  Reuse fstat() on the opened file.
+	 */
+	filestat = *statbuf;
+
+	if (!RelFileNumberIsValid(relfilenumber) && fstat(fd, &filestat) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not stat file \"%s\": %m", readfilename)));
+
+	_tarWriteHeader(sink, tarfilename, NULL, &filestat, false);
 
 	/*
 	 * Checksums are verified in multiples of BLCKSZ, so the buffer length
@@ -1685,13 +1716,13 @@ sendFile(bbsink *sink, const char *readfilename, const char *tarfilename,
 		 */
 		if (incremental_blocks == NULL)
 		{
-			size_t		remaining = statbuf->st_size - bytes_done;
+			size_t		remaining = filestat.st_size - bytes_done;
 
 			/*
 			 * If we've read the required number of bytes, then it's time to
 			 * stop.
 			 */
-			if (bytes_done >= statbuf->st_size)
+			if (bytes_done >= filestat.st_size)
 				break;
 
 			/*
@@ -1784,9 +1815,9 @@ sendFile(bbsink *sink, const char *readfilename, const char *tarfilename,
 	}
 
 	/* If the file was truncated while we were sending it, pad it with zeros */
-	while (bytes_done < statbuf->st_size)
+	while (bytes_done < filestat.st_size)
 	{
-		size_t		remaining = statbuf->st_size - bytes_done;
+		size_t		remaining = filestat.st_size - bytes_done;
 		size_t		nbytes = Min(sink->bbs_buffer_length, remaining);
 
 		MemSet(sink->bbs_buffer, 0, nbytes);
@@ -1807,7 +1838,7 @@ sendFile(bbsink *sink, const char *readfilename, const char *tarfilename,
 
 	CloseTransientFile(fd);
 
-	if (checksum_failures > 1)
+	if (checksum_failures > 0)
 	{
 		ereport(WARNING,
 				(errmsg_plural("file \"%s\" has a total of %d checksum verification failure",
@@ -1821,8 +1852,8 @@ sendFile(bbsink *sink, const char *readfilename, const char *tarfilename,
 
 	total_checksum_failures += checksum_failures;
 
-	AddFileToBackupManifest(manifest, spcoid, tarfilename, statbuf->st_size,
-							(pg_time_t) statbuf->st_mtime, &checksum_ctx);
+	AddFileToBackupManifest(manifest, spcoid, tarfilename, filestat.st_size,
+							(pg_time_t) filestat.st_mtime, &checksum_ctx);
 
 	return true;
 }

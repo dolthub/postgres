@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2025, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 # Verify that various forms of corruption are detected by pg_verifybackup.
 
@@ -208,10 +208,8 @@ for my $scenario (@scenario)
 				]);
 			chdir($cwd) || die "chdir: $!";
 
-			# Now check that the backup no longer verifies. We must use -n
-			# here, because pg_waldump can't yet read WAL from a tarfile.
 			command_fails_like(
-				[ 'pg_verifybackup', '--no-parse-wal', $tar_backup_path ],
+				[ 'pg_verifybackup', $tar_backup_path ],
 				$scenario->{'fails_like'},
 				"corrupt backup fails verification: $name");
 

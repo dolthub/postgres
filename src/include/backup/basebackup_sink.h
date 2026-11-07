@@ -17,7 +17,7 @@
  * single task e.g. command progress reporting, throttling, or
  * communication with the client.
  *
- * Portions Copyright (c) 2010-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *
  * src/include/backup/basebackup_sink.h
  *
@@ -51,10 +51,12 @@ typedef struct bbsink_ops bbsink_ops;
  * 'tablespace_num' is the index of the current tablespace within the list
  * stored in 'tablespaces'.
  *
- * 'bytes_done' is the number of bytes read so far from $PGDATA.
+ * 'bytes_done' is the number of bytes of archive data generated so far. This
+ * is counted before any server-side compression.
  *
- * 'bytes_total' is the total number of bytes estimated to be present in
- * $PGDATA, if we have estimated this.
+ * 'bytes_total' is the total number of bytes of archive data estimated to be
+ * generated, if we have estimated this. The estimate is for data before any
+ * server-side compression.
  *
  * 'bytes_total_is_valid' is true if and only if a proper estimate has been
  * stored into 'bytes_total'.
@@ -287,7 +289,8 @@ extern bbsink *bbsink_copystream_new(bool send_to_client);
 extern bbsink *bbsink_gzip_new(bbsink *next, pg_compress_specification *);
 extern bbsink *bbsink_lz4_new(bbsink *next, pg_compress_specification *);
 extern bbsink *bbsink_zstd_new(bbsink *next, pg_compress_specification *);
-extern bbsink *bbsink_progress_new(bbsink *next, bool estimate_backup_size);
+extern bbsink *bbsink_progress_new(bbsink *next, bool estimate_backup_size,
+								   bool incremental);
 extern bbsink *bbsink_server_new(bbsink *next, char *pathname);
 extern bbsink *bbsink_throttle_new(bbsink *next, uint32 maxrate);
 
@@ -296,6 +299,5 @@ extern void basebackup_progress_wait_checkpoint(void);
 extern void basebackup_progress_estimate_backup_size(void);
 extern void basebackup_progress_wait_wal_archive(bbsink_state *);
 extern void basebackup_progress_transfer_wal(void);
-extern void basebackup_progress_done(void);
 
 #endif

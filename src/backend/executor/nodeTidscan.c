@@ -3,7 +3,7 @@
  * nodeTidscan.c
  *	  Routines to support direct tid scans of relations
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -78,7 +78,7 @@ TidExprListCreate(TidScanState *tidstate)
 	foreach(l, node->tidquals)
 	{
 		Expr	   *expr = (Expr *) lfirst(l);
-		TidExpr    *tidexpr = (TidExpr *) palloc0(sizeof(TidExpr));
+		TidExpr    *tidexpr = palloc0_object(TidExpr);
 
 		if (is_opclause(expr))
 		{
@@ -536,7 +536,8 @@ ExecInitTidScan(TidScan *node, EState *estate, int eflags)
 	 */
 	ExecInitScanTupleSlot(estate, &tidstate->ss,
 						  RelationGetDescr(currentRelation),
-						  table_slot_callbacks(currentRelation));
+						  table_slot_callbacks(currentRelation),
+						  TTS_FLAG_OBEYS_NOT_NULL_CONSTRAINTS);
 
 	/*
 	 * Initialize result type and projection.

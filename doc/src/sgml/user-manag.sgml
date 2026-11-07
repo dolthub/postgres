@@ -530,7 +530,9 @@ ALTER TABLE bobs_table OWNER TO alice;
    that contains objects owned by the role.  (Note that the first
    such <command>REASSIGN OWNED</command> will change the ownership of any
    shared-across-databases objects, that is databases or tablespaces, that
-   are owned by the role-to-be-dropped.)
+   are owned by the role-to-be-dropped. Subscriptions, while stored in a
+   shared catalog, belong to a specific database and are reassigned only when
+   <command>REASSIGN OWNED</command> is executed in that database.)
   </para>
 
   <para>
@@ -660,6 +662,7 @@ GRANT pg_signal_backend TO admin_user;
        <link linkend="sql-vacuum"><command>VACUUM</command></link>,
        <link linkend="sql-analyze"><command>ANALYZE</command></link>,
        <link linkend="sql-cluster"><command>CLUSTER</command></link>,
+       <link linkend="sql-repack"><command>REPACK</command></link>,
        <link linkend="sql-refreshmaterializedview"><command>REFRESH MATERIALIZED VIEW</command></link>,
        <link linkend="sql-reindex"><command>REINDEX</command></link>,
        and <link linkend="sql-lock"><command>LOCK TABLE</command></link> on all
@@ -713,7 +716,7 @@ GRANT pg_signal_backend TO admin_user;
      <listitem>
       <para>
        <literal>pg_read_all_data</literal> allows reading all data (tables,
-       views, sequences), as if having <command>SELECT</command> rights on
+       views, sequences, large objects), as if having <command>SELECT</command> rights on
        those objects and <literal>USAGE</literal> rights on all schemas.  This
        role does not bypass row-level security (RLS) policies.  If RLS is being
        used, an administrator may wish to set <literal>BYPASSRLS</literal> on
@@ -721,7 +724,7 @@ GRANT pg_signal_backend TO admin_user;
       </para>
       <para>
        <literal>pg_write_all_data</literal> allows writing all data (tables,
-       views, sequences), as if having <command>INSERT</command>,
+       views, sequences, large objects), as if having <command>INSERT</command>,
        <command>UPDATE</command>, and <command>DELETE</command> rights on those
        objects and <literal>USAGE</literal> rights on all schemas.  This role
        does not bypass row-level security (RLS) policies.  If RLS is being

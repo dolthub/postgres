@@ -3,7 +3,7 @@
  * matview.c
  *	  materialized view support
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,7 +14,6 @@
  */
 #include "postgres.h"
 
-#include "access/doltcatalog.h"
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -25,8 +24,8 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_opclass.h"
-#include "commands/cluster.h"
 #include "commands/matview.h"
+#include "commands/repack.h"
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
 #include "executor/executor.h"
@@ -50,7 +49,7 @@ typedef struct
 	/* These fields are filled by transientrel_startup: */
 	Relation	transientrel;	/* relation to write to */
 	CommandId	output_cid;		/* cmin to insert in output tuples */
-	int			ti_options;		/* table_tuple_insert performance options */
+	uint32		ti_options;		/* table_tuple_insert performance options */
 	BulkInsertState bistate;	/* bulk insert state */
 } DR_transientrel;
 
@@ -62,7 +61,6 @@ static void transientrel_shutdown(DestReceiver *self);
 static void transientrel_destroy(DestReceiver *self);
 static uint64 refresh_matview_datafill(DestReceiver *dest, Query *query,
 									   const char *queryString, bool is_create);
-static char *make_temptable_name_n(char *tempname, int n);
 static void refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 								   int save_sec_context);
 static void refresh_by_heap_swap(Oid matviewOid, Oid OIDNewHeap, char relpersistence);
@@ -212,8 +210,8 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	if (concurrent && skipData)
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("%s and %s options cannot be used together",
-						"CONCURRENTLY", "WITH NO DATA")));
+				 errmsg("%s options %s and %s cannot be used together",
+						"REFRESH", "CONCURRENTLY", "WITH NO DATA")));
 
 	/*
 	 * Check that everything is correct for a refresh. Problems at this point
@@ -236,7 +234,7 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 			 "the rule for materialized view \"%s\" is not a SELECT INSTEAD OF rule",
 			 RelationGetRelationName(matviewRel));
 
-	actions = RewriteRuleActions(matviewRel, rule);
+	actions = rule->actions;
 	if (list_length(actions) != 1)
 		elog(ERROR,
 			 "the rule for materialized view \"%s\" is not a single action",
@@ -293,33 +291,6 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	CheckTableNotInUse(matviewRel,
 					   is_create ? "CREATE MATERIALIZED VIEW" :
 					   "REFRESH MATERIALIZED VIEW");
-
-	/*
-	 * A versioned materialized view keeps its rows on its branch: refill its
-	 * table there.
-	 */
-	if (matviewRel->rd_rel->relam == DOLT_PROLLY_TABLE_AM_OID)
-	{
-		if (concurrent)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("REFRESH MATERIALIZED VIEW CONCURRENTLY is not supported for versioned materialized views")));
-		/* Marking it populated rebuilds the relation's rules. */
-		dataQuery = copyObject(dataQuery);
-		dg_catalog_matview_refresh(matviewRel, !skipData);
-		if (!skipData)
-			processed = refresh_matview_datafill(CreateTransientRelDestReceiver(matviewOid), dataQuery,
-												 queryString, is_create);
-		table_close(matviewRel, NoLock);
-		AtEOXact_GUC(false, save_nestlevel);
-		SetUserIdAndSecContext(save_userid, save_sec_context);
-		ObjectAddressSet(address, RelationRelationId, matviewOid);
-		if (qc)
-			SetQueryCompletion(qc,
-							   is_create ? CMDTAG_SELECT : CMDTAG_REFRESH_MATERIALIZED_VIEW,
-							   processed);
-		return address;
-	}
 
 	/*
 	 * Tentatively mark the matview as populated or not (this will roll back
@@ -454,7 +425,7 @@ refresh_matview_datafill(DestReceiver *dest, Query *query,
 	CHECK_FOR_INTERRUPTS();
 
 	/* Plan the query which will generate data for the refresh. */
-	plan = pg_plan_query(query, queryString, CURSOR_OPT_PARALLEL_OK, NULL);
+	plan = pg_plan_query(query, queryString, CURSOR_OPT_PARALLEL_OK, NULL, NULL);
 
 	/*
 	 * Use a snapshot with an updated command ID to ensure this query sees
@@ -492,7 +463,7 @@ refresh_matview_datafill(DestReceiver *dest, Query *query,
 DestReceiver *
 CreateTransientRelDestReceiver(Oid transientoid)
 {
-	DR_transientrel *self = (DR_transientrel *) palloc0(sizeof(DR_transientrel));
+	DR_transientrel *self = palloc0_object(DR_transientrel);
 
 	self->pub.receiveSlot = transientrel_receive;
 	self->pub.rStartup = transientrel_startup;
@@ -584,28 +555,6 @@ transientrel_destroy(DestReceiver *self)
 	pfree(self);
 }
 
-
-/*
- * Given a qualified temporary table name, append an underscore followed by
- * the given integer, to make a new table name based on the old one.
- * The result is a palloc'd string.
- *
- * As coded, this would fail to make a valid SQL name if the given name were,
- * say, "FOO"."BAR".  Currently, the table name portion of the input will
- * never be double-quoted because it's of the form "pg_temp_NNN", cf
- * make_new_heap().  But we might have to work harder someday.
- */
-static char *
-make_temptable_name_n(char *tempname, int n)
-{
-	StringInfoData namebuf;
-
-	initStringInfo(&namebuf);
-	appendStringInfoString(&namebuf, tempname);
-	appendStringInfo(&namebuf, "_%d", n);
-	return namebuf.data;
-}
-
 /*
  * refresh_by_match_merge
  *
@@ -648,6 +597,9 @@ refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 	char	   *matviewname;
 	char	   *tempname;
 	char	   *diffname;
+	char	   *temprelname;
+	char	   *diffrelname;
+	char	   *nsp;
 	TupleDesc	tupdesc;
 	bool		foundUniqueIndex;
 	List	   *indexoidlist;
@@ -660,9 +612,17 @@ refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 	matviewname = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(matviewRel)),
 											 RelationGetRelationName(matviewRel));
 	tempRel = table_open(tempOid, NoLock);
-	tempname = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(tempRel)),
-										  RelationGetRelationName(tempRel));
-	diffname = make_temptable_name_n(tempname, 2);
+
+	/*
+	 * Build qualified names of the temporary table and the diff table.  The
+	 * only difference between them is the "_2" suffix on the diff table name.
+	 */
+	nsp = get_namespace_name(RelationGetNamespace(tempRel));
+	temprelname = RelationGetRelationName(tempRel);
+	diffrelname = psprintf("%s_2", temprelname);
+
+	tempname = quote_qualified_identifier(nsp, temprelname);
+	diffname = quote_qualified_identifier(nsp, diffrelname);
 
 	relnatts = RelationGetNumberOfAttributes(matviewRel);
 
@@ -753,7 +713,7 @@ refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 	 * include all rows.
 	 */
 	tupdesc = matviewRel->rd_att;
-	opUsedForQual = (Oid *) palloc0(sizeof(Oid) * relnatts);
+	opUsedForQual = palloc0_array(Oid, relnatts);
 	foundUniqueIndex = false;
 
 	indexoidlist = RelationGetIndexList(matviewRel);
@@ -933,6 +893,7 @@ static void
 refresh_by_heap_swap(Oid matviewOid, Oid OIDNewHeap, char relpersistence)
 {
 	finish_heap_swap(matviewOid, OIDNewHeap, false, false, true, true,
+					 true,		/* reindex */
 					 RecentXmin, ReadNextMultiXactId(), relpersistence);
 }
 

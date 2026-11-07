@@ -117,11 +117,12 @@ explain (costs off)
 
 explain (costs off)
   select * from ec0 where ff = f1 and f1 = '42'::int8alias1;
-                    QUERY PLAN                     
----------------------------------------------------
- Seq Scan on ec0
-   Filter: ((ff = f1) AND (f1 = '42'::int8alias1))
-(2 rows)
+              QUERY PLAN               
+---------------------------------------
+ Index Scan using ec0_pkey on ec0
+   Index Cond: (ff = '42'::int8alias1)
+   Filter: (f1 = '42'::int8alias1)
+(3 rows)
 
 explain (costs off)
   select * from ec1 where ff = f1 and f1 = '42'::int8alias1;
@@ -142,12 +143,12 @@ explain (costs off)
 
 explain (costs off)
   select * from ec1, ec2 where ff = x1 and ff = '42'::int8;
-               QUERY PLAN                
------------------------------------------
+                            QUERY PLAN                             
+-------------------------------------------------------------------
  Nested Loop
    Join Filter: (ec1.ff = ec2.x1)
    ->  Index Scan using ec1_pkey on ec1
-         Index Cond: (ff = '42'::bigint)
+         Index Cond: ((ff = '42'::bigint) AND (ff = '42'::bigint))
    ->  Seq Scan on ec2
 (5 rows)
 
@@ -232,20 +233,21 @@ explain (costs off)
      union all
      select ff + 4 as x from ec1) as ss1
   where ss1.x = ec1.f1 and ec1.ff = 42::int8 and ec1.ff = ec1.f1;
-                     QUERY PLAN                      
------------------------------------------------------
+                            QUERY PLAN                             
+-------------------------------------------------------------------
  Nested Loop
+   Join Filter: ((((ec1_1.ff + 2) + 1)) = ec1.f1)
    ->  Index Scan using ec1_pkey on ec1
-         Index Cond: (ff = '42'::bigint)
+         Index Cond: ((ff = '42'::bigint) AND (ff = '42'::bigint))
          Filter: (ff = f1)
    ->  Append
          ->  Index Scan using ec1_expr2 on ec1 ec1_1
-               Index Cond: (((ff + 2) + 1) = ec1.f1)
+               Index Cond: (((ff + 2) + 1) = '42'::bigint)
          ->  Index Scan using ec1_expr3 on ec1 ec1_2
-               Index Cond: (((ff + 3) + 1) = ec1.f1)
+               Index Cond: (((ff + 3) + 1) = '42'::bigint)
          ->  Index Scan using ec1_expr4 on ec1 ec1_3
-               Index Cond: ((ff + 4) = ec1.f1)
-(11 rows)
+               Index Cond: ((ff + 4) = '42'::bigint)
+(12 rows)
 
 explain (costs off)
   select * from ec1,
@@ -311,21 +313,19 @@ explain (costs off)
          ->  Index Scan using ec1_expr2 on ec1 ec1_4
          ->  Index Scan using ec1_expr3 on ec1 ec1_5
          ->  Index Scan using ec1_expr4 on ec1 ec1_6
-   ->  Sort
-         Sort Key: (((ec1_1.ff + 2) + 1))
+   ->  Materialize
          ->  Merge Join
                Merge Cond: ((((ec1_1.ff + 2) + 1)) = ec1.f1)
-               ->  Sort
+               ->  Merge Append
                      Sort Key: (((ec1_1.ff + 2) + 1))
-                     ->  Append
-                           ->  Seq Scan on ec1 ec1_1
-                           ->  Seq Scan on ec1 ec1_2
-                           ->  Seq Scan on ec1 ec1_3
+                     ->  Index Scan using ec1_expr2 on ec1 ec1_1
+                     ->  Index Scan using ec1_expr3 on ec1 ec1_2
+                     ->  Index Scan using ec1_expr4 on ec1 ec1_3
                ->  Sort
                      Sort Key: ec1.f1 USING <
                      ->  Index Scan using ec1_pkey on ec1
                            Index Cond: (ff = '42'::bigint)
-(21 rows)
+(19 rows)
 
 -- check partially indexed scan
 set enable_nestloop = on;
@@ -366,21 +366,22 @@ explain (costs off)
      union all
      select ff + 4 as x from ec1) as ss1
   where ss1.x = ec1.f1 and ec1.ff = 42::int8;
-                   QUERY PLAN                    
--------------------------------------------------
+                     QUERY PLAN                      
+-----------------------------------------------------
  Merge Join
    Merge Cond: ((((ec1_1.ff + 2) + 1)) = ec1.f1)
-   ->  Sort
+   ->  Merge Append
          Sort Key: (((ec1_1.ff + 2) + 1))
-         ->  Append
-               ->  Seq Scan on ec1 ec1_1
+         ->  Index Scan using ec1_expr2 on ec1 ec1_1
+         ->  Sort
+               Sort Key: (((ec1_2.ff + 3) + 1))
                ->  Seq Scan on ec1 ec1_2
-               ->  Seq Scan on ec1 ec1_3
+         ->  Index Scan using ec1_expr4 on ec1 ec1_3
    ->  Sort
          Sort Key: ec1.f1 USING <
          ->  Index Scan using ec1_pkey on ec1
                Index Cond: (ff = '42'::bigint)
-(12 rows)
+(13 rows)
 
 -- check effects of row-level security
 set enable_nestloop = on;
@@ -400,7 +401,7 @@ explain (costs off)
    ->  Index Scan using ec0_pkey on ec0 a
          Index Cond: (ff = '43'::int8alias1)
    ->  Index Scan using ec1_pkey on ec1 b
-         Index Cond: (ff = a.ff)
+         Index Cond: (ff = '43'::int8alias1)
 (5 rows)
 
 set session authorization regress_user_ectest;

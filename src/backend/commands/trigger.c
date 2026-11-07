@@ -3,7 +3,7 @@
  * trigger.c
  *	  PostgreSQL TRIGGERs support code.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -19,11 +19,9 @@
 #include "access/sysattr.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "access/tupconvert.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
-#include "catalog/catalogview.h"
-#include "access/doltbranch.h"
-#include "access/doltcatalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
@@ -33,9 +31,9 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
-#include "commands/dbcommands.h"
 #include "commands/trigger.h"
 #include "executor/executor.h"
+#include "executor/instrument.h"
 #include "miscadmin.h"
 #include "nodes/bitmapset.h"
 #include "nodes/makefuncs.h"
@@ -94,7 +92,7 @@ static bool TriggerEnabled(EState *estate, ResultRelInfo *relinfo,
 static HeapTuple ExecCallTriggerFunc(TriggerData *trigdata,
 									 int tgindx,
 									 FmgrInfo *finfo,
-									 Instrumentation *instr,
+									 TriggerInstrumentation *instr,
 									 MemoryContext per_tuple_context);
 static void AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 								  ResultRelInfo *src_partinfo,
@@ -161,7 +159,7 @@ static HeapTuple check_modified_virtual_generated(TupleDesc tupdesc, HeapTuple t
  * (but see CloneRowTriggersToPartition).
  */
 ObjectAddress
-CreateTrigger(CreateTrigStmt *stmt, const char *queryString,
+CreateTrigger(const CreateTrigStmt *stmt, const char *queryString,
 			  Oid relOid, Oid refRelOid, Oid constraintOid, Oid indexOid,
 			  Oid funcoid, Oid parentTriggerOid, Node *whenClause,
 			  bool isInternal, bool in_partition)
@@ -178,7 +176,7 @@ CreateTrigger(CreateTrigStmt *stmt, const char *queryString,
  * (always/origin/replica/disabled) can be specified.
  */
 ObjectAddress
-CreateTriggerFiringOn(CreateTrigStmt *stmt, const char *queryString,
+CreateTriggerFiringOn(const CreateTrigStmt *stmt, const char *queryString,
 					  Oid relOid, Oid refRelOid, Oid constraintOid,
 					  Oid indexOid, Oid funcoid, Oid parentTriggerOid,
 					  Node *whenClause, bool isInternal, bool in_partition,
@@ -875,7 +873,7 @@ CreateTriggerFiringOn(CreateTrigStmt *stmt, const char *queryString,
 															 CStringGetDatum(trigname));
 	values[Anum_pg_trigger_tgfoid - 1] = ObjectIdGetDatum(funcoid);
 	values[Anum_pg_trigger_tgtype - 1] = Int16GetDatum(tgtype);
-	values[Anum_pg_trigger_tgenabled - 1] = trigger_fires_when;
+	values[Anum_pg_trigger_tgenabled - 1] = CharGetDatum(trigger_fires_when);
 	values[Anum_pg_trigger_tgisinternal - 1] = BoolGetDatum(isInternal);
 	values[Anum_pg_trigger_tgconstrrelid - 1] = ObjectIdGetDatum(constrrelid);
 	values[Anum_pg_trigger_tgconstrindid - 1] = ObjectIdGetDatum(indexOid);
@@ -887,8 +885,17 @@ CreateTriggerFiringOn(CreateTrigStmt *stmt, const char *queryString,
 	{
 		ListCell   *le;
 		char	   *args;
-		int16		nargs = list_length(stmt->args);
+		int			nargs = list_length(stmt->args);
 		int			len = 0;
+
+		Assert(nargs >= 0);
+		if (nargs > PG_INT16_MAX)
+			ereport(ERROR,
+					errcode(ERRCODE_TOO_MANY_ARGUMENTS),
+					errmsg_plural("triggers cannot have more than %d argument",
+								  "triggers cannot have more than %d arguments",
+								  PG_INT16_MAX,
+								  PG_INT16_MAX));
 
 		foreach(le, stmt->args)
 		{
@@ -1856,14 +1863,6 @@ EnableDisableTrigger(Relation rel, const char *tgname, Oid tgparent,
 }
 
 
-/* Canonical catalog scans do not inherit the physical catalog index order. */
-static int
-trigger_name_cmp(const void *a, const void *b)
-{
-	return strcmp(((const Trigger *) a)->tgname,
-				  ((const Trigger *) b)->tgname);
-}
-
 /*
  * Build trigger data to attach to the given relcache entry.
  *
@@ -2007,12 +2006,8 @@ RelationBuildTriggers(Relation relation)
 		return;
 	}
 
-	/* Match TriggerRelidNameIndexId ordering for a revision-bound relation. */
-	if (CatalogViewObjectContext(RelationGetRelid(relation)) && numtrigs > 1)
-		qsort(triggers, numtrigs, sizeof(Trigger), trigger_name_cmp);
-
 	/* Build trigdesc */
-	trigdesc = (TriggerDesc *) palloc0(sizeof(TriggerDesc));
+	trigdesc = palloc0_object(TriggerDesc);
 	trigdesc->triggers = triggers;
 	trigdesc->numtriggers = numtrigs;
 	for (i = 0; i < numtrigs; i++)
@@ -2117,7 +2112,7 @@ CopyTriggerDesc(TriggerDesc *trigdesc)
 	if (trigdesc == NULL || trigdesc->numtriggers <= 0)
 		return NULL;
 
-	newdesc = (TriggerDesc *) palloc(sizeof(TriggerDesc));
+	newdesc = palloc_object(TriggerDesc);
 	memcpy(newdesc, trigdesc, sizeof(TriggerDesc));
 
 	trigger = (Trigger *) palloc(trigdesc->numtriggers * sizeof(Trigger));
@@ -2330,15 +2325,13 @@ static HeapTuple
 ExecCallTriggerFunc(TriggerData *trigdata,
 					int tgindx,
 					FmgrInfo *finfo,
-					Instrumentation *instr,
+					TriggerInstrumentation *instr,
 					MemoryContext per_tuple_context)
 {
 	LOCAL_FCINFO(fcinfo, 0);
 	PgStat_FunctionCallUsage fcusage;
 	Datum		result;
 	MemoryContext oldContext;
-	CatalogView *previous;
-	const char *previous_branch;
 
 	/*
 	 * Protect against code paths that may fail to initialize transition table
@@ -2367,7 +2360,7 @@ ExecCallTriggerFunc(TriggerData *trigdata,
 	 * If doing EXPLAIN ANALYZE, start charging time to this trigger.
 	 */
 	if (instr)
-		InstrStartNode(instr + tgindx);
+		InstrStartTrigger(instr + tgindx);
 
 	/*
 	 * Do the function evaluation in the per-tuple memory context, so that
@@ -2385,12 +2378,6 @@ ExecCallTriggerFunc(TriggerData *trigdata,
 
 	pgstat_init_function_usage(fcinfo, &fcusage);
 
-	/*
-	 * Trigger SQL resolves names in the owning definition, including deferred
-	 * calls.
-	 */
-	previous_branch = dg_switch_execution_branch(trigdata->tg_relation->rd_catalogview ? dg_relation_branch(trigdata->tg_relation) : NULL);
-	previous = CatalogViewSwitch(trigdata->tg_relation->rd_catalogview);
 	MyTriggerDepth++;
 	PG_TRY();
 	{
@@ -2399,8 +2386,6 @@ ExecCallTriggerFunc(TriggerData *trigdata,
 	PG_FINALLY();
 	{
 		MyTriggerDepth--;
-		CatalogViewSwitch(previous);
-		dg_switch_execution_branch(previous_branch);
 	}
 	PG_END_TRY();
 
@@ -2420,10 +2405,10 @@ ExecCallTriggerFunc(TriggerData *trigdata,
 
 	/*
 	 * If doing EXPLAIN ANALYZE, stop charging time to this trigger, and count
-	 * one "tuple returned" (really the number of firings).
+	 * the firing of the trigger.
 	 */
 	if (instr)
-		InstrStopNode(instr + tgindx, 1);
+		InstrStopTrigger(instr + tgindx, 1);
 
 	return (HeapTuple) DatumGetPointer(result);
 }
@@ -3719,37 +3704,6 @@ typedef uint32 TriggerFlags;
 #define AFTER_TRIGGER_2CTID				0x30000000
 #define AFTER_TRIGGER_CP_UPDATE			0x08000000
 #define AFTER_TRIGGER_TUP_BITS			0x38000000
-/* Event context outlives the executor that queued a cascaded/deferred event. */
-typedef struct TriggerCatalogPin
-{
-	MemoryContextCallback callback;
-	CatalogView *view;
-} TriggerCatalogPin;
-
-static void
-release_trigger_catalog(void *arg)
-{
-	TriggerCatalogPin *pin = arg;
-
-	CatalogViewRelease(pin->view);
-}
-
-static const char *
-retain_trigger_branch(Relation rel)
-{
-	TriggerCatalogPin *pin;
-
-	if (!rel->rd_catalogview)
-		return NULL;
-	pin = MemoryContextAlloc(TopTransactionContext, sizeof(*pin));
-	pin->view = rel->rd_catalogview;
-	CatalogViewRetain(pin->view);
-	pin->callback.func = release_trigger_catalog;
-	pin->callback.arg = pin;
-	MemoryContextRegisterResetCallback(TopTransactionContext, &pin->callback);
-	return MemoryContextStrdup(TopTransactionContext, dg_relation_branch(rel));
-}
-
 typedef struct AfterTriggerSharedData *AfterTriggerShared;
 
 typedef struct AfterTriggerSharedData
@@ -3757,8 +3711,6 @@ typedef struct AfterTriggerSharedData
 	TriggerEvent ats_event;		/* event type indicator, see trigger.h */
 	Oid			ats_tgoid;		/* the trigger's ID */
 	Oid			ats_relid;		/* the relation it's on */
-	const char *ats_branch;		/* explicit working branch for revision-bound
-								 * events */
 	Oid			ats_rolid;		/* role to execute the trigger */
 	CommandId	ats_firing_id;	/* ID for firing cycle */
 	struct AfterTriggersTableData *ats_table;	/* transition table access */
@@ -4000,7 +3952,7 @@ static void AfterTriggerExecute(EState *estate,
 								ResultRelInfo *dst_relInfo,
 								TriggerDesc *trigdesc,
 								FmgrInfo *finfo,
-								Instrumentation *instr,
+								TriggerInstrumentation *instr,
 								MemoryContext per_tuple_context,
 								TupleTableSlot *trig_tuple_slot1,
 								TupleTableSlot *trig_tuple_slot2);
@@ -4232,8 +4184,6 @@ afterTriggerAddEvent(AfterTriggerEventList *events,
 			newshared->ats_firing_id == 0 &&
 			newshared->ats_table == evtshared->ats_table &&
 			newshared->ats_relid == evtshared->ats_relid &&
-			((!newshared->ats_branch && !evtshared->ats_branch) ||
-			 (newshared->ats_branch && evtshared->ats_branch && !strcmp(newshared->ats_branch, evtshared->ats_branch))) &&
 			newshared->ats_rolid == evtshared->ats_rolid &&
 			bms_equal(newshared->ats_modifiedcols,
 					  evtshared->ats_modifiedcols))
@@ -4396,7 +4346,7 @@ AfterTriggerExecute(EState *estate,
 					ResultRelInfo *src_relInfo,
 					ResultRelInfo *dst_relInfo,
 					TriggerDesc *trigdesc,
-					FmgrInfo *finfo, Instrumentation *instr,
+					FmgrInfo *finfo, TriggerInstrumentation *instr,
 					MemoryContext per_tuple_context,
 					TupleTableSlot *trig_tuple_slot1,
 					TupleTableSlot *trig_tuple_slot2)
@@ -4437,7 +4387,7 @@ AfterTriggerExecute(EState *estate,
 	 * to include time spent re-fetching tuples in the trigger cost.
 	 */
 	if (instr)
-		InstrStartNode(instr + tgindx);
+		InstrStartTrigger(instr + tgindx);
 
 	/*
 	 * Fetch the required tuple(s).
@@ -4458,7 +4408,7 @@ AfterTriggerExecute(EState *estate,
 											 trig_tuple_slot2))
 					elog(ERROR, "failed to fetch tuple2 for AFTER trigger");
 			}
-			/* fall through */
+			pg_fallthrough;
 		case AFTER_TRIGGER_FDW_REUSE:
 
 			/*
@@ -4654,10 +4604,10 @@ AfterTriggerExecute(EState *estate,
 
 	/*
 	 * If doing EXPLAIN ANALYZE, stop charging time to this trigger, and count
-	 * one "tuple returned" (really the number of firings).
+	 * the firing of the trigger.
 	 */
 	if (instr)
-		InstrStopNode(instr + tgindx, 1);
+		InstrStopTrigger(instr + tgindx, 1);
 }
 
 
@@ -4773,7 +4723,7 @@ afterTriggerInvokeEvents(AfterTriggerEventList *events,
 	Relation	rel = NULL;
 	TriggerDesc *trigdesc = NULL;
 	FmgrInfo   *finfo = NULL;
-	Instrumentation *instr = NULL;
+	TriggerInstrumentation *instr = NULL;
 	TupleTableSlot *slot1 = NULL,
 			   *slot2 = NULL;
 
@@ -4812,10 +4762,9 @@ afterTriggerInvokeEvents(AfterTriggerEventList *events,
 				 * So let's fire it... but first, find the correct relation if
 				 * this is not the same relation as before.
 				 */
-				if (rel == NULL || RelationGetRelid(rel) != evtshared->ats_relid ||
-					(evtshared->ats_branch && strcmp(dg_relation_branch(rel), evtshared->ats_branch)))
+				if (rel == NULL || RelationGetRelid(rel) != evtshared->ats_relid)
 				{
-					rInfo = ExecGetTriggerResultRel(estate, evtshared->ats_relid, evtshared->ats_branch,
+					rInfo = ExecGetTriggerResultRel(estate, evtshared->ats_relid,
 													NULL);
 					rel = rInfo->ri_RelationDesc;
 					/* Catch calls with insufficient relcache refcounting */
@@ -4849,10 +4798,10 @@ afterTriggerInvokeEvents(AfterTriggerEventList *events,
 					Assert(OidIsValid(event->ate_src_part) &&
 						   OidIsValid(event->ate_dst_part));
 					src_rInfo = ExecGetTriggerResultRel(estate,
-														event->ate_src_part, NULL,
+														event->ate_src_part,
 														rInfo);
 					dst_rInfo = ExecGetTriggerResultRel(estate,
-														event->ate_dst_part, NULL,
+														event->ate_dst_part,
 														rInfo);
 				}
 				else
@@ -4957,7 +4906,7 @@ GetAfterTriggersTableData(Oid relid, CmdType cmdType)
 
 	oldcxt = MemoryContextSwitchTo(CurTransactionContext);
 
-	table = (AfterTriggersTableData *) palloc0(sizeof(AfterTriggersTableData));
+	table = palloc0_object(AfterTriggersTableData);
 	table->relid = relid;
 	table->cmdType = cmdType;
 	qs->tables = lappend(qs->tables, table);
@@ -5126,7 +5075,7 @@ MakeTransitionCaptureState(TriggerDesc *trigdesc, Oid relid, CmdType cmdType)
 	MemoryContextSwitchTo(oldcxt);
 
 	/* Now build the TransitionCaptureState struct, in caller's context */
-	state = (TransitionCaptureState *) palloc0(sizeof(TransitionCaptureState));
+	state = palloc0_object(TransitionCaptureState);
 	state->tcs_delete_old_table = need_old_del;
 	state->tcs_update_old_table = need_old_upd;
 	state->tcs_update_new_table = need_new_upd;
@@ -5829,40 +5778,8 @@ SetConstraintStateAddItem(SetConstraintState state,
  *	Execute the SET CONSTRAINTS ... utility command.
  * ----------
  */
-static void AfterTriggerSetStateContext(ConstraintsSetStmt *stmt);
-
 void
 AfterTriggerSetState(ConstraintsSetStmt *stmt)
-{
-	CatalogView *previous = CatalogViewCurrent();
-	bool		pushed;
-
-	/* ALL does not resolve catalog names and must not establish a snapshot. */
-	if (stmt->constraints == NIL)
-	{
-		AfterTriggerSetStateContext(stmt);
-		return;
-	}
-	pushed = !ActiveSnapshotSet();
-
-	if (pushed)
-		PushActiveSnapshot(GetTransactionSnapshot());
-	PG_TRY();
-	{
-		CatalogViewSwitch(dg_catalog_session_view());
-		AfterTriggerSetStateContext(stmt);
-	}
-	PG_FINALLY();
-	{
-		CatalogViewSwitch(previous);
-		if (pushed)
-			PopActiveSnapshot();
-	}
-	PG_END_TRY();
-}
-
-static void
-AfterTriggerSetStateContext(ConstraintsSetStmt *stmt)
 {
 	int			my_level = GetCurrentTransactionNestLevel();
 
@@ -5958,7 +5875,7 @@ AfterTriggerSetStateContext(ConstraintsSetStmt *stmt)
 			found = false;
 			foreach(nslc, namespacelist)
 			{
-				Oid			namespaceId = CatalogViewNamespace(CatalogViewCurrent(), lfirst_oid(nslc));
+				Oid			namespaceId = lfirst_oid(nslc);
 				SysScanDesc conscan;
 				ScanKeyData skey[2];
 				HeapTuple	tup;
@@ -6176,21 +6093,6 @@ AfterTriggerSetStateContext(ConstraintsSetStmt *stmt)
  * of knowledge of the trigger semantics we can't do this in general.
  * ----------
  */
-static bool
-trigger_event_matches_relation(AfterTriggerShared shared, Oid relid)
-{
-	const char *name;
-
-	if (shared->ats_branch && strcmp(shared->ats_branch, dg_current_branch()))
-		return false;
-	if (shared->ats_relid == relid)
-		return true;
-	if (!shared->ats_branch || !CatalogViewObjectContext(relid))
-		return false;
-	name = CatalogViewObjectIdentity(relid, RelationRelationId);
-	return !strcmp(name, CatalogViewObjectIdentity(shared->ats_relid, RelationRelationId));
-}
-
 bool
 AfterTriggerPendingOnRel(Oid relid)
 {
@@ -6211,7 +6113,7 @@ AfterTriggerPendingOnRel(Oid relid)
 		if (event->ate_flags & AFTER_TRIGGER_DONE)
 			continue;
 
-		if (trigger_event_matches_relation(evtshared, relid))
+		if (evtshared->ats_relid == relid)
 			return true;
 	}
 
@@ -6229,7 +6131,7 @@ AfterTriggerPendingOnRel(Oid relid)
 			if (event->ate_flags & AFTER_TRIGGER_DONE)
 				continue;
 
-			if (trigger_event_matches_relation(evtshared, relid))
+			if (evtshared->ats_relid == relid)
 				return true;
 		}
 	}
@@ -6645,7 +6547,6 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 			(trigger->tginitdeferred ? AFTER_TRIGGER_INITDEFERRED : 0);
 		new_shared.ats_tgoid = trigger->tgoid;
 		new_shared.ats_relid = RelationGetRelid(rel);
-		new_shared.ats_branch = retain_trigger_branch(rel);
 		new_shared.ats_rolid = GetUserId();
 		new_shared.ats_firing_id = 0;
 		if ((trigger->tgoldtable || trigger->tgnewtable) &&

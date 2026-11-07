@@ -3,7 +3,7 @@
  * nodeLockRows.c
  *	  Routines to handle FOR UPDATE/FOR SHARE row locking
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -234,7 +234,7 @@ lnext:
 				if (IsolationUsesXactSnapshot())
 					ereport(ERROR,
 							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-							 errmsg("could not serialize access due to concurrent update")));
+							 errmsg("could not serialize access due to concurrent delete")));
 				/* tuple was deleted so don't return it */
 				goto lnext;
 

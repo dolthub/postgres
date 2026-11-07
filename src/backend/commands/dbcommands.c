@@ -8,7 +8,7 @@
  * stepping on each others' toes.  Formerly we used table-level locks
  * on pg_database, but that's too coarse-grained.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -60,14 +60,18 @@
 #include "storage/lmgr.h"
 #include "storage/md.h"
 #include "storage/procarray.h"
+#include "storage/procsignal.h"
 #include "storage/smgr.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/injection_point.h"
+#include "utils/lsyscache.h"
 #include "utils/pg_locale.h"
 #include "utils/relmapper.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/wait_event.h"
 
 /*
  * Create database strategy.
@@ -430,7 +434,7 @@ ScanSourceDatabasePgClassTuple(HeapTupleData *tuple, Oid tbid, Oid dbid,
 			 classForm->oid);
 
 	/* Prepare a rel info element and add it to the list. */
-	relinfo = (CreateDBRelInfo *) palloc(sizeof(CreateDBRelInfo));
+	relinfo = palloc_object(CreateDBRelInfo);
 	if (OidIsValid(classForm->reltablespace))
 		relinfo->rlocator.spcOid = classForm->reltablespace;
 	else
@@ -570,8 +574,8 @@ CreateDatabaseUsingFileCopy(Oid src_dboid, Oid dst_dboid, Oid src_tsid,
 	 * any CREATE DATABASE commands.
 	 */
 	if (!IsBinaryUpgrade)
-		RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE |
-						  CHECKPOINT_WAIT | CHECKPOINT_FLUSH_ALL);
+		RequestCheckpoint(CHECKPOINT_FAST | CHECKPOINT_FORCE |
+						  CHECKPOINT_WAIT | CHECKPOINT_FLUSH_UNLOGGED);
 
 	/*
 	 * Iterate through all tablespaces of the template database, and copy each
@@ -673,7 +677,7 @@ CreateDatabaseUsingFileCopy(Oid src_dboid, Oid dst_dboid, Oid src_tsid,
 	 * strategy that avoids these problems.
 	 */
 	if (!IsBinaryUpgrade)
-		RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE |
+		RequestCheckpoint(CHECKPOINT_FAST | CHECKPOINT_FORCE |
 						  CHECKPOINT_WAIT);
 }
 
@@ -740,6 +744,12 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	int			npreparedxacts;
 	CreateDBStrategy dbstrategy = CREATEDB_WAL_LOG;
 	createdb_failure_params fparms;
+
+	/* Report error if name has \n or \r character. */
+	if (strpbrk(dbname, "\n\r"))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("database name \"%s\" contains a newline or carriage return character", dbname)));
 
 	/* Extract options from the statement node tree */
 	foreach(option, stmt->options)
@@ -1494,6 +1504,8 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	tuple = heap_form_tuple(RelationGetDescr(pg_database_rel),
 							new_record, new_record_nulls);
 
+	INJECTION_POINT("createdb-before-catalog-insert", NULL);
+
 	CatalogTupleInsert(pg_database_rel, tuple);
 
 	/*
@@ -1870,7 +1882,7 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 	 * Force a checkpoint to make sure the checkpointer has received the
 	 * message sent by ForgetDatabaseSyncRequests.
 	 */
-	RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
+	RequestCheckpoint(CHECKPOINT_FAST | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
 
 	/* Close all smgr fds in all backends. */
 	WaitForProcSignalBarrier(EmitProcSignalBarrier(PROCSIGNAL_BARRIER_SMGRRELEASE));
@@ -1908,6 +1920,12 @@ RenameDatabase(const char *oldname, const char *newname)
 	int			notherbackends;
 	int			npreparedxacts;
 	ObjectAddress address;
+
+	/* Report error if name has \n or \r character. */
+	if (strpbrk(newname, "\n\r"))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("database name \"%s\" contains a newline or carriage return character", newname)));
 
 	/*
 	 * Look up the target database's OID, and get exclusive lock on it. We
@@ -2120,8 +2138,8 @@ movedb(const char *dbname, const char *tblspcname)
 	 * On Windows, this also ensures that background procs don't hold any open
 	 * files, which would cause rmdir() to fail.
 	 */
-	RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT
-					  | CHECKPOINT_FLUSH_ALL);
+	RequestCheckpoint(CHECKPOINT_FAST | CHECKPOINT_FORCE | CHECKPOINT_WAIT
+					  | CHECKPOINT_FLUSH_UNLOGGED);
 
 	/* Close all smgr fds in all backends. */
 	WaitForProcSignalBarrier(EmitProcSignalBarrier(PROCSIGNAL_BARRIER_SMGRRELEASE));
@@ -2252,7 +2270,7 @@ movedb(const char *dbname, const char *tblspcname)
 		 * any unlogged operations done in the new DB tablespace before the
 		 * next checkpoint.
 		 */
-		RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
+		RequestCheckpoint(CHECKPOINT_FAST | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
 
 		/*
 		 * Force synchronous commit, thus minimizing the window between
@@ -3202,30 +3220,6 @@ get_database_oid(const char *dbname, bool missing_ok)
 						dbname)));
 
 	return oid;
-}
-
-
-/*
- * get_database_name - given a database OID, look up the name
- *
- * Returns a palloc'd string, or NULL if no such database.
- */
-char *
-get_database_name(Oid dbid)
-{
-	HeapTuple	dbtuple;
-	char	   *result;
-
-	dbtuple = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(dbid));
-	if (HeapTupleIsValid(dbtuple))
-	{
-		result = pstrdup(NameStr(((Form_pg_database) GETSTRUCT(dbtuple))->datname));
-		ReleaseSysCache(dbtuple);
-	}
-	else
-		result = NULL;
-
-	return result;
 }
 
 

@@ -3,7 +3,7 @@
  * int.c
  *	  Functions for the built-in integer types (except int8).
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -379,7 +379,7 @@ i4toi2(PG_FUNCTION_ARGS)
 	int32		arg1 = PG_GETARG_INT32(0);
 
 	if (unlikely(arg1 < SHRT_MIN) || unlikely(arg1 > SHRT_MAX))
-		ereport(ERROR,
+		ereturn(fcinfo->context, (Datum) 0,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("smallint out of range")));
 
@@ -1213,7 +1213,8 @@ int2mod(PG_FUNCTION_ARGS)
 }
 
 
-/* int[24]abs()
+/*
+ * int[24]abs()
  * Absolute value
  */
 Datum
@@ -1566,7 +1567,7 @@ generate_series_step_int4(PG_FUNCTION_ARGS)
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
 		/* allocate memory for user context */
-		fctx = (generate_series_fctx *) palloc(sizeof(generate_series_fctx));
+		fctx = palloc_object(generate_series_fctx);
 
 		/*
 		 * Use fctx to keep state from call to call. Seed current with the

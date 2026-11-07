@@ -2,7 +2,7 @@
  * decode.h
  *	   PostgreSQL WAL to logical transformation
  *
- * Portions Copyright (c) 2012-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-2026, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -30,5 +30,9 @@ extern void logicalmsg_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf
 
 extern void LogicalDecodingProcessRecord(LogicalDecodingContext *ctx,
 										 XLogReaderState *record);
+
+/* in commands/repack_worker.c */
+extern bool change_useless_for_repack(XLogRecordBuffer *buf);
+
 
 #endif

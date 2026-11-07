@@ -3,7 +3,7 @@
  * postinit.c
  *	  postgres initialization utilities
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -38,6 +38,7 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "port/pg_bitutils.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/postmaster.h"
 #include "replication/slot.h"
@@ -70,6 +71,19 @@
 #include "utils/syscache.h"
 #include "utils/timeout.h"
 
+/* has this backend called EmitConnectionWarnings()? */
+static bool ConnectionWarningsEmitted;
+
+typedef struct ConnectionWarning
+{
+	char	   *message;
+	char	   *detail;
+	ConnectionWarningFilter filter;
+} ConnectionWarning;
+
+/* warnings to send via EmitConnectionWarnings() */
+static List *ConnectionWarnings;
+
 static HeapTuple GetDatabaseTuple(const char *dbname);
 static HeapTuple GetDatabaseTupleByOid(Oid dboid);
 static void PerformAuthentication(Port *port);
@@ -85,6 +99,7 @@ static void ClientCheckTimeoutHandler(void);
 static bool ThereIsAtLeastOneRole(void);
 static void process_startup_options(Port *port, bool am_superuser);
 static void process_settings(Oid databaseid, Oid roleid);
+static void EmitConnectionWarnings(void);
 
 
 /*** InitPostgres support ***/
@@ -431,10 +446,6 @@ CheckMyDatabase(const char *name, bool am_superuser, bool override_allow_connect
 						   " which is not recognized by setlocale().", ctype),
 				 errhint("Recreate the database with another locale or install the missing locale.")));
 
-	if (strcmp(ctype, "C") == 0 ||
-		strcmp(ctype, "POSIX") == 0)
-		database_ctype_is_c = true;
-
 	init_database_collation();
 
 	/*
@@ -589,7 +600,7 @@ InitializeFastPathLocks(void)
 	 * value at FP_LOCK_GROUPS_PER_BACKEND_MAX and insist the value is at
 	 * least 1.
 	 *
-	 * The default max_locks_per_transaction = 64 means 4 groups by default.
+	 * The default max_locks_per_transaction = 128 means 8 groups by default.
 	 */
 	FastPathLockGroupsPerBackend =
 		Max(Min(pg_nextpower2_32(max_locks_per_xact) / FP_LOCK_SLOTS_PER_GROUP,
@@ -711,7 +722,7 @@ BaseInit(void)
 void
 InitPostgres(const char *in_dbname, Oid dboid,
 			 const char *username, Oid useroid,
-			 bits32 flags,
+			 uint32 flags,
 			 char *out_dbname)
 {
 	bool		bootstrap = IsBootstrapProcessingMode();
@@ -799,6 +810,16 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	}
 
 	/*
+	 * Initialize the process-local logical info WAL logging state.
+	 *
+	 * This must be called after ProcSignalInit() so that the process can
+	 * participate in procsignal-based barriers that update this state.
+	 * Furthermore, in !IsUnderPostmaster cases, this must occur after
+	 * StartupXLOG() where the shared state is first established.
+	 */
+	InitializeProcessXLogLogicalInfo();
+
+	/*
 	 * Initialize the relation cache and the system catalog caches.  Note that
 	 * no catalog access happens here; we only set up the hashtable structure.
 	 * We must do this before starting a transaction because transaction abort
@@ -818,9 +839,9 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	RelationCacheInitializePhase2();
 
 	/*
-	 * Set up process-exit callback to do pre-shutdown cleanup.  This is the
-	 * one of the first before_shmem_exit callbacks we register; thus, this
-	 * will be one the last things we do before low-level modules like the
+	 * Set up process-exit callback to do pre-shutdown cleanup.  This is one
+	 * of the first before_shmem_exit callbacks we register; thus, this will
+	 * be one of the last things we do before low-level modules like the
 	 * buffer manager begin to close down.  We need to have this in place
 	 * before we begin our first transaction --- if we fail during the
 	 * initialization transaction, as is entirely possible, we need the
@@ -988,6 +1009,9 @@ InitPostgres(const char *in_dbname, Oid dboid,
 
 		/* close the transaction we started above */
 		CommitTransactionCommand();
+
+		/* send any WARNINGs we've accumulated during initialization */
+		EmitConnectionWarnings();
 
 		return;
 	}
@@ -1234,6 +1258,9 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	/* close the transaction we started above */
 	if (!bootstrap)
 		CommitTransactionCommand();
+
+	/* send any WARNINGs we've accumulated during initialization */
+	EmitConnectionWarnings();
 }
 
 /*
@@ -1265,7 +1292,7 @@ process_startup_options(Port *port, bool am_superuser)
 
 		maxac = 2 + (strlen(port->cmdline_options) + 1) / 2;
 
-		av = (char **) palloc(maxac * sizeof(char *));
+		av = palloc_array(char *, maxac);
 		ac = 0;
 
 		av[ac++] = "postgres";
@@ -1447,4 +1474,67 @@ ThereIsAtLeastOneRole(void)
 	table_close(pg_authid_rel, AccessShareLock);
 
 	return result;
+}
+
+/*
+ * Stores a warning message to be sent later via EmitConnectionWarnings().
+ * Both msg and detail must be non-NULL.  If filter is non-NULL, it is called
+ * just before the warning is emitted, after startup and role/database settings
+ * have been applied.
+ *
+ * NB: Caller should ensure the strings are palloc'd in a long-lived context
+ * like TopMemoryContext.  This function takes ownership of the strings, which
+ * will be pfree'd in EmitConnectionWarnings().
+ */
+void
+StoreConnectionWarning(char *msg, char *detail, ConnectionWarningFilter filter)
+{
+	MemoryContext oldcontext;
+	ConnectionWarning *warning;
+
+	Assert(msg);
+	Assert(detail);
+
+	if (ConnectionWarningsEmitted)
+		elog(ERROR, "StoreConnectionWarning() called after EmitConnectionWarnings()");
+
+	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+
+	warning = palloc_object(ConnectionWarning);
+	warning->message = msg;
+	warning->detail = detail;
+	warning->filter = filter;
+	ConnectionWarnings = lappend(ConnectionWarnings, warning);
+
+	MemoryContextSwitchTo(oldcontext);
+}
+
+/*
+ * Sends the warning messages saved via StoreConnectionWarning() and frees the
+ * strings and lists.
+ *
+ * NB: This can only be called once per backend.
+ */
+static void
+EmitConnectionWarnings(void)
+{
+	if (ConnectionWarningsEmitted)
+		elog(ERROR, "EmitConnectionWarnings() called more than once");
+	else
+		ConnectionWarningsEmitted = true;
+
+	foreach_ptr(ConnectionWarning, warning, ConnectionWarnings)
+	{
+		if (warning->filter == NULL || warning->filter())
+			ereport(WARNING,
+					(errmsg("%s", warning->message),
+					 errdetail("%s", warning->detail)));
+
+		pfree(warning->message);
+		pfree(warning->detail);
+		pfree(warning);
+	}
+
+	list_free(ConnectionWarnings);
+	ConnectionWarnings = NIL;
 }

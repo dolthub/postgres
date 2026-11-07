@@ -445,6 +445,8 @@ environment value
 border                   1
 columns                  0
 csv_fieldsep             ','
+display_false            'f'
+display_true             't'
 expanded                 off
 fieldsep                 '|'
 fieldsep_zero            off
@@ -464,6 +466,36 @@ unicode_border_linestyle single
 unicode_column_linestyle single
 unicode_header_linestyle single
 xheader_width            full
+-- test the simple display substitution settings
+prepare q as select null as n, true as t, false as f;
+\pset null '(null)'
+\pset display_true 'true'
+\pset display_false 'false'
+execute q;
+   n    |  t   |   f   
+--------+------+-------
+ (null) | true | false
+(1 row)
+
+\pset null
+\pset display_true
+\pset display_false
+execute q;
+   n    |  t   |   f   
+--------+------+-------
+ (null) | true | false
+(1 row)
+
+\pset null ''
+\pset display_true 't'
+\pset display_false 'f'
+execute q;
+ n | t | f 
+---+---+---
+   | t | f
+(1 row)
+
+deallocate q;
 -- test multi-line headers, wrapping, and newline indicators
 -- in aligned, unaligned, and wrapped formats
 prepare q as select array_to_string(array_agg(repeat('x',2*n)),E'\n') as "ab
@@ -5170,36 +5202,32 @@ Indexes:
 
 -- check printing info about access methods
 \dA
-  List of access methods
-       Name        | Type  
--------------------+-------
- brin              | Index
- btree             | Index
- dolt_prolly_index | Index
- dolt_prolly_table | Table
- gin               | Index
- gist              | Index
- hash              | Index
- heap              | Table
- heap2             | Table
- spgist            | Index
-(10 rows)
+List of access methods
+  Name  | Type  
+--------+-------
+ brin   | Index
+ btree  | Index
+ gin    | Index
+ gist   | Index
+ hash   | Index
+ heap   | Table
+ heap2  | Table
+ spgist | Index
+(8 rows)
 
 \dA *
-  List of access methods
-       Name        | Type  
--------------------+-------
- brin              | Index
- btree             | Index
- dolt_prolly_index | Index
- dolt_prolly_table | Table
- gin               | Index
- gist              | Index
- hash              | Index
- heap              | Table
- heap2             | Table
- spgist            | Index
-(10 rows)
+List of access methods
+  Name  | Type  
+--------+-------
+ brin   | Index
+ btree  | Index
+ gin    | Index
+ gist   | Index
+ hash   | Index
+ heap   | Table
+ heap2  | Table
+ spgist | Index
+(8 rows)
 
 \dA h*
 List of access methods
@@ -5224,36 +5252,32 @@ List of access methods
 
 \dA: extra argument "bar" ignored
 \dA+
-                                     List of access methods
-       Name        | Type  |          Handler          |              Description               
--------------------+-------+---------------------------+----------------------------------------
- brin              | Index | brinhandler               | block range index (BRIN) access method
- btree             | Index | bthandler                 | b-tree index access method
- dolt_prolly_index | Index | dolt_prolly_index_handler | prolly ordered index access method
- dolt_prolly_table | Table | dolt_prolly_table_handler | prolly table access method
- gin               | Index | ginhandler                | GIN index access method
- gist              | Index | gisthandler               | GiST index access method
- hash              | Index | hashhandler               | hash index access method
- heap              | Table | heap_tableam_handler      | heap table access method
- heap2             | Table | heap_tableam_handler      | 
- spgist            | Index | spghandler                | SP-GiST index access method
-(10 rows)
+                             List of access methods
+  Name  | Type  |       Handler        |              Description               
+--------+-------+----------------------+----------------------------------------
+ brin   | Index | brinhandler          | block range index (BRIN) access method
+ btree  | Index | bthandler            | b-tree index access method
+ gin    | Index | ginhandler           | GIN index access method
+ gist   | Index | gisthandler          | GiST index access method
+ hash   | Index | hashhandler          | hash index access method
+ heap   | Table | heap_tableam_handler | heap table access method
+ heap2  | Table | heap_tableam_handler | 
+ spgist | Index | spghandler           | SP-GiST index access method
+(8 rows)
 
 \dA+ *
-                                     List of access methods
-       Name        | Type  |          Handler          |              Description               
--------------------+-------+---------------------------+----------------------------------------
- brin              | Index | brinhandler               | block range index (BRIN) access method
- btree             | Index | bthandler                 | b-tree index access method
- dolt_prolly_index | Index | dolt_prolly_index_handler | prolly ordered index access method
- dolt_prolly_table | Table | dolt_prolly_table_handler | prolly table access method
- gin               | Index | ginhandler                | GIN index access method
- gist              | Index | gisthandler               | GiST index access method
- hash              | Index | hashhandler               | hash index access method
- heap              | Table | heap_tableam_handler      | heap table access method
- heap2             | Table | heap_tableam_handler      | 
- spgist            | Index | spghandler                | SP-GiST index access method
-(10 rows)
+                             List of access methods
+  Name  | Type  |       Handler        |              Description               
+--------+-------+----------------------+----------------------------------------
+ brin   | Index | brinhandler          | block range index (BRIN) access method
+ btree  | Index | bthandler            | b-tree index access method
+ gin    | Index | ginhandler           | GIN index access method
+ gist   | Index | gisthandler          | GiST index access method
+ hash   | Index | hashhandler          | hash index access method
+ heap   | Table | heap_tableam_handler | heap table access method
+ heap2  | Table | heap_tableam_handler | 
+ spgist | Index | spghandler           | SP-GiST index access method
+(8 rows)
 
 \dA+ h*
                      List of access methods
@@ -6500,9 +6524,9 @@ List of schemas
 (0 rows)
 
 \dRp "no.such.publication"
-                                        List of publications
- Name | Owner | All tables | Inserts | Updates | Deletes | Truncates | Generated columns | Via root 
-------+-------+------------+---------+---------+---------+-----------+-------------------+----------
+                                                List of publications
+ Name | Owner | All tables | All sequences | Inserts | Updates | Deletes | Truncates | Generated columns | Via root 
+------+-------+------------+---------------+---------+---------+---------+-----------+-------------------+----------
 (0 rows)
 
 \dRs "no.such.subscription"

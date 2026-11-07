@@ -83,6 +83,7 @@
  * - pgstat_database.c
  * - pgstat_function.c
  * - pgstat_io.c
+ * - pgstat_lock.c
  * - pgstat_relation.c
  * - pgstat_replslot.c
  * - pgstat_slru.c
@@ -93,7 +94,7 @@
  * specific kinds of stats.
  *
  *
- * Copyright (c) 2001-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/activity/pgstat.c
@@ -313,6 +314,7 @@ static const PgStat_KindInfo pgstat_kind_builtin_infos[PGSTAT_KIND_BUILTIN_SIZE]
 
 		.flush_pending_cb = pgstat_relation_flush_cb,
 		.delete_pending_cb = pgstat_relation_delete_pending_cb,
+		.reset_timestamp_cb = pgstat_relation_reset_timestamp_cb,
 	},
 
 	[PGSTAT_KIND_FUNCTION] = {
@@ -327,6 +329,7 @@ static const PgStat_KindInfo pgstat_kind_builtin_infos[PGSTAT_KIND_BUILTIN_SIZE]
 		.pending_size = sizeof(PgStat_FunctionCounts),
 
 		.flush_pending_cb = pgstat_function_flush_cb,
+		.reset_timestamp_cb = pgstat_function_reset_timestamp_cb,
 	},
 
 	[PGSTAT_KIND_REPLSLOT] = {
@@ -446,6 +449,23 @@ static const PgStat_KindInfo pgstat_kind_builtin_infos[PGSTAT_KIND_BUILTIN_SIZE]
 		.snapshot_cb = pgstat_io_snapshot_cb,
 	},
 
+	[PGSTAT_KIND_LOCK] = {
+		.name = "lock",
+
+		.fixed_amount = true,
+		.write_to_file = true,
+
+		.snapshot_ctl_off = offsetof(PgStat_Snapshot, lock),
+		.shared_ctl_off = offsetof(PgStat_ShmemControl, lock),
+		.shared_data_off = offsetof(PgStatShared_Lock, stats),
+		.shared_data_len = sizeof(((PgStatShared_Lock *) 0)->stats),
+
+		.flush_static_cb = pgstat_lock_flush_cb,
+		.init_shmem_cb = pgstat_lock_init_shmem_cb,
+		.reset_all_cb = pgstat_lock_reset_all_cb,
+		.snapshot_cb = pgstat_lock_snapshot_cb,
+	},
+
 	[PGSTAT_KIND_SLRU] = {
 		.name = "slru",
 
@@ -521,6 +541,7 @@ pgstat_discard_stats(void)
 
 	/* NB: this needs to be done even in single user mode */
 
+	/* First, cleanup the main pgstats file */
 	ret = unlink(PGSTAT_STAT_PERMANENT_FILENAME);
 	if (ret != 0)
 	{
@@ -540,6 +561,15 @@ pgstat_discard_stats(void)
 				(errcode_for_file_access(),
 				 errmsg_internal("unlinked permanent statistics file \"%s\"",
 								 PGSTAT_STAT_PERMANENT_FILENAME)));
+	}
+
+	/* Finish callbacks, if required */
+	for (PgStat_Kind kind = PGSTAT_KIND_MIN; kind <= PGSTAT_KIND_MAX; kind++)
+	{
+		const PgStat_KindInfo *kind_info = pgstat_get_kind_info(kind);
+
+		if (kind_info && kind_info->finish)
+			kind_info->finish(STATS_DISCARD);
 	}
 
 	/*
@@ -620,7 +650,7 @@ pgstat_shutdown_hook(int code, Datum arg)
 	dlist_init(&pgStatPending);
 
 	/* drop the backend stats entry */
-	if (!pgstat_drop_entry_ext(PGSTAT_KIND_BACKEND, InvalidOid, MyProcNumber, false))
+	if (!pgstat_drop_entry(PGSTAT_KIND_BACKEND, InvalidOid, MyProcNumber, false))
 		pgstat_request_entry_refs_gc();
 
 	pgstat_detach_shmem();
@@ -821,7 +851,7 @@ pgstat_force_next_flush(void)
 static bool
 match_db_entries(PgStatShared_HashEntry *entry, Datum match_data)
 {
-	return entry->key.dboid == DatumGetObjectId(MyDatabaseId);
+	return entry->key.dboid == MyDatabaseId;
 }
 
 /*
@@ -930,9 +960,9 @@ pgstat_clear_snapshot(void)
 }
 
 void *
-pgstat_fetch_entry(PgStat_Kind kind, Oid dboid, uint64 objid)
+pgstat_fetch_entry(PgStat_Kind kind, Oid dboid, uint64 objid, bool *may_free)
 {
-	PgStat_HashKey key;
+	PgStat_HashKey key = {0};
 	PgStat_EntryRef *entry_ref;
 	void	   *stats_data;
 	const PgStat_KindInfo *kind_info = pgstat_get_kind_info(kind);
@@ -941,10 +971,14 @@ pgstat_fetch_entry(PgStat_Kind kind, Oid dboid, uint64 objid)
 	Assert(IsUnderPostmaster || !IsPostmasterEnvironment);
 	Assert(!kind_info->fixed_amount);
 
-	pgstat_prep_snapshot();
+	/*
+	 * Initialize *may_free to false.  We'll change it to true later if we end
+	 * up allocating the result in the caller's context and not caching it.
+	 */
+	if (may_free)
+		*may_free = false;
 
-	/* clear padding */
-	memset(&key, 0, sizeof(struct PgStat_HashKey));
+	pgstat_prep_snapshot();
 
 	key.kind = kind;
 	key.dboid = dboid;
@@ -997,7 +1031,16 @@ pgstat_fetch_entry(PgStat_Kind kind, Oid dboid, uint64 objid)
 	 * repeated accesses.
 	 */
 	if (pgstat_fetch_consistency == PGSTAT_FETCH_CONSISTENCY_NONE)
+	{
 		stats_data = palloc(kind_info->shared_data_len);
+
+		/*
+		 * Since we allocated the result in the caller's context and aren't
+		 * caching it, the caller can safely pfree() it.
+		 */
+		if (may_free)
+			*may_free = true;
+	}
 	else
 		stats_data = MemoryContextAlloc(pgStatLocal.snapshot.context,
 										kind_info->shared_data_len);
@@ -1490,6 +1533,10 @@ pgstat_register_kind(PgStat_Kind kind, const PgStat_KindInfo *kind_info)
 			ereport(ERROR,
 					(errmsg("custom cumulative statistics property is invalid"),
 					 errhint("Custom cumulative statistics require a shared memory size for fixed-numbered objects.")));
+		if (kind_info->track_entry_count)
+			ereport(ERROR,
+					(errmsg("custom cumulative statistics property is invalid"),
+					 errhint("Custom cumulative statistics cannot use entry count tracking for fixed-numbered objects.")));
 	}
 
 	/*
@@ -1548,6 +1595,9 @@ pgstat_assert_is_up(void)
  * ------------------------------------------------------------
  */
 
+#define write_chunk_s(fpout, ptr) write_chunk(fpout, ptr, sizeof(*ptr))
+#define read_chunk_s(fpin, ptr) read_chunk(fpin, ptr, sizeof(*ptr))
+
 /* helpers for pgstat_write_statsfile() */
 static void
 write_chunk(FILE *fpout, void *ptr, size_t len)
@@ -1559,8 +1609,6 @@ write_chunk(FILE *fpout, void *ptr, size_t len)
 	/* we'll check for errors with ferror once at the end */
 	(void) rc;
 }
-
-#define write_chunk_s(fpout, ptr) write_chunk(fpout, ptr, sizeof(*ptr))
 
 /*
  * This function is called in the last process that is accessing the shared
@@ -1575,6 +1623,7 @@ pgstat_write_statsfile(void)
 	const char *statfile = PGSTAT_STAT_PERMANENT_FILENAME;
 	dshash_seq_status hstat;
 	PgStatShared_HashEntry *ps;
+	PgStat_StatsFileOp status = STATS_WRITE;
 
 	pgstat_assert_is_up();
 
@@ -1701,6 +1750,14 @@ pgstat_write_statsfile(void)
 		write_chunk(fpout,
 					pgstat_get_entry_data(ps->key.kind, shstats),
 					pgstat_get_entry_len(ps->key.kind));
+
+		/* Write more data for the entry, if required */
+		if (kind_info->to_serialized_data &&
+			!kind_info->to_serialized_data(&ps->key, shstats, fpout))
+		{
+			status = STATS_DISCARD;
+			break;
+		}
 	}
 	dshash_seq_term(&hstat);
 
@@ -1711,7 +1768,17 @@ pgstat_write_statsfile(void)
 	 */
 	fputc(PGSTAT_FILE_ENTRY_END, fpout);
 
-	if (ferror(fpout))
+	if (status == STATS_DISCARD)
+	{
+		/*
+		 * A to_serialized_data callback failed.  DEBUG2 because the callback
+		 * already logged the reason.
+		 */
+		elog(DEBUG2, "discarding temporary statistics file \"%s\"", tmpfile);
+		FreeFile(fpout);
+		unlink(tmpfile);
+	}
+	else if (ferror(fpout))
 	{
 		ereport(LOG,
 				(errcode_for_file_access(),
@@ -1719,6 +1786,7 @@ pgstat_write_statsfile(void)
 						tmpfile)));
 		FreeFile(fpout);
 		unlink(tmpfile);
+		status = STATS_DISCARD;
 	}
 	else if (FreeFile(fpout) < 0)
 	{
@@ -1727,11 +1795,22 @@ pgstat_write_statsfile(void)
 				 errmsg("could not close temporary statistics file \"%s\": %m",
 						tmpfile)));
 		unlink(tmpfile);
+		status = STATS_DISCARD;
 	}
 	else if (durable_rename(tmpfile, statfile, LOG) < 0)
 	{
 		/* durable_rename already emitted log message */
 		unlink(tmpfile);
+		status = STATS_DISCARD;
+	}
+
+	/* Finish callbacks, if required */
+	for (PgStat_Kind kind = PGSTAT_KIND_MIN; kind <= PGSTAT_KIND_MAX; kind++)
+	{
+		const PgStat_KindInfo *kind_info = pgstat_get_kind_info(kind);
+
+		if (kind_info && kind_info->finish)
+			kind_info->finish(status);
 	}
 }
 
@@ -1741,8 +1820,6 @@ read_chunk(FILE *fpin, void *ptr, size_t len)
 {
 	return fread(ptr, 1, len, fpin) == len;
 }
-
-#define read_chunk_s(fpin, ptr) read_chunk(fpin, ptr, sizeof(*ptr))
 
 /*
  * Reads in existing statistics file into memory.
@@ -1756,6 +1833,7 @@ pgstat_read_statsfile(void)
 	FILE	   *fpin;
 	int32		format_id;
 	bool		found;
+	PgStat_StatsFileOp status = STATS_READ;
 	const char *statfile = PGSTAT_STAT_PERMANENT_FILENAME;
 	PgStat_ShmemControl *shmem = pgStatLocal.shmem;
 
@@ -1781,7 +1859,8 @@ pgstat_read_statsfile(void)
 					 errmsg("could not open statistics file \"%s\": %m",
 							statfile)));
 		pgstat_reset_after_failure();
-		return;
+		status = STATS_DISCARD;
+		goto finish;
 	}
 
 	/*
@@ -1872,6 +1951,7 @@ pgstat_read_statsfile(void)
 					PgStat_HashKey key;
 					PgStatShared_HashEntry *p;
 					PgStatShared_Common *header;
+					const PgStat_KindInfo *kind_info = NULL;
 
 					CHECK_FOR_INTERRUPTS();
 
@@ -1892,7 +1972,8 @@ pgstat_read_statsfile(void)
 							goto error;
 						}
 
-						if (!pgstat_get_kind_info(key.kind))
+						kind_info = pgstat_get_kind_info(key.kind);
+						if (!kind_info)
 						{
 							elog(WARNING, "could not find information of kind for entry %u/%u/%" PRIu64 " of type %c",
 								 key.kind, key.dboid,
@@ -1903,7 +1984,6 @@ pgstat_read_statsfile(void)
 					else
 					{
 						/* stats entry identified by name on disk (e.g. slots) */
-						const PgStat_KindInfo *kind_info = NULL;
 						PgStat_Kind kind;
 						NameData	name;
 
@@ -1997,6 +2077,18 @@ pgstat_read_statsfile(void)
 						goto error;
 					}
 
+					/* read more data for the entry, if required */
+					if (kind_info->from_serialized_data)
+					{
+						if (!kind_info->from_serialized_data(&key, header, fpin))
+						{
+							elog(WARNING, "could not read auxiliary data for entry %u/%u/%" PRIu64 " of type %c",
+								 key.kind, key.dboid,
+								 key.objid, t);
+							goto error;
+						}
+					}
+
 					break;
 				}
 			case PGSTAT_FILE_ENTRY_END:
@@ -2020,10 +2112,21 @@ pgstat_read_statsfile(void)
 	}
 
 done:
+	/* First, cleanup the main stats file */
 	FreeFile(fpin);
 
 	elog(DEBUG2, "removing permanent stats file \"%s\"", statfile);
 	unlink(statfile);
+
+finish:
+	/* Finish callbacks, if required */
+	for (PgStat_Kind kind = PGSTAT_KIND_MIN; kind <= PGSTAT_KIND_MAX; kind++)
+	{
+		const PgStat_KindInfo *kind_info = pgstat_get_kind_info(kind);
+
+		if (kind_info && kind_info->finish)
+			kind_info->finish(status);
+	}
 
 	return;
 
@@ -2032,6 +2135,7 @@ error:
 			(errmsg("corrupted statistics file \"%s\"", statfile)));
 
 	pgstat_reset_after_failure();
+	status = STATS_DISCARD;
 
 	goto done;
 }

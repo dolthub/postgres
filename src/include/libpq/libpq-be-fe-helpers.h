@@ -20,7 +20,7 @@
  * into non-blocking mode. That can lead to blocking even when only the async
  * libpq functions are used. This should be fixed.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/libpq/libpq-be-fe-helpers.h
@@ -30,17 +30,7 @@
 #ifndef LIBPQ_BE_FE_HELPERS_H
 #define LIBPQ_BE_FE_HELPERS_H
 
-/*
- * Despite the name, BUILDING_DLL is set only when building code directly part
- * of the backend. Which also is where libpq isn't allowed to be
- * used. Obviously this doesn't protect against libpq-fe.h getting included
- * otherwise, but perhaps still protects against a few mistakes...
- */
-#ifdef BUILDING_DLL
-#error "libpq may not be used code directly built into the backend"
-#endif
-
-#include "libpq-fe.h"
+#include "libpq/libpq-be-fe.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "storage/latch.h"
@@ -49,10 +39,28 @@
 
 
 static inline void libpqsrv_connect_prepare(void);
-static inline void libpqsrv_connect_internal(PGconn *conn, uint32 wait_event_info);
+static inline void libpqsrv_connect_complete(PGconn *conn, uint32 wait_event_info);
 static inline PGresult *libpqsrv_get_result_last(PGconn *conn, uint32 wait_event_info);
 static inline PGresult *libpqsrv_get_result(PGconn *conn, uint32 wait_event_info);
 
+/*
+ * Start a connection using PQconnectStart().
+ *
+ * The returned connection has not yet completed its startup sequence.  Callers
+ * may perform per-connection setup, such as installing a notice receiver,
+ * before calling libpqsrv_connect_complete().
+ *
+ * Callers must call libpqsrv_connect_complete(), even if this function returns
+ * NULL, because libpqsrv_connect_prepare() may already have reserved an
+ * external FD that must be released.
+ */
+static inline PGconn *
+libpqsrv_connect_start(const char *conninfo)
+{
+	libpqsrv_connect_prepare();
+
+	return PQconnectStart(conninfo);
+}
 
 /*
  * PQconnectdb() wrapper that reserves a file descriptor and processes
@@ -65,34 +73,45 @@ static inline PGresult *libpqsrv_get_result(PGconn *conn, uint32 wait_event_info
 static inline PGconn *
 libpqsrv_connect(const char *conninfo, uint32 wait_event_info)
 {
-	PGconn	   *conn = NULL;
+	PGconn	   *conn;
 
-	libpqsrv_connect_prepare();
+	conn = libpqsrv_connect_start(conninfo);
 
-	conn = PQconnectStart(conninfo);
-
-	libpqsrv_connect_internal(conn, wait_event_info);
+	libpqsrv_connect_complete(conn, wait_event_info);
 
 	return conn;
 }
 
 /*
+ * Start a connection using PQconnectStartParams().
+ *
+ * See libpqsrv_connect_start() for the resource-lifetime rules.
+ */
+static inline PGconn *
+libpqsrv_connect_params_start(const char *const *keywords,
+							  const char *const *values,
+							  int expand_dbname)
+{
+	libpqsrv_connect_prepare();
+
+	return PQconnectStartParams(keywords, values, expand_dbname);
+}
+
+/*
  * Like libpqsrv_connect(), except that this is a wrapper for
  * PQconnectdbParams().
-  */
+ */
 static inline PGconn *
 libpqsrv_connect_params(const char *const *keywords,
 						const char *const *values,
 						int expand_dbname,
 						uint32 wait_event_info)
 {
-	PGconn	   *conn = NULL;
+	PGconn	   *conn;
 
-	libpqsrv_connect_prepare();
+	conn = libpqsrv_connect_params_start(keywords, values, expand_dbname);
 
-	conn = PQconnectStartParams(keywords, values, expand_dbname);
-
-	libpqsrv_connect_internal(conn, wait_event_info);
+	libpqsrv_connect_complete(conn, wait_event_info);
 
 	return conn;
 }
@@ -100,8 +119,9 @@ libpqsrv_connect_params(const char *const *keywords,
 /*
  * PQfinish() wrapper that additionally releases the reserved file descriptor.
  *
- * It is allowed to call this with a NULL pgconn iff NULL was returned by
- * libpqsrv_connect*.
+ * It is allowed to call this with NULL only when the external FD reservation
+ * has already been released, for example after calling
+ * libpqsrv_connect_complete() with a NULL connection.
  */
 static inline void
 libpqsrv_disconnect(PGconn *conn)
@@ -111,7 +131,7 @@ libpqsrv_disconnect(PGconn *conn)
 	 * already released it). This rule makes it easier to write PG_CATCH()
 	 * handlers for this facility's users.
 	 *
-	 * See also libpqsrv_connect_internal().
+	 * See also libpqsrv_connect_complete().
 	 */
 	if (conn == NULL)
 		return;
@@ -121,7 +141,7 @@ libpqsrv_disconnect(PGconn *conn)
 }
 
 
-/* internal helper functions follow */
+/* lower-level connection helper functions follow */
 
 
 /*
@@ -154,10 +174,11 @@ libpqsrv_connect_prepare(void)
 }
 
 /*
- * Helper function for all connection establishment functions.
+ * Complete a connection started by libpqsrv_connect_start() or
+ * libpqsrv_connect_params_start().
  */
 static inline void
-libpqsrv_connect_internal(PGconn *conn, uint32 wait_event_info)
+libpqsrv_connect_complete(PGconn *conn, uint32 wait_event_info)
 {
 	/*
 	 * With conn == NULL libpqsrv_disconnect() wouldn't release the FD. So do
@@ -289,41 +310,30 @@ libpqsrv_exec_params(PGconn *conn,
 static inline PGresult *
 libpqsrv_get_result_last(PGconn *conn, uint32 wait_event_info)
 {
-	PGresult   *volatile lastResult = NULL;
+	PGresult   *lastResult = NULL;
 
-	/* In what follows, do not leak any PGresults on an error. */
-	PG_TRY();
+	for (;;)
 	{
-		for (;;)
-		{
-			/* Wait for, and collect, the next PGresult. */
-			PGresult   *result;
+		/* Wait for, and collect, the next PGresult. */
+		PGresult   *result;
 
-			result = libpqsrv_get_result(conn, wait_event_info);
-			if (result == NULL)
-				break;			/* query is complete, or failure */
+		result = libpqsrv_get_result(conn, wait_event_info);
+		if (result == NULL)
+			break;				/* query is complete, or failure */
 
-			/*
-			 * Emulate PQexec()'s behavior of returning the last result when
-			 * there are many.
-			 */
-			PQclear(lastResult);
-			lastResult = result;
-
-			if (PQresultStatus(lastResult) == PGRES_COPY_IN ||
-				PQresultStatus(lastResult) == PGRES_COPY_OUT ||
-				PQresultStatus(lastResult) == PGRES_COPY_BOTH ||
-				PQstatus(conn) == CONNECTION_BAD)
-				break;
-		}
-	}
-	PG_CATCH();
-	{
+		/*
+		 * Emulate PQexec()'s behavior of returning the last result when there
+		 * are many.
+		 */
 		PQclear(lastResult);
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
+		lastResult = result;
 
+		if (PQresultStatus(lastResult) == PGRES_COPY_IN ||
+			PQresultStatus(lastResult) == PGRES_COPY_OUT ||
+			PQresultStatus(lastResult) == PGRES_COPY_BOTH ||
+			PQstatus(conn) == CONNECTION_BAD)
+			break;
+	}
 	return lastResult;
 }
 
@@ -453,5 +463,53 @@ exit:	;
 
 	return error;
 }
+
+/*
+ * libpqsrv_notice_receiver
+ *
+ * Custom notice receiver for libpq connections.
+ *
+ * This function is intended to be set via PQsetNoticeReceiver() so that
+ * NOTICE, WARNING, and similar messages from the connection are reported via
+ * ereport(), instead of being printed to stderr.
+ *
+ * Because this will be called from libpq with a "real" (not wrapped)
+ * PGresult, we need to temporarily ignore libpq-be-fe.h's wrapper macros
+ * for PGresult and also PQresultErrorMessage, and put back the wrappers
+ * afterwards.  That's not pretty, but there seems no better alternative.
+ */
+#undef PGresult
+#undef PQresultErrorMessage
+
+static inline void
+libpqsrv_notice_receiver(void *arg, const PGresult *res)
+{
+	const char *message;
+	int			len;
+	const char *prefix = (const char *) arg;
+
+	/*
+	 * Trim the trailing newline from the message text returned from
+	 * PQresultErrorMessage(), as it always includes one, to produce cleaner
+	 * log output.
+	 */
+	message = PQresultErrorMessage(res);
+	len = strlen(message);
+	if (len > 0 && message[len - 1] == '\n')
+		len--;
+
+	/*
+	 * Omit the local statement and context from each remote message. They can
+	 * help identify the caller, but repeating them for every message could
+	 * greatly increase log volume.
+	 */
+	ereport(LOG,
+			errmsg_internal("%s: %.*s", prefix, len, message),
+			errhidestmt(true),
+			errhidecontext(true));
+}
+
+#define PGresult libpqsrv_PGresult
+#define PQresultErrorMessage libpqsrv_PQresultErrorMessage
 
 #endif							/* LIBPQ_BE_FE_HELPERS_H */

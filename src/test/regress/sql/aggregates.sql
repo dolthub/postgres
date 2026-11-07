@@ -140,6 +140,47 @@ SELECT covar_pop(1::float8,2::float8), covar_samp(3::float8,4::float8);
 SELECT covar_pop(1::float8,'inf'::float8), covar_samp(3::float8,'inf'::float8);
 SELECT covar_pop(1::float8,'nan'::float8), covar_samp(3::float8,'nan'::float8);
 
+-- check some cases that formerly had poor roundoff-error behavior
+-- note: regr_r2() differs from corr() for a horizontal line, per spec
+SELECT corr(0.09, g), regr_r2(0.09, g)
+  FROM generate_series(1, 30) g;
+SELECT corr(g, 0.09), regr_r2(g, 0.09), regr_slope(g, 0.09), regr_intercept(g, 0.09)
+  FROM generate_series(1, 30) g;
+SELECT corr(1.3 + g * 1e-16, 1.3 + g * 1e-16)
+  FROM generate_series(1, 3) g;
+
+-- verify that we handle Inf/NaN the same regardless of position
+with data(x) as (values (1::float8),(2::float8),(3::float8))
+select covar_pop(x, 0::float8) from data;
+with data(x) as (values ('Inf'::float8),(2::float8),(3::float8))
+select covar_pop(x, 0::float8) from data;
+with data(x) as (values (1::float8),('Inf'::float8),(3::float8))
+select covar_pop(x, 0::float8) from data;
+with data(x) as (values ('NaN'::float8),(2::float8),(3::float8))
+select covar_pop(x, 0::float8) from data;
+with data(x) as (values (1::float8),('NaN'::float8),(3::float8))
+select covar_pop(x, 0::float8) from data;
+
+-- check some cases that formerly suffered from internal overflow/underflow
+SELECT corr(1e-100 + g * 1e-105, 1e-100 + g * 1e-105),
+       regr_r2(1e-100 + g * 1e-105, 1e-100 + g * 1e-105)
+  FROM generate_series(1, 3) g;
+SELECT corr(1e-100 + g * 1e-105, 1e-100 + g * 1e-105),
+       regr_r2(1e-100 + g * 1e-105, 1e-100 + g * 1e-105)
+  FROM generate_series(1, 30) g;
+SELECT corr(1e100 + g * 1e95, 1e100 + g * 1e95),
+       regr_r2(1e100 + g * 1e95, 1e100 + g * 1e95)
+  FROM generate_series(1, 2) g;
+SELECT regr_intercept(y, x) FROM (VALUES (-1e150, 0), (2e150, 3e150)) v(x, y);
+SELECT regr_intercept(y, x) FROM (VALUES (-1e-131, 0), (2e-131, 3e-131)) v(x, y);
+
+-- these examples pose definitional questions for NaN inputs,
+-- which we resolve by saying that an all-NaN input column is not all equal
+SELECT corr(g, 'NaN'), regr_r2(g, 'NaN') FROM generate_series(1, 30) g;
+SELECT corr(0.1, 'NaN'), regr_r2(0.1, 'NaN') FROM generate_series(1, 30) g;
+SELECT corr('NaN', 0.1), regr_r2('NaN', 0.1) FROM generate_series(1, 30) g;
+SELECT corr('NaN', 'NaN'), regr_r2('NaN', 'NaN') FROM generate_series(1, 30) g;
+
 -- test accum and combine functions directly
 CREATE TABLE regr_test (x float8, y float8);
 INSERT INTO regr_test VALUES (10,150),(20,250),(30,350),(80,540),(100,200);
@@ -148,7 +189,7 @@ FROM regr_test WHERE x IN (10,20,30,80);
 SELECT count(*), sum(x), regr_sxx(y,x), sum(y),regr_syy(y,x), regr_sxy(y,x)
 FROM regr_test;
 SELECT float8_accum('{4,140,2900}'::float8[], 100);
-SELECT float8_regr_accum('{4,140,2900,1290,83075,15050}'::float8[], 200, 100);
+SELECT float8_regr_accum('{4,140,2900,1290,83075,15050,100,0}'::float8[], 200, 100);
 SELECT count(*), sum(x), regr_sxx(y,x), sum(y),regr_syy(y,x), regr_sxy(y,x)
 FROM regr_test WHERE x IN (10,20,30);
 SELECT count(*), sum(x), regr_sxx(y,x), sum(y),regr_syy(y,x), regr_sxy(y,x)
@@ -156,12 +197,12 @@ FROM regr_test WHERE x IN (80,100);
 SELECT float8_combine('{3,60,200}'::float8[], '{0,0,0}'::float8[]);
 SELECT float8_combine('{0,0,0}'::float8[], '{2,180,200}'::float8[]);
 SELECT float8_combine('{3,60,200}'::float8[], '{2,180,200}'::float8[]);
-SELECT float8_regr_combine('{3,60,200,750,20000,2000}'::float8[],
-                           '{0,0,0,0,0,0}'::float8[]);
-SELECT float8_regr_combine('{0,0,0,0,0,0}'::float8[],
-                           '{2,180,200,740,57800,-3400}'::float8[]);
-SELECT float8_regr_combine('{3,60,200,750,20000,2000}'::float8[],
-                           '{2,180,200,740,57800,-3400}'::float8[]);
+SELECT float8_regr_combine('{3,60,200,750,20000,2000,1,NaN}'::float8[],
+                           '{0,0,0,0,0,0,0,0}'::float8[]);
+SELECT float8_regr_combine('{0,0,0,0,0,0,0,0}'::float8[],
+                           '{2,180,200,740,57800,-3400,NaN,1}'::float8[]);
+SELECT float8_regr_combine('{3,60,200,750,20000,2000,7,8}'::float8[],
+                           '{2,180,200,740,57800,-3400,7,9}'::float8[]);
 DROP TABLE regr_test;
 
 -- test count, distinct
@@ -181,6 +222,11 @@ SELECT newcnt(four) AS cnt_1000 FROM onek;
 SELECT newcnt(*) AS cnt_1000 FROM onek;
 SELECT oldcnt(*) AS cnt_1000 FROM onek;
 SELECT sum2(q1,q2) FROM int8_tbl;
+
+-- sanity checks
+SELECT sum(q1+q2), sum(q1)+sum(q2) FROM int8_tbl;
+SELECT sum(q1-q2), sum(q2-q1), sum(q1)-sum(q2) FROM int8_tbl;
+SELECT sum(q1*2000), sum(-q1*2000), 2000*sum(q1) FROM int8_tbl;
 
 -- test for outer-level aggregates
 
@@ -222,6 +268,16 @@ select array(select sum(x+y) s
 select array(select sum(x+y) s
             from generate_series(1,3) y group by y order by s)
   from generate_series(1,3) x;
+
+-- Test handling of grouping-expression references within sublinks
+
+select two + four as g, (select f1 from int4_tbl where f1 = (two + four))
+from tenk1 t1
+group by two + four order by 1;
+
+select q1, (select q1) as ss  -- q1 is actually a COALESCE expression here
+from int8_tbl i81 full outer join int8_tbl i82 using (q1)
+group by q1 order by q1;
 
 --
 -- test for bitwise integer aggregates
@@ -411,10 +467,15 @@ explain (costs off)
   select max(unique2), generate_series(1,3) as g from tenk1 order by g desc;
 select max(unique2), generate_series(1,3) as g from tenk1 order by g desc;
 
--- interesting corner case: constant gets optimized into a seqscan
+-- two interesting corner cases: both non-null and null constant gets
+-- optimized into a seqscan
 explain (costs off)
   select max(100) from tenk1;
 select max(100) from tenk1;
+
+explain (costs off)
+  select max(null) from tenk1;
+select max(null) from tenk1;
 
 -- try it on an inheritance tree
 create table minmaxtest(f1 int);
@@ -763,6 +824,23 @@ select aggfns(distinct a,b,c order by a,c using ~<~,b)
   from (values (1,3,'foo'),(0,null,null),(2,2,'bar'),(3,1,'baz')) v(a,b,c),
        generate_series(1,2) i;
 
+-- single input sorted on two keys; 0 and -0 differ only for *<
+select array_agg(distinct r order by r using <, r using *<)
+  from (values (row(-0.0::float8)), (row(0.0::float8))) v(r),
+       generate_series(1,2) i;
+
+-- check again for the non-presorted aggregate code
+set enable_presorted_aggregate to off;
+select array_agg(distinct r order by r using <, r using *<)
+  from (values (row(-0.0::float8)), (row(0.0::float8))) v(r),
+       generate_series(1,2) i;
+
+-- likewise, but without DISTINCT; the second sort key must not be ignored
+select array_agg(r order by r using <, r using *<)
+  from (values (row(-0.0::float8)), (row(0.0::float8))) v(r);
+
+reset enable_presorted_aggregate;
+
 -- test a more complex permutation that has previous caused issues
 select
     string_agg(distinct 'a', ','),
@@ -1101,6 +1179,43 @@ select cleast_agg(q1,q2) from int8_tbl;
 select cleast_agg(4.5,f1) from int4_tbl;
 select cleast_agg(variadic array[4.5,f1]) from int4_tbl;
 select pg_typeof(cleast_agg(variadic array[4.5,f1])) from int4_tbl;
+
+--
+-- Test SupportRequestSimplifyAggref code
+--
+begin;
+create table agg_simplify (a int, not_null_col int not null, nullable_col int);
+
+-- Ensure count(not_null_col) uses count(*)
+explain (costs off, verbose)
+select count(not_null_col) from agg_simplify;
+
+-- Ensure count(<not null const>) uses count(*)
+explain (costs off, verbose)
+select count('bananas') from agg_simplify;
+
+-- Ensure count(null) isn't optimized
+explain (costs off, verbose)
+select count(null) from agg_simplify;
+
+-- Ensure count(nullable_col) does not use count(*)
+explain (costs off, verbose)
+select count(nullable_col) from agg_simplify;
+
+-- Ensure there's no optimization with DISTINCT aggs
+explain (costs off, verbose)
+select count(distinct not_null_col) from agg_simplify;
+
+-- Ensure there's no optimization with ORDER BY aggs
+explain (costs off, verbose)
+select count(not_null_col order by not_null_col) from agg_simplify;
+
+-- Ensure we don't optimize to count(*) with agglevelsup > 0
+explain (costs off, verbose)
+select a from agg_simplify a group by a
+having exists (select 1 from onek b where count(a.not_null_col) = b.four);
+
+rollback;
 
 -- test aggregates with common transition functions share the same states
 begin work;

@@ -3,7 +3,7 @@
  * geqo_random.h
  *	  random number generator
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/optimizer/geqo_random.h
@@ -11,12 +11,13 @@
  *-------------------------------------------------------------------------
  */
 
-/* contributed by:
-   =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
-   *  Martin Utesch				 * Institute of Automatic Control	   *
-   =							 = University of Mining and Technology =
-   *  utesch@aut.tu-freiberg.de  * Freiberg, Germany				   *
-   =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
+/*
+ * contributed by:
+ * =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
+ * *  Martin Utesch				 * Institute of Automatic Control	   *
+ * =							 = University of Mining and Technology =
+ * *  utesch@aut.tu-freiberg.de  * Freiberg, Germany				   *
+ * =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
  */
 
 /* -- parts of this are adapted from D. Whitley's Genitor algorithm -- */

@@ -4,7 +4,7 @@
  *
  *      Definitions for GSSAPI common routines
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/interfaces/libpq/fe-gssapi-common.h
@@ -20,7 +20,7 @@
 
 void		pg_GSS_error(const char *mprefix, PGconn *conn,
 						 OM_uint32 maj_stat, OM_uint32 min_stat);
-bool		pg_GSS_have_cred_cache(gss_cred_id_t *cred_out);
+gss_cred_id_t pg_GSS_get_cred_cache(void);
 int			pg_GSS_load_servicename(PGconn *conn);
 
 #endif

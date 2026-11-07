@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2025, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 pg_combinebackup_sources = files(
   'pg_combinebackup.c',
@@ -40,6 +40,8 @@ tests += {
       't/010_hardlink.pl',
       't/011_ib_truncation.pl',
       't/012_vm_consistency.pl',
+      't/013_summary_order.pl',
+      't/014_vm_truncation.pl',
     ],
   }
 }

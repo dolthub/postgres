@@ -1967,12 +1967,14 @@ civarind: cvariable indicator
 
 char_civar: char_variable
 	{
-		char	   *ptr = (char *) strstr(@1, ".arr");
+		char	   *var = loc_strdup(@1);
+		char	   *ptr = strstr(var, ".arr");
 
 		if (ptr)				/* varchar, we need the struct name here, not
 								 * the struct element */
 			*ptr = '\0';
-		add_variable_to_head(&argsinsert, find_variable(@1), &no_indicator);
+		add_variable_to_head(&argsinsert, find_variable(var), &no_indicator);
+		@$ = var;
 	}
 	;
 

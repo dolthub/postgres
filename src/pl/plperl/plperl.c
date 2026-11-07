@@ -35,6 +35,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+#include "utils/tuplestore.h"
 #include "utils/typcache.h"
 
 /* define our text domain for translations */
@@ -247,7 +248,7 @@ static plperl_call_data *current_call_data = NULL;
  **********************************************************************/
 
 static PerlInterpreter *plperl_init_interp(void);
-static void plperl_destroy_interp(PerlInterpreter **);
+static void plperl_destroy_interp(PerlInterpreter **interp);
 static void plperl_fini(int code, Datum arg);
 static void set_interp_require(bool trusted);
 
@@ -278,17 +279,20 @@ static void array_to_datum_internal(AV *av, ArrayBuildState **astatep,
 									int *ndims, int *dims, int cur_depth,
 									Oid elemtypid, int32 typmod,
 									FmgrInfo *finfo, Oid typioparam);
+static int	av_count_limit(AV *av);
 static Datum plperl_hash_to_datum(SV *src, TupleDesc td);
 
 static void plperl_init_shared_libs(pTHX);
 static void plperl_trusted_init(void);
 static void plperl_untrusted_init(void);
-static HV  *plperl_spi_execute_fetch_result(SPITupleTable *, uint64, int);
+static HV  *plperl_spi_execute_fetch_result(SPITupleTable *tuptable,
+											uint64 processed, int status);
 static void plperl_return_next_internal(SV *sv);
 static char *hek2cstr(HE *he);
 static SV **hv_store_string(HV *hv, const char *key, SV *val);
 static SV **hv_fetch_string(HV *hv, const char *key);
-static void plperl_create_sub(plperl_proc_desc *desc, const char *s, Oid fn_oid);
+static void plperl_create_sub(plperl_proc_desc *prodesc, const char *s,
+							  Oid fn_oid);
 static SV  *plperl_call_perl_func(plperl_proc_desc *desc,
 								  FunctionCallInfo fcinfo);
 static void plperl_compile_callback(void *arg);
@@ -1092,7 +1096,7 @@ plperl_build_tuple_result(HV *perlhash, TupleDesc td)
 		SV		   *val = HeVAL(he);
 		char	   *key = hek2cstr(he);
 		int			attn = SPI_fnumber(td, key);
-		Form_pg_attribute attr = TupleDescAttr(td, attn - 1);
+		Form_pg_attribute attr;
 
 		if (attn == SPI_ERROR_NOATTRIBUTE)
 			ereport(ERROR,
@@ -1105,6 +1109,7 @@ plperl_build_tuple_result(HV *perlhash, TupleDesc td)
 					 errmsg("cannot set system attribute \"%s\"",
 							key)));
 
+		attr = TupleDescAttr(td, attn - 1);
 		values[attn - 1] = plperl_sv_to_datum(val,
 											  attr->atttypid,
 											  attr->atttypmod,
@@ -1141,7 +1146,7 @@ get_perl_array_ref(SV *sv)
 {
 	dTHX;
 
-	if (SvOK(sv) && SvROK(sv))
+	if (sv && SvOK(sv) && SvROK(sv))
 	{
 		if (SvTYPE(SvRV(sv)) == SVt_PVAV)
 			return sv;
@@ -1169,8 +1174,8 @@ get_perl_array_ref(SV *sv)
  * is frozen).
  *
  * Caller is required to have set dims[cur_depth - 1] to the length of the
- * input array, i.e., av_len(av) + 1.  We make this requirement so as to
- * avoid reading av_len() twice, which is hazardous for tied arrays.
+ * input array, i.e., av_count_limit(av).  We make this requirement so as to
+ * avoid reading av_count() twice, which is hazardous for tied arrays.
  */
 static void
 array_to_datum_internal(AV *av, ArrayBuildState **astatep,
@@ -1210,11 +1215,11 @@ array_to_datum_internal(AV *av, ArrayBuildState **astatep,
 							 errmsg("number of array dimensions exceeds the maximum allowed (%d)",
 									MAXDIM)));
 				/* OK, add a dimension */
-				dims[*ndims] = av_len(nav) + 1;
+				dims[*ndims] = av_count_limit(nav);
 				(*ndims)++;
 			}
 			else if (cur_depth >= *ndims ||
-					 av_len(nav) + 1 != dims[cur_depth])
+					 av_count_limit(nav) != dims[cur_depth])
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 						 errmsg("multidimensional arrays must have array expressions with matching dimensions")));
@@ -1257,6 +1262,25 @@ array_to_datum_internal(AV *av, ArrayBuildState **astatep,
 }
 
 /*
+ * av_count returns Size_t, so at least in theory it could overrun INT_MAX.
+ * As long as we have to check, let's throw error for anything above
+ * MaxArraySize, which will surely fail later.
+ */
+static int
+av_count_limit(AV *av)
+{
+	dTHX;
+	Size_t		cnt = av_count(av);
+
+	if (cnt > MaxArraySize)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("array size exceeds the maximum allowed (%zu)",
+						MaxArraySize)));
+	return (int) cnt;
+}
+
+/*
  * convert perl array ref to a datum
  */
 static Datum
@@ -1283,7 +1307,7 @@ plperl_array_to_datum(SV *src, Oid typid, int32 typmod)
 	_sv_to_datum_finfo(elemtypid, &finfo, &typioparam);
 
 	memset(dims, 0, sizeof(dims));
-	dims[0] = av_len(nav) + 1;
+	dims[0] = av_count_limit(nav);
 
 	array_to_datum_internal(nav, &astate,
 							&ndims, dims, 1,
@@ -1457,7 +1481,7 @@ plperl_sv_to_literal(SV *sv, char *fqtypename)
 
 	check_spi_usage_allowed();
 
-	typid = DirectFunctionCall1(regtypein, CStringGetDatum(fqtypename));
+	typid = DatumGetObjectId(DirectFunctionCall1(regtypein, CStringGetDatum(fqtypename)));
 	if (!OidIsValid(typid))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
@@ -1802,7 +1826,7 @@ plperl_modify_tuple(HV *hvTD, TriggerData *tdata, HeapTuple otup)
 		char	   *key = hek2cstr(he);
 		SV		   *val = HeVAL(he);
 		int			attn = SPI_fnumber(tupdesc, key);
-		Form_pg_attribute attr = TupleDescAttr(tupdesc, attn - 1);
+		Form_pg_attribute attr;
 
 		if (attn == SPI_ERROR_NOATTRIBUTE)
 			ereport(ERROR,
@@ -1814,6 +1838,8 @@ plperl_modify_tuple(HV *hvTD, TriggerData *tdata, HeapTuple otup)
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("cannot set system attribute \"%s\"",
 							key)));
+
+		attr = TupleDescAttr(tupdesc, attn - 1);
 		if (attr->attgenerated)
 			ereport(ERROR,
 					(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
@@ -2472,14 +2498,15 @@ plperl_func_handler(PG_FUNCTION_ARGS)
 		if (sav)
 		{
 			dTHX;
-			int			i = 0;
-			SV		  **svp = 0;
 			AV		   *rav = (AV *) SvRV(sav);
+			Size_t		alen = av_count(rav);
 
-			while ((svp = av_fetch(rav, i, FALSE)) != NULL)
+			for (Size_t i = 0; i < alen; i++)
 			{
-				plperl_return_next_internal(*svp);
-				i++;
+				SV		  **svp = av_fetch(rav, i, FALSE);
+
+				if (svp)
+					plperl_return_next_internal(*svp);
 			}
 		}
 		else if (SvOK(perlret))
@@ -2573,13 +2600,13 @@ plperl_trigger_handler(PG_FUNCTION_ARGS)
 		TriggerData *trigdata = ((TriggerData *) fcinfo->context);
 
 		if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
-			retval = (Datum) trigdata->tg_trigtuple;
+			retval = PointerGetDatum(trigdata->tg_trigtuple);
 		else if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
-			retval = (Datum) trigdata->tg_newtuple;
+			retval = PointerGetDatum(trigdata->tg_newtuple);
 		else if (TRIGGER_FIRED_BY_DELETE(trigdata->tg_event))
-			retval = (Datum) trigdata->tg_trigtuple;
+			retval = PointerGetDatum(trigdata->tg_trigtuple);
 		else if (TRIGGER_FIRED_BY_TRUNCATE(trigdata->tg_event))
-			retval = (Datum) trigdata->tg_trigtuple;
+			retval = PointerGetDatum(trigdata->tg_trigtuple);
 		else
 			retval = (Datum) 0; /* can this happen? */
 	}

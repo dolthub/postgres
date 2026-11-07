@@ -1,4 +1,4 @@
-# Copyright (c) 2025, PostgreSQL Global Development Group
+# Copyright (c) 2025-2026, PostgreSQL Global Development Group
 #
 # This test aims to validate that hard links are created as expected in the
 # output directory, when running pg_combinebackup with --link mode.
@@ -18,13 +18,13 @@ $primary->append_conf('postgresql.conf', 'autovacuum = off');
 $primary->start;
 
 # Create a couple of tables (~264KB each).
-# Note: Cirrus CI runs some tests with a very small segment size, so, in that
+# Note: CI runs some tests with a very small segment size, so, in that
 # environment, a single table of 264KB would have both a segment with a link
-# count of 1 and also one with a link count of 2. But in a normal installation,
-# segment size is 1GB.  Therefore, we use 2 different tables here: for test_1,
-# all segments (or the only one) will have two hard links; for test_2, the
-# last segment (or the only one) will have 1 hard link, and any others will
-# have 2.
+# count of 1 and also one with a link count of 2. But in a normal
+# installation, segment size is 1GB.  Therefore, we use 2 different tables
+# here: for test_1, all segments (or the only one) will have two hard links;
+# for test_2, the last segment (or the only one) will have 1 hard link, and
+# any others will have 2.
 my $query = <<'EOM';
 CREATE TABLE test_%s AS
     SELECT x.id::bigint,
@@ -144,12 +144,12 @@ sub check_data_file
 	{
 		# Get the file's stat information of each segment
 		my $nlink_count = get_hard_link_count($segment);
-		ok($nlink_count == 2, "File '$segment' has 2 hard links");
+		is($nlink_count, 2, "File '$segment' has 2 hard links");
 	}
 
 	# Get the file's stat information of the last segment
 	my $nlink_count = get_hard_link_count($last_segment);
-	ok($nlink_count == $last_segment_nlinks,
+	is($nlink_count, $last_segment_nlinks,
 		"File '$last_segment' has $last_segment_nlinks hard link(s)");
 }
 

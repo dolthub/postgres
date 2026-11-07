@@ -24,6 +24,7 @@
 
 #include "common/int.h"
 #include "libpq/pqformat.h"
+#include "nodes/miscnodes.h"
 #include "utils/builtins.h"
 #include "utils/cash.h"
 #include "utils/float.h"
@@ -179,7 +180,8 @@ cash_div_int64(Cash c, int64 i)
 	return c / i;
 }
 
-/* cash_in()
+/*
+ * cash_in()
  * Convert a string to a cash data type.
  * Format is [$]###[,]###[.##]
  * Examples: 123.45 $123.45 $123,456.78
@@ -395,7 +397,8 @@ cash_in(PG_FUNCTION_ARGS)
 }
 
 
-/* cash_out()
+/*
+ * cash_out()
  * Function to convert cash to a dollars and cents representation, using
  * the lc_monetary locale's formatting.
  */
@@ -699,7 +702,8 @@ cash_cmp(PG_FUNCTION_ARGS)
 }
 
 
-/* cash_pl()
+/*
+ * cash_pl()
  * Add two cash values.
  */
 Datum
@@ -712,7 +716,8 @@ cash_pl(PG_FUNCTION_ARGS)
 }
 
 
-/* cash_mi()
+/*
+ * cash_mi()
  * Subtract two cash values.
  */
 Datum
@@ -725,7 +730,8 @@ cash_mi(PG_FUNCTION_ARGS)
 }
 
 
-/* cash_div_cash()
+/*
+ * cash_div_cash()
  * Divide cash by cash, returning float8.
  */
 Datum
@@ -745,7 +751,8 @@ cash_div_cash(PG_FUNCTION_ARGS)
 }
 
 
-/* cash_mul_flt8()
+/*
+ * cash_mul_flt8()
  * Multiply cash by float8.
  */
 Datum
@@ -758,7 +765,8 @@ cash_mul_flt8(PG_FUNCTION_ARGS)
 }
 
 
-/* flt8_mul_cash()
+/*
+ * flt8_mul_cash()
  * Multiply float8 by cash.
  */
 Datum
@@ -771,7 +779,8 @@ flt8_mul_cash(PG_FUNCTION_ARGS)
 }
 
 
-/* cash_div_flt8()
+/*
+ * cash_div_flt8()
  * Divide cash by float8.
  */
 Datum
@@ -784,7 +793,8 @@ cash_div_flt8(PG_FUNCTION_ARGS)
 }
 
 
-/* cash_mul_flt4()
+/*
+ * cash_mul_flt4()
  * Multiply cash by float4.
  */
 Datum
@@ -797,7 +807,8 @@ cash_mul_flt4(PG_FUNCTION_ARGS)
 }
 
 
-/* flt4_mul_cash()
+/*
+ * flt4_mul_cash()
  * Multiply float4 by cash.
  */
 Datum
@@ -810,7 +821,8 @@ flt4_mul_cash(PG_FUNCTION_ARGS)
 }
 
 
-/* cash_div_flt4()
+/*
+ * cash_div_flt4()
  * Divide cash by float4.
  *
  */
@@ -824,7 +836,8 @@ cash_div_flt4(PG_FUNCTION_ARGS)
 }
 
 
-/* cash_mul_int8()
+/*
+ * cash_mul_int8()
  * Multiply cash by int8.
  */
 Datum
@@ -837,7 +850,8 @@ cash_mul_int8(PG_FUNCTION_ARGS)
 }
 
 
-/* int8_mul_cash()
+/*
+ * int8_mul_cash()
  * Multiply int8 by cash.
  */
 Datum
@@ -849,7 +863,8 @@ int8_mul_cash(PG_FUNCTION_ARGS)
 	PG_RETURN_CASH(cash_mul_int64(c, i));
 }
 
-/* cash_div_int8()
+/*
+ * cash_div_int8()
  * Divide cash by 8-byte integer.
  */
 Datum
@@ -862,7 +877,8 @@ cash_div_int8(PG_FUNCTION_ARGS)
 }
 
 
-/* cash_mul_int4()
+/*
+ * cash_mul_int4()
  * Multiply cash by int4.
  */
 Datum
@@ -875,7 +891,8 @@ cash_mul_int4(PG_FUNCTION_ARGS)
 }
 
 
-/* int4_mul_cash()
+/*
+ * int4_mul_cash()
  * Multiply int4 by cash.
  */
 Datum
@@ -888,7 +905,8 @@ int4_mul_cash(PG_FUNCTION_ARGS)
 }
 
 
-/* cash_div_int4()
+/*
+ * cash_div_int4()
  * Divide cash by 4-byte integer.
  *
  */
@@ -902,7 +920,8 @@ cash_div_int4(PG_FUNCTION_ARGS)
 }
 
 
-/* cash_mul_int2()
+/*
+ * cash_mul_int2()
  * Multiply cash by int2.
  */
 Datum
@@ -914,7 +933,8 @@ cash_mul_int2(PG_FUNCTION_ARGS)
 	PG_RETURN_CASH(cash_mul_int64(c, (int64) s));
 }
 
-/* int2_mul_cash()
+/*
+ * int2_mul_cash()
  * Multiply int2 by cash.
  */
 Datum
@@ -926,7 +946,8 @@ int2_mul_cash(PG_FUNCTION_ARGS)
 	PG_RETURN_CASH(cash_mul_int64(c, (int64) s));
 }
 
-/* cash_div_int2()
+/*
+ * cash_div_int2()
  * Divide cash by int2.
  *
  */
@@ -939,7 +960,8 @@ cash_div_int2(PG_FUNCTION_ARGS)
 	PG_RETURN_CASH(cash_div_int64(c, (int64) s));
 }
 
-/* cashlarger()
+/*
+ * cashlarger()
  * Return larger of two cash values.
  */
 Datum
@@ -954,7 +976,8 @@ cashlarger(PG_FUNCTION_ARGS)
 	PG_RETURN_CASH(result);
 }
 
-/* cashsmaller()
+/*
+ * cashsmaller()
  * Return smaller of two cash values.
  */
 Datum
@@ -969,7 +992,8 @@ cashsmaller(PG_FUNCTION_ARGS)
 	PG_RETURN_CASH(result);
 }
 
-/* cash_words()
+/*
+ * cash_words()
  * This converts an int4 as well but to a representation using words
  * Obviously way North American centric - sorry
  */
@@ -1051,7 +1075,7 @@ cash_words(PG_FUNCTION_ARGS)
 	appendStringInfoString(&buf, m0 == 1 ? " cent" : " cents");
 
 	/* capitalize output */
-	buf.data[0] = pg_toupper((unsigned char) buf.data[0]);
+	buf.data[0] = pg_ascii_toupper((unsigned char) buf.data[0]);
 
 	/* return as text datum */
 	res = cstring_to_text_with_len(buf.data, buf.len);
@@ -1060,7 +1084,8 @@ cash_words(PG_FUNCTION_ARGS)
 }
 
 
-/* cash_numeric()
+/*
+ * cash_numeric()
  * Convert cash to numeric.
  */
 Datum
@@ -1116,18 +1141,19 @@ cash_numeric(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(result);
 }
 
-/* numeric_cash()
+/*
+ * numeric_cash()
  * Convert numeric to cash.
  */
 Datum
 numeric_cash(PG_FUNCTION_ARGS)
 {
-	Datum		amount = PG_GETARG_DATUM(0);
+	Numeric		amount = PG_GETARG_NUMERIC(0);
 	Cash		result;
 	int			fpoint;
 	int64		scale;
 	int			i;
-	Datum		numeric_scale;
+	Numeric		numeric_scale;
 	struct lconv *lconvert = PGLC_localeconv();
 
 	/* see comments about frac_digits in cash_in() */
@@ -1141,16 +1167,22 @@ numeric_cash(PG_FUNCTION_ARGS)
 		scale *= 10;
 
 	/* multiply the input amount by scale factor */
-	numeric_scale = NumericGetDatum(int64_to_numeric(scale));
-	amount = DirectFunctionCall2(numeric_mul, amount, numeric_scale);
+	numeric_scale = int64_to_numeric(scale);
+
+	amount = numeric_mul_safe(amount, numeric_scale, fcinfo->context);
+	if (unlikely(SOFT_ERROR_OCCURRED(fcinfo->context)))
+		PG_RETURN_NULL();
 
 	/* note that numeric_int8 will round to nearest integer for us */
-	result = DatumGetInt64(DirectFunctionCall1(numeric_int8, amount));
+	result = numeric_int8_safe(amount, fcinfo->context);
+	if (unlikely(SOFT_ERROR_OCCURRED(fcinfo->context)))
+		PG_RETURN_NULL();
 
 	PG_RETURN_CASH(result);
 }
 
-/* int4_cash()
+/*
+ * int4_cash()
  * Convert int4 (int) to cash
  */
 Datum
@@ -1174,13 +1206,16 @@ int4_cash(PG_FUNCTION_ARGS)
 		scale *= 10;
 
 	/* compute amount * scale, checking for overflow */
-	result = DatumGetInt64(DirectFunctionCall2(int8mul, Int64GetDatum(amount),
-											   Int64GetDatum(scale)));
+	if (unlikely(pg_mul_s64_overflow(amount, scale, &result)))
+		ereturn(fcinfo->context, (Datum) 0,
+				errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				errmsg("bigint out of range"));
 
 	PG_RETURN_CASH(result);
 }
 
-/* int8_cash()
+/*
+ * int8_cash()
  * Convert int8 (bigint) to cash
  */
 Datum
@@ -1204,8 +1239,10 @@ int8_cash(PG_FUNCTION_ARGS)
 		scale *= 10;
 
 	/* compute amount * scale, checking for overflow */
-	result = DatumGetInt64(DirectFunctionCall2(int8mul, Int64GetDatum(amount),
-											   Int64GetDatum(scale)));
+	if (unlikely(pg_mul_s64_overflow(amount, scale, &result)))
+		ereturn(fcinfo->context, (Datum) 0,
+				errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				errmsg("bigint out of range"));
 
 	PG_RETURN_CASH(result);
 }

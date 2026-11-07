@@ -3,7 +3,7 @@
  * walreceiver.h
  *	  Exports from replication/walreceiverfuncs.c.
  *
- * Portions Copyright (c) 2010-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *
  * src/include/replication/walreceiver.h
  *
@@ -47,6 +47,7 @@ typedef enum
 	WALRCV_STOPPED,				/* stopped and mustn't start up again */
 	WALRCV_STARTING,			/* launched, but the process hasn't
 								 * initialized yet */
+	WALRCV_CONNECTING,			/* connecting to upstream server */
 	WALRCV_STREAMING,			/* walreceiver is streaming */
 	WALRCV_WAITING,				/* stopped streaming, waiting for orders */
 	WALRCV_RESTARTING,			/* asked to restart streaming */
@@ -155,21 +156,14 @@ typedef struct
 	pg_atomic_uint64 writtenUpto;
 
 	/*
-	 * force walreceiver reply?  This doesn't need to be locked; memory
+	 * request walreceiver reply?  This doesn't need to be locked; memory
 	 * barriers for ordering are sufficient.  But we do need atomic fetch and
 	 * store semantics, so use sig_atomic_t.
 	 */
-	sig_atomic_t force_reply;	/* used as a bool */
+	sig_atomic_t apply_reply_requested; /* used as a bool */
 } WalRcvData;
 
 extern PGDLLIMPORT WalRcvData *WalRcv;
-
-/*
- * Server's WAL flush position as reported by the last IDENTIFY_SYSTEM call.
- * Set by walrcv_identify_system(), used by the walreceiver to avoid
- * requesting streaming from a point ahead of the upstream's flush position.
- */
-extern PGDLLIMPORT XLogRecPtr WalRcvIdentifySystemLsn;
 
 typedef struct
 {
@@ -286,9 +280,12 @@ typedef void (*walrcv_get_senderinfo_fn) (WalReceiverConn *conn,
  * Run IDENTIFY_SYSTEM on the cluster connected to and validate the
  * identity of the cluster.  Returns the system ID of the cluster
  * connected to.  'primary_tli' is the timeline ID of the sender.
+ * If 'server_lsn' is not NULL, it is set to the current WAL flush
+ * position of the sender.
  */
 typedef char *(*walrcv_identify_system_fn) (WalReceiverConn *conn,
-											TimeLineID *primary_tli);
+											TimeLineID *primary_tli,
+											XLogRecPtr *server_lsn);
 
 /*
  * walrcv_get_dbname_from_conninfo_fn
@@ -447,8 +444,8 @@ extern PGDLLIMPORT WalReceiverFunctionsType *WalReceiverFunctions;
 	WalReceiverFunctions->walrcv_get_conninfo(conn)
 #define walrcv_get_senderinfo(conn, sender_host, sender_port) \
 	WalReceiverFunctions->walrcv_get_senderinfo(conn, sender_host, sender_port)
-#define walrcv_identify_system(conn, primary_tli) \
-	WalReceiverFunctions->walrcv_identify_system(conn, primary_tli)
+#define walrcv_identify_system(conn, primary_tli, server_lsn) \
+	WalReceiverFunctions->walrcv_identify_system(conn, primary_tli, server_lsn)
 #define walrcv_get_dbname_from_conninfo(conninfo) \
 	WalReceiverFunctions->walrcv_get_dbname_from_conninfo(conninfo)
 #define walrcv_server_version(conn) \
@@ -494,14 +491,13 @@ walrcv_clear_result(WalRcvExecResult *walres)
 
 /* prototypes for functions in walreceiver.c */
 pg_noreturn extern void WalReceiverMain(const void *startup_data, size_t startup_data_len);
-extern void WalRcvForceReply(void);
+extern void WalRcvRequestApplyReply(void);
 
 /* prototypes for functions in walreceiverfuncs.c */
-extern Size WalRcvShmemSize(void);
-extern void WalRcvShmemInit(void);
 extern void ShutdownWalRcv(void);
 extern bool WalRcvStreaming(void);
 extern bool WalRcvRunning(void);
+extern WalRcvState WalRcvGetState(void);
 extern void RequestXLogStreaming(TimeLineID tli, XLogRecPtr recptr,
 								 const char *conninfo, const char *slotname,
 								 bool create_temp_slot);

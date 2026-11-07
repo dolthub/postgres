@@ -3,7 +3,7 @@
  * joininfo.c
  *	  joininfo list manipulation routines
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -143,41 +143,5 @@ add_join_clause_to_rels(PlannerInfo *root,
 		if (rel == NULL)
 			continue;
 		rel->joininfo = lappend(rel->joininfo, restrictinfo);
-	}
-}
-
-/*
- * remove_join_clause_from_rels
- *	  Delete 'restrictinfo' from all the joininfo lists it is in
- *
- * This reverses the effect of add_join_clause_to_rels.  It's used when we
- * discover that a relation need not be joined at all.
- *
- * 'restrictinfo' describes the join clause
- * 'join_relids' is the set of relations participating in the join clause
- *				 (some of these could be outer joins)
- */
-void
-remove_join_clause_from_rels(PlannerInfo *root,
-							 RestrictInfo *restrictinfo,
-							 Relids join_relids)
-{
-	int			cur_relid;
-
-	cur_relid = -1;
-	while ((cur_relid = bms_next_member(join_relids, cur_relid)) >= 0)
-	{
-		RelOptInfo *rel = find_base_rel_ignore_join(root, cur_relid);
-
-		/* We would only have added the clause to baserels */
-		if (rel == NULL)
-			continue;
-
-		/*
-		 * Remove the restrictinfo from the list.  Pointer comparison is
-		 * sufficient.
-		 */
-		Assert(list_member_ptr(rel->joininfo, restrictinfo));
-		rel->joininfo = list_delete_ptr(rel->joininfo, restrictinfo);
 	}
 }

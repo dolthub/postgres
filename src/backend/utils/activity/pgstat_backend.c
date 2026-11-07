@@ -15,7 +15,7 @@
  * PgStat_EntryRef->pending, relying on PendingBackendStats instead so as it
  * is possible to report data within critical sections.
  *
- * Copyright (c) 2001-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/activity/pgstat_backend.c
@@ -95,7 +95,8 @@ pgstat_fetch_stat_backend(ProcNumber procNumber)
 	PgStat_Backend *backend_entry;
 
 	backend_entry = (PgStat_Backend *) pgstat_fetch_entry(PGSTAT_KIND_BACKEND,
-														  InvalidOid, procNumber);
+														  InvalidOid, procNumber,
+														  NULL);
 
 	return backend_entry;
 }
@@ -252,6 +253,7 @@ pgstat_flush_backend_entry_wal(PgStat_EntryRef *entry_ref)
 	WALSTAT_ACC(wal_records, wal_usage_diff);
 	WALSTAT_ACC(wal_fpi, wal_usage_diff);
 	WALSTAT_ACC(wal_bytes, wal_usage_diff);
+	WALSTAT_ACC(wal_fpi_bytes, wal_usage_diff);
 #undef WALSTAT_ACC
 
 	/*
@@ -267,7 +269,7 @@ pgstat_flush_backend_entry_wal(PgStat_EntryRef *entry_ref)
  * if some statistics could not be flushed due to lock contention.
  */
 bool
-pgstat_flush_backend(bool nowait, bits32 flags)
+pgstat_flush_backend(bool nowait, uint32 flags)
 {
 	PgStat_EntryRef *entry_ref;
 	bool		has_pending_data = false;

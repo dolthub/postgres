@@ -3,7 +3,7 @@
 # pg_opfamily.dat
 #    Initial contents of the pg_opfamily system catalog.
 #
-# Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
 # src/include/catalog/pg_opfamily.dat
@@ -116,6 +116,10 @@
   opfmethod => 'hash', opfname => 'xid8_ops' },
 { oid => '5067',
   opfmethod => 'btree', opfname => 'xid8_ops' },
+{ oid => '6459',
+  opfmethod => 'hash', opfname => 'oid8_ops' },
+{ oid => '6460',
+  opfmethod => 'btree', opfname => 'oid8_ops' },
 { oid => '2226',
   opfmethod => 'hash', opfname => 'cid_ops' },
 { oid => '2227',
@@ -305,43 +309,4 @@
 { oid => '6158',
   opfmethod => 'gist', opfname => 'multirange_ops' },
 
-# Native prolly access methods (additional to PostgreSQL defaults).
-{ oid => '9005', opfmethod => 'dolt_prolly_index', opfname => 'dolt_integer_ops' },
-{ oid => '9008', opfmethod => 'dolt_prolly_index', opfname => 'dolt_bool_ops' },
-{ oid => '9009', opfmethod => 'dolt_prolly_index', opfname => 'dolt_text_ops' },
-{ oid => '9010', opfmethod => 'dolt_prolly_index', opfname => 'dolt_bytea_ops' },
-
-# Prolly indexes order keys by normalized bytes. Native cross-type families
-# retain PostgreSQL comparison semantics; scans recheck incompatible encodings.
-{ oid => '9011', opfmethod => 'dolt_prolly_index', opfname => 'dolt_float_ops' },
-{ oid => '9013', opfmethod => 'dolt_prolly_index', opfname => 'dolt_numeric_ops' },
-{ oid => '9014', opfmethod => 'dolt_prolly_index', opfname => 'dolt_datetime_ops' },
-{ oid => '9015', opfmethod => 'dolt_prolly_index', opfname => 'dolt_time_ops' },
-{ oid => '9016', opfmethod => 'dolt_prolly_index', opfname => 'dolt_timetz_ops' },
-{ oid => '9019', opfmethod => 'dolt_prolly_index', opfname => 'dolt_interval_ops' },
-{ oid => '9020', opfmethod => 'dolt_prolly_index', opfname => 'dolt_uuid_ops' },
-{ oid => '9021', opfmethod => 'dolt_prolly_index', opfname => 'dolt_bpchar_ops' },
-{ oid => '9022', opfmethod => 'dolt_prolly_index', opfname => 'dolt_char_ops' },
-{ oid => '9023', opfmethod => 'dolt_prolly_index', opfname => 'dolt_name_ops' },
-{ oid => '9024', opfmethod => 'dolt_prolly_index', opfname => 'dolt_money_ops' },
-{ oid => '9025', opfmethod => 'dolt_prolly_index', opfname => 'dolt_macaddr_ops' },
-{ oid => '9026', opfmethod => 'dolt_prolly_index', opfname => 'dolt_macaddr8_ops' },
-{ oid => '9027', opfmethod => 'dolt_prolly_index', opfname => 'dolt_enum_ops' },
-
-{ oid => '9028', opfmethod => 'dolt_prolly_index', opfname => 'dolt_array_ops' },
-
-
-# Additional native ordering families.
-{ oid => '9030', opfmethod => 'dolt_prolly_index', opfname => 'dolt_oid_ops' },
-{ oid => '9031', opfmethod => 'dolt_prolly_index', opfname => 'dolt_bit_ops' },
-{ oid => '9032', opfmethod => 'dolt_prolly_index', opfname => 'dolt_varbit_ops' },
-{ oid => '9033', opfmethod => 'dolt_prolly_index', opfname => 'dolt_network_ops' },
-{ oid => '9034', opfmethod => 'dolt_prolly_index', opfname => 'dolt_jsonb_ops' },
-{ oid => '9035', opfmethod => 'dolt_prolly_index', opfname => 'dolt_record_ops' },
-{ oid => '9036', opfmethod => 'dolt_prolly_index', opfname => 'dolt_range_ops' },
-{ oid => '9037', opfmethod => 'dolt_prolly_index', opfname => 'dolt_multirange_ops' },
-
-
-{ oid => '9252', oid_symbol => 'TEXT_PATTERN_PROLLY_FAM_OID', opfmethod => 'dolt_prolly_index', opfname => 'text_pattern_ops' },
-{ oid => '9253', oid_symbol => 'BPCHAR_PATTERN_PROLLY_FAM_OID', opfmethod => 'dolt_prolly_index', opfname => 'bpchar_pattern_ops' },
 ]

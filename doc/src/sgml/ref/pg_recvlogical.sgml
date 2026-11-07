@@ -84,7 +84,7 @@ PostgreSQL documentation
        </para>
 
        <para>
-        The <option>--slot</option> and <option>--dbname</option> are required
+        The <option>--slot</option> and <option>--dbname</option> options are required
         for this action.
        </para>
 
@@ -104,7 +104,7 @@ PostgreSQL documentation
        </para>
 
        <para>
-        The <option>--slot</option> is required for this action.
+        The <option>--slot</option> option is required for this action.
        </para>
       </listitem>
      </varlistentry>
@@ -121,8 +121,8 @@ PostgreSQL documentation
        </para>
 
        <para>
-        The <option>--slot</option> and <option>--dbname</option>,
-        <option>--file</option> are required for this action.
+        The <option>--slot</option>, <option>--dbname</option>, and
+        <option>--file</option> options are required for this action.
        </para>
 
        <para>
@@ -206,7 +206,7 @@ PostgreSQL documentation
        <para>
         Specifies how often <application>pg_recvlogical</application> should
         issue <function>fsync()</function> calls to ensure the output file is
-        safely flushed to disk.
+        safely flushed to disk. The default value is 10 seconds.
        </para>
 
        <para>
@@ -270,13 +270,15 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
-      <term><option>-P <replaceable>plugin</replaceable></option></term>
+      <term id="app-pgrecvlogical-option-plugin"><option>-P <replaceable>plugin</replaceable></option></term>
       <term><option>--plugin=<replaceable>plugin</replaceable></option></term>
       <listitem>
        <para>
         When creating a slot, use the specified logical decoding output
-        plugin. See <xref linkend="logicaldecoding"/>. This option has no
-        effect if the slot already exists.
+        plugin. See <xref linkend="logicaldecoding-output-plugin"/> for
+        information about the plugins <productname>PostgreSQL</productname>
+        provides. The default is <xref linkend="test-decoding"/>.
+        This option has no effect if the slot already exists.
        </para>
       </listitem>
      </varlistentry>

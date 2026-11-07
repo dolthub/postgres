@@ -34,7 +34,7 @@
  * same flex version, or if they don't use the same flex options.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/fe_utils/psqlscan_int.h
@@ -51,14 +51,8 @@
  * validity checking; in actual use, this file should always be included
  * from the body of a flex file, where these symbols are already defined.
  */
-#ifndef YY_TYPEDEF_YY_BUFFER_STATE
-#define YY_TYPEDEF_YY_BUFFER_STATE
 typedef struct yy_buffer_state *YY_BUFFER_STATE;
-#endif
-#ifndef YY_TYPEDEF_YY_SCANNER_T
-#define YY_TYPEDEF_YY_SCANNER_T
 typedef void *yyscan_t;
-#endif
 
 /*
  * We use a stack of flex buffers to handle substitution of psql variables.
@@ -146,14 +140,14 @@ typedef struct PsqlScanStateData
  * concerned with comment or SQL literal processing: we won't be inside
  * one of those.
  */
-struct PsqlScanStateSave
+typedef struct PsqlScanStateSave
 {
 	int			paren_depth;	/* depth of nesting in parentheses */
 	int			begin_depth;	/* depth of begin/end pairs */
 	int			copy_stdin_count;	/* number of COPY FROM STDIN commands */
 	int			init_idents_count;	/* # identifiers since start of statement */
 	char		init_idents[8]; /* records the first few identifiers */
-};
+} PsqlScanStateSave;
 
 
 /*

@@ -15,7 +15,7 @@
  * forked backends, but they could not be accessed by exec'd backends.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -65,7 +65,10 @@ static PGSemaphore sharedSemas; /* array of PGSemaphoreData in shared memory */
 #endif
 static int	numSems;			/* number of semas acquired so far */
 static int	maxSems;			/* allocated size of above arrays */
+
+#ifdef USE_NAMED_POSIX_SEMAPHORES
 static int	nextSemKey;			/* next name to try */
+#endif
 
 
 static void ReleaseSemaphores(int status, Datum arg);
@@ -159,22 +162,24 @@ PosixSemaphoreKill(sem_t *sem)
 
 
 /*
- * Report amount of shared memory needed for semaphores
+ * Request shared memory needed for semaphores
  */
-Size
-PGSemaphoreShmemSize(int maxSemas)
+void
+PGSemaphoreShmemRequest(int maxSemas)
 {
 #ifdef USE_NAMED_POSIX_SEMAPHORES
 	/* No shared memory needed in this case */
-	return 0;
 #else
 	/* Need a PGSemaphoreData per semaphore */
-	return mul_size(maxSemas, sizeof(PGSemaphoreData));
+	ShmemRequestStruct(.name = "Semaphores",
+					   .size = mul_size(maxSemas, sizeof(PGSemaphoreData)),
+					   .ptr = (void **) &sharedSemas,
+		);
 #endif
 }
 
 /*
- * PGReserveSemaphores --- initialize semaphore support
+ * PGSemaphoreInit --- initialize semaphore support
  *
  * This is called during postmaster start or shared memory reinitialization.
  * It should do whatever is needed to be able to support up to maxSemas
@@ -193,8 +198,9 @@ PGSemaphoreShmemSize(int maxSemas)
  * we don't have to expose the counters to other processes.)
  */
 void
-PGReserveSemaphores(int maxSemas)
+PGSemaphoreInit(int maxSemas)
 {
+#ifdef USE_NAMED_POSIX_SEMAPHORES
 	struct stat statbuf;
 
 	/*
@@ -208,24 +214,17 @@ PGReserveSemaphores(int maxSemas)
 				(errcode_for_file_access(),
 				 errmsg("could not stat data directory \"%s\": %m",
 						DataDir)));
+	nextSemKey = statbuf.st_ino;
+#endif
 
 #ifdef USE_NAMED_POSIX_SEMAPHORES
 	mySemPointers = (sem_t **) malloc(maxSemas * sizeof(sem_t *));
 	if (mySemPointers == NULL)
 		elog(PANIC, "out of memory");
-#else
-
-	/*
-	 * We must use ShmemAllocUnlocked(), since the spinlock protecting
-	 * ShmemAlloc() won't be ready yet.
-	 */
-	sharedSemas = (PGSemaphore)
-		ShmemAllocUnlocked(PGSemaphoreShmemSize(maxSemas));
 #endif
 
 	numSems = 0;
 	maxSems = maxSemas;
-	nextSemKey = statbuf.st_ino;
 
 	on_shmem_exit(ReleaseSemaphores, 0);
 }

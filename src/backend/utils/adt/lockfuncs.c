@@ -3,7 +3,7 @@
  * lockfuncs.c
  *		Functions for SQL access to various lock-manager capabilities.
  *
- * Copyright (c) 2002-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/backend/utils/adt/lockfuncs.c
@@ -146,13 +146,14 @@ pg_lock_status(PG_FUNCTION_ARGS)
 		TupleDescInitEntry(tupdesc, (AttrNumber) 16, "waitstart",
 						   TIMESTAMPTZOID, -1, 0);
 
+		TupleDescFinalize(tupdesc);
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
 
 		/*
 		 * Collect all the locking information that we will format and send
 		 * out as a result set.
 		 */
-		mystatus = (PG_Lock_Status *) palloc(sizeof(PG_Lock_Status));
+		mystatus = palloc_object(PG_Lock_Status);
 		funcctx->user_fctx = mystatus;
 
 		mystatus->lockData = GetLockStatusData();
@@ -398,15 +399,15 @@ pg_lock_status(PG_FUNCTION_ARGS)
 		values[0] = CStringGetTextDatum(PredicateLockTagTypeNames[lockType]);
 
 		/* lock target */
-		values[1] = GET_PREDICATELOCKTARGETTAG_DB(*predTag);
-		values[2] = GET_PREDICATELOCKTARGETTAG_RELATION(*predTag);
+		values[1] = ObjectIdGetDatum(GET_PREDICATELOCKTARGETTAG_DB(*predTag));
+		values[2] = ObjectIdGetDatum(GET_PREDICATELOCKTARGETTAG_RELATION(*predTag));
 		if (lockType == PREDLOCKTAG_TUPLE)
-			values[4] = GET_PREDICATELOCKTARGETTAG_OFFSET(*predTag);
+			values[4] = UInt16GetDatum(GET_PREDICATELOCKTARGETTAG_OFFSET(*predTag));
 		else
 			nulls[4] = true;
 		if ((lockType == PREDLOCKTAG_TUPLE) ||
 			(lockType == PREDLOCKTAG_PAGE))
-			values[3] = GET_PREDICATELOCKTARGETTAG_PAGE(*predTag);
+			values[3] = UInt32GetDatum(GET_PREDICATELOCKTARGETTAG_PAGE(*predTag));
 		else
 			nulls[3] = true;
 
@@ -517,8 +518,14 @@ pg_blocking_pids(PG_FUNCTION_ARGS)
 			/* A proc never blocks itself, so ignore that entry */
 			if (instance == blocked_instance)
 				continue;
-			/* Members of same lock group never block each other, either */
-			if (instance->leaderPid == blocked_instance->leaderPid)
+
+			/*
+			 * Members of the same lock group don't block each other, either,
+			 * except on relation extension locks (see LockCheckConflicts()).
+			 */
+			if (instance->leaderPid == blocked_instance->leaderPid &&
+				blocked_instance->locktag.locktag_type !=
+				LOCKTAG_RELATION_EXTEND)
 				continue;
 
 			if (conflictMask & instance->holdMask)
@@ -767,7 +774,7 @@ pg_try_advisory_xact_lock_shared_int8(PG_FUNCTION_ARGS)
  * pg_advisory_unlock(int8) - release exclusive lock on an int8 key
  *
  * Returns true if successful, false if lock was not held
-*/
+ */
 Datum
 pg_advisory_unlock_int8(PG_FUNCTION_ARGS)
 {
@@ -957,7 +964,7 @@ pg_try_advisory_xact_lock_shared_int4(PG_FUNCTION_ARGS)
  * pg_advisory_unlock(int4, int4) - release exclusive lock on 2 int4 keys
  *
  * Returns true if successful, false if lock was not held
-*/
+ */
 Datum
 pg_advisory_unlock_int4(PG_FUNCTION_ARGS)
 {

@@ -846,7 +846,7 @@ int SPI_execute_extended(const char *<parameter>command</parameter>,
 <synopsis>
 int SPI_execute_with_args(const char *<parameter>command</parameter>,
                           int <parameter>nargs</parameter>, Oid *<parameter>argtypes</parameter>,
-                          Datum *<parameter>values</parameter>, const char *<parameter>nulls</parameter>,
+                          const Datum *<parameter>values</parameter>, const char *<parameter>nulls</parameter>,
                           bool <parameter>read_only</parameter>, long <parameter>count</parameter>)
 </synopsis>
  </refsynopsisdiv>
@@ -1671,7 +1671,7 @@ bool SPI_is_cursor_plan(SPIPlanPtr <parameter>plan</parameter>)
 
  <refsynopsisdiv>
 <synopsis>
-int SPI_execute_plan(SPIPlanPtr <parameter>plan</parameter>, Datum * <parameter>values</parameter>, const char * <parameter>nulls</parameter>,
+int SPI_execute_plan(SPIPlanPtr <parameter>plan</parameter>, const Datum * <parameter>values</parameter>, const char * <parameter>nulls</parameter>,
                      bool <parameter>read_only</parameter>, long <parameter>count</parameter>)
 </synopsis>
  </refsynopsisdiv>
@@ -2086,7 +2086,7 @@ int SPI_execute_plan_with_paramlist(SPIPlanPtr <parameter>plan</parameter>,
 
  <refsynopsisdiv>
 <synopsis>
-int SPI_execp(SPIPlanPtr <parameter>plan</parameter>, Datum * <parameter>values</parameter>, const char * <parameter>nulls</parameter>, long <parameter>count</parameter>)
+int SPI_execp(SPIPlanPtr <parameter>plan</parameter>, const Datum * <parameter>values</parameter>, const char * <parameter>nulls</parameter>, long <parameter>count</parameter>)
 </synopsis>
  </refsynopsisdiv>
 
@@ -2191,7 +2191,7 @@ int SPI_execp(SPIPlanPtr <parameter>plan</parameter>, Datum * <parameter>values<
  <refsynopsisdiv>
 <synopsis>
 Portal SPI_cursor_open(const char * <parameter>name</parameter>, SPIPlanPtr <parameter>plan</parameter>,
-                       Datum * <parameter>values</parameter>, const char * <parameter>nulls</parameter>,
+                       const Datum * <parameter>values</parameter>, const char * <parameter>nulls</parameter>,
                        bool <parameter>read_only</parameter>)
 </synopsis>
  </refsynopsisdiv>
@@ -2317,7 +2317,7 @@ Portal SPI_cursor_open(const char * <parameter>name</parameter>, SPIPlanPtr <par
 Portal SPI_cursor_open_with_args(const char *<parameter>name</parameter>,
                                  const char *<parameter>command</parameter>,
                                  int <parameter>nargs</parameter>, Oid *<parameter>argtypes</parameter>,
-                                 Datum *<parameter>values</parameter>, const char *<parameter>nulls</parameter>,
+                                 const Datum *<parameter>values</parameter>, const char *<parameter>nulls</parameter>,
                                  bool <parameter>read_only</parameter>, int <parameter>cursorOptions</parameter>)
 </synopsis>
  </refsynopsisdiv>
@@ -4694,7 +4694,7 @@ HeapTupleHeader SPI_returntuple(HeapTuple <parameter>row</parameter>, TupleDesc 
  <refsynopsisdiv>
 <synopsis>
 HeapTuple SPI_modifytuple(Relation <parameter>rel</parameter>, HeapTuple <parameter>row</parameter>, int <parameter>ncols</parameter>,
-                          int * <parameter>colnum</parameter>, Datum * <parameter>values</parameter>, const char * <parameter>nulls</parameter>)
+                          int * <parameter>colnum</parameter>, const Datum * <parameter>values</parameter>, const char * <parameter>nulls</parameter>)
 </synopsis>
  </refsynopsisdiv>
 

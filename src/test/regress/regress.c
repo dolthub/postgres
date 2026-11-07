@@ -6,7 +6,7 @@
  *
  * This code is released under the terms of the PostgreSQL License.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/test/regress/regress.c
@@ -29,7 +29,9 @@
 #include "commands/trigger.h"
 #include "common/pg_lzcompress.h"
 #include "executor/executor.h"
+#include "executor/functions.h"
 #include "executor/spi.h"
+#include "foreign/foreign.h"
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
@@ -38,14 +40,21 @@
 #include "optimizer/plancat.h"
 #include "parser/parse_coerce.h"
 #include "port/atomics.h"
+#include "portability/instr_time.h"
 #include "postmaster/postmaster.h"	/* for MAX_BACKENDS */
 #include "storage/spin.h"
+#include "tcop/tcopprot.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/geo_decls.h"
 #include "utils/memutils.h"
+#include "utils/pg_locale.h"
 #include "utils/rel.h"
 #include "utils/typcache.h"
+
+/* define our text domain for translations */
+#undef TEXTDOMAIN
+#define TEXTDOMAIN PG_TEXTDOMAIN("postgresql-regress")
 
 #define EXPECT_TRUE(expr)	\
 	do { \
@@ -155,7 +164,8 @@ overpaid(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(salary > 699);
 }
 
-/* New type "widget"
+/*
+ * New type "widget"
  * This used to be "circle", but I added circle to builtins,
  *	so needed to make sure the names do not collide. - tgl 97/04/21
  */
@@ -197,7 +207,7 @@ widget_in(PG_FUNCTION_ARGS)
 				 errmsg("invalid input syntax for type %s: \"%s\"",
 						"widget", str)));
 
-	result = (WIDGET *) palloc(sizeof(WIDGET));
+	result = palloc_object(WIDGET);
 	result->center.x = atof(coord[0]);
 	result->center.y = atof(coord[1]);
 	result->radius = atof(coord[2]);
@@ -371,9 +381,9 @@ make_tuple_indirect(PG_FUNCTION_ARGS)
 
 	for (i = 0; i < ncolumns; i++)
 	{
-		struct varlena *attr;
-		struct varlena *new_attr;
-		struct varatt_indirect redirect_pointer;
+		varlena    *attr;
+		varlena    *new_attr;
+		varatt_indirect redirect_pointer;
 
 		/* only work on existing, not-null varlenas */
 		if (TupleDescAttr(tupdesc, i)->attisdropped ||
@@ -382,7 +392,7 @@ make_tuple_indirect(PG_FUNCTION_ARGS)
 			TupleDescAttr(tupdesc, i)->attstorage == TYPSTORAGE_PLAIN)
 			continue;
 
-		attr = (struct varlena *) DatumGetPointer(values[i]);
+		attr = (varlena *) DatumGetPointer(values[i]);
 
 		/* don't recursively indirect */
 		if (VARATT_IS_EXTERNAL_INDIRECT(attr))
@@ -393,14 +403,14 @@ make_tuple_indirect(PG_FUNCTION_ARGS)
 			attr = detoast_external_attr(attr);
 		else
 		{
-			struct varlena *oldattr = attr;
+			varlena    *oldattr = attr;
 
 			attr = palloc0(VARSIZE_ANY(oldattr));
 			memcpy(attr, oldattr, VARSIZE_ANY(oldattr));
 		}
 
 		/* build indirection Datum */
-		new_attr = (struct varlena *) palloc0(INDIRECT_POINTER_SIZE);
+		new_attr = (varlena *) palloc0(INDIRECT_POINTER_SIZE);
 		redirect_pointer.pointer = attr;
 		SET_VARTAG_EXTERNAL(new_attr, VARTAG_INDIRECT);
 		memcpy(VARDATA_EXTERNAL(new_attr), &redirect_pointer,
@@ -433,7 +443,7 @@ PG_FUNCTION_INFO_V1(get_environ);
 Datum
 get_environ(PG_FUNCTION_ARGS)
 {
-#if !defined(WIN32) || defined(_MSC_VER)
+#if !defined(WIN32)
 	extern char **environ;
 #endif
 	int			nvals = 0;
@@ -724,11 +734,20 @@ test_fdw_handler(PG_FUNCTION_ARGS)
 	PG_RETURN_NULL();
 }
 
+PG_FUNCTION_INFO_V1(test_fdw_connection);
+Datum
+test_fdw_connection(PG_FUNCTION_ARGS)
+{
+	/* Ensure the test fails if no valid user mapping exists. */
+	GetUserMapping(PG_GETARG_OID(0), PG_GETARG_OID(1));
+	PG_RETURN_TEXT_P(cstring_to_text("dbname=regress_doesnotexist user=doesnotexist password=secret"));
+}
+
 PG_FUNCTION_INFO_V1(is_catalog_text_unique_index_oid);
 Datum
 is_catalog_text_unique_index_oid(PG_FUNCTION_ARGS)
 {
-	return IsCatalogTextUniqueIndexOid(PG_GETARG_OID(0));
+	return BoolGetDatum(IsCatalogTextUniqueIndexOid(PG_GETARG_OID(0)));
 }
 
 PG_FUNCTION_INFO_V1(test_support_func);
@@ -804,6 +823,125 @@ test_support_func(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(ret);
 }
 
+PG_FUNCTION_INFO_V1(test_inline_in_from_support_func);
+Datum
+test_inline_in_from_support_func(PG_FUNCTION_ARGS)
+{
+	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
+
+	if (IsA(rawreq, SupportRequestInlineInFrom))
+	{
+		/*
+		 * Assume that the target is foo_from_bar; that's safe as long as we
+		 * don't attach this to any other function.
+		 */
+		SupportRequestInlineInFrom *req = (SupportRequestInlineInFrom *) rawreq;
+		StringInfoData sql;
+		RangeTblFunction *rtfunc = req->rtfunc;
+		FuncExpr   *expr = (FuncExpr *) rtfunc->funcexpr;
+		Node	   *node;
+		Const	   *c;
+		char	   *colname;
+		char	   *tablename;
+		SQLFunctionParseInfoPtr pinfo;
+		List	   *raw_parsetree_list;
+		List	   *querytree_list;
+		Query	   *querytree;
+
+		if (list_length(expr->args) != 3)
+		{
+			ereport(WARNING, (errmsg("test_inline_in_from_support_func called with %d args but expected 3", list_length(expr->args))));
+			PG_RETURN_POINTER(NULL);
+		}
+
+		/* Get colname */
+		node = linitial(expr->args);
+		if (!IsA(node, Const))
+		{
+			ereport(WARNING, (errmsg("test_inline_in_from_support_func called with non-Const parameters")));
+			PG_RETURN_POINTER(NULL);
+		}
+
+		c = (Const *) node;
+		if (c->consttype != TEXTOID || c->constisnull)
+		{
+			ereport(WARNING, (errmsg("test_inline_in_from_support_func called with non-TEXT parameters")));
+			PG_RETURN_POINTER(NULL);
+		}
+		colname = TextDatumGetCString(c->constvalue);
+
+		/* Get tablename */
+		node = lsecond(expr->args);
+		if (!IsA(node, Const))
+		{
+			ereport(WARNING, (errmsg("test_inline_in_from_support_func called with non-Const parameters")));
+			PG_RETURN_POINTER(NULL);
+		}
+
+		c = (Const *) node;
+		if (c->consttype != TEXTOID || c->constisnull)
+		{
+			ereport(WARNING, (errmsg("test_inline_in_from_support_func called with non-TEXT parameters")));
+			PG_RETURN_POINTER(NULL);
+		}
+		tablename = TextDatumGetCString(c->constvalue);
+
+		/* Begin constructing replacement SELECT query. */
+		initStringInfo(&sql);
+		appendStringInfo(&sql, "SELECT %s::text FROM %s",
+						 quote_identifier(colname),
+						 quote_identifier(tablename));
+
+		/* Add filter expression if present. */
+		node = lthird(expr->args);
+		if (!(IsA(node, Const) && ((Const *) node)->constisnull))
+		{
+			/*
+			 * We only filter if $3 is not constant-NULL.  This is not a very
+			 * exact implementation of the PL/pgSQL original, but it's close
+			 * enough for demonstration purposes.
+			 */
+			appendStringInfo(&sql, " WHERE %s::text = $3",
+							 quote_identifier(colname));
+		}
+
+		/* Build a SQLFunctionParseInfo with the parameters of my function. */
+		pinfo = prepare_sql_fn_parse_info(req->proc,
+										  (Node *) expr,
+										  expr->inputcollid);
+
+		/* Parse the generated SQL. */
+		raw_parsetree_list = pg_parse_query(sql.data);
+		if (list_length(raw_parsetree_list) != 1)
+		{
+			ereport(WARNING, (errmsg("test_inline_in_from_support_func parsed to more than one node")));
+			PG_RETURN_POINTER(NULL);
+		}
+
+		/* Analyze the parse tree as if it were a SQL-language body. */
+		querytree_list = pg_analyze_and_rewrite_withcb(linitial(raw_parsetree_list),
+													   sql.data,
+													   (ParserSetupHook) sql_fn_parser_setup,
+													   pinfo, NULL);
+		if (list_length(querytree_list) != 1)
+		{
+			ereport(WARNING, (errmsg("test_inline_in_from_support_func rewrote to more than one node")));
+			PG_RETURN_POINTER(NULL);
+		}
+
+		querytree = linitial(querytree_list);
+		if (!IsA(querytree, Query))
+		{
+			ereport(WARNING, (errmsg("test_inline_in_from_support_func didn't parse to a Query")));
+			PG_RETURN_POINTER(NULL);
+		}
+
+		PG_RETURN_POINTER(querytree);
+	}
+
+	PG_RETURN_POINTER(NULL);
+}
+
 PG_FUNCTION_INFO_V1(test_opclass_options_func);
 Datum
 test_opclass_options_func(PG_FUNCTION_ARGS)
@@ -825,6 +963,8 @@ test_enc_setup(PG_FUNCTION_ARGS)
 					mblen,
 					valid;
 
+		if (!PG_VALID_ENCODING(i))
+			continue;
 		if (pg_encoding_max_length(i) == 1)
 			continue;
 		pg_encoding_set_invalid(i, buf);
@@ -1170,6 +1310,132 @@ test_relpath(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Simple test to verify NLS support, particularly that the PRI* macros work.
+ *
+ * A secondary objective is to verify that <inttypes.h>'s values for the
+ * PRI* macros match what our snprintf.c code will do.  Therefore, we run
+ * the ereport() calls even when we know that translation will not happen.
+ */
+PG_FUNCTION_INFO_V1(test_translation);
+Datum
+test_translation(PG_FUNCTION_ARGS)
+{
+#ifdef ENABLE_NLS
+	static bool inited = false;
+
+	/*
+	 * Ideally we'd do this bit in a _PG_init() hook.  However, it seems best
+	 * that the Solaris hack only get applied in the nls.sql test, so it
+	 * doesn't risk affecting other tests that load this module.
+	 */
+	if (!inited)
+	{
+		/*
+		 * Solaris' built-in gettext is not bright about associating locales
+		 * with message catalogs that are named after just the language.
+		 * Apparently the customary workaround is for users to set the
+		 * LANGUAGE environment variable to provide a mapping.  Do so here to
+		 * ensure that the nls.sql regression test will work.
+		 *
+		 * With glibc and perhaps other implementations, LANGUAGE overrides
+		 * LC_MESSAGES, which we don't want either; so let's unset it if we're
+		 * not on Solaris.
+		 */
+#if defined(__sun__)
+		setenv("LANGUAGE", "es_ES.UTF-8:es", 1);
+#else
+		unsetenv("LANGUAGE");
+#endif
+		pg_bindtextdomain(TEXTDOMAIN);
+		inited = true;
+	}
+
+	/*
+	 * If nls.sql failed to select a non-C locale, no translation will happen.
+	 * Report that so that we can distinguish this outcome from brokenness.
+	 * (We do this here, not in nls.sql, so as to need only 3 expected files.)
+	 */
+	if (strcmp(GetConfigOption("lc_messages", false, false), "C") == 0)
+		elog(NOTICE, "lc_messages is 'C'");
+#else
+	elog(NOTICE, "NLS is not enabled");
+#endif
+
+	ereport(NOTICE,
+			errmsg("translated PRId64 = %" PRId64, (int64) 424242424242));
+	ereport(NOTICE,
+			errmsg("translated PRId32 = %" PRId32, (int32) -1234));
+	ereport(NOTICE,
+			errmsg("translated PRIdMAX = %" PRIdMAX, (intmax_t) -123456789012));
+	ereport(NOTICE,
+			errmsg("translated PRIdPTR = %" PRIdPTR, (intptr_t) -9999));
+
+	ereport(NOTICE,
+			errmsg("translated PRIu64 = %" PRIu64, (uint64) 424242424242));
+	ereport(NOTICE,
+			errmsg("translated PRIu32 = %" PRIu32, (uint32) -1234));
+	ereport(NOTICE,
+			errmsg("translated PRIuMAX = %" PRIuMAX, (uintmax_t) 123456789012));
+	ereport(NOTICE,
+			errmsg("translated PRIuPTR = %" PRIuPTR, (uintptr_t) 9999));
+
+	ereport(NOTICE,
+			errmsg("translated PRIx64 = %" PRIx64, (uint64) 424242424242));
+	ereport(NOTICE,
+			errmsg("translated PRIx32 = %" PRIx32, (uint32) -1234));
+	ereport(NOTICE,
+			errmsg("translated PRIxMAX = %" PRIxMAX, (uintmax_t) 123456789012));
+	ereport(NOTICE,
+			errmsg("translated PRIxPTR = %" PRIxPTR, (uintptr_t) 9999));
+
+	ereport(NOTICE,
+			errmsg("translated PRIX64 = %" PRIX64, (uint64) 424242424242));
+	ereport(NOTICE,
+			errmsg("translated PRIX32 = %" PRIX32, (uint32) -1234));
+	ereport(NOTICE,
+			errmsg("translated PRIXMAX = %" PRIXMAX, (uintmax_t) 123456789012));
+	ereport(NOTICE,
+			errmsg("translated PRIXPTR = %" PRIXPTR, (uintptr_t) 9999));
+
+	PG_RETURN_VOID();
+}
+
+/* Verify that pg_ticks_to_ns behaves correct, including overflow */
+PG_FUNCTION_INFO_V1(test_instr_time);
+Datum
+test_instr_time(PG_FUNCTION_ARGS)
+{
+	instr_time	t;
+	int64		test_ns[] = {0, 1000, INT64CONST(1000000000000000)};
+	int64		max_err;
+
+	/*
+	 * The ns-to-ticks-to-ns roundtrip may lose precision due to integer
+	 * truncation in the fixed-point conversion. The maximum error depends on
+	 * ticks_per_ns_scaled relative to the shift factor.
+	 */
+	max_err = (ticks_per_ns_scaled >> TICKS_TO_NS_SHIFT) + 1;
+
+	for (int i = 0; i < lengthof(test_ns); i++)
+	{
+		int64		result;
+
+		INSTR_TIME_SET_ZERO(t);
+		INSTR_TIME_ADD_NANOSEC(t, test_ns[i]);
+		result = INSTR_TIME_GET_NANOSEC(t);
+
+		if (result < test_ns[i] - max_err || result > test_ns[i])
+			elog(ERROR,
+				 "INSTR_TIME_GET_NANOSEC(t) yielded " INT64_FORMAT
+				 ", expected " INT64_FORMAT " (max_err " INT64_FORMAT
+				 ") in file \"%s\" line %u",
+				 result, test_ns[i], max_err, __FILE__, __LINE__);
+	}
+
+	PG_RETURN_BOOL(true);
+}
+
+/*
  * test_pglz_compress
  *
  * Compress the input using pglz_compress().  Only the "always" strategy is
@@ -1232,4 +1498,137 @@ test_pglz_decompress(PG_FUNCTION_ARGS)
 
 	SET_VARSIZE(result, dlen + VARHDRSZ);
 	PG_RETURN_BYTEA_P(result);
+}
+
+static void
+test_case_mapping(pg_locale_t locale)
+{
+	char		buf[32];
+	size_t		n;
+
+	n = pg_strlower(NULL, 0, "AbC", 3, locale);
+	if (n != 3)
+		elog(ERROR, "pg_strlower() size probe returned %zu, expected 3", n);
+	n = pg_strlower(buf, 4, "AbC", 3, locale);
+	if (n != 3 || strcmp(buf, "abc") != 0)
+		elog(ERROR, "pg_strlower() produced \"%s\"", buf);
+
+	n = pg_strupper(NULL, 0, "AbC", 3, locale);
+	if (n != 3)
+		elog(ERROR, "pg_strupper() size probe returned %zu, expected 3", n);
+	n = pg_strupper(buf, 4, "AbC", 3, locale);
+	if (n != 3 || strcmp(buf, "ABC") != 0)
+		elog(ERROR, "pg_strupper() produced \"%s\"", buf);
+
+	n = pg_strfold(buf, 4, "AbC", 3, locale);
+	if (n != 3 || strcmp(buf, "abc") != 0)
+		elog(ERROR, "pg_strfold() produced \"%s\"", buf);
+
+	buf[0] = '\0';
+	n = pg_strtitle(buf, sizeof(buf), "hello-world", 11, locale);
+	if (n != 11)
+		elog(ERROR, "pg_strtitle() returned %zu, expected 11", n);
+	if (locale->ctype_is_c && strcmp(buf, "Hello-World") != 0)
+		elog(ERROR, "pg_strtitle() produced \"%s\"", buf);
+}
+
+static void
+test_collate(pg_locale_t locale)
+{
+	char		buf[32];
+	char		pfx[8];
+	char		x1[8];
+	char		x2[8];
+	size_t		n;
+
+	if (pg_strcoll("abc", "abc", locale) != 0 ||
+		pg_strncoll("abc", 3, "abc", 3, locale) != 0 ||
+		pg_strcoll("", "", locale) != 0)
+		elog(ERROR, "equal strings did not compare equal");
+
+	if (locale->collate_is_c)
+	{
+		if (locale->collate != NULL)
+			elog(ERROR, "collate_is_c but collate methods are set");
+		if (pg_strcoll("abc", "abd", locale) >= 0 ||
+			pg_strcoll("abd", "abc", locale) <= 0 ||
+			pg_strncoll("ab", 2, "abc", 3, locale) >= 0 ||
+			pg_strncoll("abc", 3, "ab", 2, locale) <= 0 ||
+			pg_strncoll("xyz", 3, "abc", 2, locale) <= 0)
+			elog(ERROR, "C-locale comparison result is wrong");
+
+		if (!pg_strxfrm_enabled(locale))
+			elog(ERROR, "pg_strxfrm_enabled() is false for C locale");
+		n = pg_strnxfrm(NULL, 0, "abc", 3, locale);
+		if (n != 3)
+			elog(ERROR, "pg_strnxfrm() size probe returned %zu, expected 3", n);
+		n = pg_strnxfrm(buf, 4, "abc", 3, locale);
+		if (n != 3 || strcmp(buf, "abc") != 0)
+			elog(ERROR, "pg_strnxfrm() produced \"%s\"", buf);
+		n = pg_strxfrm(buf, "abc", 4, locale);
+		if (n != 3 || strcmp(buf, "abc") != 0)
+			elog(ERROR, "pg_strxfrm() produced \"%s\"", buf);
+		n = pg_strnxfrm(buf, 3, "abc", 3, locale);
+		if (n != 3)
+			elog(ERROR, "pg_strnxfrm() destsize==srclen returned %zu", n);
+		n = pg_strnxfrm(buf, 2, "abc", 3, locale);
+		if (n != 3)
+			elog(ERROR, "pg_strnxfrm() short dest returned %zu", n);
+
+		if (!pg_strxfrm_prefix_enabled(locale))
+			elog(ERROR, "pg_strxfrm_prefix_enabled() is false for C locale");
+		n = pg_strnxfrm_prefix(NULL, 0, "abcdef", 6, locale);
+		if (n != 0)
+			elog(ERROR, "pg_strnxfrm_prefix() destsize 0 returned %zu", n);
+		n = pg_strnxfrm_prefix(pfx, 2, "abcdef", 6, locale);
+		if (n != 2 || memcmp(pfx, "ab", 2) != 0)
+			elog(ERROR, "pg_strnxfrm_prefix() produced a wrong prefix");
+		n = pg_strnxfrm_prefix(pfx, sizeof(pfx), "abc", 3, locale);
+		if (n != 3 || memcmp(pfx, "abc", 3) != 0)
+			elog(ERROR, "pg_strnxfrm_prefix() destsize>=srclen produced a wrong result");
+		n = pg_strxfrm_prefix(pfx, "abcdef", 2, locale);
+		if (n != 2 || memcmp(pfx, "ab", 2) != 0)
+			elog(ERROR, "pg_strxfrm_prefix() produced a wrong prefix");
+
+		if (pg_strxfrm(x1, "abc", sizeof(x1), locale) >= sizeof(x1) ||
+			pg_strxfrm(x2, "abd", sizeof(x2), locale) >= sizeof(x2) ||
+			(strcmp(x1, x2) < 0) != (pg_strcoll("abc", "abd", locale) < 0))
+			elog(ERROR, "pg_strxfrm() disagrees with pg_strcoll()");
+	}
+	else
+	{
+		char	   *tmp;
+
+		if (locale->collate == NULL)
+			elog(ERROR, "collate methods missing for non-C locale");
+
+		n = pg_strnxfrm(NULL, 0, "abc", 3, locale);
+		tmp = palloc(n + 1);
+		if (pg_strnxfrm(tmp, n + 1, "abc", 3, locale) > n)
+			elog(ERROR, "pg_strnxfrm() grew on the second call");
+		pfree(tmp);
+
+		if (pg_strxfrm_prefix_enabled(locale) &&
+			pg_strnxfrm_prefix(pfx, sizeof(pfx), "abc", 3, locale) > sizeof(pfx))
+			elog(ERROR, "pg_strnxfrm_prefix() exceeded destsize");
+	}
+}
+
+/*
+ * Test pg_locale.h APIs directly, to cover cases not easily reachable by SQL.
+ */
+PG_FUNCTION_INFO_V1(test_pg_locale_apis);
+Datum
+test_pg_locale_apis(PG_FUNCTION_ARGS)
+{
+	pg_locale_t locale;
+
+	locale = pg_newlocale_from_collation(PG_GETARG_OID(0));
+	if (locale == NULL)
+		elog(ERROR, "pg_newlocale_from_collation() returned NULL");
+
+	test_collate(locale);
+	test_case_mapping(locale);
+
+	PG_RETURN_VOID();
 }

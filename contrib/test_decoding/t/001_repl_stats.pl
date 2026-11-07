@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2025, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 # Test replication statistics data in pg_stat_replication_slots is sane after
 # drop replication slot and restart.
@@ -177,5 +177,43 @@ my $stats_file = "$datadir/pg_stat/pgstat.stat";
 ok(-f "$stats_file", "stats file must exist after shutdown");
 
 $bpgsql->quit;
+
+# Session holding a stale reference to a slot stats entry, reinitialized
+# then dropped again.  It must be freed on exit.
+$node->start;
+
+my $slot_name_stale = 'regression_slot6';
+$node->safe_psql('postgres',
+	"SELECT pg_create_logical_replication_slot('$slot_name_stale', 'test_decoding');"
+);
+
+$bpgsql = $node->background_psql('postgres', on_error_stop => 1);
+$bpgsql->query_safe(
+	"SELECT pg_logical_slot_peek_binary_changes('$slot_name_stale', NULL, NULL)"
+);
+
+# Entry dropped, still kept by the session with a reference.
+$node->safe_psql('postgres',
+	"SELECT pg_drop_replication_slot('$slot_name_stale')");
+
+# Entry reinitialized for the new slot, then dropped again.  The session
+# still holds its reference.
+$node->safe_psql(
+	'postgres', qq[
+	SELECT pg_create_logical_replication_slot('regression_slot7', 'test_decoding');
+	SELECT pg_drop_replication_slot('regression_slot7');
+]);
+
+# This session is the last referrer, and frees the entry on exit.
+$bpgsql->quit;
+
+$node->stop;
+
+command_like(
+	[ 'pg_controldata', $node->data_dir ],
+	qr/Database cluster state:\s+shut down\n/,
+	'node shut down ok with stale stats reference');
+ok(-f "$stats_file",
+	"stats file must exist after shutdown with stale stats reference");
 
 done_testing();

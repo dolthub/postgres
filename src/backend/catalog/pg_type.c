@@ -3,7 +3,7 @@
  * pg_type.c
  *	  routines to support manipulation of the pg_type relation
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -66,7 +66,7 @@ TypeShellMake(const char *typeName, Oid typeNamespace, Oid ownerId)
 	NameData	name;
 	ObjectAddress address;
 
-	Assert(PointerIsValid(typeName));
+	Assert(typeName);
 
 	/*
 	 * open pg_type
@@ -80,7 +80,7 @@ TypeShellMake(const char *typeName, Oid typeNamespace, Oid ownerId)
 	for (i = 0; i < Natts_pg_type; ++i)
 	{
 		nulls[i] = false;
-		values[i] = (Datum) NULL;	/* redundant, but safe */
+		values[i] = (Datum) 0;	/* redundant, but safe */
 	}
 
 	/*
@@ -288,8 +288,7 @@ TypeCreate(Oid newTypeOid,
 						 errmsg("alignment \"%c\" is invalid for passed-by-value type of size %d",
 								alignment, internalSize)));
 		}
-#if SIZEOF_DATUM == 8
-		else if (internalSize == (int16) sizeof(Datum))
+		else if (internalSize == (int16) sizeof(int64))
 		{
 			if (alignment != TYPALIGN_DOUBLE)
 				ereport(ERROR,
@@ -297,7 +296,6 @@ TypeCreate(Oid newTypeOid,
 						 errmsg("alignment \"%c\" is invalid for passed-by-value type of size %d",
 								alignment, internalSize)));
 		}
-#endif
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),

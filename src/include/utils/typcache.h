@@ -6,7 +6,7 @@
  * The type cache exists to speed lookup of certain information about data
  * types that is not directly available from a type's pg_type row.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/typcache.h
@@ -34,8 +34,6 @@ typedef struct TypeCacheEntry
 	Oid			type_id;		/* OID of the data type */
 
 	uint32		type_id_hash;	/* hashed value of the OID */
-	struct CatalogView *catalogview;	/* pinned for native typcache entry
-										 * lifetime */
 
 	/* some subsidiary information copied from the pg_type row */
 	int16		typlen;
@@ -185,7 +183,7 @@ extern void InitDomainConstraintRef(Oid type_id, DomainConstraintRef *ref,
 
 extern void UpdateDomainConstraintRef(DomainConstraintRef *ref);
 
-extern bool DomainHasConstraints(Oid type_id);
+extern bool DomainHasConstraints(Oid type_id, bool *has_volatile);
 
 extern TupleDesc lookup_rowtype_tupdesc(Oid type_id, int32 typmod);
 
@@ -211,9 +209,6 @@ extern void SharedRecordTypmodRegistryInit(SharedRecordTypmodRegistry *,
 extern void SharedRecordTypmodRegistryAttach(SharedRecordTypmodRegistry *);
 
 extern void AtEOXact_TypeCache(void);
-
-struct CatalogView;
-extern void TypeCacheForgetCatalogView(struct CatalogView *view);
 
 extern void AtEOSubXact_TypeCache(void);
 

@@ -1299,9 +1299,9 @@ SELECT $1 \parse stmt1
         <replaceable class="parameter">pattern</replaceable>, show all
         columns, their types, the tablespace (if not the default) and any
         special attributes such as <literal>NOT NULL</literal> or defaults.
-        Associated indexes, constraints, rules, and triggers are
-        also shown.  For foreign tables, the associated foreign
-        server is shown as well.
+        Associated objects, such as indexes, constraints, rules, triggers,
+        and publications, are also shown. For foreign tables,
+        the associated foreign server is shown as well.
         (<quote>Matching the pattern</quote> is defined in
         <xref linkend="app-psql-patterns"/> below.)
         </para>
@@ -1314,8 +1314,8 @@ SELECT $1 \parse stmt1
 
         <para>
         The command form <literal>\d+</literal> is identical, except that
-        more information is displayed: any comments associated with the
-        columns of the table are shown, as is the presence of OIDs in the
+        more information is displayed: for example, any comments associated
+        with the columns of the table, the presence of OIDs in the
         table, the view definition if the relation is a view, a non-default
         <link linkend="sql-altertable-replica-identity">replica
          identity</link> setting and the
@@ -1340,10 +1340,13 @@ SELECT $1 \parse stmt1
         </para>
         <para>
         As with many other commands, if <literal>x</literal> is appended to
-        the command name, the results are displayed in expanded mode, but note
-        that this only applies when <command>\d</command> is used without a
-        <replaceable class="parameter">pattern</replaceable> argument, and
-        the <literal>x</literal> modifier cannot appear immediately after the
+        the command name, the results are displayed in expanded mode for this
+        command only, but note that this only applies when <command>\d</command>
+        is used without a <replaceable class="parameter">pattern</replaceable>
+        argument or to describe a sequence.
+        The same limitation on expanded output applies to
+        <command>\x on</command> and <command>\x auto</command>.
+        The <literal>x</literal> modifier cannot appear immediately after the
         <command>\d</command> (because <command>\dx</command> is a different
         command); the <literal>x</literal> modifier may only appear after an
         <literal>S</literal> or <literal>+</literal> modifier. For example,
@@ -2103,8 +2106,9 @@ SELECT $1 \parse stmt1
         listed.
         If <literal>x</literal> is appended to the command name, the results
         are displayed in expanded mode.
-        If <literal>+</literal> is appended to the command name, the tables and
-        schemas associated with each publication are shown as well.
+        If <literal>+</literal> is appended to the command name, the tables,
+        excluded tables, and schemas associated with each publication are shown
+        as well.
         </para>
         </listitem>
       </varlistentry>
@@ -2182,7 +2186,7 @@ SELECT $1 \parse stmt1
       </varlistentry>
 
       <varlistentry id="app-psql-meta-command-dx-uc">
-        <term><literal>\dX[x] [ <link linkend="app-psql-patterns"><replaceable class="parameter">pattern</replaceable></link> ]</literal></term>
+        <term><literal>\dX[x+] [ <link linkend="app-psql-patterns"><replaceable class="parameter">pattern</replaceable></link> ]</literal></term>
         <listitem>
         <para>
         Lists extended statistics.
@@ -2191,6 +2195,8 @@ SELECT $1 \parse stmt1
         pattern are listed.
         If <literal>x</literal> is appended to the command name, the results
         are displayed in expanded mode.
+        If <literal>+</literal> is appended to the command name, each object
+        is listed with its associated description.
         </para>
 
         <para>
@@ -2531,7 +2537,7 @@ Tue Oct 26 21:40:57 CEST 1999
          statement to be executed.  For example, to create an index on each
          column of <structname>my_table</structname>:
 <programlisting>
-=&gt; <userinput>SELECT format('create index on my_table(%I)', attname)</userinput>
+=&gt; <userinput>SELECT format('CREATE INDEX ON my_table (%I)', attname)</userinput>
 -&gt; <userinput>FROM pg_attribute</userinput>
 -&gt; <userinput>WHERE attrelid = 'my_table'::regclass AND attnum &gt; 0</userinput>
 -&gt; <userinput>ORDER BY attnum</userinput>
@@ -2766,8 +2772,8 @@ hello 10
 -- check for the existence of two separate records in the database and store
 -- the results in separate psql variables
 SELECT
-    EXISTS(SELECT 1 FROM customer WHERE customer_id = 123) as is_customer,
-    EXISTS(SELECT 1 FROM employee WHERE employee_id = 456) as is_employee
+    EXISTS (SELECT 1 FROM customer WHERE customer_id = 123) AS is_customer,
+    EXISTS (SELECT 1 FROM employee WHERE employee_id = 456) AS is_employee
 \gset
 \if :is_customer
     SELECT * FROM customer WHERE customer_id = 123;
@@ -3096,6 +3102,26 @@ SELECT $1 \parse stmt1
           appears in a field's value, that field is output within double
           quotes, following standard <acronym>CSV</acronym> rules.
           The default is a comma.
+          </para>
+          </listitem>
+          </varlistentry>
+
+          <varlistentry id="app-psql-meta-command-pset-display-false">
+          <term><literal>display_false</literal></term>
+          <listitem>
+          <para>
+          Sets the string to be printed in place of a false value.
+          The default is to print <literal>f</literal>.
+          </para>
+          </listitem>
+          </varlistentry>
+
+          <varlistentry id="app-psql-meta-command-pset-display-true">
+          <term><literal>display_true</literal></term>
+          <listitem>
+          <para>
+          Sets the string to be printed in place of a true value.
+          The default is to print <literal>t</literal>.
           </para>
           </listitem>
           </varlistentry>
@@ -4009,7 +4035,7 @@ SELECT 1 \bind \sendpipeline
         server as soon as it reaches the command-ending semicolon, even if
         more input remains on the current line.  Thus for example entering
 <programlisting>
-select 1; select 2; select 3;
+SELECT 1; SELECT 2; SELECT 3;
 </programlisting>
         will result in the three SQL commands being individually sent to
         the server, with each one's results being displayed before
@@ -4018,7 +4044,7 @@ select 1; select 2; select 3;
         command before it and the one after are effectively combined and
         sent to the server in one request.  So for example
 <programlisting>
-select 1\; select 2\; select 3;
+SELECT 1\; SELECT 2\; SELECT 3;
 </programlisting>
         results in sending the three SQL commands to the server in a single
         request, when the non-backslashed semicolon is reached.
@@ -4113,7 +4139,7 @@ select 1\; select 2\; select 3;
    Advanced users can use regular-expression notations such as character
    classes, for example <literal>[0-9]</literal> to match any digit.  All regular
    expression special characters work as specified in
-   <xref linkend="functions-posix-regexp"/>, except for <literal>.</literal> which
+   <xref linkend="posix-syntax-details"/>, except for <literal>.</literal> which
    is taken as a separator as mentioned above, <literal>*</literal> which is
    translated to the regular-expression notation <literal>.*</literal>,
    <literal>?</literal> which is translated to <literal>.</literal>, and
@@ -4836,7 +4862,7 @@ bar
 testdb=&gt; <userinput>\set foo 'my_table'</userinput>
 testdb=&gt; <userinput>SELECT * FROM :foo;</userinput>
 </programlisting>
-    would query the table <literal>my_table</literal>. Note that this
+    would query the table <structname>my_table</structname>. Note that this
     may be unsafe: the value of the variable is copied literally, so it can
     contain unbalanced quotes, or even backslash commands. You must make sure
     that it makes sense where you put it.
@@ -4971,6 +4997,17 @@ testdb=&gt; <userinput>INSERT INTO my_table VALUES (:'content');</userinput>
         </listitem>
       </varlistentry>
 
+      <varlistentry id="app-psql-prompting-S">
+       <term><literal>%S</literal></term>
+       <listitem>
+        <para>
+         The current value of <xref linkend="guc-search-path"/>, or
+         <literal>?</literal> if connected to a server running
+         <productname>PostgreSQL</productname> 17 or older.
+        </para>
+       </listitem>
+      </varlistentry>
+
       <varlistentry id="app-psql-prompting-s">
         <term><literal>%s</literal></term>
         <listitem><para>The name of the service.</para></listitem>
@@ -5037,6 +5074,23 @@ testdb=&gt; <userinput>INSERT INTO my_table VALUES (:'content');</userinput>
         a dollar sign if there is an unfinished dollar-quoted string,
         or <literal>(</literal> if there is an unmatched left parenthesis.
         In prompt 3 <literal>%R</literal> doesn't produce anything.
+        </para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry id="app-psql-prompting-i">
+        <term><literal>%i</literal></term>
+        <listitem>
+        <para>
+        Indicates whether the connected server is running in hot standby mode.
+        The value is shown as <literal>standby</literal>, if the server is
+        currently in hot standby and reports
+        <xref linkend="guc-in-hot-standby"/> as <literal>on</literal>,
+        and <literal>primary</literal> otherwise. This is useful when
+        connecting to multiple servers to quickly determine the role of
+        each connection. A value of <literal>?</literal> is shown
+        when connected to a server running
+        <productname>PostgreSQL</productname> 13 or older.
         </para>
         </listitem>
       </varlistentry>
@@ -5547,7 +5601,7 @@ PSQL_EDITOR_LINENUMBER_ARG='--line '
   input. Notice the changing prompt:
 <programlisting>
 testdb=&gt; <userinput>CREATE TABLE my_table (</userinput>
-testdb(&gt; <userinput> first integer not null default 0,</userinput>
+testdb(&gt; <userinput> first integer NOT NULL DEFAULT 0,</userinput>
 testdb(&gt; <userinput> second text)</userinput>
 testdb-&gt; <userinput>;</userinput>
 CREATE TABLE
@@ -5736,8 +5790,8 @@ testdb=&gt; <userinput>\crosstabview first second</userinput>
 This second example shows a multiplication table with rows sorted in reverse
 numerical order and columns with an independent, ascending numerical order.
 <programlisting>
-testdb=&gt; <userinput>SELECT t1.first as "A", t2.first+100 AS "B", t1.first*(t2.first+100) as "AxB",</userinput>
-testdb-&gt; <userinput>row_number() over(order by t2.first) AS ord</userinput>
+testdb=&gt; <userinput>SELECT t1.first AS "A", t2.first+100 AS "B", t1.first*(t2.first+100) AS "AxB",</userinput>
+testdb-&gt; <userinput>row_number() OVER (ORDER BY t2.first) AS ord</userinput>
 testdb-&gt; <userinput>FROM my_table t1 CROSS JOIN my_table t2 ORDER BY 1 DESC</userinput>
 testdb-&gt; <userinput>\crosstabview "A" "B" "AxB" ord</userinput>
  A | 101 | 102 | 103 | 104

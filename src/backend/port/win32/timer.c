@@ -8,7 +8,7 @@
  *	  - Does not support interval timer (value->it_interval)
  *	  - Only supports ITIMER_REAL
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/port/win32/timer.c
@@ -103,7 +103,7 @@ setitimer(int which, const struct itimerval *value, struct itimerval *ovalue)
 		InitializeCriticalSection(&timerCommArea.crit_sec);
 
 		timerThreadHandle = CreateThread(NULL, 0, pg_timer_thread, NULL, 0, NULL);
-		if (timerThreadHandle == INVALID_HANDLE_VALUE)
+		if (timerThreadHandle == NULL)
 			ereport(FATAL,
 					(errmsg_internal("could not create timer thread: error code %lu",
 									 GetLastError())));

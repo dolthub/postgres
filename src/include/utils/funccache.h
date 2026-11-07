@@ -5,7 +5,7 @@
  *
  * See funccache.c for comments.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/funccache.h
@@ -80,7 +80,6 @@ typedef struct CachedFunctionHashKey
 	 * collations) for different collation settings.
 	 */
 	Oid			inputCollation;
-	uint64		catalogContext; /* revision scope of compiled catalog queries */
 
 	/* Number of arguments (counting input arguments only, ie pronargs) */
 	int			nargs;

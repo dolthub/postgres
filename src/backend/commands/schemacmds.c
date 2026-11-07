@@ -3,7 +3,7 @@
  * schemacmds.c
  *	  schema creation/manipulation commands
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,7 +14,6 @@
  */
 #include "postgres.h"
 
-#include "access/doltcatalog.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
@@ -26,7 +25,6 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
-#include "commands/dbcommands.h"
 #include "commands/event_trigger.h"
 #include "commands/schemacmds.h"
 #include "miscadmin.h"
@@ -35,6 +33,7 @@
 #include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
@@ -50,7 +49,7 @@ static void AlterSchemaOwner_internal(HeapTuple tup, Relation rel, Oid newOwnerI
  * a subquery.
  */
 Oid
-CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString,
+CreateSchemaCommand(ParseState *pstate, CreateSchemaStmt *stmt,
 					int stmt_location, int stmt_len)
 {
 	const char *schemaName = stmt->schemaname;
@@ -150,10 +149,8 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString,
 		SetUserIdAndSecContext(owner_uid,
 							   save_sec_context | SECURITY_LOCAL_USERID_CHANGE);
 
-	/* Create the schema's namespace, unless another branch already made it. */
-	namespaceId = dg_catalog_existing_schema(schemaName);
-	if (!OidIsValid(namespaceId))
-		namespaceId = NamespaceCreate(schemaName, owner_uid, false);
+	/* Create the schema's namespace */
+	namespaceId = NamespaceCreate(schemaName, owner_uid, false);
 
 	/* Advance cmd counter to make the namespace visible */
 	CommandCounterIncrement();
@@ -197,7 +194,8 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString,
 	 * we cannot, in general, run parse analysis on one statement until we
 	 * have actually executed the prior ones.
 	 */
-	parsetree_list = transformCreateSchemaStmtElements(stmt->schemaElts,
+	parsetree_list = transformCreateSchemaStmtElements(pstate,
+													   stmt->schemaElts,
 													   schemaName);
 
 	/*
@@ -218,10 +216,11 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString,
 		wrapper->utilityStmt = stmt;
 		wrapper->stmt_location = stmt_location;
 		wrapper->stmt_len = stmt_len;
+		wrapper->planOrigin = PLAN_STMT_INTERNAL;
 
 		/* do this step */
 		ProcessUtility(wrapper,
-					   queryString,
+					   pstate->p_sourcetext,
 					   false,
 					   PROCESS_UTILITY_SUBCOMMAND,
 					   NULL,

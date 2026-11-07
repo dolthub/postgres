@@ -14,7 +14,7 @@ PG_MODULE_MAGIC_EXT(
 );
 
 static SV  *Jsonb_to_SV(JsonbContainer *jsonb);
-static JsonbValue *SV_to_JsonbValue(SV *obj, JsonbParseState **ps, bool is_elem);
+static void SV_to_JsonbValue(SV *in, JsonbInState *jsonb_state, bool is_elem);
 
 
 static SV  *
@@ -131,28 +131,27 @@ Jsonb_to_SV(JsonbContainer *jsonb)
 	}
 }
 
-static JsonbValue *
-AV_to_JsonbValue(AV *in, JsonbParseState **jsonb_state)
+static void
+AV_to_JsonbValue(AV *in, JsonbInState *jsonb_state)
 {
 	dTHX;
-	SSize_t		pcount = av_len(in) + 1;
-	SSize_t		i;
+	Size_t		pcount = av_count(in);
 
 	pushJsonbValue(jsonb_state, WJB_BEGIN_ARRAY, NULL);
 
-	for (i = 0; i < pcount; i++)
+	for (Size_t i = 0; i < pcount; i++)
 	{
 		SV		  **value = av_fetch(in, i, FALSE);
 
 		if (value)
-			(void) SV_to_JsonbValue(*value, jsonb_state, true);
+			SV_to_JsonbValue(*value, jsonb_state, true);
 	}
 
-	return pushJsonbValue(jsonb_state, WJB_END_ARRAY, NULL);
+	pushJsonbValue(jsonb_state, WJB_END_ARRAY, NULL);
 }
 
-static JsonbValue *
-HV_to_JsonbValue(HV *obj, JsonbParseState **jsonb_state)
+static void
+HV_to_JsonbValue(HV *obj, JsonbInState *jsonb_state)
 {
 	dTHX;
 	JsonbValue	key;
@@ -171,14 +170,14 @@ HV_to_JsonbValue(HV *obj, JsonbParseState **jsonb_state)
 		key.val.string.val = pnstrdup(kstr, klen);
 		key.val.string.len = klen;
 		pushJsonbValue(jsonb_state, WJB_KEY, &key);
-		(void) SV_to_JsonbValue(val, jsonb_state, false);
+		SV_to_JsonbValue(val, jsonb_state, false);
 	}
 
-	return pushJsonbValue(jsonb_state, WJB_END_OBJECT, NULL);
+	pushJsonbValue(jsonb_state, WJB_END_OBJECT, NULL);
 }
 
-static JsonbValue *
-SV_to_JsonbValue(SV *in, JsonbParseState **jsonb_state, bool is_elem)
+static void
+SV_to_JsonbValue(SV *in, JsonbInState *jsonb_state, bool is_elem)
 {
 	dTHX;
 	JsonbValue	out;			/* result */
@@ -187,7 +186,7 @@ SV_to_JsonbValue(SV *in, JsonbParseState **jsonb_state, bool is_elem)
 	check_stack_depth();
 
 	/* Dereference references recursively. */
-	while (SvROK(in))
+	while (in && SvROK(in))
 	{
 		/*
 		 * It's possible for circular references to make this an infinite
@@ -198,90 +197,109 @@ SV_to_JsonbValue(SV *in, JsonbParseState **jsonb_state, bool is_elem)
 		in = SvRV(in);
 	}
 
-	switch (SvTYPE(in))
+	if (!in)
 	{
-		case SVt_PVAV:
-			return AV_to_JsonbValue((AV *) in, jsonb_state);
+		out.type = jbvNull;
+	}
+	else
+	{
+		switch (SvTYPE(in))
+		{
+			case SVt_PVAV:
+				AV_to_JsonbValue((AV *) in, jsonb_state);
+				return;
 
-		case SVt_PVHV:
-			return HV_to_JsonbValue((HV *) in, jsonb_state);
+			case SVt_PVHV:
+				HV_to_JsonbValue((HV *) in, jsonb_state);
+				return;
 
-		default:
-			if (!SvOK(in))
-			{
-				out.type = jbvNull;
-			}
-			else if (SvUOK(in))
-			{
-				/*
-				 * If UV is >=64 bits, we have no better way to make this
-				 * happen than converting to text and back.  Given the low
-				 * usage of UV in Perl code, it's not clear it's worth working
-				 * hard to provide alternate code paths.
-				 */
-				const char *strval = SvPV_nolen(in);
+			default:
+				if (!SvOK(in))
+				{
+					out.type = jbvNull;
+				}
+				else if (SvUOK(in))
+				{
+					/*
+					 * If UV is >=64 bits, we have no better way to make this
+					 * happen than converting to text and back.  Given the low
+					 * usage of UV in Perl code, it's not clear it's worth
+					 * working hard to provide alternate code paths.
+					 */
+					const char *strval = SvPV_nolen(in);
 
-				out.type = jbvNumeric;
-				out.val.numeric =
-					DatumGetNumeric(DirectFunctionCall3(numeric_in,
-														CStringGetDatum(strval),
-														ObjectIdGetDatum(InvalidOid),
-														Int32GetDatum(-1)));
-			}
-			else if (SvIOK(in))
-			{
-				IV			ival = SvIV(in);
+					out.type = jbvNumeric;
+					out.val.numeric =
+						DatumGetNumeric(DirectFunctionCall3(numeric_in,
+															CStringGetDatum(strval),
+															ObjectIdGetDatum(InvalidOid),
+															Int32GetDatum(-1)));
+				}
+				else if (SvIOK(in))
+				{
+					IV			ival = SvIV(in);
 
-				out.type = jbvNumeric;
-				out.val.numeric = int64_to_numeric(ival);
-			}
-			else if (SvNOK(in))
-			{
-				double		nval = SvNV(in);
+					out.type = jbvNumeric;
+					out.val.numeric = int64_to_numeric(ival);
+				}
+				else if (SvNOK(in))
+				{
+					double		nval = SvNV(in);
 
-				/*
-				 * jsonb doesn't allow infinity or NaN (per JSON
-				 * specification), but the numeric type that is used for the
-				 * storage accepts those, so we have to reject them here
-				 * explicitly.
-				 */
-				if (isinf(nval))
+					/*
+					 * jsonb doesn't allow infinity or NaN (per JSON
+					 * specification), but the numeric type that is used for
+					 * the storage accepts those, so we have to reject them
+					 * here explicitly.
+					 */
+					if (isinf(nval))
+						ereport(ERROR,
+								(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+								 errmsg("cannot convert infinity to jsonb")));
+					if (isnan(nval))
+						ereport(ERROR,
+								(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+								 errmsg("cannot convert NaN to jsonb")));
+
+					out.type = jbvNumeric;
+					out.val.numeric =
+						DatumGetNumeric(DirectFunctionCall1(float8_numeric,
+															Float8GetDatum(nval)));
+				}
+				else if (SvPOK(in))
+				{
+					out.type = jbvString;
+					out.val.string.val = sv2cstr(in);
+					out.val.string.len = strlen(out.val.string.val);
+				}
+				else
+				{
+					/*
+					 * XXX It might be nice if we could include the Perl type
+					 * in the error message.
+					 */
 					ereport(ERROR,
-							(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-							 errmsg("cannot convert infinity to jsonb")));
-				if (isnan(nval))
-					ereport(ERROR,
-							(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-							 errmsg("cannot convert NaN to jsonb")));
-
-				out.type = jbvNumeric;
-				out.val.numeric =
-					DatumGetNumeric(DirectFunctionCall1(float8_numeric,
-														Float8GetDatum(nval)));
-			}
-			else if (SvPOK(in))
-			{
-				out.type = jbvString;
-				out.val.string.val = sv2cstr(in);
-				out.val.string.len = strlen(out.val.string.val);
-			}
-			else
-			{
-				/*
-				 * XXX It might be nice if we could include the Perl type in
-				 * the error message.
-				 */
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("cannot transform this Perl type to jsonb")));
-				return NULL;
-			}
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("cannot transform this Perl type to jsonb")));
+				}
+		}
 	}
 
-	/* Push result into 'jsonb_state' unless it is a raw scalar. */
-	return *jsonb_state
-		? pushJsonbValue(jsonb_state, is_elem ? WJB_ELEM : WJB_VALUE, &out)
-		: memcpy(palloc(sizeof(JsonbValue)), &out, sizeof(JsonbValue));
+	if (jsonb_state->parseState)
+	{
+		/* We're in an array or object, so push value as element or field. */
+		pushJsonbValue(jsonb_state, is_elem ? WJB_ELEM : WJB_VALUE, &out);
+	}
+	else
+	{
+		/*
+		 * We are at top level, so it's a raw scalar.  If we just shove the
+		 * scalar value into jsonb_state->result, JsonbValueToJsonb will take
+		 * care of wrapping it into a dummy array.
+		 */
+		jsonb_state->result = palloc_object(JsonbValue);
+		memcpy(jsonb_state->result, &out, sizeof(JsonbValue));
+	}
 }
 
 
@@ -304,10 +322,9 @@ Datum
 plperl_to_jsonb(PG_FUNCTION_ARGS)
 {
 	dTHX;
-	JsonbParseState *jsonb_state = NULL;
 	SV		   *in = (SV *) PG_GETARG_POINTER(0);
-	JsonbValue *out = SV_to_JsonbValue(in, &jsonb_state, true);
-	Jsonb	   *result = JsonbValueToJsonb(out);
+	JsonbInState jsonb_state = {0};
 
-	PG_RETURN_JSONB_P(result);
+	SV_to_JsonbValue(in, &jsonb_state, true);
+	PG_RETURN_JSONB_P(JsonbValueToJsonb(jsonb_state.result));
 }

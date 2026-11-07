@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2025, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 # used by frontend programs like pg_waldump
 rmgr_desc_sources = files(
@@ -6,8 +6,6 @@ rmgr_desc_sources = files(
   'clogdesc.c',
   'committsdesc.c',
   'dbasedesc.c',
-  'doltchunkdesc.c',
-  'doltdeltadesc.c',
   'genericdesc.c',
   'gindesc.c',
   'gistdesc.c',

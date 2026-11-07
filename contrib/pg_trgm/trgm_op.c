@@ -226,6 +226,55 @@ CMPTRGM_CHOOSE(const void *a, const void *b)
 	return CMPTRGM(a, b);
 }
 
+#define ST_SORT trigram_qsort_signed
+#define ST_ELEMENT_TYPE_VOID
+#define ST_COMPARE(a, b) CMPTRGM_SIGNED(a, b)
+#define ST_SCOPE static
+#define ST_DEFINE
+#define ST_DECLARE
+#include "lib/sort_template.h"
+
+#define ST_SORT trigram_qsort_unsigned
+#define ST_ELEMENT_TYPE_VOID
+#define ST_COMPARE(a, b) CMPTRGM_UNSIGNED(a, b)
+#define ST_SCOPE static
+#define ST_DEFINE
+#define ST_DECLARE
+#include "lib/sort_template.h"
+
+/* Sort an array of trigrams, handling signedness correctly */
+static void
+trigram_qsort(trgm *array, size_t n)
+{
+	if (GetDefaultCharSignedness())
+		trigram_qsort_signed(array, n, sizeof(trgm));
+	else
+		trigram_qsort_unsigned(array, n, sizeof(trgm));
+}
+
+
+/*
+ * Compare two trigrams for equality.  This has the same signature as
+ * comparison functions used for sorting, so that this can be used with
+ * qunique().  This doesn't need separate versions for "signed char" and "
+ * unsigned char" because equality is the same for both.
+ */
+static inline int
+CMPTRGM_EQ(const void *a, const void *b)
+{
+	const char *aa = a;
+	const char *bb = b;
+
+	return aa[0] != bb[0] || aa[1] != bb[1] || aa[2] != bb[2] ? 1 : 0;
+}
+
+/* Deduplicate an array of trigrams */
+static size_t
+trigram_qunique(trgm *array, size_t n)
+{
+	return qunique(array, n, sizeof(trgm), CMPTRGM_EQ);
+}
+
 /*
  * Deprecated function.
  * Use "pg_trgm.similarity_threshold" GUC variable instead of this function.
@@ -279,12 +328,6 @@ Datum
 show_limit(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_FLOAT4(similarity_threshold);
-}
-
-static int
-comp_trgm(const void *a, const void *b)
-{
-	return CMPTRGM(a, b);
 }
 
 /*
@@ -569,8 +612,8 @@ generate_trgm(char *str, int slen)
 	 */
 	if (len > 1)
 	{
-		qsort(GETARR(trg), len, sizeof(trgm), comp_trgm);
-		len = qunique(GETARR(trg), len, sizeof(trgm), comp_trgm);
+		trigram_qsort(GETARR(trg), len);
+		len = trigram_qunique(GETARR(trg), len);
 	}
 
 	SET_VARSIZE(trg, CALCGTSIZE(ARRKEY, len));
@@ -595,7 +638,7 @@ make_positional_trgm(trgm *trg1, int len1, trgm *trg2, int len2)
 	int			i,
 				len = len1 + len2;
 
-	result = (pos_trgm *) palloc(sizeof(pos_trgm) * len);
+	result = palloc_array(pos_trgm, len);
 
 	for (i = 0; i < len1; i++)
 	{
@@ -678,7 +721,7 @@ iterate_word_similarity(int *trg2indexes,
 	lower = (flags & WORD_SIMILARITY_STRICT) ? 0 : -1;
 
 	/* Memorise last position of each trigram */
-	lastpos = (int *) palloc(sizeof(int) * len);
+	lastpos = palloc_array(int, len);
 	memset(lastpos, -1, sizeof(int) * len);
 
 	for (i = 0; i < len2; i++)
@@ -848,8 +891,8 @@ calc_word_similarity(char *str1, int slen1, char *str2, int slen2,
 	 * Merge positional trigrams array: enumerate each trigram and find its
 	 * presence in required word.
 	 */
-	trg2indexes = (int *) palloc(sizeof(int) * len2);
-	found = (bool *) palloc0(sizeof(bool) * len);
+	trg2indexes = palloc_array(int, len2);
+	found = palloc0_array(bool, len);
 
 	ulen1 = 0;
 	j = 0;
@@ -1063,7 +1106,7 @@ generate_wildcard_trgm(const char *str, int slen)
 	init_trgm_array(&arr, slen);
 
 	/* Allocate a buffer for blank-padded, but not yet case-folded, words */
-	buf = palloc(sizeof(char) * (slen + 4));
+	buf = palloc_array(char, slen + 4);
 
 	/*
 	 * Extract trigrams from each substring extracted by get_wildcard_part.
@@ -1100,8 +1143,8 @@ generate_wildcard_trgm(const char *str, int slen)
 	len = arr.length;
 	if (len > 1)
 	{
-		qsort(GETARR(trg), len, sizeof(trgm), comp_trgm);
-		len = qunique(GETARR(trg), len, sizeof(trgm), comp_trgm);
+		trigram_qsort(GETARR(trg), len);
+		len = trigram_qunique(GETARR(trg), len);
 	}
 
 	trg->flag = ARRKEY;
@@ -1135,7 +1178,7 @@ show_trgm(PG_FUNCTION_ARGS)
 	int			i;
 
 	trg = generate_trgm(VARDATA_ANY(in), VARSIZE_ANY_EXHDR(in));
-	d = (Datum *) palloc(sizeof(Datum) * (1 + ARRNELEM(trg)));
+	d = palloc_array(Datum, 1 + ARRNELEM(trg));
 
 	for (i = 0, ptr = GETARR(trg); i < ARRNELEM(trg); i++, ptr++)
 	{
@@ -1263,7 +1306,7 @@ trgm_presence_map(TRGM *query, TRGM *key)
 				lenk = ARRNELEM(key),
 				i;
 
-	result = (bool *) palloc0(lenq * sizeof(bool));
+	result = palloc0_array(bool, lenq);
 
 	/* for each query trigram, do a binary search in the key array */
 	for (i = 0; i < lenq; i++)

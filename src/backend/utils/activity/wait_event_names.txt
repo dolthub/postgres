@@ -2,7 +2,7 @@
 # wait_event_names.txt
 #      PostgreSQL wait events
 #
-# Copyright (c) 2023-2025, PostgreSQL Global Development Group
+# Copyright (c) 2023-2026, PostgreSQL Global Development Group
 #
 # This list serves as the basis for generating source and documentation files
 # related to wait events.
@@ -62,7 +62,7 @@ LOGICAL_APPLY_MAIN	"Waiting in main loop of logical replication apply process."
 LOGICAL_LAUNCHER_MAIN	"Waiting in main loop of logical replication launcher process."
 LOGICAL_PARALLEL_APPLY_MAIN	"Waiting in main loop of logical replication parallel apply process."
 RECOVERY_WAL_STREAM	"Waiting in main loop of startup process for WAL to arrive, during streaming recovery."
-REPLICATION_SLOTSYNC_MAIN	"Waiting in main loop of slot sync worker."
+REPLICATION_SLOTSYNC_MAIN	"Waiting in main loop of slot synchronization."
 REPLICATION_SLOTSYNC_SHUTDOWN	"Waiting for slot sync worker to shut down."
 SYSLOGGER_MAIN	"Waiting in main loop of syslogger process."
 WAL_RECEIVER_MAIN	"Waiting in main loop of WAL receiver process."
@@ -151,18 +151,22 @@ RECOVERY_CONFLICT_SNAPSHOT	"Waiting for recovery conflict resolution for a vacuu
 RECOVERY_CONFLICT_TABLESPACE	"Waiting for recovery conflict resolution for dropping a tablespace."
 RECOVERY_END_COMMAND	"Waiting for <xref linkend="guc-recovery-end-command"/> to complete."
 RECOVERY_PAUSE	"Waiting for recovery to be resumed."
+REPACK_WORKER_EXPORT	"Waiting for decoding worker to export a new output file."
 REPLICATION_ORIGIN_DROP	"Waiting for a replication origin to become inactive so it can be dropped."
 REPLICATION_SLOT_DROP	"Waiting for a replication slot to become inactive so it can be dropped."
 RESTORE_COMMAND	"Waiting for <xref linkend="guc-restore-command"/> to complete."
 SAFE_SNAPSHOT	"Waiting to obtain a valid snapshot for a <literal>READ ONLY DEFERRABLE</literal> transaction."
 SYNC_REP	"Waiting for confirmation from a remote server during synchronous replication."
+WAIT_FOR_WAL_FLUSH	"Waiting for WAL flush to reach a target LSN on a primary or standby."
+WAIT_FOR_WAL_REPLAY	"Waiting for WAL replay to reach a target LSN on a standby."
+WAIT_FOR_WAL_WRITE	"Waiting for WAL write to reach a target LSN on a standby."
 WAL_RECEIVER_EXIT	"Waiting for the WAL receiver to exit."
+WAL_RECEIVER_UPSTREAM_CATCHUP	"Waiting for upstream server WAL flush position to catch up to requested start point."
 WAL_RECEIVER_WAIT_START	"Waiting for startup process to send initial data for streaming replication."
 WAL_SUMMARY_READY	"Waiting for a new WAL summary to be generated."
 XACT_GROUP_UPDATE	"Waiting for the group leader to update transaction status at transaction end."
 
 ABI_compatibility:
-WAL_RECEIVER_UPSTREAM_CATCHUP	"Waiting for upstream server WAL flush position to catch up to requested start point."
 
 #
 # Wait Events - Timeout
@@ -174,8 +178,7 @@ Section: ClassName - WaitEventTimeout
 
 BASE_BACKUP_THROTTLE	"Waiting during base backup when throttling activity."
 CHECKPOINT_WRITE_DELAY	"Waiting between writes while performing a checkpoint."
-DOLT_DELTA_LIMIT	"Waiting for folds to free prolly delta store memory at <varname>dolt_delta_memory_limit</varname>."
-DOLT_DELTA_THROTTLE	"Waiting before appending prolly changes while the delta store is past its throttle point."
+COMMIT_DELAY	"Waiting for commit delay before WAL flush."
 PG_SLEEP	"Waiting due to a call to <function>pg_sleep</function> or a sibling function."
 RECOVERY_APPLY_DELAY	"Waiting to apply WAL during recovery because of a delay setting."
 RECOVERY_RETRIEVE_RETRY_INTERVAL	"Waiting during recovery when WAL data is not available from any source (<filename>pg_wal</filename>, archive or stream)."
@@ -212,6 +215,8 @@ CONTROL_FILE_WRITE_UPDATE	"Waiting for a write to update the <filename>pg_contro
 COPY_FILE_COPY	"Waiting for a file copy operation."
 COPY_FILE_READ	"Waiting for a read during a file copy operation."
 COPY_FILE_WRITE	"Waiting for a write during a file copy operation."
+COPY_FROM_READ	"Waiting to read data from a pipe, a file or a program during COPY FROM."
+COPY_TO_WRITE	"Waiting to write data to a pipe, a file or a program during COPY TO."
 DATA_FILE_EXTEND	"Waiting for a relation data file to be extended."
 DATA_FILE_FLUSH	"Waiting for a relation data file to reach durable storage."
 DATA_FILE_IMMEDIATE_SYNC	"Waiting for an immediate synchronization of a relation data file to durable storage."
@@ -220,10 +225,6 @@ DATA_FILE_READ	"Waiting for a read from a relation data file."
 DATA_FILE_SYNC	"Waiting for changes to a relation data file to reach durable storage."
 DATA_FILE_TRUNCATE	"Waiting for a relation data file to be truncated."
 DATA_FILE_WRITE	"Waiting for a write to a relation data file."
-DOLT_CHUNK_READ	"Waiting for a read from the prolly chunk journal."
-DOLT_CHUNK_SYNC	"Waiting for the prolly chunk journal to reach durable storage."
-DOLT_CHUNK_WRITE	"Waiting for a write to the prolly chunk journal."
-DOLT_DELTA_STATE_WRITE	"Waiting for a write to the prolly delta store's checkpoint file."
 DSM_ALLOCATE	"Waiting for a dynamic shared memory segment to be allocated."
 DSM_FILL_ZERO_WRITE	"Waiting to fill a dynamic shared memory backing file with zeroes."
 LOCK_FILE_ADDTODATADIR_READ	"Waiting for a read while adding a line to the data directory lock file."
@@ -284,12 +285,15 @@ WAL_WRITE	"Waiting for a write to a WAL file."
 ABI_compatibility:
 
 #
-# Wait Events - Buffer Pin
+# Wait Events - Buffer
 #
 
-Section: ClassName - WaitEventBufferPin
+Section: ClassName - WaitEventBuffer
 
-BUFFER_PIN	"Waiting to acquire an exclusive pin on a buffer."
+BUFFER_CLEANUP	"Waiting to acquire an exclusive pin on a buffer. Buffer pin waits can be protracted if another process holds an open cursor that last read data from the buffer in question."
+BUFFER_SHARED	"Waiting to acquire a shared lock on a buffer."
+BUFFER_SHARE_EXCLUSIVE	"Waiting to acquire a share exclusive lock on a buffer."
+BUFFER_EXCLUSIVE	"Waiting to acquire an exclusive lock on a buffer."
 
 ABI_compatibility:
 
@@ -309,14 +313,16 @@ ABI_compatibility:
 # This class of wait events has its own set of C structure, so these are
 # only used for the documentation.
 #
-# NB: Predefined LWLocks (i.e., those declared in lwlocklist.h) must be
-# listed in the top section of locks and must be listed in the same order as in
-# lwlocklist.h.
+# NB: Predefined LWLocks (i.e., those declared with PG_LWLOCK in lwlocklist.h)
+# must be listed before the "END OF PREDEFINED LWLOCKS" comment and must be
+# listed in the same order as in lwlocklist.h.  Likewise, the built-in LWLock
+# tranches (i.e., those declared with PG_LWLOCKTRANCHE in lwlocklist.h) must be
+# listed after the "END OF PREDEFINED LWLOCKS" comment and must be listed in
+# the same order as lwlocklist.h.
 #
 
 Section: ClassName - WaitEventLWLock
 
-ShmemIndex	"Waiting to find or allocate space in shared memory."
 OidGen	"Waiting to allocate a new OID."
 XidGen	"Waiting to allocate a new transaction ID."
 ProcArray	"Waiting to access the shared per-process data structures (typically, to get a snapshot or report a session's transaction ID)."
@@ -359,13 +365,12 @@ DSMRegistry	"Waiting to read or update the dynamic shared memory registry."
 InjectionPoint	"Waiting to read or update information related to injection points."
 SerialControl	"Waiting to read or update shared <filename>pg_serial</filename> state."
 AioWorkerSubmissionQueue	"Waiting to access AIO worker submission queue."
+WaitLSN	"Waiting to read or update shared Wait-for-LSN state."
+LogicalDecodingControl	"Waiting to read or update logical decoding status information."
+AioWorkerControl	"Waiting to update AIO worker information."
 
 #
 # END OF PREDEFINED LWLOCKS (DO NOT CHANGE THIS LINE)
-#
-# Predefined LWLocks (i.e., those declared in lwlocknames.h) must be listed
-# in the section above and must be listed in the same order as in
-# lwlocknames.h.  Other LWLocks must be listed in the section below.
 #
 
 XactBuffer	"Waiting for I/O on a transaction status SLRU buffer."
@@ -374,9 +379,9 @@ SubtransBuffer	"Waiting for I/O on a sub-transaction SLRU buffer."
 MultiXactOffsetBuffer	"Waiting for I/O on a multixact offset SLRU buffer."
 MultiXactMemberBuffer	"Waiting for I/O on a multixact member SLRU buffer."
 NotifyBuffer	"Waiting for I/O on a <command>NOTIFY</command> message SLRU buffer."
+NotifyChannelHash	"Waiting to access the <command>NOTIFY</command> channel hash table."
 SerialBuffer	"Waiting for I/O on a serializable transaction conflict SLRU buffer."
 WALInsert	"Waiting to insert WAL data into a memory buffer."
-BufferContent	"Waiting to access a data page in memory."
 ReplicationOriginState	"Waiting to read or update the progress of one replication origin."
 ReplicationSlotIO	"Waiting for I/O on a replication slot."
 LockFastPath	"Waiting to read or update a process' fast-path lock information."
@@ -409,13 +414,7 @@ SubtransSLRU	"Waiting to access the sub-transaction SLRU cache."
 XactSLRU	"Waiting to access the transaction status SLRU cache."
 ParallelVacuumDSA	"Waiting for parallel vacuum dynamic shared memory allocation."
 AioUringCompletion	"Waiting for another process to complete IO via io_uring."
-DoltNodeMapping	"Waiting to associate a prolly node with a slot in the shared node cache."
-DoltNodeDSA	"Waiting for shared node cache memory allocation."
-DoltDeltaTrees	"Waiting to find or add a prolly tree in the shared delta store."
-DoltDeltaTree	"Waiting to read or append a prolly tree's pending changes."
-DoltDeltaDSA	"Waiting for shared delta store memory allocation."
-DoltChunkAppend	"Waiting to append to the prolly chunk journal."
-DoltChunkIndex	"Waiting to look up or index chunks in the prolly chunk journal."
+ShmemIndex	"Waiting to find or allocate space in shared memory."
 
 # No "ABI_compatibility" region here as WaitEventLWLock has its own C code.
 

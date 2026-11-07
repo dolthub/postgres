@@ -587,6 +587,18 @@ from generate_series(9223372036854775804, 9223372036854775806) x;
 select x, last_value(x) over (order by x desc range between current row and 5 following)
 from generate_series(-9223372036854775806, -9223372036854775804) x;
 
+SELECT x,
+       lead(x, -2147483648) over w as respect_nulls,
+       lead(x, -2147483648) ignore nulls over w as ignore_nulls
+from (values (1), (2)) as t(x)
+window w as (order by x);
+
+SELECT x,
+       lag(x, -2147483648) over w as respect_nulls,
+       lag(x, -2147483648) ignore nulls over w as ignore_nulls
+from (values (1), (2)) as t(x)
+window w as (order by x);
+
 -- Test in_range for other numeric datatypes
 
 create temp table numerics(
@@ -1659,6 +1671,19 @@ SELECT * FROM
    FROM empsalary) emp
 WHERE first_emp = 1 OR last_emp = 1;
 
+CREATE INDEX empsalary_salary_empno_idx ON empsalary (salary, empno);
+
+SET enable_seqscan = 0;
+
+-- Ensure no sorting is done and that the IndexScan maintains all pathkeys
+-- useful for the final sort order.
+EXPLAIN (COSTS OFF)
+SELECT salary, empno, row_number() OVER (ORDER BY salary) rn
+FROM empsalary
+ORDER BY salary, empno;
+
+RESET enable_seqscan;
+
 -- cleanup
 DROP TABLE empsalary;
 
@@ -2095,3 +2120,216 @@ $$ LANGUAGE SQL STABLE;
 
 EXPLAIN (costs off) SELECT * FROM pg_temp.f(2);
 SELECT * FROM pg_temp.f(2);
+
+-- IGNORE NULLS tests
+
+CREATE TEMPORARY TABLE planets (
+    name text,
+    distance text,
+    orbit integer
+);
+
+INSERT INTO planets VALUES
+  ('mercury', 'close', 88),
+  ('venus', 'close', 224),
+  ('earth', 'close', NULL),
+  ('mars', 'close', NULL),
+  ('jupiter', 'close', 4332),
+  ('saturn', 'far', 24491),
+  ('uranus', 'far', NULL),
+  ('neptune', 'far', 60182),
+  ('pluto', 'far', 90560),
+  ('xyzzy', 'far', NULL);
+
+-- test ruleutils
+CREATE VIEW planets_view AS
+SELECT name,
+       orbit,
+       lag(orbit) OVER w AS lag,
+       lag(orbit) RESPECT NULLS OVER w AS lag_respect,
+       lag(orbit) IGNORE NULLS OVER w AS lag_ignore
+FROM planets
+WINDOW w AS (ORDER BY name)
+;
+SELECT pg_get_viewdef('planets_view');
+
+-- lag
+SELECT name,
+       orbit,
+       lag(orbit) OVER w AS lag,
+       lag(orbit) RESPECT NULLS OVER w AS lag_respect,
+       lag(orbit) IGNORE NULLS OVER w AS lag_ignore
+FROM planets
+WINDOW w AS (ORDER BY name)
+;
+
+-- lead
+SELECT name,
+       orbit,
+       lead(orbit) OVER w AS lead,
+       lead(orbit) RESPECT NULLS OVER w AS lead_respect,
+       lead(orbit) IGNORE NULLS OVER w AS lead_ignore
+FROM planets
+WINDOW w AS (ORDER BY name)
+;
+
+-- first_value
+SELECT name,
+       orbit,
+       first_value(orbit) RESPECT NULLS OVER w1,
+       first_value(orbit) IGNORE NULLS OVER w1,
+       first_value(orbit) RESPECT NULLS OVER w2,
+       first_value(orbit) IGNORE NULLS OVER w2
+FROM planets
+WINDOW w1 AS (ORDER BY name ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+       w2 AS (ORDER BY name ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING)
+;
+
+-- nth_value
+SELECT name,
+       orbit,
+       nth_value(orbit, 2) RESPECT NULLS OVER w1,
+       nth_value(orbit, 2) IGNORE NULLS OVER w1,
+       nth_value(orbit, 2) RESPECT NULLS OVER w2,
+       nth_value(orbit, 2) IGNORE NULLS OVER w2
+FROM planets
+WINDOW w1 AS (ORDER BY name ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+       w2 AS (ORDER BY name ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING)
+;
+
+-- last_value
+SELECT name,
+       orbit,
+       last_value(orbit) RESPECT NULLS OVER w1,
+       last_value(orbit) IGNORE NULLS OVER w1,
+       last_value(orbit) RESPECT NULLS OVER w2,
+       last_value(orbit) IGNORE NULLS OVER w2
+FROM planets
+WINDOW w1 AS (ORDER BY name ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+       w2 AS (ORDER BY name ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING)
+;
+
+-- exclude current row
+SELECT name,
+       orbit,
+       first_value(orbit) IGNORE NULLS OVER w,
+       last_value(orbit) IGNORE NULLS OVER w,
+       nth_value(orbit, 2) IGNORE NULLS OVER w,
+       lead(orbit, 1) IGNORE NULLS OVER w AS lead_ignore,
+       lag(orbit, 1) IGNORE NULLS OVER w AS lag_ignore
+FROM planets
+WINDOW w AS (ORDER BY name ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING EXCLUDE CURRENT ROW)
+;
+
+-- valid and invalid functions
+SELECT abs(1) IGNORE NULLS; -- fails
+SELECT no_such_window_func() IGNORE NULLS; -- fails, but not because of null treatment
+SELECT sum(orbit) IGNORE NULLS FROM planets; -- fails
+SELECT sum(orbit) OVER () FROM planets; -- succeeds
+SELECT sum(orbit) RESPECT NULLS OVER () FROM planets; -- fails
+SELECT sum(orbit) IGNORE NULLS OVER () FROM planets; -- fails
+SELECT row_number() OVER () FROM planets; -- succeeds
+SELECT row_number() RESPECT NULLS OVER () FROM planets; -- fails
+SELECT row_number() IGNORE NULLS OVER () FROM planets; -- fails
+SELECT rank() OVER () FROM planets; -- succeeds
+SELECT rank() RESPECT NULLS OVER () FROM planets; -- fails
+SELECT rank() IGNORE NULLS OVER () FROM planets; -- fails
+SELECT dense_rank() OVER () FROM planets; -- succeeds
+SELECT dense_rank() RESPECT NULLS OVER () FROM planets; -- fails
+SELECT dense_rank() IGNORE NULLS OVER () FROM planets; -- fails
+SELECT percent_rank() OVER () FROM planets; -- succeeds
+SELECT percent_rank() RESPECT NULLS OVER () FROM planets; -- fails
+SELECT percent_rank() IGNORE NULLS OVER () FROM planets; -- fails
+SELECT cume_dist() OVER () FROM planets; -- succeeds
+SELECT cume_dist() RESPECT NULLS OVER () FROM planets; -- fails
+SELECT cume_dist() IGNORE NULLS OVER () FROM planets; -- fails
+SELECT ntile(1) OVER () FROM planets; -- succeeds
+SELECT ntile(1) RESPECT NULLS OVER () FROM planets; -- fails
+SELECT ntile(1) IGNORE NULLS OVER () FROM planets; -- fails
+
+-- test two consecutive nulls
+update planets set orbit=null where name='jupiter';
+SELECT name,
+       orbit,
+       first_value(orbit) IGNORE NULLS OVER w,
+       last_value(orbit) IGNORE NULLS OVER w,
+       nth_value(orbit, 2) IGNORE NULLS OVER w,
+       lead(orbit, 1) IGNORE NULLS OVER w AS lead_ignore,
+       lag(orbit, 1) IGNORE NULLS OVER w AS lag_ignore
+FROM planets
+WINDOW w AS (ORDER BY name ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING)
+;
+
+-- test partitions
+SELECT name,
+       distance,
+       orbit,
+       first_value(orbit) IGNORE NULLS OVER w,
+       last_value(orbit) IGNORE NULLS OVER w,
+       nth_value(orbit, 2) IGNORE NULLS OVER w,
+       lead(orbit, 1) IGNORE NULLS OVER w AS lead_ignore,
+       lag(orbit, 1) IGNORE NULLS OVER w AS lag_ignore
+FROM planets
+WINDOW w AS (PARTITION BY distance ORDER BY name ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING)
+;
+
+-- nth_value without nulls
+SELECT x,
+       nth_value(x,2) IGNORE NULLS OVER w
+FROM generate_series(1,5) g(x)
+WINDOW w AS (ORDER BY x ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING EXCLUDE CURRENT ROW);
+SELECT x,
+       nth_value(x,2) IGNORE NULLS OVER w
+FROM generate_series(1,5) g(x)
+WINDOW w AS (ORDER BY x ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING);
+
+-- EXCLUDE GROUP/TIES without ORDER BY: every row is a peer of the current
+-- row, so the IGNORE NULLS scan must stop at the end of the partition
+SELECT x,
+       first_value(x) IGNORE NULLS OVER w,
+       nth_value(x, 2) IGNORE NULLS OVER w
+FROM (VALUES (1), (NULL), (3)) v(x)
+WINDOW w AS (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP)
+ORDER BY x;
+SELECT x,
+       first_value(x) IGNORE NULLS OVER w,
+       nth_value(x, 2) IGNORE NULLS OVER w
+FROM (VALUES (1), (NULL), (3)) v(x)
+WINDOW w AS (RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING EXCLUDE TIES)
+ORDER BY x;
+SELECT p, x,
+       first_value(x) IGNORE NULLS OVER w
+FROM (VALUES (1, 1), (1, NULL), (2, NULL)) v(p, x)
+WINDOW w AS (PARTITION BY p ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE TIES)
+ORDER BY p, x;
+
+-- volatile arguments cannot use the IGNORE NULLS nullness cache
+CREATE TEMPORARY SEQUENCE null_treatment_seq;
+CREATE FUNCTION pg_temp.volatile_null(i int) RETURNS int
+LANGUAGE sql VOLATILE AS
+$$
+  SELECT CASE WHEN nextval('null_treatment_seq') % 2 = 0 THEN i ELSE NULL END;
+$$;
+
+SELECT x,
+       first_value(pg_temp.volatile_null(x)) IGNORE NULLS
+         OVER (ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+FROM generate_series(1,5) g(x);
+SELECT last_value FROM null_treatment_seq;
+
+ALTER SEQUENCE null_treatment_seq RESTART WITH 1;
+SELECT x,
+       lead(pg_temp.volatile_null(x), 1) IGNORE NULLS OVER (ORDER BY x)
+FROM generate_series(1,5) g(x);
+SELECT last_value FROM null_treatment_seq;
+
+ALTER SEQUENCE null_treatment_seq RESTART WITH 1;
+SELECT x,
+       first_value((SELECT CASE WHEN nextval('null_treatment_seq') % 2 = 0
+                                THEN x ELSE NULL END)) IGNORE NULLS
+         OVER (ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+FROM generate_series(1,5) g(x);
+SELECT last_value FROM null_treatment_seq;
+
+--cleanup
+DROP TABLE planets CASCADE;

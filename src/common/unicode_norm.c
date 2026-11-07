@@ -5,7 +5,7 @@
  * This implements Unicode normalization, per the documentation at
  * https://www.unicode.org/reports/tr15/.
  *
- * Portions Copyright (c) 2017-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2017-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/common/unicode_norm.c
@@ -70,7 +70,7 @@ conv_compare(const void *p1, const void *p2)
  * lookup, while the frontend version uses a binary search.
  */
 static const pg_unicode_decomposition *
-get_code_entry(pg_wchar code)
+get_code_entry(char32_t code)
 {
 #ifndef FRONTEND
 	int			h;
@@ -110,12 +110,12 @@ get_code_entry(pg_wchar code)
  * Get the combining class of the given codepoint.
  */
 static uint8
-get_canonical_class(pg_wchar code)
+get_canonical_class(char32_t code)
 {
 	const pg_unicode_decomposition *entry = get_code_entry(code);
 
 	/*
-	 * If no entries are found, the character used is either an Hangul
+	 * If no entries are found, the character used is either a Hangul
 	 * character or a character with a class of 0 and no decompositions.
 	 */
 	if (!entry)
@@ -131,15 +131,15 @@ get_canonical_class(pg_wchar code)
  * Note: the returned pointer can point to statically allocated buffer, and
  * is only valid until next call to this function!
  */
-static const pg_wchar *
+static const char32_t *
 get_code_decomposition(const pg_unicode_decomposition *entry, int *dec_size)
 {
-	static pg_wchar x;
+	static char32_t x;
 
 	if (DECOMPOSITION_IS_INLINE(entry))
 	{
 		Assert(DECOMPOSITION_SIZE(entry) == 1);
-		x = (pg_wchar) entry->dec_index;
+		x = (char32_t) entry->dec_index;
 		*dec_size = 1;
 		return &x;
 	}
@@ -157,7 +157,7 @@ get_code_decomposition(const pg_unicode_decomposition *entry, int *dec_size)
  * are, in turn, decomposable.
  */
 static int
-get_decomposed_size(pg_wchar code, bool compat)
+get_decomposed_size(char32_t code, bool compat)
 {
 	const pg_unicode_decomposition *entry;
 	int			size = 0;
@@ -319,7 +319,7 @@ recompose_code(uint32 start, uint32 code, uint32 *result)
  * in the array result.
  */
 static void
-decompose_code(pg_wchar code, bool compat, pg_wchar **result, int *current)
+decompose_code(char32_t code, bool compat, char32_t **result, int *current)
 {
 	const pg_unicode_decomposition *entry;
 	int			i;
@@ -338,7 +338,7 @@ decompose_code(pg_wchar code, bool compat, pg_wchar **result, int *current)
 					v,
 					tindex,
 					sindex;
-		pg_wchar   *res = *result;
+		char32_t   *res = *result;
 
 		sindex = code - SBASE;
 		l = LBASE + sindex / (VCOUNT * TCOUNT);
@@ -370,7 +370,7 @@ decompose_code(pg_wchar code, bool compat, pg_wchar **result, int *current)
 	if (entry == NULL || DECOMPOSITION_SIZE(entry) == 0 ||
 		(!compat && DECOMPOSITION_IS_COMPAT(entry)))
 	{
-		pg_wchar   *res = *result;
+		char32_t   *res = *result;
 
 		res[*current] = code;
 		(*current)++;
@@ -383,7 +383,7 @@ decompose_code(pg_wchar code, bool compat, pg_wchar **result, int *current)
 	decomp = get_code_decomposition(entry, &dec_size);
 	for (i = 0; i < dec_size; i++)
 	{
-		pg_wchar	lcode = (pg_wchar) decomp[i];
+		char32_t	lcode = (char32_t) decomp[i];
 
 		/* Leave if no more decompositions */
 		decompose_code(lcode, compat, result, current);
@@ -399,17 +399,17 @@ decompose_code(pg_wchar code, bool compat, pg_wchar **result, int *current)
  * malloc. Or NULL if we run out of memory. In backend, the returned
  * string is palloc'd instead, and OOM is reported with ereport().
  */
-pg_wchar *
-unicode_normalize(UnicodeNormalizationForm form, const pg_wchar *input)
+char32_t *
+unicode_normalize(UnicodeNormalizationForm form, const char32_t *input)
 {
 	bool		compat = (form == UNICODE_NFKC || form == UNICODE_NFKD);
 	bool		recompose = (form == UNICODE_NFC || form == UNICODE_NFKC);
-	pg_wchar   *decomp_chars;
-	pg_wchar   *recomp_chars;
+	char32_t   *decomp_chars;
+	char32_t   *recomp_chars;
 	int			decomp_size,
 				current_size;
 	int			count;
-	const pg_wchar *p;
+	const char32_t *p;
 
 	/* variables for recomposition */
 	int			last_class;
@@ -432,7 +432,7 @@ unicode_normalize(UnicodeNormalizationForm form, const pg_wchar *input)
 	for (p = input; *p; p++)
 	{
 		decomp_size += get_decomposed_size(*p, compat);
-		if (unlikely(decomp_size > MaxAllocSize / sizeof(pg_wchar)))
+		if (unlikely(decomp_size > MaxAllocSize / sizeof(char32_t)))
 		{
 #ifndef FRONTEND
 			/* Exit loop and let palloc() throw error below */
@@ -444,7 +444,7 @@ unicode_normalize(UnicodeNormalizationForm form, const pg_wchar *input)
 		}
 	}
 
-	decomp_chars = (pg_wchar *) ALLOC((decomp_size + 1) * sizeof(pg_wchar));
+	decomp_chars = (char32_t *) ALLOC((decomp_size + 1) * sizeof(char32_t));
 	if (decomp_chars == NULL)
 		return NULL;
 
@@ -467,9 +467,9 @@ unicode_normalize(UnicodeNormalizationForm form, const pg_wchar *input)
 	 */
 	for (count = 1; count < decomp_size; count++)
 	{
-		pg_wchar	prev = decomp_chars[count - 1];
-		pg_wchar	next = decomp_chars[count];
-		pg_wchar	tmp;
+		char32_t	prev = decomp_chars[count - 1];
+		char32_t	next = decomp_chars[count];
+		char32_t	tmp;
 		const uint8 prevClass = get_canonical_class(prev);
 		const uint8 nextClass = get_canonical_class(next);
 
@@ -506,7 +506,7 @@ unicode_normalize(UnicodeNormalizationForm form, const pg_wchar *input)
 	 * longer than the decomposed one, so make the allocation of the output
 	 * string based on that assumption.
 	 */
-	recomp_chars = (pg_wchar *) ALLOC((decomp_size + 1) * sizeof(pg_wchar));
+	recomp_chars = (char32_t *) ALLOC((decomp_size + 1) * sizeof(char32_t));
 	if (!recomp_chars)
 	{
 		FREE(decomp_chars);
@@ -520,9 +520,9 @@ unicode_normalize(UnicodeNormalizationForm form, const pg_wchar *input)
 
 	for (count = 1; count < decomp_size; count++)
 	{
-		pg_wchar	ch = decomp_chars[count];
+		char32_t	ch = decomp_chars[count];
 		int			ch_class = get_canonical_class(ch);
-		pg_wchar	composite;
+		char32_t	composite;
 
 		if (last_class < ch_class &&
 			recompose_code(starter_ch, ch, &composite))
@@ -543,7 +543,7 @@ unicode_normalize(UnicodeNormalizationForm form, const pg_wchar *input)
 			recomp_chars[target_pos++] = ch;
 		}
 	}
-	recomp_chars[target_pos] = (pg_wchar) '\0';
+	recomp_chars[target_pos] = (char32_t) '\0';
 
 	FREE(decomp_chars);
 
@@ -559,7 +559,7 @@ unicode_normalize(UnicodeNormalizationForm form, const pg_wchar *input)
 #ifndef FRONTEND
 
 static const pg_unicode_normprops *
-qc_hash_lookup(pg_wchar ch, const pg_unicode_norminfo *norminfo)
+qc_hash_lookup(char32_t ch, const pg_unicode_norminfo *norminfo)
 {
 	int			h;
 	uint32		hashkey;
@@ -590,7 +590,7 @@ qc_hash_lookup(pg_wchar ch, const pg_unicode_norminfo *norminfo)
  * Look up the normalization quick check character property
  */
 static UnicodeNormalizationQC
-qc_is_allowed(UnicodeNormalizationForm form, pg_wchar ch)
+qc_is_allowed(UnicodeNormalizationForm form, char32_t ch)
 {
 	const pg_unicode_normprops *found = NULL;
 
@@ -614,7 +614,7 @@ qc_is_allowed(UnicodeNormalizationForm form, pg_wchar ch)
 }
 
 UnicodeNormalizationQC
-unicode_is_normalized_quickcheck(UnicodeNormalizationForm form, const pg_wchar *input)
+unicode_is_normalized_quickcheck(UnicodeNormalizationForm form, const char32_t *input)
 {
 	uint8		lastCanonicalClass = 0;
 	UnicodeNormalizationQC result = UNICODE_NORM_QC_YES;
@@ -629,9 +629,9 @@ unicode_is_normalized_quickcheck(UnicodeNormalizationForm form, const pg_wchar *
 	if (form == UNICODE_NFD || form == UNICODE_NFKD)
 		return UNICODE_NORM_QC_MAYBE;
 
-	for (const pg_wchar *p = input; *p; p++)
+	for (const char32_t *p = input; *p; p++)
 	{
-		pg_wchar	ch = *p;
+		char32_t	ch = *p;
 		uint8		canonicalClass;
 		UnicodeNormalizationQC check;
 

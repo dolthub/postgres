@@ -3,7 +3,7 @@
  * genam.c
  *	  general index access method routines
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -18,7 +18,6 @@
  */
 
 #include "postgres.h"
-#include "catalog/catalogview.h"
 
 #include "access/genam.h"
 #include "access/heapam.h"
@@ -82,7 +81,7 @@ RelationGetIndexScan(Relation indexRelation, int nkeys, int norderbys)
 {
 	IndexScanDesc scan;
 
-	scan = (IndexScanDesc) palloc(sizeof(IndexScanDescData));
+	scan = palloc_object(IndexScanDescData);
 
 	scan->heapRelation = NULL;	/* may be set later */
 	scan->xs_heapfetch = NULL;
@@ -95,11 +94,11 @@ RelationGetIndexScan(Relation indexRelation, int nkeys, int norderbys)
 	 * We allocate key workspace here, but it won't get filled until amrescan.
 	 */
 	if (nkeys > 0)
-		scan->keyData = (ScanKey) palloc(sizeof(ScanKeyData) * nkeys);
+		scan->keyData = palloc_array(ScanKeyData, nkeys);
 	else
 		scan->keyData = NULL;
 	if (norderbys > 0)
-		scan->orderByData = (ScanKey) palloc(sizeof(ScanKeyData) * norderbys);
+		scan->orderByData = palloc_array(ScanKeyData, norderbys);
 	else
 		scan->orderByData = NULL;
 
@@ -311,8 +310,8 @@ index_compute_xid_horizon_for_tuples(Relation irel,
 	delstate.bottomup = false;
 	delstate.bottomupfreespace = 0;
 	delstate.ndeltids = 0;
-	delstate.deltids = palloc(nitems * sizeof(TM_IndexDelete));
-	delstate.status = palloc(nitems * sizeof(TM_IndexStatus));
+	delstate.deltids = palloc_array(TM_IndexDelete, nitems);
+	delstate.status = palloc_array(TM_IndexStatus, nitems);
 
 	/* identify what the index tuples about to be deleted point to */
 	for (int i = 0; i < nitems; i++)
@@ -394,15 +393,6 @@ systable_beginscan(Relation heapRelation,
 {
 	SysScanDesc sysscan;
 	Relation	irel;
-	CatalogViewScan *viewscan = CatalogViewBeginScanSnapshot(heapRelation, nkeys, key, snapshot);
-
-	if (viewscan)
-	{
-		sysscan = palloc0(sizeof(SysScanDescData));
-		sysscan->heap_rel = heapRelation;
-		sysscan->catalog_view = viewscan;
-		return sysscan;
-	}
 
 	if (indexOK &&
 		!IgnoreSystemIndexes &&
@@ -411,7 +401,7 @@ systable_beginscan(Relation heapRelation,
 	else
 		irel = NULL;
 
-	sysscan = (SysScanDesc) palloc0(sizeof(SysScanDescData));
+	sysscan = palloc_object(SysScanDescData);
 
 	sysscan->heap_rel = heapRelation;
 	sysscan->irel = irel;
@@ -429,6 +419,14 @@ systable_beginscan(Relation heapRelation,
 		/* Caller is responsible for any snapshot. */
 		sysscan->snapshot = NULL;
 	}
+
+	/*
+	 * If CheckXidAlive is set then set a flag to indicate that system table
+	 * scan is in-progress.  See detailed comments in xact.c where these
+	 * variables are declared.
+	 */
+	if (TransactionIdIsValid(CheckXidAlive))
+		bsysscan = true;
 
 	if (irel)
 	{
@@ -457,7 +455,8 @@ systable_beginscan(Relation heapRelation,
 		}
 
 		sysscan->iscan = index_beginscan(heapRelation, irel,
-										 snapshot, NULL, nkeys, 0);
+										 snapshot, NULL, nkeys, 0,
+										 SO_NONE);
 		index_rescan(sysscan->iscan, idxkey, nkeys, NULL, 0);
 		sysscan->scan = NULL;
 
@@ -478,14 +477,6 @@ systable_beginscan(Relation heapRelation,
 		sysscan->iscan = NULL;
 	}
 
-	/*
-	 * If CheckXidAlive is set then set a flag to indicate that system table
-	 * scan is in-progress.  See detailed comments in xact.c where these
-	 * variables are declared.
-	 */
-	if (TransactionIdIsValid(CheckXidAlive))
-		bsysscan = true;
-
 	return sysscan;
 }
 
@@ -498,7 +489,7 @@ systable_beginscan(Relation heapRelation,
  * is declared.
  */
 static inline void
-HandleConcurrentAbort()
+HandleConcurrentAbort(void)
 {
 	if (TransactionIdIsValid(CheckXidAlive) &&
 		!TransactionIdIsInProgress(CheckXidAlive) &&
@@ -524,9 +515,6 @@ HeapTuple
 systable_getnext(SysScanDesc sysscan)
 {
 	HeapTuple	htup = NULL;
-
-	if (sysscan->catalog_view)
-		return CatalogViewNext(sysscan->catalog_view, ForwardScanDirection);
 
 	if (sysscan->irel)
 	{
@@ -588,9 +576,6 @@ systable_recheck_tuple(SysScanDesc sysscan, HeapTuple tup)
 	Snapshot	freshsnap;
 	bool		result;
 
-	/* A pinned immutable catalog view cannot change while a lock is acquired. */
-	if (sysscan->catalog_view)
-		return true;
 	Assert(tup == ExecFetchSlotHeapTuple(sysscan->slot, false, NULL));
 
 	freshsnap = GetCatalogSnapshot(RelationGetRelid(sysscan->heap_rel));
@@ -618,12 +603,6 @@ systable_recheck_tuple(SysScanDesc sysscan, HeapTuple tup)
 void
 systable_endscan(SysScanDesc sysscan)
 {
-	if (sysscan->catalog_view)
-	{
-		CatalogViewEndScan(sysscan->catalog_view);
-		pfree(sysscan);
-		return;
-	}
 	if (sysscan->slot)
 	{
 		ExecDropSingleTupleTableSlot(sysscan->slot);
@@ -678,18 +657,6 @@ systable_beginscan_ordered(Relation heapRelation,
 	int			i;
 	ScanKey		idxkey;
 
-	CatalogViewScan *viewscan = CatalogViewBeginScanSnapshot(heapRelation, nkeys, key, snapshot);
-
-	if (viewscan)
-	{
-		CatalogViewOrderScan(viewscan, indexRelation);
-		sysscan = palloc0(sizeof(SysScanDescData));
-		sysscan->heap_rel = heapRelation;
-		sysscan->irel = indexRelation;
-		sysscan->catalog_view = viewscan;
-		return sysscan;
-	}
-
 	/* REINDEX can probably be a hard error here ... */
 	if (ReindexIsProcessingIndex(RelationGetRelid(indexRelation)))
 		ereport(ERROR,
@@ -701,7 +668,7 @@ systable_beginscan_ordered(Relation heapRelation,
 		elog(WARNING, "using index \"%s\" despite IgnoreSystemIndexes",
 			 RelationGetRelationName(indexRelation));
 
-	sysscan = (SysScanDesc) palloc0(sizeof(SysScanDescData));
+	sysscan = palloc_object(SysScanDescData);
 
 	sysscan->heap_rel = heapRelation;
 	sysscan->irel = indexRelation;
@@ -741,13 +708,6 @@ systable_beginscan_ordered(Relation heapRelation,
 			elog(ERROR, "column is not in index");
 	}
 
-	sysscan->iscan = index_beginscan(heapRelation, indexRelation,
-									 snapshot, NULL, nkeys, 0);
-	index_rescan(sysscan->iscan, idxkey, nkeys, NULL, 0);
-	sysscan->scan = NULL;
-
-	pfree(idxkey);
-
 	/*
 	 * If CheckXidAlive is set then set a flag to indicate that system table
 	 * scan is in-progress.  See detailed comments in xact.c where these
@@ -755,6 +715,14 @@ systable_beginscan_ordered(Relation heapRelation,
 	 */
 	if (TransactionIdIsValid(CheckXidAlive))
 		bsysscan = true;
+
+	sysscan->iscan = index_beginscan(heapRelation, indexRelation,
+									 snapshot, NULL, nkeys, 0,
+									 SO_NONE);
+	index_rescan(sysscan->iscan, idxkey, nkeys, NULL, 0);
+	sysscan->scan = NULL;
+
+	pfree(idxkey);
 
 	return sysscan;
 }
@@ -766,9 +734,6 @@ HeapTuple
 systable_getnext_ordered(SysScanDesc sysscan, ScanDirection direction)
 {
 	HeapTuple	htup = NULL;
-
-	if (sysscan->catalog_view)
-		return CatalogViewNext(sysscan->catalog_view, direction);
 
 	Assert(sysscan->irel);
 	if (index_getnext_slot(sysscan->iscan, direction, sysscan->slot))
@@ -793,12 +758,6 @@ systable_getnext_ordered(SysScanDesc sysscan, ScanDirection direction)
 void
 systable_endscan_ordered(SysScanDesc sysscan)
 {
-	if (sysscan->catalog_view)
-	{
-		CatalogViewEndScan(sysscan->catalog_view);
-		pfree(sysscan);
-		return;
-	}
 	if (sysscan->slot)
 	{
 		ExecDropSingleTupleTableSlot(sysscan->slot);
@@ -824,10 +783,11 @@ systable_endscan_ordered(SysScanDesc sysscan)
  * systable_inplace_update_begin --- update a row "in place" (overwrite it)
  *
  * Overwriting violates both MVCC and transactional safety, so the uses of
- * this function in Postgres are extremely limited.  Nonetheless we find some
- * places to use it.  See README.tuplock section "Locking to write
- * inplace-updated tables" and later sections for expectations of readers and
- * writers of a table that gets inplace updates.  Standard flow:
+ * this function in Postgres are extremely limited.  This makes no effort to
+ * support updating cache key columns or other indexed columns.  Nonetheless
+ * we find some places to use it.  See README.tuplock section "Locking to
+ * write inplace-updated tables" and later sections for expectations of
+ * readers and writers of a table that gets inplace updates.  Standard flow:
  *
  * ... [any slow preparation not requiring oldtup] ...
  * systable_inplace_update_begin([...], &tup, &inplace_state);

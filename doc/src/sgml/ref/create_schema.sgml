@@ -193,12 +193,15 @@ CREATE VIEW hollywood.winners AS
   </para>
 
   <para>
-   The SQL standard specifies that the subcommands in <command>CREATE
-   SCHEMA</command> can appear in any order.  The present
-   <productname>PostgreSQL</productname> implementation does not
-   handle all cases of forward references in subcommands; it might
-   sometimes be necessary to reorder the subcommands in order to avoid
-   forward references.
+   The SQL standard suggests, without saying so in so many words, that the
+   subcommands in <command>CREATE SCHEMA</command> can appear in any
+   order; but the only actual requirement it gives is that foreign keys
+   referencing table definitions that appear in later <command>CREATE
+   SCHEMA</command> subcommands should be accepted.  The
+   present <productname>PostgreSQL</productname> implementation handles
+   that case, but does not handle all other cases of forward references in
+   subcommands; it might sometimes be necessary to reorder the subcommands
+   in order to avoid forward references.
   </para>
 
   <para>

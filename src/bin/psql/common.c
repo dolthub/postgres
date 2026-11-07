@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2026, PostgreSQL Global Development Group
  *
  * src/bin/psql/common.c
  */
@@ -28,6 +28,7 @@
 #include "fe_utils/mbprint.h"
 #include "fe_utils/string_utils.h"
 #include "mainloop.h"
+#include "mb/pg_wchar.h"
 #include "portability/instr_time.h"
 #include "settings.h"
 
@@ -330,7 +331,8 @@ psql_setup_cancel_handler(void)
 }
 
 
-/* ConnectionUp
+/*
+ * ConnectionUp
  *
  * Returns whether our backend connection is still there.
  */
@@ -342,7 +344,8 @@ ConnectionUp(void)
 
 
 
-/* CheckConnection
+/*
+ * CheckConnection
  *
  * Verify that we still have a good connection to the backend, and if not,
  * see if it can be restored.
@@ -666,14 +669,14 @@ PSQLexec(const char *query)
 
 	if (pset.echo_hidden != PSQL_ECHO_HIDDEN_OFF)
 	{
-		printf(_("/******** QUERY *********/\n"
+		printf(_("/**** INTERNAL QUERY ****/\n"
 				 "%s\n"
 				 "/************************/\n\n"), query);
 		fflush(stdout);
 		if (pset.logfile)
 		{
 			fprintf(pset.logfile,
-					_("/******** QUERY *********/\n"
+					_("/**** INTERNAL QUERY ****/\n"
 					  "%s\n"
 					  "/************************/\n\n"), query);
 			fflush(pset.logfile);
@@ -1025,7 +1028,7 @@ PrintQueryStatus(PGresult *result, FILE *printQueryFout)
 	if (pset.logfile)
 		fprintf(pset.logfile, "%s\n", cmdstatus);
 
-	snprintf(buf, sizeof(buf), "%u", (unsigned int) PQoidValue(result));
+	snprintf(buf, sizeof(buf), "%u", PQoidValue(result));
 	SetVariable(pset.vars, "LASTOID", buf);
 }
 
@@ -1794,15 +1797,36 @@ ExecQueryAndProcessResults(const char *query,
 		PsqlScanState scan_state;
 		PQExpBuffer query_buf;
 		promptStatus_t prompt_tmp;
+		PsqlScanResult scan_result;
 
 		scan_state = psql_scan_create(&psqlscan_callbacks);
 		psql_scan_setup(scan_state, query, strlen(query),
 						pset.encoding, standard_strings());
 		query_buf = createPQExpBuffer();
 
-		(void) psql_scan(scan_state, query_buf, &prompt_tmp);
+		/*
+		 * A semicolon ends only one sub-command; keep scanning so that COPY
+		 * FROM STDIN commands past the first semicolon are counted too.  The
+		 * count accumulates in scan_state across the psql_scan() calls.
+		 */
+		do
+		{
+			scan_result = psql_scan(scan_state, query_buf, &prompt_tmp);
+		} while (scan_result == PSCAN_SEMICOLON);
 
-		num_copy_from_stdin = psql_scan_count_copy_from_stdin(scan_state);
+		/*
+		 * We expect the result now to be PSCAN_EOL.  If it is PSCAN_BACKSLASH
+		 * or PSCAN_INCOMPLETE, the server will get a parse error and refuse
+		 * to execute any part of the command string, so don't expect any
+		 * PGRES_COPY_IN results.  (This will mean that we don't attempt to
+		 * discard any following data, but this seems consistent with the
+		 * general contract of psql_scan_count_copy_from_stdin, which is that
+		 * it only promises to count syntactically-valid COPY commands.)
+		 */
+		if (scan_result == PSCAN_EOL)
+			num_copy_from_stdin = psql_scan_count_copy_from_stdin(scan_state);
+		else
+			num_copy_from_stdin = 0;
 
 		destroyPQExpBuffer(query_buf);
 		psql_scan_destroy(scan_state);
@@ -2595,6 +2619,48 @@ command_no_begin(const char *query)
 
 
 /*
+ * addQueryComment
+ *
+ * Reset buf and insert a comment holding label.  The comment will show up
+ * in -E output and in the server log.
+ *
+ * If it's safe, we attempt to translate the label string.
+ * (addQueryComment is marked as a gettext trigger, so this requires no
+ * special effort at call sites.)
+ */
+void
+addQueryComment(PQExpBuffer buf, const char *label)
+{
+#if defined(ENABLE_NLS)
+	const char *server_enc = PQparameterStatus(pset.db, "server_encoding");
+	int			client_enc = PQclientEncoding(pset.db);
+
+	/*
+	 * We must skip translation if it would cause the server to reject the
+	 * query due to an encoding conversion/verification failure.  For now it
+	 * seems sufficient to handle only the case of equal client and server
+	 * encodings: then the server just verifies the string in that encoding,
+	 * and we can run the same check here.  It's necessary to check for this
+	 * because we can't be 100% sure which encoding gettext() thinks it should
+	 * produce.  If it is indeed different from our client encoding, the
+	 * result may look like junk to a human, but it won't cause an error.
+	 */
+	if (server_enc != NULL &&
+		pg_char_to_encoding(server_enc) == client_enc)
+	{
+		const char *translated = _(label);
+		int			len = strlen(translated);
+
+		if (pg_encoding_verifymbstr(client_enc, translated, len) == len)
+			label = translated;
+	}
+#endif
+
+	printfPQExpBuffer(buf, "/* %s */\n", label);
+}
+
+
+/*
  * Test if the current user is a database superuser.
  */
 bool
@@ -2688,7 +2754,8 @@ get_conninfo_value(const char *keyword)
 	return res;
 }
 
-/* expand_tilde
+/*
+ * expand_tilde
  *
  * substitute '~' with HOME or '~username' with username's home dir
  *

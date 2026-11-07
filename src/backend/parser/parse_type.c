@@ -3,7 +3,7 @@
  * parse_type.c
  *		handle type operations for parser
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -15,7 +15,6 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
-#include "access/doltcatalog.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "lib/stringinfo.h"
@@ -169,11 +168,7 @@ LookupTypeNameExtended(ParseState *pstate,
 		/* deconstruct the name list */
 		DeconstructQualifiedName(typeName->names, &schemaname, &typname);
 
-		if (dg_catalog_lookup_type(schemaname, typname, temp_ok, &typoid))
-		{
-			/* Canonical membership is authoritative, including a miss. */
-		}
-		else if (schemaname)
+		if (schemaname)
 		{
 			/* Look in specific schema only */
 			Oid			namespaceId;
@@ -374,7 +369,7 @@ typenameTypeMod(ParseState *pstate, const TypeName *typeName, Type typ)
 	 * Currently, we allow simple numeric constants, string literals, and
 	 * identifiers; possibly this list could be extended.
 	 */
-	datums = (Datum *) palloc(list_length(typeName->typmods) * sizeof(Datum));
+	datums = palloc_array(Datum, list_length(typeName->typmods));
 	n = 0;
 	foreach(l, typeName->typmods)
 	{
@@ -387,7 +382,7 @@ typenameTypeMod(ParseState *pstate, const TypeName *typeName, Type typ)
 
 			if (IsA(&ac->val, Integer))
 			{
-				cstr = psprintf("%ld", (long) intVal(&ac->val));
+				cstr = psprintf("%d", intVal(&ac->val));
 			}
 			else if (IsA(&ac->val, Float))
 			{

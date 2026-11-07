@@ -90,12 +90,13 @@ gettoken(WORKSTATE *state, int32 *val)
 				else
 				{
 					long		lval;
+					char	   *endptr;
 
 					nnn[innn] = '\0';
 					errno = 0;
-					lval = strtol(nnn, NULL, 0);
+					lval = strtol(nnn, &endptr, 10);
 					*val = (int32) lval;
-					if (errno != 0 || (long) *val != lval)
+					if (errno != 0 || *endptr != '\0' || (long) *val != lval)
 						return ERR;
 					state->state = WAITOPERATOR;
 					return (state->count && *(state->buf) == '\0')
@@ -135,7 +136,7 @@ gettoken(WORKSTATE *state, int32 *val)
 static void
 pushquery(WORKSTATE *state, int32 type, int32 val)
 {
-	NODE	   *tmp = (NODE *) palloc(sizeof(NODE));
+	NODE	   *tmp = palloc_object(NODE);
 
 	tmp->type = type;
 	tmp->val = val;
@@ -346,7 +347,7 @@ gin_bool_consistent(QUERYTYPE *query, bool *check)
 	 * extraction code in ginint4_queryextract.
 	 */
 	gcv.first = items;
-	gcv.mapped_check = (bool *) palloc(sizeof(bool) * query->size);
+	gcv.mapped_check = palloc_array(bool, query->size);
 	for (i = 0; i < query->size; i++)
 	{
 		if (items[i].type == VAL)
@@ -659,7 +660,7 @@ infix(INFIX *in, bool first)
 
 		nrm.curpol = in->curpol;
 		nrm.buflen = 16;
-		nrm.cur = nrm.buf = (char *) palloc(sizeof(char) * nrm.buflen);
+		nrm.cur = nrm.buf = palloc_array(char, nrm.buflen);
 
 		/* get right operand */
 		infix(&nrm, false);
@@ -697,7 +698,7 @@ bqarr_out(PG_FUNCTION_ARGS)
 
 	nrm.curpol = GETQUERY(query) + query->size - 1;
 	nrm.buflen = 32;
-	nrm.cur = nrm.buf = (char *) palloc(sizeof(char) * nrm.buflen);
+	nrm.cur = nrm.buf = palloc_array(char, nrm.buflen);
 	*(nrm.cur) = '\0';
 	infix(&nrm, true);
 

@@ -1,13 +1,13 @@
 # German message translation file for pg_walsummary
-# Copyright (C) 2024 PostgreSQL Global Development Group
+# Copyright (C) 2026 PostgreSQL Global Development Group
 # This file is distributed under the same license as the pg_walsummary (PostgreSQL) package.
 #
 msgid ""
 msgstr ""
-"Project-Id-Version: pg_walsummary (PostgreSQL) 17\n"
+"Project-Id-Version: pg_walsummary (PostgreSQL) 19\n"
 "Report-Msgid-Bugs-To: pgsql-bugs@lists.postgresql.org\n"
-"POT-Creation-Date: 2026-08-08 06:24+0000\n"
-"PO-Revision-Date: 2024-06-22 07:35+0200\n"
+"POT-Creation-Date: 2026-05-28 19:27+0000\n"
+"PO-Revision-Date: 2026-04-14 07:23+0200\n"
 "Last-Translator: Peter Eisentraut <peter@eisentraut.org>\n"
 "Language-Team: German <pgsql-translators@postgresql.org>\n"
 "Language: de\n"
@@ -15,22 +15,22 @@ msgstr ""
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 
-#: ../../../src/common/logging.c:279
+#: ../../../src/common/logging.c:293 ../../../src/common/logging.c:295
 #, c-format
 msgid "error: "
 msgstr "Fehler: "
 
-#: ../../../src/common/logging.c:286
+#: ../../../src/common/logging.c:302 ../../../src/common/logging.c:304
 #, c-format
 msgid "warning: "
 msgstr "Warnung: "
 
-#: ../../../src/common/logging.c:297
+#: ../../../src/common/logging.c:315 ../../../src/common/logging.c:317
 #, c-format
 msgid "detail: "
 msgstr "Detail: "
 
-#: ../../../src/common/logging.c:304
+#: ../../../src/common/logging.c:324 ../../../src/common/logging.c:326
 #, c-format
 msgid "hint: "
 msgstr "Tipp: "
@@ -113,6 +113,11 @@ msgstr "%s muss im Bereich %d..%d sein"
 #, c-format
 msgid "unrecognized sync method: %s"
 msgstr "unbekannte Sync-Methode: %s"
+
+#: ../../fe_utils/option_utils.c:139
+#, c-format
+msgid "options %s and %s cannot be used together"
+msgstr "Optionen %s und %s können nicht zusammen verwendet werden"
 
 #: pg_walsummary.c:86 pg_walsummary.c:94
 #, c-format

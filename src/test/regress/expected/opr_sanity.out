@@ -487,7 +487,7 @@ AND case proargtypes[array_length(proargtypes, 1)-1]
 	ELSE (SELECT t.oid
 		  FROM pg_type t
 		  WHERE t.typarray = proargtypes[array_length(proargtypes, 1)-1])
-	END  != provariadic;
+	END IS DISTINCT FROM provariadic;
  oid | provariadic | proargtypes 
 -----+-------------+-------------
 (0 rows)
@@ -880,6 +880,16 @@ bytea(integer)
 bytea(bigint)
 bytea_larger(bytea,bytea)
 bytea_smaller(bytea,bytea)
+oid8eq(oid8,oid8)
+oid8ne(oid8,oid8)
+oid8lt(oid8,oid8)
+oid8le(oid8,oid8)
+oid8gt(oid8,oid8)
+oid8ge(oid8,oid8)
+btoid8cmp(oid8,oid8)
+bytea(uuid)
+tid_block(tid)
+tid_offset(tid)
 -- Check that functions without argument are not marked as leakproof.
 SELECT p1.oid::regprocedure
 FROM pg_proc p1 JOIN pg_namespace pn
@@ -1470,7 +1480,7 @@ WHERE aggfnoid = 0 OR aggtransfn = 0 OR
     (aggkind = 'n' AND aggnumdirectargs > 0) OR
     aggfinalmodify NOT IN ('r', 's', 'w') OR
     aggmfinalmodify NOT IN ('r', 's', 'w') OR
-    aggtranstype = 0 OR aggtransspace < 0 OR aggmtransspace < 0;
+    aggtranstype = 0 OR aggmtransspace < 0;
  ctid | aggfnoid 
 ------+----------
 (0 rows)
@@ -2102,16 +2112,7 @@ ORDER BY 1, 2, 3;
        4000 |           28 | ^@
        4000 |           29 | <^
        4000 |           30 | >^
-       9001 |            1 | <
-       9001 |            1 | ~<~
-       9001 |            2 | <=
-       9001 |            2 | ~<=~
-       9001 |            3 | =
-       9001 |            4 | >=
-       9001 |            4 | ~>=~
-       9001 |            5 | >
-       9001 |            5 | ~>~
-(133 rows)
+(124 rows)
 
 -- Check that all opclass search operators have selectivity estimators.
 -- This is not absolutely required, but it seems a reasonable thing
@@ -2222,25 +2223,27 @@ LEFT JOIN pg_amproc AS amp ON amp.amprocfamily = opf.oid AND
 WHERE am.amname = 'btree' AND
     amp.amproc IS DISTINCT FROM 'btequalimage'::regproc
 ORDER BY 1, 2, 3;
-        proc        |  opfamily_name   |   opclass_name   |    opcintype     
---------------------+------------------+------------------+------------------
- btvarstrequalimage | bpchar_ops       | bpchar_ops       | character
- btvarstrequalimage | text_ops         | name_ops         | name
- btvarstrequalimage | text_ops         | text_ops         | text
- btvarstrequalimage | text_ops         | varchar_ops      | text
-                    | array_ops        | array_ops        | anyarray
-                    | float_ops        | float4_ops       | real
-                    | float_ops        | float8_ops       | double precision
-                    | interval_ops     | interval_ops     | interval
-                    | jsonb_ops        | jsonb_ops        | jsonb
-                    | multirange_ops   | multirange_ops   | anymultirange
-                    | numeric_ops      | numeric_ops      | numeric
-                    | range_ops        | range_ops        | anyrange
-                    | record_image_ops | record_image_ops | record
-                    | record_ops       | record_ops       | record
-                    | tsquery_ops      | tsquery_ops      | tsquery
-                    | tsvector_ops     | tsvector_ops     | tsvector
-(16 rows)
+        proc        |   opfamily_name    |    opclass_name    |    opcintype     
+--------------------+--------------------+--------------------+------------------
+ btvarstrequalimage | text_ops           | name_ops           | name
+ btvarstrequalimage | text_ops           | text_ops           | text
+ btvarstrequalimage | text_ops           | varchar_ops        | text
+                    | array_ops          | array_ops          | anyarray
+                    | bpchar_ops         | bpchar_ops         | character
+                    | bpchar_pattern_ops | bpchar_pattern_ops | character
+                    | float_ops          | float4_ops         | real
+                    | float_ops          | float8_ops         | double precision
+                    | interval_ops       | interval_ops       | interval
+                    | jsonb_ops          | jsonb_ops          | jsonb
+                    | multirange_ops     | multirange_ops     | anymultirange
+                    | numeric_ops        | numeric_ops        | numeric
+                    | oidvector_ops      | oidvector_ops      | oidvector
+                    | range_ops          | range_ops          | anyrange
+                    | record_image_ops   | record_image_ops   | record
+                    | record_ops         | record_ops         | record
+                    | tsquery_ops        | tsquery_ops        | tsquery
+                    | tsvector_ops       | tsvector_ops       | tsvector
+(18 rows)
 
 -- **************** pg_index ****************
 -- Look for illegal values in pg_index fields.

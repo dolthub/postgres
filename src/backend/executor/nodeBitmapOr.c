@@ -3,7 +3,7 @@
  * nodeBitmapOr.c
  *	  routines to handle BitmapOr nodes.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -12,7 +12,8 @@
  *
  *-------------------------------------------------------------------------
  */
-/* INTERFACE ROUTINES
+/*
+ * INTERFACE ROUTINES
  *		ExecInitBitmapOr	- initialize the BitmapOr node
  *		MultiExecBitmapOr	- retrieve the result bitmap from the node
  *		ExecEndBitmapOr		- shut down the BitmapOr node
@@ -29,7 +30,9 @@
 #include "postgres.h"
 
 #include "executor/executor.h"
+#include "executor/instrument.h"
 #include "executor/nodeBitmapOr.h"
+#include "nodes/tidbitmap.h"
 #include "miscadmin.h"
 
 

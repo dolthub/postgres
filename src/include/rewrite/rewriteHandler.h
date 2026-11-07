@@ -4,7 +4,7 @@
  *		External interface to query rewriter.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/rewrite/rewriteHandler.h
@@ -15,7 +15,6 @@
 #define REWRITEHANDLER_H
 
 #include "nodes/parsenodes.h"
-#include "rewrite/prs2lock.h"
 #include "utils/relcache.h"
 
 extern List *QueryRewrite(Query *parsetree);
@@ -25,7 +24,6 @@ extern void AcquireRewriteLocks(Query *parsetree,
 
 extern Node *build_column_default(Relation rel, int attrno);
 
-extern List *RewriteRuleActions(Relation relation, RewriteRule *rule);
 extern Query *get_view_query(Relation view);
 extern bool view_has_instead_trigger(Relation view, CmdType event,
 									 List *mergeActionList);

@@ -3,7 +3,7 @@
  * backend_startup.c
  *	  Backend startup code
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -59,7 +59,7 @@ ConnectionTiming conn_timing = {.ready_for_use = TIMESTAMP_MINUS_INFINITY};
 
 static void BackendInitialize(ClientSocket *client_sock, CAC_state cac);
 static int	ProcessSSLStartup(Port *port);
-static int	ProcessStartupPacket(Port *port, bool ssl_done, bool gss_done);
+static int	ProcessStartupPacket(Port *port);
 static void ProcessCancelRequestPacket(Port *port, void *pkt, int pktlen);
 static void SendNegotiateProtocolVersion(List *unrecognized_protocol_options);
 static void process_startup_packet_die(SIGNAL_ARGS);
@@ -292,7 +292,7 @@ BackendInitialize(ClientSocket *client_sock, CAC_state cac)
 	 * packet).
 	 */
 	if (status == STATUS_OK)
-		status = ProcessStartupPacket(port, false, false);
+		status = ProcessStartupPacket(port);
 
 	/*
 	 * If we're going to reject the connection due to database state, say so
@@ -481,20 +481,27 @@ reject:
  * send anything to the client, which would typically be appropriate
  * if we detect a communications failure.)
  *
- * Set ssl_done and/or gss_done when negotiation of an encrypted layer
- * (currently, TLS or GSSAPI) is completed. A successful negotiation of either
- * encryption layer sets both flags, but a rejected negotiation sets only the
- * flag for that layer, since the client may wish to try the other one. We
- * should make no assumption here about the order in which the client may make
- * requests.
  */
 static int
-ProcessStartupPacket(Port *port, bool ssl_done, bool gss_done)
+ProcessStartupPacket(Port *port)
 {
 	int32		len;
-	char	   *buf;
+	char	   *buf = NULL;
 	ProtocolVersion proto;
 	MemoryContext oldcontext;
+	bool		gss_done;
+	bool		ssl_done;
+
+	/*
+	 * Set ssl_done and/or gss_done when negotiation of an encrypted layer
+	 * (currently, TLS or GSSAPI) is completed.  A successful negotiation of
+	 * either encryption layer sets both flags, but a rejected negotiation
+	 * sets only the flag for that layer, since the client may wish to try the
+	 * other one.  We should make no assumption here about the order in which
+	 * the client may make requests.
+	 */
+	gss_done = false;
+	ssl_done = false;
 
 retry:
 	pq_startmsgread();
@@ -517,7 +524,7 @@ retry:
 		 * scanners, which may be less benign, but it's not really our job to
 		 * notice those.)
 		 */
-		return STATUS_ERROR;
+		goto fail;
 	}
 
 	if (pq_getbytes(((char *) &len) + 1, 3) == EOF)
@@ -527,7 +534,7 @@ retry:
 			ereport(COMMERROR,
 					(errcode(ERRCODE_PROTOCOL_VIOLATION),
 					 errmsg("incomplete startup packet")));
-		return STATUS_ERROR;
+		goto fail;
 	}
 
 	len = pg_ntoh32(len);
@@ -539,7 +546,7 @@ retry:
 		ereport(COMMERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg("invalid length of startup packet")));
-		return STATUS_ERROR;
+		goto fail;
 	}
 
 	/*
@@ -555,7 +562,7 @@ retry:
 		ereport(COMMERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg("incomplete startup packet")));
-		return STATUS_ERROR;
+		goto fail;
 	}
 	pq_endmsgread();
 
@@ -569,7 +576,7 @@ retry:
 	{
 		ProcessCancelRequestPacket(port, buf, len);
 		/* Not really an error, but we don't want to proceed further */
-		return STATUS_ERROR;
+		goto fail;
 	}
 
 	if (proto == NEGOTIATE_SSL_CODE && !ssl_done)
@@ -608,13 +615,16 @@ retry:
 			ereport(COMMERROR,
 					(errcode_for_socket_access(),
 					 errmsg("failed to send SSL negotiation response: %m")));
-			return STATUS_ERROR;	/* close the connection */
+			goto fail;			/* close the connection */
 		}
 
 #ifdef USE_SSL
 		if (SSLok == 'S' && secure_open_server(port) == -1)
-			return STATUS_ERROR;
+			goto fail;
 #endif
+
+		pfree(buf);
+		buf = NULL;
 
 		/*
 		 * At this point we should have no data already buffered.  If we do,
@@ -676,13 +686,16 @@ retry:
 			ereport(COMMERROR,
 					(errcode_for_socket_access(),
 					 errmsg("failed to send GSSAPI negotiation response: %m")));
-			return STATUS_ERROR;	/* close the connection */
+			goto fail;			/* close the connection */
 		}
 
 #ifdef ENABLE_GSS
 		if (GSSok == 'G' && secure_open_gssapi(port) == -1)
-			return STATUS_ERROR;
+			goto fail;
 #endif
+
+		pfree(buf);
+		buf = NULL;
 
 		/*
 		 * At this point we should have no data already buffered.  If we do,
@@ -845,6 +858,8 @@ retry:
 		if (PG_PROTOCOL_MINOR(proto) > PG_PROTOCOL_MINOR(PG_PROTOCOL_LATEST) ||
 			unrecognized_protocol_options != NIL)
 			SendNegotiateProtocolVersion(unrecognized_protocol_options);
+
+		list_free_deep(unrecognized_protocol_options);
 	}
 
 	/* Check a user name was given. */
@@ -866,10 +881,9 @@ retry:
 	if (strlen(port->user_name) >= NAMEDATALEN)
 		port->user_name[NAMEDATALEN - 1] = '\0';
 
+	Assert(MyBackendType == B_BACKEND || MyBackendType == B_DEAD_END_BACKEND);
 	if (am_walsender)
 		MyBackendType = B_WAL_SENDER;
-	else
-		MyBackendType = B_BACKEND;
 
 	/*
 	 * Normal walsender backends, e.g. for streaming replication, are not
@@ -887,7 +901,16 @@ retry:
 	 */
 	MemoryContextSwitchTo(oldcontext);
 
+	pfree(buf);
+
 	return STATUS_OK;
+
+fail:
+	/* be tidy, just to avoid Valgrind complaints */
+	if (buf)
+		pfree(buf);
+
+	return STATUS_ERROR;
 }
 
 /*

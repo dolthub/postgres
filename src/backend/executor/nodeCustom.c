@@ -3,7 +3,7 @@
  * nodeCustom.c
  *		Routines to handle execution of custom scan node
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * ------------------------------------------------------------------------
@@ -55,7 +55,7 @@ ExecInitCustomScan(CustomScan *cscan, EState *estate, int eflags)
 	/*
 	 * open the scan relation, if any
 	 */
-	if (scanrelid > 0 && exec_rt_fetch(scanrelid, estate)->rtekind != RTE_DOLT)
+	if (scanrelid > 0)
 	{
 		scan_rel = ExecOpenScanRelation(estate, scanrelid, eflags);
 		css->ss.ss_currentRelation = scan_rel;
@@ -79,18 +79,14 @@ ExecInitCustomScan(CustomScan *cscan, EState *estate, int eflags)
 		TupleDesc	scan_tupdesc;
 
 		scan_tupdesc = ExecTypeFromTL(cscan->custom_scan_tlist);
-		ExecInitScanTupleSlot(estate, &css->ss, scan_tupdesc, slotOps);
-
-		/*
-		 * Native versioned bindings retain their RTE for whole-row/EPQ
-		 * support.
-		 */
-		tlistvarno = scanrelid > 0 && exec_rt_fetch(scanrelid, estate)->rtekind == RTE_DOLT ? scanrelid : INDEX_VAR;
+		ExecInitScanTupleSlot(estate, &css->ss, scan_tupdesc, slotOps, 0);
+		/* Node's targetlist will contain Vars with varno = INDEX_VAR */
+		tlistvarno = INDEX_VAR;
 	}
 	else
 	{
 		ExecInitScanTupleSlot(estate, &css->ss, RelationGetDescr(scan_rel),
-							  slotOps);
+							  slotOps, 0);
 		/* Node's targetlist will contain Vars with varno = scanrelid */
 		tlistvarno = scanrelid;
 	}

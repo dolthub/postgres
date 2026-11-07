@@ -3,7 +3,7 @@
  * dirmod.c
  *	  directory handling functions
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *	This includes replacement versions of functions that work on
@@ -99,7 +99,7 @@ pgrename(const char *from, const char *to)
  * Check if _pglstat64()'s reason for failure was STATUS_DELETE_PENDING.
  * This doesn't apply to Cygwin, which has its own lstat() that would report
  * the case as EACCES.
-*/
+ */
 static bool
 lstat_error_was_status_delete_pending(void)
 {

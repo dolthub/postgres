@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2026, PostgreSQL Global Development Group
  *
  * src/bin/psql/help.c
  */
@@ -220,7 +220,8 @@ slashUsage(unsigned short int pager)
 	HELP0("Informational\n");
 	HELP0("  (options: S = show system objects, x = expanded mode, + = additional detail)\n");
 	HELP0("  \\d[Sx+]                list tables, views, and sequences\n");
-	HELP0("  \\d[S+]   NAME          describe table, view, sequence, or index\n");
+	HELP0("  \\d[Sx+]  NAME          describe table, view, sequence, or index\n");
+	HELP0("                         (x applies only to sequences)\n");
 	HELP0("  \\da[Sx]  [PATTERN]     list aggregates\n");
 	HELP0("  \\dA[x+]  [PATTERN]     list access methods\n");
 	HELP0("  \\dAc[x+] [AMPTRN [TYPEPTRN]]  list operator classes\n");
@@ -267,7 +268,7 @@ slashUsage(unsigned short int pager)
 	HELP0("  \\du[Sx+] [PATTERN]     list roles\n");
 	HELP0("  \\dv[Sx+] [PATTERN]     list views\n");
 	HELP0("  \\dx[x+]  [PATTERN]     list extensions\n");
-	HELP0("  \\dX[x]   [PATTERN]     list extended statistics\n");
+	HELP0("  \\dX[x+]  [PATTERN]     list extended statistics\n");
 	HELP0("  \\dy[x+]  [PATTERN]     list event triggers\n");
 	HELP0("  \\l[x+]   [PATTERN]     list databases\n");
 	HELP0("  \\sf[+]   FUNCNAME      show a function's definition\n");
@@ -290,12 +291,7 @@ slashUsage(unsigned short int pager)
 	HELPN("  \\H                     toggle HTML output mode (currently %s)\n",
 		  ON(pset.popt.topt.format == PRINT_HTML));
 	HELP0("  \\pset [NAME [VALUE]]   set table output option\n"
-		  "                         (border|columns|csv_fieldsep|expanded|fieldsep|\n"
-		  "                         fieldsep_zero|footer|format|linestyle|null|\n"
-		  "                         numericlocale|pager|pager_min_lines|recordsep|\n"
-		  "                         recordsep_zero|tableattr|title|tuples_only|\n"
-		  "                         unicode_border_linestyle|unicode_column_linestyle|\n"
-		  "                         unicode_header_linestyle|xheader_width)\n");
+		  "                         see \"\\? variables\" for valid options\n");
 	HELPN("  \\t [on|off]            show only rows (currently %s)\n",
 		  ON(pset.popt.topt.tuples_only));
 	HELP0("  \\T [STRING]            set HTML <table> tag attributes, or unset if none\n");
@@ -483,6 +479,10 @@ helpVariables(unsigned short int pager)
 	HELPN("  csv_fieldsep\n"
 		  "    field separator for CSV output format (default \"%c\")\n",
 		  DEFAULT_CSV_FIELD_SEP);
+	HELP0("  display_false\n"
+		  "    set the string to be printed in place of a Boolean \"false\"\n");
+	HELP0("  display_true\n"
+		  "    set the string to be printed in place of a Boolean \"true\"\n");
 	HELP0("  expanded (or x)\n"
 		  "    expanded output [on, off, auto]\n");
 	HELPN("  fieldsep\n"
@@ -756,7 +756,7 @@ print_copyright(void)
 {
 	puts("PostgreSQL Database Management System\n"
 		 "(also known as Postgres, formerly known as Postgres95)\n\n"
-		 "Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group\n\n"
+		 "Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group\n\n"
 		 "Portions Copyright (c) 1994, The Regents of the University of California\n\n"
 		 "Permission to use, copy, modify, and distribute this software and its\n"
 		 "documentation for any purpose, without fee, and without a written agreement\n"

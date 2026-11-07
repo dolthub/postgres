@@ -147,7 +147,7 @@ px_set_debug_handler(void (*handler) (const char *))
 }
 
 void
-px_debug(const char *fmt,...)
+px_debug(const char *fmt, ...)
 {
 	va_list		ap;
 
@@ -292,7 +292,7 @@ px_find_combo(const char *name, PX_Combo **res)
 
 	PX_Combo   *cx;
 
-	cx = palloc0(sizeof(*cx));
+	cx = palloc0_object(PX_Combo);
 	buf = pstrdup(name);
 
 	err = parse_cipher_name(buf, &s_cipher, &s_pad);

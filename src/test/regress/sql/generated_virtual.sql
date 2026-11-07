@@ -243,6 +243,9 @@ COPY gtest3 (a, b) FROM stdin;
 
 SELECT * FROM gtest3 ORDER BY a;
 
+-- COPY JSON should exclude generated columns, same as text/CSV
+COPY gtest1 TO stdout WITH (FORMAT json);
+
 -- null values
 CREATE TABLE gtest2 (a int PRIMARY KEY, b int GENERATED ALWAYS AS (NULL) VIRTUAL);
 INSERT INTO gtest2 VALUES (1);
@@ -260,7 +263,7 @@ CREATE TYPE double_int as (a int, b int);
 CREATE TABLE gtest4 (
     a int,
     b double_int GENERATED ALWAYS AS ((a * 2, a * 3)) VIRTUAL
-);
+);  -- fails, user-defined type
 --INSERT INTO gtest4 VALUES (1), (6);
 --SELECT * FROM gtest4;
 
@@ -321,8 +324,13 @@ CREATE TABLE gtest20 (a int PRIMARY KEY, b int GENERATED ALWAYS AS (a * 2) VIRTU
 INSERT INTO gtest20 (a) VALUES (10);  -- ok
 INSERT INTO gtest20 (a) VALUES (30);  -- violates constraint
 
-ALTER TABLE gtest20 ALTER COLUMN b SET EXPRESSION AS (a * 100);  -- violates constraint (currently not supported)
-ALTER TABLE gtest20 ALTER COLUMN b SET EXPRESSION AS (a * 3);  -- ok (currently not supported)
+ALTER TABLE gtest20 ALTER COLUMN b SET EXPRESSION AS (a * 100);  -- violates constraint
+ALTER TABLE gtest20 ALTER COLUMN b SET EXPRESSION AS (a * 3);  -- ok
+-- table rewrite should not happen
+SELECT pg_relation_filenode('gtest20') AS gtest20_filenode \gset
+ALTER TABLE gtest20 ALTER COLUMN b SET EXPRESSION AS (a * 4), ADD COLUMN c INT DEFAULT 11;
+SELECT pg_relation_filenode('gtest20') = :gtest20_filenode AS is_same_file;
+\d gtest20
 
 CREATE TABLE gtest20a (a int PRIMARY KEY, b int GENERATED ALWAYS AS (a * 2) VIRTUAL);
 INSERT INTO gtest20a (a) VALUES (10);
@@ -343,6 +351,16 @@ CREATE TABLE gtest20c (a int, b int GENERATED ALWAYS AS (a * 2) VIRTUAL);
 ALTER TABLE gtest20c ADD CONSTRAINT whole_row_check CHECK (gtest20c IS NOT NULL);
 INSERT INTO gtest20c VALUES (1);  -- ok
 INSERT INTO gtest20c VALUES (NULL);  -- fails
+ALTER TABLE gtest20c ALTER COLUMN b SET EXPRESSION AS (NULL::int);  -- violates constraint
+
+-- index with whole-row reference needs rebuild
+CREATE TABLE gtest20d (a int, b int GENERATED ALWAYS AS (a * 2) VIRTUAL);
+INSERT INTO gtest20d VALUES (1), (1);
+CREATE INDEX gtest20d_idx1 ON gtest20d (a) WHERE gtest20d = ROW (1, 2);
+
+ALTER TABLE gtest20d ALTER COLUMN b SET EXPRESSION AS (a * 2::bigint);  -- index rebuild
+CREATE INDEX gtest20d_idx2 ON gtest20d ((gtest20d = ROW (1, 2)));
+ALTER TABLE gtest20d ALTER COLUMN b SET EXPRESSION AS (a * 3);  -- index rebuild
 
 -- not-null constraints
 CREATE TABLE gtest21a (a int PRIMARY KEY, b int GENERATED ALWAYS AS (nullif(a, 0)) VIRTUAL NOT NULL);
@@ -493,9 +511,6 @@ CREATE TABLE gtest24nn (a int, b gtestdomainnn GENERATED ALWAYS AS (a * 2) VIRTU
 --INSERT INTO gtest24nn (a) VALUES (4);  -- ok
 --INSERT INTO gtest24nn (a) VALUES (NULL);  -- error
 
--- using user-defined type not yet supported
-CREATE TABLE gtest24xxx (a gtestdomain1, b gtestdomain1, c int GENERATED ALWAYS AS (greatest(a, b)) VIRTUAL);  -- error
-
 -- typed tables (currently not supported)
 CREATE TYPE gtest_type AS (f1 integer, f2 text, f3 bigint);
 CREATE TABLE gtest28 OF gtest_type (f1 WITH OPTIONS GENERATED ALWAYS AS (f2 *2) VIRTUAL);
@@ -560,6 +575,13 @@ ALTER TABLE gtest_child ALTER COLUMN f3 SET EXPRESSION AS (f2 * 10);
 \d gtest_child2
 \d gtest_child3
 SELECT tableoid::regclass, * FROM gtest_parent ORDER BY 1, 2, 3;
+
+-- check constraint was validated based on each partitions's generation expression
+ALTER TABLE gtest_parent ADD CONSTRAINT cc1 CHECK (f3 < 19); -- error
+ALTER TABLE gtest_parent ADD CONSTRAINT cc1 CHECK (f3 < 66); -- error
+ALTER TABLE gtest_parent ADD CONSTRAINT cc1 CHECK (f3 <> 33); -- error
+ALTER TABLE gtest_parent ADD CONSTRAINT cc CHECK (f3 < 67); -- ok
+ALTER TABLE gtest_parent DROP CONSTRAINT cc;
 
 -- alter generation expression of parent and all its children altogether
 ALTER TABLE gtest_parent ALTER COLUMN f3 SET EXPRESSION AS (f2 * 2);
@@ -861,15 +883,19 @@ SELECT attrelid, attname, attgenerated FROM pg_attribute WHERE attgenerated NOT 
 -- these tests are specific to generated_virtual.sql
 --
 
+-- using user-defined type not yet supported
+CREATE TABLE gtest24xxx (a gtestdomain1, b gtestdomain1, c int GENERATED ALWAYS AS (greatest(a, b)) VIRTUAL);  -- error
+
 create table gtest32 (
   a int primary key,
   b int generated always as (a * 2),
   c int generated always as (10 + 10),
-  d int generated always as (coalesce(a, 100)),
-  e int
+  d int generated always as (coalesce(f, 100)),
+  e int,
+  f int
 );
 
-insert into gtest32 values (1), (2);
+insert into gtest32 (a, f) values (1, 1), (2, 2);
 analyze gtest32;
 
 -- Ensure that nullingrel bits are propagated into the generation expressions
@@ -907,11 +933,20 @@ select t2.* from gtest32 t1 left join gtest32 t2 on false;
 select t2.* from gtest32 t1 left join gtest32 t2 on false;
 
 explain (verbose, costs off)
-select * from gtest32 t group by grouping sets (a, b, c, d, e) having c = 20;
-select * from gtest32 t group by grouping sets (a, b, c, d, e) having c = 20;
+select * from gtest32 t group by grouping sets (a, b, c, d, e, f) having c = 20;
+select * from gtest32 t group by grouping sets (a, b, c, d, e, f) having c = 20;
 
 -- Ensure that the virtual generated columns in ALTER COLUMN TYPE USING expression are expanded
 alter table gtest32 alter column e type bigint using b;
+
+-- Ensure that virtual generated column references within SubLinks that should
+-- be transformed into joins can get expanded
+explain (costs off)
+select 1 from gtest32 t1 where exists
+  (select 1 from gtest32 t2 where t1.a > t2.a and t2.b = 2);
+
+select 1 from gtest32 t1 where exists
+  (select 1 from gtest32 t2 where t1.a > t2.a and t2.b = 2);
 
 drop table gtest32;
 
@@ -969,3 +1004,13 @@ select * from gtest_cursor order by id;
 commit;
 
 drop table gtest_cursor;
+
+-- NOT NULL on a partitioned table's virtual column does not prove non-nullness,
+-- because a partition can have a different generation expression
+CREATE TABLE gtestnn_parent2 (a int NOT NULL, b int GENERATED ALWAYS AS (nullif(a, 0)) VIRTUAL NOT NULL) PARTITION BY LIST (a);
+CREATE TABLE gtestnn_child2 PARTITION OF gtestnn_parent2 (b GENERATED ALWAYS AS (a + 1) VIRTUAL) FOR VALUES IN (0);
+INSERT INTO gtestnn_parent2 VALUES (0);
+EXPLAIN (COSTS OFF)
+SELECT a FROM gtestnn_parent2 WHERE a NOT IN (SELECT b FROM gtestnn_parent2);
+SELECT a FROM gtestnn_parent2 WHERE a NOT IN (SELECT b FROM gtestnn_parent2);
+DROP TABLE gtestnn_parent2;

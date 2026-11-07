@@ -1,4 +1,4 @@
-# Copyright (c) 2023-2025, PostgreSQL Global Development Group
+# Copyright (c) 2023-2026, PostgreSQL Global Development Group
 
 # logical decoding on standby : test logical decoding,
 # recovery conflict and standby promotion.
@@ -71,12 +71,13 @@ sub drop_logical_slots
 }
 
 # Acquire one of the standby logical slots created by create_logical_slots().
-# In case wait is true we are waiting for an active pid on the 'activeslot' slot.
-# If wait is not true it means we are testing a known failure scenario.
+# If wait is true, wait for pg_recvlogical to enter streaming mode.
+# Otherwise, starting replication is expected to fail.
 sub make_slot_active
 {
 	my ($node, $slot_prefix, $wait, $to_stdout, $to_stderr) = @_;
 	my $slot_user_handle;
+	my $timeout = IPC::Run::timeout($default_timeout);
 
 	my $active_slot = $slot_prefix . 'activeslot';
 	$slot_user_handle = IPC::Run::start(
@@ -87,19 +88,20 @@ sub make_slot_active
 			'--option' => 'include-xids=0',
 			'--option' => 'skip-empty-xacts=1',
 			'--file' => '-',
+			'--verbose',
 			'--no-loop',
 			'--start',
 		],
 		'>' => $to_stdout,
 		'2>' => $to_stderr,
-		IPC::Run::timeout($default_timeout));
+		$timeout);
 
 	if ($wait)
 	{
-		# make sure activeslot is in use
-		$node->poll_query_until('testdb',
-			qq[SELECT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '$active_slot' AND active_pid IS NOT NULL)]
-		) or die "slot never became active";
+		# Make sure that pg_recvlogical has entered streaming mode.
+		pump_until($slot_user_handle, $timeout, $to_stderr,
+			qr/streaming initiated/)
+		  or die "pg_recvlogical did not enter streaming mode";
 	}
 	return $slot_user_handle;
 }
@@ -394,8 +396,9 @@ foreach my $i (0 .. 10 * $PostgreSQL::Test::Utils::timeout_default)
 
 # Confirm that the server startup fails with an expected error
 my $logfile = slurp_file($node_standby->logfile());
-ok( $logfile =~
-	  qr/FATAL: .* logical replication slot ".*" exists on the standby, but "hot_standby" = "off"/,
+like(
+	$logfile,
+	qr/FATAL: .* logical replication slot ".*" exists on the standby, but "hot_standby" = "off"/,
 	"the standby ends with an error during startup because hot_standby was disabled"
 );
 $node_standby->adjust_conf('postgresql.conf', 'hot_standby', 'on');
@@ -487,8 +490,9 @@ $node_primary->wait_for_replay_catchup($node_standby);
 ($result, $stdout, $stderr) = $node_standby->psql('otherdb',
 	"SELECT lsn FROM pg_logical_slot_peek_changes('behaves_ok_activeslot', NULL, NULL) ORDER BY lsn DESC LIMIT 1;"
 );
-ok( $stderr =~
-	  m/replication slot "behaves_ok_activeslot" was not created in this database/,
+like(
+	$stderr,
+	qr/replication slot "behaves_ok_activeslot" was not created in this database/,
 	"replaying logical slot from another database fails");
 
 ##################################################
@@ -620,8 +624,9 @@ check_pg_recvlogical_stderr($handle,
 	'postgres',
 	qq[select pg_copy_logical_replication_slot('vacuum_full_inactiveslot', 'vacuum_full_inactiveslot_copy');],
 	replication => 'database');
-ok( $stderr =~
-	  /ERROR:  cannot copy invalidated replication slot "vacuum_full_inactiveslot"/,
+like(
+	$stderr,
+	qr/ERROR:  cannot copy invalidated replication slot "vacuum_full_inactiveslot"/,
 	"invalidated slot cannot be copied");
 
 # Set hot_standby_feedback to on
@@ -755,12 +760,14 @@ wait_until_vacuum_can_remove(
 
 # message should not be issued
 ok( !$node_standby->log_contains(
-		"invalidating obsolete replication slot \"no_conflict_inactiveslot\"", $logstart),
+		"invalidating obsolete replication slot \"no_conflict_inactiveslot\"",
+		$logstart),
 	'inactiveslot slot invalidation is not logged with vacuum on conflict_test'
 );
 
 ok( !$node_standby->log_contains(
-		"invalidating obsolete replication slot \"no_conflict_activeslot\"", $logstart),
+		"invalidating obsolete replication slot \"no_conflict_activeslot\"",
+		$logstart),
 	'activeslot slot invalidation is not logged with vacuum on conflict_test'
 );
 
@@ -875,9 +882,10 @@ check_slots_conflict_reason('wal_level_', 'wal_level_insufficient');
 
 $handle =
   make_slot_active($node_standby, 'wal_level_', 0, \$stdout, \$stderr);
-# We are not able to read from the slot as it requires wal_level >= logical on the primary server
+# We are not able to read from the slot as it requires effective_wal_level >= logical on
+# the primary server
 check_pg_recvlogical_stderr($handle,
-	"logical decoding on standby requires \"wal_level\" >= \"logical\" on the primary"
+	"logical decoding on standby requires \"effective_wal_level\" >= \"logical\" on the primary"
 );
 
 # Restore primary wal_level
@@ -922,7 +930,7 @@ is( $node_standby->safe_psql(
 	'f',
 	'database dropped on standby');
 
-check_slots_dropped('drop_db', $handle);
+check_slots_dropped('drop_db_', $handle);
 
 is($node_standby->slot('otherslot')->{'slot_type'},
 	'logical', 'otherslot on standby not dropped');

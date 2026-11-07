@@ -3,7 +3,7 @@
  * parse_coerce.c
  *		handle type coercions/conversions for parser
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,6 +14,7 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "catalog/pg_cast.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_inherits.h"
@@ -2970,7 +2971,8 @@ check_valid_internal_signature(Oid ret_type,
 }
 
 
-/* TypeCategory()
+/*
+ * TypeCategory()
  *		Assign a category to the specified type OID.
  *
  * NB: this must not return TYPCATEGORY_INVALID.
@@ -2987,7 +2989,8 @@ TypeCategory(Oid type)
 }
 
 
-/* IsPreferredType()
+/*
+ * IsPreferredType()
  *		Check if this type is a preferred type for the given category.
  *
  * If category is TYPCATEGORY_INVALID, then we'll return true for preferred
@@ -3008,7 +3011,8 @@ IsPreferredType(TYPCATEGORY category, Oid type)
 }
 
 
-/* IsBinaryCoercible()
+/*
+ * IsBinaryCoercible()
  *		Check if srctype is binary-coercible to targettype.
  *
  * This notion allows us to cheat and directly exchange values without
@@ -3037,7 +3041,8 @@ IsBinaryCoercible(Oid srctype, Oid targettype)
 	return IsBinaryCoercibleWithCast(srctype, targettype, &castoid);
 }
 
-/* IsBinaryCoercibleWithCast()
+/*
+ * IsBinaryCoercibleWithCast()
  *		Check if srctype is binary-coercible to targettype.
  *
  * This variant also returns the OID of the pg_cast entry if one is involved.

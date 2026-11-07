@@ -3,7 +3,7 @@
  * pquery.c
  *	  POSTGRES process query command code
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -74,7 +74,7 @@ CreateQueryDesc(PlannedStmt *plannedstmt,
 				QueryEnvironment *queryEnv,
 				int instrument_options)
 {
-	QueryDesc  *qd = (QueryDesc *) palloc(sizeof(QueryDesc));
+	QueryDesc  *qd = palloc_object(QueryDesc);
 
 	qd->operation = plannedstmt->commandType;	/* operation */
 	qd->plannedstmt = plannedstmt;	/* plan */
@@ -86,12 +86,13 @@ CreateQueryDesc(PlannedStmt *plannedstmt,
 	qd->params = params;		/* parameter values passed into query */
 	qd->queryEnv = queryEnv;
 	qd->instrument_options = instrument_options;	/* instrumentation wanted? */
+	qd->query_instr_options = 0;
 
 	/* null these fields until set by ExecutorStart */
 	qd->tupDesc = NULL;
 	qd->estate = NULL;
 	qd->planstate = NULL;
-	qd->totaltime = NULL;
+	qd->query_instr = NULL;
 
 	/* not yet executed */
 	qd->already_executed = false;
@@ -165,27 +166,22 @@ ProcessQuery(PlannedStmt *plan,
 	 */
 	if (qc)
 	{
-		switch (queryDesc->operation)
-		{
-			case CMD_SELECT:
-				SetQueryCompletion(qc, CMDTAG_SELECT, queryDesc->estate->es_processed);
-				break;
-			case CMD_INSERT:
-				SetQueryCompletion(qc, CMDTAG_INSERT, queryDesc->estate->es_processed);
-				break;
-			case CMD_UPDATE:
-				SetQueryCompletion(qc, CMDTAG_UPDATE, queryDesc->estate->es_processed);
-				break;
-			case CMD_DELETE:
-				SetQueryCompletion(qc, CMDTAG_DELETE, queryDesc->estate->es_processed);
-				break;
-			case CMD_MERGE:
-				SetQueryCompletion(qc, CMDTAG_MERGE, queryDesc->estate->es_processed);
-				break;
-			default:
-				SetQueryCompletion(qc, CMDTAG_UNKNOWN, queryDesc->estate->es_processed);
-				break;
-		}
+		CommandTag	tag;
+
+		if (queryDesc->operation == CMD_SELECT)
+			tag = CMDTAG_SELECT;
+		else if (queryDesc->operation == CMD_INSERT)
+			tag = CMDTAG_INSERT;
+		else if (queryDesc->operation == CMD_UPDATE)
+			tag = CMDTAG_UPDATE;
+		else if (queryDesc->operation == CMD_DELETE)
+			tag = CMDTAG_DELETE;
+		else if (queryDesc->operation == CMD_MERGE)
+			tag = CMDTAG_MERGE;
+		else
+			tag = CMDTAG_UNKNOWN;
+
+		SetQueryCompletion(qc, tag, queryDesc->estate->es_processed);
 	}
 
 	/*
@@ -393,7 +389,11 @@ FetchStatementTargetList(Node *stmt)
 
 		Assert(!fstmt->ismove);
 		subportal = GetPortalByName(fstmt->portalname);
-		Assert(PortalIsValid(subportal));
+		if (!PortalIsValid(subportal))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_CURSOR),
+					 errmsg("cursor \"%s\" does not exist",
+							fstmt->portalname)));
 		return FetchPortalTargetList(subportal);
 	}
 	if (IsA(stmt, ExecuteStmt))
@@ -1163,10 +1163,11 @@ PortalRunUtility(Portal portal, PlannedStmt *pstmt,
 	MemoryContextSwitchTo(portal->portalContext);
 
 	/*
-	 * Some utility commands (e.g., VACUUM) pop the ActiveSnapshot stack from
-	 * under us, so don't complain if it's now empty.  Otherwise, our snapshot
-	 * should be the top one; pop it.  Note that this could be a different
-	 * snapshot from the one we made above; see EnsurePortalSnapshotExists.
+	 * Some utility commands (e.g., VACUUM, WAIT FOR) pop the ActiveSnapshot
+	 * stack from under us, so don't complain if it's now empty.  Otherwise,
+	 * our snapshot should be the top one; pop it.  Note that this could be a
+	 * different snapshot from the one we made above; see
+	 * EnsurePortalSnapshotExists.
 	 */
 	if (portal->portalSnapshot != NULL && ActiveSnapshotSet())
 	{
@@ -1743,7 +1744,8 @@ PlannedStmtRequiresSnapshot(PlannedStmt *pstmt)
 		IsA(utilityStmt, ListenStmt) ||
 		IsA(utilityStmt, NotifyStmt) ||
 		IsA(utilityStmt, UnlistenStmt) ||
-		IsA(utilityStmt, CheckPointStmt))
+		IsA(utilityStmt, CheckPointStmt) ||
+		IsA(utilityStmt, WaitStmt))
 		return false;
 
 	return true;

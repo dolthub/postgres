@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2026, PostgreSQL Global Development Group
  *
  * src/bin/psql/psqlscanslash.h
  */
@@ -35,10 +35,6 @@ extern PsqlScanStateSave *psql_scan_get_lex_state(PsqlScanState state);
 
 extern void psql_scan_set_lex_state(PsqlScanState state,
 									const PsqlScanStateSave *lex_state);
-
-extern int	psql_scan_get_paren_depth(PsqlScanState state);
-
-extern void psql_scan_set_paren_depth(PsqlScanState state, int depth);
 
 extern void dequote_downcase_identifier(char *str, bool downcase, int encoding);
 

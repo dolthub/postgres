@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2025, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 # Verify that work items work correctly
 
@@ -39,7 +39,7 @@ $node->safe_psql(
 my $count = $node->safe_psql('postgres',
 	"select count(*) from brin_page_items(get_raw_page('brin_wi_idx', 2), 'brin_wi_idx'::regclass)"
 );
-is($count, '1', "initial brin_wi_index index state is correct");
+is($count, '1', "initial brin_wi_idx index state is correct");
 $count = $node->safe_psql('postgres',
 	"select count(*) from brin_page_items(get_raw_page('brin_packdate_idx', 2), 'brin_packdate_idx'::regclass)"
 );
@@ -48,14 +48,20 @@ is($count, '1', "initial brin_packdate_idx index state is correct");
 $node->safe_psql('postgres',
 	'insert into brin_wi select * from generate_series(1, 100)');
 $node->safe_psql('postgres',
-	"insert into journal select * from generate_series(timestamp '1976-08-01', '1976-10-28', '1 day')");
+	"insert into journal select * from generate_series(timestamp '1976-08-01', '1976-10-28', '1 day')"
+);
+
+# Give a little time for autovacuum to react.  This matches the naptime
+# configured above.
+sleep(1);
 
 $node->poll_query_until(
 	'postgres',
 	"select count(*) > 1 from brin_page_items(get_raw_page('brin_wi_idx', 2), 'brin_wi_idx'::regclass)",
 	't');
 
-$count = $node->safe_psql('postgres',
+$count = $node->safe_psql(
+	'postgres',
 	"select count(*) from brin_page_items(get_raw_page('brin_wi_idx', 2), 'brin_wi_idx'::regclass)
 	 where not placeholder;"
 );
@@ -66,7 +72,8 @@ $node->poll_query_until(
 	"select count(*) > 1 from brin_page_items(get_raw_page('brin_packdate_idx', 2), 'brin_packdate_idx'::regclass)",
 	't');
 
-$count = $node->safe_psql('postgres',
+$count = $node->safe_psql(
+	'postgres',
 	"select count(*) from brin_page_items(get_raw_page('brin_packdate_idx', 2), 'brin_packdate_idx'::regclass)
 	 where not placeholder;"
 );

@@ -13,7 +13,7 @@
  * estimates are already available in pg_statistic.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -27,10 +27,8 @@
 
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_statistic_ext_data.h"
-#include "lib/stringinfo.h"
 #include "statistics/extended_stats_internal.h"
-#include "statistics/statistics.h"
-#include "utils/fmgrprotos.h"
+#include "utils/memutils.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 #include "varatt.h"
@@ -92,12 +90,17 @@ statext_ndistinct_build(double totalrows, StatsBuildData *data)
 	int			itemcnt;
 	int			numattrs = data->nattnums;
 	int			numcombs = num_combinations(numattrs);
+	MemoryContext cxt;
 
 	result = palloc(offsetof(MVNDistinct, items) +
 					numcombs * sizeof(MVNDistinctItem));
 	result->magic = STATS_NDISTINCT_MAGIC;
 	result->type = STATS_NDISTINCT_TYPE_BASIC;
 	result->nitems = numcombs;
+
+	cxt = AllocSetContextCreate(CurrentMemoryContext,
+								"ndistinct_for_combination cxt",
+								ALLOCSET_DEFAULT_SIZES);
 
 	itemcnt = 0;
 	for (k = 2; k <= numattrs; k++)
@@ -112,8 +115,9 @@ statext_ndistinct_build(double totalrows, StatsBuildData *data)
 		{
 			MVNDistinctItem *item = &result->items[itemcnt];
 			int			j;
+			MemoryContext oldcxt;
 
-			item->attributes = palloc(sizeof(AttrNumber) * k);
+			item->attributes = palloc_array(AttrNumber, k);
 			item->nattributes = k;
 
 			/* translate the indexes to attnums */
@@ -124,8 +128,12 @@ statext_ndistinct_build(double totalrows, StatsBuildData *data)
 				Assert(AttributeNumberIsValid(item->attributes[j]));
 			}
 
+			/* release memory used by ndistinct calculation */
+			oldcxt = MemoryContextSwitchTo(cxt);
 			item->ndistinct =
 				ndistinct_for_combination(totalrows, data, k, combination);
+			MemoryContextSwitchTo(oldcxt);
+			MemoryContextReset(cxt);
 
 			itemcnt++;
 			Assert(itemcnt <= result->nitems);
@@ -133,6 +141,8 @@ statext_ndistinct_build(double totalrows, StatsBuildData *data)
 
 		generator_free(generator);
 	}
+
+	MemoryContextDelete(cxt);
 
 	/* must consume exactly the whole output array */
 	Assert(itemcnt == result->nitems);
@@ -329,85 +339,79 @@ statext_ndistinct_deserialize(bytea *data)
 }
 
 /*
- * pg_ndistinct_in
- *		input routine for type pg_ndistinct
- *
- * pg_ndistinct is real enough to be a table column, but it has no
- * operations of its own, and disallows input (just like pg_node_tree).
+ * Free allocations of a MVNDistinct.
  */
-Datum
-pg_ndistinct_in(PG_FUNCTION_ARGS)
+void
+statext_ndistinct_free(MVNDistinct *ndistinct)
 {
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("cannot accept a value of type %s", "pg_ndistinct")));
-
-	PG_RETURN_VOID();			/* keep compiler quiet */
+	for (int i = 0; i < ndistinct->nitems; i++)
+		pfree(ndistinct->items[i].attributes);
+	pfree(ndistinct);
 }
 
 /*
- * pg_ndistinct
- *		output routine for type pg_ndistinct
+ * Validate a set of MVNDistincts against the extended statistics object
+ * definition.
  *
- * Produces a human-readable representation of the value.
+ * Every MVNDistinctItem must be checked to ensure that the attnums in the
+ * attributes list correspond to attnums/expressions defined by the extended
+ * statistics object.
+ *
+ * Positive attnums are attributes which must be found in the stxkeys,
+ * while negative attnums correspond to an expression number, no attribute
+ * number can be below (0 - numexprs).
  */
-Datum
-pg_ndistinct_out(PG_FUNCTION_ARGS)
+bool
+statext_ndistinct_validate(const MVNDistinct *ndistinct,
+						   const int2vector *stxkeys,
+						   int numexprs, int elevel)
 {
-	bytea	   *data = PG_GETARG_BYTEA_PP(0);
-	MVNDistinct *ndist = statext_ndistinct_deserialize(data);
-	int			i;
-	StringInfoData str;
+	int			attnum_expr_lowbound = 0 - numexprs;
 
-	initStringInfo(&str);
-	appendStringInfoChar(&str, '{');
-
-	for (i = 0; i < ndist->nitems; i++)
+	/* Scan through each MVNDistinct entry */
+	for (int i = 0; i < ndistinct->nitems; i++)
 	{
-		int			j;
-		MVNDistinctItem item = ndist->items[i];
+		MVNDistinctItem item = ndistinct->items[i];
 
-		if (i > 0)
-			appendStringInfoString(&str, ", ");
-
-		for (j = 0; j < item.nattributes; j++)
+		/*
+		 * Cross-check each attribute in a MVNDistinct entry with the extended
+		 * stats object definition.
+		 */
+		for (int j = 0; j < item.nattributes; j++)
 		{
 			AttrNumber	attnum = item.attributes[j];
+			bool		ok = false;
 
-			appendStringInfo(&str, "%s%d", (j == 0) ? "\"" : ", ", attnum);
+			if (attnum > 0)
+			{
+				/* attribute number in stxkeys */
+				for (int k = 0; k < stxkeys->dim1; k++)
+				{
+					if (attnum == stxkeys->values[k])
+					{
+						ok = true;
+						break;
+					}
+				}
+			}
+			else if ((attnum < 0) && (attnum >= attnum_expr_lowbound))
+			{
+				/* attribute number for an expression */
+				ok = true;
+			}
+
+			if (!ok)
+			{
+				ereport(elevel,
+						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+						 errmsg("could not validate \"%s\" object: invalid attribute number %d found",
+								"pg_ndistinct", attnum)));
+				return false;
+			}
 		}
-		appendStringInfo(&str, "\": %d", (int) item.ndistinct);
 	}
 
-	appendStringInfoChar(&str, '}');
-
-	PG_RETURN_CSTRING(str.data);
-}
-
-/*
- * pg_ndistinct_recv
- *		binary input routine for type pg_ndistinct
- */
-Datum
-pg_ndistinct_recv(PG_FUNCTION_ARGS)
-{
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("cannot accept a value of type %s", "pg_ndistinct")));
-
-	PG_RETURN_VOID();			/* keep compiler quiet */
-}
-
-/*
- * pg_ndistinct_send
- *		binary output routine for type pg_ndistinct
- *
- * n-distinct is serialized into a bytea value, so let's send that.
- */
-Datum
-pg_ndistinct_send(PG_FUNCTION_ARGS)
-{
-	return byteasend(fcinfo);
+	return true;
 }
 
 /*
@@ -444,9 +448,9 @@ ndistinct_for_combination(double totalrows, StatsBuildData *data,
 	 * using the specified column combination as dimensions.  We could try to
 	 * sort in place, but it'd probably be more complex and bug-prone.
 	 */
-	items = (SortItem *) palloc(numrows * sizeof(SortItem));
-	values = (Datum *) palloc0(sizeof(Datum) * numrows * k);
-	isnull = (bool *) palloc0(sizeof(bool) * numrows * k);
+	items = palloc_array(SortItem, numrows);
+	values = palloc0_array(Datum, numrows * k);
+	isnull = palloc0_array(bool, numrows * k);
 
 	for (i = 0; i < numrows; i++)
 	{
@@ -593,12 +597,12 @@ generator_init(int n, int k)
 	Assert((n >= k) && (k > 0));
 
 	/* allocate the generator state as a single chunk of memory */
-	state = (CombinationGenerator *) palloc(sizeof(CombinationGenerator));
+	state = palloc_object(CombinationGenerator);
 
 	state->ncombinations = n_choose_k(n, k);
 
 	/* pre-allocate space for all combinations */
-	state->combinations = (int *) palloc(sizeof(int) * k * state->ncombinations);
+	state->combinations = palloc_array(int, k * state->ncombinations);
 
 	state->current = 0;
 	state->k = k;
@@ -691,7 +695,7 @@ generate_combinations_recurse(CombinationGenerator *state,
 static void
 generate_combinations(CombinationGenerator *state)
 {
-	int		   *current = (int *) palloc0(sizeof(int) * state->k);
+	int		   *current = palloc0_array(int, state->k);
 
 	generate_combinations_recurse(state, 0, 0, current);
 

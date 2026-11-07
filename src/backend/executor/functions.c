@@ -3,7 +3,7 @@
  * functions.c
  *	  Execution of SQL-language functions
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -13,8 +13,6 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "catalog/catalogview.h"
-#include "access/doltcatalog.h"
 
 #include "access/htup_details.h"
 #include "access/xact.h"
@@ -39,6 +37,7 @@
 #include "utils/plancache.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/tuplestore.h"
 
 
 /*
@@ -258,7 +257,7 @@ prepare_sql_fn_parse_info(HeapTuple procedureTuple,
 	Form_pg_proc procedureStruct = (Form_pg_proc) GETSTRUCT(procedureTuple);
 	int			nargs;
 
-	pinfo = (SQLFunctionParseInfoPtr) palloc0(sizeof(SQLFunctionParseInfo));
+	pinfo = (SQLFunctionParseInfoPtr) palloc0_object(SQLFunctionParseInfo);
 
 	/* Function's name (only) can be used to qualify argument names */
 	pinfo->fname = pstrdup(NameStr(procedureStruct->proname));
@@ -590,8 +589,6 @@ init_sql_fcache(FunctionCallInfo fcinfo, bool lazyEvalOK)
 	if (fcache->eslist != NULL)
 	{
 		Assert(fcache->func != NULL);
-		if (!fcache->func->cfunc.fn_hashkey || fcache->func->cfunc.fn_hashkey->catalogContext != CatalogViewCacheId(CatalogViewCurrent()))
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("cannot change catalog context during an active SQL function")));
 		return fcache;
 	}
 
@@ -1157,7 +1154,7 @@ sql_compile_callback(FunctionCallInfo fcinfo,
 		/* Source queries are already parse-analyzed */
 		Node	   *n;
 
-		n = dg_routine_body(procedureTuple, stringToNode(TextDatumGetCString(tmp)));
+		n = stringToNode(TextDatumGetCString(tmp));
 		if (IsA(n, List))
 			source_list = linitial_node(List, castNode(List, n));
 		else
@@ -1576,35 +1573,8 @@ postquel_get_single_result(TupleTableSlot *slot,
 /*
  * fmgr_sql: function call manager for SQL functions
  */
-static Datum fmgr_sql_in_context(FunctionCallInfo fcinfo);
-
-/* Object-ID aliases and concrete composite argument types identify immutable
- * catalog objects in another revision. Resolve polymorphic arguments from the
- * call expression, not the declared signature. Nested calls without a binding
- * inherit the enclosing scope. Always restore it, including on errors. */
 Datum
 fmgr_sql(PG_FUNCTION_ARGS)
-{
-	CatalogView *view = NULL,
-			   *previous;
-	Datum		result;
-
-	view = CatalogViewCallContext(fcinfo);
-	previous = CatalogViewSwitch(view);
-	PG_TRY();
-	{
-		result = fmgr_sql_in_context(fcinfo);
-	}
-	PG_FINALLY();
-	{
-		CatalogViewSwitch(previous);
-	}
-	PG_END_TRY();
-	return result;
-}
-
-static Datum
-fmgr_sql_in_context(FunctionCallInfo fcinfo)
 {
 	SQLFunctionCachePtr fcache;
 	ErrorContextCallback sqlerrcontext;
@@ -2514,7 +2484,7 @@ tlist_coercion_finished:
 		rte = makeNode(RangeTblEntry);
 		rte->rtekind = RTE_SUBQUERY;
 		rte->subquery = parse;
-		rte->eref = rte->alias = makeAlias("*SELECT*", colnames);
+		rte->eref = makeAlias("unnamed_subquery", colnames);
 		rte->lateral = false;
 		rte->inh = false;
 		rte->inFromCl = true;
@@ -2647,7 +2617,7 @@ get_sql_fn_result_tlist(List *queryTreeList)
 DestReceiver *
 CreateSQLFunctionDestReceiver(void)
 {
-	DR_sqlfunction *self = (DR_sqlfunction *) palloc0(sizeof(DR_sqlfunction));
+	DR_sqlfunction *self = palloc0_object(DR_sqlfunction);
 
 	self->pub.receiveSlot = sqlfunction_receive;
 	self->pub.rStartup = sqlfunction_startup;

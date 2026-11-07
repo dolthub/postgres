@@ -136,7 +136,7 @@ InitArchiveFmt_Custom(ArchiveHandle *AH)
 	AH->WorkerJobRestorePtr = _WorkerJobRestoreCustom;
 
 	/* Set up a private area. */
-	ctx = (lclContext *) pg_malloc0(sizeof(lclContext));
+	ctx = pg_malloc0_object(lclContext);
 	AH->formatData = ctx;
 
 	/*
@@ -193,13 +193,13 @@ InitArchiveFmt_Custom(ArchiveHandle *AH)
  * Optional.
  *
  * Set up extract format-related TOC data.
-*/
+ */
 static void
 _ArchiveEntry(ArchiveHandle *AH, TocEntry *te)
 {
 	lclTocEntry *ctx;
 
-	ctx = (lclTocEntry *) pg_malloc0(sizeof(lclTocEntry));
+	ctx = pg_malloc0_object(lclTocEntry);
 	if (te->dataDumper)
 		ctx->dataState = K_OFFSET_POS_NOT_SET;
 	else
@@ -240,7 +240,7 @@ _ReadExtraToc(ArchiveHandle *AH, TocEntry *te)
 
 	if (ctx == NULL)
 	{
-		ctx = (lclTocEntry *) pg_malloc0(sizeof(lclTocEntry));
+		ctx = pg_malloc0_object(lclTocEntry);
 		te->formatData = ctx;
 	}
 
@@ -563,7 +563,7 @@ _PrintTocData(ArchiveHandle *AH, TocEntry *te)
 
 /*
  * Print data from current file position.
-*/
+ */
 static void
 _PrintData(ArchiveHandle *AH)
 {
@@ -617,19 +617,26 @@ _skipLOs(ArchiveHandle *AH)
  * Skip data from current file position.
  * Data blocks are formatted as an integer length, followed by data.
  * A zero length indicates the end of the block.
-*/
+ */
 static void
 _skipData(ArchiveHandle *AH)
 {
 	lclContext *ctx = (lclContext *) AH->formatData;
 	size_t		blkLen;
 	char	   *buf = NULL;
-	int			buflen = 0;
+	size_t		buflen = 0;
 
 	blkLen = ReadInt(AH);
 	while (blkLen != 0)
 	{
-		if (ctx->hasSeek)
+		/*
+		 * Seeks of less than stdio's buffer size are less efficient than just
+		 * reading the data, at least on common platforms.  We don't know the
+		 * buffer size for sure, but 4kB is the usual value.  (While pg_dump
+		 * currently tries to avoid producing such short data blocks, older
+		 * dump files often contain them.)
+		 */
+		if (ctx->hasSeek && blkLen >= 4 * 1024)
 		{
 			if (fseeko(AH->FH, blkLen, SEEK_CUR) != 0)
 				pg_fatal("error during file seek: %m");
@@ -639,8 +646,8 @@ _skipData(ArchiveHandle *AH)
 			if (blkLen > buflen)
 			{
 				free(buf);
-				buf = (char *) pg_malloc(blkLen);
-				buflen = blkLen;
+				buflen = Max(blkLen, 4 * 1024);
+				buf = (char *) pg_malloc(buflen);
 			}
 			if (fread(buf, 1, blkLen, AH->FH) != blkLen)
 			{
@@ -886,7 +893,7 @@ _Clone(ArchiveHandle *AH)
 	/*
 	 * Each thread must have private lclContext working state.
 	 */
-	AH->formatData = (lclContext *) pg_malloc(sizeof(lclContext));
+	AH->formatData = pg_malloc_object(lclContext);
 	memcpy(AH->formatData, ctx, sizeof(lclContext));
 	ctx = (lclContext *) AH->formatData;
 

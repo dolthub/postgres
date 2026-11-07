@@ -3,7 +3,7 @@
  * readfuncs.c
  *	  Reader functions for Postgres tree nodes.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -25,8 +25,6 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-
-#include <math.h>
 
 #include "miscadmin.h"
 #include "nodes/bitmapset.h"
@@ -357,9 +355,6 @@ _readRangeTblEntry(void)
 	READ_NODE_FIELD(alias);
 	READ_NODE_FIELD(eref);
 	READ_ENUM_FIELD(rtekind, RTEKind);
-	READ_STRING_FIELD(dolt_ref);
-	READ_STRING_FIELD(dolt_ref_target);
-	READ_STRING_FIELD(dolt_database);
 
 	switch (local_node->rtekind)
 	{
@@ -415,20 +410,6 @@ _readRangeTblEntry(void)
 			READ_STRING_FIELD(ctename);
 			READ_UINT_FIELD(ctelevelsup);
 			READ_BOOL_FIELD(self_reference);
-			READ_NODE_FIELD(coltypes);
-			READ_NODE_FIELD(coltypmods);
-			READ_NODE_FIELD(colcollations);
-			break;
-		case RTE_DOLT:
-			READ_OID_FIELD(relid);
-			READ_BOOL_FIELD(inh);
-			READ_CHAR_FIELD(relkind);
-			READ_INT_FIELD(rellockmode);
-			READ_UINT_FIELD(perminfoindex);
-			READ_OID_FIELD(dolt_catalog);
-			READ_OID_FIELD(dolt_rowtype);
-			READ_STRING_FIELD(dolt_branch);
-			READ_OID_FIELD(dolt_relid);
 			READ_NODE_FIELD(coltypes);
 			READ_NODE_FIELD(coltypmods);
 			READ_NODE_FIELD(colcollations);
@@ -616,8 +597,7 @@ parseNodeString(void)
 Datum
 readDatum(bool typbyval)
 {
-	Size		length,
-				i;
+	Size		length;
 	int			tokenLength;
 	const char *token;
 	Datum		res;
@@ -640,18 +620,18 @@ readDatum(bool typbyval)
 			elog(ERROR, "byval datum but length = %zu", length);
 		res = (Datum) 0;
 		s = (char *) (&res);
-		for (i = 0; i < (Size) sizeof(Datum); i++)
+		for (Size i = 0; i < (Size) sizeof(Datum); i++)
 		{
 			token = pg_strtok(&tokenLength);
 			s[i] = (char) atoi(token);
 		}
 	}
 	else if (length <= 0)
-		res = (Datum) NULL;
+		res = (Datum) 0;
 	else
 	{
 		s = (char *) palloc(length);
-		for (i = 0; i < length; i++)
+		for (Size i = 0; i < length; i++)
 		{
 			token = pg_strtok(&tokenLength);
 			s[i] = (char) atoi(token);

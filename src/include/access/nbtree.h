@@ -4,7 +4,7 @@
  *	  header file for postgres btree access method implementation.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/nbtree.h
@@ -17,12 +17,12 @@
 #include "access/amapi.h"
 #include "access/itup.h"
 #include "access/sdir.h"
-#include "access/tableam.h"
-#include "access/xlogreader.h"
 #include "catalog/pg_am_d.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_index.h"
 #include "lib/stringinfo.h"
 #include "storage/bufmgr.h"
+#include "storage/dsm.h"
 #include "storage/shm_toc.h"
 #include "utils/skipsupport.h"
 
@@ -1097,37 +1097,6 @@ typedef struct BTScanOpaqueData
 typedef BTScanOpaqueData *BTScanOpaque;
 
 /*
- * _bt_readpage state used across _bt_checkkeys calls for a page
- */
-typedef struct BTReadPageState
-{
-	/* Input parameters, set by _bt_readpage for _bt_checkkeys */
-	OffsetNumber minoff;		/* Lowest non-pivot tuple's offset */
-	OffsetNumber maxoff;		/* Highest non-pivot tuple's offset */
-	IndexTuple	finaltup;		/* Needed by scans with array keys */
-	Page		page;			/* Page being read */
-	bool		firstpage;		/* page is first for primitive scan? */
-	bool		forcenonrequired;	/* treat all keys as nonrequired? */
-	int			startikey;		/* start comparisons from this scan key */
-
-	/* Per-tuple input parameters, set by _bt_readpage for _bt_checkkeys */
-	OffsetNumber offnum;		/* current tuple's page offset number */
-
-	/* Output parameters, set by _bt_checkkeys for _bt_readpage */
-	OffsetNumber skip;			/* Array keys "look ahead" skip offnum */
-	bool		continuescan;	/* Terminate ongoing (primitive) index scan? */
-
-	/*
-	 * Private _bt_checkkeys state used to manage "look ahead" optimization
-	 * and primscan scheduling (only used during scans with array keys)
-	 */
-	int16		rechecks;
-	int16		targetdistance;
-	int16		nskipadvances;
-
-} BTReadPageState;
-
-/*
  * We use some private sk_flags bits in preprocessed scan keys.  We're allowed
  * to use bits 16-31 (see skey.h).  The uppermost bits are copied from the
  * index's indoption[] array entry for the index attribute.
@@ -1234,7 +1203,7 @@ extern void _bt_dedup_start_pending(BTDedupState state, IndexTuple base,
 									OffsetNumber baseoff);
 extern bool _bt_dedup_save_htid(BTDedupState state, IndexTuple itup);
 extern Size _bt_dedup_finish_pending(Page newpage, BTDedupState state);
-extern IndexTuple _bt_form_posting(IndexTuple base, ItemPointer htids,
+extern IndexTuple _bt_form_posting(IndexTuple base, const ItemPointerData *htids,
 								   int nhtids);
 extern void _bt_update_posting(BTVacuumPosting vacposting);
 extern IndexTuple _bt_swap_posting(IndexTuple newitem, IndexTuple oposting,
@@ -1285,9 +1254,10 @@ extern void _bt_pageinit(Page page, Size size);
 extern void _bt_delitems_vacuum(Relation rel, Buffer buf,
 								OffsetNumber *deletable, int ndeletable,
 								BTVacuumPosting *updatable, int nupdatable);
+struct TM_IndexDeleteOp;		/* avoid including tableam.h here */
 extern void _bt_delitems_delete_check(Relation rel, Buffer buf,
 									  Relation heapRel,
-									  TM_IndexDeleteOp *delstate);
+									  struct TM_IndexDeleteOp *delstate);
 extern void _bt_pagedel(Relation rel, Buffer leafbuf, BTVacState *vstate);
 extern void _bt_pendingfsm_init(Relation rel, BTVacState *vstate,
 								bool cleanuponly);
@@ -1299,10 +1269,22 @@ extern void _bt_pendingfsm_finalize(Relation rel, BTVacState *vstate);
 extern void _bt_preprocess_keys(IndexScanDesc scan);
 
 /*
+ * prototypes for functions in nbtreadpage.c
+ */
+extern bool _bt_readpage(IndexScanDesc scan, ScanDirection dir,
+						 OffsetNumber offnum, bool firstpage);
+extern void _bt_start_array_keys(IndexScanDesc scan, ScanDirection dir);
+extern int	_bt_binsrch_array_skey(FmgrInfo *orderproc,
+								   bool cur_elem_trig, ScanDirection dir,
+								   Datum tupdatum, bool tupnull,
+								   BTArrayKeyInfo *array, ScanKey cur,
+								   int32 *set_elem_result);
+
+/*
  * prototypes for functions in nbtsearch.c
  */
 extern BTStack _bt_search(Relation rel, Relation heaprel, BTScanInsert key,
-						  Buffer *bufP, int access);
+						  Buffer *bufP, int access, bool returnstack);
 extern OffsetNumber _bt_binsrch_insert(Relation rel, BTInsertState insertstate);
 extern int32 _bt_compare(Relation rel, BTScanInsert key, Page page, OffsetNumber offnum);
 extern bool _bt_first(IndexScanDesc scan, ScanDirection dir);
@@ -1313,26 +1295,11 @@ extern Buffer _bt_get_endpoint(Relation rel, uint32 level, bool rightmost);
  * prototypes for functions in nbtutils.c
  */
 extern BTScanInsert _bt_mkscankey(Relation rel, IndexTuple itup);
-extern void _bt_freestack(BTStack stack);
-extern bool _bt_start_prim_scan(IndexScanDesc scan, ScanDirection dir);
-extern int	_bt_binsrch_array_skey(FmgrInfo *orderproc,
-								   bool cur_elem_trig, ScanDirection dir,
-								   Datum tupdatum, bool tupnull,
-								   BTArrayKeyInfo *array, ScanKey cur,
-								   int32 *set_elem_result);
-extern void _bt_start_array_keys(IndexScanDesc scan, ScanDirection dir);
-extern bool _bt_checkkeys(IndexScanDesc scan, BTReadPageState *pstate, bool arrayKeys,
-						  IndexTuple tuple, int tupnatts);
-extern bool _bt_scanbehind_checkkeys(IndexScanDesc scan, ScanDirection dir,
-									 IndexTuple finaltup);
-extern void _bt_set_startikey(IndexScanDesc scan, BTReadPageState *pstate);
 extern void _bt_killitems(IndexScanDesc scan);
 extern BTCycleId _bt_vacuum_cycleid(Relation rel);
 extern BTCycleId _bt_start_vacuum(Relation rel);
 extern void _bt_end_vacuum(Relation rel);
 extern void _bt_end_vacuum_callback(int code, Datum arg);
-extern Size BTreeShmemSize(void);
-extern void BTreeShmemInit(void);
 extern bytea *btoptions(Datum reloptions, bool validate);
 extern bool btproperty(Oid index_oid, int attno,
 					   IndexAMProperty prop, const char *propname,
