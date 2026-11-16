@@ -1,0 +1,271 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The fork's CI on a pull request to dolthub/postgres, the only repository it runs in: Postgres' suites, with the
+# regression and isolation suites modeled on Doltgres' regression workflow, and the static checks. Every suite
+# `meson test` runs on Ubuntu, and the regression and isolation suites on macOS too; the static checks (pgindent, and
+# rustfmt, clippy, and the Rust workspace's tests where the tree has it) run on Ubuntu. A tree with only the C builds
+# the targets pgfork/targets.sh names for it, and runs the suites once those include the server. Everything runs on the
+# pull request merged with main (GitHub's merge commit) and on that commit's main parent, test by test, and main's
+# results are cached by its commit, so a push runs only the pull request's side until main moves. The run fails only for
+# a test that passes on main and fails on the pull request, since the fork is unfinished and tests may fail on both, and
+# leaves one comment per suite as an artifact, which pgfork-comment.yml posts. A Windows build only reports and never
+# fails the run, until the fork has a Windows machine. The scripts come from main, or from the pull request while main
+# has none. Every job has a read-only token and no secret.
+
+name: Fork CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  resolve:
+    name: Resolve main
+    if: github.repository == 'dolthub/postgres'
+    runs-on: ubuntu-24.04
+    outputs:
+      main_sha: ${{ steps.resolve.outputs.main_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          sparse-checkout: .github/workflows
+      # The merge commit's first parent is the main the pull request is merged with.
+      - id: resolve
+        run: echo "main_sha=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: ${{ matrix.side }} on ${{ matrix.os }}
+    needs: resolve
+    if: github.repository == 'dolthub/postgres'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        side: [pr, main]
+        include:
+          - os: ubuntu-24.04
+            suites: ''
+          - os: macos-15
+            suites: --suite setup --suite regress --suite isolation
+    env:
+      MAIN_SHA: ${{ needs.resolve.outputs.main_sha }}
+      RESULTS: results/${{ matrix.os }}-${{ matrix.side }}.json
+      CHECKS: results/checks-${{ matrix.side }}.json
+    steps:
+      - name: Check out main's CI scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ci
+          ref: ${{ env.MAIN_SHA }}
+          sparse-checkout: .github/workflows
+      - name: Check out the pull request's CI scripts, since main has none
+        if: hashFiles('ci/.github/workflows/pgfork/results.py') == ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ci
+          sparse-checkout: .github/workflows
+      # Main's results are kept for its commit and for the CI scripts that produced them.
+      - name: Restore main's results
+        id: cached
+        if: matrix.side == 'main'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ env.RESULTS }}
+            ${{ env.CHECKS }}
+          key: pgfork-ci-${{ matrix.os }}-${{ env.MAIN_SHA }}-${{ hashFiles('ci/.github/workflows/**') }}
+      - name: Check out the tree
+        if: steps.cached.outputs.cache-hit != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tree
+          ref: ${{ matrix.side == 'main' && env.MAIN_SHA || github.sha }}
+      - name: Install dependencies
+        if: steps.cached.outputs.cache-hit != 'true'
+        run: ci/.github/workflows/pgfork/deps.sh tree
+      - name: Build
+        id: build
+        if: steps.cached.outputs.cache-hit != 'true'
+        run: ci/.github/workflows/pgfork/build.sh "$PWD/tree" "$PWD/build"
+      # A tree whose build installed no server, one with only the C until the port's group C, has no suites to run.
+      - name: Run the suites
+        if: steps.build.outcome == 'success' && hashFiles('build/install/bin/postgres') != ''
+        timeout-minutes: 180
+        run: |
+          meson test -C build --no-rebuild --print-errorlogs ${{ matrix.suites }} || true
+          touch "$RUNNER_TEMP/finished"
+      - name: Run the static checks
+        if: steps.build.outcome == 'success' && matrix.os == 'ubuntu-24.04'
+        timeout-minutes: 90
+        run: ci/.github/workflows/pgfork/checks.sh "$PWD/tree" "$PWD/build" "$RUNNER_TEMP/checks.txt"
+      - name: Record the results
+        if: always() && steps.build.outcome == 'success'
+        run: |
+          mkdir -p results
+          if [ -f "$RUNNER_TEMP/checks.txt" ]; then
+            python3 ci/.github/workflows/pgfork/results.py --checks "$RUNNER_TEMP/checks.txt" "$CHECKS"
+          fi
+          if [ -f build/meson-logs/testlog.json ]; then
+            incomplete=()
+            [ -f "$RUNNER_TEMP/finished" ] || incomplete=(--incomplete)
+            python3 ci/.github/workflows/pgfork/results.py build/meson-logs/testlog.json "$RESULTS" "${incomplete[@]}"
+          elif [ -n "$(ci/.github/workflows/pgfork/targets.sh tree)" ]; then
+            python3 ci/.github/workflows/pgfork/results.py --not-run "$RESULTS"
+          fi
+      - name: Save main's results
+        if: always() && matrix.side == 'main' && steps.build.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ env.RESULTS }}
+            ${{ env.CHECKS }}
+          key: pgfork-ci-${{ matrix.os }}-${{ env.MAIN_SHA }}-${{ hashFiles('ci/.github/workflows/**') }}
+      # Each results upload names only its own side's files, so a pull request's tests can't put a file of main's into
+      # the comparison.
+      - name: Upload the results
+        if: always() && hashFiles(env.RESULTS, env.CHECKS) != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-results-${{ matrix.os }}-${{ matrix.side }}
+          path: |
+            ${{ env.RESULTS }}
+            ${{ env.CHECKS }}
+          retention-days: 14
+      - name: Upload the logs
+        if: always() && steps.build.outcome != 'skipped'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: postgres-logs-${{ matrix.os }}-${{ matrix.side }}
+          path: |
+            build/meson-logs/meson-log.txt
+            build/meson-logs/testlog.txt
+            build/testrun/regress/regress/regression.diffs
+            build/testrun/isolation/isolation/regression.diffs
+          if-no-files-found: ignore
+          retention-days: 14
+
+  windows:
+    name: Windows build (informational)
+    if: github.repository == 'dolthub/postgres'
+    runs-on: windows-2025
+    timeout-minutes: 180
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tree
+      - name: Cache vcpkg's packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: vcpkg-libxml2-openssl-windows-2025
+      - name: Install dependencies
+        shell: bash
+        run: |
+          "$VCPKG_INSTALLATION_ROOT/vcpkg" install libxml2:x64-windows openssl:x64-windows
+          choco install -y --no-progress winflexbison3
+          pipx install meson==1.11.2
+          pipx install ninja
+          if [ -f tree/src/doltgres/Cargo.toml ]; then (cd tree/src/doltgres && rustup toolchain install); fi
+      - name: Choose the targets
+        id: targets
+        shell: bash
+        run: echo "targets=$(tree/.github/workflows/pgfork/targets.sh tree)" >> "$GITHUB_OUTPUT"
+      - name: Build
+        shell: cmd
+        env:
+          TARGETS: ${{ steps.targets.outputs.targets }}
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars64.bat"
+          meson setup build tree --buildtype=debugoptimized -Dcassert=true -Dinjection_points=true -Dicu=enabled -Dlibxml=enabled -Dlz4=enabled -Dzstd=enabled -Dssl=openssl "-Dcmake_prefix_path=%VCPKG_INSTALLATION_ROOT%\installed\x64-windows" "-Dpkg_config_path=%VCPKG_INSTALLATION_ROOT%\installed\x64-windows\lib\pkgconfig" || exit /b 1
+          meson compile -C build %TARGETS% || exit /b 1
+
+  compare:
+    name: Compare with main
+    needs: [resolve, test]
+    if: always() && github.repository == 'dolthub/postgres' && needs.resolve.result == 'success' &&
+      needs.test.result != 'cancelled'
+    runs-on: ubuntu-24.04
+    env:
+      MAIN_SHA: ${{ needs.resolve.outputs.main_sha }}
+    steps:
+      - name: Check out main's CI scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.MAIN_SHA }}
+          sparse-checkout: .github/workflows
+      - name: Check out the pull request's CI scripts, since main has none
+        if: hashFiles('.github/workflows/pgfork/results.py') == ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/workflows
+      # A side whose build failed left no results, which the comparison reads as a run without results.
+      - name: Download the results
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: ci-results-*
+          path: results
+          merge-multiple: true
+      - name: Compare
+        id: compare
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mkdir comments
+          echo "$PR_NUMBER" > comments/pr-number
+          status=0
+          for suite in regress isolation; do
+            title="Regression suite (\`regress\`)"
+            [ $suite = isolation ] && title="Isolation suite (\`isolation\`)"
+            platforms=()
+            for os in ubuntu-24.04 macos-15; do
+              platforms+=(--platform "$os" "results/$os-main.json" "results/$os-pr.json")
+            done
+            python3 .github/workflows/pgfork/compare.py --suite $suite --title "$title" --detail \
+              --match "$suite/$suite:" --main-sha "$MAIN_SHA" --pr-sha "$PR_SHA" --out "comments/$suite.md" \
+              "${platforms[@]}" || status=1
+          done
+          python3 .github/workflows/pgfork/compare.py --suite postgres-suites --title "Postgres' other suites" \
+            --by-suite --exclude regress/ --exclude isolation/ --main-sha "$MAIN_SHA" --pr-sha "$PR_SHA" \
+            --out comments/postgres-suites.md \
+            --platform ubuntu-24.04 results/ubuntu-24.04-main.json results/ubuntu-24.04-pr.json || status=1
+          python3 .github/workflows/pgfork/compare.py --suite checks --title "Static checks" --detail \
+            --main-sha "$MAIN_SHA" --pr-sha "$PR_SHA" --out comments/checks.md \
+            --platform ubuntu-24.04 results/checks-main.json results/checks-pr.json || status=1
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+      - name: Upload the comments
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pgfork-comments
+          path: comments
+          retention-days: 14
+      - name: Fail on a regression
+        if: steps.compare.outputs.status != '0'
+        run: |
+          echo "::error::A test that passes on main fails on this pull request; the comments list it."
+          exit 1
