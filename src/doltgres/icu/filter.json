@@ -1,0 +1,63 @@
+{
+  "featureFilters": {
+    "conversion_mappings": {
+      "whitelist": [
+        "euc-jp-2007",
+        "ibm-1383_P110-1999",
+        "ibm-970_P110_P110-2006_U2",
+        "euc-tw-2014",
+        "ibm-912_P100-1995",
+        "ibm-913_P100-2000",
+        "ibm-914_P100-1995",
+        "ibm-920_P100-1995",
+        "iso-8859_10-1998",
+        "ibm-921_P100-1995",
+        "iso-8859_14-1998",
+        "ibm-923_P100-1998",
+        "ibm-9448_X100-2005",
+        "ibm-5354_P100-1998",
+        "ibm-866_P100-1995",
+        "ibm-878_P100-1996",
+        "ibm-5347_P100-1998",
+        "ibm-5348_P100-1997",
+        "ibm-915_P100-1995",
+        "ibm-1089_P100-1995",
+        "ibm-9005_X110-2007",
+        "ibm-5012_P100-1999",
+        "ibm-5346_P100-1998",
+        "ibm-5349_P100-1998",
+        "ibm-5350_P100-1998",
+        "ibm-9447_P100-2002",
+        "ibm-9449_P100-2002",
+        "ibm-1168_P100-2002"
+      ]
+    },
+    "confusables": {
+      "filterType": "exclude"
+    },
+    "curr_supplemental": {
+      "filterType": "exclude"
+    },
+    "curr_tree": {
+      "filterType": "exclude"
+    },
+    "rbnf_tree": {
+      "filterType": "exclude"
+    },
+    "stringprep": {
+      "filterType": "exclude"
+    },
+    "translit": {
+      "filterType": "exclude"
+    },
+    "unit_tree": {
+      "filterType": "exclude"
+    },
+    "zone_supplemental": {
+      "filterType": "exclude"
+    },
+    "zone_tree": {
+      "filterType": "exclude"
+    }
+  }
+}

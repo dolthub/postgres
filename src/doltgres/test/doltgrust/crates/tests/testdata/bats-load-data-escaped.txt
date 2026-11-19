@@ -1,0 +1,4 @@
+hi
+\hello
+Try\N
+new\ns

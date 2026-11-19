@@ -33,6 +33,7 @@
 #include "access/htup_details.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_collation.h"
+#include "doltgres/hooks.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
@@ -327,9 +328,12 @@ create_pg_locale_icu(Oid collid, MemoryContext context)
 
 		/* default database collation is always deterministic */
 		deterministic = true;
-		datum = SysCacheGetAttrNotNull(DATABASEOID, tp,
-									   Anum_pg_database_datlocale);
-		iculocstr = TextDatumGetCString(datum);
+		if (!doltgres_icu_locale(collid, &iculocstr))
+		{
+			datum = SysCacheGetAttrNotNull(DATABASEOID, tp,
+										   Anum_pg_database_datlocale);
+			iculocstr = TextDatumGetCString(datum);
+		}
 		datum = SysCacheGetAttr(DATABASEOID, tp,
 								Anum_pg_database_daticurules, &isnull);
 		if (!isnull)
@@ -349,9 +353,12 @@ create_pg_locale_icu(Oid collid, MemoryContext context)
 			elog(ERROR, "cache lookup failed for collation %u", collid);
 		collform = (Form_pg_collation) GETSTRUCT(tp);
 		deterministic = collform->collisdeterministic;
-		datum = SysCacheGetAttrNotNull(COLLOID, tp,
-									   Anum_pg_collation_colllocale);
-		iculocstr = TextDatumGetCString(datum);
+		if (!doltgres_icu_locale(collid, &iculocstr))
+		{
+			datum = SysCacheGetAttrNotNull(COLLOID, tp,
+										   Anum_pg_collation_colllocale);
+			iculocstr = TextDatumGetCString(datum);
+		}
 		datum = SysCacheGetAttr(COLLOID, tp,
 								Anum_pg_collation_collicurules, &isnull);
 		if (!isnull)

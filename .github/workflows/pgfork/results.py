@@ -14,14 +14,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-"""results.py [--checks] <log> <results.json> [--incomplete], or results.py --not-run <results.json>: reads the log
-`meson test` writes, or with --checks the lines of checks.sh, and records each test's result as ok, fail, or skip. A
+"""results.py [--checks | --bats | --cargo] <log> <results.json> [--incomplete], or results.py --not-run <results.json>:
+reads the log `meson test` writes, or with --checks the lines of checks.sh, with --bats the TAP output of
+`bats --tap`, or with --cargo the output of `cargo test`, and records each test's result as ok, fail, or skip. A
 meson test that runs pg_regress is recorded once per pg_regress test, under `<meson test>:<pg_regress test>`, every
-other meson test once under its meson name (`<suite>/<test>`), and a check under `checks:<check>`. Each meson test is
-marked complete when it ran to its end (a failed meson test that printed no pg_regress results never did), so a
-comparison can tell a test the branch removed from one a crash or a timeout never reached; --incomplete marks the
-whole run as stopped before its end. --not-run records a run whose tree, by pgfork/targets.sh, builds no server, so
-its suites were never meant to run. The setup suite's steps are left out."""
+other meson test once under its meson name (`<suite>/<test>`), a check under `checks:<check>`, a bats test under
+`bats:<test>`, and a cargo test under `<test binary>:<test>`. Each meson test, bats run, and test binary is marked
+complete when it ran to its end (a failed meson test that printed no pg_regress results never did), so a comparison
+can tell a test the branch removed from one a crash or a timeout never reached; --incomplete marks the whole run as
+stopped before its end. --not-run records a run whose tree, by pgfork/targets.sh, builds no server, so its suites
+were never meant to run. The setup suite's steps are left out."""
 
 import json
 import re
@@ -31,8 +33,50 @@ import sys
 STATUS = re.compile(r"^\s*(not )?ok\s+\d+\s+[-+]\s+(\S+)\s+\d+ ms\s*$")
 # The TAP plan pg_regress prints after its last test.
 PLAN = re.compile(r"^\s*1\.\.\d+\s*$")
+# The line `cargo test` prints before running a test binary, and the binary's name in it, without its hash.
+RUNNING = re.compile(r"^\s*Running .*\(.*?([^/\\]+?)(?:-[0-9a-f]{16})?(?:\.exe)?\)\s*$")
+# A cargo test's result line: `test name ... ok`, `... FAILED`, or `... ignored`, with an optional reason.
+CARGO_STATUS = re.compile(r"^test (\S+) \.\.\. (ok|FAILED|ignored)\b")
+# The result each cargo status stands for.
+CARGO_RESULTS = {"ok": "ok", "FAILED": "fail", "ignored": "skip"}
+# The summary `cargo test` prints after a test binary's last test.
+CARGO_SUMMARY = re.compile(r"^test result: ")
+# A bats TAP result line, `ok 3 name` or `not ok 3 name`, with an optional directive after `#` that isn't part of the
+# test's name: `# skip reason` for a skipped test, or bats' `# timeout after 120s` for a failed one.
+BATS_STATUS = re.compile(r"^(not )?ok \d+ (.*?)(?:\s+# (.*))?$")
 # Meson's results for a test that ran: everything else (FAIL, TIMEOUT, ERROR, UNEXPECTEDPASS) is a failure.
 RESULTS = {"OK": "ok", "EXPECTEDFAIL": "ok", "SKIP": "skip"}
+
+
+def cargo(log):
+    """Returns the tests and the completed test binaries of a `cargo test` output, a test that ran twice keeping its
+    later result."""
+    tests, complete, binary = {}, {}, None
+    with open(log, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            running, status = RUNNING.match(line), CARGO_STATUS.match(line)
+            if running:
+                binary = running.group(1)
+                complete[binary] = False
+            elif binary and status:
+                tests[f"{binary}:{status.group(1)}"] = CARGO_RESULTS[status.group(2)]
+            elif binary and CARGO_SUMMARY.match(line):
+                complete[binary] = True
+    return tests, complete
+
+
+def bats(log):
+    """Returns the tests of a `bats --tap` output, and the run as complete when it printed every test its plan names."""
+    tests, planned = {}, None
+    with open(log, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            status = BATS_STATUS.match(line.rstrip("\n"))
+            if planned is None and PLAN.match(line):
+                planned = int(line.strip()[3:])
+            elif status:
+                skipped = (status.group(3) or "").lower().startswith("skip")
+                tests[f"bats:{status.group(2)}"] = "skip" if skipped else "fail" if status.group(1) else "ok"
+    return tests, {"bats": planned is not None and len(tests) >= planned}
 
 
 def checks(log):
@@ -69,7 +113,9 @@ def main():
     if "--not-run" in sys.argv:
         tests, complete = {}, {}
     else:
-        tests, complete = (checks if "--checks" in sys.argv else meson)(args.pop(0))
+        readers = {"--checks": checks, "--bats": bats, "--cargo": cargo}
+        reader = next((readers[arg] for arg in sys.argv if arg in readers), meson)
+        tests, complete = reader(args.pop(0))
     with open(args[0], "w", encoding="utf-8") as f:
         json.dump({"incomplete": "--incomplete" in sys.argv, "not_run": "--not-run" in sys.argv, "complete": complete,
                    "tests": tests}, f, indent=1, sort_keys=True)

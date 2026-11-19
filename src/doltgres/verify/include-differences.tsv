@@ -1,0 +1,21 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Lines an installed header may add to the stock one (include_tree.py), each additive and unused by a stock-built
+# extension, by the line it must follow (a line the stock header holds exactly once, the addition before it in a run,
+# or START for the header's first line), each a line the stock header doesn't hold, with why. Only the coordinator's refs change this file, each line with
+# PRevPF's YES.
+# header	the line before	added line	reason
+postgresql/server/utils/fmgroids.h	#define F_TID_OFFSET 6516	#define F_DOLT_VERSION 9999	dolt_version()'s OID from pg_proc.dat (design item 17's first entries), a symbol no stock-built extension names
+postgresql/server/utils/fmgrprotos.h	extern Datum tid_offset(PG_FUNCTION_ARGS);	extern Datum doltgres_dolt_version(PG_FUNCTION_ARGS);	the prototype of dolt_version()'s entry thunk, in the fork's prefix (design item 17's first entries), a symbol no stock-built extension names

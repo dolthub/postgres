@@ -5,6 +5,8 @@
 
 subdir('timezone')
 
+subdir('doltgres')
+
 subdir('backend')
 
 subdir('bin')

@@ -1,0 +1,28 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http:#www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Each case and the error `cargo check` must fail it with.
+# case	error
+chunk_forged	error: cannot construct `Chunk` with struct literal syntax due to private fields
+raw_forged	error[E0451]: fields `flag`, `data` and `slot` of struct `Raw` are private
+torn_tail_cloned	error[E0599]: no method named `clone` found for struct `TornTail` in the current scope
+torn_tail_forged	error: cannot construct `TornTail` with struct literal syntax due to private fields
+torn_tail_reused	error[E0382]: use of moved value: `tail`
+verified_kept	error[E0521]: borrowed data escapes outside of closure
+forwarded_forged	error[E0451]: fields `packs`, `froms` and `borrowed` of struct `chunks::Forwarded` are private
+retire_unforwarded	error[E0061]: this method takes 5 arguments but 4 arguments were supplied
+reservation_forged	error[E0451]: fields `entries` and `word` of struct `Reservation` are private
+root_slot_registered_twice	error[E0499]: cannot borrow `*slot` as mutable more than once at a time
+read_without_a_reader	error[E0061]: this method takes 3 arguments but 2 arguments were supplied
+registration_outlives_its_scope	error: lifetime may not live long enough

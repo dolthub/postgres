@@ -58,6 +58,9 @@ src/pl/plperl/Util\.c$
 # We'll stick to that to permit comparison with the FreeBSD upstream.
 src/tools/pg_bsd_indent/.*
 #
+# The fork's vendored zstd and lz4 are upstream's code byte for byte.
+src/doltgres/third_party/
+#
 # Exclude any temporary installations that may be in the tree.
 /tmp_check/
 /tmp_install/

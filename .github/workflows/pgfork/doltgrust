@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+#
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+"""doltgrust [--data-dir <folder>] [--config <file>]: starts the fork's server where Doltgrust's bats, driver, and
+client tests start the `doltgrust` binary, by mapping its arguments onto Postgres' and doing nothing else of its own,
+so a test's failure is the fork's. The data folder (--data-dir, else DOLTGRUST_DATA_DIR, else the current folder)
+holds the cluster in `pgdata`, which a first start creates as Doltgrust's does: initdb with DOLTGRUST_USER (else
+postgres) and DOLTGRUST_PASSWORD (else password), and DOLTGRUST_DB's database when it names one. With the default user
+and password, a first start copies the cluster PGFORK_DOLTGRUST_TEMPLATE names instead, made once by
+`doltgrust --template <folder>` with the same initdb, so the server starts within the tests' wait for it. The config's
+`listener.port`, `listener.host`, and `system_variables` become the server's port, listen address, and settings, and
+the process then becomes the postmaster, so the tests stop it by its pid. Any other argument, subcommand, or config
+key is an error, since the fork has no equivalent of it."""
+
+import os
+import shutil
+import subprocess
+import sys
+
+# The environment variable naming a cluster that `doltgrust --template <folder>` made, which a first start with the
+# default user and password copies instead of running initdb, so the server starts within the tests' wait.
+TEMPLATE_ENV = "PGFORK_DOLTGRUST_TEMPLATE"
+
+# The config keys mapped onto the server's options; any other key is an error, except the ones Doltgrust's tests
+# write whose Postgres equivalent is the default (`log_level` is the log's verbosity, `behavior.read_only` false is a
+# writable server, and the others are Doltgrust's settings for Dolt behavior the fork leaves to Postgres).
+DEFAULTS = {
+    "log_level": None,
+    "behavior.read_only": "false",
+    "behavior.disable_client_multi_statements": "false",
+    "behavior.dolt_transaction_commit": "false",
+}
+
+
+def refuse(what):
+    """Exits with an error naming what the fork has no equivalent of."""
+    sys.exit(f"doltgrust: the fork has no equivalent of {what}")
+
+
+def config(path):
+    """Returns a config file's settings by dotted name, reading the two levels of `key: value` lines it uses."""
+    settings, section, level = {}, None, 0
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            indent = len(line) - len(line.lstrip())
+            key, _, value = line.strip().partition(":")
+            value = value.strip().strip("'\"")
+            if section and indent > level:
+                settings[f"{section}.{key}"] = value
+            elif value:
+                settings[key], section = value, None
+            else:
+                section, level = key, indent
+    return settings
+
+
+def initdb(cluster, user, secret, data):
+    """Creates a cluster as a first start of Doltgrust's server creates its data: its superuser the user, whose password
+    is the secret, signing in by SCRAM, and UTF-8 its encoding."""
+    password = os.path.join(data, ".pgpass-init")
+    with open(password, "w", encoding="utf-8") as f:
+        f.write(secret)
+    subprocess.run(["initdb", "-D", cluster, "-U", user, f"--pwfile={password}", "-A", "scram-sha-256",
+                    "--encoding=UTF8"], check=True, stdout=subprocess.DEVNULL)
+    os.remove(password)
+
+
+def main():
+    """Maps the arguments and starts the server, or with `--template <folder>`, makes the template cluster."""
+    if sys.argv[1:2] == ["--template"] and len(sys.argv) == 3:
+        folder = os.path.abspath(sys.argv[2])
+        initdb(folder, "postgres", "password", os.path.dirname(folder))
+        return
+    data, path, args = None, None, sys.argv[1:]
+    while args:
+        arg = args.pop(0)
+        name, _, value = arg.lstrip("-").partition("=")
+        if not arg.startswith("-") or name not in ("data-dir", "config"):
+            refuse(f"`doltgrust {arg}`")
+        if not value:
+            if not args:
+                refuse(f"`doltgrust {arg}` without a value")
+            value = args.pop(0)
+        if name == "data-dir":
+            data = value
+        else:
+            path = value
+    data = data or os.environ.get("DOLTGRUST_DATA_DIR") or "."
+    settings = config(path) if path else {}
+    options = []
+    for key, value in settings.items():
+        if key == "listener.port":
+            options += ["-p", value]
+        elif key == "listener.host":
+            options += ["-c", f"listen_addresses={value}"]
+        elif key.startswith("system_variables."):
+            options += ["-c", f"{key.split('.', 1)[1]}={value}"]
+        elif key not in DEFAULTS or (DEFAULTS[key] is not None and DEFAULTS[key] != value):
+            refuse(f"the config's `{key}: {value}`")
+    cluster = os.path.join(data, "pgdata")
+    if not os.path.exists(os.path.join(cluster, "PG_VERSION")):
+        user = os.environ.get("DOLTGRUST_USER") or "postgres"
+        secret = os.environ.get("DOLTGRUST_PASSWORD") or "password"
+        template = os.environ.get(TEMPLATE_ENV)
+        if template and (user, secret) == ("postgres", "password"):
+            shutil.copytree(template, cluster)
+        else:
+            initdb(cluster, user, secret, data)
+        database = os.environ.get("DOLTGRUST_DB")
+        if database and database != "postgres":
+            subprocess.run(["postgres", "--single", "-D", cluster, "postgres"], check=True, stdout=subprocess.DEVNULL,
+                           input=f'CREATE DATABASE "{database}"\n', text=True)
+    os.execvp("postgres", ["postgres", "-D", cluster, *options])
+
+
+if __name__ == "__main__":
+    main()

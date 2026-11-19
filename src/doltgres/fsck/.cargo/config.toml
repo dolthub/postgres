@@ -1,0 +1,22 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The one definition of the frontend program's builds' cfg (design item D12): every cargo run in this folder, whether
+# cargo.pl's build-frontend or a gate's step, builds pg, host, and chunks with `doltgres_frontend`, which leaves out the
+# server's items and puts in the frontend's.
+
+[build]
+rustflags = ["--cfg", "doltgres_frontend"]
+# rustdoc, which builds the doctests, takes the same cfg, so they build the frontend's items too.
+rustdocflags = ["--cfg", "doltgres_frontend"]

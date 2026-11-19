@@ -69,6 +69,7 @@
 #include "catalog/pg_database.h"
 #include "common/controldata_utils.h"
 #include "common/file_utils.h"
+#include "doltgres/hooks.h"
 #include "executor/instrument.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
@@ -5812,6 +5813,8 @@ StartupXLOG(void)
 	RedoRecPtr = XLogCtl->RedoRecPtr = XLogCtl->Insert.RedoRecPtr = checkPoint.redo;
 	doPageWrites = lastFullPageWrites;
 
+	doltgres_startup_open(checkPoint.redo);
+
 	/* REDO */
 	if (InRecovery)
 	{
@@ -5889,6 +5892,7 @@ StartupXLOG(void)
 		 * garbage is left over from before.
 		 */
 		ResetUnloggedRelations(UNLOGGED_RELATION_CLEANUP);
+		doltgres_unlogged_cleanup();
 
 		/*
 		 * Likewise, delete any saved transaction snapshot files that got left
@@ -5969,6 +5973,7 @@ StartupXLOG(void)
 		 */
 		PerformWalRecovery();
 		performedWalRecovery = true;
+		doltgres_redo_done();
 	}
 	else
 		performedWalRecovery = false;
@@ -7704,6 +7709,7 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 
 	/* We deliberately delay 2PC checkpointing as long as possible */
 	CheckPointTwoPhase(checkPointRedo);
+	doltgres_checkpoint(checkPointRedo);
 }
 
 /*
@@ -7806,7 +7812,8 @@ CreateRestartPoint(int flags)
 	 * side-effect.
 	 */
 	if (!XLogRecPtrIsValid(lastCheckPointRecPtr) ||
-		lastCheckPoint.redo <= ControlFile->checkPointCopy.redo)
+		lastCheckPoint.redo <= ControlFile->checkPointCopy.redo ||
+		doltgres_restartpoint_held(lastCheckPoint.redo))
 	{
 		ereport(DEBUG2,
 				errmsg_internal("skipping restartpoint, already performed at %X/%08X",
@@ -8167,6 +8174,8 @@ KeepLogSeg(XLogRecPtr recptr, XLogSegNo *logSegNo)
 		if (unsummarized_segno < segno)
 			segno = unsummarized_segno;
 	}
+
+	segno = doltgres_kept_segment(segno, wal_segment_size);
 
 	/* but, keep at least wal_keep_size if that's set */
 	if (wal_keep_size_mb > 0)
@@ -9081,6 +9090,8 @@ do_pg_backup_start(const char *backupidstr, bool fast, List **tablespaces,
 		tablespaceinfo *ti;
 		int			datadirpathlen;
 
+		doltgres_backup_started();
+
 		/*
 		 * Force an XLOG file switch before the checkpoint, to ensure that the
 		 * WAL segment the checkpoint is written to doesn't contain pages with
@@ -9380,6 +9391,7 @@ do_pg_backup_stop(BackupState *state, bool waitforarchive)
 	 */
 	Assert(XLogCtl->Insert.runningBackups > 0);
 	XLogCtl->Insert.runningBackups--;
+	doltgres_backup_ended();
 
 	/*
 	 * Clean up session-level lock.
@@ -9625,6 +9637,7 @@ do_pg_abort_backup(int code, Datum arg)
 		WALInsertLockAcquireExclusive();
 		Assert(XLogCtl->Insert.runningBackups > 0);
 		XLogCtl->Insert.runningBackups--;
+		doltgres_backup_ended();
 
 		sessionBackupState = SESSION_BACKUP_NONE;
 		WALInsertLockRelease();

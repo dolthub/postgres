@@ -1,0 +1,173 @@
+# Hook ledger
+
+Every change the fork makes to core Postgres, one row per change, and every existing Postgres hook the fork uses. A
+core change is one of five kinds: a call site (a single call into `src/doltgres`, declared in
+`src/include/doltgres/hooks.h`); a registration entry in one of the files under "Lists" below (a data line or a macro
+line whose functions, if any, are `src/doltgres`'s); a build file change that builds the fork, which builds with meson
+only (the `meson.build`s that build the fork's directories into Postgres' targets and link them, and in the root `meson.build` and `meson_options.txt`, only
+these: the vendored ICU of design item 12; the vendored CORE-MATH, dtoa, Ryu, libxml2, zstd, and lz4, `-ffp-contract=off`, the
+bundled tzdata only, and the libm symbol checks of design item 15; `-ffp-contract=off` in the `BITCODE_CFLAGS` and
+`BITCODE_CXXFLAGS` `src/makefiles/meson.build` gives PGXS, also design item 15; the Rust build's options of design item 18; the entry of the fork's tests after
+Postgres' own; and `src/Makefile.global.in`'s stop of a make build); a raised limit (a limit Postgres keeps
+privately, named in its row, grown by exactly the fork's own use: a line whose only change is the limit becoming
+`<limit> + DOLTGRES_<NAME>`, an integer constant `hooks.h` defines, or `<limit> + DoltgresReservedWorkers`, the one
+postmaster-fixed variable `hooks.h` declares (the owner, 2026-11-15), with the include of `hooks.h`, so extensions keep
+every slot stock gives); a helper function (one whole function added to a core file because the data it reads is
+private to that file, its name beginning `doltgres_` and declared in `hooks.h`, with nothing else in its hunk; the
+owner, 2026-11-15); or a documentation file of the fork's own (`doc/src/sgml/doltgres-*.sgml`) with its entries in
+`filelist.sgml` and the chapter list that includes it. A core change not listed here is a defect, and the queue's
+boundary check bounces it: every file a ref changes outside `src/doltgres` and
+`src/include/doltgres` must match a row's File (exact paths, or a glob), a call site's hunk must add one guard or
+statement around a single call to a function `hooks.h` declares (a guard's body is one added exit, or added braces
+around existing lines, whose leading whitespace alone may change; a guard may follow one added declaration of a
+local at the start of an existing block when its call passes the local by address and its body only returns it, the
+owner's form of 2026-11-16 for a hook's out value), or append `&& hook(args)` or `&& !hook(args)` to
+the end of a loop's condition, its one changed line (so the stock lines around it stay byte-identical), or take one
+hook call as an existing `if`'s last `||` operand, the condition's closing line ending in ` ||` in place of its `)` and
+one added line holding the call and that `)`, so the existing operands and body stay as they were (the owner,
+2026-11-16, for a hook joining an existing skip), and change
+nothing else, a registration entry's
+hunk must only add lines (in a C file, an
+array's initializers), a raised limit's hunk may change a line only that way, and a helper function's hunk may only add its row's function
+whole. The rows include those the design has yet to build. The prototype's 150 touched files
+(`git diff --stat 724edf9bde9 9f61d266b7f`) are the checklist for what the design needs.
+
+## Lists
+
+The files whose entries count as registration entries; a file joins only through the coordinator. Stock-built
+extensions must work unchanged (the owner, 2026-11-07), so no entry may move a constant an installed header gives
+them: `rmgrlist.h`, `lwlocklist.h`, and the sorted part of `wait_event_names.txt` are not lists here (the fork uses
+`RegisterCustomRmgr`, `LWLockNewTrancheId`, and the file's `ABI_compatibility:` section or `WaitEventExtensionNew`
+instead), and every installed header stays byte-identical to the reference's except the reviewed differences the
+queue's include-tree check lists.
+
+- `src/backend/utils/activity/wait_event_names.txt`'s `ABI_compatibility:` section
+- `src/include/catalog/pg_proc.dat`
+- `src/backend/utils/misc/guc_parameters.dat`
+- `src/bin/initdb/initdb.c`'s `subdirs` array
+- `src/backend/utils/misc/postgresql.conf.sample`
+- `src/backend/postmaster/bgworker.c`'s `InternalBGWorkers` table
+- `src/tools/pgindent/typedefs.list`, one typedef name of the fork's per data line
+- `src/tools/pgindent/exclude_file_patterns`, for lines naming the fork's vendored upstream code
+- `.gitattributes`, for lines that name the fork's own files, and `eol=lf` for `*.sql` (design item 15)
+
+## Rows
+
+| File | Function or list | Change | Why |
+|---|---|---|---|
+| src/backend/utils/cache/relcache.c | `InitTableAmRoutine` | call site | A fork relation gets the fork's `TableAmRoutine` whatever its `relam` names (design item 9) |
+| src/backend/utils/cache/relcache.c | `RelationInitIndexAccessInfo` | call site | A fork index of a method the fork implements gets the fork's copy of that method's routine, once the entry holds its operator classes (design items 4 and 9) |
+| src/backend/catalog/heap.c | `heap_create_with_catalog` | call site | Tell the fork, before `heap_create` fills the new relation's routine and makes its storage, the relation's OID and the relation it is made to rewrite, which the entry holds only afterwards, so the transient relations of a catalog's rewrite keep Postgres' code; it runs for every creation, a zero `relrewrite` included (design item 9) |
+| src/backend/storage/buffer/bufmgr.c | `RelationGetNumberOfBlocksInFork` | call site | An index whose entries are the fork's answers with its tree's derived blocks, since that path goes to smgr directly (design item 5) |
+| src/backend/utils/adt/selfuncs.c | `get_actual_variable_endpoint` | call site | The same visibility skip for the planner's endpoint probe (design items 2 and 5) |
+| src/backend/executor/execCurrent.c | `execCurrent`'s index-only branch | call site | WHERE CURRENT OF on an index-only scan of a fork index asks the fork for the visible version's tid (design item 2) |
+| src/backend/access/heap/visibilitymap.c | `visibilitymap_count` | call site | A fork table counts every block all-visible and all-frozen, `relpages` (design items 5 and 16) |
+| src/backend/storage/smgr/smgr.c | `smgrdounlinkall` | call site | Free the fork's state of each relfilenode Postgres unlinks, at commit, abort, and in redo (design item 5) |
+| src/backend/storage/lmgr/lwlock.c | `MAX_USER_DEFINED_TRANCHES` | raised limit | The private table of named LWLock tranches and its check grow by `DOLTGRES_LWLOCK_TRANCHES`, the fork's own tranches, so extensions keep the 256 stock gives (the owner's decision of 2026-11-09) |
+| src/backend/utils/adt/dbsize.c | `pg_relation_size`, `calculate_table_size`, `calculate_toast_table_size`, `calculate_indexes_size`, `calculate_database_size`, `calculate_tablespace_size` | call sites | Sizes of fork relations, added from each open relation (whose empty files count 0), since a locator alone can't name a session's own temporary relation; and the repositories' directories in database and tablespace sizes (design item 5) |
+| src/backend/commands/tablecmds.c | `index_copy_data` | call site | ALTER INDEX SET TABLESPACE moves a fork index's tree (design item 5) |
+| src/backend/commands/tablecmds.c | `ATExecCmd` | call site | Every executed ALTER TABLE subcommand reaches the fork before and after it runs: the row layouts of the relation and its inheritors before it, then their layout transforms, a keyless table's re-keyed rows, and identity pairs (design items 5 and 10) |
+| src/backend/commands/tablecmds.c | `ATRewriteTables` | call site | Settle each altered table that Postgres doesn't rewrite and whose primary key changed, writing it once under the new key before phase 3's validation (design item 5; Differences row 31) |
+| src/backend/tcop/utility.c | `ProcessUtility` | call sites | Open the statement's level of the primary key settle's list before the hook or standard function dispatch, and settle and close that level as the function's last statement after it returns, so a hook that doesn't chain can't skip it and a nested statement (an event trigger's) settles only its own level (design item 5; the rewrite text's section 6) |
+| src/backend/catalog/heap.c | `heap_drop_with_catalog` | call site | Remove a dropped table's identity pairs and table data record in the dropping transaction (design item 10) |
+| src/backend/catalog/index.c | `index_drop` | call site | Remove a dropped index's identity pairs (design item 10) |
+| src/backend/catalog/dependency.c | `doDeletion` | call site | Remove a dropped schema's identity pair before `DropObjectById` removes its row, so a schema made again derives the same id (design item 10) |
+| src/backend/catalog/dependency.c | `doDeletion`'s column branch | call site | Every dropped column reaches the fork, which chains its table's transform and re-keys a keyless table (design item 5) |
+| src/backend/catalog/toasting.c | `create_toast_table` | call site | A table's new TOAST relation reaches the fork, which records its identity pair in the creating transaction (design item 10) |
+| src/backend/catalog/index.c | `index_create`, `index_constraint_create`, `index_drop` | call sites | Name the table whose primary key the statement creates, marks, or drops, for the settle that rewrites it once under its new key (design item 5; Differences row 31) |
+| src/backend/commands/tablespace.c | `DropTableSpace`, `tblspc_redo` | call sites | Evacuate and remove the fork's packs in a tablespace before Postgres removes its directories, and in redo (design item 5) |
+| src/backend/commands/dbcommands.c | `createdb` | call site | Make the new database's repository from the template's folded base, logging the template's root (design items 5 and 8) |
+| src/backend/commands/dbcommands.c | `dropdb` | call site | Log the drop, remove the database's repository through the file door, and checkpoint after its removal, whose redo is the fork's own record's (design items 5 and 8) |
+| src/backend/commands/dbcommands.c | `movedb` | call sites | Copy the database's repository into the new tablespace after Postgres' copy, and after the commit's `XLOG_DBASE_DROP` and before the lock's release make the copy the repository, remove the old directory, and checkpoint (design items 5 and 8) |
+| src/backend/commands/dbcommands.c | `check_db_file_conflict` | call site | Refuse a database's id while a directory of a dropped repository of that id still stands, which Postgres' own check of `base/<id>` doesn't see (design item 6) |
+| src/backend/commands/repack.c | `check_concurrent_repack_requirements` | call site | REPACK (CONCURRENTLY) admits the fork's routine (design item 5; Order 2c) |
+| src/backend/commands/repack.c | `make_new_heap` | call site | Give the transient table's storage the old table's key, so CLUSTER, VACUUM FULL, REPACK, and ALTER TABLE's rewrite write under it (design item 5) |
+| src/backend/commands/vacuum.c | `vac_update_datfrozenxid` | call site | Lower the database's new `datfrozenxid` to the oldest xid its identity and table data trees' delta versions and runs name, after the scan of `pg_class`, so commit log truncation never passes an xid they hold (design item 7's commit log rule; bugs row 104) |
+| src/backend/catalog/pg_enum.c | `AddEnumLabel` | call site | Rewrite every relation keyed by the enum type after `RenumberEnumType` changes its labels' sort order, which a key stores (design item 5) |
+| src/backend/catalog/pg_namespace.c | `NamespaceCreate`, after its row is inserted | call site | Record a new schema's identity pair in its creating transaction, so no writer of a table in it derives the pair and two transactions' first writes in one schema never wait on each other (design item 10, CommPF's ruling (a)) |
+| src/backend/access/transam/xact.c | `RecordTransactionCommit` | call site | Register the transaction and its commit record's end LSN in the commit status table inside the `DELAY_CHKPT_START` window (design item 7) |
+| src/backend/access/transam/twophase.c | `RecordTransactionCommitPrepared` | call sites | The same for COMMIT PREPARED, and, ahead of its critical section, where an error may still be raised, the step in which the committing process makes room for that registration and takes over the prepared transaction's entry in the commit status table (design item 7) |
+| src/backend/access/transam/xact.c | `xact_redo_commit`, `xact_redo_abort` | call sites | Fill the commit status table during recovery and on standbys (design item 7) |
+| src/backend/access/transam/xact.c | `xact_redo`, at its start, before any branch's `DropRelationFiles` | call site | At a replayed `XLOG_XACT_ABORT` or `XLOG_XACT_ABORT_PREPARED`, which the entry reads from the record, take out of each working state's delta the built nodes of every storage the abort drops, so an aborted rewrite's chunk records leave nothing on a standby that never promotes (bugs row 119; the table rewrite's built bases) |
+| src/backend/storage/ipc/standby.c | `standby_redo` | call site | Before its return when hot standby is off, at a replayed `XLOG_RUNNING_XACTS`, expire the commit status table's count-0 entries of transactions the record shows ended, in recovery without hot standby, so a long recovery's table stays bounded (design item 7; bugs row 100) |
+| src/backend/storage/ipc/standby.c | `standby_redo`, at a replayed `XLOG_RUNNING_XACTS` before its return for a disabled standby | call site | Drop from each working state's delta the built nodes of every writer the record shows ended uncommitted, so a rewrite the primary's crash cut short, which writes no abort record, leaves nothing on a standby that never promotes (bugs row 119; the table rewrite's built bases) |
+| src/backend/access/transam/xlog.c | `xlog_redo` | call site | At a replayed shutdown checkpoint, expire the commit status table's count-0 entries of transactions its next xid shows ended, prepared transactions excepted (as the recovered `TwoPhaseState` lists them), in recovery without hot standby (design item 7; bugs row 100) |
+| src/backend/postmaster/startup.c | `ProcessStartupProcInterrupts` | call site | End recovery with a FATAL naming the storage and both roots when a hot standby's fold worker found a byte-ordered tree's root at a replayed fold point differing from the record's, which the worker publishes in shared memory, since the worker's own error would end only itself (design item 8's standbys' roots) |
+| src/backend/access/transam/xlog.c | `CheckPointGuts` | call site | Write every storage's unfolded versions as runs and the manifests at each checkpoint (design item 8) |
+| src/backend/access/transam/xlog.c | `do_pg_backup_start`, `do_pg_backup_stop`, `do_pg_abort_backup` | call sites | Hold a backup's manifest generation and pack table, and every deletion they name, for the backup's lifetime: the start counts the backup in and waits for a running collection to end, and the stop and the abort count it out (design items 6 and 8) |
+| src/backend/access/transam/xlog.c | `StartupXLOG` | call site | After a crash, beside Postgres' cleanup of unlogged relations and before redo, reset each of the fork's unlogged storages to an empty base keeping its key and table, so it starts empty as an unlogged relation does (design item 5) |
+| src/backend/storage/buffer/localbuf.c | `check_temp_buffers` | call site | Refuse a change of `temp_buffers` once the backend's local region for temporary tables exists, as Postgres refuses it once local buffers exist, a different value only and never at `PGC_S_TEST` (design item 5's temporary tables) |
+| src/backend/access/transam/xlog.c | `KeepLogSeg` | call site | Keep WAL back to the oldest redo point a repository's previous manifest still needs, read from shared memory, so a fallback to that manifest loses no base (design item 8) |
+| src/backend/access/transam/xlog.c | `CreateRestartPoint` | call site | Skip a standby's restartpoint whose redo point would pass a storage's oldest unfolded reached fold point, as the last `||` operand of the existing skip's condition, so Postgres' own skip path keeps updating the minimum recovery point and the shutdown state, and replay after a restart re-delivers every reached record in order (bugs row 158) |
+| src/backend/access/transam/xlog.c | `StartupXLOG` | call site | Open every repository before the redo decision, whether or not WAL is replayed: settle its packs, settle a directory no database names, check the WAL kept for a marked manifest, and even it, since redo needs the packs (design item 6's Opening) |
+| src/backend/access/transam/xlog.c | `StartupXLOG`, after `PerformWalRecovery` | call site | Once redo has ended and before the end-of-recovery checkpoint, drop from each working state's delta every built node whose base record never came, as a crash between a built base's chunk records and its base record leaves them (bugs row 119; the table rewrite's built bases) |
+| src/backend/storage/sync/sync.c | `RememberSyncRequest`, `SyncPreCheckpoint` | call sites | Tell the fork of each unlink registered and of the cycle's advance, so the checkpoint that removes a relfilenode's tombstone takes its storage's entry out of the base tree in the same save; the fork keeps its two sets of names in that process's own memory, unbounded as Postgres' list is (design item 6) |
+| src/backend/postmaster/bgworker.c | `max_worker_processes` | raised limit | The worker slots and their bounds (in BackgroundWorkerShmemRequest, BackgroundWorkerShmemInit, BackgroundWorkerStateChange, ForgetBackgroundWorker, ReportBackgroundWorkerPID, ReportBackgroundWorkerExit, ForgetUnstartedBackgroundWorkers, RegisterBackgroundWorker, GetBackgroundWorkerPid, and TerminateBackgroundWorker) grow by `DoltgresReservedWorkers`, the fork's own workers (the fold launcher, `fold_workers`' maximum, and the collector), so a user's `max_worker_processes` leaves extensions and parallel query every slot stock gives; messages naming `max_worker_processes` are unchanged (design item 6; the owner's decision of 2026-11-15) |
+| src/backend/postmaster/bgworker.c | `doltgres_worker_slots_in_use` | helper function | Count the in-use slots held by workers other than the fork's, under `BackgroundWorkerLock`, since `BackgroundWorkerData` is private to bgworker.c; the fork's guard reads it so an extension's dynamic workers keep exactly stock's `max_worker_processes` and never take the slots `DoltgresReservedWorkers` reserves (design item 6; the owner, 2026-11-15) |
+| src/backend/postmaster/bgworker.c | `RegisterDynamicBackgroundWorker` | call site | The slot search's loop condition gains `&& !doltgres_worker_refused(worker)`, which refuses a worker that isn't the fork's once `max_worker_processes` slots hold such workers, so the search ends at once and the registration fails as stock's does when no slot is free (design item 6) |
+| src/backend/postmaster/pmchild.c | `max_worker_processes` | raised limit | The `B_BG_WORKER` pool (InitPostmasterChildSlots) grows by `DoltgresReservedWorkers` (design item 6) |
+| src/backend/storage/lmgr/proc.c | `max_worker_processes` | raised limit | The background workers' partition of `PGPROC`s (ProcGlobalShmemInit) grows by `DoltgresReservedWorkers` (design item 6) |
+| src/backend/utils/init/postinit.c | `max_worker_processes` | raised limit | `MaxBackends` (InitializeMaxBackends) grows by `DoltgresReservedWorkers`, the fork's own workers' `PGPROC`s; its errdetail is unchanged (design item 6) |
+| src/backend/utils/misc/guc_parameters.dat | the GUC table | registration entries | `node_cache_size`, `delta_memory`, `fold_workers`, the fold's `fold_threshold` and `fold_timeout`, the collector's `collector_naptime`, `collector_target_percent`, `collector_first_packs`, `collector_full_interval`, `collector_io_limit`, `collector_min_free_disk`, `collector_young_size`, `collector_young_packs`, the crash recorder's developer setting (design items 6 and 14), and `debug_fail_preload_allocation`, the preload entry's allocation-failure trigger (design item 17's cases) |
+| src/backend/utils/misc/guc_tables.c | the includes | call site | Include `doltgres/hooks.h`, which declares the variables of the fork's settings that `guc_parameters.dat` names (design item 6) |
+| src/backend/commands/collationcmds.c | `DefineCollation` | call site | Mark CREATE COLLATION's own load check of a new collation not copied `FROM` a stored one, so that `create_pg_locale_libc`'s second call site builds a new libc name only after stock's refusal, and a stored name never asks the C library (design item 12; bugs row 51) |
+| src/backend/utils/adt/pg_locale_libc.c | `create_pg_locale_libc` | call sites | libc-named locales get the ICU locale's collation and ctype methods (design item 12): the first call builds every stored name; the second, after `make_libc_collator`, builds a name entering the catalog, which `DefineCollation`'s call site marks, once stock's own refusal has run (bugs row 51) |
+| src/backend/utils/adt/pg_locale_libc.c | `get_collation_actual_version_libc` | call site | libc-named collations report the vendored ICU's collator version (design item 12) |
+| src/backend/utils/adt/pg_locale_icu.c | `create_pg_locale_icu` | call sites | A libc-named locale's ICU tag comes from the fork, mapped from its stored name, in place of the catalog's locale name, which a libc row leaves null; the two guards skip only the two lines that read it (design item 12) |
+| src/backend/utils/adt/pg_locale_builtin.c | `create_pg_locale_builtin` | call sites | A libc locale of the C family, but `C` and `POSIX` alone, gets the builtin provider's locale of the name its ctype name stands for (`C.UTF-8` in a UTF-8 database, else `C`), which the fork gives in place of the catalog's locale name, which a libc row leaves null; the two guards skip only the two lines that read it (design item 12) |
+| contrib/pageinspect/heapfuncs.c, contrib/pageinspect/rawpage.c, contrib/pageinspect/btreefuncs.c, contrib/pageinspect/brinfuncs.c, contrib/pageinspect/gistfuncs.c, contrib/pageinspect/hashfuncs.c, contrib/pageinspect/ginfuncs.c | each function's access method check | call sites | Refuse fork relations with that check's own SQLSTATE and message (design item 5) |
+| contrib/pg_visibility/pg_visibility.c | `check_relation_relkind` | call site | As above (design item 5) |
+| contrib/pg_surgery/heap_surgery.c | the access method check | call site | As above (design item 5) |
+| contrib/pgstattuple/pgstattuple.c, contrib/pgstattuple/pgstatapprox.c, contrib/pgstattuple/pgstatindex.c | the access method checks | call sites | As above (design item 5) |
+| contrib/amcheck/verify_heapam.c, contrib/amcheck/verify_nbtree.c | the access method checks | call sites | As above (design item 5) |
+| contrib/pg_prewarm/pg_prewarm.c | `pg_prewarm` | call site | Read a fork relation's trees into the node cache (design item 5) |
+| src/bin/initdb/initdb.c | `subdirs` | registration entry | Create `pg_versioned` (design item 5) |
+| src/bin/pg_checksums/pg_checksums.c | `scan_directory` | call site | Skip `pg_versioned` in a tablespace's version directory (design item 5) |
+| src/bin/pg_rewind/filemap.c | `decide_file_action` | call site | The fork's rule for `pg_versioned`: packs copied only when missing and removed only when the source lacks them (design item 5; Order 2c) |
+| src/bin/pg_resetwal/pg_resetwal.c | the WAL reset | call site | Record the reset where the fork's open reads it (design item 5) |
+| src/bin/pg_amcheck/pg_amcheck.c | the relation query | call site | Leave out the fork's relations, which its fsck checks (design item 9) |
+| src/bin/pg_upgrade/relfilenumber.c | `transfer_all_new_dbs` | call site | Move repositories between the fork's clusters, and load stock heap files into the fork's storage (design item 5; Order 2c) |
+| src/tools/pgindent/typedefs.list | the typedef list | registration entry | The typedefs of the fork's C, for pgindent |
+| src/meson.build | `subdir('doltgres')` before `subdir('backend')` | build file | Builds the fork's Rust workspace into the object the backend links (design item 18) |
+| meson.build | `subdir('src/doltgres/test')` after `subdir('src/test')` | build file | The fork's tests and test modules, entered where Postgres enters its own, so a test module builds with the backend's module arguments (design item 11) |
+| meson.build | `subproject_dir: 'src/doltgres/third_party'` in `project()`, and `subproject('zstd', required: not get_option('zstd').disabled())` and `subproject('lz4', required: not get_option('lz4').disabled())` before the lz4 section | build file | Builds the vendored, pinned zstd and lz4 as meson subprojects, which override Postgres' `libzstd` and `liblz4` dependencies, so the server, its client tools, and `pg`'s wrappers link the same versions on every platform; a vendored subproject that fails stops configure rather than falling back to the system's library (design item 15) |
+| src/tools/pgindent/exclude_file_patterns | `src/doltgres/third_party/` | registration entry | The vendored zstd and lz4 are upstream's code byte for byte, which pgindent must not reformat; the queue's compiler-warning bounce excludes the same folder (design item 15) |
+| src/backend/meson.build | `backend_link_args`, `backend_link_depends` | build file | The postgres executable links the fork's object after its own, with unused code removed and the system libraries Rust needs that the compiler's driver doesn't already link, and relinks when the object changes (design items 17 and 18) |
+| src/include/catalog/pg_proc.dat | `dolt_version` | registration entry | `dolt_version()`, the fork's version as Dolt's function gives it, the first SQL entry into the fork (design item 17) |
+| meson_options.txt | `libclang` | build file | The libclang bindgen uses to read Postgres' headers (design item 18) |
+| src/Makefile.global.in | a make build outside PGXS | build file | Stops a make build with a message naming meson, since the fork builds with meson only; extensions building through PGXS are unaffected |
+| src/bin/pg_rewind/meson.build, src/bin/pg_resetwal/meson.build, src/bin/pg_checksums/meson.build, src/bin/pg_amcheck/meson.build, src/bin/pg_upgrade/meson.build | build files | build file | Link the fork's frontend file door and relation rule (design items 5 and 9) |
+| src/backend/utils/misc/postgresql.conf.sample | the sample's settings | registration entries | `node_cache_size`, `delta_memory`, `fold_workers`, the fold's `fold_threshold` and `fold_timeout`, and the collector's `collector_naptime`, `collector_target_percent`, `collector_first_packs`, `collector_full_interval`, `collector_io_limit`, `collector_min_free_disk`, `collector_young_size`, `collector_young_packs`, which `test_misc/t/003_check_guc.pl` requires; the crash recorder's developer setting is `GUC_NOT_IN_SAMPLE` in `guc_parameters.dat` (design items 6 and 14) |
+| src/backend/postmaster/bgworker.c | `InternalBGWorkers` | registration entry | The fold launcher's and fold workers' entry functions, and the collector's (design item 6) |
+| src/backend/utils/init/miscinit.c | `process_shared_preload_libraries` | call site | Inside the preload window, the fork's first entry in every process but bootstrap mode (whose first entry installs them through the entry thunk), install its allocation error hook and memory reserve (design item 17, H11) and register its shared memory, custom resource manager, fold launcher, transaction callback, LWLock tranches, and wait events, at postmaster start and in each `EXEC_BACKEND` process (design items 6 to 8) |
+| src/backend/utils/init/postinit.c | `BaseInit` | call site | Register the fork's exit callbacks at the one point every process with a `PGPROC` passes once, after `BaseInit`'s own exit callbacks and before every one Postgres registers that can run fork code, never at a first use, which can fall inside a `PG_ENSURE_ERROR_CLEANUP` block (design item 14's S2) |
+| src/backend/storage/ipc/ipc.c | `MAX_ON_EXITS` | raised limit | The `before_shmem_exit` list and its check grow by `DOLTGRES_EXIT_CALLBACKS`, the fork's own exit callbacks, so extensions keep the 20 stock gives (design item 14's S2) |
+| meson.build, meson_options.txt | build files | build file | Build the vendored ICU and always build Postgres' ICU support against it (design item 12) |
+| doc/src/sgml/doltgres-*.sgml | the fork's documentation | documentation | The storage base's settings (`node_cache_size`, `delta_memory`, `fold_workers`), the developer setting `debug_fail_preload_allocation`, and the differences from Postgres users meet |
+| doc/src/sgml/filelist.sgml, doc/src/sgml/postgres.sgml | the documentation's file list and chapter list | documentation | Entries for the fork's documentation files |
+| src/backend/storage/buffer/bufmgr.c | `ReadBufferExtended` | call site | Refuse any read of a fork relation's pages, so a stock-built extension that bypasses the table AM meets an error, never an empty table (design item 5) |
+| (existing hook) | `RegisterXactCallback`, `XACT_EVENT_PRE_PREPARE` | existing hook | Write a prepared transaction's row locks as fork records (design item 7) |
+| (existing hook) | `RegisterXactCallback`, `XACT_EVENT_COMMIT`, `XACT_EVENT_PARALLEL_COMMIT`, `XACT_EVENT_PREPARE` | existing hook | End the transaction's holds of storages' states before the resource owners' release, which would warn of them at commit (design item 7) |
+| (existing hook) | `RegisterXactCallback`, `XACT_EVENT_ABORT`, `XACT_EVENT_PARALLEL_ABORT`; `RegisterSubXactCallback`, `SUBXACT_EVENT_ABORT_SUB` | existing hook | Take an aborted transaction's or subtransaction's versions back out of the memtable after its abort record (design item 7) |
+| (existing hook) | `ProcessUtility_hook` | existing hook | After the standard function, settle the tables whose primary key a cascaded drop changed outside ALTER TABLE (design item 5) |
+| src/backend/optimizer/path/costsize.c | `cost_index` | call site | A fork table's part of an index scan: primary key lookups, none for an index-only scan (design item 16) |
+| src/backend/optimizer/path/costsize.c | `cost_bitmap_heap_scan`, `compute_bitmap_pages` | call sites | A fork table's part of a bitmap scan: tid resolutions and primary key lookups (design item 16) |
+| src/backend/access/transam/xlogrecovery.c | `PerformWalRecovery` | call site | Refuse a replay that stopped below the WAL position the fork's durable bases and runs prove (design item 8) |
+| src/backend/utils/adt/float.c | `float4in_internal`, `float8in_internal`, `float4recv`, `float8recv`, `float4send`, `float8send` | call sites | The correctly rounded parser and the quiet positive NaN (design item 15) |
+| src/port/snprintf.c | `fmtfloat` | call site | Float formatting with a precision through Ryu (design item 15) |
+| src/backend/utils/adt/pg_locale.c | `PGLC_localeconv`, `cache_locale_time` | call sites | CLDR's numeric, monetary, and time conventions from the vendored ICU (design item 15) |
+| src/backend/parser/scansup.c | `downcase_identifier` | call site | Downcase through the database's ICU-backed ctype (design item 15) |
+| src/port/pgstrcasecmp.c | `pg_strcasecmp`, `pg_strncasecmp`, `pg_toupper`, `pg_tolower` | call sites | In the backend, fold high-bit characters through the database's ICU-backed ctype (design item 15) |
+| src/backend/utils/init/postinit.c | `CheckMyDatabase` | call site | The process's `LC_CTYPE` is `C` on every platform (design item 15) |
+| src/port/strerror.c | `pg_strerror_r` | call site | Linux's error wording on every platform (design item 15) |
+| src/interfaces/libpq/fe-connect.c | the address lookup's error report | call site | Linux's `gai_strerror` wording on every platform (design item 15) |
+| src/backend/postmaster/launch_backend.c | the `EXEC_BACKEND` startup's parameters | call site | Backends use the postmaster's loaded `pg_hba.conf` and `pg_ident.conf` (design item 15) |
+| src/backend/commands/extension.c | `pg_get_loaded_modules` | call site | Report `.so` names on every platform (design item 15) |
+| meson.build, meson_options.txt | build files | build file | `-ffp-contract=off`, the bundled tzdata only, the vendored CORE-MATH, dtoa, Ryu, and libxml2, and the build check that no libm function CORE-MATH provides stays undefined (design item 15) |
+| src/makefiles/meson.build | `BITCODE_CFLAGS`, `BITCODE_CXXFLAGS` | build file | An extension built with PGXS compiles its bitcode with `-ffp-contract=off`, as its objects are through `CFLAGS`, so its functions round the same called or inlined (design item 15) |
+| .github/workflows/pgfork* | the fork's workflows and their scripts in `.github/workflows/pgfork/` | build file | The fork's CI on pull requests against main: Postgres' and Doltgrust's suites on the pull request and on main, failing only for a test that passes on main and fails on the pull request, with one comment per suite (the owner, 2026-11-15); upstream's `pg-ci.yml` is untouched |
+| .gitattributes | `eol=lf` for `*.sql` | registration entry | Extension scripts keep LF on every checkout (design item 15) |
+| src/pl/plpython/plpy_main.c | `_PG_init`, after `Py_Initialize` | call site | Set the process's `LC_CTYPE` back to `C` (design item 15) |
+| src/pl/tcl/pltcl.c | `_PG_init`, after `Tcl_Init` | call site | Set the process's `LC_CTYPE` back to `C` (design item 15) |
+| src/backend/access/transam/xact.c | `StartTransaction` | call site | Restore `LC_CTYPE` to `C` when loaded code changed it, warning once per backend (design item 15) |
+| src/backend/storage/file/fd.c | `RemovePgTempFiles`, after its tablespaces' loop | call site | Remove `pg_versioned/temp`, every backend's session repository for temporary tables, where and when Postgres removes its temporary relations' files: at every start, and at a restart after a crash only while `remove_temp_files_after_crash` is on, logging what it can't remove and going on (design item 5's temporary tables) |

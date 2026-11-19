@@ -15,6 +15,7 @@
 #include "catalog/pg_collation.h"
 #include "common/unicode_case.h"
 #include "common/unicode_category.h"
+#include "doltgres/hooks.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/pg_locale.h"
@@ -248,9 +249,12 @@ create_pg_locale_builtin(Oid collid, MemoryContext context)
 		tp = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
 		if (!HeapTupleIsValid(tp))
 			elog(ERROR, "cache lookup failed for database %u", MyDatabaseId);
-		datum = SysCacheGetAttrNotNull(DATABASEOID, tp,
-									   Anum_pg_database_datlocale);
-		locstr = TextDatumGetCString(datum);
+		if (!doltgres_builtin_locale(collid, &locstr))
+		{
+			datum = SysCacheGetAttrNotNull(DATABASEOID, tp,
+										   Anum_pg_database_datlocale);
+			locstr = TextDatumGetCString(datum);
+		}
 		ReleaseSysCache(tp);
 	}
 	else
@@ -261,9 +265,12 @@ create_pg_locale_builtin(Oid collid, MemoryContext context)
 		tp = SearchSysCache1(COLLOID, ObjectIdGetDatum(collid));
 		if (!HeapTupleIsValid(tp))
 			elog(ERROR, "cache lookup failed for collation %u", collid);
-		datum = SysCacheGetAttrNotNull(COLLOID, tp,
-									   Anum_pg_collation_colllocale);
-		locstr = TextDatumGetCString(datum);
+		if (!doltgres_builtin_locale(collid, &locstr))
+		{
+			datum = SysCacheGetAttrNotNull(COLLOID, tp,
+										   Anum_pg_collation_colllocale);
+			locstr = TextDatumGetCString(datum);
+		}
 		ReleaseSysCache(tp);
 	}
 

@@ -2,7 +2,7 @@
 
 backend_build_deps = [backend_code]
 backend_sources = []
-backend_link_with = [pgport_srv, common_srv]
+backend_link_with = [pgport_srv, common_srv, doltgres_c]
 
 generated_backend_sources = []
 post_export_backend_sources = []
@@ -37,8 +37,8 @@ subdir('utils')
 subdir('po', if_found: libintl)
 
 
-backend_link_args = []
-backend_link_depends = []
+backend_link_args = doltgres_link_args
+backend_link_depends = [doltgres_lib]
 
 
 # On Windows also make the backend depend on dbghelp, for backtrace support

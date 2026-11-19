@@ -1,0 +1,1 @@
+CREATE FUNCTION dg_include_func() RETURNS int LANGUAGE sql AS 'SELECT 7';

@@ -1,0 +1,1887 @@
+/*
+ * Copyright 2026 Dolthub, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/*
+ * Object ids and the identity tree (txn's identity.rs): a schema's, a
+ * relation's, and a column's id derived from its kind, its parent's id, and
+ * its name; the identity tree's two key forms, which pair each id with the
+ * number Postgres gives the object; and the tree's changes, versions in a
+ * database's working state's delta written in the DDL's transaction.
+ */
+#ifndef FRONTEND
+#include "postgres.h"
+#else
+#include "postgres_fe.h"
+#endif
+
+#include "doltgres/chunks/address.h"
+#include "doltgres/chunks/varint.h"
+#include "doltgres/host/delta.h"
+#include "doltgres/repo/lib.h"
+#include "doltgres/std/num.h"
+#include "doltgres/std/unwind.h"
+#include "doltgres/txn/base.h"
+#include "doltgres/txn/change.h"
+#include "doltgres/txn/fold.h"
+#include "doltgres/txn/identity.h"
+#include "doltgres/txn/memtable/branch.h"
+#include "doltgres/txn/memtable/table.h"
+#include "doltgres/txn/outcome.h"
+#include "doltgres/txn/visible.h"
+#include "doltgres/txn/written.h"
+
+/* The prepare whose closure pushes an identity change's versions, or answers false to start over. */
+#define TXN_MEMTABLE_BRANCH_RS Bool
+#define TXN_MEMTABLE_BRANCH_WS Striping
+#define TXN_MEMTABLE_BRANCH_RETURNS bool
+#define TXN_MEMTABLE_BRANCH_RESULT_PARAMS , bool *result, HostError *error
+#define TXN_MEMTABLE_BRANCH_WITH_PARAMS , HostIoStriping striping
+#define TXN_MEMTABLE_BRANCH_DECLARE
+#define TXN_MEMTABLE_BRANCH_DEFINE
+#define TXN_MEMTABLE_BRANCH_WITH_FIELDS HostIoStriping striping;
+#define TXN_MEMTABLE_BRANCH_WITH_INIT , striping
+#define TXN_MEMTABLE_BRANCH_WITH_ARGS(c) , (c)->striping
+#define TXN_MEMTABLE_BRANCH_RESULT_FIELDS bool *result;
+#define TXN_MEMTABLE_BRANCH_RESULT_INIT , result
+#define TXN_MEMTABLE_BRANCH_RESULT_ARGS(c) , (c)->result
+#define TXN_MEMTABLE_BRANCH_RESULT_ERROR error
+#include "doltgres/txn/memtable/branch_template.h"
+
+/* The prepare whose closure pushes a replayed identity change's version. */
+#define TXN_MEMTABLE_BRANCH_RS Handle
+#define TXN_MEMTABLE_BRANCH_WS Unit
+#define TXN_MEMTABLE_BRANCH_RETURNS bool
+#define TXN_MEMTABLE_BRANCH_RESULT_PARAMS , TxnMemtableVersionHandle *result, HostError *error
+#define TXN_MEMTABLE_BRANCH_WITH_PARAMS
+#define TXN_MEMTABLE_BRANCH_DECLARE
+#define TXN_MEMTABLE_BRANCH_DEFINE
+#define TXN_MEMTABLE_BRANCH_WITH_FIELDS
+#define TXN_MEMTABLE_BRANCH_WITH_INIT
+#define TXN_MEMTABLE_BRANCH_WITH_ARGS(c)
+#define TXN_MEMTABLE_BRANCH_RESULT_FIELDS TxnMemtableVersionHandle *result;
+#define TXN_MEMTABLE_BRANCH_RESULT_INIT , result
+#define TXN_MEMTABLE_BRANCH_RESULT_ARGS(c) , (c)->result
+#define TXN_MEMTABLE_BRANCH_RESULT_ERROR error
+#include "doltgres/txn/memtable/branch_template.h"
+
+/* TXN_IDENTITY_BY_ID starts a key that finds an object's number from its id. */
+#define TXN_IDENTITY_BY_ID 1
+
+/* TXN_IDENTITY_BY_NUMBER starts a key that finds an object's id from its number. */
+#define TXN_IDENTITY_BY_NUMBER 2
+
+/* TXN_IDENTITY_PROBED is the pause after a derivation's probe, before its pairs' push. */
+#define TXN_IDENTITY_PROBED "doltgres-identity-probed"
+
+/* The element layouts of the vectors identity's functions build. */
+#define TXN_IDENTITY_BYTES 1, 1
+#define TXN_IDENTITY_VEC sizeof(StdVec), _Alignof(StdVec)
+#define TXN_IDENTITY_PAIR sizeof(TxnIdentityPair), _Alignof(TxnIdentityPair)
+#define TXN_IDENTITY_PAIRED sizeof(TxnIdentityPaired), _Alignof(TxnIdentityPaired)
+#define TXN_IDENTITY_OP sizeof(TxnMemtableOp), _Alignof(TxnMemtableOp)
+#define TXN_IDENTITY_NEED sizeof(txn_TupleRefSliceU8Usize_t), _Alignof(txn_TupleRefSliceU8Usize_t)
+#define TXN_IDENTITY_HANDLE sizeof(TxnMemtableVersionHandle), _Alignof(TxnMemtableVersionHandle)
+#define TXN_IDENTITY_FOLDED_VERSION sizeof(txn_TupleHandleOptionU64_t), _Alignof(txn_TupleHandleOptionU64_t)
+#define TXN_IDENTITY_FOLDED sizeof(txn_TupleVecU8VecTupleHandleOptionU64_t), \
+	_Alignof(txn_TupleVecU8VecTupleHandleOptionU64_t)
+
+/* txn_TupleHandleOptionU64_t is dropped's (Handle, Option<u64>): a folded version and its top-level xid, or none. */
+typedef struct txn_TupleHandleOptionU64_t
+{
+	TxnMemtableVersionHandle f0;
+	bool		has_f1;
+	uint64		f1;
+} txn_TupleHandleOptionU64_t;
+
+/*
+ * txn_TupleVecU8VecTupleHandleOptionU64_t is dropped's (Vec<u8>, Vec<(Handle,
+ * Option<u64>)>): a key and its folded versions.
+ */
+typedef struct txn_TupleVecU8VecTupleHandleOptionU64_t
+{
+	StdVec		f0;
+	StdVec		f1;
+} txn_TupleVecU8VecTupleHandleOptionU64_t;
+
+/* TxnIdentityFoundTag is Found's variants. */
+typedef enum TxnIdentityFoundTag
+{
+	/* The value of the key's live pair. */
+	TXN_IDENTITY_FOUND_VALUE,
+	/* Another transaction's running change of the key, which must end first. */
+	TXN_IDENTITY_FOUND_WAIT,
+	/* Nothing. */
+	TXN_IDENTITY_FOUND_FREE,
+} TxnIdentityFoundTag;
+
+/* TxnIdentityFound is Found: what a key of the identity tree holds for the running transaction. */
+typedef struct TxnIdentityFound
+{
+	TxnIdentityFoundTag tag;
+	union
+	{
+		/* value is a Vec<u8>. */
+		StdVec		value;
+		HostXid		wait;
+	}			u;
+} TxnIdentityFound;
+
+const TxnIdentityInitial TXN_IDENTITY_INITIAL[3] = {
+	{TXN_IDENTITY_INITIAL_0, "pg_catalog", 10},
+	{TXN_IDENTITY_INITIAL_1, "pg_toast", 8},
+	{TXN_IDENTITY_INITIAL_2, "public", 6},
+};
+
+/* txn_identity_fork returns an error of a code and a message. */
+static HostError
+txn_identity_fork(const char *code, const char *text)
+{
+	StdString	message;
+
+	std_string_from_Checked(&message, text, strlen(text));
+	return host_Error_fork((const uint8 *) code, &message);
+}
+
+/* txn_identity_bytes copies bytes into a new vector, as to_vec does. */
+static void
+txn_identity_bytes(const uint8 *bytes, size_t bytes_len, StdVec *result)
+{
+	std_vec_with_capacity_Checked(result, bytes_len, TXN_IDENTITY_BYTES);
+	std_vec_extend_from_slice_Checked(result, bytes, bytes_len, TXN_IDENTITY_BYTES);
+}
+
+/* txn_identity_Pair_drop frees a pair's key and its value. */
+static void
+txn_identity_Pair_drop(void *pair_)
+{
+	TxnIdentityPair *pair = pair_;
+
+	std_vec_free_Checked(&pair->f0, TXN_IDENTITY_BYTES);
+	if (pair->has_f1)
+		std_vec_free_Checked(&pair->f1, TXN_IDENTITY_BYTES);
+}
+
+/* txn_identity_Paired_drop frees a paired key and its value. */
+static void
+txn_identity_Paired_drop(void *paired_)
+{
+	TxnIdentityPaired *paired = paired_;
+
+	std_vec_free_Checked(&paired->f0, TXN_IDENTITY_BYTES);
+	std_vec_free_Checked(&paired->f1, TXN_IDENTITY_BYTES);
+}
+
+/* txn_identity_bytes_drop frees a vector of bytes held as a vector's element. */
+static void
+txn_identity_bytes_drop(void *bytes)
+{
+	std_vec_free_Checked(bytes, TXN_IDENTITY_BYTES);
+}
+
+/*
+ * txn_identity_derive_object_id returns the first candidate of a new
+ * object's id from its kind, its parent's id, and its name at creation, so
+ * the same creation gives the same id in every database; a taken candidate
+ * moves to next_id's.
+ */
+bool
+txn_identity_derive_object_id(TxnIdentityKind kind, uint64 parent, const uint8 *name, size_t name_len, uint64 *result,
+							  HostError *error)
+{
+	StdVec		input = STD_VEC_NEW;
+	uint8		be[8];
+	ChunksAddressAddress hash;
+
+	if (!std_vec_try_reserve_exact(&input, 9 + name_len, TXN_IDENTITY_BYTES))
+	{
+		*error = host_Error_out_of_memory();
+		return false;
+	}
+	std_vec_u8_push_Checked(&input, (uint8) kind);
+	std_u64_to_be_bytes(parent, be);
+	std_vec_extend_from_slice_Checked(&input, be, sizeof(be), TXN_IDENTITY_BYTES);
+	std_vec_extend_from_slice_Checked(&input, name, name_len, TXN_IDENTITY_BYTES);
+	hash = chunks_address_Address_of(input.ptr, input.len);
+	std_vec_free_Checked(&input, TXN_IDENTITY_BYTES);
+	*result = std_u64_from_be_bytes(hash.f0) | TXN_IDENTITY_OBJECT_ID_BIT;
+	return true;
+}
+
+/*
+ * txn_identity_paired_frame_t is paired's state across its pad: the two keys
+ * it takes and the varint it makes, each while live.
+ */
+typedef struct txn_identity_paired_frame_t
+{
+	StdVec		numbered;
+	StdVec		keyed;
+	bool		keys_live;
+	uint64		id;
+	uint32		number;
+	StdVec		varint;
+	bool		varint_live;
+	TxnIdentityPaired *result;
+} txn_identity_paired_frame_t;
+
+/* txn_identity_paired_body makes the number's varint and the id's bytes, then the two pairs. */
+static void
+txn_identity_paired_body(void *frame_)
+{
+	txn_identity_paired_frame_t *frame = frame_;
+	uint8		be[8];
+	StdVec		id;
+
+	std_vec_new(&frame->varint, TXN_IDENTITY_BYTES);
+	frame->varint_live = true;
+	chunks_varint_put_varint(&frame->varint, (uint64) frame->number);
+	std_u64_to_be_bytes(frame->id, be);
+	txn_identity_bytes(be, sizeof(be), &id);
+	frame->result[0].f0 = frame->numbered;
+	frame->result[0].f1 = id;
+	frame->result[1].f0 = frame->keyed;
+	frame->result[1].f1 = frame->varint;
+	frame->keys_live = frame->varint_live = false;
+}
+
+/* txn_identity_paired_pad frees what paired holds live: its keys and its varint. */
+static void
+txn_identity_paired_pad(void *frame_)
+{
+	txn_identity_paired_frame_t *frame = frame_;
+
+	if (frame->varint_live)
+		std_vec_free_Checked(&frame->varint, TXN_IDENTITY_BYTES);
+	if (frame->keys_live)
+	{
+		std_vec_free_Checked(&frame->keyed, TXN_IDENTITY_BYTES);
+		std_vec_free_Checked(&frame->numbered, TXN_IDENTITY_BYTES);
+	}
+	frame->varint_live = frame->keys_live = false;
+}
+
+/*
+ * txn_identity_paired returns an object's two pairs, taking both keys: its
+ * pair by number holding its id, and its pair by id holding its number as a
+ * varint.
+ */
+static void
+txn_identity_paired(StdVec numbered, StdVec keyed, uint64 id, uint32 number, TxnIdentityPaired *result)
+{
+	txn_identity_paired_frame_t frame = {.numbered = numbered, .keyed = keyed, .keys_live = true, .id = id,
+	.number = number, .result = result};
+
+	std_landing(&frame, txn_identity_paired_body, txn_identity_paired_pad);
+	txn_identity_paired_pad(&frame);
+}
+
+/*
+ * txn_identity_initial_frame_t is initial's state across its pad: its pairs,
+ * a schema's key by OID before it is paired, and a schema's two pairs before
+ * they are added, each while live.
+ */
+typedef struct txn_identity_initial_frame_t
+{
+	StdVec		pairs;
+	bool		pairs_live;
+	StdVec		numbered;
+	bool		numbered_live;
+	TxnIdentityPaired two[2];
+	bool		two_live;
+	StdVec	   *result;
+	HostError  *error;
+	bool		ok;
+} txn_identity_initial_frame_t;
+
+/* txn_identity_initial_body derives each initial schema's id and adds its two pairs. */
+static void
+txn_identity_initial_body(void *frame_)
+{
+	txn_identity_initial_frame_t *frame = frame_;
+
+	std_vec_new(&frame->pairs, TXN_IDENTITY_PAIRED);
+	frame->pairs_live = true;
+	for (int i = 0; i < lengthof(TXN_IDENTITY_INITIAL); i++)
+	{
+		const TxnIdentityInitial *schema = &TXN_IDENTITY_INITIAL[i];
+		uint64		id;
+		StdVec		keyed;
+
+		if (!txn_identity_derive_object_id(TXN_IDENTITY_KIND_SCHEMA, 0, (const uint8 *) schema->name,
+										   schema->name_len, &id, frame->error))
+			return;
+		txn_identity_by_oid(TXN_IDENTITY_KIND_SCHEMA, schema->oid, &frame->numbered);
+		frame->numbered_live = true;
+		txn_identity_by_id(TXN_IDENTITY_KIND_SCHEMA, id, &keyed);
+		frame->numbered_live = false;
+		txn_identity_paired(frame->numbered, keyed, id, schema->oid, frame->two);
+		frame->two_live = true;
+		std_vec_reserve_Checked(&frame->pairs, lengthof(frame->two), TXN_IDENTITY_PAIRED);
+		for (int j = 0; j < lengthof(frame->two); j++)
+			std_vec_push_Checked(&frame->pairs, &frame->two[j], TXN_IDENTITY_PAIRED);
+		frame->two_live = false;
+	}
+	*frame->result = frame->pairs;
+	frame->pairs_live = false;
+	frame->ok = true;
+}
+
+/* txn_identity_initial_pad frees what initial holds live: a schema's pairs and key, and its pairs. */
+static void
+txn_identity_initial_pad(void *frame_)
+{
+	txn_identity_initial_frame_t *frame = frame_;
+
+	if (frame->two_live)
+		for (int j = 0; j < lengthof(frame->two); j++)
+			txn_identity_Paired_drop(&frame->two[j]);
+	if (frame->numbered_live)
+		std_vec_free_Checked(&frame->numbered, TXN_IDENTITY_BYTES);
+	if (frame->pairs_live)
+		std_vec_drop_Checked(&frame->pairs, TXN_IDENTITY_PAIRED, txn_identity_Paired_drop);
+	frame->two_live = frame->numbered_live = frame->pairs_live = false;
+}
+
+/*
+ * txn_identity_initial returns the pairs of a database's initial schemas,
+ * each its pair by OID and its pair by id, which a new repository's identity
+ * tree starts with, so that no writer derives a schema's pair.
+ */
+bool
+txn_identity_initial(StdVec *result, HostError *error)
+{
+	txn_identity_initial_frame_t frame = {.result = result, .error = error};
+
+	std_landing(&frame, txn_identity_initial_body, txn_identity_initial_pad);
+	txn_identity_initial_pad(&frame);
+	return frame.ok;
+}
+
+/* txn_identity_next_id returns the candidate after a taken one, which keeps the user bit. */
+uint64
+txn_identity_next_id(uint64 id)
+{
+	return (id + 1) | TXN_IDENTITY_OBJECT_ID_BIT;
+}
+
+/*
+ * txn_identity_column_name returns the name a column's id derives from under
+ * its table: its name and its base type's category, so a column made again
+ * under its name with a type of another category is another column.
+ */
+void
+txn_identity_column_name(const uint8 *name, size_t name_len, uint8 category, StdVec *result)
+{
+	std_vec_with_capacity_Checked(result, name_len + 2, TXN_IDENTITY_BYTES);
+	std_vec_extend_from_slice_Checked(result, name, name_len, TXN_IDENTITY_BYTES);
+	std_vec_u8_push_Checked(result, 0);
+	std_vec_u8_push_Checked(result, category);
+}
+
+/* txn_identity_keyed returns a key of a form and a kind followed by a big-endian number of a width. */
+static void
+txn_identity_keyed(uint8 form, uint8 kind, const uint8 *number, size_t number_len, StdVec *result)
+{
+	std_vec_with_capacity_Checked(result, 2 + number_len, TXN_IDENTITY_BYTES);
+	std_vec_u8_push_Checked(result, form);
+	std_vec_u8_push_Checked(result, kind);
+	std_vec_extend_from_slice_Checked(result, number, number_len, TXN_IDENTITY_BYTES);
+}
+
+/* txn_identity_by_id returns the key that finds a schema's or a relation's OID from its id. */
+void
+txn_identity_by_id(TxnIdentityKind kind, uint64 id, StdVec *result)
+{
+	uint8		be[8];
+
+	std_u64_to_be_bytes(id, be);
+	txn_identity_keyed(TXN_IDENTITY_BY_ID, (uint8) kind, be, sizeof(be), result);
+}
+
+/* txn_identity_by_oid returns the key that finds a schema's or a relation's id from its OID. */
+void
+txn_identity_by_oid(TxnIdentityKind kind, uint32 oid, StdVec *result)
+{
+	uint8		be[4];
+
+	std_u32_to_be_bytes(oid, be);
+	txn_identity_keyed(TXN_IDENTITY_BY_NUMBER, (uint8) kind, be, sizeof(be), result);
+}
+
+/* txn_identity_column_by_id returns the key that finds a column's attribute number from its id under its table's id. */
+void
+txn_identity_column_by_id(uint64 table, uint64 column, StdVec *result)
+{
+	uint8		be[16];
+
+	std_u64_to_be_bytes(table, be);
+	std_u64_to_be_bytes(column, be + 8);
+	txn_identity_keyed(TXN_IDENTITY_BY_ID, TXN_IDENTITY_KIND_COLUMN, be, sizeof(be), result);
+}
+
+/*
+ * txn_identity_column_by_number returns the key that finds a column's id from
+ * its attribute number under its table's id.
+ */
+void
+txn_identity_column_by_number(uint64 table, uint16 attnum, StdVec *result)
+{
+	uint8		be[10];
+
+	std_u64_to_be_bytes(table, be);
+	std_u16_to_be_bytes(attnum, be + 8);
+	txn_identity_keyed(TXN_IDENTITY_BY_NUMBER, TXN_IDENTITY_KIND_COLUMN, be, sizeof(be), result);
+}
+
+/*
+ * txn_identity_columns returns the key prefix of a table's columns' pairs in
+ * one of the two forms, by id when ids says so.
+ */
+void
+txn_identity_columns(uint64 table, bool ids, StdVec *result)
+{
+	uint8		be[8];
+
+	std_u64_to_be_bytes(table, be);
+	txn_identity_keyed(ids ? TXN_IDENTITY_BY_ID : TXN_IDENTITY_BY_NUMBER, TXN_IDENTITY_KIND_COLUMN, be, sizeof(be),
+					   result);
+}
+
+/* txn_identity_corrupt returns the error of an identity tree's value of the wrong form. */
+static HostError
+txn_identity_corrupt(void)
+{
+	return txn_identity_fork("XX001", "an identity tree's value has the wrong form");
+}
+
+/* txn_identity_storage returns what names a database's identity tree in a transaction's list of touched keys. */
+static HostStorage
+txn_identity_storage(uint32 repository)
+{
+	HostStorage storage = {.database = repository};
+
+	return storage;
+}
+
+/*
+ * txn_identity_stripe returns the key lock's stripe of a database's identity
+ * tree, which every change of its pairs takes, so a derivation's probe and
+ * its pairs' insert are one step to every other writer of the tree.
+ */
+static uint32
+txn_identity_stripe(uint32 repository)
+{
+	HostStorage storage = txn_identity_storage(repository);
+
+	return txn_change_stripe(&storage, NULL, 0, false);
+}
+
+/*
+ * txn_identity_found_frame_t is found's state across its pad: the key's
+ * versions, the folded tree's value, and the resolve, each while live.
+ */
+typedef struct txn_identity_found_frame_t
+{
+	HostIoIo   *io;
+	const HostDeltaHold *hold;
+	const RepoRepo *repo;
+	const HostSharedReader *reading;
+	HostSharedRecord deltas;
+	const uint8 *key;
+	size_t		key_len;
+	StdVec		versions;
+	bool		versions_live;
+	bool		has_based;
+	StdVec		based;
+	bool		based_live;
+	TxnVisibleResolved resolved;
+	bool		resolved_live;
+	TxnIdentityFound *result;
+	HostError  *error;
+	bool		ok;
+} txn_identity_found_frame_t;
+
+/*
+ * txn_identity_found_body reads the key's versions and then the folded
+ * tree's value, resolves the key, and for a key that exists answers the
+ * newest put whose writer is the caller's transaction or committed, or the
+ * folded tree's value.
+ */
+static void
+txn_identity_found_body(void *frame_)
+{
+	txn_identity_found_frame_t *frame = frame_;
+	ChunksErrorError storage;
+	StdBytes	based;
+
+	if (!txn_memtable_branch_identity_versions(frame->io, frame->hold, frame->deltas, frame->key, frame->key_len,
+											   &frame->versions, frame->error))
+		return;
+	frame->versions_live = true;
+	if (!repo_Repo_identity(frame->repo, frame->io, frame->reading, frame->key, frame->key_len, &frame->has_based,
+							&frame->based, &storage))
+	{
+		*frame->error = txn_base_storage(&storage);
+		return;
+	}
+	frame->based_live = frame->has_based;
+	based.ptr = frame->has_based ? frame->based.ptr : NULL;
+	based.len = frame->has_based ? frame->based.len : 0;
+	if (!txn_visible_resolved(frame->io, frame->versions.ptr, frame->versions.len, based, &frame->resolved,
+							  frame->error))
+		return;
+	frame->resolved_live = true;
+	switch (frame->resolved.tag)
+	{
+		case TXN_VISIBLE_RESOLVED_FREE:
+			frame->result->tag = TXN_IDENTITY_FOUND_FREE;
+			frame->ok = true;
+			return;
+		case TXN_VISIBLE_RESOLVED_WAIT:
+			frame->result->tag = TXN_IDENTITY_FOUND_WAIT;
+			frame->result->u.wait = frame->resolved.u.wait.f0;
+			frame->ok = true;
+			return;
+		case TXN_VISIBLE_RESOLVED_EXISTS:
+			break;
+	}
+	frame->resolved_live = false;
+	txn_visible_Resolved_drop(&frame->resolved);
+	for (size_t i = 0; i < frame->versions.len; i++)
+	{
+		TxnMemtableVersionVersion *version = &STD_VEC_AT(&frame->versions, TxnMemtableVersionVersion, i);
+		TxnMemtableVersionRecord record = txn_memtable_version_Version_record(version);
+		TxnMemtableVersionOpRef op = txn_memtable_version_Record_op(&record);
+		HostXid		writer = {txn_memtable_version_Record_writer(&record).xid};
+		HostStatus	status;
+
+		if (op.tag != TXN_MEMTABLE_VERSION_OP_REF_PUT)
+			continue;
+		if (!host_is_current(HOST_IO_IO_IO_DOORS(frame->io), writer))
+		{
+			if (!txn_outcome_outcome(frame->io, version, &status, frame->error))
+				return;
+			if (status != HOST_STATUS_COMMITTED)
+				continue;
+		}
+		frame->result->tag = TXN_IDENTITY_FOUND_VALUE;
+		txn_identity_bytes(op.u.put.value.ptr, op.u.put.value.len, &frame->result->u.value);
+		frame->ok = true;
+		return;
+	}
+	if (!frame->based_live)
+	{
+		*frame->error = txn_identity_fork("XX000", "an identity tree key that exists has no value");
+		return;
+	}
+	frame->result->tag = TXN_IDENTITY_FOUND_VALUE;
+	frame->result->u.value = frame->based;
+	frame->based_live = false;
+	frame->ok = true;
+}
+
+/* txn_identity_found_pad frees what found holds live: its resolve, the folded tree's value, and the versions. */
+static void
+txn_identity_found_pad(void *frame_)
+{
+	txn_identity_found_frame_t *frame = frame_;
+
+	if (frame->resolved_live)
+		txn_visible_Resolved_drop(&frame->resolved);
+	if (frame->based_live)
+		std_vec_free_Checked(&frame->based, TXN_IDENTITY_BYTES);
+	if (frame->versions_live)
+		txn_memtable_version_versions_drop(&frame->versions, 0);
+	frame->resolved_live = frame->based_live = frame->versions_live = false;
+}
+
+/*
+ * txn_identity_found reads a key of the identity tree as a unique check
+ * reads its key, the caller's own changes and every committed one counted,
+ * with the value of the version that decides it: the newest put whose writer
+ * is the caller's transaction or committed, or the folded tree's value with
+ * no such version. It reads the delta's versions before the folded tree, so
+ * a save between the reads only folds versions it has already read.
+ */
+static bool
+txn_identity_found(HostIoIo *io, const HostDeltaHold *hold, const RepoRepo *repo, const HostSharedReader *reading,
+				   HostSharedRecord deltas, const uint8 *key, size_t key_len, TxnIdentityFound *result,
+				   HostError *error)
+{
+	txn_identity_found_frame_t frame = {.io = io, .hold = hold, .repo = repo, .reading = reading, .deltas = deltas,
+	.key = key, .key_len = key_len, .result = result, .error = error};
+
+	std_landing(&frame, txn_identity_found_body, txn_identity_found_pad);
+	txn_identity_found_pad(&frame);
+	return frame.ok;
+}
+
+/* txn_identity_looked_up_frame_t is looked_up's state across its pad: its deltas and a read's hold, each while live. */
+typedef struct txn_identity_looked_up_frame_t
+{
+	HostIoIo   *io;
+	HostIoWaits *waits;
+	TxnIdentityDatabase database;
+	const uint8 *key;
+	size_t		key_len;
+	HostSharedHeld deltas;
+	bool		deltas_live;
+	HostDeltaHold hold;
+	bool		hold_live;
+	bool	   *has_result;
+	StdVec	   *result;
+	HostError  *error;
+	bool		ok;
+} txn_identity_looked_up_frame_t;
+
+/* txn_identity_looked_up_body reads the key under a hold until it finds no running change of it. */
+static void
+txn_identity_looked_up_body(void *frame_)
+{
+	txn_identity_looked_up_frame_t *frame = frame_;
+	HostOperation none = {0};
+
+	if (!txn_memtable_branch_deltas(frame->io, frame->database.f2, repo_Repo_own(frame->database.f0), &frame->deltas,
+									frame->error))
+		return;
+	frame->deltas_live = true;
+	for (;;)
+	{
+		TxnIdentityFound read;
+		bool		waited;
+
+		if (!host_delta_hold(frame->io, &frame->hold, frame->error))
+			return;
+		frame->hold_live = true;
+		if (!txn_identity_found(frame->io, &frame->hold, frame->database.f0, frame->database.f1,
+								host_shared_Held_record(&frame->deltas), frame->key, frame->key_len, &read,
+								frame->error))
+			return;
+		frame->hold_live = false;
+		host_delta_Hold_drop(&frame->hold);
+		switch (read.tag)
+		{
+			case TXN_IDENTITY_FOUND_VALUE:
+				*frame->has_result = true;
+				*frame->result = read.u.value;
+				frame->ok = true;
+				return;
+			case TXN_IDENTITY_FOUND_FREE:
+				*frame->has_result = false;
+				frame->ok = true;
+				return;
+			case TXN_IDENTITY_FOUND_WAIT:
+				if (!host_xact_wait(frame->waits, HOST_IO_IO_IO_DOORS(frame->io), read.u.wait, false, none, true,
+									&waited, frame->error))
+					return;
+				break;
+		}
+	}
+}
+
+/* txn_identity_looked_up_pad frees what looked_up holds live: a read's hold and its deltas. */
+static void
+txn_identity_looked_up_pad(void *frame_)
+{
+	txn_identity_looked_up_frame_t *frame = frame_;
+
+	if (frame->hold_live)
+		host_delta_Hold_drop(&frame->hold);
+	if (frame->deltas_live)
+		host_shared_Held_drop(&frame->deltas);
+	frame->hold_live = frame->deltas_live = false;
+}
+
+/*
+ * txn_identity_looked_up returns the value a key of a database's identity
+ * tree holds for the running transaction, or none, waiting for another
+ * transaction's running change of it to end first.
+ */
+bool
+txn_identity_looked_up(HostIoIo *io, HostIoWaits *waits, TxnIdentityDatabase database, const uint8 *key,
+					   size_t key_len, bool *has_result, StdVec *result, HostError *error)
+{
+	txn_identity_looked_up_frame_t frame = {.io = io, .waits = waits, .database = database, .key = key,
+	.key_len = key_len, .has_result = has_result, .result = result, .error = error};
+
+	std_landing(&frame, txn_identity_looked_up_body, txn_identity_looked_up_pad);
+	txn_identity_looked_up_pad(&frame);
+	return frame.ok;
+}
+
+/* txn_identity_id reads an object's id from the value of its pair by number, eight bytes big-endian. */
+bool
+txn_identity_id(const uint8 *value, size_t value_len, uint64 *result, HostError *error)
+{
+	if (value_len != 8)
+	{
+		*error = txn_identity_corrupt();
+		return false;
+	}
+	*result = std_u64_from_be_bytes(value);
+	return true;
+}
+
+/*
+ * txn_identity_number reads an object's number, an OID or an attribute number,
+ * from the value of its pair by id, a varint.
+ */
+bool
+txn_identity_number(const uint8 *value, size_t value_len, uint32 *result, HostError *error)
+{
+	size_t		at = 0;
+	uint64		number;
+	ChunksErrorError storage;
+
+	if (!chunks_varint_read_varint(value, value_len, &at, &number, &storage))
+	{
+		*error = txn_base_storage(&storage);
+		return false;
+	}
+	if (at != value_len || number > PG_UINT32_MAX)
+	{
+		*error = txn_identity_corrupt();
+		return false;
+	}
+	*result = (uint32) number;
+	return true;
+}
+
+/* txn_identity_Op_drop frees an op held as a vector's element. */
+static void
+txn_identity_Op_drop(void *op)
+{
+	txn_memtable_Op_drop(op);
+}
+
+/*
+ * txn_identity_op returns the version's change of an identity tree key's
+ * value, taking it: a put of the value, or a delete for none.
+ */
+static void
+txn_identity_op(bool has_value, StdVec value, TxnMemtableOp *result)
+{
+	if (!has_value)
+	{
+		result->tag = TXN_MEMTABLE_OP_DELETE;
+		return;
+	}
+	result->tag = TXN_MEMTABLE_OP_PUT;
+	result->u.put.value = value;
+	std_vec_new(&result->u.put.addresses, sizeof(chunks_TupleU32Locator_t), _Alignof(chunks_TupleU32Locator_t));
+	std_vec_new(&result->u.put.values, sizeof(uint32), _Alignof(uint32));
+	result->u.put.tuple.f0 = 0;
+	result->u.put.heap_bytes = 0;
+}
+
+/*
+ * txn_identity_changed_frame_t is changed's state across its pad and its
+ * prepare: the pairs from the first it hasn't taken, and the records, keys,
+ * ops, and needs it makes of them, each while live.
+ */
+typedef struct txn_identity_changed_frame_t
+{
+	HostIoIo   *io;
+	HostIoWaits *waits;
+	const HostSharedHeld *deltas;
+	uint32		repository;
+	TxnMemtableVersionWriter writer;
+	TxnStatusRoomed roomed;
+	StdVec		pairs;
+	size_t		at;
+	bool		has_count;
+	uint64		count;
+	uint32		stripe;
+	StdVec		bodies;
+	bool		bodies_live;
+	StdVec		keys;
+	bool		keys_live;
+	StdVec		ops;
+	bool		ops_live;
+	StdVec		needs;
+	bool		needs_live;
+	bool	   *result;
+	HostError  *error;
+	bool		ok;
+} txn_identity_changed_frame_t;
+
+/*
+ * txn_identity_changed_closure_4_frame_t is the push's state across its pad:
+ * its stripe's guard and its checkpoint window, each while live.
+ */
+typedef struct txn_identity_changed_closure_4_frame_t
+{
+	txn_identity_changed_frame_t *changed;
+	HostIoIo   *io;
+	TxnMemtableTablePreparedBranchDeltas *prepared;
+	HostIoStriping striping;
+	HostKeyGuard guard;
+	bool		guard_live;
+	HostDelayCheckpoint window;
+	bool		window_live;
+	bool	   *result;
+	HostError  *error;
+	bool		ok;
+} txn_identity_changed_closure_4_frame_t;
+
+/*
+ * txn_identity_changed_closure_4_body takes the tree's stripe, answers false
+ * when another writer pushed under it since the caller's count, and else in
+ * one checkpoint window appends each change's record and pushes its version
+ * with its LSN.
+ */
+static void
+txn_identity_changed_closure_4_body(void *frame_)
+{
+	txn_identity_changed_closure_4_frame_t *frame = frame_;
+	txn_identity_changed_frame_t *changed = frame->changed;
+	HostIoKeyIo key_io;
+	HostIoTakesShort io;
+
+	if (!host_key_lock(&frame->striping, frame->io, &changed->stripe, 1, &frame->guard, frame->error))
+		return;
+	frame->guard_live = true;
+	key_io = host_KeyGuard_io(&frame->guard);
+	io.ops = &HOST_IO_KEY_IO_TAKES_SHORT_OPS;
+	io.self = &key_io;
+	if (changed->has_count && host_key_count(changed->stripe) != changed->count)
+	{
+		*frame->result = false;
+		frame->ok = true;
+		return;
+	}
+	if (!host_delay_checkpoint(HOST_IO_TAKES_SHORT_IO_DOORS(io), NULL, 0, &frame->window, frame->error))
+		return;
+	frame->window_live = true;
+	for (size_t at = 0; at < changed->bodies.len; at++)
+	{
+		const StdVec *body = &STD_VEC_AT(&changed->bodies, StdVec, at);
+		TxnMemtableVersionChange change = {.writer = changed->writer,
+			.op = &STD_VEC_AT(&changed->ops, TxnMemtableOp, at), .lock = TXN_MEMTABLE_LOCK_MODE_UPDATE,
+		.shown = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND}, .has_lsn = true};
+		TxnMemtableVersionHandle handle;
+
+		if (!host_wal_insert(HOST_IO_TAKES_SHORT_IO_DOORS(io), HOST_WAL_KIND_DATABASE_CHANGE, body->ptr, body->len,
+							 &change.lsn, frame->error) ||
+			!txn_memtable_branch_identity_finish(io, frame->prepared, at, &change, true, changed->roomed, &handle,
+												 frame->error))
+			return;
+	}
+	frame->window_live = false;
+	host_DelayCheckpoint_finish(&frame->window);
+	*frame->result = true;
+	frame->ok = true;
+}
+
+/* txn_identity_changed_closure_4_pad frees what the push holds live: its window and its guard. */
+static void
+txn_identity_changed_closure_4_pad(void *frame_)
+{
+	txn_identity_changed_closure_4_frame_t *frame = frame_;
+
+	if (frame->window_live)
+		host_DelayCheckpoint_drop(&frame->window);
+	if (frame->guard_live)
+		host_KeyGuard_drop(&frame->guard);
+	frame->window_live = frame->guard_live = false;
+}
+
+/* txn_identity_changed_closure_4 is the prepare's closure of a change: its push, or false to start over. */
+static bool
+txn_identity_changed_closure_4(void *captures, HostIoIo *io, TxnMemtableTablePreparedBranchDeltas *prepared,
+							   HostIoStriping striping, bool *result, HostError *error)
+{
+	txn_identity_changed_closure_4_frame_t frame = {.changed = captures, .io = io, .prepared = prepared,
+	.striping = striping, .result = result, .error = error};
+
+	std_landing(&frame, txn_identity_changed_closure_4_body, txn_identity_changed_closure_4_pad);
+	txn_identity_changed_closure_4_pad(&frame);
+	return frame.ok;
+}
+
+/*
+ * txn_identity_changed_body records each pair's key in the transaction's
+ * list and makes its record, key, and op, then the versions' needs, and
+ * prepares the push.
+ */
+static void
+txn_identity_changed_body(void *frame_)
+{
+	txn_identity_changed_frame_t *frame = frame_;
+	HostStorage storage = txn_identity_storage(frame->repository);
+	uint64		top = frame->writer.has_top ? frame->writer.top : frame->writer.xid;
+	TxnMemtableVersionShown command = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND};
+	size_t		len = frame->pairs.len;
+
+	frame->stripe = txn_identity_stripe(frame->repository);
+	std_vec_new(&frame->bodies, TXN_IDENTITY_VEC);
+	frame->bodies_live = true;
+	if (!std_vec_try_reserve_exact(&frame->bodies, len, TXN_IDENTITY_VEC))
+	{
+		*frame->error = host_Error_out_of_memory();
+		return;
+	}
+	std_vec_new(&frame->keys, TXN_IDENTITY_VEC);
+	frame->keys_live = true;
+	std_vec_new(&frame->ops, TXN_IDENTITY_OP);
+	frame->ops_live = true;
+	if (!std_vec_try_reserve_exact(&frame->keys, len, TXN_IDENTITY_VEC) ||
+		!std_vec_try_reserve_exact(&frame->ops, len, TXN_IDENTITY_OP))
+	{
+		*frame->error = host_Error_out_of_memory();
+		return;
+	}
+	for (; frame->at < len; frame->at++)
+	{
+		TxnIdentityPair *pair = &STD_VEC_AT(&frame->pairs, TxnIdentityPair, frame->at);
+		TxnRecordDatabaseChange change = {.tree = TXN_RECORD_TREE_IDENTITY, .writer = frame->writer,
+			.repository = frame->repository, .key = pair->f0, .has_value = pair->has_f1,
+		.value = pair->f1};
+		uint64		touched;
+		StdVec		body;
+		TxnMemtableOp op;
+
+		if (!txn_written_touched(frame->io, top, &storage, TXN_WRITTEN_OF_IDENTITY, pair->f0.ptr, pair->f0.len, 0,
+								 &touched, frame->error))
+			return;
+		txn_record_DatabaseChange_encode(&change, &body);
+		std_vec_push_Checked(&frame->bodies, &body, TXN_IDENTITY_VEC);
+		std_vec_push_Checked(&frame->keys, &change.key, TXN_IDENTITY_VEC);
+		txn_identity_op(change.has_value, change.value, &op);
+		std_vec_push_Checked(&frame->ops, &op, TXN_IDENTITY_OP);
+	}
+	std_vec_with_capacity_Checked(&frame->needs, len, TXN_IDENTITY_NEED);
+	frame->needs_live = true;
+	for (size_t i = 0; i < len; i++)
+	{
+		const StdVec *key = &STD_VEC_AT(&frame->keys, StdVec, i);
+		txn_TupleRefSliceU8Usize_t need = {{key->ptr, key->len},
+		txn_memtable_version_encoded(&frame->writer, &STD_VEC_AT(&frame->ops, TxnMemtableOp, i), command, true, 0)};
+
+		std_vec_push_Checked(&frame->needs, &need, TXN_IDENTITY_NEED);
+	}
+	frame->ok = txn_memtable_branch_identity_prepare_Bool_Striping(frame->io, host_shared_Held_record(frame->deltas),
+																   frame->needs.ptr, frame->needs.len,
+																   host_io_Waits_striping(frame->waits),
+																   txn_identity_changed_closure_4, frame, NULL,
+																   frame->result, frame->error);
+}
+
+/* txn_identity_changed_pad frees what changed holds live: its needs, ops, keys, and records, and the untaken pairs. */
+static void
+txn_identity_changed_pad(void *frame_)
+{
+	txn_identity_changed_frame_t *frame = frame_;
+
+	if (frame->needs_live)
+		std_vec_free_Checked(&frame->needs, TXN_IDENTITY_NEED);
+	if (frame->ops_live)
+		std_vec_drop_Checked(&frame->ops, TXN_IDENTITY_OP, txn_identity_Op_drop);
+	if (frame->keys_live)
+		std_vec_drop_Checked(&frame->keys, TXN_IDENTITY_VEC, txn_identity_bytes_drop);
+	if (frame->bodies_live)
+		std_vec_drop_Checked(&frame->bodies, TXN_IDENTITY_VEC, txn_identity_bytes_drop);
+	for (; frame->at < frame->pairs.len; frame->at++)
+		txn_identity_Pair_drop(&STD_VEC_AT(&frame->pairs, TxnIdentityPair, frame->at));
+	std_vec_free_Checked(&frame->pairs, TXN_IDENTITY_PAIR);
+	frame->needs_live = frame->ops_live = frame->keys_live = frame->bodies_live = false;
+}
+
+/*
+ * txn_identity_changed gives keys of a database's identity tree their
+ * values, a removal for none, in the running transaction, taking the pairs:
+ * it records each key in the transaction's list, which an abort prunes, then
+ * in one prepare's window under the tree's stripe appends each change's
+ * record and pushes its version with its LSN, every pair of a database being
+ * logged. With the push count the caller read before its probe, it pushes
+ * nothing and answers false when another writer pushed under the stripe
+ * since.
+ */
+static bool
+txn_identity_changed(HostIoIo *io, HostIoWaits *waits, const HostSharedHeld *deltas, uint32 repository,
+					 TxnMemtableVersionWriter writer, TxnStatusRoomed roomed, StdVec *pairs, bool has_count,
+					 uint64 count, bool *result, HostError *error)
+{
+	txn_identity_changed_frame_t frame = {.io = io, .waits = waits, .deltas = deltas, .repository = repository,
+		.writer = writer, .roomed = roomed, .pairs = *pairs, .has_count = has_count, .count = count,
+	.result = result, .error = error};
+
+	std_landing(&frame, txn_identity_changed_body, txn_identity_changed_pad);
+	txn_identity_changed_pad(&frame);
+	return frame.ok;
+}
+
+/*
+ * txn_identity_derived_frame_t is derived's state across its pad: its
+ * deltas, a probe's hold, a candidate's key, the pairs' keys before they are
+ * paired, the pairs before they are listed, and the keyed closure, each
+ * while live.
+ */
+typedef struct txn_identity_derived_frame_t
+{
+	HostIoIo   *io;
+	HostIoWaits *waits;
+	TxnIdentityDatabase database;
+	TxnMemtableVersionWriter writer;
+	TxnStatusRoomed roomed;
+	TxnIdentityKind kind;
+	uint64		parent;
+	const uint8 *name;
+	size_t		name_len;
+	const uint8 *numbered;
+	size_t		numbered_len;
+	uint32		number;
+	TxnIdentityKeyed keyed;
+	const void *keyed_captures;
+	void		(*keyed_drop) (void *);
+	bool		keyed_live;
+	HostSharedHeld deltas;
+	bool		deltas_live;
+	HostDeltaHold hold;
+	bool		hold_live;
+	StdVec		key;
+	bool		key_live;
+	StdVec		numbered_key;
+	bool		numbered_key_live;
+	TxnIdentityPaired two[2];
+	bool		two_live;
+	uint64	   *result;
+	HostError  *error;
+	bool		ok;
+} txn_identity_derived_frame_t;
+
+/*
+ * txn_identity_derived_probe reads the object's pair by number under the
+ * hold, then for a free one derives the id, a candidate taken when its pair
+ * by id is live: it answers the found value, a running writer to wait for, or
+ * the derived id.
+ */
+static bool
+txn_identity_derived_probe(txn_identity_derived_frame_t *frame, TxnIdentityFound *found, bool *has_derivation,
+						   uint64 *derivation)
+{
+	HostSharedRecord deltas = host_shared_Held_record(&frame->deltas);
+	uint64		candidate;
+
+	*has_derivation = false;
+	if (!txn_identity_found(frame->io, &frame->hold, frame->database.f0, frame->database.f1, deltas, frame->numbered,
+							frame->numbered_len, found, frame->error))
+		return false;
+	if (found->tag != TXN_IDENTITY_FOUND_FREE)
+		return true;
+	if (!txn_identity_derive_object_id(frame->kind, frame->parent, frame->name, frame->name_len, &candidate,
+									   frame->error))
+		return false;
+	for (;;)
+	{
+		frame->keyed(frame->keyed_captures, candidate, &frame->key);
+		frame->key_live = true;
+		if (!txn_identity_found(frame->io, &frame->hold, frame->database.f0, frame->database.f1, deltas,
+								frame->key.ptr, frame->key.len, found, frame->error))
+			return false;
+		frame->key_live = false;
+		std_vec_free_Checked(&frame->key, TXN_IDENTITY_BYTES);
+		switch (found->tag)
+		{
+			case TXN_IDENTITY_FOUND_VALUE:
+				std_vec_free_Checked(&found->u.value, TXN_IDENTITY_BYTES);
+				candidate = txn_identity_next_id(candidate);
+				break;
+			case TXN_IDENTITY_FOUND_FREE:
+				*has_derivation = true;
+				*derivation = candidate;
+				return true;
+			case TXN_IDENTITY_FOUND_WAIT:
+				return true;
+		}
+	}
+}
+
+/*
+ * txn_identity_derived_body probes under a push count of the tree's stripe
+ * and a hold, waits for a running writer with no stripe held and starts
+ * over, or pushes the derived id's pairs, starting over when another writer
+ * pushed under the stripe since the count.
+ */
+static void
+txn_identity_derived_body(void *frame_)
+{
+	txn_identity_derived_frame_t *frame = frame_;
+	uint32		stripe = txn_identity_stripe(frame->database.f2);
+	HostOperation none = {0};
+
+	if (!txn_memtable_branch_deltas(frame->io, frame->database.f2, repo_Repo_own(frame->database.f0), &frame->deltas,
+									frame->error))
+		return;
+	frame->deltas_live = true;
+	for (;;)
+	{
+		uint64		count;
+		TxnIdentityFound found;
+		bool		has_derivation;
+		uint64		derivation;
+		bool		waited;
+		StdVec		keyed;
+		StdVec		pairs;
+		bool		pushed;
+
+		if (!host_key_wait(frame->waits, HOST_IO_IO_IO_DOORS(frame->io), stripe, frame->error))
+			return;
+		count = host_key_count(stripe);
+		if (!host_delta_hold(frame->io, &frame->hold, frame->error))
+			return;
+		frame->hold_live = true;
+		if (!txn_identity_derived_probe(frame, &found, &has_derivation, &derivation))
+			return;
+		if (!has_derivation && found.tag == TXN_IDENTITY_FOUND_VALUE)
+		{
+			frame->ok = txn_identity_id(found.u.value.ptr, found.u.value.len, frame->result, frame->error);
+			std_vec_free_Checked(&found.u.value, TXN_IDENTITY_BYTES);
+			return;
+		}
+		frame->hold_live = false;
+		host_delta_Hold_drop(&frame->hold);
+		if (found.tag == TXN_IDENTITY_FOUND_WAIT)
+		{
+			if (!host_xact_wait(frame->waits, HOST_IO_IO_IO_DOORS(frame->io), found.u.wait, false, none, true,
+								&waited, frame->error))
+				return;
+			continue;
+		}
+		if (!has_derivation)
+			continue;
+		if (!host_pause(HOST_SHARED_IO_PAUSES(frame->io), TXN_IDENTITY_PROBED, frame->error))
+			return;
+		txn_identity_bytes(frame->numbered, frame->numbered_len, &frame->numbered_key);
+		frame->numbered_key_live = true;
+		frame->keyed(frame->keyed_captures, derivation, &keyed);
+		frame->numbered_key_live = false;
+		txn_identity_paired(frame->numbered_key, keyed, derivation, frame->number, frame->two);
+		frame->two_live = true;
+		std_vec_with_capacity_Checked(&pairs, lengthof(frame->two), TXN_IDENTITY_PAIR);
+		for (int i = 0; i < lengthof(frame->two); i++)
+		{
+			TxnIdentityPair pair = {.f0 = frame->two[i].f0, .has_f1 = true, .f1 = frame->two[i].f1};
+
+			std_vec_push_Checked(&pairs, &pair, TXN_IDENTITY_PAIR);
+		}
+		frame->two_live = false;
+		if (!txn_identity_changed(frame->io, frame->waits, &frame->deltas, frame->database.f2, frame->writer,
+								  frame->roomed, &pairs, true, count, &pushed, frame->error))
+			return;
+		if (pushed)
+		{
+			*frame->result = derivation;
+			frame->ok = true;
+			return;
+		}
+	}
+}
+
+/*
+ * txn_identity_derived_pad frees what derived holds live: a push's pairs and
+ * keys, a probe's key and hold, its deltas, and keyed.
+ */
+static void
+txn_identity_derived_pad(void *frame_)
+{
+	txn_identity_derived_frame_t *frame = frame_;
+
+	if (frame->two_live)
+		for (int i = 0; i < lengthof(frame->two); i++)
+			txn_identity_Paired_drop(&frame->two[i]);
+	if (frame->numbered_key_live)
+		std_vec_free_Checked(&frame->numbered_key, TXN_IDENTITY_BYTES);
+	if (frame->key_live)
+		std_vec_free_Checked(&frame->key, TXN_IDENTITY_BYTES);
+	if (frame->hold_live)
+		host_delta_Hold_drop(&frame->hold);
+	if (frame->deltas_live)
+		host_shared_Held_drop(&frame->deltas);
+	if (frame->keyed_live && frame->keyed_drop != NULL)
+		frame->keyed_drop((void *) frame->keyed_captures);
+	frame->two_live = frame->numbered_key_live = frame->key_live = frame->hold_live = frame->deltas_live = false;
+	frame->keyed_live = false;
+}
+
+/*
+ * txn_identity_derived records a new object's pairs in the running
+ * transaction and returns its id, or returns the id its pair by number
+ * already holds, its pair by id holding the number as a varint: under a push
+ * count of the tree's stripe read first, it reads the pair by number, then
+ * derives the id, a candidate taken when its pair by id is live, and pushes
+ * both pairs under the stripe, starting over when another writer pushed
+ * under it since the count. A running change of a key it reads is waited
+ * for, with no stripe held, and the derivation starts over. keyed gives the
+ * key of an id's pair by id; derived takes it.
+ */
+bool
+txn_identity_derived(HostIoIo *io, HostIoWaits *waits, TxnIdentityDatabase database, TxnMemtableVersionWriter writer,
+					 TxnStatusRoomed roomed, TxnIdentityKind kind, uint64 parent, const uint8 *name, size_t name_len,
+					 const uint8 *numbered, size_t numbered_len, uint32 number, TxnIdentityKeyed keyed,
+					 const void *keyed_captures, void (*keyed_drop) (void *), uint64 *result, HostError *error)
+{
+	txn_identity_derived_frame_t frame = {.io = io, .waits = waits, .database = database, .writer = writer,
+		.roomed = roomed, .kind = kind, .parent = parent, .name = name, .name_len = name_len, .numbered = numbered,
+		.numbered_len = numbered_len, .number = number, .keyed = keyed, .keyed_captures = keyed_captures,
+	.keyed_drop = keyed_drop, .keyed_live = true, .result = result, .error = error};
+
+	std_landing(&frame, txn_identity_derived_body, txn_identity_derived_pad);
+	txn_identity_derived_pad(&frame);
+	return frame.ok;
+}
+
+/* txn_identity_removed_frame_t is removed's state across its pad: the keys it takes and its deltas, each while live. */
+typedef struct txn_identity_removed_frame_t
+{
+	HostIoIo   *io;
+	HostIoWaits *waits;
+	uint32		repository;
+	uint32		own;
+	TxnMemtableVersionWriter writer;
+	TxnStatusRoomed roomed;
+	StdVec		keys;
+	bool		keys_live;
+	HostSharedHeld deltas;
+	bool		deltas_live;
+	HostError  *error;
+	bool		ok;
+} txn_identity_removed_frame_t;
+
+/* txn_identity_removed_body makes each key a removal and changes the tree. */
+static void
+txn_identity_removed_body(void *frame_)
+{
+	txn_identity_removed_frame_t *frame = frame_;
+	StdVec		pairs;
+	bool		pushed;
+
+	if (!txn_memtable_branch_deltas(frame->io, frame->repository, frame->own, &frame->deltas, frame->error))
+		return;
+	frame->deltas_live = true;
+	std_vec_with_capacity_Checked(&pairs, frame->keys.len, TXN_IDENTITY_PAIR);
+	for (size_t i = 0; i < frame->keys.len; i++)
+	{
+		TxnIdentityPair pair = {.f0 = STD_VEC_AT(&frame->keys, StdVec, i)};
+
+		std_vec_push_Checked(&pairs, &pair, TXN_IDENTITY_PAIR);
+	}
+	std_vec_free_Checked(&frame->keys, TXN_IDENTITY_VEC);
+	frame->keys_live = false;
+	frame->ok = txn_identity_changed(frame->io, frame->waits, &frame->deltas, frame->repository, frame->writer,
+									 frame->roomed, &pairs, false, 0, &pushed, frame->error);
+}
+
+/* txn_identity_removed_pad frees what removed holds live: its deltas and the keys. */
+static void
+txn_identity_removed_pad(void *frame_)
+{
+	txn_identity_removed_frame_t *frame = frame_;
+
+	if (frame->deltas_live)
+		host_shared_Held_drop(&frame->deltas);
+	if (frame->keys_live)
+		std_vec_drop_Checked(&frame->keys, TXN_IDENTITY_VEC, txn_identity_bytes_drop);
+	frame->deltas_live = frame->keys_live = false;
+}
+
+/*
+ * txn_identity_removed removes keys of a database's identity tree in the
+ * running transaction, a dropped object's pairs, under the tree's stripe,
+ * taking the keys.
+ */
+bool
+txn_identity_removed(HostIoIo *io, HostIoWaits *waits, uint32 repository, uint32 own, TxnMemtableVersionWriter writer,
+					 TxnStatusRoomed roomed, StdVec *keys, HostError *error)
+{
+	txn_identity_removed_frame_t frame = {.io = io, .waits = waits, .repository = repository, .own = own,
+	.writer = writer, .roomed = roomed, .keys = *keys, .keys_live = true, .error = error};
+
+	std_landing(&frame, txn_identity_removed_body, txn_identity_removed_pad);
+	txn_identity_removed_pad(&frame);
+	return frame.ok;
+}
+
+/* txn_identity_folded_closure_0_captures_t is folded's walk's captures: the deltas, the fold point, and the pairs. */
+typedef struct txn_identity_folded_closure_0_captures_t
+{
+	HostSharedRecord deltas;
+	HostLsn		point;
+	StdVec	   *pairs;
+} txn_identity_folded_closure_0_captures_t;
+
+/*
+ * txn_identity_folded_closure_0_frame_t is the walk's state across its pad:
+ * a key's hold, its versions from the first it hasn't dropped, and the value
+ * it found, each while live.
+ */
+typedef struct txn_identity_folded_closure_0_frame_t
+{
+	txn_identity_folded_closure_0_captures_t *walk;
+	HostIoIo   *io;
+	const uint8 *key;
+	size_t		key_len;
+	HostDeltaHold hold;
+	bool		hold_live;
+	StdVec		versions;
+	size_t		at;
+	bool		versions_live;
+	bool		has_value;
+	StdVec		value;
+	bool		value_live;
+	HostError  *error;
+	bool		ok;
+} txn_identity_folded_closure_0_frame_t;
+
+/* txn_identity_folded_closure_0_body adds the key's change of its newest version the fold applies, if any. */
+static void
+txn_identity_folded_closure_0_body(void *frame_)
+{
+	txn_identity_folded_closure_0_frame_t *frame = frame_;
+	txn_identity_folded_closure_0_captures_t *walk = frame->walk;
+
+	if (!host_delta_hold(frame->io, &frame->hold, frame->error))
+		return;
+	frame->hold_live = true;
+	if (!txn_memtable_branch_identity_versions(frame->io, &frame->hold, walk->deltas, frame->key, frame->key_len,
+											   &frame->versions, frame->error))
+		return;
+	frame->versions_live = true;
+	for (; frame->at < frame->versions.len; frame->at++)
+	{
+		TxnMemtableVersionVersion *version = &STD_VEC_AT(&frame->versions, TxnMemtableVersionVersion, frame->at);
+		TxnFoldApplied applied;
+		TxnMemtableVersionRecord record;
+		TxnMemtableVersionOpRef op;
+		TxnIdentityPair pair;
+
+		if (!txn_fold_applied(frame->io, version, walk->point, &applied, frame->error))
+			return;
+		if (applied.tag != TXN_FOLD_APPLIED_YES)
+		{
+			txn_memtable_version_Version_drop(version);
+			continue;
+		}
+		record = txn_memtable_version_Version_record(version);
+		op = txn_memtable_version_Record_op(&record);
+		switch (op.tag)
+		{
+			case TXN_MEMTABLE_VERSION_OP_REF_PUT:
+				txn_identity_bytes(op.u.put.value.ptr, op.u.put.value.len, &frame->value);
+				frame->has_value = frame->value_live = true;
+				break;
+			case TXN_MEMTABLE_VERSION_OP_REF_DELETE:
+				break;
+			default:
+				*frame->error = txn_identity_fork("XX001", "an identity tree's version neither puts nor deletes");
+				return;
+		}
+		if (!std_vec_try_reserve(walk->pairs, 1, TXN_IDENTITY_PAIR))
+		{
+			*frame->error = host_Error_out_of_memory();
+			return;
+		}
+		txn_identity_bytes(frame->key, frame->key_len, &pair.f0);
+		pair.has_f1 = frame->has_value;
+		if (frame->has_value)
+			pair.f1 = frame->value;
+		std_vec_push_Checked(walk->pairs, &pair, TXN_IDENTITY_PAIR);
+		frame->value_live = false;
+		break;
+	}
+	frame->ok = true;
+}
+
+/* txn_identity_folded_closure_0_pad frees what the walk holds live: its value, its versions, and its hold. */
+static void
+txn_identity_folded_closure_0_pad(void *frame_)
+{
+	txn_identity_folded_closure_0_frame_t *frame = frame_;
+
+	if (frame->value_live)
+		std_vec_free_Checked(&frame->value, TXN_IDENTITY_BYTES);
+	if (frame->versions_live)
+		txn_memtable_version_versions_drop(&frame->versions, frame->at);
+	if (frame->hold_live)
+		host_delta_Hold_drop(&frame->hold);
+	frame->value_live = frame->versions_live = frame->hold_live = false;
+}
+
+/* txn_identity_folded_closure_0 is folded's walk's closure, of one key of the delta. */
+static bool
+txn_identity_folded_closure_0(void *captures, HostIoIo *io, const uint8 *key, size_t key_len, const StdVec *values,
+							  size_t values_len, HostError *error)
+{
+	txn_identity_folded_closure_0_frame_t frame = {.walk = captures, .io = io, .key = key, .key_len = key_len,
+	.error = error};
+
+	std_landing(&frame, txn_identity_folded_closure_0_body, txn_identity_folded_closure_0_pad);
+	txn_identity_folded_closure_0_pad(&frame);
+	return frame.ok;
+}
+
+/* txn_identity_folded_frame_t is folded's state across its pad: its deltas and its pairs, each while live. */
+typedef struct txn_identity_folded_frame_t
+{
+	HostIoIo   *io;
+	uint32		repository;
+	HostLsn		point;
+	HostSharedHeld deltas;
+	bool		deltas_live;
+	StdVec		pairs;
+	bool		pairs_live;
+	StdVec	   *result;
+	HostError  *error;
+	bool		ok;
+} txn_identity_folded_frame_t;
+
+/* txn_identity_folded_body walks the tree's delta, if the database has one, for each key's folded change. */
+static void
+txn_identity_folded_body(void *frame_)
+{
+	txn_identity_folded_frame_t *frame = frame_;
+	txn_identity_folded_closure_0_captures_t walk = {.point = frame->point, .pairs = &frame->pairs};
+	bool		some;
+
+	if (!txn_memtable_branch_find(HOST_SHARED_IO_WITHIN(frame->io), frame->repository, &some, &frame->deltas,
+								  frame->error))
+		return;
+	std_vec_new(&frame->pairs, TXN_IDENTITY_PAIR);
+	if (!some)
+	{
+		*frame->result = frame->pairs;
+		frame->ok = true;
+		return;
+	}
+	frame->deltas_live = true;
+	frame->pairs_live = true;
+	walk.deltas = host_shared_Held_record(&frame->deltas);
+	if (!txn_memtable_table_walked(&TXN_MEMTABLE_BRANCH_IDENTITY_TREE_OPS, frame->io, walk.deltas,
+								   txn_identity_folded_closure_0, &walk, NULL, frame->error))
+		return;
+	*frame->result = frame->pairs;
+	frame->pairs_live = false;
+	frame->ok = true;
+}
+
+/* txn_identity_folded_pad frees what folded holds live: its pairs and its deltas. */
+static void
+txn_identity_folded_pad(void *frame_)
+{
+	txn_identity_folded_frame_t *frame = frame_;
+
+	if (frame->pairs_live)
+		std_vec_drop_Checked(&frame->pairs, TXN_IDENTITY_PAIR, txn_identity_Pair_drop);
+	if (frame->deltas_live)
+		host_shared_Held_drop(&frame->deltas);
+	frame->pairs_live = frame->deltas_live = false;
+}
+
+/*
+ * txn_identity_folded returns what a save at a fold point folds of a
+ * database's identity tree: for each key of the tree's delta, the change of
+ * its newest version the fold applies, as the key's value or none for its
+ * removal, which the save makes only where the folded tree holds another.
+ */
+bool
+txn_identity_folded(HostIoIo *io, uint32 repository, HostLsn point, StdVec *result, HostError *error)
+{
+	txn_identity_folded_frame_t frame = {.io = io, .repository = repository, .point = point, .result = result,
+	.error = error};
+
+	std_landing(&frame, txn_identity_folded_body, txn_identity_folded_pad);
+	txn_identity_folded_pad(&frame);
+	return frame.ok;
+}
+
+/* txn_identity_folded_drop frees a key's folded versions held as a vector's element. */
+static void
+txn_identity_folded_drop(void *folded_)
+{
+	txn_TupleVecU8VecTupleHandleOptionU64_t *folded = folded_;
+
+	std_vec_free_Checked(&folded->f0, TXN_IDENTITY_BYTES);
+	std_vec_free_Checked(&folded->f1, TXN_IDENTITY_FOLDED_VERSION);
+}
+
+/*
+ * txn_identity_dropped_closure_0_captures_t is dropped's walk's captures: the
+ * deltas, the fold point, and the keys it folded.
+ */
+typedef struct txn_identity_dropped_closure_0_captures_t
+{
+	HostSharedRecord deltas;
+	HostLsn		point;
+	StdVec	   *folded;
+} txn_identity_dropped_closure_0_captures_t;
+
+/*
+ * txn_identity_dropped_closure_0_frame_t is the walk's state across its pad:
+ * a key's hold, its versions from the first it hasn't dropped, and its
+ * folded ones, each while live.
+ */
+typedef struct txn_identity_dropped_closure_0_frame_t
+{
+	txn_identity_dropped_closure_0_captures_t *walk;
+	HostIoIo   *io;
+	const uint8 *key;
+	size_t		key_len;
+	HostDeltaHold hold;
+	bool		hold_live;
+	StdVec		versions;
+	size_t		at;
+	bool		versions_live;
+	StdVec		applied;
+	bool		applied_live;
+	HostError  *error;
+	bool		ok;
+} txn_identity_dropped_closure_0_frame_t;
+
+/*
+ * txn_identity_dropped_closure_0_body lists the key's versions the fold
+ * applied at the point, with their top-level xids.
+ */
+static void
+txn_identity_dropped_closure_0_body(void *frame_)
+{
+	txn_identity_dropped_closure_0_frame_t *frame = frame_;
+	txn_identity_dropped_closure_0_captures_t *walk = frame->walk;
+	txn_TupleVecU8VecTupleHandleOptionU64_t folded;
+
+	if (!host_delta_hold(frame->io, &frame->hold, frame->error))
+		return;
+	frame->hold_live = true;
+	std_vec_new(&frame->applied, TXN_IDENTITY_FOLDED_VERSION);
+	frame->applied_live = true;
+	if (!txn_memtable_branch_identity_versions(frame->io, &frame->hold, walk->deltas, frame->key, frame->key_len,
+											   &frame->versions, frame->error))
+		return;
+	frame->versions_live = true;
+	for (; frame->at < frame->versions.len; frame->at++)
+	{
+		TxnMemtableVersionVersion *version = &STD_VEC_AT(&frame->versions, TxnMemtableVersionVersion, frame->at);
+		TxnFoldApplied applied;
+
+		if (!txn_fold_applied(frame->io, version, walk->point, &applied, frame->error))
+			return;
+		if (applied.tag == TXN_FOLD_APPLIED_YES)
+		{
+			txn_TupleHandleOptionU64_t top = {.f0 = version->handle, .has_f1 = applied.u.yes.has_top,
+			.f1 = applied.u.yes.top};
+
+			if (!std_vec_try_reserve(&frame->applied, 1, TXN_IDENTITY_FOLDED_VERSION))
+			{
+				*frame->error = host_Error_out_of_memory();
+				return;
+			}
+			std_vec_push_Checked(&frame->applied, &top, TXN_IDENTITY_FOLDED_VERSION);
+		}
+		txn_memtable_version_Version_drop(version);
+	}
+	if (frame->applied.len > 0)
+	{
+		if (!std_vec_try_reserve(walk->folded, 1, TXN_IDENTITY_FOLDED))
+		{
+			*frame->error = host_Error_out_of_memory();
+			return;
+		}
+		txn_identity_bytes(frame->key, frame->key_len, &folded.f0);
+		folded.f1 = frame->applied;
+		std_vec_push_Checked(walk->folded, &folded, TXN_IDENTITY_FOLDED);
+		frame->applied_live = false;
+	}
+	frame->ok = true;
+}
+
+/* txn_identity_dropped_closure_0_pad frees what the walk holds live: its versions, its folded ones, and its hold. */
+static void
+txn_identity_dropped_closure_0_pad(void *frame_)
+{
+	txn_identity_dropped_closure_0_frame_t *frame = frame_;
+
+	if (frame->versions_live)
+		txn_memtable_version_versions_drop(&frame->versions, frame->at);
+	if (frame->applied_live)
+		std_vec_free_Checked(&frame->applied, TXN_IDENTITY_FOLDED_VERSION);
+	if (frame->hold_live)
+		host_delta_Hold_drop(&frame->hold);
+	frame->versions_live = frame->applied_live = frame->hold_live = false;
+}
+
+/* txn_identity_dropped_closure_0 is dropped's walk's closure, of one key of the delta. */
+static bool
+txn_identity_dropped_closure_0(void *captures, HostIoIo *io, const uint8 *key, size_t key_len, const StdVec *values,
+							   size_t values_len, HostError *error)
+{
+	txn_identity_dropped_closure_0_frame_t frame = {.walk = captures, .io = io, .key = key, .key_len = key_len,
+	.error = error};
+
+	std_landing(&frame, txn_identity_dropped_closure_0_body, txn_identity_dropped_closure_0_pad);
+	txn_identity_dropped_closure_0_pad(&frame);
+	return frame.ok;
+}
+
+/*
+ * txn_identity_dropped_frame_t is dropped's state across its pad: its
+ * deltas, the folded keys from the first it hasn't taken out, and a key's
+ * handles and what their removal took, each while live.
+ */
+typedef struct txn_identity_dropped_frame_t
+{
+	HostIoIo   *io;
+	uint32		repository;
+	HostLsn		point;
+	HostSharedHeld deltas;
+	bool		deltas_live;
+	StdVec		folded;
+	size_t		at;
+	bool		folded_live;
+	StdVec		handles;
+	bool		handles_live;
+	StdVec		taken;
+	bool		taken_live;
+	HostError  *error;
+	bool		ok;
+} txn_identity_dropped_frame_t;
+
+/*
+ * txn_identity_dropped_body lists each key's versions the fold applied, then
+ * takes each key's out of its chain and gives each taken one's count back at
+ * its top-level transaction's entry.
+ */
+static void
+txn_identity_dropped_body(void *frame_)
+{
+	txn_identity_dropped_frame_t *frame = frame_;
+	txn_identity_dropped_closure_0_captures_t walk = {.point = frame->point, .folded = &frame->folded};
+	bool		some;
+
+	if (!txn_memtable_branch_find(HOST_SHARED_IO_WITHIN(frame->io), frame->repository, &some, &frame->deltas,
+								  frame->error))
+		return;
+	if (!some)
+	{
+		frame->ok = true;
+		return;
+	}
+	frame->deltas_live = true;
+	std_vec_new(&frame->folded, TXN_IDENTITY_FOLDED);
+	frame->folded_live = true;
+	walk.deltas = host_shared_Held_record(&frame->deltas);
+	if (!txn_memtable_table_walked(&TXN_MEMTABLE_BRANCH_IDENTITY_TREE_OPS, frame->io, walk.deltas,
+								   txn_identity_dropped_closure_0, &walk, NULL, frame->error))
+		return;
+	for (; frame->at < frame->folded.len; frame->at++)
+	{
+		txn_TupleVecU8VecTupleHandleOptionU64_t *key = &STD_VEC_AT(&frame->folded,
+																   txn_TupleVecU8VecTupleHandleOptionU64_t,
+																   frame->at);
+		size_t		zipped;
+
+		std_vec_with_capacity_Checked(&frame->handles, key->f1.len, TXN_IDENTITY_HANDLE);
+		frame->handles_live = true;
+		for (size_t i = 0; i < key->f1.len; i++)
+			std_vec_push_Checked(&frame->handles, &STD_VEC_AT(&key->f1, txn_TupleHandleOptionU64_t, i).f0,
+								 TXN_IDENTITY_HANDLE);
+		if (!txn_memtable_table_removed(&TXN_MEMTABLE_BRANCH_IDENTITY_TREE_OPS, frame->io, walk.deltas, key->f0.ptr,
+										key->f0.len, frame->handles.ptr, frame->handles.len, &frame->taken,
+										frame->error))
+			return;
+		frame->taken_live = true;
+		zipped = Min(key->f1.len, frame->taken.len);
+		for (size_t i = 0; i < zipped; i++)
+		{
+			const txn_TupleHandleOptionU64_t *top = &STD_VEC_AT(&key->f1, txn_TupleHandleOptionU64_t, i);
+			HostXid		xid = {top->f1};
+			bool		has_added;
+			uint64		added;
+
+			if (!STD_VEC_AT(&frame->taken, bool, i) || !top->has_f1)
+				continue;
+			if (!txn_status_add(frame->io, xid, PG_UINT64_MAX, &has_added, &added, frame->error))
+				return;
+		}
+		frame->taken_live = false;
+		std_vec_free_Checked(&frame->taken, sizeof(bool), _Alignof(bool));
+		frame->handles_live = false;
+		std_vec_free_Checked(&frame->handles, TXN_IDENTITY_HANDLE);
+		txn_identity_folded_drop(key);
+	}
+	frame->ok = true;
+}
+
+/*
+ * txn_identity_dropped_pad frees what dropped holds live: a key's removal and
+ * handles, the folded keys left, and its deltas.
+ */
+static void
+txn_identity_dropped_pad(void *frame_)
+{
+	txn_identity_dropped_frame_t *frame = frame_;
+
+	if (frame->taken_live)
+		std_vec_free_Checked(&frame->taken, sizeof(bool), _Alignof(bool));
+	if (frame->handles_live)
+		std_vec_free_Checked(&frame->handles, TXN_IDENTITY_HANDLE);
+	if (frame->folded_live)
+	{
+		for (; frame->at < frame->folded.len; frame->at++)
+			txn_identity_folded_drop(&STD_VEC_AT(&frame->folded, txn_TupleVecU8VecTupleHandleOptionU64_t,
+												 frame->at));
+		std_vec_free_Checked(&frame->folded, TXN_IDENTITY_FOLDED);
+	}
+	if (frame->deltas_live)
+		host_shared_Held_drop(&frame->deltas);
+	frame->taken_live = frame->handles_live = frame->folded_live = frame->deltas_live = false;
+}
+
+/*
+ * txn_identity_dropped takes out of a database's identity tree's delta, once
+ * a save at a fold point has made its manifest durable, every version that
+ * save folded, each one folded finds applied at the point, and gives each
+ * one's count back at its top-level transaction's entry, so the folded pairs
+ * live in the manifest's tree alone. A reader reads the delta and then the
+ * newest manifest (found), so no reader tells the two apart once the save is
+ * durable, and no horizon is waited for.
+ */
+bool
+txn_identity_dropped(HostIoIo *io, uint32 repository, HostLsn point, HostError *error)
+{
+	txn_identity_dropped_frame_t frame = {.io = io, .repository = repository, .point = point, .error = error};
+
+	std_landing(&frame, txn_identity_dropped_body, txn_identity_dropped_pad);
+	txn_identity_dropped_pad(&frame);
+	return frame.ok;
+}
+
+/*
+ * txn_identity_redo_closure_0_captures_t is a redo's prepare's closure's
+ * captures: the version it pushes and its slot.
+ */
+typedef struct txn_identity_redo_closure_0_captures_t
+{
+	const TxnMemtableVersionChange *pushed;
+	bool		has_roomed;
+	TxnStatusRoomed roomed;
+} txn_identity_redo_closure_0_captures_t;
+
+/* txn_identity_redo_closure_0 is a redo's prepare's closure: it pushes the replayed version. */
+static bool
+txn_identity_redo_closure_0(void *captures, HostIoIo *io, TxnMemtableTablePreparedBranchDeltas *prepared,
+							TxnMemtableVersionHandle *result, HostError *error)
+{
+	txn_identity_redo_closure_0_captures_t *inside = captures;
+
+	return txn_memtable_branch_identity_finish(HOST_IO_IO_TAKES_SHORT(io), prepared, 0, inside->pushed,
+											   inside->has_roomed, inside->roomed, result, error);
+}
+
+/*
+ * txn_identity_redo_frame_t is redo's state across its pad: the change it
+ * takes, its deltas, and the op made of the change's value, each while live.
+ */
+typedef struct txn_identity_redo_frame_t
+{
+	HostIoIo   *io;
+	TxnRecordDatabaseChange change;
+	bool		value_live;
+	uint32		own;
+	uint64		lsn;
+	HostSharedHeld deltas;
+	bool		deltas_live;
+	TxnMemtableOp op;
+	bool		op_live;
+	HostError  *error;
+	bool		ok;
+} txn_identity_redo_frame_t;
+
+/* txn_identity_redo_body pushes the replayed change's version unless the delta holds it already. */
+static void
+txn_identity_redo_body(void *frame_)
+{
+	txn_identity_redo_frame_t *frame = frame_;
+	TxnRecordDatabaseChange *change = &frame->change;
+	TxnMemtableVersionShown replayed = {.tag = TXN_MEMTABLE_VERSION_SHOWN_REPLAYED};
+	HostSharedRecord deltas;
+	bool		holds;
+	txn_identity_redo_closure_0_captures_t inside;
+	TxnMemtableVersionChange pushed;
+	txn_TupleRefSliceU8Usize_t needs;
+	TxnMemtableVersionHandle handle;
+
+	if (!txn_memtable_branch_deltas(frame->io, change->repository, frame->own, &frame->deltas, frame->error))
+		return;
+	frame->deltas_live = true;
+	deltas = host_shared_Held_record(&frame->deltas);
+	if (!txn_memtable_branch_identity_holds(frame->io, deltas, change->key.ptr, change->key.len, frame->lsn, &holds,
+											frame->error))
+		return;
+	if (holds)
+	{
+		frame->ok = true;
+		return;
+	}
+	if (!txn_status_redo_roomed(frame->io, &change->writer, &inside.has_roomed, &inside.roomed, frame->error))
+		return;
+	frame->value_live = false;
+	txn_identity_op(change->has_value, change->value, &frame->op);
+	frame->op_live = true;
+	needs.f0.ptr = change->key.ptr;
+	needs.f0.len = change->key.len;
+	needs.f1 = txn_memtable_version_encoded(&change->writer, &frame->op, replayed, true, frame->lsn);
+	pushed.writer = change->writer;
+	pushed.op = &frame->op;
+	pushed.lock = TXN_MEMTABLE_LOCK_MODE_UPDATE;
+	pushed.shown = replayed;
+	pushed.has_lsn = true;
+	pushed.lsn = frame->lsn;
+	inside.pushed = &pushed;
+	frame->ok = txn_memtable_branch_identity_prepare_Handle_Unit(frame->io, deltas, &needs, 1,
+																 txn_identity_redo_closure_0, &inside, NULL, &handle,
+																 frame->error);
+}
+
+/* txn_identity_redo_pad frees what redo holds live: its op, its deltas, and the change. */
+static void
+txn_identity_redo_pad(void *frame_)
+{
+	txn_identity_redo_frame_t *frame = frame_;
+
+	if (frame->op_live)
+		txn_memtable_Op_drop(&frame->op);
+	if (frame->deltas_live)
+		host_shared_Held_drop(&frame->deltas);
+	if (frame->value_live)
+		std_vec_free_Checked(&frame->change.value, TXN_IDENTITY_BYTES);
+	std_vec_free_Checked(&frame->change.key, TXN_IDENTITY_BYTES);
+	frame->op_live = frame->deltas_live = frame->value_live = false;
+}
+
+/*
+ * txn_identity_redo pushes a replayed identity change into its database's
+ * working state's delta, taking it, in the startup process or on a standby,
+ * with no catalog access, unless the checkpoint's runs brought it back,
+ * which the delta holds by its key and the record's LSN.
+ */
+bool
+txn_identity_redo(HostIoIo *io, TxnRecordDatabaseChange *change, uint32 own, uint64 lsn, HostError *error)
+{
+	txn_identity_redo_frame_t frame = {.io = io, .change = *change, .value_live = change->has_value, .own = own,
+	.lsn = lsn, .error = error};
+
+	std_landing(&frame, txn_identity_redo_body, txn_identity_redo_pad);
+	txn_identity_redo_pad(&frame);
+	return frame.ok;
+}

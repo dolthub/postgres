@@ -14,6 +14,7 @@
 
 #include "access/parallel.h"
 #include "commands/repack.h"
+#include "doltgres/hooks.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -157,6 +158,18 @@ static const struct
 	{
 		.fn_name = "TableSyncWorkerMain",
 		.fn_addr = TableSyncWorkerMain
+	},
+	{
+		.fn_name = "doltgres_collect",
+		.fn_addr = doltgres_collect
+	},
+	{
+		.fn_name = "doltgres_fold_launch",
+		.fn_addr = doltgres_fold_launch
+	},
+	{
+		.fn_name = "doltgres_fold_work",
+		.fn_addr = doltgres_fold_work
 	}
 };
 
@@ -174,7 +187,7 @@ BackgroundWorkerShmemRequest(void *arg)
 
 	/* Array of workers is variably sized. */
 	size = offsetof(BackgroundWorkerArray, slot);
-	size = add_size(size, mul_size(max_worker_processes,
+	size = add_size(size, mul_size(max_worker_processes + DoltgresReservedWorkers,
 								   sizeof(BackgroundWorkerSlot)));
 	ShmemRequestStruct(.name = "Background Worker Data",
 					   .size = size,
@@ -191,7 +204,7 @@ BackgroundWorkerShmemInit(void *arg)
 	dlist_iter	iter;
 	int			slotno = 0;
 
-	BackgroundWorkerData->total_slots = max_worker_processes;
+	BackgroundWorkerData->total_slots = max_worker_processes + DoltgresReservedWorkers;
 	BackgroundWorkerData->parallel_register_count = 0;
 	BackgroundWorkerData->parallel_terminate_count = 0;
 
@@ -207,7 +220,7 @@ BackgroundWorkerShmemInit(void *arg)
 		RegisteredBgWorker *rw;
 
 		rw = dlist_container(RegisteredBgWorker, rw_lnode, iter.cur);
-		Assert(slotno < max_worker_processes);
+		Assert(slotno < max_worker_processes + DoltgresReservedWorkers);
 		slot->in_use = true;
 		slot->terminate = false;
 		slot->pid = InvalidPid;
@@ -221,7 +234,7 @@ BackgroundWorkerShmemInit(void *arg)
 	/*
 	 * Mark any remaining slots as not in use.
 	 */
-	while (slotno < max_worker_processes)
+	while (slotno < max_worker_processes + DoltgresReservedWorkers)
 	{
 		BackgroundWorkerSlot *slot = &BackgroundWorkerData->slot[slotno];
 
@@ -271,7 +284,7 @@ BackgroundWorkerStateChange(bool allow_new_workers)
 	 * max_worker_processes, in case shared memory gets corrupted while we're
 	 * looping.
 	 */
-	if (max_worker_processes != BackgroundWorkerData->total_slots)
+	if (max_worker_processes + DoltgresReservedWorkers != BackgroundWorkerData->total_slots)
 	{
 		ereport(LOG,
 				(errmsg("inconsistent background worker state (\"max_worker_processes\"=%d, total slots=%d)",
@@ -284,7 +297,7 @@ BackgroundWorkerStateChange(bool allow_new_workers)
 	 * Iterate through slots, looking for newly-registered workers or workers
 	 * who must die.
 	 */
-	for (slotno = 0; slotno < max_worker_processes; ++slotno)
+	for (slotno = 0; slotno < max_worker_processes + DoltgresReservedWorkers; ++slotno)
 	{
 		BackgroundWorkerSlot *slot = &BackgroundWorkerData->slot[slotno];
 		RegisteredBgWorker *rw;
@@ -447,7 +460,7 @@ ForgetBackgroundWorker(RegisteredBgWorker *rw)
 {
 	BackgroundWorkerSlot *slot;
 
-	Assert(rw->rw_shmem_slot < max_worker_processes);
+	Assert(rw->rw_shmem_slot < max_worker_processes + DoltgresReservedWorkers);
 	slot = &BackgroundWorkerData->slot[rw->rw_shmem_slot];
 	Assert(slot->in_use);
 
@@ -479,7 +492,7 @@ ReportBackgroundWorkerPID(RegisteredBgWorker *rw)
 {
 	BackgroundWorkerSlot *slot;
 
-	Assert(rw->rw_shmem_slot < max_worker_processes);
+	Assert(rw->rw_shmem_slot < max_worker_processes + DoltgresReservedWorkers);
 	slot = &BackgroundWorkerData->slot[rw->rw_shmem_slot];
 	slot->pid = rw->rw_pid;
 
@@ -502,7 +515,7 @@ ReportBackgroundWorkerExit(RegisteredBgWorker *rw)
 	BackgroundWorkerSlot *slot;
 	int			notify_pid;
 
-	Assert(rw->rw_shmem_slot < max_worker_processes);
+	Assert(rw->rw_shmem_slot < max_worker_processes + DoltgresReservedWorkers);
 	slot = &BackgroundWorkerData->slot[rw->rw_shmem_slot];
 	slot->pid = rw->rw_pid;
 	notify_pid = rw->rw_worker.bgw_notify_pid;
@@ -565,7 +578,7 @@ ForgetUnstartedBackgroundWorkers(void)
 		BackgroundWorkerSlot *slot;
 
 		rw = dlist_container(RegisteredBgWorker, rw_lnode, iter.cur);
-		Assert(rw->rw_shmem_slot < max_worker_processes);
+		Assert(rw->rw_shmem_slot < max_worker_processes + DoltgresReservedWorkers);
 		slot = &BackgroundWorkerData->slot[rw->rw_shmem_slot];
 
 		/* If it's not yet started, and there's someone waiting ... */
@@ -1010,7 +1023,7 @@ RegisterBackgroundWorker(BackgroundWorker *worker)
 	 * towards the MAX_BACKENDS limit elsewhere.  For now, it doesn't seem
 	 * important to relax this restriction.
 	 */
-	if (++numworkers > max_worker_processes)
+	if (++numworkers > max_worker_processes + DoltgresReservedWorkers)
 	{
 		ereport(LOG,
 				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
@@ -1105,7 +1118,7 @@ RegisterDynamicBackgroundWorker(BackgroundWorker *worker,
 	/*
 	 * Look for an unused slot.  If we find one, grab it.
 	 */
-	for (slotno = 0; slotno < BackgroundWorkerData->total_slots; ++slotno)
+	for (slotno = 0; slotno < BackgroundWorkerData->total_slots && !doltgres_worker_refused(worker); ++slotno)
 	{
 		BackgroundWorkerSlot *slot = &BackgroundWorkerData->slot[slotno];
 
@@ -1173,7 +1186,7 @@ GetBackgroundWorkerPid(BackgroundWorkerHandle *handle, pid_t *pidp)
 	BackgroundWorkerSlot *slot;
 	pid_t		pid;
 
-	Assert(handle->slot < max_worker_processes);
+	Assert(handle->slot < max_worker_processes + DoltgresReservedWorkers);
 	slot = &BackgroundWorkerData->slot[handle->slot];
 
 	/*
@@ -1312,7 +1325,7 @@ TerminateBackgroundWorker(BackgroundWorkerHandle *handle)
 	BackgroundWorkerSlot *slot;
 	bool		signal_postmaster = false;
 
-	Assert(handle->slot < max_worker_processes);
+	Assert(handle->slot < max_worker_processes + DoltgresReservedWorkers);
 	slot = &BackgroundWorkerData->slot[handle->slot];
 
 	/* Set terminate flag in shared memory, unless slot has been reused. */
@@ -1457,4 +1470,24 @@ TerminateBackgroundWorkersForDatabase(Oid databaseId)
 	/* Make sure the postmaster notices the change to shared memory. */
 	if (signal_postmaster)
 		SendPostmasterSignal(PMSIGNAL_BACKGROUND_WORKER_CHANGE);
+}
+
+/*
+ * doltgres_worker_slots_in_use counts the in-use background worker slots held
+ * by workers that aren't the fork's own, with BackgroundWorkerLock held.
+ */
+int
+doltgres_worker_slots_in_use(void)
+{
+	int			count = 0;
+
+	Assert(LWLockHeldByMe(BackgroundWorkerLock));
+	for (int slotno = 0; slotno < BackgroundWorkerData->total_slots; ++slotno)
+	{
+		BackgroundWorkerSlot *slot = &BackgroundWorkerData->slot[slotno];
+
+		if (slot->in_use && !doltgres_fork_worker(&slot->worker))
+			count++;
+	}
+	return count;
 }

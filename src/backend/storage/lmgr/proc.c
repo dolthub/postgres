@@ -37,6 +37,7 @@
 #include "access/transam.h"
 #include "access/twophase.h"
 #include "access/xlogutils.h"
+#include "doltgres/hooks.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
@@ -344,7 +345,7 @@ ProcGlobalShmemInit(void *arg)
 			dlist_push_tail(&ProcGlobal->autovacFreeProcs, &proc->freeProcsLink);
 			proc->procgloballist = &ProcGlobal->autovacFreeProcs;
 		}
-		else if (i < MaxConnections + autovacuum_worker_slots + NUM_SPECIAL_WORKER_PROCS + max_worker_processes)
+		else if (i < MaxConnections + autovacuum_worker_slots + NUM_SPECIAL_WORKER_PROCS + max_worker_processes + DoltgresReservedWorkers)
 		{
 			/* PGPROC for bgworker, add to bgworkerFreeProcs list */
 			dlist_push_tail(&ProcGlobal->bgworkerFreeProcs, &proc->freeProcsLink);

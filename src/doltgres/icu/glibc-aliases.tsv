@@ -1,0 +1,69 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# glibc's locale aliases and the language tag each stands for (design item 12), matched whatever the case of their
+# letters, as glibc matches them. Written by glibc-aliases.py, never by hand, from intl/locale.alias of
+# glibc 2.44, commit c3a3a9808ad3ab4a3336836833f83288b672ccbf
+# (https://sourceware.org/git/glibc.git), whose own header reads:
+# Copyright (C) 1996-2026 Free Software Foundation, Inc.
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2, or (at your option)
+# any later version.
+# A row is an alias, a tab, and its tag.
+bokmal	nb-NO
+catalan	ca-ES
+croatian	hr-HR
+czech	cs-CZ
+danish	da-DK
+dansk	da-DK
+deutsch	de-DE
+dutch	nl-NL
+eesti	et-EE
+estonian	et-EE
+finnish	fi-FI
+french	fr-FR
+galego	gl-ES
+galician	gl-ES
+german	de-DE
+greek	el-GR
+hebrew	he-IL
+hrvatski	hr-HR
+hungarian	hu-HU
+icelandic	is-IS
+italian	it-IT
+japanese	ja-JP
+japanese.euc	ja-JP
+ja_JP	ja-JP
+ja_JP.ujis	ja-JP
+japanese.sjis	ja-JP
+korean	ko-KR
+korean.euc	ko-KR
+ko_KR	ko-KR
+lithuanian	lt-LT
+no_NO	nb-NO
+no_NO.ISO-8859-1	nb-NO
+norwegian	nb-NO
+nynorsk	nn-NO
+polish	pl-PL
+portuguese	pt-PT
+romanian	ro-RO
+russian	ru-RU
+slovak	sk-SK
+slovene	sl-SI
+slovenian	sl-SI
+spanish	es-ES
+swedish	sv-SE
+thai	th-TH
+turkish	tr-TR

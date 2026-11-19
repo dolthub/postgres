@@ -1,0 +1,3 @@
+comment = 'Doltgrust test extension with configuration tables'
+default_version = '1.0'
+relocatable = true

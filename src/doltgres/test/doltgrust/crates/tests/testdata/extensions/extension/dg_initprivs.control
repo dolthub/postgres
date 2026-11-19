@@ -1,0 +1,4 @@
+comment = 'Doltgrust test extension whose script sets privileges'
+default_version = '1.0'
+relocatable = false
+schema = 'public'

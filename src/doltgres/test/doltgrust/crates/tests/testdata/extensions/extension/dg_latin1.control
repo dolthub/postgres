@@ -1,0 +1,4 @@
+comment = 'Doltgrust test extension with a LATIN1 script'
+default_version = '1.0'
+relocatable = true
+encoding = 'LATIN1'

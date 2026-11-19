@@ -1,0 +1,1008 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Windows' traditional locale names and the language tag each stands for (design item 12): a language's English name,
+# an underscore, and a country's English name, as Windows' C library spells a locale (`English_United States`), or a
+# language's name alone, which names its default country. Written by windows-names.py, never by hand, from Windows'
+# own list of its locales and from the list of them Microsoft publishes, which holds earlier releases' spellings
+# ([MS-LCID] Windows Language Code Identifier (LCID) Reference, Appendix A: Product Behavior, read at
+# https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-lcid/a9eac961-e77d-41a6-90a5-ce1a8b0cdb9c). A row is
+# never taken out, since a stored name keeps the spelling of the Windows it was made on.
+# name	tag
+# Windows builds read: 10.0.19045.6456
+# Published lists read: [MS-LCID] Appendix A: Product Behavior, as updated 2024-04-23
+Afar	aa-ET
+Afar_Djibouti	aa-DJ
+Afar_Eritrea	aa-ER
+Afar_Ethiopia	aa-ET
+Afrikaans	af-ZA
+Afrikaans_Namibia	af-NA
+Afrikaans_South Africa	af-ZA
+Aghem	agq-CM
+Aghem_Cameroon	agq-CM
+Akan	ak-GH
+Akan_Ghana	ak-GH
+Albanian	sq-AL
+Albanian_Albania	sq-AL
+Albanian_Kosovo	sq-XK
+Albanian_North Macedonia	sq-MK
+Alsatian_France	gsw-FR
+Alsatian_Liechtenstein	gsw-LI
+Alsatian_Switzerland	gsw-CH
+Amharic	am-ET
+Amharic_Ethiopia	am-ET
+Arabic	ar-SA
+Arabic_Algeria	ar-DZ
+Arabic_Bahrain	ar-BH
+Arabic_Chad	ar-TD
+Arabic_Comoros	ar-KM
+Arabic_Djibouti	ar-DJ
+Arabic_Egypt	ar-EG
+Arabic_Eritrea	ar-ER
+Arabic_Iraq	ar-IQ
+Arabic_Israel	ar-IL
+Arabic_Jordan	ar-JO
+Arabic_Kuwait	ar-KW
+Arabic_Lebanon	ar-LB
+Arabic_Libya	ar-LY
+Arabic_Mauritania	ar-MR
+Arabic_Morocco	ar-MA
+Arabic_Oman	ar-OM
+Arabic_Palestinian Authority	ar-PS
+Arabic_Qatar	ar-QA
+Arabic_Saudi Arabia	ar-SA
+Arabic_Somalia	ar-SO
+Arabic_South Sudan	ar-SS
+Arabic_Sudan	ar-SD
+Arabic_Syria	ar-SY
+Arabic_Tunisia	ar-TN
+Arabic_U.A.E.	ar-AE
+Arabic_United Arab Emirates	ar-AE
+Arabic_World	ar-001
+Arabic_Yemen	ar-YE
+Armenian	hy-AM
+Armenian_Armenia	hy-AM
+Assamese	as-IN
+Assamese_India	as-IN
+Asturian	ast-ES
+Asturian_Spain	ast-ES
+Asu	asa-TZ
+Asu_Tanzania	asa-TZ
+Azerbaijani	az-Latn-AZ
+Azerbaijani (Cyrillic)	az-Cyrl-AZ
+Azerbaijani (Cyrillic)_Azerbaijan	az-Cyrl-AZ
+Azerbaijani (Latin)	az-Latn-AZ
+Azerbaijani (Latin)_Azerbaijan	az-Latn-AZ
+Azerbaijani_Azerbaijan	az-Latn-AZ
+Bafia	ksf-CM
+Bafia_Cameroon	ksf-CM
+Bamanankan	bm-Latn-ML
+Bamanankan (Latin)	bm-Latn-ML
+Bamanankan (Latin)_Mali	bm-Latn-ML
+Bamanankan_Mali	bm-Latn-ML
+Bangla	bn-BD
+Bangla_Bangladesh	bn-BD
+Bangla_India	bn-IN
+Basaa	bas-CM
+Basaa_Cameroon	bas-CM
+Bashkir	ba-RU
+Bashkir_Russia	ba-RU
+Basque	eu-ES
+Basque_Spain	eu-ES
+Belarusian	be-BY
+Belarusian_Belarus	be-BY
+Bemba	bem-ZM
+Bemba_Zambia	bem-ZM
+Bena	bez-TZ
+Bena_Tanzania	bez-TZ
+Bengali_India	bn-IN
+Bhojpuri (Devanagari)_India	bho-Deva-IN
+Blin	byn-ER
+Blin_Eritrea	byn-ER
+Bodo	brx-IN
+Bodo_India	brx-IN
+Bosnian	bs-Latn-BA
+Bosnian (Cyrillic)	bs-Cyrl-BA
+Bosnian (Cyrillic)_Bosnia and Herzegovina	bs-Cyrl-BA
+Bosnian (Latin)	bs-Latn-BA
+Bosnian (Latin)_Bosnia & Herzegovina	bs-Latn-BA
+Bosnian (Latin)_Bosnia and Herzegovina	bs-Latn-BA
+Bosnian_Bosnia & Herzegovina	bs-Latn-BA
+Breton	br-FR
+Breton_France	br-FR
+Bulgarian	bg-BG
+Bulgarian_Bulgaria	bg-BG
+Burmese	my-MM
+Burmese_Myanmar	my-MM
+Catalan	ca-ES
+Catalan_Andorra	ca-AD
+Catalan_France	ca-FR
+Catalan_Italy	ca-IT
+Catalan_Spain	ca-ES
+Cebuan (Latin)_Philippines	ceb-Latn-PH
+Cebuano	ceb-Latn-PH
+Cebuano (Latin)	ceb-Latn-PH
+Cebuano (Latin)_Philippines	ceb-Latn-PH
+Cebuano_Philippines	ceb-Latn-PH
+Central Atlas Tamazight	tzm-Latn-DZ
+Central Atlas Tamazight (Arabic)	tzm-Arab-MA
+Central Atlas Tamazight (Arabic)_Morocco	tzm-Arab-MA
+Central Atlas Tamazight (Latin)	tzm-Latn-DZ
+Central Atlas Tamazight (Latin)_Algeria	tzm-Latn-DZ
+Central Atlas Tamazight (Latin)_Morocco	tzm-Latn-MA
+Central Atlas Tamazight (Tifinagh)	tzm-Tfng-MA
+Central Atlas Tamazight (Tifinagh)_Morocco	tzm-Tfng-MA
+Central Atlas Tamazight_Algeria	tzm-Latn-DZ
+Central Kurdish	ku-Arab-IQ
+Central Kurdish_Iraq	ku-Arab-IQ
+Chakma	ccp-Cakm-BD
+Chakma (Chakma)	ccp-Cakm-BD
+Chakma (Chakma)_Bangladesh	ccp-Cakm-BD
+Chakma (Chakma)_India	ccp-Cakm-IN
+Chakma_Bangladesh	ccp-Cakm-BD
+Chakma_Chakma	ccp-Cakm
+Chakma_India	ccp-Cakm-IN
+Chechen	ce-RU
+Chechen_Russia	ce-RU
+Cherokee	chr-Cher-US
+Cherokee_United States	chr-Cher-US
+Chiga	cgg-UG
+Chiga_Uganda	cgg-UG
+Chinese	zh-CN
+Chinese (Simplified Han)_Hong Kong S.A.R.	zh-Hans-HK
+Chinese (Simplified Han)_Hong Kong SAR	zh-Hans-HK
+Chinese (Simplified Han)_Macao S.A.R.	zh-Hans-MO
+Chinese (Simplified Han)_Macao SAR	zh-Hans-MO
+Chinese (Simplified Han)_Macau S.A.R.	zh-Hans-MO
+Chinese (Simplified)	zh-CN
+Chinese (Simplified)_China	zh-CN
+Chinese (Simplified)_People's Republic of China	zh-CN
+Chinese (Simplified)_Singapore	zh-SG
+Chinese (Traditional)	zh-HK
+Chinese (Traditional)_Hong Kong S.A.R.	zh-HK
+Chinese (Traditional)_Hong Kong SAR	zh-HK
+Chinese (Traditional)_Macao S.A.R.	zh-MO
+Chinese (Traditional)_Macao SAR	zh-MO
+Chinese (Traditional)_Macau S.A.R.	zh-MO
+Chinese (Traditional)_Taiwan	zh-TW
+Chinese_China	zh-CN
+Church Slavic	cu-RU
+Church Slavic_Russia	cu-RU
+Chuvash (Cyrillic)_Russia	cv-Cyrl-RU
+Colognian	ksh-DE
+Colognian_Germany	ksh-DE
+Congo Swahili_Congo DRC	swc-CD
+Cornish	kw-GB
+Cornish_United Kingdom	kw-GB
+Corsican	co-FR
+Corsican_France	co-FR
+Croatian	hr-HR
+Croatian (Latin)_Bosnia and Herzegovina	hr-BA
+Croatian_Bosnia & Herzegovina	hr-BA
+Croatian_Croatia	hr-HR
+Czech	cs-CZ
+Czech_Czech Republic	cs-CZ
+Czech_Czechia	cs-CZ
+Danish	da-DK
+Danish_Denmark	da-DK
+Danish_Greenland	da-GL
+Dari	prs-AF
+Dari_Afghanistan	prs-AF
+Divehi	dv-MV
+Divehi_Maldives	dv-MV
+Duala	dua-CM
+Duala_Cameroon	dua-CM
+Dutch	nl-NL
+Dutch_Aruba	nl-AW
+Dutch_Belgium	nl-BE
+Dutch_Bonaire, Sint Eustatius and Saba	nl-BQ
+Dutch_Curaçao	nl-CW
+Dutch_Netherlands	nl-NL
+Dutch_Sint Maarten	nl-SX
+Dutch_Suriname	nl-SR
+Dzongkha	dz-BT
+Dzongkha_Bhutan	dz-BT
+Edo	bin-NG
+Edo_Nigeria	bin-NG
+Embu	ebu-KE
+Embu_Kenya	ebu-KE
+English	en-US
+English_American Samoa	en-AS
+English_Anguilla	en-AI
+English_Antigua & Barbuda	en-AG
+English_Antigua and Barbuda	en-AG
+English_Australia	en-AU
+English_Austria	en-AT
+English_Bahamas	en-BS
+English_Barbados	en-BB
+English_Belgium	en-BE
+English_Belize	en-BZ
+English_Bermuda	en-BM
+English_Botswana	en-BW
+English_British Indian Ocean Territory	en-IO
+English_British Virgin Islands	en-VG
+English_Burundi	en-BI
+English_Cameroon	en-CM
+English_Canada	en-CA
+English_Caribbean	en-029
+English_Cayman Islands	en-KY
+English_Christmas Island	en-CX
+English_Cocos (Keeling) Islands	en-CC
+English_Cocos [Keeling] Islands	en-CC
+English_Cook Islands	en-CK
+English_Cyprus	en-CY
+English_Denmark	en-DK
+English_Dominica	en-DM
+English_Eritrea	en-ER
+English_Eswatini	en-SZ
+English_Europe	en-150
+English_Falkland Islands	en-FK
+English_Fiji	en-FJ
+English_Finland	en-FI
+English_Gambia	en-GM
+English_Germany	en-DE
+English_Ghana	en-GH
+English_Gibraltar	en-GI
+English_Grenada	en-GD
+English_Guam	en-GU
+English_Guernsey	en-GG
+English_Guyana	en-GY
+English_Hong Kong	en-HK
+English_Hong Kong S.A.R.	en-HK
+English_Hong Kong SAR	en-HK
+English_India	en-IN
+English_Indonesia	en-ID
+English_Ireland	en-IE
+English_Isle of Man	en-IM
+English_Israel	en-IL
+English_Jamaica	en-JM
+English_Jersey	en-JE
+English_Kenya	en-KE
+English_Kiribati	en-KI
+English_Lesotho	en-LS
+English_Liberia	en-LR
+English_Macao S.A.R.	en-MO
+English_Macao SAR	en-MO
+English_Macau S.A.R.	en-MO
+English_Madagascar	en-MG
+English_Malawi	en-MW
+English_Malaysia	en-MY
+English_Maldives	en-MV
+English_Malta	en-MT
+English_Marshall Islands	en-MH
+English_Mauritius	en-MU
+English_Micronesia	en-FM
+English_Montserrat	en-MS
+English_Namibia	en-NA
+English_Nauru	en-NR
+English_Netherlands	en-NL
+English_New Zealand	en-NZ
+English_Nigeria	en-NG
+English_Niue	en-NU
+English_Norfolk Island	en-NF
+English_Northern Mariana Islands	en-MP
+English_Pakistan	en-PK
+English_Palau	en-PW
+English_Papua New Guinea	en-PG
+English_Philippines	en-PH
+English_Pitcairn Islands	en-PN
+English_Puerto Rico	en-PR
+English_Republic of the Philippines	en-PH
+English_Rwanda	en-RW
+English_Saint Kitts and Nevis	en-KN
+English_Saint Lucia	en-LC
+English_Saint Vincent and the Grenadines	en-VC
+English_Samoa	en-WS
+English_Seychelles	en-SC
+English_Sierra Leone	en-SL
+English_Singapore	en-SG
+English_Sint Maarten	en-SX
+English_Slovenia	en-SI
+English_Solomon Islands	en-SB
+English_South Africa	en-ZA
+English_South Sudan	en-SS
+English_St Helena, Ascension, Tristan da Cunha	en-SH
+English_St. Kitts & Nevis	en-KN
+English_St. Lucia	en-LC
+English_St. Vincent & Grenadines	en-VC
+English_Sudan	en-SD
+English_Swaziland	en-SZ
+English_Sweden	en-SE
+English_Switzerland	en-CH
+English_Tanzania	en-TZ
+English_Tokelau	en-TK
+English_Tonga	en-TO
+English_Trinidad & Tobago	en-TT
+English_Trinidad and Tobago	en-TT
+English_Turks & Caicos Islands	en-TC
+English_Turks and Caicos Islands	en-TC
+English_Tuvalu	en-TV
+English_U.A.E.	en-AE
+English_U.S. Outlying Islands	en-UM
+English_U.S. Virgin Islands	en-VI
+English_US Minor Outlying Islands	en-UM
+English_US Virgin Islands	en-VI
+English_Uganda	en-UG
+English_United Arab Emirates	en-AE
+English_United Kingdom	en-GB
+English_United States	en-US
+English_Vanuatu	en-VU
+English_World	en-001
+English_Zambia	en-ZM
+English_Zimbabwe	en-ZW
+Esperanto	eo-001
+Esperanto_World	eo-001
+Estonian	et-EE
+Estonian_Estonia	et-EE
+Ewe	ee-GH
+Ewe_Ghana	ee-GH
+Ewe_Togo	ee-TG
+Ewondo	ewo-CM
+Ewondo_Cameroon	ewo-CM
+Faroese	fo-FO
+Faroese_Denmark	fo-DK
+Faroese_Faroe Islands	fo-FO
+Filipino	fil-PH
+Filipino_Philippines	fil-PH
+Finnish	fi-FI
+Finnish_Finland	fi-FI
+French	fr-FR
+French_Algeria	fr-DZ
+French_Belgium	fr-BE
+French_Benin	fr-BJ
+French_Burkina Faso	fr-BF
+French_Burundi	fr-BI
+French_Cameroon	fr-CM
+French_Canada	fr-CA
+French_Caribbean	fr-029
+French_Central African Republic	fr-CF
+French_Chad	fr-TD
+French_Comoros	fr-KM
+French_Congo	fr-CG
+French_Congo (DRC)	fr-CD
+French_Congo, DRC	fr-CD
+French_Côte d'Ivoire	fr-CI
+French_Côte d’Ivoire	fr-CI
+French_Djibouti	fr-DJ
+French_Equatorial Guinea	fr-GQ
+French_France	fr-FR
+French_French Guiana	fr-GF
+French_French Polynesia	fr-PF
+French_Gabon	fr-GA
+French_Guadeloupe	fr-GP
+French_Guinea	fr-GN
+French_Haiti	fr-HT
+French_Luxembourg	fr-LU
+French_Madagascar	fr-MG
+French_Mali	fr-ML
+French_Martinique	fr-MQ
+French_Mauritania	fr-MR
+French_Mauritius	fr-MU
+French_Mayotte	fr-YT
+French_Monaco	fr-MC
+French_Morocco	fr-MA
+French_New Caledonia	fr-NC
+French_Niger	fr-NE
+French_Principality of Monaco	fr-MC
+French_Reunion	fr-RE
+French_Rwanda	fr-RW
+French_Réunion	fr-RE
+French_Saint Barthélemy	fr-BL
+French_Saint Martin	fr-MF
+French_Saint Pierre and Miquelon	fr-PM
+French_Senegal	fr-SN
+French_Seychelles	fr-SC
+French_St. Barthélemy	fr-BL
+French_St. Martin	fr-MF
+French_St. Pierre & Miquelon	fr-PM
+French_Switzerland	fr-CH
+French_Syria	fr-SY
+French_Togo	fr-TG
+French_Tunisia	fr-TN
+French_Vanuatu	fr-VU
+French_Wallis & Futuna	fr-WF
+French_Wallis and Futuna	fr-WF
+Frisian_Netherlands	fy-NL
+Friulian	fur-IT
+Friulian_Italy	fur-IT
+Fulah (Latin)	ff-Latn-SN
+Fulah (Latin)_Burkina Faso	ff-Latn-BF
+Fulah (Latin)_Cameroon	ff-Latn-CM
+Fulah (Latin)_Gambia	ff-Latn-GM
+Fulah (Latin)_Ghana	ff-Latn-GH
+Fulah (Latin)_Guinea	ff-Latn-GN
+Fulah (Latin)_Guinea-Bissau	ff-Latn-GW
+Fulah (Latin)_Liberia	ff-Latn-LR
+Fulah (Latin)_Mauritania	ff-Latn-MR
+Fulah (Latin)_Niger	ff-Latn-NE
+Fulah (Latin)_Nigeria	ff-Latn-NG
+Fulah (Latin)_Senegal	ff-Latn-SN
+Fulah (Latin)_Sierra Leone	ff-Latn-SL
+Fulah_Cameroon	ff-CM
+Fulah_Guinea	ff-GN
+Fulah_Mauritania	ff-MR
+Fulah_Nigeria	ff-NG
+Fulah_Senegal	ff-Latn-SN
+Galician	gl-ES
+Galician_Spain	gl-ES
+Ganda	lg-UG
+Ganda_Uganda	lg-UG
+Georgian	ka-GE
+Georgian_Georgia	ka-GE
+German	de-DE
+German_Austria	de-AT
+German_Belgium	de-BE
+German_Germany	de-DE
+German_Italy	de-IT
+German_Liechtenstein	de-LI
+German_Luxembourg	de-LU
+German_Switzerland	de-CH
+Greek	el-GR
+Greek_Cyprus	el-CY
+Greek_Greece	el-GR
+Greenlandic_Greenland	kl-GL
+Guarani	gn-PY
+Guarani_Paraguay	gn-PY
+Gujarati	gu-IN
+Gujarati_India	gu-IN
+Gusii	guz-KE
+Gusii_Kenya	guz-KE
+Haryanvi (Devanagari)_India	bgc-Deva-IN
+Hausa	ha-Latn-NG
+Hausa (Latin)	ha-Latn-NG
+Hausa (Latin)_Ghana	ha-Latn-GH
+Hausa (Latin)_Niger	ha-Latn-NE
+Hausa (Latin)_Nigeria	ha-Latn-NG
+Hausa_Nigeria	ha-Latn-NG
+Hawaiian	haw-US
+Hawaiian_United States	haw-US
+Hebrew	he-IL
+Hebrew_Israel	he-IL
+Hindi	hi-IN
+Hindi (Latin)_India	hi-Latn-IN
+Hindi_India	hi-IN
+Hungarian	hu-HU
+Hungarian_Hungary	hu-HU
+Ibibio	ibb-NG
+Ibibio_Nigeria	ibb-NG
+Icelandic	is-IS
+Icelandic_Iceland	is-IS
+Igbo	ig-NG
+Igbo_Nigeria	ig-NG
+Indonesian	id-ID
+Indonesian_Indonesia	id-ID
+Interlingua	ia-001
+Interlingua_France	ia-FR
+Interlingua_World	ia-001
+Inuktitut	iu-Latn-CA
+Inuktitut (Latin)	iu-Latn-CA
+Inuktitut (Latin)_Canada	iu-Latn-CA
+Inuktitut (Syllabics)	iu-Cans-CA
+Inuktitut (Syllabics)_Canada	iu-Cans-CA
+Inuktitut_Canada	iu-Latn-CA
+Irish	ga-IE
+Irish_Ireland	ga-IE
+Italian	it-IT
+Italian_Italy	it-IT
+Italian_San Marino	it-SM
+Italian_Switzerland	it-CH
+Italian_Vatican City	it-VA
+Japanese	ja-JP
+Japanese_Japan	ja-JP
+Javanese	jv-Latn-ID
+Javanese (Javanese)	jv-Java-ID
+Javanese (Javanese)_Indonesia	jv-Java-ID
+Javanese_Indonesia	jv-Latn-ID
+Javanese_Latin	jv-Latn
+Javanese_Latin, Indonesia	jv-Latn-ID
+Jola-Fonyi	dyo-SN
+Jola-Fonyi_Senegal	dyo-SN
+K'iche'	quc-Latn-GT
+K'iche'_Guatemala	quc-Latn-GT
+K'iche_Guatemala	quc-Latn-GT
+Kabuverdianu	kea-CV
+Kabuverdianu_Cabo Verde	kea-CV
+Kabyle	kab-DZ
+Kabyle_Algeria	kab-DZ
+Kaingang (Latin)_Brazil	kgp-Latn-BR
+Kako	kkj-CM
+Kako_Cameroon	kkj-CM
+Kalaallisut	kl-GL
+Kalaallisut_Greenland	kl-GL
+Kalenjin	kln-KE
+Kalenjin_Kenya	kln-KE
+Kamba	kam-KE
+Kamba_Kenya	kam-KE
+Kannada	kn-IN
+Kannada_India	kn-IN
+Kanuri	kr-Latn-NG
+Kanuri (Latin)_Nigeria	kr-Latn-NG
+Kanuri_Nigeria	kr-Latn-NG
+Kashmiri	ks-Arab-IN
+Kashmiri (Devanagari)	ks-Deva-IN
+Kashmiri (Devanagari)_India	ks-Deva-IN
+Kashmiri (Perso-Arabic)	ks-Arab-IN
+Kashmiri (Perso-Arabic)_India	ks-Arab-IN
+Kashmiri_India	ks-Arab-IN
+Kazakh	kk-KZ
+Kazakh_Kazakhstan	kk-KZ
+Khmer	km-KH
+Khmer_Cambodia	km-KH
+Kikuyu	ki-KE
+Kikuyu_Kenya	ki-KE
+Kinyarwanda	rw-RW
+Kinyarwanda_Rwanda	rw-RW
+Kiswahili	sw-KE
+Kiswahili_Congo (DRC)	sw-CD
+Kiswahili_Kenya	sw-KE
+Kiswahili_Tanzania	sw-TZ
+Kiswahili_Uganda	sw-UG
+Konkani	kok-IN
+Konkani_India	kok-IN
+Korean	ko-KR
+Korean_Korea	ko-KR
+Korean_North Korea	ko-KP
+Koyra Chiini	khq-ML
+Koyra Chiini_Mali	khq-ML
+Koyraboro Senni	ses-ML
+Koyraboro Senni_Mali	ses-ML
+Kurdish (Perso-Arabic)_Iran	ku-Arab-IR
+Kurdish_Perso-Arabic, Iran	ku-Arab-IR
+Kwasio	nmg-CM
+Kwasio_Cameroon	nmg-CM
+Kyrgyz	ky-KG
+Kyrgyz_Kyrgyzstan	ky-KG
+Lakota	lkt-US
+Lakota_United States	lkt-US
+Langi	lag-TZ
+Langi_Tanzania	lag-TZ
+Lao	lo-LA
+Lao_Lao P.D.R.	lo-LA
+Lao_Laos	lo-LA
+Latin	la-001
+Latin_Vatican City	la-VA
+Latin_World	la-001
+Latvian	lv-LV
+Latvian_Latvia	lv-LV
+Lingala	ln-CD
+Lingala_Angola	ln-AO
+Lingala_Central African Republic	ln-CF
+Lingala_Congo	ln-CG
+Lingala_Congo (DRC)	ln-CD
+Lingala_Congo DRC	ln-CD
+Lithuanian	lt-LT
+Lithuanian_Lithuania	lt-LT
+Low German	nds-DE
+Low German_Germany	nds-DE
+Low German_Netherlands	nds-NL
+Lower Sorbian	dsb-DE
+Lower Sorbian_Germany	dsb-DE
+Luba-Katanga	lu-CD
+Luba-Katanga_Congo (DRC)	lu-CD
+Luba-Katanga_Congo DRC	lu-CD
+Luo	luo-KE
+Luo_Kenya	luo-KE
+Luxembourgish	lb-LU
+Luxembourgish_Luxembourg	lb-LU
+Luyia	luy-KE
+Luyia_Kenya	luy-KE
+Macedonian	mk-MK
+Macedonian_North Macedonia	mk-MK
+Machame	jmc-TZ
+Machame_Tanzania	jmc-TZ
+Makhuwa-Meetto	mgh-MZ
+Makhuwa-Meetto_Mozambique	mgh-MZ
+Makonde	kde-TZ
+Makonde_Tanzania	kde-TZ
+Malagasy	mg-MG
+Malagasy_Madagascar	mg-MG
+Malay	ms-MY
+Malay_Brunei	ms-BN
+Malay_Brunei Darussalam	ms-BN
+Malay_Malaysia	ms-MY
+Malay_Singapore	ms-SG
+Malayalam	ml-IN
+Malayalam_India	ml-IN
+Maltese	mt-MT
+Maltese_Malta	mt-MT
+Manipuri	mni-IN
+Manipuri_India	mni-IN
+Manx	gv-IM
+Manx_Isle of Man	gv-IM
+Maori	mi-NZ
+Maori_New Zealand	mi-NZ
+Mapuche	arn-CL
+Mapuche_Chile	arn-CL
+Mapudungun_Chile	arn-CL
+Marathi	mr-IN
+Marathi_India	mr-IN
+Masai	mas-KE
+Masai_Kenya	mas-KE
+Masai_Tanzania	mas-TZ
+Mazanderani	mzn-IR
+Mazanderani_Iran	mzn-IR
+Meru	mer-KE
+Meru_Kenya	mer-KE
+Meta'_Cameroon	mgo-CM
+Metaʼ	mgo-CM
+Metaʼ_Cameroon	mgo-CM
+Mohawk	moh-CA
+Mohawk_Canada	moh-CA
+Mongolian	mn-MN
+Mongolian (Cyrillic)_Mongolia	mn-MN
+Mongolian (Traditional Mongolian)	mn-Mong-CN
+Mongolian (Traditional Mongolian)_China	mn-Mong-CN
+Mongolian (Traditional Mongolian)_Mongolia	mn-Mong-MN
+Mongolian (Traditional Mongolian)_People's Republic of China	mn-Mong-CN
+Mongolian_Mongolia	mn-MN
+Morisyen	mfe-MU
+Morisyen_Mauritius	mfe-MU
+Mundang	mua-CM
+Mundang_Cameroon	mua-CM
+N'ko	nqo-GN
+N'ko_Guinea	nqo-GN
+Nama	naq-NA
+Nama_Namibia	naq-NA
+Nepali	ne-NP
+Nepali_India	ne-IN
+Nepali_Nepal	ne-NP
+Ngiemboon	nnh-CM
+Ngiemboon_Cameroon	nnh-CM
+Ngomba	jgo-CM
+Ngomba_Cameroon	jgo-CM
+Nheengatu (Latin)_Brazil	yrl-Latn-BR
+Nheengatu (Latin)_Colombia	yrl-Latn-CO
+Nheengatu (Latin)_Venezuela	yrl-Latn-VE
+North Ndebele	nd-ZW
+North Ndebele_Zimbabwe	nd-ZW
+Northern Luri	lrc-IR
+Northern Luri_Iran	lrc-IR
+Northern Luri_Iraq	lrc-IQ
+Northern Sami	se-NO
+Northern Sami_Norway	se-NO
+Norwegian	nb-NO
+Norwegian (Bokmal)_Norway	nb-NO
+Norwegian (Bokmål)	nb-NO
+Norwegian (Bokmål)_Norway	nb-NO
+Norwegian (Bokmål)_Svalbard & Jan Mayen	nb-SJ
+Norwegian (Nynorsk)_Norway	nn-NO
+Norwegian Bokmål	nb-NO
+Norwegian Bokmål_Norway	nb-NO
+Norwegian Bokmål_Svalbard & Jan Mayen	nb-SJ
+Norwegian Bokmål_Svalbard and Jan Mayen	nb-SJ
+Norwegian Nynorsk	nn-NO
+Norwegian Nynorsk_Norway	nn-NO
+Norwegian_Norway	nb-NO
+Norwegian_Svalbard & Jan Mayen	nb-SJ
+Nuer	nus-SS
+Nuer_South Sudan	nus-SS
+Nuer_Sudan	nus-SD
+Nyankole	nyn-UG
+Nyankole_Uganda	nyn-UG
+Occitan	oc-FR
+Occitan_France	oc-FR
+Occitan_Spain	oc-ES
+Odia	or-IN
+Odia_India	or-IN
+Oromo	om-ET
+Oromo_Ethiopia	om-ET
+Oromo_Kenya	om-KE
+Ossetian_Cyrillic, Georgia	os-GE
+Ossetian_Cyrillic, Russia	os-RU
+Ossetic	os-GE
+Ossetic_Georgia	os-GE
+Ossetic_Russia	os-RU
+Papiamento	pap-029
+Papiamento_Caribbean	pap-029
+Pashto	ps-AF
+Pashto_Afghanistan	ps-AF
+Pashto_Pakistan	ps-PK
+Persian	fa-IR
+Persian_Afghanistan	fa-AF
+Persian_Iran	fa-IR
+Polish	pl-PL
+Polish_Poland	pl-PL
+Portuguese	pt-BR
+Portuguese_Angola	pt-AO
+Portuguese_Brazil	pt-BR
+Portuguese_Cabo Verde	pt-CV
+Portuguese_Equatorial Guinea	pt-GQ
+Portuguese_Guinea-Bissau	pt-GW
+Portuguese_Luxembourg	pt-LU
+Portuguese_Macao S.A.R.	pt-MO
+Portuguese_Macao SAR	pt-MO
+Portuguese_Macau S.A.R.	pt-MO
+Portuguese_Mozambique	pt-MZ
+Portuguese_Portugal	pt-PT
+Portuguese_Switzerland	pt-CH
+Portuguese_São Tomé & Príncipe	pt-ST
+Portuguese_São Tomé and Príncipe	pt-ST
+Portuguese_Timor-Leste	pt-TL
+Prussian	prg-001
+Prussian_World	prg-001
+Pseudo Language_Pseudo locale for east Asian/complex script localization testing	qps-ploca
+Pseudo Language_Pseudo locale used for localization testing	qps-ploc
+Pseudo Language_Pseudo locale used for localization testing of mirrored locales	qps-plocm
+Punjabi	pa-IN
+Punjabi_India	pa-IN
+Punjabi_Islamic Republic of Pakistan	pa-Arab-PK
+Punjabi_Pakistan	pa-Arab-PK
+Quechua	quz-BO
+Quechua_Bolivia	quz-BO
+Quechua_Ecuador	quz-EC
+Quechua_Peru	quz-PE
+Rajasthani (Devanagari)_India	raj-Deva-IN
+Ripuarian_Germany	ksh-DE
+Romanian	ro-RO
+Romanian_Moldova	ro-MD
+Romanian_Romania	ro-RO
+Romansh	rm-CH
+Romansh_Switzerland	rm-CH
+Rombo	rof-TZ
+Rombo_Tanzania	rof-TZ
+Rundi	rn-BI
+Rundi_Burundi	rn-BI
+Russian	ru-RU
+Russian_Belarus	ru-BY
+Russian_Kazakhstan	ru-KZ
+Russian_Kyrgyzstan	ru-KG
+Russian_Moldova	ru-MD
+Russian_Russia	ru-RU
+Russian_Ukraine	ru-UA
+Rwa	rwk-TZ
+Rwa_Tanzania	rwk-TZ
+Saho	ssy-ER
+Saho_Eritrea	ssy-ER
+Sakha	sah-RU
+Sakha_Russia	sah-RU
+Samburu	saq-KE
+Samburu_Kenya	saq-KE
+Sami (Inari)	smn-FI
+Sami (Inari)_Finland	smn-FI
+Sami (Lule)	smj-SE
+Sami (Lule)_Norway	smj-NO
+Sami (Lule)_Sweden	smj-SE
+Sami (Northern)_Finland	se-FI
+Sami (Northern)_Norway	se-NO
+Sami (Northern)_Sweden	se-SE
+Sami (Skolt)	sms-FI
+Sami (Skolt)_Finland	sms-FI
+Sami (Southern)	sma-SE
+Sami (Southern)_Norway	sma-NO
+Sami (Southern)_Sweden	sma-SE
+Sango	sg-CF
+Sango_Central African Republic	sg-CF
+Sangu	sbp-TZ
+Sangu_Tanzania	sbp-TZ
+Sanskrit	sa-IN
+Sanskrit_India	sa-IN
+Sardinian (Latin)_Italy	sc-Latn-IT
+Scottish Gaelic	gd-GB
+Scottish Gaelic_United Kingdom	gd-GB
+Sena	seh-MZ
+Sena_Mozambique	seh-MZ
+Serbian	sr-Latn-RS
+Serbian (Cyrillic)	sr-Cyrl-RS
+Serbian (Cyrillic)_Bosnia and Herzegovina	sr-Cyrl-BA
+Serbian (Cyrillic)_Kosovo	sr-Cyrl-XK
+Serbian (Cyrillic)_Montenegro	sr-Cyrl-ME
+Serbian (Cyrillic)_Serbia	sr-Cyrl-RS
+Serbian (Cyrillic)_Serbia and Montenegro (Former)	sr-Cyrl-CS
+Serbian (Latin)	sr-Latn-RS
+Serbian (Latin)_Bosnia & Herzegovina	sr-Latn-BA
+Serbian (Latin)_Bosnia and Herzegovina	sr-Latn-BA
+Serbian (Latin)_Kosovo	sr-Latn-XK
+Serbian (Latin)_Montenegro	sr-Latn-ME
+Serbian (Latin)_Serbia	sr-Latn-RS
+Serbian (Latin)_Serbia and Montenegro (Former)	sr-Latn-CS
+Serbian_Serbia	sr-Latn-RS
+Sesotho	st-ZA
+Sesotho sa Leboa	nso-ZA
+Sesotho sa Leboa_South Africa	nso-ZA
+Sesotho_Lesotho	st-LS
+Sesotho_South Africa	st-ZA
+Setswana	tn-ZA
+Setswana_Botswana	tn-BW
+Setswana_South Africa	tn-ZA
+Shambala	ksb-TZ
+Shambala_Tanzania	ksb-TZ
+Shona	sn-Latn-ZW
+Shona (Latin)	sn-Latn-ZW
+Shona (Latin)_Zimbabwe	sn-Latn-ZW
+Shona_Latin	sn-Latn
+Shona_Zimbabwe	sn-Latn-ZW
+Sindhi	sd-Arab-PK
+Sindhi (Devanagari)	sd-Deva-IN
+Sindhi (Devanagari)_India	sd-Deva-IN
+Sindhi_Islamic Republic of Pakistan	sd-Arab-PK
+Sindhi_Pakistan	sd-Arab-PK
+Sinhala	si-LK
+Sinhala_Sri Lanka	si-LK
+Slovak	sk-SK
+Slovak_Slovakia	sk-SK
+Slovenian	sl-SI
+Slovenian_Slovenia	sl-SI
+Soga	xog-UG
+Soga_Uganda	xog-UG
+Somali	so-SO
+Somali_Djibouti	so-DJ
+Somali_Ethiopia	so-ET
+Somali_Kenya	so-KE
+Somali_Somalia	so-SO
+Sotho_South Africa	st-ZA
+South Ndebele	nr-ZA
+South Ndebele_South Africa	nr-ZA
+Southern Sotho_Lesotho	st-LS
+Spanish	es-ES
+Spanish_Argentina	es-AR
+Spanish_Belize	es-BZ
+Spanish_Bolivarian Republic of Venezuela	es-VE
+Spanish_Bolivia	es-BO
+Spanish_Brazil	es-BR
+Spanish_Chile	es-CL
+Spanish_Colombia	es-CO
+Spanish_Costa Rica	es-CR
+Spanish_Cuba	es-CU
+Spanish_Dominican Republic	es-DO
+Spanish_Ecuador	es-EC
+Spanish_El Salvador	es-SV
+Spanish_Equatorial Guinea	es-GQ
+Spanish_Guatemala	es-GT
+Spanish_Honduras	es-HN
+Spanish_Latin America	es-419
+Spanish_Mexico	es-MX
+Spanish_Nicaragua	es-NI
+Spanish_Panama	es-PA
+Spanish_Paraguay	es-PY
+Spanish_Peru	es-PE
+Spanish_Philippines	es-PH
+Spanish_Puerto Rico	es-PR
+Spanish_Spain	es-ES
+Spanish_United States	es-US
+Spanish_Uruguay	es-UY
+Spanish_Venezuela	es-VE
+Standard Moroccan Tamazight	zgh-Tfng-MA
+Standard Moroccan Tamazight (Tifinagh)	zgh-Tfng-MA
+Standard Moroccan Tamazight (Tifinagh)_Morocco	zgh-Tfng-MA
+Standard Moroccan Tamazight_Morocco	zgh-Tfng-MA
+Standard Moroccan Tamazight_Tifinagh	zgh-Tfng
+Swati_South Africa	ss-ZA
+Swati_Swaziland	ss-SZ
+Swedish	sv-SE
+Swedish_Finland	sv-FI
+Swedish_Sweden	sv-SE
+Swedish_Åland Islands	sv-AX
+Swiss German	gsw-CH
+Swiss German_Liechtenstein	gsw-LI
+Swiss German_Switzerland	gsw-CH
+Syriac	syr-SY
+Syriac_Syria	syr-SY
+Tachelhit	shi-Tfng-MA
+Tachelhit (Latin)	shi-Latn-MA
+Tachelhit (Latin)_Morocco	shi-Latn-MA
+Tachelhit (Tifinagh)	shi-Tfng-MA
+Tachelhit (Tifinagh)_Morocco	shi-Tfng-MA
+Tachelhit_Morocco	shi-Tfng-MA
+Tachelhit_Tifinagh	shi-Tfng
+Tachelhit_Tifinagh, Morocco	shi-Tfng-MA
+Taita	dav-KE
+Taita_Kenya	dav-KE
+Tajik	tg-Cyrl-TJ
+Tajik (Cyrillic)	tg-Cyrl-TJ
+Tajik (Cyrillic)_Tajikistan	tg-Cyrl-TJ
+Tajik_Tajikistan	tg-Cyrl-TJ
+Tamazight (Latin)_Algeria	tzm-Latn-DZ
+Tamil	ta-IN
+Tamil_India	ta-IN
+Tamil_Malaysia	ta-MY
+Tamil_Singapore	ta-SG
+Tamil_Sri Lanka	ta-LK
+Tasawaq	twq-NE
+Tasawaq_Niger	twq-NE
+Tatar	tt-RU
+Tatar_Russia	tt-RU
+Telugu	te-IN
+Telugu_India	te-IN
+Teso	teo-UG
+Teso_Kenya	teo-KE
+Teso_Uganda	teo-UG
+Thai	th-TH
+Thai_Thailand	th-TH
+Tibetan	bo-CN
+Tibetan_China	bo-CN
+Tibetan_India	bo-IN
+Tibetan_People's Republic of China	bo-CN
+Tigre	tig-ER
+Tigre_Eritrea	tig-ER
+Tigrinya	ti-ER
+Tigrinya_Eritrea	ti-ER
+Tigrinya_Ethiopia	ti-ET
+Tongan	to-TO
+Tongan_Tonga	to-TO
+Tsonga_South Africa	ts-ZA
+Turkish	tr-TR
+Turkish_Cyprus	tr-CY
+Turkish_Turkey	tr-TR
+Turkish_Türkiye	tr-TR
+Turkmen	tk-TM
+Turkmen_Turkmenistan	tk-TM
+Ukrainian	uk-UA
+Ukrainian_Ukraine	uk-UA
+Upper Sorbian	hsb-DE
+Upper Sorbian_Germany	hsb-DE
+Urdu	ur-PK
+Urdu_India	ur-IN
+Urdu_Islamic Republic of Pakistan	ur-PK
+Urdu_Pakistan	ur-PK
+Uyghur	ug-CN
+Uyghur_China	ug-CN
+Uyghur_People's Republic of China	ug-CN
+Uzbek	uz-Latn-UZ
+Uzbek (Cyrillic)	uz-Cyrl-UZ
+Uzbek (Cyrillic)_Uzbekistan	uz-Cyrl-UZ
+Uzbek (Latin)	uz-Latn-UZ
+Uzbek (Latin)_Uzbekistan	uz-Latn-UZ
+Uzbek (Perso-Arabic)	uz-Arab-AF
+Uzbek (Perso-Arabic)_Afghanistan	uz-Arab-AF
+Uzbek_Perso-Arabic	uz-Arab
+Uzbek_Perso-Arabic, Afghanistan	uz-Arab-AF
+Uzbek_Uzbekistan	uz-Latn-UZ
+Vai	vai-Vaii-LR
+Vai (Latin)	vai-Latn-LR
+Vai (Latin)_Liberia	vai-Latn-LR
+Vai (Vai)	vai-Vaii-LR
+Vai (Vai)_Liberia	vai-Vaii-LR
+Vai_Liberia	vai-Vaii-LR
+Valencian_Spain	ca-ES-valencia
+Venda	ve-ZA
+Venda_South Africa	ve-ZA
+Vietnamese	vi-VN
+Vietnamese_Vietnam	vi-VN
+Volapük	vo-001
+Volapük_World	vo-001
+Vunjo	vun-TZ
+Vunjo_Tanzania	vun-TZ
+Walser	wae-CH
+Walser_Switzerland	wae-CH
+Welsh	cy-GB
+Welsh_United Kingdom	cy-GB
+Western Frisian	fy-NL
+Western Frisian_Netherlands	fy-NL
+Wolaytta	wal-ET
+Wolaytta_Ethiopia	wal-ET
+Wolof	wo-SN
+Wolof_Senegal	wo-SN
+Xhosa_South Africa	xh-ZA
+Xitsonga	ts-ZA
+Xitsonga_South Africa	ts-ZA
+Yangben	yav-CM
+Yangben_Cameroon	yav-CM
+Yi	ii-CN
+Yi_China	ii-CN
+Yi_People's Republic of China	ii-CN
+Yiddish	yi-001
+Yiddish_World	yi-001
+Yoruba	yo-NG
+Yoruba_Benin	yo-BJ
+Yoruba_Nigeria	yo-NG
+Zarma	dje-NE
+Zarma_Niger	dje-NE
+Zulu_South Africa	zu-ZA
+isiXhosa	xh-ZA
+isiXhosa_South Africa	xh-ZA
+isiZulu	zu-ZA
+isiZulu_South Africa	zu-ZA
+siSwati	ss-ZA
+siSwati_Eswatini	ss-SZ
+siSwati_South Africa	ss-ZA

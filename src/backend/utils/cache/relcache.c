@@ -70,6 +70,7 @@
 #include "commands/publicationcmds.h"
 #include "commands/trigger.h"
 #include "common/int.h"
+#include "doltgres/hooks.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -1645,6 +1646,7 @@ RelationInitIndexAccessInfo(Relation relation)
 	relation->rd_exclprocs = NULL;
 	relation->rd_exclstrats = NULL;
 	relation->rd_amcache = NULL;
+	doltgres_index_routine(relation);
 }
 
 /*
@@ -1868,6 +1870,7 @@ static void
 InitTableAmRoutine(Relation relation)
 {
 	relation->rd_tableam = GetTableAmRoutine(relation->rd_amhandler);
+	doltgres_table_am_routine(relation, &relation->rd_tableam);
 }
 
 /*

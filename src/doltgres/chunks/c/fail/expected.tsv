@@ -1,0 +1,26 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# chunks' C compile-fail cases (t/117_cport_compile_fail.pl): a case, a compiler family, and the diagnostic that
+# family refuses the case's c/fail/<case>.c with, the counterparts of chunks/fail/expected.tsv's Rust cases.
+raw_forged	clang	no member named 'flag' in 'struct ChunksPackRaw'
+raw_forged	gcc	'ChunksPackRaw' has no member named 'flag'
+raw_forged	msvc	error C2039: 'flag': is not a member of 'ChunksPackRaw'
+chunk_forged	clang	no member named 'address' in 'struct ChunksChunkChunk'
+chunk_forged	gcc	'ChunksChunkChunk' has no member named 'address'
+chunk_forged	msvc	error C2039: 'address': is not a member of 'ChunksChunkChunk'
+torn_tail_forged	clang	no member named 'end' in 'struct ChunksFileTornTail'
+torn_tail_forged	gcc	'ChunksFileTornTail' has no member named 'end'
+torn_tail_forged	msvc	error C2039: 'end': is not a member of 'ChunksFileTornTail'
+root_slot_registered_twice	clang	releasing root slot 'slot' that was not held

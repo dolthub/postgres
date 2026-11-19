@@ -76,6 +76,7 @@
 #include "commands/sequence.h"
 #include "commands/trigger.h"
 #include "commands/typecmds.h"
+#include "doltgres/hooks.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
@@ -1389,6 +1390,7 @@ doDeletion(const ObjectAddress *object, int flags)
 											object->objectSubId);
 					else
 						heap_drop_with_catalog(object->objectId);
+					doltgres_column_dropped(object->objectId, object->objectSubId);
 				}
 
 				/*
@@ -1480,6 +1482,7 @@ doDeletion(const ObjectAddress *object, int flags)
 		case EventTriggerRelationId:
 		case TransformRelationId:
 		case AuthMemRelationId:
+			doltgres_object_dropped(object->classId, object->objectId);
 			DropObjectById(object);
 			break;
 

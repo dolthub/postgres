@@ -16,13 +16,16 @@
 # regression and isolation suites modeled on Doltgres' regression workflow, and the static checks. Every suite
 # `meson test` runs on Ubuntu, and the regression and isolation suites on macOS too; the static checks (pgindent, and
 # rustfmt, clippy, and the Rust workspace's tests where the tree has it) run on Ubuntu. A tree with only the C builds
-# the targets pgfork/targets.sh names for it, and runs the suites once those include the server. Everything runs on the
-# pull request merged with main (GitHub's merge commit) and on that commit's main parent, test by test, and main's
-# results are cached by its commit, so a push runs only the pull request's side until main moves. The run fails only for
-# a test that passes on main and fails on the pull request, since the fork is unfinished and tests may fail on both, and
-# leaves one comment per suite as an artifact, which pgfork-comment.yml posts. A Windows build only reports and never
-# fails the run, until the fork has a Windows machine. The scripts come from main, or from the pull request while main
-# has none. Every job has a read-only token and no secret.
+# the targets pgfork/targets.sh names for it, and runs the suites once those include the server. Doltgrust's tests,
+# copied into src/doltgres/test/doltgrust, run once a tree installs a server: its bats on Ubuntu and macOS, with
+# pgfork/doltgrust starting the fork's server where they start Doltgrust's, and on Ubuntu its engine-test corpus, server
+# tests, and dump imports, through the fork's form of its harness. Everything runs on the pull request merged with main
+# (GitHub's merge commit) and on that commit's main parent, test by test, and main's results are cached by its commit,
+# so a push runs only the pull request's side until main moves. The run fails only for a test that passes on main and
+# fails on the pull request, since the fork is unfinished and tests may fail on both, and leaves one comment per suite
+# as an artifact, which pgfork-comment.yml posts. A Windows build only reports and never fails the run, until the fork
+# has a Windows machine. The scripts come from main, or from the pull request while main has none. Every job has a
+# read-only token and no secret.
 
 name: Fork CI
 
@@ -74,6 +77,8 @@ jobs:
       MAIN_SHA: ${{ needs.resolve.outputs.main_sha }}
       RESULTS: results/${{ matrix.os }}-${{ matrix.side }}.json
       CHECKS: results/checks-${{ matrix.side }}.json
+      BATS: results/bats-${{ matrix.os }}-${{ matrix.side }}.json
+      DOLTGRUST: results/doltgrust-${{ matrix.os }}-${{ matrix.side }}.json
     steps:
       - name: Check out main's CI scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -96,6 +101,8 @@ jobs:
           path: |
             ${{ env.RESULTS }}
             ${{ env.CHECKS }}
+            ${{ env.BATS }}
+            ${{ env.DOLTGRUST }}
           key: pgfork-ci-${{ matrix.os }}-${{ env.MAIN_SHA }}-${{ hashFiles('ci/.github/workflows/**') }}
       - name: Check out the tree
         if: steps.cached.outputs.cache-hit != 'true'
@@ -121,6 +128,63 @@ jobs:
         if: steps.build.outcome == 'success' && matrix.os == 'ubuntu-24.04'
         timeout-minutes: 90
         run: ci/.github/workflows/pgfork/checks.sh "$PWD/tree" "$PWD/build" "$RUNNER_TEMP/checks.txt"
+      # Doltgrust's bats (src/doltgres/test/doltgrust), with the bats pgfork/bats pins and pgfork/doltgrust starting the
+      # fork's server where they start Doltgrust's, from a template cluster so a server starts within the tests' wait.
+      # Each test runs once, so an intermittent failure shows. A test that runs that server in the foreground expecting
+      # it to refuse and exit gets the fork's server, which keeps running, so each test has a time limit and such a test
+      # fails instead of stopping the run.
+      - name: Run Doltgrust's bats
+        if: >-
+          steps.build.outcome == 'success' && hashFiles('build/install/bin/postgres') != '' &&
+          hashFiles('tree/src/doltgres/test/doltgrust/bats/setup/common.bash') != ''
+        timeout-minutes: 150
+        working-directory: tree/src/doltgres/test/doltgrust/bats
+        env:
+          SQL_ENGINE: local-engine
+          BATS_TEST_TIMEOUT: 120
+          LC_ALL: en_US.UTF-8
+          PGFORK_DOLTGRUST_TEMPLATE: ${{ runner.temp }}/doltgrust-template
+        run: |
+          pgfork="$GITHUB_WORKSPACE/ci/.github/workflows/pgfork"
+          npm ci --prefix "$pgfork/bats" --no-audit --no-fund
+          export PATH="$pgfork/bats/node_modules/.bin:$pgfork:$GITHUB_WORKSPACE/build/install/bin:$PATH"
+          doltgrust --template "$PGFORK_DOLTGRUST_TEMPLATE"
+          bats --tap . > "$RUNNER_TEMP/bats.tap" 2>&1 || true
+          touch "$RUNNER_TEMP/bats-finished"
+      - name: Cache the build of Doltgrust's tests
+        if: >-
+          steps.build.outcome == 'success' && matrix.os == 'ubuntu-24.04' &&
+          hashFiles('tree/src/doltgres/test/doltgrust/Cargo.toml') != ''
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            build/doltgrust-target
+          key: doltgrust-tests-${{ hashFiles('tree/src/doltgres/test/doltgrust/**/*.rs', 'tree/src/doltgres/test/doltgrust/**/Cargo.*') }}
+          restore-keys: doltgrust-tests-
+      # Doltgrust's tests (src/doltgres/test/doltgrust/crates): its engine-test corpus, server tests, and dump imports,
+      # built against the fork's form of its harness and run against the fork's server as Doltgrust runs them against a
+      # real Postgres. The dump imports run again with the ones Doltgrust marks ignored, since its server fails most of
+      # them and Postgres' shouldn't; a test's later result is the one recorded.
+      - name: Run Doltgrust's tests
+        if: >-
+          steps.build.outcome == 'success' && matrix.os == 'ubuntu-24.04' &&
+          hashFiles('build/install/bin/postgres') != '' && hashFiles('tree/src/doltgres/test/doltgrust/Cargo.toml') != ''
+        timeout-minutes: 180
+        working-directory: tree/src/doltgres/test/doltgrust
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/build/doltgrust-target
+          LC_ALL: en_US.UTF-8
+        run: |
+          rustup toolchain install
+          "$GITHUB_WORKSPACE/build/install/bin/initdb" -D "$RUNNER_TEMP/template" -U postgres -A trust --encoding=UTF8 \
+            > /dev/null
+          export DOLTGRUST_TEST_TARGET="postgres:$GITHUB_WORKSPACE/build/install/bin:$RUNNER_TEMP/template"
+          export DOLTGRUST_PSQL="$GITHUB_WORKSPACE/build/install/bin/psql"
+          cargo test --locked --profile quick -p doltgrust-tests --no-fail-fast > "$RUNNER_TEMP/cargo.log" 2>&1 || true
+          cargo test --locked --profile quick -p doltgrust-tests --test dumps --no-fail-fast -- --include-ignored \
+            >> "$RUNNER_TEMP/cargo.log" 2>&1 || true
+          touch "$RUNNER_TEMP/cargo-finished"
       - name: Record the results
         if: always() && steps.build.outcome == 'success'
         run: |
@@ -135,6 +199,20 @@ jobs:
           elif [ -n "$(ci/.github/workflows/pgfork/targets.sh tree)" ]; then
             python3 ci/.github/workflows/pgfork/results.py --not-run "$RESULTS"
           fi
+          if [ -f "$RUNNER_TEMP/bats.tap" ]; then
+            incomplete=()
+            [ -f "$RUNNER_TEMP/bats-finished" ] || incomplete=(--incomplete)
+            python3 ci/.github/workflows/pgfork/results.py --bats "$RUNNER_TEMP/bats.tap" "$BATS" "${incomplete[@]}"
+          elif [ -n "$(ci/.github/workflows/pgfork/targets.sh tree)" ]; then
+            python3 ci/.github/workflows/pgfork/results.py --not-run "$BATS"
+          fi
+          if [ -f "$RUNNER_TEMP/cargo.log" ]; then
+            incomplete=()
+            [ -f "$RUNNER_TEMP/cargo-finished" ] || incomplete=(--incomplete)
+            python3 ci/.github/workflows/pgfork/results.py --cargo "$RUNNER_TEMP/cargo.log" "$DOLTGRUST" "${incomplete[@]}"
+          elif [ "${{ matrix.os }}" = ubuntu-24.04 ] && [ -n "$(ci/.github/workflows/pgfork/targets.sh tree)" ]; then
+            python3 ci/.github/workflows/pgfork/results.py --not-run "$DOLTGRUST"
+          fi
       - name: Save main's results
         if: always() && matrix.side == 'main' && steps.build.outcome == 'success'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -142,17 +220,21 @@ jobs:
           path: |
             ${{ env.RESULTS }}
             ${{ env.CHECKS }}
+            ${{ env.BATS }}
+            ${{ env.DOLTGRUST }}
           key: pgfork-ci-${{ matrix.os }}-${{ env.MAIN_SHA }}-${{ hashFiles('ci/.github/workflows/**') }}
       # Each results upload names only its own side's files, so a pull request's tests can't put a file of main's into
       # the comparison.
       - name: Upload the results
-        if: always() && hashFiles(env.RESULTS, env.CHECKS) != ''
+        if: always() && hashFiles(env.RESULTS, env.CHECKS, env.BATS, env.DOLTGRUST) != ''
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-results-${{ matrix.os }}-${{ matrix.side }}
           path: |
             ${{ env.RESULTS }}
             ${{ env.CHECKS }}
+            ${{ env.BATS }}
+            ${{ env.DOLTGRUST }}
           retention-days: 14
       - name: Upload the logs
         if: always() && steps.build.outcome != 'skipped'
@@ -257,6 +339,21 @@ jobs:
           python3 .github/workflows/pgfork/compare.py --suite checks --title "Static checks" --detail \
             --main-sha "$MAIN_SHA" --pr-sha "$PR_SHA" --out comments/checks.md \
             --platform ubuntu-24.04 results/checks-main.json results/checks-pr.json || status=1
+          corpus=(--main-sha "$MAIN_SHA" --pr-sha "$PR_SHA"
+            --platform ubuntu-24.04 results/doltgrust-ubuntu-24.04-main.json results/doltgrust-ubuntu-24.04-pr.json)
+          python3 .github/workflows/pgfork/compare.py --suite doltgrust-scripts --title "Doltgrust's scripts" \
+            --match scripts: --exclude scripts:doltgrust_engine:: --out comments/doltgrust-scripts.md \
+            "${corpus[@]}" || status=1
+          python3 .github/workflows/pgfork/compare.py --suite doltgrust-engine --title "Doltgrust's engine tests" \
+            --match scripts:doltgrust_engine:: --out comments/doltgrust-engine.md "${corpus[@]}" || status=1
+          python3 .github/workflows/pgfork/compare.py --suite doltgrust-server --title "Doltgrust's server tests" \
+            --by-suite --exclude scripts: --exclude dumps: --out comments/doltgrust-server.md "${corpus[@]}" || status=1
+          python3 .github/workflows/pgfork/compare.py --suite doltgrust-dumps --title "Doltgrust's dump imports" \
+            --match dumps: --out comments/doltgrust-dumps.md "${corpus[@]}" || status=1
+          python3 .github/workflows/pgfork/compare.py --suite doltgrust-bats --title "Doltgrust's bats" \
+            --main-sha "$MAIN_SHA" --pr-sha "$PR_SHA" --out comments/doltgrust-bats.md \
+            --platform ubuntu-24.04 results/bats-ubuntu-24.04-main.json results/bats-ubuntu-24.04-pr.json \
+            --platform macos-15 results/bats-macos-15-main.json results/bats-macos-15-pr.json || status=1
           echo "status=$status" >> "$GITHUB_OUTPUT"
       - name: Upload the comments
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

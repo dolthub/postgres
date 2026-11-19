@@ -12658,4 +12658,8 @@
   proname => 'hashoid8extended', prorettype => 'int8',
   proargtypes => 'oid8 int8', prosrc => 'hashoid8extended' },
 
+{ oid => '9999', descr => 'the Postgres fork\'s version',
+  proname => 'dolt_version', provolatile => 's', prorettype => 'text',
+  proargtypes => '', prosrc => 'doltgres_dolt_version' },
+
 ]

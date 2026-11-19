@@ -31,6 +31,7 @@
 
 #include "postgres.h"
 
+#include "doltgres/hooks.h"
 #include "miscadmin.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/postmaster.h"
@@ -111,7 +112,7 @@ InitPostmasterChildSlots(void)
 	pmchild_pools[B_BACKEND].size = 2 * (MaxConnections + max_wal_senders);
 
 	pmchild_pools[B_AUTOVAC_WORKER].size = autovacuum_worker_slots;
-	pmchild_pools[B_BG_WORKER].size = max_worker_processes;
+	pmchild_pools[B_BG_WORKER].size = max_worker_processes + DoltgresReservedWorkers;
 	pmchild_pools[B_IO_WORKER].size = MAX_IO_WORKERS;
 
 	/*

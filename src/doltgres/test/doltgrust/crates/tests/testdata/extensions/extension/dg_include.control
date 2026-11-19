@@ -1,0 +1,4 @@
+comment = 'Doltgrust test extension whose control file includes others'
+include 'dg_include_version.conf'
+include_if_exists 'dg_include_missing.conf'
+include_dir 'dg_include.d'

@@ -40,6 +40,7 @@
 #include "commands/tablecmds.h"
 #include "commands/trigger.h"
 #include "common/pg_prng.h"
+#include "doltgres/hooks.h"
 #include "executor/spi.h"
 #include "libpq/be-fsstubs.h"
 #include "libpq/pqsignal.h"
@@ -1492,6 +1493,8 @@ RecordTransactionCommit(void)
 							RelcacheInitFileInval,
 							MyXactFlags,
 							InvalidTransactionId, NULL /* plain commit */ );
+
+		doltgres_commit_registered();
 
 		if (replorigin)
 			/* Move LSNs forward for this replication origin */
@@ -6241,6 +6244,8 @@ xact_redo_commit(xl_xact_parsed_commit *parsed,
 	TransactionTreeSetCommitTsData(xid, parsed->nsubxacts, parsed->subxacts,
 								   commit_time, origin_id);
 
+	doltgres_redo_committed(xid, lsn);
+
 	if (standbyState == STANDBY_DISABLED)
 	{
 		/*
@@ -6453,6 +6458,8 @@ xact_redo(XLogReaderState *record)
 
 	/* Backup blocks are not used in xact records */
 	Assert(!XLogRecHasAnyBlockRefs(record));
+
+	doltgres_redo_aborted(record);
 
 	if (info == XLOG_XACT_COMMIT)
 	{

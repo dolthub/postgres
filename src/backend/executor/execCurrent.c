@@ -16,6 +16,7 @@
 #include "access/relscan.h"
 #include "access/sysattr.h"
 #include "catalog/pg_type.h"
+#include "doltgres/hooks.h"
 #include "executor/executor.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -205,6 +206,7 @@ execCurrentOf(CurrentOfExpr *cexpr,
 			IndexScanDesc scan = ((IndexOnlyScanState *) scanstate)->ioss_ScanDesc;
 
 			*current_tid = scan->xs_heaptid;
+			doltgres_index_only_tid(scan, current_tid);
 		}
 		else
 		{
