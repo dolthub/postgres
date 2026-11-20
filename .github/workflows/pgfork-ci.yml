@@ -138,7 +138,8 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  # The Windows build, with MSVC and the vcpkg libraries, whose DLLs it keeps with the build for the tests.
+  # The Windows build, with MSVC and the vcpkg libraries, whose DLLs it keeps with the build for the tests. A tree that
+  # vendors lz4 and zstd builds its own, which take the place of vcpkg's.
   build-windows:
     name: Build ${{ matrix.side }} on windows-2025
     needs: resolve
@@ -187,11 +188,13 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/AppData/Local/vcpkg/archives
-          key: vcpkg-libxml2-openssl-icu-windows-2025
+          key: vcpkg-libxml2-openssl-icu-lz4-zstd-windows-2025
+          restore-keys: vcpkg-
       - name: Install dependencies
         if: steps.cached.outputs.cache-hit != 'true'
         run: |
-          "$VCPKG_INSTALLATION_ROOT/vcpkg" install libxml2:x64-windows openssl:x64-windows icu:x64-windows
+          "$VCPKG_INSTALLATION_ROOT/vcpkg" install libxml2:x64-windows openssl:x64-windows icu:x64-windows lz4:x64-windows \
+            zstd:x64-windows
           choco install -y --no-progress winflexbison3
           pipx install meson==1.11.2
           pipx install ninja
