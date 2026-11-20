@@ -562,12 +562,12 @@ jobs:
           done
           suites=(ubuntu-24.04 results/suites-ubuntu-24.04-main.json results/suites-ubuntu-24.04-pr.json)
           doltgrust=(ubuntu-24.04 results/doltgrust-ubuntu-24.04-main.json results/doltgrust-ubuntu-24.04-pr.json)
-          python3 $compare --title "BATS" --out sections/3-bats.md \
+          python3 $compare --title "BATS" --out sections/4-bats.md \
             --platform ubuntu-24.04 results/bats-ubuntu-24.04-main.json results/bats-ubuntu-24.04-pr.json \
             --platform macos-15 results/bats-macos-15-main.json results/bats-macos-15-pr.json || status=1
           # Postgres' other suites and Doltgrust's engine tests, scripts, and server tests, as one run.
           python3 $compare --title "Tests" --exclude regress/ --exclude isolation/ --exclude dumps: \
-            --out sections/4-tests.md --platform "${suites[@]}" --platform "${doltgrust[@]}" || status=1
+            --out sections/3-tests.md --platform "${suites[@]}" --platform "${doltgrust[@]}" || status=1
           python3 $compare --title "Dump Imports" --match dumps: --out sections/5-dumps.md \
             --platform "${doltgrust[@]}" || status=1
           python3 $compare --title "Static Checks" --out sections/6-checks.md \
