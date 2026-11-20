@@ -45,7 +45,6 @@ pgindent_check() {
     "${files[@]}")
 }
 
-ninja -C "$build" src/tools/pg_bsd_indent/pg_bsd_indent
 files=()
 while IFS= read -r file; do
   files+=("$file")
