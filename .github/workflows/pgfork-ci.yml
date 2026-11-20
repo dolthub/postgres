@@ -538,6 +538,11 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: .github/workflows
+      - name: Test the results script
+        run: |
+          python3 -m pip install --quiet --break-system-packages --require-hashes --only-binary=:all: \
+            -r .github/workflows/pgfork/requirements.txt
+          python3 .github/workflows/pgfork/test_results.py
       # A side whose build failed left no results, which the comparison reads as a run without results.
       - name: Download the results
         continue-on-error: true
