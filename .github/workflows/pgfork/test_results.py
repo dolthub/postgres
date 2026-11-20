@@ -156,6 +156,11 @@ class Tables(unittest.TestCase):
         self.assertTrue(valid(ANY, [" a ", "---", " 1", " 2", "(2 rows)"], [" a ", "---", " 2", " 1", "(2 rows)"]))
         self.assertFalse(valid(ANY, [" 1", " 2"], [" 2", " 1"]))
 
+    def test_a_value_ending_in_a_plus_sign_is_a_row_of_its_own(self):
+        expected = [" to_char ", "---------", " 123456+", " 654321+", "(2 rows)", ""]
+        self.assertTrue(valid(ANY, expected, [expected[0], expected[1], expected[3], expected[2], *expected[4:]]))
+        self.assertFalse(valid(ANY, expected, [expected[0], expected[1], expected[3], " 123457+", *expected[4:]]))
+
     def test_sorted_tables_take_ties_in_any_order(self):
         expected, swapped = render([("1", "a"), ("1", "b"), ("2", "c")]), render([("1", "b"), ("1", "a"), ("2", "c")])
         self.assertTrue(valid(sorted_by([0]), expected, swapped))
@@ -189,6 +194,14 @@ class Exceptions(unittest.TestCase):
         self.assertFalse(excepted("aggregates", query, table("\\xffeeaa"), table("\\xaaeeaa")))
         self.assertTrue(joined("ffaa", ["ff", "aa"], "") and joined("aaff", ["ff", "aa"], ""))
         self.assertFalse(joined("ffaaaa", ["ff", "aa"], ""))
+
+    def test_an_exception_is_its_units_last_statement(self):
+        query = "select string_agg(v, decode('ee', 'hex')) from bytea_test_table;"
+        table = lambda value: [" string_agg ", "------------", f" {value}", "(1 row)", ""]
+        expected, received = table("\\xffeeaa"), table("\\xaaeeff")
+        self.assertTrue(excepted("aggregates", ["insert into bytea_test_table values (1);", query], expected, received))
+        self.assertFalse(excepted("aggregates", [query + " select 1;"], expected, received))
+        self.assertFalse(excepted("aggregates", [query[:-1] + " limit 1;"], expected, received))
 
     def test_crosstab_values_take_their_lines_in_any_order(self):
         query = results.EXCEPTIONS[4][1].split("\n")
