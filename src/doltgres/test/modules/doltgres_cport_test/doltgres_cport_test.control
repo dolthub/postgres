@@ -1,0 +1,4 @@
+# doltgres_cport_test extension
+comment = 'Unit tests of the C port of the crates, run in a backend'
+default_version = '1.0'
+relocatable = true

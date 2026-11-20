@@ -1,0 +1,22 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# The external macros whose expansions may hold unsafe code in a crate that forbids it (design item 17), by the path
+# of the crate that defines them, each with the reason it is accepted and its stand-in's rules, which expand to safe code
+# of the same kind, and any items the stand-in adds to that crate for its rules to call: the expanded-source scan
+# expands each crate with the stand-ins in place, and the typed lint attributes by the expansion's macro. Only the
+# coordinator's refs change this file, each line with PRevPF's YES.
+# path	reason	stand-in rules	stand-in items
+pg::export_entries	expands only pg's generated entry list, whose exported names need #[unsafe(no_mangle)] (design item 11)	() => {};
+pg::export_frontend_entries	expands only pg's generated frontend entry list, whose exported names need #[unsafe(no_mangle)] and whose Rust side runs the entry under run_frontend (design item D12)	() => {};
+generativity::make_guard	branded lifetimes tying a token to its instance, with no safe replacement: the one maker of the guard a tree's writer is branded by (design item 17, B8)	($name:ident) => { let $name = $crate::stand_in_guard(); };	#[doc(hidden)] pub fn stand_in_guard<'id>() -> Guard<'id> { unsafe { Guard::new(Id::new()) } }

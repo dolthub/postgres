@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+#include "doltgres/hooks.h"
 #include "miscadmin.h"
 #ifdef PROFILE_PID_DIR
 #include "postmaster/autovacuum.h"
@@ -79,7 +80,7 @@ struct ONEXIT
 
 static struct ONEXIT on_proc_exit_list[MAX_ON_EXITS];
 static struct ONEXIT on_shmem_exit_list[MAX_ON_EXITS];
-static struct ONEXIT before_shmem_exit_list[MAX_ON_EXITS];
+static struct ONEXIT before_shmem_exit_list[MAX_ON_EXITS + DOLTGRES_EXIT_CALLBACKS];
 
 static int	on_proc_exit_index,
 			on_shmem_exit_index,
@@ -343,7 +344,7 @@ on_proc_exit(pg_on_exit_callback function, Datum arg)
 void
 before_shmem_exit(pg_on_exit_callback function, Datum arg)
 {
-	if (before_shmem_exit_index >= MAX_ON_EXITS)
+	if (before_shmem_exit_index >= MAX_ON_EXITS + DOLTGRES_EXIT_CALLBACKS)
 		ereport(FATAL,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg_internal("out of before_shmem_exit slots")));

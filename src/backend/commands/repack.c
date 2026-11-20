@@ -58,6 +58,7 @@
 #include "commands/repack_internal.h"
 #include "commands/tablecmds.h"
 #include "commands/vacuum.h"
+#include "doltgres/hooks.h"
 #include "executor/executor.h"
 #include "libpq/pqformat.h"
 #include "libpq/pqmq.h"
@@ -1344,6 +1345,8 @@ make_new_heap(Oid OIDOldHeap, Oid NewTableSpace, Oid NewAccessMethod,
 										  OIDOldHeap,
 										  NULL);
 	Assert(OIDNewHeap != InvalidOid);
+
+	doltgres_new_heap(OIDNewHeap, OldHeap);
 
 	ReleaseSysCache(tuple);
 

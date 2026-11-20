@@ -32,6 +32,7 @@
 #include "access/parallel.h"
 #include "catalog/pg_authid.h"
 #include "common/file_perm.h"
+#include "doltgres/hooks.h"
 #include "libpq/libpq.h"
 #include "libpq/pqsignal.h"
 #include "mb/pg_wchar.h"
@@ -1852,6 +1853,7 @@ void
 process_shared_preload_libraries(void)
 {
 	process_shared_preload_libraries_in_progress = true;
+	doltgres_shared_preload();
 	load_libraries(shared_preload_libraries_string,
 				   "shared_preload_libraries",
 				   false);

@@ -10,6 +10,7 @@ project('postgresql',
   ['c'],
   version: '19rc2',
   license: 'PostgreSQL',
+  subproject_dir: 'src/doltgres/third_party',
 
   # We want < 0.62 for python 3.6 compatibility on old platforms.
   # RHEL 8 has 0.58.  < 0.57 would require various additional
@@ -953,6 +954,15 @@ endif
 # Library: icu
 ###############################################################
 
+# The fork's vendored, pinned ICU (src/doltgres/third_party/pins.tsv), which
+# the icu dependencies below find in place of the system's. Collation keys
+# are stored data made by it (design item 12), so the fork is never built
+# without it.
+if get_option('icu').disabled()
+  error('the fork stores collation keys made by its vendored ICU and is never built without it')
+endif
+subproject('icu')
+
 icuopt = get_option('icu')
 if not icuopt.disabled()
   icu = dependency('icu-uc', required: false)
@@ -1167,6 +1177,13 @@ if not libxsltopt.disabled()
 else
   libxslt = not_found_dep
 endif
+
+
+
+# The fork's vendored, pinned zstd and lz4 (src/doltgres/third_party/pins.tsv),
+# which the zstd and lz4 dependencies below find in place of the system's.
+subproject('zstd', required: not get_option('zstd').disabled())
+subproject('lz4', required: not get_option('lz4').disabled())
 
 
 
@@ -2206,6 +2223,9 @@ common_functional_flags = [
   # probably not worth it.  See also
   # https://github.com/ccache/ccache/issues/1686
   '-fpch-deps',
+  # The fork rounds every floating-point operation on its own, so results are
+  # the same whether or not the machine can fuse a multiply and an add
+  '-ffp-contract=off',
 ]
 
 cflags += cc.get_supported_arguments(common_functional_flags)
@@ -3559,6 +3579,13 @@ generated_sources = []
 generated_sources_ac = {}
 
 
+# The vendored ICU's data, compiled into every program that links ICU
+# (src/doltgres/icu). Its library is declared here, the first place a target
+# of this project may be, and before the first program that links ICU.
+subdir('src/doltgres/icu')
+icu = declare_dependency(dependencies: [icu, doltgres_icudata])
+
+
 # First visit src/include - all targets creating headers are defined
 # within. That makes it easy to add the necessary dependencies for the
 # subsequent build steps.
@@ -3706,6 +3733,7 @@ subdir('src')
 subdir('contrib')
 
 subdir('src/test')
+subdir('src/doltgres/test')
 subdir('src/interfaces/ecpg/test')
 
 subdir('doc/src/sgml')

@@ -49,6 +49,7 @@
 #include "commands/seclabel.h"
 #include "commands/tablespace.h"
 #include "common/file_perm.h"
+#include "doltgres/hooks.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -1563,6 +1564,8 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 			CreateDatabaseUsingFileCopy(src_dboid, dboid, src_deftablespace,
 										dst_deftablespace);
 
+		doltgres_createdb(src_dboid, dboid, dst_deftablespace);
+
 		/*
 		 * Close pg_database, but keep lock till commit.
 		 */
@@ -1891,6 +1894,7 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 	 * Remove all tablespace subdirs belonging to the database.
 	 */
 	remove_dbtablespaces(db_id);
+	doltgres_dropdb(db_id);
 
 	/*
 	 * Close pg_database, but keep lock till commit.
@@ -2214,6 +2218,7 @@ movedb(const char *dbname, const char *tblspcname)
 		 * Copy files from the old tablespace to the new one
 		 */
 		copydir(src_dbpath, dst_dbpath, false);
+		doltgres_movedb_copy(db_id, src_tblspcoid, dst_tblspcoid);
 
 		/*
 		 * Record the filesystem change in XLOG
@@ -2329,6 +2334,7 @@ movedb(const char *dbname, const char *tblspcname)
 		(void) XLogInsert(RM_DBASE_ID,
 						  XLOG_DBASE_DROP | XLR_SPECIAL_REL_UPDATE);
 	}
+	doltgres_movedb_finish(db_id, src_tblspcoid, dst_tblspcoid);
 
 	/* Now it's safe to release the database lock */
 	UnlockSharedObjectForSession(DatabaseRelationId, db_id, 0,
@@ -3115,6 +3121,9 @@ check_db_file_conflict(Oid db_id)
 	Relation	rel;
 	TableScanDesc scan;
 	HeapTuple	tuple;
+
+	if (doltgres_db_file_conflict(db_id))
+		return true;
 
 	rel = table_open(TableSpaceRelationId, AccessShareLock);
 	scan = table_beginscan_catalog(rel, 0, NULL);

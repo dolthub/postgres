@@ -1,0 +1,21 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The tables that pieces landing side by side each add lines to: a rebase keeps both sides' lines, main's first,
+# instead of stopping. A line both sides changed is then kept twice, which the build refuses as a second function or
+# the gates as a second row, and a line one side took out comes back as a call nothing calls or a row the check of
+# ported files refuses. A table read as a set or a map would take such a line silently, so none is listed here.
+doltgrust.tsv	merge=union
+pg/calls.list	merge=union
+pg/test-calls.list	merge=union

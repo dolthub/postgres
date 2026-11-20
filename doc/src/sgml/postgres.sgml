@@ -167,6 +167,7 @@ break is not needed in a wider output rendering.
   &logical-replication;
   &jit;
   &regress;
+  &doltgres-config;
 
  </part>
 

@@ -1,0 +1,302 @@
+/*
+ * Copyright 2026 Dolthub, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/*
+ * The C port of core's sort tests (library/alloctests/tests/sort, Rust
+ * 1.99.1), which std's test module runs against the stable sort: the input
+ * patterns, the Zipf distribution they draw from, the FFI element types, and
+ * the tests of tests.rs's stable instantiation.
+ */
+#ifndef DOLTGRES_STD_TEST_SORT_H
+#define DOLTGRES_STD_TEST_SORT_H
+
+#include "doltgres/std/cmp.h"
+#include "doltgres/std/fmt.h"
+#include "doltgres/std/vec.h"
+
+/* AlloctestsSortZipfDistribution is zipf.rs's ZipfDistribution: its bounds and the integrals rejection-inversion samples by. */
+typedef struct AlloctestsSortZipfDistribution
+{
+	float8		num_elements;
+	float8		exponent;
+	float8		h_integral_x1;
+	float8		h_integral_num_elements;
+	float8		s;
+} AlloctestsSortZipfDistribution;
+
+/* AlloctestsSortFfiTypesFFIOneKibiByte is ffi_types.rs's FFIOneKibiByte: a kibibyte of i64s, repr(C). */
+typedef struct AlloctestsSortFfiTypesFFIOneKibiByte
+{
+	int64		values[128];
+} AlloctestsSortFfiTypesFFIOneKibiByte;
+
+/* AlloctestsSortFfiTypesF128 is ffi_types.rs's F128: a pair of f64s, repr(C). */
+typedef struct AlloctestsSortFfiTypesF128
+{
+	float8		x;
+	float8		y;
+} AlloctestsSortFfiTypesF128;
+
+extern bool alloctests_sort_zipf_ZipfDistribution_new(size_t num_elements, float8 exponent,
+													  AlloctestsSortZipfDistribution *result);
+extern size_t alloctests_sort_zipf_ZipfDistribution_next(const AlloctestsSortZipfDistribution *self, uint32 *rng);
+
+extern void alloctests_sort_patterns_random(size_t len, StdVec *result);
+extern void alloctests_sort_patterns_random_uniform_RangeI32(size_t len, int32 start, int32 end, StdVec *result);
+extern void alloctests_sort_patterns_random_uniform_RangeInclusiveI32(size_t len, int32 start, int32 end,
+																	  StdVec *result);
+extern void alloctests_sort_patterns_random_zipf(size_t len, float8 exponent, StdVec *result);
+extern void alloctests_sort_patterns_random_sorted(size_t len, float8 sorted_percent, StdVec *result);
+extern void alloctests_sort_patterns_all_equal(size_t len, StdVec *result);
+extern void alloctests_sort_patterns_ascending(size_t len, StdVec *result);
+extern void alloctests_sort_patterns_descending(size_t len, StdVec *result);
+extern void alloctests_sort_patterns_saw_mixed(size_t len, size_t saw_count, StdVec *result);
+extern void alloctests_sort_patterns_saw_mixed_range(size_t len, size_t range_start, size_t range_end,
+													 StdVec *result);
+extern void alloctests_sort_patterns_pipe_organ(size_t len, StdVec *result);
+extern uint64 alloctests_sort_patterns_get_or_init_rand_seed(void);
+extern AlloctestsSortFfiTypesFFIOneKibiByte alloctests_sort_ffi_types_FFIOneKibiByte_new(int32 val);
+extern StdOrdering alloctests_sort_ffi_types_FFIOneKibiByte_Ord_cmp(const void *self_, const void *other_);
+extern bool alloctests_sort_ffi_types_FFIOneKibiByte_PartialOrd_lt(const AlloctestsSortFfiTypesFFIOneKibiByte *self, const AlloctestsSortFfiTypesFFIOneKibiByte *other);
+extern bool alloctests_sort_ffi_types_FFIOneKibiByte_PartialEq_eq(const void *self_, const void *other_);
+extern bool alloctests_sort_ffi_types_FFIOneKibiByte_Debug_fmt(const void *value, StdFormatter *f);
+extern AlloctestsSortFfiTypesF128 alloctests_sort_ffi_types_F128_new(int32 val);
+extern StdOrdering alloctests_sort_ffi_types_F128_Ord_cmp(const void *self_, const void *other_);
+extern bool alloctests_sort_ffi_types_F128_PartialOrd_lt(const AlloctestsSortFfiTypesF128 *self, const AlloctestsSortFfiTypesF128 *other);
+extern bool alloctests_sort_ffi_types_F128_PartialEq_eq(const void *self_, const void *other_);
+extern bool alloctests_sort_ffi_types_F128_Debug_fmt(const void *value, StdFormatter *f);
+extern void test_alloctests_sort_partial_basic_impl(void);
+extern void test_alloctests_sort_partial_random_patterns(void);
+extern void test_alloctests_sort_tests_stable_basic(void);
+extern void test_alloctests_sort_tests_stable_box_value(void);
+extern void test_alloctests_sort_tests_stable_correct_1k_ascending(void);
+extern void test_alloctests_sort_tests_stable_correct_1k_descending(void);
+extern void test_alloctests_sort_tests_stable_correct_1k_random(void);
+extern void test_alloctests_sort_tests_stable_correct_1k_random_d2(void);
+extern void test_alloctests_sort_tests_stable_correct_1k_random_d20(void);
+extern void test_alloctests_sort_tests_stable_correct_1k_random_s95(void);
+extern void test_alloctests_sort_tests_stable_correct_1k_random_z1(void);
+extern void test_alloctests_sort_tests_stable_correct_1k_saw_mixed(void);
+extern void test_alloctests_sort_tests_stable_correct_cell_i32_ascending(void);
+extern void test_alloctests_sort_tests_stable_correct_cell_i32_descending(void);
+extern void test_alloctests_sort_tests_stable_correct_cell_i32_random(void);
+extern void test_alloctests_sort_tests_stable_correct_cell_i32_random_d2(void);
+extern void test_alloctests_sort_tests_stable_correct_cell_i32_random_d20(void);
+extern void test_alloctests_sort_tests_stable_correct_cell_i32_random_s95(void);
+extern void test_alloctests_sort_tests_stable_correct_cell_i32_random_z1(void);
+extern void test_alloctests_sort_tests_stable_correct_cell_i32_saw_mixed(void);
+extern void test_alloctests_sort_tests_stable_correct_dyn_val_ascending(void);
+extern void test_alloctests_sort_tests_stable_correct_dyn_val_descending(void);
+extern void test_alloctests_sort_tests_stable_correct_dyn_val_random(void);
+extern void test_alloctests_sort_tests_stable_correct_dyn_val_random_d2(void);
+extern void test_alloctests_sort_tests_stable_correct_dyn_val_random_d20(void);
+extern void test_alloctests_sort_tests_stable_correct_dyn_val_random_s95(void);
+extern void test_alloctests_sort_tests_stable_correct_dyn_val_random_z1(void);
+extern void test_alloctests_sort_tests_stable_correct_dyn_val_saw_mixed(void);
+extern void test_alloctests_sort_tests_stable_correct_f128_ascending(void);
+extern void test_alloctests_sort_tests_stable_correct_f128_descending(void);
+extern void test_alloctests_sort_tests_stable_correct_f128_random(void);
+extern void test_alloctests_sort_tests_stable_correct_f128_random_d2(void);
+extern void test_alloctests_sort_tests_stable_correct_f128_random_d20(void);
+extern void test_alloctests_sort_tests_stable_correct_f128_random_s95(void);
+extern void test_alloctests_sort_tests_stable_correct_f128_random_z1(void);
+extern void test_alloctests_sort_tests_stable_correct_f128_saw_mixed(void);
+extern void test_alloctests_sort_tests_stable_correct_i32_all_equal(void);
+extern void test_alloctests_sort_tests_stable_correct_i32_ascending(void);
+extern void test_alloctests_sort_tests_stable_correct_i32_descending(void);
+extern void test_alloctests_sort_tests_stable_correct_i32_narrow(void);
+extern void test_alloctests_sort_tests_stable_correct_i32_pipe_organ(void);
+extern void test_alloctests_sort_tests_stable_correct_i32_random(void);
+extern void test_alloctests_sort_tests_stable_correct_i32_random_d1024(void);
+extern void test_alloctests_sort_tests_stable_correct_i32_random_d2(void);
+extern void test_alloctests_sort_tests_stable_correct_i32_random_d20(void);
+extern void test_alloctests_sort_tests_stable_correct_i32_random_d311(void);
+extern void test_alloctests_sort_tests_stable_correct_i32_random_d4(void);
+extern void test_alloctests_sort_tests_stable_correct_i32_random_d8(void);
+extern void test_alloctests_sort_tests_stable_correct_i32_random_s50(void);
+extern void test_alloctests_sort_tests_stable_correct_i32_random_s95(void);
+extern void test_alloctests_sort_tests_stable_correct_i32_random_z1(void);
+extern void test_alloctests_sort_tests_stable_correct_i32_random_z1_03(void);
+extern void test_alloctests_sort_tests_stable_correct_i32_random_z2(void);
+extern void test_alloctests_sort_tests_stable_correct_i32_saw_mixed(void);
+extern void test_alloctests_sort_tests_stable_correct_i32_saw_mixed_range(void);
+extern void test_alloctests_sort_tests_stable_correct_string_ascending(void);
+extern void test_alloctests_sort_tests_stable_correct_string_descending(void);
+extern void test_alloctests_sort_tests_stable_correct_string_random(void);
+extern void test_alloctests_sort_tests_stable_correct_string_random_d2(void);
+extern void test_alloctests_sort_tests_stable_correct_string_random_d20(void);
+extern void test_alloctests_sort_tests_stable_correct_string_random_s95(void);
+extern void test_alloctests_sort_tests_stable_correct_string_random_z1(void);
+extern void test_alloctests_sort_tests_stable_correct_string_saw_mixed(void);
+extern void test_alloctests_sort_tests_stable_correct_u128_ascending(void);
+extern void test_alloctests_sort_tests_stable_correct_u128_descending(void);
+extern void test_alloctests_sort_tests_stable_correct_u128_random(void);
+extern void test_alloctests_sort_tests_stable_correct_u128_random_d2(void);
+extern void test_alloctests_sort_tests_stable_correct_u128_random_d20(void);
+extern void test_alloctests_sort_tests_stable_correct_u128_random_s95(void);
+extern void test_alloctests_sort_tests_stable_correct_u128_random_z1(void);
+extern void test_alloctests_sort_tests_stable_correct_u128_saw_mixed(void);
+extern void test_alloctests_sort_tests_stable_correct_u64_ascending(void);
+extern void test_alloctests_sort_tests_stable_correct_u64_descending(void);
+extern void test_alloctests_sort_tests_stable_correct_u64_random(void);
+extern void test_alloctests_sort_tests_stable_correct_u64_random_d2(void);
+extern void test_alloctests_sort_tests_stable_correct_u64_random_d20(void);
+extern void test_alloctests_sort_tests_stable_correct_u64_random_s95(void);
+extern void test_alloctests_sort_tests_stable_correct_u64_random_z1(void);
+extern void test_alloctests_sort_tests_stable_correct_u64_saw_mixed(void);
+extern void test_alloctests_sort_tests_stable_deterministic_cell_i32_ascending(void);
+extern void test_alloctests_sort_tests_stable_deterministic_cell_i32_descending(void);
+extern void test_alloctests_sort_tests_stable_deterministic_cell_i32_random(void);
+extern void test_alloctests_sort_tests_stable_deterministic_cell_i32_random_d2(void);
+extern void test_alloctests_sort_tests_stable_deterministic_cell_i32_random_d20(void);
+extern void test_alloctests_sort_tests_stable_deterministic_cell_i32_random_s95(void);
+extern void test_alloctests_sort_tests_stable_deterministic_cell_i32_random_z1(void);
+extern void test_alloctests_sort_tests_stable_deterministic_cell_i32_saw_mixed(void);
+extern void test_alloctests_sort_tests_stable_deterministic_i32_ascending(void);
+extern void test_alloctests_sort_tests_stable_deterministic_i32_descending(void);
+extern void test_alloctests_sort_tests_stable_deterministic_i32_random(void);
+extern void test_alloctests_sort_tests_stable_deterministic_i32_random_d2(void);
+extern void test_alloctests_sort_tests_stable_deterministic_i32_random_d20(void);
+extern void test_alloctests_sort_tests_stable_deterministic_i32_random_s95(void);
+extern void test_alloctests_sort_tests_stable_deterministic_i32_random_z1(void);
+extern void test_alloctests_sort_tests_stable_deterministic_i32_saw_mixed(void);
+extern void test_alloctests_sort_tests_stable_deterministic_string_ascending(void);
+extern void test_alloctests_sort_tests_stable_deterministic_string_descending(void);
+extern void test_alloctests_sort_tests_stable_deterministic_string_random(void);
+extern void test_alloctests_sort_tests_stable_deterministic_string_random_d2(void);
+extern void test_alloctests_sort_tests_stable_deterministic_string_random_d20(void);
+extern void test_alloctests_sort_tests_stable_deterministic_string_random_s95(void);
+extern void test_alloctests_sort_tests_stable_deterministic_string_random_z1(void);
+extern void test_alloctests_sort_tests_stable_deterministic_string_saw_mixed(void);
+extern void test_alloctests_sort_tests_stable_fixed_seed(void);
+extern void test_alloctests_sort_tests_stable_fixed_seed_rand_vec_prefix(void);
+extern void test_alloctests_sort_tests_stable_int_edge(void);
+extern void test_alloctests_sort_tests_stable_observable_is_less_ascending(void);
+extern void test_alloctests_sort_tests_stable_observable_is_less_descending(void);
+extern void test_alloctests_sort_tests_stable_observable_is_less_random(void);
+extern void test_alloctests_sort_tests_stable_observable_is_less_random_d2(void);
+extern void test_alloctests_sort_tests_stable_observable_is_less_random_d20(void);
+extern void test_alloctests_sort_tests_stable_observable_is_less_random_s95(void);
+extern void test_alloctests_sort_tests_stable_observable_is_less_random_z1(void);
+extern void test_alloctests_sort_tests_stable_observable_is_less_saw_mixed(void);
+extern void test_alloctests_sort_tests_stable_panic_observable_is_less_ascending(void);
+extern void test_alloctests_sort_tests_stable_panic_observable_is_less_descending(void);
+extern void test_alloctests_sort_tests_stable_panic_observable_is_less_random(void);
+extern void test_alloctests_sort_tests_stable_panic_observable_is_less_random_d2(void);
+extern void test_alloctests_sort_tests_stable_panic_observable_is_less_random_d20(void);
+extern void test_alloctests_sort_tests_stable_panic_observable_is_less_random_s95(void);
+extern void test_alloctests_sort_tests_stable_panic_observable_is_less_random_z1(void);
+extern void test_alloctests_sort_tests_stable_panic_observable_is_less_saw_mixed(void);
+extern void test_alloctests_sort_tests_stable_panic_retain_orig_set_cell_i32_ascending(void);
+extern void test_alloctests_sort_tests_stable_panic_retain_orig_set_cell_i32_descending(void);
+extern void test_alloctests_sort_tests_stable_panic_retain_orig_set_cell_i32_random(void);
+extern void test_alloctests_sort_tests_stable_panic_retain_orig_set_cell_i32_random_d2(void);
+extern void test_alloctests_sort_tests_stable_panic_retain_orig_set_cell_i32_random_d20(void);
+extern void test_alloctests_sort_tests_stable_panic_retain_orig_set_cell_i32_random_s95(void);
+extern void test_alloctests_sort_tests_stable_panic_retain_orig_set_cell_i32_random_z1(void);
+extern void test_alloctests_sort_tests_stable_panic_retain_orig_set_cell_i32_saw_mixed(void);
+extern void test_alloctests_sort_tests_stable_panic_retain_orig_set_i32_ascending(void);
+extern void test_alloctests_sort_tests_stable_panic_retain_orig_set_i32_descending(void);
+extern void test_alloctests_sort_tests_stable_panic_retain_orig_set_i32_random(void);
+extern void test_alloctests_sort_tests_stable_panic_retain_orig_set_i32_random_d2(void);
+extern void test_alloctests_sort_tests_stable_panic_retain_orig_set_i32_random_d20(void);
+extern void test_alloctests_sort_tests_stable_panic_retain_orig_set_i32_random_s95(void);
+extern void test_alloctests_sort_tests_stable_panic_retain_orig_set_i32_random_z1(void);
+extern void test_alloctests_sort_tests_stable_panic_retain_orig_set_i32_saw_mixed(void);
+extern void test_alloctests_sort_tests_stable_panic_retain_orig_set_string_ascending(void);
+extern void test_alloctests_sort_tests_stable_panic_retain_orig_set_string_descending(void);
+extern void test_alloctests_sort_tests_stable_panic_retain_orig_set_string_random(void);
+extern void test_alloctests_sort_tests_stable_panic_retain_orig_set_string_random_d2(void);
+extern void test_alloctests_sort_tests_stable_panic_retain_orig_set_string_random_d20(void);
+extern void test_alloctests_sort_tests_stable_panic_retain_orig_set_string_random_s95(void);
+extern void test_alloctests_sort_tests_stable_panic_retain_orig_set_string_random_z1(void);
+extern void test_alloctests_sort_tests_stable_panic_retain_orig_set_string_saw_mixed(void);
+extern void test_alloctests_sort_tests_stable_self_cmp_cell_i32_ascending(void);
+extern void test_alloctests_sort_tests_stable_self_cmp_cell_i32_descending(void);
+extern void test_alloctests_sort_tests_stable_self_cmp_cell_i32_random(void);
+extern void test_alloctests_sort_tests_stable_self_cmp_cell_i32_random_d2(void);
+extern void test_alloctests_sort_tests_stable_self_cmp_cell_i32_random_d20(void);
+extern void test_alloctests_sort_tests_stable_self_cmp_cell_i32_random_s95(void);
+extern void test_alloctests_sort_tests_stable_self_cmp_cell_i32_random_z1(void);
+extern void test_alloctests_sort_tests_stable_self_cmp_cell_i32_saw_mixed(void);
+extern void test_alloctests_sort_tests_stable_self_cmp_i32_ascending(void);
+extern void test_alloctests_sort_tests_stable_self_cmp_i32_descending(void);
+extern void test_alloctests_sort_tests_stable_self_cmp_i32_random(void);
+extern void test_alloctests_sort_tests_stable_self_cmp_i32_random_d2(void);
+extern void test_alloctests_sort_tests_stable_self_cmp_i32_random_d20(void);
+extern void test_alloctests_sort_tests_stable_self_cmp_i32_random_s95(void);
+extern void test_alloctests_sort_tests_stable_self_cmp_i32_random_z1(void);
+extern void test_alloctests_sort_tests_stable_self_cmp_i32_saw_mixed(void);
+extern void test_alloctests_sort_tests_stable_self_cmp_string_ascending(void);
+extern void test_alloctests_sort_tests_stable_self_cmp_string_descending(void);
+extern void test_alloctests_sort_tests_stable_self_cmp_string_random(void);
+extern void test_alloctests_sort_tests_stable_self_cmp_string_random_d2(void);
+extern void test_alloctests_sort_tests_stable_self_cmp_string_random_d20(void);
+extern void test_alloctests_sort_tests_stable_self_cmp_string_random_s95(void);
+extern void test_alloctests_sort_tests_stable_self_cmp_string_random_z1(void);
+extern void test_alloctests_sort_tests_stable_self_cmp_string_saw_mixed(void);
+extern void test_alloctests_sort_tests_stable_sort_vs_sort_by(void);
+extern void test_alloctests_sort_tests_stable_stability_cell_i32_ascending(void);
+extern void test_alloctests_sort_tests_stable_stability_cell_i32_descending(void);
+extern void test_alloctests_sort_tests_stable_stability_cell_i32_random(void);
+extern void test_alloctests_sort_tests_stable_stability_cell_i32_random_d2(void);
+extern void test_alloctests_sort_tests_stable_stability_cell_i32_random_d20(void);
+extern void test_alloctests_sort_tests_stable_stability_cell_i32_random_s95(void);
+extern void test_alloctests_sort_tests_stable_stability_cell_i32_random_z1(void);
+extern void test_alloctests_sort_tests_stable_stability_cell_i32_saw_mixed(void);
+extern void test_alloctests_sort_tests_stable_stability_i32_ascending(void);
+extern void test_alloctests_sort_tests_stable_stability_i32_descending(void);
+extern void test_alloctests_sort_tests_stable_stability_i32_random(void);
+extern void test_alloctests_sort_tests_stable_stability_i32_random_d2(void);
+extern void test_alloctests_sort_tests_stable_stability_i32_random_d20(void);
+extern void test_alloctests_sort_tests_stable_stability_i32_random_s95(void);
+extern void test_alloctests_sort_tests_stable_stability_i32_random_z1(void);
+extern void test_alloctests_sort_tests_stable_stability_i32_saw_mixed(void);
+extern void test_alloctests_sort_tests_stable_stability_legacy(void);
+extern void test_alloctests_sort_tests_stable_stability_string_ascending(void);
+extern void test_alloctests_sort_tests_stable_stability_string_descending(void);
+extern void test_alloctests_sort_tests_stable_stability_string_random(void);
+extern void test_alloctests_sort_tests_stable_stability_string_random_d2(void);
+extern void test_alloctests_sort_tests_stable_stability_string_random_d20(void);
+extern void test_alloctests_sort_tests_stable_stability_string_random_s95(void);
+extern void test_alloctests_sort_tests_stable_stability_string_random_z1(void);
+extern void test_alloctests_sort_tests_stable_stability_string_saw_mixed(void);
+extern void test_alloctests_sort_tests_stable_violate_ord_retain_orig_set_cell_i32_ascending(void);
+extern void test_alloctests_sort_tests_stable_violate_ord_retain_orig_set_cell_i32_descending(void);
+extern void test_alloctests_sort_tests_stable_violate_ord_retain_orig_set_cell_i32_random(void);
+extern void test_alloctests_sort_tests_stable_violate_ord_retain_orig_set_cell_i32_random_d2(void);
+extern void test_alloctests_sort_tests_stable_violate_ord_retain_orig_set_cell_i32_random_d20(void);
+extern void test_alloctests_sort_tests_stable_violate_ord_retain_orig_set_cell_i32_random_s95(void);
+extern void test_alloctests_sort_tests_stable_violate_ord_retain_orig_set_cell_i32_random_z1(void);
+extern void test_alloctests_sort_tests_stable_violate_ord_retain_orig_set_cell_i32_saw_mixed(void);
+extern void test_alloctests_sort_tests_stable_violate_ord_retain_orig_set_i32_ascending(void);
+extern void test_alloctests_sort_tests_stable_violate_ord_retain_orig_set_i32_descending(void);
+extern void test_alloctests_sort_tests_stable_violate_ord_retain_orig_set_i32_random(void);
+extern void test_alloctests_sort_tests_stable_violate_ord_retain_orig_set_i32_random_d2(void);
+extern void test_alloctests_sort_tests_stable_violate_ord_retain_orig_set_i32_random_d20(void);
+extern void test_alloctests_sort_tests_stable_violate_ord_retain_orig_set_i32_random_s95(void);
+extern void test_alloctests_sort_tests_stable_violate_ord_retain_orig_set_i32_random_z1(void);
+extern void test_alloctests_sort_tests_stable_violate_ord_retain_orig_set_i32_saw_mixed(void);
+extern void test_alloctests_sort_tests_stable_violate_ord_retain_orig_set_string_ascending(void);
+extern void test_alloctests_sort_tests_stable_violate_ord_retain_orig_set_string_descending(void);
+extern void test_alloctests_sort_tests_stable_violate_ord_retain_orig_set_string_random(void);
+extern void test_alloctests_sort_tests_stable_violate_ord_retain_orig_set_string_random_d2(void);
+extern void test_alloctests_sort_tests_stable_violate_ord_retain_orig_set_string_random_d20(void);
+extern void test_alloctests_sort_tests_stable_violate_ord_retain_orig_set_string_random_s95(void);
+extern void test_alloctests_sort_tests_stable_violate_ord_retain_orig_set_string_random_z1(void);
+extern void test_alloctests_sort_tests_stable_violate_ord_retain_orig_set_string_saw_mixed(void);
+
+#endif							/* DOLTGRES_STD_TEST_SORT_H */

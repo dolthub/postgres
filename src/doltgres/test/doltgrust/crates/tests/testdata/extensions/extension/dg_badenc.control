@@ -1,0 +1,4 @@
+comment = 'Doltgrust test extension with a script invalid in its encoding'
+default_version = '1.0'
+relocatable = true
+encoding = 'EUC_JP'

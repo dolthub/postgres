@@ -52,6 +52,7 @@
 <!ENTITY wal           SYSTEM "wal.sgml">
 <!ENTITY logical-replication    SYSTEM "logical-replication.sgml">
 <!ENTITY jit    SYSTEM "jit.sgml">
+<!ENTITY doltgres-config SYSTEM "doltgres-config.sgml">
 
 <!-- programmer's guide -->
 <!ENTITY bgworker   SYSTEM "bgworker.sgml">

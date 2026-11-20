@@ -33,6 +33,7 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_db_role_setting.h"
 #include "catalog/pg_tablespace.h"
+#include "doltgres/hooks.h"
 #include "libpq/auth.h"
 #include "libpq/libpq-be.h"
 #include "mb/pg_wchar.h"
@@ -569,7 +570,7 @@ InitializeMaxBackends(void)
 
 	/* Note that this does not include "auxiliary" processes */
 	MaxBackends = MaxConnections + autovacuum_worker_slots +
-		max_worker_processes + max_wal_senders + NUM_SPECIAL_WORKER_PROCS;
+		max_worker_processes + DoltgresReservedWorkers + max_wal_senders + NUM_SPECIAL_WORKER_PROCS;
 
 	if (MaxBackends > MAX_BACKENDS)
 		ereport(ERROR,
@@ -674,6 +675,7 @@ BaseInit(void)
 	 * drop ephemeral slots, which in turn triggers stats reporting.
 	 */
 	ReplicationSlotInitialize();
+	doltgres_process_start();
 }
 
 

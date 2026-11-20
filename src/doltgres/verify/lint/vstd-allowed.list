@@ -1,0 +1,19 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The `vstd` functions the workspace's crates may call, by path, each with why it is sound for any caller. Verus'
+# library holds functions sound only for verified callers (its pointers, cells, atomics, and locks) and wrappers that
+# reach `std` behind the doors (its threads and hash maps), so a call outside this list fails the typed lint.
+vstd::pervasive::VecAdditionalExecFns::set	stores a vector's element through std's own checked indexing (`self[i] = value`), so an index out of range panics as it does for any caller
+<std::vec::Vec<T> as vstd::pervasive::VecAdditionalExecFns<T>>::set	stores a vector's element through std's own checked indexing (`self[i] = value`), so an index out of range panics as it does for any caller

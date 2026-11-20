@@ -1,0 +1,25 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Windows' locale names with a sort name that ICU itself has a collation for (design item 12), each by two published
+# tables, and no name without both: Microsoft's table of its locale names by locale id, whose sort names stand under
+# their sort ids (the .NET runtime's src/libraries/System.Private.CoreLib/src/System/Globalization/IcuLocaleData.cs,
+# read at github.com/dotnet/runtime, commit 6e51f762bc4c98ea90ae6ca21c4e220b4b2e7a5c; [MS-LCID]'s Appendix A has
+# es-ES_tradnl's id too), and ICU's own table from a Windows locale id to its locale, the vendored
+# third_party/icu/common/locmap.cpp. The tag is that locale as ICU's uloc_toLanguageTag writes it. Every other sort
+# name is unknown beside its tag.
+# name	Windows' locale id	ICU's locale for the id	tag
+de-DE_phoneb	0x10407	de_DE@collation=phonebook	de-DE-u-co-phonebk
+es-ES_tradnl	0x040a	es_ES@collation=traditional	es-ES-u-co-trad
+zh-CN_stroke	0x20804	zh_CN@collation=stroke	zh-CN-u-co-stroke

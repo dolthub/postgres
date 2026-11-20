@@ -32,6 +32,7 @@
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "common/string.h"
+#include "doltgres/hooks.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
@@ -384,7 +385,10 @@ DefineCollation(ParseState *pstate, List *names, List *parameters, bool if_not_e
 
 	/* Check that the locales can be loaded. */
 	CommandCounterIncrement();
-	(void) pg_newlocale_from_collation(newoid);
+	if (!doltgres_new_collation(newoid, fromEl))
+	{
+		(void) pg_newlocale_from_collation(newoid);
+	}
 
 	ObjectAddressSet(address, CollationRelationId, newoid);
 

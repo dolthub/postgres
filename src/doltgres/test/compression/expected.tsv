@@ -1,0 +1,39 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The compression corpus's cases (design item 15): each compresses an input of corpus/ (numbered as
+# doltgres/src/entries/testing.rs's CORPUS lists them) or, for pg_dump, the table holding them all, and records the
+# output's length and SHA-256, which t/008_compression.pl checks on every platform. zstd is the fork's, at level -1
+# without a dictionary, with the one trained on the leaf input's 4 KiB chunks, or that dictionary itself; toast-lz4 is
+# TOAST's lz4, null when the input doesn't shrink; pg_dump is one table's data file in directory format at a setting.
+# case	codec	input	setting	length	sha256
+zstd-0-none	zstd	0	none	6362	baf2b2147fd7052fcb4491943fca74531a5bbedda7a54bab850afe5c6f86fcd0
+zstd-0-dictionary	zstd	0	dictionary	6366	89d405fbcb2504c139823f47f53df70ad37224f48fd2f11f2a558973bc25ca19
+zstd-1-none	zstd	1	none	63370	95ffa3b8cbed58a35b21d22987da95a523bb90889a821f4d667f13f6b7692a4c
+zstd-1-dictionary	zstd	1	dictionary	62106	3f078c1570ef787f5ea992e482a4fe055ff9cb771101a75bba82a66431df44a7
+zstd-2-none	zstd	2	none	1249	5bde6aa0adc59f132b249192a8c30cf0016ddac7dc7f722f83f752af936be160
+zstd-2-dictionary	zstd	2	dictionary	2149	518d6cded8fc0aefafcfe9122078146c14480702d157ae6ddbfbf980580e5412
+zstd-3-none	zstd	3	none	16394	0319b33cff42c58baa418341ff7eb719fb6a4ad8a12c14961ae0c5c74a2fd592
+zstd-3-dictionary	zstd	3	dictionary	16398	02cf6845683e00c00602eac7fcd0312e6b5181f20b566c37ba536140f2d1ceb9
+zstd-trained	zstd	1	trained	4096	90f2a412684f157d82d437acee87f36a396d4fa5eebd172be4610b053d097aba
+toast-lz4-0	toast-lz4	0	default	9536	e4bf0d5e7b9a506e22bae62bfc1cb42311e7d40f547d98a523fa14736a3079b3
+toast-lz4-1	toast-lz4	1	default	83205	0bdeccd7d51ce74b5dbb6c2dc171ce218ff1e37b7836005a1e8245e8821ff27f
+toast-lz4-2	toast-lz4	2	default	3106	2737407a037fd32af23bb4cf8b2802f3f6ddc271abf47663954ee5587bd21026
+toast-lz4-3	toast-lz4	3	default	null	none
+pg_dump-lz4	pg_dump	all	lz4	154626	8341cfdf355c761e63c7cd27dea6ec05536c219eb0aaa2fa3a60bc2c04d92cf6
+pg_dump-lz4:9	pg_dump	all	lz4:9	121507	3f3081996cd7c15a0b615cabd643d49b424a4faac753e7d36274e50e97e3afdf
+pg_dump-zstd	pg_dump	all	zstd	92651	dbd3e8dc32f102c4f192d96c957a3b2fbc2567163c8522de320b197cbf2baf5d
+pg_dump-zstd:1	pg_dump	all	zstd:1	89054	b566187f6f2266ed67a0dab1aa9ce9fd23f320c5188dd895ce418a71de6d0935
+pg_dump-zstd:19	pg_dump	all	zstd:19	80871	dda81752542ef1a1ed68f2bdd96e2712e5a1beab0d55798c3c1d92fd0866b982
+pg_dump-zstd:level=3,long	pg_dump	all	zstd:level=3,long	92734	2338eff07c33fd9afd65c6316b9e8834b27fe80bc4882ea1bbeabf6dc1d4c89b

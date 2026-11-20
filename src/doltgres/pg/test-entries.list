@@ -1,0 +1,71 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The test-only entries, in entries.list's form, generated only with the injection_points feature, which cargo.pl turns
+# on exactly when Postgres is built with injection points (design item 17).
+
+doltgres_test_shmem_store	void	int64 value	error	nocatalog	the test module's store reads no catalog	test/t/003_shmem.pl: a backend waiting on the fork's lock sees the value the holder stored
+doltgres_test_shmem_load	int64		error	nocatalog	the test module's load reads no catalog	test/t/003_shmem.pl: a backend waiting on the fork's lock sees the value the holder stored
+doltgres_test_lwlock_pairs	void	int64 pairs, int32 way	error	nocatalog	the test module's measurement reads no catalog	test/t/003_shmem.pl: the measurement runs each way
+doltgres_test_escalate	void		error	nocatalog	the test module's escalation reads no catalog	test/t/003_shmem.pl: an error inside an escalating wrapper becomes a PANIC
+doltgres_test_host	int64	int32 which	error	nocatalog	the test module's host reads no catalog	test/t/004_host.pl: the host's process id is the backend's
+doltgres_test_file	Datum	int32 step	error	nocatalog	the test module's file steps read no catalog	test/t/005_file.pl: a file written and synced reads back
+doltgres_test_wal	int64	int64 value	error	nocatalog	the test module's record reads no catalog	test/t/006_wal.pl: a flushed record is durable
+doltgres_test_wal_unknown	void	int32 len	error	nocatalog	the test module's record of no kind reads no catalog	test/t/006_wal.pl: a record of an unknown kind stops recovery
+doltgres_test_delay	void	int32 step	error	nocatalog	the test module's delay reads no catalog	test/t/006_wal.pl: a checkpoint waits for the delay guard
+doltgres_test_check	void		error	nocatalog	the test module's loop reads no catalog	test/t/004_host.pl: a pending cancel stops a loop at its next check
+doltgres_test_lock	int64	int32 step	error	nocatalog	the test module's counter reads no catalog	test/t/004_host.pl: an entry after a panic under a static lock works
+doltgres_test_shared	int64	int32 step, int64 location, int64 value	error	nocatalog	the test module's shared steps read no catalog	test/t/007_shared.pl: a blob written by one backend is read by another
+doltgres_test_zstd	Datum	int32 input, int32 dictionary	error	nocatalog	the test module's compression reads no catalog	test/t/008_compression.pl: the fork's zstd output is the recorded one
+doltgres_test_cache	int64	int32 step, int64 key, int64 value	error	nocatalog	the test module's node cache steps read no catalog	test/t/009_cache.pl: two backends read one node
+doltgres_test_exit_callback	void	int code, Datum arg	error	nocatalog	before_shmem_exit runs the test module's callback as the process exits, after the transaction's abort	test/t/016_exit_doors.pl: a record opened by a callback registered after the fork's is closed at the exit
+doltgres_test_delta	int64	int32 step, int64 a, int64 b	error	nocatalog	the test module's steps over the delta's pages read no catalog	test/t/017_pages.pl: bytes appended by one backend are read by another
+doltgres_test_status	int64	int64 xid	error	nocatalog	the status door reads the running transactions and the commit log, no catalog	test/t/026_status.pl: a subtransaction rolled back is aborted while its transaction runs
+doltgres_test_in_progress	int64	int64 xid	error	nocatalog	the in_progress door reads the running transactions, no catalog	test/t/026_status.pl: an xid in a later epoch than the next one is in progress to no one
+doltgres_test_writer	int64	int32 which	error	nocatalog	the current_writer door assigns xids and reads no catalog	test/t/026_status.pl: a savepoint's writer is its own xid under its transaction's
+doltgres_test_command	int64	int32 used	error	nocatalog	the current_command door reads no catalog	test/t/026_status.pl: a command that writes is followed by the next command
+doltgres_test_is_current	int64	int64 xid	error	nocatalog	the is_current door reads no catalog	test/t/026_status.pl: a subtransaction rolled back is no longer the current transaction's
+doltgres_test_status_table	int64	int32 step, int64 xid, int64 value	error	nocatalog	the status table's steps read the running transactions and the commit log, no catalog	test/t/027_status_table.pl: an entry one backend takes another finds
+doltgres_test_kept_wal	void	int64 from, int64 to	error	nocatalog	the test module's check of the kept WAL reads pg_wal's segments and no catalog	test/t/023_kept_wal.pl: a kept segment cut short warns, naming it
+doltgres_test_repository	void	int id	error	nocatalog	the test module's repository is made in pg_versioned's files and the fork's shared memory, and reads no catalog	test/t/025_checkversioned.pl: a flipped pack byte exits 2 naming the pack
+doltgres_test_registered	void		error	nocatalog	the test module's registration takes the process's own root slots and pauses, and reads no catalog	test/t/040_registration.pl: a backend terminated inside a registration registers at its exit
+doltgres_test_session	int64	bool save	error	nocatalog	the test module's session repository is opened and saved in pg_versioned's files and the fork's shared memory, and reads no catalog	test/t/041_database.pl: a new database has a repository
+doltgres_test_key	Datum	FunctionCallInfo fcinfo	error	catalog	SQL functions run inside a transaction	test/t/028_keys.pl: a text read inline with a full header gives its key
+doltgres_test_words	int64		error	nocatalog	the test module's comparison reads no catalog	test/t/001_binding.pl: each word reader and writer gives what its macro gives
+doltgres_test_slot	void	TupleTableSlot *slot, TupleTableSlot *source, int keys, bool descending, const char *version	error	catalog	SQL functions run inside a transaction	test/t/029_slot.pl: a row stored in the fork's slot reads back as heap's own row
+doltgres_test_att	int64	TupleTableSlot *slot, int att, int field	error	nocatalog	the test module's comparison reads only the slot's descriptor	test/t/029_slot.pl: each attribute's packed word is its pg_attribute row
+doltgres_test_owned	int64	int32 step, int64 value	error	catalog	the owned records' steps read and change the backend's own table of them, and step 5 compares through a function, user code that may read any catalog	test/t/031_owned.pl: a record outlives the call that made it and is lent to the next by its handle
+doltgres_test_states	int64	int64 repository, int64 count	error	nocatalog	the storage states' steps read the repository's files and the fork's shared records, no catalog	test/t/032_state.pl: one state more than the relation locks is the pool's error
+doltgres_test_relation_locks	int64		error	nocatalog	the count reads only Postgres' lock sizing globals, no catalog	test/t/032_state.pl: the storage states' pool holds a state for each relation lock a backend's own globals count
+doltgres_test_base_row	void	Relation target, TupleTableSlot *source	error	catalog	the test writer reads the target's primary key and its columns' types from the catalog	test/t/033_scan.pl: a seq scan of a table on the fork's storage gives its base's rows
+doltgres_test_base_save	int64	Relation target, int32 extra	error	catalog	the test writer reads the target's primary key from the catalog and writes its repository's files	test/t/033_scan.pl: a seq scan of a table on the fork's storage gives its base's rows
+doltgres_test_index_fetch_key	void	struct IndexFetchTableData *fetch, Relation target, TupleTableSlot *source, uint64 copy	error	catalog	the test writer reads the target's primary key and its columns' types from the catalog	test/t/033_scan.pl: an index fetch by a row key gives the version of the key the snapshot sees and writes its tid
+doltgres_test_fold	bool	Relation target	error	catalog	the fold reads the target's primary key and its columns' operator classes from the catalog and runs their comparison functions	test/t/050_fold.pl: a fold applies the rows committed below its point and keeps a row whose commit is past it
+doltgres_test_free_space	Datum	Relation target, int32 block	error	catalog	it opens the target's storage's state through the backend's repository, which reads the repository's newest manifest	test/t/052_vacuum.pl: a standby's free space entry for a freed block equals the primary's, bytes and offsets, after VACUUM
+doltgres_test_base_sizes	Datum	Relation target	error	catalog	it opens the target's storage's state through the backend's repository, which reads the repository's newest manifest	test/t/050_fold.pl: the base's heap bytes and rows after an insert are heap's twin's live tuples'
+doltgres_test_index_entries	Datum	Relation target	error	catalog	it opens the index's storage's state through the backend's repository, which reads the repository's newest manifest	test/t/045_btree.pl: an insert writes each btree index's entry into the index's own storage
+doltgres_test_held	bool	Relation target, uint64 tid	error	catalog	it opens the target's storage's state through the backend's repository, which reads the repository's newest manifest	test/t/052_vacuum.pl: a standby's replay of a free takes out the row version its own drop kept for the freed tuple id
+doltgres_test_index_base	Datum	Relation target	error	catalog	it opens the index's storage's state through the backend's repository and reads its base	test/t/045_btree.pl: an index built over a table's rows holds an entry for each live row
+doltgres_test_index_fold	Datum	Relation heap, Relation index	error	catalog	the fold reads the table's primary key from the catalog and opens the index's storage's state through the backend's repository	test/t/045_btree.pl: a fold of an index's storage writes the base a fresh build of the table's rows writes
+doltgres_test_collect	Datum		error	catalog	it asks the collector worker and sleeps on a condition variable inside the SQL function's transaction, answering cancel	test/t/056_collect.pl: a base backup started while a marking runs waits for its collection, which changes no list
+doltgres_test_disk_space	Datum		error	nocatalog	it reads the volume's sizes through the host and reads no catalog	test/t/056_collect.pl: the data directory's volume reports free bytes below its size
+doltgres_test_database_lock	bool	Oid database, bool hold	error	nocatalog	it takes or gives back a session lock on the database's object and reads no catalog	test/t/056_collect.pl: a standby's replay of a move's copy waits for the database's lock before it copies
+doltgres_test_changes	Datum	Relation target	error	catalog	it opens the target's storage's state through the backend's repository, which reads the repository's newest manifest	test/t/047_rewrite.pl: a rewrite carries the recently dead row and its own delete, and no delete by the reinsert's writer
+doltgres_test_built_nodes	Datum		error	nocatalog	it walks the working states' deltas in shared memory and reads no catalog	test/t/047_rewrite.pl: a crash between a built base's chunk records and its base record leaves no built node in the delta
+doltgres_test_mapped	bool	Relation target	error	catalog	it opens the target's storage's state through the backend's repository, which reads the repository's newest manifest	test/t/062_fold_trigger.pl: a TOAST relation's value map is folded into its base with no call from a test, its words clear
+doltgres_test_identity	Datum	int32 kind, Oid number, int32 attnum	error	catalog	it reads the database's identity tree through the backend's repository, which reads the repository's newest manifest	test/t/057_identity.pl: a CREATE TABLE records its schema's, its own, and its columns' pairs
+doltgres_test_epochs	Datum		error	nocatalog	it reads the epoch lock's words in shared memory and reads no catalog	test/t/062_fold_trigger.pl: a fold worker waiting at its fold point for the commits delaying a checkpoint holds no reader epoch
+doltgres_test_base_levels	int	Relation target	error	catalog	it opens the relation's storage's state through the backend's repository and walks its base tree	test/t/045_btree.pl: a fork btree index answers its base tree's levels above its leaves, a primary key's index its table's tree's, and 0 for an empty base
+doltgres_test_totals	Datum	Relation target	error	catalog	it opens the target's storage's state through the backend's repository, which reads the repository's newest manifest	test/t/062_size_sites.pl: an aborted insert and a rolled-back subtransaction leave a fork table's totals as they were
+doltgres_test_count	Datum	Relation target	error	catalog	it opens the target's storage's state through the backend's repository and reads its table's key from the catalog for the count's fold	test/t/062_size_sites.pl: an aborted insert and a rolled-back subtransaction leave a fork table's totals as they were

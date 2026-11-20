@@ -1,0 +1,100 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The functions without a body the lint can follow that allocate nothing, or that only a bug reaches (design item 17),
+# by path; an entry ending in `::` names every function under that path. Each line gives its reason.
+
+alloc::alloc::__rust_dealloc	frees memory, never allocates
+core::panicking::	a panic runs only on a bug, and a panic while unwinding aborts whatever it would allocate
+std::panicking::	a panic runs only on a bug, and a panic while unwinding aborts whatever it would allocate
+std::rt::	the runtime's panic entry points, as above
+core::intrinsics::	compiler intrinsics, which allocate nothing
+std::sys::pal::unix::sync::mutex::Mutex::unlock	unlocks a pthread mutex (macOS), which allocates nothing
+std::sys::sync::mutex::futex::Mutex::wake	wakes a waiter on a futex mutex (Linux), which allocates nothing
+pg::ffi::doltgres_call_lwlock_release	releases an LWLock through LWLockRelease, which runs no fork code, so nothing allocates from Rust's heap
+pg::ffi::doltgres_call_shmem_base	reads the C global holding the region's address, so nothing allocates from Rust's heap
+pg::ffi::doltgres_call_top_xid_if_any	reads the top-level transaction's full xid through GetTopFullTransactionIdIfAny, the transaction state's own field, so nothing allocates from Rust's heap
+pg::ffi::doltgres_call_last_record_end	reads the backend's XactLastRecEnd, a C global, so nothing allocates from Rust's heap
+pg::ffi::doltgres_call_file_close	closes a file through FileClose, which reports a failure to close at LOG and runs no fork code, so nothing allocates from Rust's heap
+pg::ffi::doltgres_fe_close	closes a frontend program's file descriptor through close(2), setting errno on a failure, and runs no fork code, so nothing allocates from Rust's heap
+host::ReadHost::close	closes a file from `host::File`'s `Drop`, a seam of a host's reads since a frontend program's host closes what it read too; the lint checks every implementation of it as a root, such as pghost's, which calls only `file_close`
+pg::ffi::doltgres_call_resume_checkpoints	clears a flag of MyProc and ends the critical section, or PANICs, which ends the process, so nothing allocates from Rust's heap
+host::Host::resume_checkpoints	ends a checkpoint delay from `host::DelayCheckpoint`'s `Drop`; the lint checks every implementation of it as a root, such as pghost's, which calls only `resume_checkpoints`
+std::sys::sync::rwlock::queue::RwLock::read_unlock_contended	wakes a reader-writer lock's queued waiters (macOS) as a reader lets go, whose queue nodes live on the waiters' stacks, so nothing allocates
+std::sys::sync::rwlock::queue::RwLock::unlock_contended	wakes a reader-writer lock's queued waiters (macOS) as a writer lets go, whose queue nodes live on the waiters' stacks, so nothing allocates
+pg::ffi::ZSTD_freeCDict	frees a prepared libzstd compression dictionary, never allocates
+pg::ffi::ZSTD_freeDDict	frees a prepared libzstd decompression dictionary, never allocates
+host::Host::shared_unlock	releases a record's lock from `host::shared::Guard`'s and `LongGuard`'s `Drop`; the lint checks every implementation of it as a root, such as pghost's, which releases the LWLock
+host::Host::flag_clear	clears a flag from `host::shared::FlagGuard`'s `Drop`; the lint checks every implementation of it as a root, such as pghost's, which writes the flag's atomic and broadcasts its condition variable
+host::Host::epochs_end	ends a reader's epoch from `host::shared::Reader`'s `Drop`; the lint checks every implementation of it as a root
+pg::ffi::doltgres_call_atomic_write_u32	a pg_atomic write, which allocates nothing
+pg::ffi::doltgres_call_atomic_write_u64	a pg_atomic write, which allocates nothing
+pg::ffi::doltgres_call_cv_broadcast	sets a condition variable's waiters' latches under its spinlock, which allocates nothing
+pg::ffi::doltgres_call_my_proc_number	reads MyProcNumber, which allocates nothing
+host::Host::epochs_unlock	releases the epoch lock from `host::shared::Epochs`' `Drop`; the lint checks every implementation of it as a root
+std::vec::Vec::<T, A>::swap_remove::assert_failed	panics on an index out of bounds, which runs only on a bug, and a panic while unwinding aborts whatever it would allocate
+std::sys::sync::rwlock::futex::RwLock::wake_writer_or_readers	wakes a reader-writer lock's waiters through the futex (Windows, whose std RwLock is the futex one) as a holder lets go, which allocates nothing
+host::Host::owner_forget	has a resource owner forget a pin from `host::cache`'s `Pin`'s `Drop`; the lint checks every implementation of it as a root, such as pghost's, which calls only `owner_forget`
+host::Host::cache_unpin	gives up a node cache pin from `host::cache`'s `Pin`'s `Drop` and from the resource owner's release; the lint checks every implementation of it as a root, such as pghost's, which lowers the frame's state word
+host::Host::actor	names the running actor for `BackendLocal::existing` in the resource owner's release; the lint checks every implementation of it as a root, such as pghost's, which answers None
+pg::ffi::doltgres_call_owner_forget	ResourceOwnerForget clears the pin's entry in the owner's array or hash, which allocates nothing; it raises, which the wrapper makes a PANIC, only for a pin the owner doesn't remember or an owner that has started releasing, and the pin table and the pin kind's place before every other fork kind in an owner's release rule both out
+pg::ffi::doltgres_call_atomic_add_u64	a pg_atomic fetch-add, which allocates nothing
+pg::ffi::doltgres_call_cache_base	reads the C global holding the node cache's address, so nothing allocates from Rust's heap
+pg::ffi::doltgres_call_cache_table	reads the C global holding the node cache's table, so nothing allocates from Rust's heap
+pg::ffi::doltgres_call_local_cache_base	reads the C global holding the backend's own node cache's address, so nothing allocates from Rust's heap
+pg::ffi::doltgres_call_local_cache_table	reads the C global holding the backend's own node cache's table, so nothing allocates from Rust's heap
+host::Host::shared_give_up	gives up a record from `host::shared::Owned`'s `Drop` by one compare-and-swap of its slot's word; the lint checks every implementation of it as a root, such as pghost's, which takes the handle out of the process's list and swaps the word
+host::Host::shared_close	closes a record from `host::shared::Held`'s `Drop` by one compare-and-swap of its slot's word; the lint checks every implementation of it as a root
+host::Host::shared_unreclaim	gives up a record from `host::shared::Reclaim`'s `Drop` by one compare-and-swap of its slot's word; the lint checks every implementation of it as a root
+pg::ffi::doltgres_call_atomic_read_u64	a pg_atomic read, which allocates nothing
+pg::ffi::doltgres_call_atomic_exchange_u64	a pg_atomic compare-and-exchange, which allocates nothing
+pg::ffi::doltgres_call_zeroing	runs the tests' injection point between two stores of an exit's zeroing, in a build with injection points alone; its callback is the test module's, so nothing allocates from Rust's heap
+std::ffi::CStr::from_bytes_with_nul	checks that its bytes end with their one NUL and returns a borrowed C string or an error value, so nothing allocates
+std::option::unwrap_failed	`Option::unwrap`'s panic, which runs only on a bug, and a panic while unwinding aborts whatever it would allocate
+std::option::expect_failed	`Option::expect`'s panic, which runs only on a bug, and a panic while unwinding aborts whatever it would allocate
+host::Host::atomic	reads or writes one atomic of a shared record or of a process's own slot, from the drops of chunks' reservation, change, and merge; the lint checks every implementation of it as a root, such as pghost's, which reads or writes a `pg_atomic`
+host::Host::word_store	stores a word of a process's own slot from the drop of chunks' hold of a pack number; the lint checks every implementation of it as a root, such as pghost's, which writes a `pg_atomic`
+host::Host::word_store_own	stores a word of a process's own slot of a kind at its place in the server's table of kinds, from a commit's registration inside its critical section; the lint checks every implementation of it as a root, such as pghost's, which writes a `pg_atomic` at the place the kind's index and the process's number give
+host::Host::delta_release	ends a hold on the delta's pages from `host::delta::Hold`'s `Drop`; the lint checks every implementation of it as a root, such as pghost's, which ends the reader's epoch and lowers the process's count of holds
+host::Host::delta_unmake	gives back a record of the delta its maker didn't link from `host::delta::Unlinked`'s `Drop`; the lint checks every implementation of it as a root, such as pghost's, which frees the record's slot and counts a free when the process still lists the record as made
+host::Host::delta_give_back	gives back a page of the delta from `host::delta::Owned`'s `Drop`; the lint checks every implementation of it as a root, such as pghost's, which gives the page's body back to the delta's region of blocks and frees its slot when the process still owns it
+pg::ffi::doltgres_call_delta_directory	reads the C global holding the page directory's address, so nothing allocates from Rust's heap
+pg::ffi::doltgres_call_delta_base	reads the C global holding the delta's region of blocks' address, so nothing allocates from Rust's heap
+core::slice::index::slice_index_fail	a slice index out of range panics, which runs only on a bug, and a panic while unwinding aborts whatever it would allocate
+pg::ffi::doltgres_call_slot_release	frees the buffer of a slot of the fork's kind through pfree, which runs no fork code, so nothing allocates from Rust's heap
+pg::ffi::doltgres_call_slot_clear	frees a virtual slot's materialized values through pfree and resets the slot's own fields, which runs no fork code, so nothing allocates from Rust's heap
+host::Host::key_unlock	releases the key lock's stripes from `host::KeyGuard`'s `Drop`; the lint checks every implementation of it as a root, such as pghost's, which releases the LWLocks
+host::Host::unlock_tuple	releases a row's tuple lock from `host::TupleGuard`'s `Drop`; the lint checks every implementation of it as a root, such as pghost's, which calls only `unlock_tuple`
+pg::ffi::doltgres_call_unlock_tuple	releases a tuple lock through LockRelease, which runs no fork code, so nothing allocates from Rust's heap
+pg::ffi::doltgres_call_drop_slot	drops a slot of the fork's kind through ExecDropSingleTupleTableSlot, whose clear and release are the fork's slot callbacks, which free only through `slot_clear` and `slot_release` (listed), and frees the slot through pfree, so nothing allocates from Rust's heap
+pg::ffi::doltgres_call_keys_base	reads the C global holding the key lock's stripes' address, so nothing allocates from Rust's heap
+pg::ffi::doltgres_call_free_snapshot	frees a snapshot `nonvacuumable_snapshot` made through pfree, which runs no fork code, so nothing allocates from Rust's heap
+host::Host::key_release	clears a stripe's hold-back flag from `host::KeyHold`'s `Drop`; the lint checks every implementation of it as a root, such as pghost's, which writes the flag and broadcasts its condition variable
+pg::ffi::doltgres_call_atomic_exchange_u32	a pg_atomic compare-and-exchange, which allocates nothing
+pg::ffi::doltgres_call_free_dead_items	destroys a TidStore `make_dead_items` made through TidStoreDestroy, which deletes its memory context and frees the store, running no fork code, so nothing allocates from Rust's heap
+pg::ffi::doltgres_call_old_entries_close	frees a removal of old entries' executor state through FreeExecutorState and deletes its memory context, none of which runs fork code, so nothing allocates from Rust's heap
+pg::ffi::doltgres_call_build_free	frees an index build's executor state through FreeExecutorState and pfree its own memory, none of which runs fork code, so nothing allocates from Rust's heap
+pg::ffi::doltgres_call_sort_end	ends an index build's tuplesort through tuplesort_end, which frees its memory and closes its temporary files, and pfree the value it last copied out and its own memory, none of which runs fork code, so nothing allocates from Rust's heap
+pg::ffi::doltgres_call_lwlock_acquire_sure	takes an LWLock through LWLockAcquire, which records it in the backend's fixed array of held locks and runs no fork code, so nothing allocates from Rust's heap
+pg::ffi::doltgres_call_collection_base	reads the C global holding the collection region's address, so nothing allocates from Rust's heap
+pg::ffi::doltgres_call_cv_cancel	takes the process off a condition variable's wait list through ConditionVariableCancelSleep, under its spinlock, so nothing allocates from Rust's heap
+pg::ffi::doltgres_call_session_locks_released	gives back the process's session locks through LockReleaseSession, which runs no fork code, so nothing allocates from Rust's heap
+pg::ffi::doltgres_call_lwlock_try_sure	takes an LWLock through LWLockConditionalAcquire, which records it in the backend's fixed array of held locks and runs no fork code, so nothing allocates from Rust's heap
+pg::ffi::doltgres_call_atomic_or_u64	a pg_atomic fetch-or, which allocates nothing
+pg::ffi::doltgres_call_atomic_and_u64	a pg_atomic fetch-and, which allocates nothing
+pg::ffi::doltgres_call_fork_worker_named	compares a background worker's library and entry names through strcmp and strncmp, which runs no fork code, so nothing allocates from Rust's heap
+pg::ffi::doltgres_call_worker_slots_in_use	counts bgworker.c's slots in use under the BackgroundWorkerLock its caller holds, which runs no fork code, so nothing allocates from Rust's heap
+pg::ffi::doltgres_call_max_worker_processes	reads the max_worker_processes setting, a C global, so nothing allocates from Rust's heap
+pg::ffi::doltgres_call_table_close_kept	closes the table `index_table_open` opened through table_close with NoLock, whose RelationClose drops the relcache reference count and runs no fork code, so nothing allocates from Rust's heap
+pg::ffi::doltgres_call_relation_closed	gives back a relcache reference through RelationClose, which decrements its count, forgets it in the resource owner, and frees stale partition descriptors in C memory contexts, none of which runs fork code, so nothing allocates from Rust's heap

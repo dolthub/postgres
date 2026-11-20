@@ -1,0 +1,4 @@
+comment = 'Doltgrust test extension that a user with CREATE on the database may install'
+default_version = '1.0'
+relocatable = true
+trusted = true

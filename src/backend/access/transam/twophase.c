@@ -91,6 +91,7 @@
 #include "catalog/pg_type.h"
 #include "catalog/storage.h"
 #include "common/string.h"
+#include "doltgres/hooks.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
@@ -2370,6 +2371,8 @@ RecordTransactionCommitPrepared(TransactionId xid,
 	/* Load the injection point before entering the critical section */
 	INJECTION_POINT_LOAD("commit-after-delay-checkpoint");
 
+	doltgres_prepared_committing(xid);
+
 	START_CRIT_SECTION();
 
 	/* See notes in RecordTransactionCommit */
@@ -2406,6 +2409,8 @@ RecordTransactionCommitPrepared(TransactionId xid,
 								 initfileinval,
 								 MyXactFlags | XACT_FLAGS_ACQUIREDACCESSEXCLUSIVELOCK,
 								 xid, gid);
+
+	doltgres_prepared_registered();
 
 
 	if (replorigin)

@@ -1,0 +1,3 @@
+comment = 'Doltgrust test extension that only a superuser may install'
+default_version = '1.0'
+relocatable = true

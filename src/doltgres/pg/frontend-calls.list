@@ -1,0 +1,29 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Every port layer function the frontend build's Rust calls (design item D12), one per line, tab-separated: the name
+# of its wrapper, its C return type, which is int64, the C parameters, how it fails (errno: it returns a negative
+# number, with errno in its error), the C statements the wrapper runs, which set `result`, and the test of pg's
+# frontend tests (`cargo test -p pg` inside src/doltgres/fsck, over the real wrappers) that exercises the wrapper. No
+# wrapper may exit or call what exits (pg_fatal, exit, pg_log_*, the pg_malloc family), since the
+# check runs under Rust frames. The build generates the C wrapper and its Rust function.
+
+open	int64	const char *path	errno	result = open(path, O_RDONLY | PG_BINARY, 0)	tests::a_file_opens_reads_and_closes
+close	int64	int fd	errno	result = close(fd)	tests::a_file_opens_reads_and_closes
+pread	int64	int fd, DgBuffer buffer, uint64 offset	errno	result = pg_pread(fd, buffer.data, buffer.len, (pgoff_t) offset)	tests::a_file_opens_reads_and_closes
+size	int64	int fd	errno	{ struct stat st; result = fstat(fd, &st) < 0 ? -1 : (int64) st.st_size; }	tests::a_file_opens_reads_and_closes
+list_dir	int64	const char *path, DgBuffer names	errno	{ DIR *d = opendir(path); struct dirent *de; size_t at = 0; result = d == NULL ? -1 : 0; while (d != NULL && (errno = 0, de = readdir(d)) != NULL) { size_t len = strlen(de->d_name) + 1; if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue; if (at + len <= names.len) memcpy(names.data + at, de->d_name, len); at += len; } if (d != NULL && errno != 0) result = -1; else if (d != NULL) result = (int64) at; if (d != NULL) { int e = errno; closedir(d); errno = e; } }	tests::a_directory_lists_its_names_and_asks_for_room
+error_text	int64	int number, DgBuffer text	errno	{ const char *message = strerror(number); size_t len = strlen(message); memcpy(text.data, message, Min(len, text.len)); result = (int64) Min(len, text.len); }	tests::a_missing_file_fails_with_its_errno_and_text
+version_directory	int64	DgBuffer text	errno	{ size_t len = strlen(TABLESPACE_VERSION_DIRECTORY); memcpy(text.data, TABLESPACE_VERSION_DIRECTORY, Min(len, text.len)); result = (int64) Min(len, text.len); }	tests::the_version_directory_is_the_major_versions
+is_missing	int64	int number	errno	result = number == ENOENT	tests::a_missing_file_fails_with_its_errno_and_text

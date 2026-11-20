@@ -1,0 +1,33 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The fork's settings whose variables the binding defines (design items 6 and 17), one per line, tab-separated: its
+# name, its type (enum or int), an enum's values separated by commas with the first its default or an int's default,
+# what it is for, and the test that exercises its variable. Each has a row in src/backend/utils/misc/guc_parameters.dat,
+# and src/include/doltgres/hooks.h declares its variable and an enum's values.
+
+debug_fail_preload_allocation	enum	off,postmaster,child	the preload entry's allocation-failure trigger (design item 17's cases)	test/t/002_preload.pl: the postmaster fails to start when its preload entry fails to allocate
+node_cache_size	int	131072	the size in kB of the shared node cache (design item 14's S5)	test/t/009_cache.pl: node_cache_size is a memory setting of 128MB by default, set at server start
+delta_memory	int	32768	the size in kB of the shared memory area for recent changes (design items 6 and 14)	test/t/017_pages.pl: delta_memory is a memory setting of 32MB by default, set at server start
+collector_first_packs	int	64	the number of packs a repository holds before its first full collection (Doltgrust's FIRST_COLLECTION_PACKS)	test/t/056_collect.pl: the collector's settings have Postgres' units, defaults, and contexts
+collector_full_interval	int	86400	the longest time in seconds between full collections of a repository (Doltgrust's FULL_EVERY)	test/t/056_collect.pl: the collector's settings have Postgres' units, defaults, and contexts
+collector_io_limit	int	0	the kB a second a collection reads and copies at most while its packs are within their target, 0 for no limit (Doltgrust's io_limit)	test/t/056_collect.pl: the collector's settings have Postgres' units, defaults, and contexts
+collector_min_free_disk	int	-1	the MB free on the data directory's volume below which collections run whenever packs hold garbage, -1 for the smaller of 10 GB and a tenth of the volume (Doltgrust's min_free_disk)	test/t/056_collect.pl: the collector's settings have Postgres' units, defaults, and contexts
+collector_naptime	int	1000	the time in milliseconds the collector worker waits between its checks of which collections are due	test/t/056_collect.pl: the collector's settings have Postgres' units, defaults, and contexts
+collector_target_percent	int	50	how far a repository's packs, or one pack, may pass their live bytes before a collection, or its copy, runs, as a percent of them (Doltgrust's target_percent)	test/t/056_collect.pl: the collector's settings have Postgres' units, defaults, and contexts
+collector_young_packs	int	16	the number of packs written since a repository's last collection that make a young collection due (Doltgrust's YOUNG_PACKS)	test/t/056_collect.pl: the collector's settings have Postgres' units, defaults, and contexts
+collector_young_size	int	262144	the kB of packs written since a repository's last collection that make a young collection due (Doltgrust's young_size)	test/t/056_collect.pl: the collector's settings have Postgres' units, defaults, and contexts
+fold_threshold	int	-1	the kB of a storage's unfolded changes at which it is folded, -1 for a sixteenth of delta_memory (§III.6's size threshold)	test/t/062_fold_trigger.pl: the fold's settings have Postgres' units, defaults, and contexts
+fold_timeout	int	30	the age in seconds of a storage's unfolded changes at which it is folded (§III.6's materialize_timeout)	test/t/062_fold_trigger.pl: the fold's settings have Postgres' units, defaults, and contexts
+fold_workers	int	2	the number of fold worker processes (design item 6)	test/t/062_fold_trigger.pl: the fold's settings have Postgres' units, defaults, and contexts

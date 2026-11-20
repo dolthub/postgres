@@ -1,0 +1,31 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# The symbols a crate the server links may not reference in its compiled objects (the build without link-time
+# optimization), by a regular expression over the symbol's demangled name (the toolchain's llvm-nm --demangle), with
+# why: the per-crate symbol check holds the doors where clippy can't see, such as a dependency's export, a direct system
+# call, or a spawned process. It covers every member and every linked third-party crate; crates.tsv may list a
+# reviewed exception for a third-party crate. Only the coordinator's refs change this file, each line with PRevPF's YES.
+# pattern	reason
+\bstd::(?:sys::(?:\w+::)*)?fs::	files go through the file door over fd.c
+\bstd::os::(?:unix|windows|wasi)::fs::	files go through the file door over fd.c
+\bstd::(?:sys::(?:\w+::)*)?net::	the fork opens no socket
+\bstd::(?:sys::(?:\w+::)*)?process::	the fork spawns and ends no process itself
+\bstd::thread::(?:spawn|scope|Builder)\b	a backend is one thread: the fork starts none
+\bstd::sys::(?:\w+::)*thread::	a backend is one thread: the fork starts none
+\bstd::io::stdio::	the fork writes nothing to standard output or error
+\bstd::env::set_current_dir\b|\bstd::sys::(?:\w+::)*chdir\b	the working directory is Postgres' to set
+\bstd::sys::(?:\w+::)*(?:condvar::|futex::futex_wait\b)|\bstd::sync::(?:mpsc|mpmc|barrier)::|^_?(?:pthread_cond_wait|pthread_cond_timedwait|SleepConditionVariableSRW|SleepConditionVariableCS|WaitOnAddress)$	a backend is one thread: the fork waits on no other
+^_?(?:open|open64|openat|openat64|creat|creat64|unlink|unlinkat|rename|renameat|renameat2|ftruncate|ftruncate64|truncate|truncate64|mkdir|mkdirat|rmdir|symlink|symlinkat|link|linkat|chdir|fchdir|fsync|fdatasync|syscall)$	a direct file or system call around the doors
+^_?(?:pthread_create|_beginthreadex|CreateThread|fork|vfork|execve|execv|execvp|posix_spawn|posix_spawnp|system|socket|connect|bind|accept|accept4)$	a thread, process, or socket around the doors
+^_?_?imp_?_?(?:CreateFile[AW]|DeleteFile[AW]|MoveFileEx[AW]|CreateDirectory[AW]|RemoveDirectory[AW]|CreateProcess[AW]|CreateThread|WSASocket[AW])$|^(?:CreateFile[AW]|DeleteFile[AW]|MoveFileEx[AW]|CreateDirectory[AW]|RemoveDirectory[AW]|CreateProcess[AW]|WSASocket[AW])$	a Windows file, process, or socket call around the doors
