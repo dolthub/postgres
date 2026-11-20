@@ -14,10 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# post.sh <comments folder> <repository> <head sha>: posts the comments a pull request's test run left as its
-# artifact, each replacing the earlier comment of the bot that carries the same marker, so each suite keeps one comment
+# post.sh <comments folder> <repository> <head sha>: posts the comments a pull request's test run wrote, each
+# replacing the earlier comment of the bot that carries the same marker, so each suite keeps one comment
 # that every push updates, as Doltgres' regression workflow does. The folder holds the pull request's number in
-# `pr-number` and one `<suite>.md` per comment, whose first line is its marker. The artifact came from a run of the
+# `pr-number` and one `<suite>.md` per comment, whose first line is its marker. Its results came from a run of the
 # pull request's code, so it is read as data: the number must name a pull request whose head is the tested commit, and
 # a file whose first line isn't a marker is refused. GH_TOKEN must allow writing pull request comments.
 set -euo pipefail

@@ -21,10 +21,10 @@
 # tests, and dump imports, through the fork's form of its harness. Everything runs on the pull request merged with main
 # (GitHub's merge commit) and on that commit's main parent, test by test, and main's results are cached by its commit,
 # so a push runs only the pull request's side until main moves. The run fails only for a test that passes on main and
-# fails on the pull request, since the fork is unfinished and tests may fail on both, and leaves one comment per suite
-# as an artifact, which pgfork-comment.yml posts. The scripts come from main, or from the pull request while main has
+# fails on the pull request, since the fork is unfinished and tests may fail on both, and posts one comment per suite
+# on the pull request, each push replacing it. The scripts come from main, or from the pull request while main has
 # none. A comment also counts the lines the pull request adds and removes, by category (pgfork/lines.py). Every job
-# has a read-only token and no secret.
+# has a read-only token and no secret, but the comparison's can also write pull request comments.
 
 name: Fork CI
 
@@ -365,8 +365,13 @@ jobs:
     if: always() && github.repository == 'dolthub/postgres' && needs.resolve.result == 'success' &&
       needs.test.result != 'cancelled' && needs.windows.result != 'cancelled'
     runs-on: ubuntu-24.04
+    # It posts the comments itself, with the run's own token, as Doltgres' regression workflow does.
+    permissions:
+      contents: read
+      pull-requests: write
     env:
       MAIN_SHA: ${{ needs.resolve.outputs.main_sha }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Check out main's CI scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -437,6 +442,10 @@ jobs:
           fetch-depth: 2
       - name: Count the lines
         run: python3 .github/workflows/pgfork/lines.py lines-tree "$MAIN_SHA" HEAD comments/lines.md
+      # Each comment replaces the bot's earlier one with the same marker, so each suite keeps one comment.
+      - name: Post the comments
+        if: always()
+        run: .github/workflows/pgfork/post.sh comments "$GITHUB_REPOSITORY" "${{ github.event.pull_request.head.sha }}"
       - name: Upload the comments
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
