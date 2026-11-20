@@ -19,13 +19,17 @@ reads the log `meson test` writes, or with --checks the lines of checks.sh, with
 `bats --tap`, or with --cargo the output of `cargo test`, and records each test's result as ok, fail, or skip. A
 meson test that runs pg_regress is recorded once per pg_regress test, under `<meson test>:<pg_regress test>`, every
 other meson test once under its meson name (`<suite>/<test>`), a check under `checks:<check>`, a bats test under
-`bats:<test>`, and a cargo test under `<test binary>:<test>`. Each meson test, bats run, and test binary is marked
+`bats:<test>`, and a cargo test under `<test binary>:<test>`. A pg_regress test whose every difference from one of its
+expected files is rows reordered under a statement with no ORDER BY passes, since Postgres leaves that order undefined
+(its regression chapter's "Row Ordering Differences"). Each meson test, bats run, and test binary is marked
 complete when it ran to its end (a failed meson test that printed no pg_regress results never did), so a comparison
 can tell a test the branch removed from one a crash or a timeout never reached; --incomplete marks the whole run as
 stopped before its end. --not-run records a run whose tree, by pgfork/targets.sh, builds no server, so its suites
 were never meant to run. The setup suite's steps are left out."""
 
+import glob
 import json
+import os
 import re
 import sys
 
@@ -86,6 +90,67 @@ def checks(log):
     return {f"checks:{name}": status for name, status in lines}, {"checks": True}
 
 
+# The header pg_regress writes above each test's diff in regression.diffs, naming the expected and the results file.
+DIFF_HEADER = re.compile(r"^diff (?:--strip-trailing-cr )?-U3 (\S+) (\S+)$")
+# The line under a psql table's column names, and the row count that closes the table.
+SEPARATOR = re.compile(r"^-+(\+-+)*$")
+ROWS = re.compile(r"^\(\d+ rows?\)$")
+
+
+def unordered(lines):
+    """Returns a psql output's lines with each table's rows sorted, unless the statement above the table orders them
+    (an ORDER BY) or the table is a plan, whose rows' order is its meaning; a row continued over lines (`+`) moves
+    whole."""
+    out, statement, i = [], [], 0
+    while i < len(lines):
+        line = lines[i]
+        text = " ".join(statement).lower()
+        if (SEPARATOR.match(line) and i and lines[i - 1].strip() and not lines[i - 1].startswith("--")
+                and "order by" not in text and "explain" not in text and "QUERY PLAN" not in lines[i - 1]):
+            out.append(line)
+            i += 1
+            rows, row = [], []
+            while i < len(lines) and not ROWS.match(lines[i]):
+                row.append(lines[i])
+                if not lines[i].endswith("+"):
+                    rows.append(row)
+                    row = []
+                i += 1
+            if row:
+                rows.append(row)
+            out += [part for row in sorted(rows) for part in row]
+            statement = []
+            continue
+        statement = [] if ROWS.match(line) else statement + [line]
+        out.append(line)
+        i += 1
+    return out
+
+
+def read(path):
+    """Returns a file's lines without their line ends."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return [line.rstrip("\r\n") for line in f]
+
+
+def reordered(build, name):
+    """Returns the pg_regress tests of a meson test whose results differ from one of their expected files only in the
+    order of rows no ORDER BY orders, read from the diffs it left."""
+    diffs = os.path.join(build, "testrun", *name.split("/"), "regression.diffs")
+    if not os.path.exists(diffs):
+        return set()
+    found = set()
+    for header in filter(None, map(DIFF_HEADER.match, read(diffs))):
+        expected, results = header.group(1), header.group(2)
+        test = os.path.basename(results)[:-len(".out")]
+        stem = os.path.join(os.path.dirname(expected), test)
+        result = unordered(read(results))
+        if any(unordered(read(path)) == result for path in [stem + ".out", *glob.glob(stem + "_*.out")]
+               if os.path.exists(path)):
+            found.add(test)
+    return found
+
+
 def meson(log):
     """Returns the tests and the completed meson tests of a `meson test` log."""
     tests, complete = {}, {}
@@ -98,8 +163,9 @@ def meson(log):
             stdout = (entry.get("stdout") or "").splitlines()
             statuses = [m for m in map(STATUS.match, stdout) if m]
             if statuses:
+                passing = reordered(os.path.dirname(os.path.dirname(log)), name)
                 for m in statuses:
-                    tests[f"{name}:{m.group(2)}"] = "fail" if m.group(1) else "ok"
+                    tests[f"{name}:{m.group(2)}"] = "fail" if m.group(1) and m.group(2) not in passing else "ok"
                 complete[name] = any(PLAN.match(line) for line in stdout)
             else:
                 tests[name] = RESULTS.get(entry["result"], "fail")
