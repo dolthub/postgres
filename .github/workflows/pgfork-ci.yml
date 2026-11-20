@@ -297,11 +297,11 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/AppData/Local/vcpkg/archives
-          key: vcpkg-libxml2-openssl-windows-2025
+          key: vcpkg-libxml2-openssl-icu-windows-2025
       - name: Install dependencies
         if: steps.cached.outputs.cache-hit != 'true'
         run: |
-          "$VCPKG_INSTALLATION_ROOT/vcpkg" install libxml2:x64-windows openssl:x64-windows
+          "$VCPKG_INSTALLATION_ROOT/vcpkg" install libxml2:x64-windows openssl:x64-windows icu:x64-windows
           choco install -y --no-progress winflexbison3
           pipx install meson==1.11.2
           pipx install ninja
