@@ -16,8 +16,9 @@
 #
 """compare.py --title <title> --out <section.md> [--match <prefix>]... [--exclude <prefix>]... --platform <name> <main
 results> <pr results>...: compares the results.py files of main and of the pull request for the tests whose names
-start with a --match prefix (every test without one) and with no --exclude prefix, platform by platform, and writes the
-comment's section for them: a row per platform of each side's pass rate and the counts of regressions and fixes, then
+start with a --match prefix (every test without one) and with no --exclude prefix, platform by platform (a platform
+named more than once takes every pair of files named for it as one run), and writes the comment's section for them:
+a row per platform of each side's pass rate and the counts of regressions and fixes, then
 collapsed lists of both. A test regresses when it passes on main and fails on the pull request, or is missing from a
 pull request run that never reached it, and is fixed when it fails on main and passes on the pull request; the script
 exits 1 when any platform has a regression. A results file that doesn't exist is a run that produced no results: on
@@ -39,6 +40,17 @@ def load(path, prefixes, excluded):
     tests = {k: v for k, v in data["tests"].items()
              if (not prefixes or k.startswith(tuple(prefixes))) and not k.startswith(tuple(excluded))}
     return {"tests": tests, "complete": data["complete"], "incomplete": data["incomplete"]}
+
+
+def merged(runs):
+    """Returns a platform's runs as one run, or None when none has results; one without results makes the merged run
+    incomplete, so the tests it would have run count as not reached."""
+    if all(run is None for run in runs):
+        return None
+    present = [run for run in runs if run]
+    return {"tests": {t: s for run in present for t, s in run["tests"].items()},
+            "complete": {t: c for run in present for t, c in run["complete"].items()},
+            "incomplete": len(present) < len(runs) or any(run["incomplete"] for run in present)}
 
 
 def reached(run, test):
@@ -98,9 +110,13 @@ def main():
     parser.add_argument("--platform", nargs=3, action="append", required=True, metavar=("NAME", "MAIN", "PR"))
     args = parser.parse_args()
 
-    rows, lists, failed = [], [], False
+    platforms = {}
     for name, main_path, pr_path in args.platform:
-        main, pr = load(main_path, args.match, args.exclude), load(pr_path, args.match, args.exclude)
+        platforms.setdefault(name, []).append((main_path, pr_path))
+    rows, lists, failed = [], [], False
+    for name, paths in platforms.items():
+        main = merged([load(m, args.match, args.exclude) for m, _ in paths])
+        pr = merged([load(p, args.match, args.exclude) for _, p in paths])
         regressed, fixed = changes(main, pr)
         failed = failed or bool(regressed)
         rows.append(f"| {name} | {rate(main)} | {rate(pr)} | {colored(len(regressed), 'red')} | "

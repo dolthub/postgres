@@ -560,23 +560,17 @@ jobs:
             [ $suite = isolation ] && out=sections/2-isolation.md
             python3 $compare --title "$title" --match "$suite/$suite:" --out $out "${platforms[@]}" || status=1
           done
-          python3 $compare --title "Other Postgres Suites" --exclude regress/ --exclude isolation/ \
-            --out sections/3-suites.md \
-            --platform ubuntu-24.04 results/suites-ubuntu-24.04-main.json results/suites-ubuntu-24.04-pr.json \
-            || status=1
-          python3 $compare --title "BATS" --out sections/4-bats.md \
+          suites=(ubuntu-24.04 results/suites-ubuntu-24.04-main.json results/suites-ubuntu-24.04-pr.json)
+          doltgrust=(ubuntu-24.04 results/doltgrust-ubuntu-24.04-main.json results/doltgrust-ubuntu-24.04-pr.json)
+          python3 $compare --title "BATS" --out sections/3-bats.md \
             --platform ubuntu-24.04 results/bats-ubuntu-24.04-main.json results/bats-ubuntu-24.04-pr.json \
             --platform macos-15 results/bats-macos-15-main.json results/bats-macos-15-pr.json || status=1
-          corpus=(--platform ubuntu-24.04 results/doltgrust-ubuntu-24.04-main.json
-            results/doltgrust-ubuntu-24.04-pr.json)
-          python3 $compare --title "Engine Tests" --match scripts:doltgrust_engine:: --out sections/5-engine.md \
-            "${corpus[@]}" || status=1
-          python3 $compare --title "Script Tests" --match scripts: --exclude scripts:doltgrust_engine:: \
-            --out sections/6-scripts.md "${corpus[@]}" || status=1
-          python3 $compare --title "Server Tests" --exclude scripts: --exclude dumps: --out sections/7-server.md \
-            "${corpus[@]}" || status=1
-          python3 $compare --title "Dump Imports" --match dumps: --out sections/8-dumps.md "${corpus[@]}" || status=1
-          python3 $compare --title "Static Checks" --out sections/9-checks.md \
+          # Postgres' other suites and Doltgrust's engine tests, scripts, and server tests, as one run.
+          python3 $compare --title "Tests" --exclude regress/ --exclude isolation/ --exclude dumps: \
+            --out sections/4-tests.md --platform "${suites[@]}" --platform "${doltgrust[@]}" || status=1
+          python3 $compare --title "Dump Imports" --match dumps: --out sections/5-dumps.md \
+            --platform "${doltgrust[@]}" || status=1
+          python3 $compare --title "Static Checks" --out sections/6-checks.md \
             --platform ubuntu-24.04 results/checks-ubuntu-24.04-main.json results/checks-ubuntu-24.04-pr.json \
             || status=1
           echo "status=$status" >> "$GITHUB_OUTPUT"
