@@ -24,9 +24,9 @@
 # where they start Doltgrust's, and on Ubuntu its engine-test corpus, server tests, and dump imports, through the
 # fork's form of its harness. Main's results are cached by its commit, so a push tests only the pull request's side
 # until main moves. Last, the comparison, test by test: it fails only for a test that passes on main and fails on the
-# pull request, since the fork is unfinished and tests may fail on both, and posts one comment per suite on the pull
-# request, each push replacing it, and one counting the lines the pull request adds and removes, by category
-# (pgfork/lines.py). The scripts come from main, or from the pull request while main has none. Every job has a
+# pull request, since the fork is unfinished and tests may fail on both, and posts one comment on the pull request,
+# each push replacing it, with the lines the pull request adds and removes by category (pgfork/lines.py) and a table
+# per suite. The scripts come from main, or from the pull request while main has none. Every job has a
 # read-only token and no secret, but the comparison's can also write pull request comments.
 
 name: Fork CI
@@ -516,7 +516,7 @@ jobs:
     needs: [resolve, test, test-windows]
     if: ${{ !cancelled() && github.repository == 'dolthub/postgres' && needs.resolve.result == 'success' }}
     runs-on: ubuntu-24.04
-    # It posts the comments itself, with the run's own token, as Doltgres' regression workflow does.
+    # It posts the comment itself, with the run's own token, as Doltgres' regression workflow does.
     permissions:
       contents: read
       pull-requests: write
@@ -542,48 +542,43 @@ jobs:
           pattern: ci-results-*
           path: results
           merge-multiple: true
+      # Each comparison writes one section of the comment, numbered in the comment's order.
       - name: Compare
         id: compare
-        env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          mkdir comments
-          echo "$PR_NUMBER" > comments/pr-number
+          mkdir sections
+          compare=.github/workflows/pgfork/compare.py
           status=0
           for suite in regress isolation; do
-            title="Regression suite (\`regress\`)"
-            [ $suite = isolation ] && title="Isolation suite (\`isolation\`)"
+            title="Regression Suite"
+            [ $suite = isolation ] && title="Isolation Suite"
             platforms=()
             for os in ubuntu-24.04 macos-15 windows-2025; do
               platforms+=(--platform "$os" "results/$suite-$os-main.json" "results/$suite-$os-pr.json")
             done
-            python3 .github/workflows/pgfork/compare.py --suite $suite --title "$title" --detail \
-              --match "$suite/$suite:" --main-sha "$MAIN_SHA" --pr-sha "$PR_SHA" --out "comments/$suite.md" \
-              "${platforms[@]}" || status=1
+            out=sections/1-regress.md
+            [ $suite = isolation ] && out=sections/2-isolation.md
+            python3 $compare --title "$title" --match "$suite/$suite:" --out $out "${platforms[@]}" || status=1
           done
-          python3 .github/workflows/pgfork/compare.py --suite postgres-suites --title "Postgres' other suites" \
-            --by-suite --exclude regress/ --exclude isolation/ --main-sha "$MAIN_SHA" --pr-sha "$PR_SHA" \
-            --out comments/postgres-suites.md \
-            --platform ubuntu-24.04 results/suites-ubuntu-24.04-main.json results/suites-ubuntu-24.04-pr.json || status=1
-          python3 .github/workflows/pgfork/compare.py --suite checks --title "Static checks" --detail \
-            --main-sha "$MAIN_SHA" --pr-sha "$PR_SHA" --out comments/checks.md \
-            --platform ubuntu-24.04 results/checks-ubuntu-24.04-main.json results/checks-ubuntu-24.04-pr.json || status=1
-          corpus=(--main-sha "$MAIN_SHA" --pr-sha "$PR_SHA"
-            --platform ubuntu-24.04 results/doltgrust-ubuntu-24.04-main.json results/doltgrust-ubuntu-24.04-pr.json)
-          python3 .github/workflows/pgfork/compare.py --suite doltgrust-scripts --title "Doltgrust's scripts" \
-            --match scripts: --exclude scripts:doltgrust_engine:: --out comments/doltgrust-scripts.md \
-            "${corpus[@]}" || status=1
-          python3 .github/workflows/pgfork/compare.py --suite doltgrust-engine --title "Doltgrust's engine tests" \
-            --match scripts:doltgrust_engine:: --out comments/doltgrust-engine.md "${corpus[@]}" || status=1
-          python3 .github/workflows/pgfork/compare.py --suite doltgrust-server --title "Doltgrust's server tests" \
-            --by-suite --exclude scripts: --exclude dumps: --out comments/doltgrust-server.md "${corpus[@]}" || status=1
-          python3 .github/workflows/pgfork/compare.py --suite doltgrust-dumps --title "Doltgrust's dump imports" \
-            --match dumps: --out comments/doltgrust-dumps.md "${corpus[@]}" || status=1
-          python3 .github/workflows/pgfork/compare.py --suite doltgrust-bats --title "Doltgrust's bats" \
-            --main-sha "$MAIN_SHA" --pr-sha "$PR_SHA" --out comments/doltgrust-bats.md \
+          python3 $compare --title "Other Postgres Suites" --exclude regress/ --exclude isolation/ \
+            --out sections/3-suites.md \
+            --platform ubuntu-24.04 results/suites-ubuntu-24.04-main.json results/suites-ubuntu-24.04-pr.json \
+            || status=1
+          python3 $compare --title "BATS" --out sections/4-bats.md \
             --platform ubuntu-24.04 results/bats-ubuntu-24.04-main.json results/bats-ubuntu-24.04-pr.json \
             --platform macos-15 results/bats-macos-15-main.json results/bats-macos-15-pr.json || status=1
+          corpus=(--platform ubuntu-24.04 results/doltgrust-ubuntu-24.04-main.json
+            results/doltgrust-ubuntu-24.04-pr.json)
+          python3 $compare --title "Engine Tests" --match scripts:doltgrust_engine:: --out sections/5-engine.md \
+            "${corpus[@]}" || status=1
+          python3 $compare --title "Script Tests" --match scripts: --exclude scripts:doltgrust_engine:: \
+            --out sections/6-scripts.md "${corpus[@]}" || status=1
+          python3 $compare --title "Server Tests" --exclude scripts: --exclude dumps: --out sections/7-server.md \
+            "${corpus[@]}" || status=1
+          python3 $compare --title "Dump Imports" --match dumps: --out sections/8-dumps.md "${corpus[@]}" || status=1
+          python3 $compare --title "Static Checks" --out sections/9-checks.md \
+            --platform ubuntu-24.04 results/checks-ubuntu-24.04-main.json results/checks-ubuntu-24.04-pr.json \
+            || status=1
           echo "status=$status" >> "$GITHUB_OUTPUT"
       # The lines the pull request adds and removes, by category, from the merge commit's main parent to the commit.
       - name: Check out the pull request merged with main
@@ -592,19 +587,34 @@ jobs:
           path: lines-tree
           fetch-depth: 2
       - name: Count the lines
-        run: python3 .github/workflows/pgfork/lines.py lines-tree "$MAIN_SHA" HEAD comments/lines.md
-      # Each comment replaces the bot's earlier one with the same marker, so each suite keeps one comment.
-      - name: Post the comments
+        run: python3 .github/workflows/pgfork/lines.py lines-tree "$MAIN_SHA" HEAD sections/0-lines.md
+      # The run's one comment, which replaces the bot's earlier one.
+      - name: Post the comment
         if: always()
-        run: .github/workflows/pgfork/post.sh comments "$GITHUB_REPOSITORY" "${{ github.event.pull_request.head.sha }}"
-      - name: Upload the comments
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mkdir -p comments
+          echo "$PR_NUMBER" > comments/pr-number
+          {
+            echo "<!-- pgfork-ci -->"
+            printf '```\nmain: %s\npr:   %s\n```\n\n' "${MAIN_SHA:0:11}" "${PR_SHA:0:11}"
+            for section in sections/*.md; do
+              cat "$section"
+              echo
+            done
+          } > comments/comment.md
+          .github/workflows/pgfork/post.sh comments "$GITHUB_REPOSITORY" "$PR_SHA"
+      - name: Upload the comment
+        if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: pgfork-comments
-          path: comments
+          name: pgfork-comment
+          path: comments/comment.md
           retention-days: 14
       - name: Fail on a regression
         if: steps.compare.outputs.status != '0'
         run: |
-          echo "::error::A test that passes on main fails on this pull request; the comments list it."
+          echo "::error::A test that passes on main fails on this pull request; the comment lists it."
           exit 1

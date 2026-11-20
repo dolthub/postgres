@@ -14,11 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-"""lines.py <tree> <base> <head> <comment.md>: writes the pull request's comment counting the lines its diff from base
-to head adds and removes in three categories, Postgres (Postgres' own files the fork changes), Doltgres (the fork's
-code the server runs), and testing (tests, code that exists only for tests, and the simulator), and in the excluded
-rest (CI, build files, documents, vendored third-party code, tables, and binaries), so the four add up to the diff's
-total. A line of the fork's C inside a `#ifdef DOLTGRES_TEST_...` block counts as testing."""
+"""lines.py <tree> <base> <head> <section.md>: writes the comment's section counting the lines the pull request's
+diff from base to head adds and removes in three categories, Postgres (Postgres' own files the fork changes),
+Doltgres (the fork's code the server runs), and testing (tests, code that exists only for tests, and the simulator),
+and in the excluded rest (CI, build files, documents, vendored third-party code, tables, and binaries), so the four
+add up to the diff's total. A line of the fork's C inside a `#ifdef DOLTGRES_TEST_...` block counts as testing."""
 
 import re
 import subprocess
@@ -90,7 +90,7 @@ def test_lines(text):
 
 
 def main():
-    """Counts the diff's lines by category and writes the comment."""
+    """Counts the diff's lines by category and writes the section."""
     tree, base, head, out = sys.argv[1:5]
     added, removed = defaultdict(int), defaultdict(int)
     for row in git(tree, "diff", "--numstat", "--no-renames", "-z", base, head).decode().split("\0"):
@@ -125,10 +125,7 @@ def main():
     total = (sum(added.values()), sum(removed.values()))
     rows = [f"| {kind} | +{added[kind]:,} | -{removed[kind]:,} |" for kind in CATEGORIES]
     text = "\n".join([
-        "<!-- pgfork-ci:lines -->", "## Lines by category", "",
-        f"`{base[:11]}` to `{head[:11]}`. Postgres is Postgres' own files the fork changes, Doltgres the fork's code "
-        "the server runs, and Testing its tests, test-only code, and the simulator; Excluded is CI, build files, "
-        "documents, vendored third-party code, and tables.", "",
+        "## Lines by Category", "",
         "| Category | Added | Removed |", "|---|---|---|", *rows,
         f"| **Total** | **+{total[0]:,}** | **-{total[1]:,}** |", ""])
     with open(out, "w", encoding="utf-8") as f:
