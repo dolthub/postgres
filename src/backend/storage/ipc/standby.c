@@ -22,6 +22,7 @@
 #include "access/xloginsert.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
+#include "doltgres/hooks.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "replication/slot.h"
@@ -1168,6 +1169,8 @@ standby_redo(XLogReaderState *record)
 
 	/* Backup blocks are not used in standby records */
 	Assert(!XLogRecHasAnyBlockRefs(record));
+
+	doltgres_running_replayed(record);
 
 	/* Do nothing if we're not in hot standby mode */
 	if (standbyState == STANDBY_DISABLED)

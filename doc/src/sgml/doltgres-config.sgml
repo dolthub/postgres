@@ -1,0 +1,330 @@
+<!-- doc/src/sgml/doltgres-config.sgml -->
+<!--
+ Copyright 2026 Dolthub, Inc.
+
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+-->
+
+<chapter id="doltgres-config">
+ <title>Versioned Storage Configuration</title>
+
+ <para>
+  This chapter describes the configuration parameters of the versioned
+  storage, beside those of <xref linkend="runtime-config"/>.
+ </para>
+
+ <sect1 id="doltgres-config-resource">
+  <title>Resource Consumption</title>
+
+  <variablelist>
+   <varlistentry id="guc-delta-memory" xreflabel="delta_memory">
+    <term><varname>delta_memory</varname> (<type>integer</type>)
+    <indexterm>
+     <primary><varname>delta_memory</varname> configuration parameter</primary>
+    </indexterm>
+    </term>
+    <listitem>
+     <para>
+      Sets the amount of shared memory the versioned storage uses for recent
+      changes, which the server allocates at start beside
+      <xref linkend="guc-shared-buffers"/>, as the region
+      <literal>versioned delta</literal> of
+      <link linkend="view-pg-shmem-allocations"><structname>pg_shmem_allocations</structname></link>.
+      If this value is specified without units, it is taken as kilobytes.
+      It is used in whole blocks of 64 kilobytes, rounded down.
+      The default is 32 megabytes (<literal>32MB</literal>), and the minimum
+      is 1 megabyte (<literal>1MB</literal>).
+      Beside it the server takes fixed shared memory sized from this setting
+      and not counted in it, under 1% of it.
+      This parameter can only be set at server start.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="guc-node-cache-size" xreflabel="node_cache_size">
+    <term><varname>node_cache_size</varname> (<type>integer</type>)
+    <indexterm>
+     <primary><varname>node_cache_size</varname> configuration parameter</primary>
+    </indexterm>
+    </term>
+    <listitem>
+     <para>
+      Sets the amount of shared memory the versioned storage uses to cache
+      its tables' and indexes' tree nodes, which the server allocates at start
+      beside <xref linkend="guc-shared-buffers"/>, as the region
+      <literal>versioned node cache</literal> of
+      <link linkend="view-pg-shmem-allocations"><structname>pg_shmem_allocations</structname></link>.
+      If this value is specified without units, it is taken as kilobytes.
+      The default is 128 megabytes (<literal>128MB</literal>), and the minimum
+      is 1 megabyte (<literal>1MB</literal>).
+      This parameter can only be set at server start.
+     </para>
+    </listitem>
+   </varlistentry>
+  </variablelist>
+ </sect1>
+
+ <sect1 id="doltgres-config-developer">
+  <title>Developer Options</title>
+
+  <para>
+   The following parameters are intended for developer testing, and should
+   never be used on a production database.  As such, they have been excluded
+   from the sample <filename>postgresql.conf</filename> file.
+  </para>
+
+  <variablelist>
+   <varlistentry id="guc-debug-fail-preload-allocation" xreflabel="debug_fail_preload_allocation">
+    <term><varname>debug_fail_preload_allocation</varname> (<type>enum</type>)
+    <indexterm>
+     <primary><varname>debug_fail_preload_allocation</varname> configuration parameter</primary>
+    </indexterm>
+    </term>
+    <listitem>
+     <para>
+      Makes the versioned storage's first allocation fail when a process
+      starts, so that tests can check that the failure is reported as an
+      <literal>out of memory</literal> error rather than crashing the server.
+      The allowed values are <literal>off</literal> (the default), which
+      fails nothing; <literal>postmaster</literal>, which fails it in the
+      postmaster, so the server fails to start with an
+      <literal>out of memory</literal> <literal>FATAL</literal> error; and
+      <literal>child</literal>, which fails it in each process the postmaster
+      starts.  The <literal>child</literal> value takes effect only in
+      servers built with <symbol>EXEC_BACKEND</symbol> (see
+      <xref linkend="guc-debug-exec-backend"/>), since only there does each
+      child process run the preload step itself; elsewhere it fails nothing.
+      This parameter can only be set at server start.
+     </para>
+    </listitem>
+   </varlistentry>
+  </variablelist>
+ </sect1>
+ <sect1 id="doltgres-config-collector">
+  <title>Collection</title>
+
+  <para>
+   The collector, a background worker, removes the chunks of the versioned
+   storage that no reader can reach. These parameters set when it runs and
+   how fast. Each can be set only in the <filename>postgresql.conf</filename>
+   file or on the server command line.
+  </para>
+
+  <variablelist>
+   <varlistentry id="guc-collector-first-packs" xreflabel="collector_first_packs">
+    <term><varname>collector_first_packs</varname> (<type>integer</type>)
+    <indexterm>
+     <primary><varname>collector_first_packs</varname> configuration parameter</primary>
+    </indexterm>
+    </term>
+    <listitem>
+     <para>
+      Sets how many packs a database's versioned storage holds before the
+      collector's first full collection of it runs on its own. Doltgrust's
+      <literal>FIRST_COLLECTION_PACKS</literal>. The default is 64.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="guc-collector-full-interval" xreflabel="collector_full_interval">
+    <term><varname>collector_full_interval</varname> (<type>integer</type>)
+    <indexterm>
+     <primary><varname>collector_full_interval</varname> configuration parameter</primary>
+    </indexterm>
+    </term>
+    <listitem>
+     <para>
+      Sets the longest time between full collections of a database's versioned
+      storage. If this value is specified without units, it is taken as
+      seconds. Doltgrust's <literal>FULL_EVERY</literal>. The default is one
+      day (<literal>1d</literal>).
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="guc-collector-io-limit" xreflabel="collector_io_limit">
+    <term><varname>collector_io_limit</varname> (<type>integer</type>)
+    <indexterm>
+     <primary><varname>collector_io_limit</varname> configuration parameter</primary>
+    </indexterm>
+    </term>
+    <listitem>
+     <para>
+      Sets the most bytes a second a collection reads and copies while the
+      database's packs are within
+      <xref linkend="guc-collector-target-percent"/> of their live bytes; past
+      it collections run unpaced. If this
+      value is specified without units, it is taken as kilobytes a second.
+      Zero, the default, sets no limit. Doltgrust's
+      <literal>io_limit</literal>.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="guc-collector-min-free-disk" xreflabel="collector_min_free_disk">
+    <term><varname>collector_min_free_disk</varname> (<type>integer</type>)
+    <indexterm>
+     <primary><varname>collector_min_free_disk</varname> configuration parameter</primary>
+    </indexterm>
+    </term>
+    <listitem>
+     <para>
+      Sets the free space of the data directory's volume below which the
+      collector runs a full collection whenever a database's packs hold more
+      than their live bytes. If this value is specified without units, it is
+      taken as megabytes. The default, <literal>-1</literal>, is the smaller
+      of 10 gigabytes and a tenth of the volume. Doltgrust's
+      <literal>min_free_disk</literal>.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="guc-collector-naptime" xreflabel="collector_naptime">
+    <term><varname>collector_naptime</varname> (<type>integer</type>)
+    <indexterm>
+     <primary><varname>collector_naptime</varname> configuration parameter</primary>
+    </indexterm>
+    </term>
+    <listitem>
+     <para>
+      Sets the time the collector waits between its checks of which
+      collections are due. If this value is specified without units, it is
+      taken as milliseconds. The default is one second
+      (<literal>1s</literal>).
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="guc-collector-target-percent" xreflabel="collector_target_percent">
+    <term><varname>collector_target_percent</varname> (<type>integer</type>)
+    <indexterm>
+     <primary><varname>collector_target_percent</varname> configuration parameter</primary>
+    </indexterm>
+    </term>
+    <listitem>
+     <para>
+      Sets how far a database's packs may pass the live bytes its last full
+      collection found, as a percentage of them, before the next full
+      collection runs, and how far one pack may pass its own live bytes before
+      a collection copies its live chunks out and retires it. Doltgrust's
+      <literal>target_percent</literal>. The default is 50.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="guc-collector-young-packs" xreflabel="collector_young_packs">
+    <term><varname>collector_young_packs</varname> (<type>integer</type>)
+    <indexterm>
+     <primary><varname>collector_young_packs</varname> configuration parameter</primary>
+    </indexterm>
+    </term>
+    <listitem>
+     <para>
+      Sets how many packs written since a database's last collection make a
+      young collection of them due. Doltgrust's
+      <literal>YOUNG_PACKS</literal>. The default is 16.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="guc-collector-young-size" xreflabel="collector_young_size">
+    <term><varname>collector_young_size</varname> (<type>integer</type>)
+    <indexterm>
+     <primary><varname>collector_young_size</varname> configuration parameter</primary>
+    </indexterm>
+    </term>
+    <listitem>
+     <para>
+      Sets the size of the packs written since a database's last collection
+      that makes a young collection of them due. If this value is specified
+      without units, it is taken as kilobytes. Doltgrust's
+      <literal>young_size</literal>. The default is 256 megabytes
+      (<literal>256MB</literal>).
+     </para>
+    </listitem>
+   </varlistentry>
+  </variablelist>
+ </sect1>
+
+ <sect1 id="doltgres-config-fold">
+  <title>Folding</title>
+
+  <para>
+   A fold launcher folds each storage whose unfolded changes pass
+   <xref linkend="guc-fold-threshold"/> or grow older than
+   <xref linkend="guc-fold-timeout"/>, and each storage a writer needs folded
+   to find room in <xref linkend="guc-delta-memory"/>, in fold workers of its
+   own, which never count against
+   <xref linkend="guc-max-worker-processes"/>.
+  </para>
+
+  <variablelist>
+   <varlistentry id="guc-fold-threshold" xreflabel="fold_threshold">
+    <term><varname>fold_threshold</varname> (<type>integer</type>)
+    <indexterm>
+     <primary><varname>fold_threshold</varname> configuration parameter</primary>
+    </indexterm>
+    </term>
+    <listitem>
+     <para>
+      Sets the size of a storage's unfolded changes at which it is folded.
+      If this value is specified without units, it is taken as kilobytes.
+      The default of -1 means a sixteenth of
+      <xref linkend="guc-delta-memory"/>, read again at each reload.
+      Doltgrust's size threshold.
+      This parameter can only be set in the
+      <filename>postgresql.conf</filename> file or on the server command line.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="guc-fold-timeout" xreflabel="fold_timeout">
+    <term><varname>fold_timeout</varname> (<type>integer</type>)
+    <indexterm>
+     <primary><varname>fold_timeout</varname> configuration parameter</primary>
+    </indexterm>
+    </term>
+    <listitem>
+     <para>
+      Sets the age of a storage's unfolded changes at which it is folded:
+      the time since its first change after its last fold, or since that
+      fold when the fold left changes a snapshot still needs. It is also the
+      longest time the fold launcher waits between its checks. If this value
+      is specified without units, it is taken as seconds. Doltgrust's
+      <literal>materialize_timeout</literal>. The default is 30 seconds
+      (<literal>30s</literal>).
+      This parameter can only be set in the
+      <filename>postgresql.conf</filename> file or on the server command line.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="guc-fold-workers" xreflabel="fold_workers">
+    <term><varname>fold_workers</varname> (<type>integer</type>)
+    <indexterm>
+     <primary><varname>fold_workers</varname> configuration parameter</primary>
+    </indexterm>
+    </term>
+    <listitem>
+     <para>
+      Sets the number of fold worker processes that may run at once, beside
+      the fold launcher, in background worker slots the server reserves for
+      them. The default is 2.
+      This parameter can only be set at server start.
+     </para>
+    </listitem>
+   </varlistentry>
+  </variablelist>
+ </sect1>
+
+</chapter>

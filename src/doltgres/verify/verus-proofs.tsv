@@ -1,0 +1,165 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Every Verus proof function and every function with requires, ensures, recommends, or decreases, by file (relative to
+# the workspace), name, and its signature with its clauses (whitespace collapsed), once per occurrence: one missing
+# from the tree or changed, or one the tree adds without a line here, bounces. Only the coordinator removes or changes
+# a line, after PRevPF's review.
+# file	function	specification
+encoding/src/key.rs	null	pub fn null(out: &mut Vec<u8>, order: Order) ensures final(out)@ == old(out)@ + column_key(order, None),
+encoding/src/key.rs	column	pub fn column(out: &mut Vec<u8>, order: Order, write: impl FnOnce(&mut Vec<u8>)) requires forall|o: &mut Vec<u8>| call_requires(write, (o,)), ensures forall|k: Seq<u8>| appends(write, k) ==> final(out)@ == old(out)@ + column_key(order, Some(k)),
+encoding/src/key.rs	lemma_column_keys	pub proof fn lemma_column_keys( order: Order, a: Option<Seq<u8>>, b: Option<Seq<u8>>, ra: Seq<u8>, rb: Seq<u8>, ) requires a is Some && b is Some ==> a->0 == b->0 || (!prefix(a->0, b->0) && !prefix(b->0, a->0)), ensures lex(column_key(order, a) + ra, column_key(order, b) + rb) == if column_order(order, a, b) != 0
+encoding/src/key.rs	lemma_int_keys	pub proof fn lemma_int_keys(a: int, b: int, n: nat, signed: bool) requires fits(a, n, signed), fits(b, n, signed), ensures lex(int_key(a, n, signed), int_key(b, n, signed)) == sign(a, b), a != b ==> !prefix(int_key(a, n, signed), int_key(b, n, signed)),
+encoding/src/key.rs	bool	pub fn bool(out: &mut Vec<u8>, value: bool) ensures final(out)@ == old(out)@ + int_key( if value
+encoding/src/key.rs	byte	pub fn byte(out: &mut Vec<u8>, value: u8) ensures final(out)@ == old(out)@ + int_key(value as int, 1, false), fits(value as int, 1, false),
+encoding/src/key.rs	i16	pub fn i16(out: &mut Vec<u8>, value: i16) ensures final(out)@ == old(out)@ + int_key(value as int, 2, true), fits(value as int, 2, true),
+encoding/src/key.rs	i32	pub fn i32(out: &mut Vec<u8>, value: i32) ensures final(out)@ == old(out)@ + int_key(value as int, 4, true), fits(value as int, 4, true),
+encoding/src/key.rs	i64	pub fn i64(out: &mut Vec<u8>, value: i64) ensures final(out)@ == old(out)@ + int_key(value as int, 8, true), fits(value as int, 8, true),
+encoding/src/key.rs	u32	pub fn u32(out: &mut Vec<u8>, value: u32) ensures final(out)@ == old(out)@ + int_key(value as int, 4, false), fits(value as int, 4, false),
+encoding/src/key.rs	u64	pub fn u64(out: &mut Vec<u8>, value: u64) ensures final(out)@ == old(out)@ + int_key(value as int, 8, false), fits(value as int, 8, false),
+encoding/src/key.rs	be_bytes_u16	fn be_bytes_u16(x: u16) -> (bytes: [u8; 2]) ensures bytes@ == be(x as nat, 2),
+encoding/src/key.rs	be_bytes_u32	fn be_bytes_u32(x: u32) -> (bytes: [u8; 4]) ensures bytes@ == be(x as nat, 4),
+encoding/src/key.rs	lemma_float_keys	pub proof fn lemma_float_keys(a: int, b: int, n: nat) requires n == 4 || n == 8, 0 <= a < pow256(n), 0 <= b < pow256(n), ensures lex(float_key(a, n), float_key(b, n)) == pg_float_order(a, b, n), pg_float_order(a, b, n) != 0 ==> !prefix(float_key(a, n), float_key(b, n)),
+encoding/src/key.rs	float4	fn float4(out: &mut Vec<u8>, bits: u32) ensures final(out)@ == old(out)@ + float_key(bits as int, 4),
+encoding/src/key.rs	float8	fn float8(out: &mut Vec<u8>, bits: u64) ensures final(out)@ == old(out)@ + float_key(bits as int, 8),
+encoding/src/key.rs	len_of	pub open spec fn len_of(v: nat) -> nat decreases v,
+encoding/src/key.rs	lemma_len_of	proof fn lemma_len_of(v: nat, n: nat) requires n >= 1, n == 1 || pow256((n - 1) as nat) <= v, v < pow256(n), ensures len_of(v) == n, decreases n,
+encoding/src/key.rs	lemma_pow256_grows	proof fn lemma_pow256_grows(n: nat) requires n >= 1, ensures pow256(n) >= 256, decreases n,
+encoding/src/key.rs	lemma_pow256_parts	proof fn lemma_pow256_parts(a: nat, b: nat) ensures pow256(a) > 0, pow256(a + b) == pow256(a) * pow256(b), decreases a,
+encoding/src/key.rs	lemma_len_of_bound	proof fn lemma_len_of_bound(v: nat) ensures len_of(v) >= 1, v < pow256(len_of(v)), decreases v,
+encoding/src/key.rs	lemma_be_tail	proof fn lemma_be_tail(x: nat, n: nat, k: nat) requires k <= n, ensures be(x, n).len() == n, be(x, n).subrange(n - k, n as int) == be(x % pow256(k), k), decreases n,
+encoding/src/key.rs	lemma_len_of_lower	proof fn lemma_len_of_lower(v: nat) ensures len_of(v) > 1 ==> pow256((len_of(v) - 1) as nat) <= v, decreases v,
+encoding/src/key.rs	lemma_pow256_order	proof fn lemma_pow256_order(a: nat, b: nat) requires a <= b, ensures pow256(a) <= pow256(b),
+encoding/src/key.rs	lemma_lex_same	proof fn lemma_lex_same(a: Seq<u8>) ensures lex(a, a) == 0, decreases a.len(),
+encoding/src/key.rs	lemma_sortable_keys	pub proof fn lemma_sortable_keys(a: int, b: int) requires i64::MIN <= a <= i64::MAX, i64::MIN <= b <= i64::MAX, ensures lex(sortable_key(a), sortable_key(b)) == sign(a, b), a != b ==> !prefix(sortable_key(a), sortable_key(b)),
+encoding/src/key.rs	byte_len	fn byte_len(v: u64) -> (len: usize) ensures 1 <= len <= 8, len == len_of(v as nat),
+encoding/src/key.rs	sortable_int	pub fn sortable_int(out: &mut Vec<u8>, value: i64) ensures final(out)@ == old(out)@ + sortable_key(value as int),
+encoding/src/key.rs	push_tail	fn push_tail(out: &mut Vec<u8>, bytes: &[u8; 8], len: usize) requires len <= 8, ensures final(out)@ == old(out)@ + bytes@.subrange(8 - len, 8),
+encoding/src/key.rs	new	pub fn new(digits: &'a [u8]) -> (made: Option<Digits<'a>>) ensures made matches Some(made) ==> made@ == digits@,
+encoding/src/key.rs	zeros_before	pub open spec fn zeros_before(ds: Seq<u8>) -> nat decreases ds.len(),
+encoding/src/key.rs	trimmed	pub open spec fn trimmed(ds: Seq<u8>) -> Seq<u8> decreases ds.len(),
+encoding/src/key.rs	lemma_zeros_before	proof fn lemma_zeros_before(ds: Seq<u8>, f: nat) requires f <= ds.len(), forall|j: int| 0 <= j < f ==> ds[j] == 0, f == ds.len() || ds[f as int] != 0, ensures zeros_before(ds) == f, decreases f,
+encoding/src/key.rs	lemma_trimmed	proof fn lemma_trimmed(ds: Seq<u8>, l: nat) requires l < ds.len(), ds[l as int] != 0, forall|j: int| l < j < ds.len() ==> ds[j] == 0, ensures trimmed(ds) == ds.subrange(0, l as int + 1), decreases ds.len(),
+encoding/src/key.rs	lemma_pairs_after_zero	proof fn lemma_pairs_after_zero(t: Seq<u8>) requires t.len() >= 1, ensures pairs(seq![0u8] + t) == seq![(t[0] + 1) as u8] + pairs(t.skip(1)),
+encoding/src/key.rs	numeric	pub fn numeric(out: &mut Vec<u8>, value: &Numeric) ensures final(out)@ == old(out)@ + numeric_key(*value),
+encoding/src/key.rs	first_nonzero	fn first_nonzero(digits: &[u8]) -> (first: usize) ensures first == zeros_before(digits@), first <= digits@.len(), first < digits@.len() ==> digits@[first as int] != 0,
+encoding/src/key.rs	last_nonzero	fn last_nonzero(digits: &[u8], first: usize) -> (last: usize) requires first < digits@.len(), digits@[first as int] != 0, ensures first <= last < digits@.len(), trimmed(digits@.skip(first as int)) == digits@.subrange(first as int, last + 1),
+encoding/src/key.rs	base100_exponent	fn base100_exponent(exponent: i32, first: usize) -> (r: (i64, bool)) requires first <= i32::MAX, ensures r.1 == ((exponent - first) % 2 != 0), r.0 == (if r.1
+encoding/src/key.rs	push_body	fn push_body(out: &mut Vec<u8>, digits: &[u8], first: usize, last: usize, exponent: i32) requires first == zeros_before(digits@), first <= last < digits@.len() <= i32::MAX, trimmed(digits@.skip(first as int)) == digits@.subrange(first as int, last + 1), forall|i: int| 0 <= i < digits@.len() ==> digits@[i] <= 9, ensures final(out)@ == old(out)@ + numeric_body(digits@, exponent as int),
+encoding/src/key.rs	push_pairs	fn push_pairs(out: &mut Vec<u8>, digits: &[u8], from: usize, last: usize) requires from <= last + 1, last < digits@.len() <= i32::MAX, forall|i: int| 0 <= i < digits@.len() ==> digits@[i] <= 9, ensures final(out)@ == old(out)@ + pairs(digits@.subrange(from as int, last + 1)),
+encoding/src/key.rs	invert_from	fn invert_from(out: &mut Vec<u8>, start: usize) ensures start <= old(out)@.len() ==> final(out)@ == old(out)@.subrange(0, start as int) + inverted( old(out)@.subrange(start as int, old(out)@.len() as int), ), start > old(out)@.len() ==> final(out)@ == old(out)@,
+encoding/src/key.rs	lemma_zeros_end	proof fn lemma_zeros_end(ds: Seq<u8>) ensures zeros_before(ds) <= ds.len(), zeros_before(ds) < ds.len() ==> ds[zeros_before(ds) as int] != 0, decreases ds.len(),
+encoding/src/key.rs	lemma_trimmed_start	proof fn lemma_trimmed_start(x: Seq<u8>) ensures trimmed(x).len() <= x.len(), trimmed(x) == x.subrange(0, trimmed(x).len() as int), trimmed(x).len() == 0 || trimmed(x).last() != 0, x.len() > 0 && x[0] != 0 ==> trimmed(x).len() > 0, decreases x.len(),
+encoding/src/key.rs	lemma_significant	proof fn lemma_significant(ds: Seq<u8>) requires zeros_before(ds) < ds.len(), ensures (
+encoding/src/key.rs	lemma_pairs_front	proof fn lemma_pairs_front(s: Seq<u8>) requires s.len() >= 2, ensures pairs(s) == seq![pairs(s)[0]] + pairs(s.skip(2)),
+encoding/src/key.rs	lemma_pairs_order	proof fn lemma_pairs_order(s: Seq<u8>, r: Seq<u8>) requires forall|i: int| 0 <= i < s.len() ==> s[i] <= 9, forall|i: int| 0 <= i < r.len() ==> r[i] <= 9, s.len() == 0 || s.last() != 0, r.len() == 0 || r.last() != 0, ensures lex(pairs(s) + seq![0u8], pairs(r) + seq![0u8]) == lex(s, r), s != r ==> lex(s, r) != 0 && !prefix(pairs(s) + seq![0u8], pairs(r) + seq![0u8]), decreases s.len(),
+encoding/src/key.rs	lemma_lex_inverted	proof fn lemma_lex_inverted(x: Seq<u8>, y: Seq<u8>) requires x == y || (!prefix(x, y) && !prefix(y, x)), ensures lex(inverted(x), inverted(y)) == -lex(x, y), x != y ==> !prefix(inverted(x), inverted(y)), decreases x.len(),
+encoding/src/key.rs	lemma_body_order	proof fn lemma_body_order(da: Seq<u8>, ea: int, db: Seq<u8>, eb: int) requires zeros_before(da) < da.len() <= i32::MAX, zeros_before(db) < db.len() <= i32::MAX, forall|i: int| 0 <= i < da.len() ==> da[i] <= 9, forall|i: int| 0 <= i < db.len() ==> db[i] <= 9, i32::MIN <= ea <= i32::MAX, i32::MIN <= eb <= i32::MAX, ensures lex(numeric_body(da, ea), numeric_body(db, eb)) == magnitude_order(da, ea, db, eb), magnitude_order(da, ea, db, eb) != 0 ==> !prefix( numeric_body(da, ea), numeric_body(db, eb), ), magnitude_order(da, ea, db, eb) == 0 ==> numeric_body(da, ea) == numeric_body(db, eb),
+encoding/src/key.rs	lemma_numeric_keys	pub proof fn lemma_numeric_keys(a: Numeric, b: Numeric) requires numeric_digits(a), numeric_digits(b), ensures lex(numeric_key(a), numeric_key(b)) == numeric_order(a, b), numeric_order(a, b) != 0 ==> !prefix(numeric_key(a), numeric_key(b)),
+encoding/src/key.rs	lex	pub open spec fn lex(a: Seq<u8>, b: Seq<u8>) -> int decreases a.len(),
+encoding/src/key.rs	escaped	pub open spec fn escaped(s: Seq<u8>) -> Seq<u8> decreases s.len(),
+encoding/src/key.rs	lemma_escaped_push	proof fn lemma_escaped_push(s: Seq<u8>, b: u8) ensures escaped(s.push(b)) == escaped(s) + step(b), decreases s.len(),
+encoding/src/key.rs	lemma_lex_common	proof fn lemma_lex_common(c: Seq<u8>, x: Seq<u8>, y: Seq<u8>) ensures lex(c + x, c + y) == lex(x, y), prefix(c + x, c + y) == prefix(x, y), decreases c.len(),
+encoding/src/key.rs	lemma_lex_first	proof fn lemma_lex_first(x: Seq<u8>, y: Seq<u8>) requires x.len() > 0, y.len() > 0, x[0] != y[0], ensures lex(x, y) == sign(x[0] as int, y[0] as int), !prefix(x, y),
+encoding/src/key.rs	lemma_prefix_drop	proof fn lemma_prefix_drop(x: Seq<u8>, y: Seq<u8>) requires x.len() > 0, y.len() > 0, x[0] == y[0], ensures prefix(x, y) == prefix(x.drop_first(), y.drop_first()),
+encoding/src/key.rs	lemma_lex_apart	proof fn lemma_lex_apart(p: Seq<u8>, x: Seq<u8>, q: Seq<u8>, y: Seq<u8>) requires !prefix(p, q), !prefix(q, p), ensures lex(p + x, q + y) == lex(p, q), !prefix(p + x, q + y), decreases p.len(),
+encoding/src/key.rs	lemma_lex_zero	proof fn lemma_lex_zero(x: Seq<u8>, y: Seq<u8>) ensures lex(x, y) == 0 ==> x == y, decreases x.len(),
+encoding/src/key.rs	lemma_lex_flip	proof fn lemma_lex_flip(x: Seq<u8>, y: Seq<u8>) ensures lex(x, y) == -lex(y, x), decreases x.len(),
+encoding/src/key.rs	lemma_bytes_keys	pub proof fn lemma_bytes_keys(a: Seq<u8>, b: Seq<u8>) ensures lex(bytes_key(a), bytes_key(b)) == lex(a, b), a != b ==> !prefix(bytes_key(a), bytes_key(b)), decreases a.len() + b.len(),
+encoding/src/key.rs	pow256	pub open spec fn pow256(n: nat) -> nat decreases n,
+encoding/src/key.rs	be	pub open spec fn be(x: nat, n: nat) -> Seq<u8> decreases n,
+encoding/src/key.rs	lemma_lex_push	proof fn lemma_lex_push(p: Seq<u8>, q: Seq<u8>, a: u8, b: u8) requires p.len() == q.len(), ensures lex(p.push(a), q.push(b)) == if lex(p, q) != 0
+encoding/src/key.rs	lemma_be_order	pub proof fn lemma_be_order(x: nat, y: nat, n: nat) requires x < pow256(n), y < pow256(n), ensures lex(be(x, n), be(y, n)) == sign(x as int, y as int), be(x, n).len() == n, decreases n,
+encoding/src/key.rs	be_bytes_u64	fn be_bytes_u64(x: u64) -> (bytes: [u8; 8]) ensures bytes@ == be(x as nat, 8),
+encoding/src/key.rs	lemma_text_keys	pub proof fn lemma_text_keys(a: Seq<u8>, b: Seq<u8>) requires !a.contains(0u8), !b.contains(0u8), ensures lex(text_key(a), text_key(b)) == lex(a, b), a != b ==> !prefix(text_key(a), text_key(b)), decreases a.len() + b.len(),
+encoding/src/key.rs	append_text	fn append_text(out: &mut Vec<u8>, value: &[u8]) ensures final(out)@ == old(out)@ + text_key(value@),
+encoding/src/key.rs	bytes	pub fn bytes(out: &mut Vec<u8>, value: &[u8]) ensures final(out)@ == old(out)@ + bytes_key(value@),
+encoding/src/key.rs	interval	pub fn interval(out: &mut Vec<u8>, months: i32, days: i32, micros: i64) ensures final(out)@ == old(out)@ + int_key( interval_span(months as int, days as int, micros as int), 16, true, ), fits(interval_span(months as int, days as int, micros as int), 16, true),
+encoding/src/key.rs	be_bytes_u128	fn be_bytes_u128(x: u128) -> (bytes: [u8; 16]) ensures bytes@ == be(x as nat, 16),
+encoding/src/key.rs	new	pub fn new(micros: i64, zone: i32) -> (made: Option<TimeWithZone>) ensures made matches Some(made) ==> made@ == (micros as int, zone as int),
+encoding/src/key.rs	timetz	pub fn timetz(out: &mut Vec<u8>, value: TimeWithZone) ensures final(out)@ == old(out)@ + int_key(value@.0 + value@.1 * 1_000_000, 8, true) + int_key( value@.1, 4, true, ), fits(value@.0 + value@.1 * 1_000_000, 8, true), fits(value@.1, 4, true),
+encoding/src/key.rs	lemma_timetz_keys	pub proof fn lemma_timetz_keys(ta: int, za: int, tb: int, zb: int) requires fits(ta, 8, true), fits(tb, 8, true), fits(za, 4, true), fits(zb, 4, true), ensures lex( int_key(ta, 8, true) + int_key(za, 4, true), int_key(tb, 8, true) + int_key(zb, 4, true), ) == if ta != tb
+encoding/src/key.rs	range_empty	pub fn range_empty(out: &mut Vec<u8>) ensures final(out)@ == old(out)@ + range_key(None),
+encoding/src/key.rs	range	pub fn range<T, F: FnMut(&mut Vec<u8>, T)>( out: &mut Vec<u8>, lower: Option<(T, bool)>, upper: Option<(T, bool)>, mut write: F, ) requires forall|g: F, o: &mut Vec<u8>, v: T| call_requires(g, (o, v)), ensures forall|key: spec_fn(T) -> Seq<u8>| writes::<T, F>(key) ==> final(out)@ == old(out)@ + range_key( Some((keyed(lower, key), keyed(upper, key))), ),
+encoding/src/key.rs	lemma_bound_keys	proof fn lemma_bound_keys( a: Option<(Seq<u8>, bool)>, b: Option<(Seq<u8>, bool)>, lower: bool, ra: Seq<u8>, rb: Seq<u8>, ) requires apart(a, b), ensures lex(bound_key(a, lower) + ra, bound_key(b, lower) + rb) == if bound_order(a, b, lower) != 0
+encoding/src/key.rs	lemma_range_keys	pub proof fn lemma_range_keys( a: Option<(Option<(Seq<u8>, bool)>, Option<(Seq<u8>, bool)>)>, b: Option<(Option<(Seq<u8>, bool)>, Option<(Seq<u8>, bool)>)>, ) requires a is Some && b is Some ==> apart((a->0).0, (b->0).0) && apart((a->0).1, (b->0).1), ensures lex(range_key(a), range_key(b)) == range_order(a, b), range_order(a, b) != 0 ==> !prefix(range_key(a), range_key(b)),
+encoding/src/tuple.rs	lemma_ends_ordered	proof fn lemma_ends_ordered(bytes: Seq<u8>, ends_at: int, n: int, j: int, k: int) requires forall|m: int| 0 < m < n ==> end_of(bytes, ends_at, m - 1) <= #[trigger] end_of(bytes, ends_at, m), 0 <= j <= k < n, ensures end_of(bytes, ends_at, j) <= end_of(bytes, ends_at, k), decreases k - j,
+encoding/src/tuple.rs	bitmap_len	fn bitmap_len(n: usize) -> (len: usize) ensures len == (n + 7) / 8,
+encoding/src/tuple.rs	end	fn end(&self, i: usize) -> (end: usize) requires i < self.inline, ensures end == end_of(self.bytes@, self.ends_at as int, i as int), self.data_at + end <= self.bytes@.len(),
+encoding/src/tuple.rs	external	fn external(&self, i: usize) -> bool requires i < self.inline,
+chunks/src/address.rs	lemma_same_bytes	pub proof fn lemma_same_bytes(a: Address, b: Address) requires forall|j: int| 0 <= j < 32 ==> a.0[j] == b.0[j], ensures a == b,
+chunks/src/address.rs	lemma_below_from	proof fn lemma_below_from(a: Address, b: Address, k: int) requires 0 <= k <= 32, forall|j: int| 0 <= j < k ==> a.0[j] == b.0[j], ensures a == b || below(a, b) || below(b, a), decreases 32 - k,
+chunks/src/address.rs	lemma_below_total	pub proof fn lemma_below_total(a: Address, b: Address) ensures a == b || below(a, b) || below(b, a), !(below(a, b) && below(b, a)), !(below(a, b) && a == b),
+chunks/src/address.rs	lemma_below_trans	pub proof fn lemma_below_trans(a: Address, b: Address, c: Address) requires below(a, b), below(b, c), ensures below(a, c),
+chunks/src/address.rs	of	pub fn of(bytes: &[u8]) -> (address: Address) ensures address == address_spec(bytes@),
+chunks/src/address.rs	before	pub fn before(&self, other: &Address) -> (before: bool) ensures before == below(*self, *other),
+chunks/src/address.rs	same	pub fn same(&self, other: &Address) -> (same: bool) ensures same == (*self == *other),
+chunks/src/chunk.rs	lemma_hashes	pub proof fn lemma_hashes(tracked &self) ensures self.hashed_view() <= self.bytes_view().len(), self.address_view() == crate::address::address_spec( self.bytes_view().take(self.hashed_view() as int), ),
+chunks/src/chunk.rs	checked	pub(crate) fn checked(address: &Address, stored: Vec<u8>, hashed: usize) -> (chunk: Option< Chunk, >) ensures chunk matches Some(c) ==> c.address_view() == *address,
+chunks/src/chunk.rs	address	pub fn address(&self) -> (address: Address) ensures address == self.address_view(),
+chunks/src/chunk.rs	bytes	pub fn bytes(&self) -> (bytes: &[u8]) ensures bytes@ == self.bytes_view(),
+chunks/src/chunk.rs	clone	fn clone(&self) -> (chunk: Chunk) ensures chunk.address_view() == self.address_view(), chunk.bytes_view() == self.bytes_view(), chunk.hashed_view() == self.hashed_view(),
+chunks/src/hash.rs	len	pub fn len(&self) -> (len: usize) ensures len == vstd::std_specs::hash::spec_hash_map_len(&self.model()),
+chunks/src/hash.rs	get	pub fn get<Q: Eq + Hash + ?Sized>(&self, key: &Q) -> (value: Option<&V>) where K: Borrow<Q> ensures vstd::std_specs::hash::obeys_key_model::<K>() && vstd::std_specs::hash::builds_valid_hashers::<S>() ==> match value
+chunks/src/index.rs	key_of	spec fn key_of(&self) -> Address; fn key(&self) -> (key: &Address) ensures *key == self.key_of(), ; } impl Keyed for Address
+chunks/src/index.rs	key	fn key(&self) -> (key: &Address) ensures *key == self.key_of(), ; } impl Keyed for Address
+chunks/src/index.rs	first_from	pub fn first_from<T: Keyed>(values: &[T], key: &Address) -> (at: usize) requires sorted(values@), ensures at <= values.len(), forall|i: int| 0 <= i < at ==> crate::address::below(#[trigger] values[i].key_of(), *key), forall|i: int| at <= i < values.len() ==> !crate::address::below(#[trigger] values[i].key_of(), *key),
+chunks/src/index.rs	first_past	pub fn first_past<T: Keyed>(values: &[T], key: &Address) -> (at: usize) requires sorted(values@), ensures at <= values.len(), forall|i: int| 0 <= i < at ==> !crate::address::below(*key, #[trigger] values[i].key_of()), forall|i: int| at <= i < values.len() ==> crate::address::below(*key, #[trigger] values[i].key_of()),
+chunks/src/index.rs	in_order	pub fn in_order<T: Keyed>(values: &[T]) -> (ok: bool) ensures ok == sorted(values@),
+chunks/src/index.rs	block_range	pub fn block_range(fences: &[Address], key: &Address) -> (range: (usize, usize)) requires sorted(fences@), ensures brackets(fences@, *key, range),
+chunks/src/index.rs	first_with	pub fn first_with<V>(entries: &[(Address, V)], key: &Address) -> (found: Option<usize>) requires sorted(entries@), ensures match found
+chunks/src/index.rs	block_fits	pub fn block_fits<V>(entries: &[(Address, V)], fences: &[Address], i: usize) -> (ok: bool) ensures ok == fits(entries@, fences@, i as int),
+chunks/src/index.rs	lemma_key_within	pub proof fn lemma_key_within<V>( entries: Seq<(Address, V)>, fences: Seq<Address>, i: int, at: int, key: Address, range: (usize, usize), ) requires fits(entries, fences, i), 0 <= at < entries.len(), entries[at].0 == key, brackets(fences, key, range), ensures range.0 <= i < range.1,
+chunks/src/index.rs	holds	spec fn holds(&self, question: Q) -> A; fn ask(&mut self, with: &mut C, question: &Q) -> (answer: core::result::Result<A, E>) ensures forall|q: Q| #[trigger] final(self).holds(q) == old(self).holds(q), answer matches Ok(a) ==> a == old(self).holds(*question), ; } pub struct Fences
+chunks/src/index.rs	ask	fn ask(&mut self, with: &mut C, question: &Q) -> (answer: core::result::Result<A, E>) ensures forall|q: Q| #[trigger] final(self).holds(q) == old(self).holds(q), answer matches Ok(a) ==> a == old(self).holds(*question), ; } pub struct Fences
+chunks/src/index.rs	keys	pub fn keys(&self) -> (keys: &[Address]) ensures keys@ == self.seq(), sorted(keys@),
+chunks/src/index.rs	first_in_run	pub fn first_in_run<C, V: Copy, E, S: Source<C, (usize, usize), Vec<(Address, V)>, E>>( source: &mut S, with: &mut C, run: usize, fences: &Fences, key: &Address, ) -> (found: core::result::Result<Option<(usize, V)>, Unread<E>>) ensures forall|q: (usize, usize)| #[trigger] final(source).holds(q) == old(source).holds(q), match found
+chunks/src/index.rs	first_in_index	pub fn first_in_index<C, V: Copy, E, S: Source<C, (usize, usize), Vec<(Address, V)>, E>>( source: &mut S, with: &mut C, fences: &[&Fences], key: &Address, ) -> (found: core::result::Result<Found<V>, Unread<E>>) ensures forall|q: (usize, usize)| #[trigger] final(source).holds(q) == old(source).holds(q), match found
+chunks/src/packs/follow.rs	leads	spec fn leads(&self, from: (u64, u64), to: Locator) -> bool; spec fn ends(&self, from: (u64, u64)) -> bool; fn ask(&mut self, with: &mut C, from: &(u64, u64)) -> (answer: core::result::Result< Found<Locator>, E, >) ensures forall|place: (u64, u64), to: Locator| #[trigger] final(self).leads(place, to) == old(self).leads(place, to), forall|place: (u64, u64)| #[trigger] final(self).ends(place) == old(self).ends(place), match answer
+chunks/src/packs/follow.rs	ends	spec fn ends(&self, from: (u64, u64)) -> bool; fn ask(&mut self, with: &mut C, from: &(u64, u64)) -> (answer: core::result::Result< Found<Locator>, E, >) ensures forall|place: (u64, u64), to: Locator| #[trigger] final(self).leads(place, to) == old(self).leads(place, to), forall|place: (u64, u64)| #[trigger] final(self).ends(place) == old(self).ends(place), match answer
+chunks/src/packs/follow.rs	ask	fn ask(&mut self, with: &mut C, from: &(u64, u64)) -> (answer: core::result::Result< Found<Locator>, E, >) ensures forall|place: (u64, u64), to: Locator| #[trigger] final(self).leads(place, to) == old(self).leads(place, to), forall|place: (u64, u64)| #[trigger] final(self).ends(place) == old(self).ends(place), match answer
+chunks/src/packs/follow.rs	place_key	pub fn place_key(from: &(u64, u64)) -> (key: Address) ensures key == place_key_of(*from),
+chunks/src/packs/follow.rs	lemma_place_keys_differ	pub proof fn lemma_place_keys_differ(a: (u64, u64), b: (u64, u64)) requires place_key_of(a) == place_key_of(b), ensures a == b,
+chunks/src/packs/follow.rs	lemma_same_blocks	proof fn lemma_same_blocks<C, V, E, S: Source<C, (usize, usize), Vec<(Address, V)>, E>>(a: S, b: S) requires forall|q: (usize, usize)| #![trigger a.holds(q)] #![trigger b.holds(q)] a.holds(q) == b.holds(q), ensures forall|run: usize, fences: Seq<Address>, key: Address, value: V| #![trigger crate::index::has(a, run, fences, key, value)] #![trigger crate::index::has(b, run, fences, key, value)] crate::index::has(a, run, fences, key, value) == crate::index::has( b, run, fences, key, value, ), forall|run: usize, fences: Seq<Address>, key: Address| #![trigger crate::index::lacks(a, run, fences, key)] #![trigger crate::index::lacks(b, run, fences, key)] crate::index::lacks(a, run, fences, key) == crate::index::lacks(b, run, fences, key),
+chunks/src/packs/follow.rs	follow	pub(crate) fn follow<F: Forwards<C, E>, C, E, V>( forwards: &mut F, with: &mut C, copy: Locator, listed: &BTreeMap<u64, V>, added: u64, ) -> (found: core::result::Result<Locator, Stopped<E>>) ensures forall|place: (u64, u64), to: Locator| #[trigger] final(forwards).leads(place, to) == old(forwards).leads(place, to), forall|place: (u64, u64)| #[trigger] final(forwards).ends(place) == old(forwards).ends(place), match found
+chunks/src/trailer.rs	subtree_maxes	fn subtree_maxes(bytes: &[u8]) -> (maxes: core::result::Result<Vec<u64>, Option<Malformed>>) ensures maxes matches Ok(m) ==> m@.len() <= bytes@.len() && forall|i: int| 0 <= i < m@.len() ==> m@[i] < 0x1_0000_0000_0000, crate::varint::sdec(bytes@, 0) matches Some((v, _)) ==> v >= 0x1_0000_0000_0000 ==> maxes is Err,
+chunks/src/varint.rs	enc	pub open spec fn enc(v: nat) -> Seq<u8> decreases v,
+chunks/src/varint.rs	lemma_low_byte	proof fn lemma_low_byte(v: u64) requires v >= 0x80, ensures (v as u8 | 0x80) == ((v % 128) + 128) as u8,
+chunks/src/varint.rs	put_varint	pub fn put_varint(out: &mut Vec<u8>, value: u64) ensures final(out)@ == old(out)@ + enc(value as nat),
+chunks/src/varint.rs	lemma_enc_len	proof fn lemma_enc_len(v: nat, k: nat) requires k >= 1, v < pow128(k), ensures enc(v).len() <= k, v >= 128 ==> enc(v).len() >= 2, decreases k,
+chunks/src/varint.rs	varint_len	pub fn varint_len(value: u64) -> (len: usize) ensures len == enc(value as nat).len(),
+chunks/src/varint.rs	sdec	pub open spec fn sdec(s: Seq<u8>, i: nat) -> Option<(nat, nat)> decreases 10 - i,
+chunks/src/varint.rs	lemma_sdec_takes	pub proof fn lemma_sdec_takes(s: Seq<u8>, i: nat) ensures sdec(s, i) matches Some((_, k)) ==> i < k <= s.len(), decreases 10 - i,
+chunks/src/varint.rs	lemma_sdec_enc	pub proof fn lemma_sdec_enc(s: Seq<u8>, i: nat, w: nat) requires i < 10, i + enc(w).len() <= s.len(), s.subrange(i as int, (i + enc(w).len()) as int) == enc(w), i == 0 || w > 0, w * pow128(i) <= u64::MAX, ensures sdec(s, i) == Some((w * pow128(i), i + enc(w).len())), decreases w,
+chunks/src/varint.rs	lemma_enc_sdec	pub proof fn lemma_enc_sdec(s: Seq<u8>, i: nat) requires sdec(s, i) is Some, ensures (
+chunks/src/varint.rs	lemma_pow128_positive	proof fn lemma_pow128_positive(i: nat) ensures pow128(i) > 0, decreases i,
+chunks/src/varint.rs	pow128	pub open spec fn pow128(i: nat) -> nat decreases i,
+chunks/src/varint.rs	decode	pub fn decode(bytes: &[u8], at: &mut usize) -> (read: core::result::Result<u64, Malformed>) ensures *old(at) <= bytes@.len() ==> match sdec( bytes@.subrange(*old(at) as int, bytes@.len() as int), 0, )
+chunks/src/varint.rs	decode_long	fn decode_long(bytes: &[u8], at: &mut usize) -> (read: core::result::Result<u64, Malformed>) ensures *old(at) <= bytes@.len() ==> match sdec( bytes@.subrange(*old(at) as int, bytes@.len() as int), 0, )
+chunks/src/varint.rs	lemma_pow128_step	proof fn lemma_pow128_step(i: nat, shift: u32) requires i >= 1, shift == 7 * i, pow128((i - 1) as nat) == vstd::arithmetic::power2::pow2((shift - 7) as nat), ensures pow128(i) == vstd::arithmetic::power2::pow2(shift as nat),
+chunks/src/varint.rs	lemma_shift_adds	proof fn lemma_shift_adds(value: u64, low: u64, shift: u32, i: nat, byte: u8) requires shift == 7 * i, i < 10, low < 128, shift == 63 ==> low <= 1, (value as nat) < pow128(i), pow128(i) == vstd::arithmetic::power2::pow2(shift as nat), ensures (value | (low << shift)) as nat == value as nat + low as nat * pow128(i), ((value | (low << shift)) as nat) < pow128(i) * 128,
+trees/src/chunker.rs	lemma_first_entry	pub proof fn lemma_first_entry( a: (u8, u64, u64, u64, u32, Seq<u8>), b: (u8, u64, u64, u64, u32, Seq<u8>), key: Seq<u8>, size: u64, ) requires a.4 == 0, (a.0, a.1, a.2, a.3, a.4) == (b.0, b.1, b.2, b.3, b.4), ensures (
+trees/src/chunker.rs	grow	fn grow(&mut self, key: &[u8], size: u64) -> (before: u64) ensures before == old(self).state().2, final(self).state() == grown(old(self).state(), key@, size),
+trees/src/chunker.rs	reset	fn reset(&mut self) ensures final(self).state() == ( old(self).state().0, old(self).state().1, 0u64, 0u64, 0u32, old(self).state().5, ),
+trees/src/node.rs	shared_len	pub open spec fn shared_len(a: Seq<u8>, b: Seq<u8>) -> nat decreases a.len(),
+trees/src/node.rs	lemma_shared_at	proof fn lemma_shared_at(a: Seq<u8>, b: Seq<u8>, i: nat) requires i <= a.len(), i <= b.len(), forall|j: int| 0 <= j < i ==> a[j] == b[j], i == a.len() || i == b.len() || a[i as int] != b[i as int], ensures shared_len(a, b) == i, decreases i,
+trees/src/node.rs	shared_prefix	pub(crate) fn shared_prefix(a: &[u8], b: &[u8]) -> (shared: usize) ensures shared == shared_len(a@, b@),
+chunks/src/trailer.rs	offset	pub fn offset(&self) -> (offset: u64) ensures offset == self.offset_of(),
+txn/src/counted.rs	keyless_value	pub fn keyless_value(count: u64, tuple: &[u8]) -> (value: Vec<u8>) ensures value@ == chunks::varint::enc(count as nat) + tuple@,
+txn/src/counted.rs	counted_parts	fn counted_parts(value: &[u8]) -> (parts: Option<(u64, &[u8])>) ensures match chunks::varint::sdec(value@, 0)
+txn/src/counted.rs	lemma_keyless_round_trip	pub proof fn lemma_keyless_round_trip(count: u64, tuple: Seq<u8>) ensures chunks::varint::sdec(chunks::varint::enc(count as nat) + tuple, 0) == Some( (count as nat, chunks::varint::enc(count as nat).len()), ), (chunks::varint::enc(count as nat) + tuple).subrange( chunks::varint::enc(count as nat).len() as int, (chunks::varint::enc(count as nat) + tuple).len() as int, ) == tuple,
+txn/src/counted.rs	lemma_enc_short	proof fn lemma_enc_short(v: nat) requires v <= u64::MAX, ensures chunks::varint::enc(v).len() <= 10,
+txn/src/counted.rs	lemma_counted_value	pub proof fn lemma_counted_value(bytes: Seq<u8>) requires chunks::varint::sdec(bytes, 0) is Some, ensures (
+txn/src/counted.rs	shifted	fn shifted(addresses: &[(u32, Locator)], from: u32, to: u32) -> (shifted: Vec<(u32, Locator)>) ensures shifted@.len() == addresses@.len(), forall|k: int| 0 <= k < addresses@.len() ==> #[trigger] shifted@[k] == ( offset_moved(addresses@[k].0, from, to), addresses@[k].1, ),
+txn/src/counted.rs	recount_parts	fn recount_parts( value_len: usize, tuple: &[u8], addresses: &[(u32, Locator)], count: u64, out: &mut Vec<u8>, out_addresses: &mut Vec<(u32, Locator)>, ) ensures final(out)@ == chunks::varint::enc(count as nat) + tuple@, final(out_addresses)@.len() == addresses@.len(), forall|k: int| 0 <= k < addresses@.len() ==> #[trigger] final(out_addresses)@[k] == ( offset_moved( addresses@[k].0, prefix_len(value_len as int, tuple@.len() as int), chunks::varint::enc(count as nat).len() as u32, ), addresses@[k].1, ),
+txn/src/counted.rs	keyless_addresses	pub fn keyless_addresses(count: u64, addresses: &[(u32, Locator)]) -> (moved: Vec<(u32, Locator)>) ensures moved@.len() == addresses@.len(), forall|k: int| 0 <= k < addresses@.len() ==> #[trigger] moved@[k] == ( offset_moved(addresses@[k].0, 0, chunks::varint::enc(count as nat).len() as u32), addresses@[k].1, ),

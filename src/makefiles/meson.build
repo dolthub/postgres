@@ -114,8 +114,12 @@ pgxs_kv = {
   'LDFLAGS_SL': var_ldflags_sl,
 
   # TODO: requires bitcode generation to be implemented for meson
-  'BITCODE_CFLAGS': '',
-  'BITCODE_CXXFLAGS': '',
+  # The fork's -ffp-contract=off, wherever CFLAGS and CXXFLAGS carry it, so an
+  # extension's inlined code rounds as its compiled code does
+  'BITCODE_CFLAGS':
+    cflags.contains('-ffp-contract=off') ? '-ffp-contract=off' : '',
+  'BITCODE_CXXFLAGS':
+    cxxflags.contains('-ffp-contract=off') ? '-ffp-contract=off' : '',
 
   'BISONFLAGS': ' '.join(bison_flags),
   'FLEXFLAGS': ' '.join(flex_flags),

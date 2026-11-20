@@ -76,6 +76,7 @@
  */
 #include "postgres.h"
 
+#include "doltgres/hooks.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
 #include "pgstat.h"
@@ -185,7 +186,7 @@ typedef struct LWLockTrancheShmemData
 		 * was allocated with LWLockNewTrancheId()
 		 */
 		int			main_array_idx;
-	}			user_defined[MAX_USER_DEFINED_TRANCHES];
+	}			user_defined[MAX_USER_DEFINED_TRANCHES + DOLTGRES_LWLOCK_TRANCHES];
 
 	int			num_user_defined;	/* 'user_defined' entries in use */
 
@@ -578,7 +579,7 @@ LWLockNewTrancheId(const char *name)
 	/* The counter and the tranche names are protected by the spinlock */
 	SpinLockAcquire(&LWLockTranches->lock);
 
-	if (LWLockTranches->num_user_defined >= MAX_USER_DEFINED_TRANCHES)
+	if (LWLockTranches->num_user_defined >= MAX_USER_DEFINED_TRANCHES + DOLTGRES_LWLOCK_TRANCHES)
 	{
 		SpinLockRelease(&LWLockTranches->lock);
 		ereport(ERROR,

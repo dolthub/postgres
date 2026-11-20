@@ -1,0 +1,106 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# The C port's tokens (the port text's section 7): one row per Rust compile-fail case of a crate with a C port, naming
+# the C form that keeps the case's token, what the C keeps and can't refuse, and the C case that shows it, a t/117
+# subtest ("t/117: <name>"), a C test case ("c: <crate>::<module>::tests::<name>"), or a sim or lockstep case
+# ("rust: <path>::<name>"), several separated by "; ", or the form outstanding, with "-" for its item, keeps, and check, for
+# a case whose C form is still owed. t/117 checks that each case has one row, that each check exists, and that no case
+# with a C form of its own is outstanding; the port lands only with no row outstanding.
+# crate	rust_case	item	c_form	keeps	check
+chunks	chunks/fail/chunk_forged	chunks::chunk::Chunk	opaque-storage	a ChunksChunkChunk is opaque storage whose layout only chunk.c knows, so no other C names its parts, though the C can't refuse a value of it zero-initialized or with bytes copied into it; outside chunk.c, t/117 refuses a ChunksChunkChunk value or pointer made by an initializer list, a compound literal, a cast of another pointer to its pointer, or a copy or set of its bytes, while a whole-value assignment moves a value already made and an enclosing aggregate's initializer or copy, which zero-fills or copies a member as a whole, isn't seen	t/117: chunk_forged is refused with its diagnostic; t/117: no file but its owner writes a ChunksChunkChunk's opaque storage
+chunks	chunks/fail/forwarded_forged	-	outstanding	-	-
+chunks	chunks/fail/raw_forged	chunks::pack::Raw	opaque-storage	a ChunksPackRaw is opaque storage whose layout only pack.c knows, so no other C names its parts, though the C can't refuse a value of it zero-initialized or with bytes copied into it; outside pack.c, t/117 refuses a ChunksPackRaw value or pointer made by an initializer list, a compound literal, a cast of another pointer to its pointer, or a copy or set of its bytes, while a whole-value assignment moves a value already made and an enclosing aggregate's initializer or copy, which zero-fills or copies a member as a whole, isn't seen	t/117: raw_forged is refused with its diagnostic; t/117: no file but its owner writes a ChunksPackRaw's opaque storage
+chunks	chunks/fail/read_without_a_reader	-	outstanding	-	-
+chunks	chunks/fail/registration_outlives_its_scope	-	outstanding	-	-
+chunks	chunks/fail/reservation_forged	-	outstanding	-	-
+chunks	chunks/fail/retire_unforwarded	-	outstanding	-	-
+chunks	chunks/fail/root_slot_registered_twice	chunks::packs::roots::RootSlot	capability	a ChunksPacksRootsRootSlot is a capability under clang's analysis: RootSlots' one and fold acquire it inside register's run, and a pin or RootSlot_unused releases it, so a second pin through one slot is refused as a release of a capability not held; msvc's and gcc's builds can't refuse it, a pin that fails releases the slot all the same, and a Pin's drop doesn't give the slot back, so the C refuses a pin after a failed pin or a dropped pin on the same slot, which the Rust's ended borrow allows	t/117: root_slot_registered_twice is refused with its diagnostic
+chunks	chunks/fail/torn_tail_cloned	chunks::file::TornTail	move-out	the C has no clone of a ChunksFileTornTail either, which t/117 refuses to find, and outside file.c t/117 refuses a bitwise copy of one into a variable or through a pointer from anything but a call's result, which would leave two storages holding one tail; a copy into a struct's member or an enclosing aggregate's copy isn't seen	t/117: no C clone of a ChunksFileTornTail exists; t/117: no file but its owner copies a ChunksFileTornTail
+chunks	chunks/fail/torn_tail_forged	chunks::file::TornTail	opaque-storage	a ChunksFileTornTail is opaque storage whose layout only file.c knows, so no other C names its parts, though the C can't refuse a value of it zero-initialized or with bytes copied into it; outside file.c, t/117 refuses a ChunksFileTornTail value or pointer made by an initializer list, a compound literal, a cast of another pointer to its pointer, or a copy or set of its bytes, while a whole-value assignment moves a value already made and an enclosing aggregate's initializer or copy, which zero-fills or copies a member as a whole, isn't seen	t/117: torn_tail_forged is refused with its diagnostic; t/117: no file but its owner writes a ChunksFileTornTail's opaque storage
+chunks	chunks/fail/torn_tail_reused	chunks::file::TornTail	move-out	a door that takes a ChunksFileTornTail (cut, append, write_end, of_generation) moves it out of its caller's storage before anything that can fail, so a failed door takes it too, and that storage's next read or door panics as an unwrap of None at the Rust's use of the tail while its drop frees nothing; outside file.c, t/117 refuses a copy of a tail into a variable or through a pointer from anything but a call's result, so no second storage holds the tail a door empties, though it doesn't see a copy into a struct's member or an enclosing aggregate's copy	c: chunks::file::tests::a_torn_tail_a_door_took_panics_at_its_next_use_and_a_failed_door_still_takes_it; t/117: no file but its owner copies a ChunksFileTornTail
+chunks	chunks/fail/verified_kept	-	outstanding	-	-
+fsck	fsck/fehost/fail/make_an_io	-	outstanding	-	-
+fsck	fsck/fehost/fail/write_with_a_read_io	-	outstanding	-	-
+host	host/fail/cache_pinned_past_its_entry	-	outstanding	-	-
+host	host/fail/comparison_under_a_key_lock	-	outstanding	-	-
+host	host/fail/delta_aged_claimed	-	outstanding	-	-
+host	host/fail/delta_aged_freed	-	outstanding	-	-
+host	host/fail/delta_aged_opened	-	outstanding	-	-
+host	host/fail/delta_aged_reclaimed	-	outstanding	-	-
+host	host/fail/delta_aged_swept	-	outstanding	-	-
+host	host/fail/delta_append_by_a_name	-	outstanding	-	-
+host	host/fail/delta_append_under_a_shared_guard	-	outstanding	-	-
+host	host/fail/delta_bytes_past_their_hold	-	outstanding	-	-
+host	host/fail/delta_hold_past_its_io	-	outstanding	-	-
+host	host/fail/delta_list_insert_without_removes	-	outstanding	-	-
+host	host/fail/delta_list_set_under_a_shared_guard	-	outstanding	-	-
+host	host/fail/delta_list_under_another_shapes_guard	-	outstanding	-	-
+host	host/fail/delta_lock_through_a_made	-	outstanding	-	-
+host	host/fail/delta_owned_past_its_entry	-	outstanding	-	-
+host	host/fail/delta_page_past_its_hold	-	outstanding	-	-
+host	host/fail/delta_record_past_its_hold	-	outstanding	-	-
+host	host/fail/delta_seal_by_a_name	-	outstanding	-	-
+host	host/fail/delta_seal_under_a_shared_guard	-	outstanding	-	-
+host	host/fail/io_cloned	-	outstanding	-	-
+host	host/fail/io_door_in_a_locked_expression	-	outstanding	-	-
+host	host/fail/io_door_under_a_lock	-	outstanding	-	-
+host	host/fail/io_door_under_a_read_lock	-	outstanding	-	-
+host	host/fail/io_forged	-	outstanding	-	-
+host	host/fail/io_from_held	-	outstanding	-	-
+host	host/fail/io_lender_under_a_lock	-	outstanding	-	-
+host	host/fail/io_sent	-	outstanding	-	-
+host	host/fail/key_lock_past_its_io	-	outstanding	-	-
+host	host/fail/lending_lock_from_held	-	outstanding	-	-
+host	host/fail/pause_named_by_a_constant	-	outstanding	-	-
+host	host/fail/pause_without_a_capability	-	outstanding	-	-
+host	host/fail/scratch_file_past_its_entry	-	outstanding	-	-
+host	host/fail/shared_array_of_two_disciplines	-	outstanding	-	-
+host	host/fail/shared_blob_declared_twice	-	outstanding	-	-
+host	host/fail/shared_blob_under_another_lock	-	outstanding	-	-
+host	host/fail/shared_claim_under_another_shapes_lock	-	outstanding	-	-
+host	host/fail/shared_entry_set_under_a_shared_lock	-	outstanding	-	-
+host	host/fail/shared_flag_from_a_flags_capability	-	outstanding	-	-
+host	host/fail/shared_flag_out_of_order	-	outstanding	-	-
+host	host/fail/shared_flag_under_a_long_lock	-	outstanding	-	-
+host	host/fail/shared_freed_twice	-	outstanding	-	-
+host	host/fail/shared_guard_past_its_handle	-	outstanding	-	-
+host	host/fail/shared_lock_from_a_guards_lend	-	outstanding	-	-
+host	host/fail/shared_lock_out_of_order	-	outstanding	-	-
+host	host/fail/shared_long_lock_out_of_order	-	outstanding	-	-
+host	host/fail/shared_long_lock_under_a_short_lock	-	outstanding	-	-
+host	host/fail/shared_record_freed	-	outstanding	-	-
+host	host/fail/shared_record_past_its_handle	-	outstanding	-	-
+host	host/fail/shared_slots_read_under_a_shared_barrier	-	outstanding	-	-
+host	host/fail/shared_words_sent	-	outstanding	-	-
+host	host/fail/shared_write_under_a_shared_lock	-	outstanding	-	-
+host	host/fail/short_lender_under_a_short_lender	-	outstanding	-	-
+host	host/fail/user_code_under_a_lock	-	outstanding	-	-
+host	host/fail/wait_under_a_key_lock	-	outstanding	-	-
+trees	trees/fail/brand_a_temporary_writer	-	outstanding	-	-
+trees	trees/fail/finished_forged	-	outstanding	-	-
+trees	trees/fail/fresh_minted	-	outstanding	-	-
+trees	trees/fail/hold_another_writers_root	-	outstanding	-	-
+trees	trees/fail/hold_memory_root	-	outstanding	-	-
+trees	trees/fail/hold_on_a_loose_writer	-	outstanding	-	-
+trees	trees/fail/hold_scratch_root	-	outstanding	-	-
+trees	trees/fail/mutate_inside_a_registration	-	outstanding	-	-
+trees	trees/fail/node_unchecked	-	outstanding	-	-
+trees	trees/fail/publish_with_another_writer	-	outstanding	-	-
+trees	trees/fail/published_deref	-	outstanding	-	-
+trees	trees/fail/published_tree	-	outstanding	-	-
+trees	trees/fail/temporary_writer_past_its_entry	-	outstanding	-	-
+txn	txn/fail/index_open_forged	-	outstanding	-	-
+txn	txn/fail/index_open_under_a_shared_guard	-	outstanding	-	-
+txn	txn/fail/table_unlist_without_an_open	-	outstanding	-	-
+txn	txn/fail/version_push_without_an_open	-	outstanding	-	-

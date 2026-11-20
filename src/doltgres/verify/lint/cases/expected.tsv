@@ -1,0 +1,84 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# What each synthetic case must report, one finding per line, tab-separated: the case crate and a part of the
+# finding's message. A case not listed here, like `clean`, must report nothing.
+
+cap_field	a type holds a capability in a field
+cap_capture	a capability is held in a field, element, argument, capture, or coroutine
+cap_generic	a capability is held in a field, element, argument, capture, or coroutine
+cap_static	a static holds a capability
+unsafe_macro	an `unsafe` block expanded from `smuggle::sneak`
+drop_alloc	a `Drop` impl can reach an allocation
+root_alloc	a cleanup callback can reach an allocation
+access	`access` keeps no state of its own: no static
+access	`access` calls `pg::refused`
+access	`access` calls `host::lock`, a `host` item
+access	`access` reaches `host::Guard`, a `host` type
+access	`access` keeps state in `std::sync::Mutex
+access	`access` calls `pg::refused_value`
+access	`access` calls `<pg::Token as std::clone::Clone>::clone`
+cap_vec	a type holds a capability in a field
+cap_vec	coroutine (design item 17), in `<std::vec::Vec<&pg::MayRaise> as std::ops::Drop>::drop`
+cap_vec	coroutine (design item 17), in `<alloc::raw_vec::RawVec<&pg::MayRaise> as std::ops::Drop>::drop`
+cap_mono	coroutine (design item 17), in `keep::<&pg::MayRaise>`
+cap_mono	coroutine (design item 17), in `<Keep<&pg::MayRaise> as std::ops::Drop>::drop`
+cap_alias	a type holds a capability in a field
+cap_coroutine	a capability is held in a field, element, argument, capture, or coroutine
+unsafe_arg	a call-site expression other than a path inside a listed macro's `unsafe` code
+asm	`global_asm!` outside `pg` and `shmem`
+asm	a naked function outside `pg` and `shmem`
+entry_alloc	a cleanup callback can reach an allocation (design item 17): entries::cases_release
+drop_glue	dropping a local of `holds` can reach an allocation
+access	dropping a local of `crosses` can reach an allocation
+host_forged	`host::io::Io::new_for_pghost` is named outside `pghost`
+host_const_mint	`host::io::Io::new_for_pghost` is named outside `pghost`
+host_cap_field	a type holds a capability in a field
+virtual_drop	an implementation of a method `non-allocating.list` names can reach an allocation
+derive_clone	an `unsafe trait` outside `pg` and `shmem`
+derive_clone	an `unsafe impl` outside `pg` and `shmem`
+vstd_call	a call to `vstd::raw_ptr::ptr_mut_read`, which `vstd-allowed.list` doesn't name
+cap_tuple	a capability is held in a field, element, argument, capture, or coroutine
+err_let	a value that holds an error is dropped
+err_arm	a value that holds an error is dropped
+err_default	a value that holds an error is dropped, where it can only be returned (design item 17), in `std::result::Result::<u32, host::Error>::unwrap_or_default`
+err_closure	a value that holds an error is dropped
+err_static	a static holds an error
+err_variant	a value that holds an error is dropped
+err_borrowed	a value that holds an error is dropped
+err_sibling	a value that holds an error is dropped
+err_erased	an error is hidden behind a trait object
+err_forget	an error is kept from its drop by `std::mem::forget`
+err_forget	ownership of an error is turned into a pointer
+err_forget	an error is kept in a type whose drop doesn't drop it
+err_kept	an error is kept in a type whose drop doesn't drop it
+err_kept	ownership of an error is turned into a pointer
+err_kept	a type keeps an error in a field whose drop doesn't drop it
+err_panic	`Result::unwrap` would panic in the place of an error
+err_panic	`Result::expect` would panic in the place of an error
+err_panic	a call that never returns, made while an error is held, panics in its place
+err_collected	a value that holds an error is dropped
+err_collected_twice	a consumer of a `collect` into a `Result` outside the standard library
+read_forged	`host::io::ReadIo::new_for_fehost` is named outside `fehost`
+chunks	`chunks::Error::into_finding` is called outside the check's own modules
+llvm_intrinsic	an extern block outside `pg` and `shmem`
+llvm_intrinsic	an `unsafe` block outside `pg` and `shmem`
+reader_static	a static keeps a reader's guard outside an owned record
+reader_erased	a reader's guard is hidden behind a trait object
+reader_owed	an owned record, `Scan`, keeps a place in a pack across calls with no reader's guard
+reader_owed	an owned record, `Fetch`, keeps a place in a pack across calls with no reader's guard
+cap_registering	a type holds a capability in a field
+cap_reexported	a type holds a capability in a field
+reader_reexported	a static keeps a reader's guard outside an owned record
+mint_reexported	`host::io::Io::new_for_pghost` is named outside `pghost`

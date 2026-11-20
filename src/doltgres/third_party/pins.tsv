@@ -1,0 +1,32 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The vendored upstream code (design item 15), each path under this folder pinned to upstream's release by its tag, the
+# tag's commit, the path it comes from, and git's id of that path's object there (a tree for a folder, a blob for a
+# file), so a path's every byte and mode are upstream's; the gates check each path's id in the fork's tree.
+# path	upstream	tag	commit	upstream path	object
+zstd/lib	https://github.com/facebook/zstd	v1.5.7	f8745da6ff1ad1e7bab384bd1f9d742439278e99	lib	f371adadf3efd8b0467ce6dd551c1bdda42cea02
+zstd/LICENSE	https://github.com/facebook/zstd	v1.5.7	f8745da6ff1ad1e7bab384bd1f9d742439278e99	LICENSE	75800288cc243f164b9d130f125e2ffae28f8e39
+zstd/COPYING	https://github.com/facebook/zstd	v1.5.7	f8745da6ff1ad1e7bab384bd1f9d742439278e99	COPYING	ecbc0593737be657aef92e3adcf3bcbd6fdb812e
+lz4/lib	https://github.com/lz4/lz4	v1.10.0	ebb370ca83af193212df4dcbadcc5d87bc0de2f0	lib	36b4e17858344fd07bec2b55471bc7c5c64f02fa
+icu/common	https://github.com/unicode-org/icu	release-79.1	ddc6b66926bfac6036144ca9902992a0d6d50af9	icu4c/source/common	85560fecce71b65ed05f388de96e62a2dfbacec8
+icu/i18n	https://github.com/unicode-org/icu	release-79.1	ddc6b66926bfac6036144ca9902992a0d6d50af9	icu4c/source/i18n	2fdf831fae4592566665b5f0805adf69a8a04a86
+icu/LICENSE	https://github.com/unicode-org/icu	release-79.1	ddc6b66926bfac6036144ca9902992a0d6d50af9	LICENSE	fec99457b941a38283b6b2f6e128470182c73dc0
+blake3/c	https://github.com/BLAKE3-team/BLAKE3	1.8.7	f3149ec5bb5449af877ba20377a11008ff499fa2	c	038467e6d921b19c6339e4d3ae716646f1085847
+blake3/LICENSE_A2	https://github.com/BLAKE3-team/BLAKE3	1.8.7	f3149ec5bb5449af877ba20377a11008ff499fa2	LICENSE_A2	d512ca94d0ca6bf6a7272b16c83f51b7045902ca
+blake3/LICENSE_A2LLVM	https://github.com/BLAKE3-team/BLAKE3	1.8.7	f3149ec5bb5449af877ba20377a11008ff499fa2	LICENSE_A2LLVM	8d11bec0e86f88276b155cd3214a3de45cdafeb7
+blake3/LICENSE_CC0	https://github.com/BLAKE3-team/BLAKE3	1.8.7	f3149ec5bb5449af877ba20377a11008ff499fa2	LICENSE_CC0	0e259d42c996742e9e3cba14c677129b2c1b6311
+xxhash/xxhash.h	https://github.com/Cyan4973/xxHash	v0.8.3	e626a72bc2321cd320e953a0ccf1584cad60f363	xxhash.h	78fc2e8dbf6db809650fbb59762c5566a71677ca
+xxhash/xxhash.c	https://github.com/Cyan4973/xxHash	v0.8.3	e626a72bc2321cd320e953a0ccf1584cad60f363	xxhash.c	e60cc37f13c27ff0668ec2535937df3f4c097ec2
+xxhash/LICENSE	https://github.com/Cyan4973/xxHash	v0.8.3	e626a72bc2321cd320e953a0ccf1584cad60f363	LICENSE	e4c5da7234eca7baad9a46f0b144e49ccad2e500

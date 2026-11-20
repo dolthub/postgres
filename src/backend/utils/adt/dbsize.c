@@ -20,6 +20,7 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_tablespace.h"
 #include "commands/tablespace.h"
+#include "doltgres/hooks.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "utils/acl.h"
@@ -161,6 +162,8 @@ calculate_database_size(Oid dbOid)
 
 	FreeDir(dirdesc);
 
+	totalsize = doltgres_database_size(dbOid, totalsize);
+
 	return totalsize;
 }
 
@@ -274,6 +277,8 @@ calculate_tablespace_size(Oid tblspcOid)
 
 	FreeDir(dirdesc);
 
+	totalsize = doltgres_tablespace_size(tblspcOid, totalsize);
+
 	return totalsize;
 }
 
@@ -382,6 +387,7 @@ pg_relation_size(PG_FUNCTION_ARGS)
 
 	size = calculate_relation_size(&(rel->rd_locator), rel->rd_backend,
 								   forkname_to_number(text_to_cstring(forkName)));
+	size = doltgres_relation_size_added(rel, forkName, size);
 
 	relation_close(rel, AccessShareLock);
 
@@ -407,6 +413,7 @@ calculate_toast_table_size(Oid toastrelid)
 	for (forkNum = 0; forkNum <= MAX_FORKNUM; forkNum++)
 		size += calculate_relation_size(&(toastRel->rd_locator),
 										toastRel->rd_backend, forkNum);
+	size = doltgres_relation_size_added(toastRel, NULL, size);
 
 	/* toast index size, including FSM and VM size */
 	indexlist = RelationGetIndexList(toastRel);
@@ -421,6 +428,7 @@ calculate_toast_table_size(Oid toastrelid)
 		for (forkNum = 0; forkNum <= MAX_FORKNUM; forkNum++)
 			size += calculate_relation_size(&(toastIdxRel->rd_locator),
 											toastIdxRel->rd_backend, forkNum);
+		size = doltgres_relation_size_added(toastIdxRel, NULL, size);
 
 		relation_close(toastIdxRel, AccessShareLock);
 	}
@@ -450,6 +458,7 @@ calculate_table_size(Relation rel)
 	for (forkNum = 0; forkNum <= MAX_FORKNUM; forkNum++)
 		size += calculate_relation_size(&(rel->rd_locator), rel->rd_backend,
 										forkNum);
+	size = doltgres_relation_size_added(rel, NULL, size);
 
 	/*
 	 * Size of toast relation
@@ -490,6 +499,7 @@ calculate_indexes_size(Relation rel)
 				size += calculate_relation_size(&(idxRel->rd_locator),
 												idxRel->rd_backend,
 												forkNum);
+			size = doltgres_relation_size_added(idxRel, NULL, size);
 
 			relation_close(idxRel, AccessShareLock);
 		}

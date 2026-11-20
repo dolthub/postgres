@@ -1,0 +1,3 @@
+sharon	x	(15,12)	x	sam
+sharon	25	(15,12)	1000	sam
+sharon	y	(15,12)	x	sam

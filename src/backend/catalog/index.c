@@ -57,6 +57,7 @@
 #include "commands/progress.h"
 #include "commands/tablecmds.h"
 #include "commands/trigger.h"
+#include "doltgres/hooks.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -1061,6 +1062,8 @@ index_create(Relation heapRelation,
 						(flags & INDEX_CREATE_DEFERRABLE) == 0,
 						!concurrent && !invalid,
 						!concurrent);
+
+	doltgres_key_named(heapRelation, isprimary);
 
 	/*
 	 * Register relcache invalidation on the indexes' heap relation, to
@@ -2129,6 +2132,8 @@ index_constraint_create(Relation heapRelation,
 			if (marked_as_primary)
 				CacheInvalidateRelcache(heapRelation);
 
+			doltgres_key_named(heapRelation, marked_as_primary);
+
 			InvokeObjectPostAlterHookArg(IndexRelationId, indexRelationId, 0,
 										 InvalidOid, is_internal);
 		}
@@ -2196,6 +2201,8 @@ index_drop(Oid indexId, bool concurrent, bool concurrent_lock_mode)
 	lockmode = (concurrent || concurrent_lock_mode) ? ShareUpdateExclusiveLock : AccessExclusiveLock;
 	userHeapRelation = table_open(heapId, lockmode);
 	userIndexRelation = index_open(indexId, lockmode);
+
+	doltgres_key_named(userHeapRelation, userIndexRelation->rd_index->indisprimary);
 
 	/*
 	 * We might still have open queries using it in our own session, which the
@@ -2357,6 +2364,8 @@ index_drop(Oid indexId, bool concurrent, bool concurrent_lock_mode)
 	 */
 	if (RELKIND_HAS_STORAGE(userIndexRelation->rd_rel->relkind))
 		RelationDropStorage(userIndexRelation);
+
+	doltgres_relation_dropped(userIndexRelation);
 
 	/* ensure that stats are dropped if transaction commits */
 	pgstat_drop_relation(userIndexRelation);

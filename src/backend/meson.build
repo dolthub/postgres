@@ -2,7 +2,7 @@
 
 backend_build_deps = [backend_code]
 backend_sources = []
-backend_link_with = [pgport_srv, common_srv]
+backend_link_with = [pgport_srv, common_srv, doltgres_c, doltgres_cport]
 
 generated_backend_sources = []
 post_export_backend_sources = []

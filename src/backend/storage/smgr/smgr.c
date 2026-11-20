@@ -64,6 +64,7 @@
 #include "postgres.h"
 
 #include "access/xlogutils.h"
+#include "doltgres/hooks.h"
 #include "lib/ilist.h"
 #include "miscadmin.h"
 #include "storage/aio.h"
@@ -597,6 +598,7 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 	{
 		int			which = rels[i]->smgr_which;
 
+		doltgres_storage_unlinked(&rlocators[i].locator);
 		for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
 			smgrsw[which].smgr_unlink(rlocators[i], forknum, isRedo);
 	}

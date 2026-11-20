@@ -21,6 +21,7 @@
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_namespace.h"
+#include "doltgres/hooks.h"
 #include "utils/builtins.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
@@ -95,6 +96,7 @@ NamespaceCreate(const char *nspName, Oid ownerId, bool isTemp)
 
 	CatalogTupleInsert(nspdesc, tup);
 	Assert(OidIsValid(nspoid));
+	doltgres_namespace_created(nspoid, nspName, isTemp);
 
 	table_close(nspdesc, RowExclusiveLock);
 

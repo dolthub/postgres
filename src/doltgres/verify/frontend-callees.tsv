@@ -1,0 +1,29 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# The functions and macros a wrapper's C in pg's frontend-calls.list may call, each with why it can't exit, print, or
+# allocate through common's pg_malloc family, which a frontend program's wrapper must never reach (design item D12):
+# the gates refuse any other name a row's C calls. A piece that adds a wrapper adds the callees it needs.
+# callee	reason
+Min	c.h's macro of the lesser of two values, which calls nothing
+close	the C library's close, which returns -1 with errno set
+closedir	the C library's closedir, which frees what opendir allocated
+fstat	the C library's fstat, which returns -1 with errno set
+memcpy	the C library's memcpy, which only copies into the caller's buffer
+open	the C library's open, which returns -1 with errno set and allocates nothing
+opendir	the C library's opendir, or port's on Windows, which allocates with malloc and returns NULL with errno set
+pg_pread	port's pread, a system call on Unix and a ReadFile at an offset on Windows, which returns -1 with errno set
+readdir	the C library's readdir, which returns NULL at the end and sets errno only on a failure
+strcmp	the C library's strcmp, which only reads
+strerror	the C library's strerror, which returns a static message for an errno
+strlen	the C library's strlen, which only reads

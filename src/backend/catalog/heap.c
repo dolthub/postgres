@@ -59,6 +59,7 @@
 #include "commands/tablecmds.h"
 #include "commands/typecmds.h"
 #include "common/int.h"
+#include "doltgres/hooks.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
@@ -1622,6 +1623,7 @@ heap_create_with_catalog(const char *relname,
 	 * upgrade.  The storage we create here will be replaced later, but we
 	 * need to have something on disk in the meanwhile.
 	 */
+	doltgres_relation_creating(relid, relrewrite);
 	new_rel_desc = heap_create(relname,
 							   relnamespace,
 							   reltablespace,
@@ -2229,6 +2231,8 @@ heap_drop_with_catalog(Oid relid)
 	 */
 	if (RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
 		RelationDropStorage(rel);
+
+	doltgres_relation_dropped(rel);
 
 	/* ensure that stats are dropped if transaction commits */
 	pgstat_drop_relation(rel);

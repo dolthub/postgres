@@ -167,6 +167,10 @@
 #vacuum_buffer_usage_limit = 2MB        # size of vacuum and analyze buffer access strategy ring;
                                         # 0 to disable vacuum buffer access strategy;
                                         # range 128kB to 16GB
+#delta_memory = 32MB                    # min 1MB
+                                        # (change requires restart)
+#node_cache_size = 128MB                # min 1MB
+                                        # (change requires restart)
 
 # SLRU buffers (change requires restart)
 #commit_timestamp_buffers = 0           # memory for pg_commit_ts (0 = auto)
@@ -759,6 +763,18 @@
 #autovacuum_vacuum_cost_limit = -1      # default vacuum cost limit for
                                         # autovacuum, -1 means use
                                         # vacuum_cost_limit
+#collector_first_packs = 64             # min 1
+#collector_full_interval = 1d           # min 1s
+#collector_io_limit = 0                 # 0 for no limit
+#collector_min_free_disk = -1           # -1 for the smaller of 10GB and a tenth of the volume
+#collector_naptime = 1s                 # min 1ms
+#collector_target_percent = 50          # min 1
+#collector_young_packs = 16             # min 1
+#collector_young_size = 256MB           # min 1kB
+#fold_threshold = -1                    # -1 for a sixteenth of delta_memory
+#fold_timeout = 30s                     # min 1s
+#fold_workers = 2                       # min 1
+                                        # (change requires restart)
 
 # - Cost-Based Vacuum Delay -
 

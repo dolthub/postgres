@@ -1,0 +1,3 @@
+comment = 'Doltgrust test extension that names a table it does not own'
+default_version = '1.0'
+relocatable = true

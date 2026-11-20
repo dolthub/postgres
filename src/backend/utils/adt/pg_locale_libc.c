@@ -17,6 +17,7 @@
 #include "access/htup_details.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_collation.h"
+#include "doltgres/hooks.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
@@ -776,6 +777,9 @@ create_pg_locale_libc(Oid collid, MemoryContext context)
 	locale_t	loc;
 	pg_locale_t result;
 
+	if (doltgres_libc_locale(collid, context, &result))
+		return result;
+
 	if (collid == DEFAULT_COLLATION_OID)
 	{
 		HeapTuple	tp;
@@ -814,6 +818,9 @@ create_pg_locale_libc(Oid collid, MemoryContext context)
 
 
 	loc = make_libc_collator(collate, ctype);
+
+	if (doltgres_libc_new_locale(collid, context, loc, &result))
+		return result;
 
 	result = MemoryContextAllocZero(context, sizeof(struct pg_locale_struct));
 	result->deterministic = true;
@@ -1021,6 +1028,9 @@ char *
 get_collation_actual_version_libc(const char *collcollate)
 {
 	char	   *collversion = NULL;
+
+	if (doltgres_libc_collversion(collcollate, &collversion))
+		return collversion;
 
 	if (pg_strcasecmp("C", collcollate) != 0 &&
 		pg_strncasecmp("C.", collcollate, 2) != 0 &&

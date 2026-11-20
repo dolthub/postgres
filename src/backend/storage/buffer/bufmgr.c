@@ -46,6 +46,7 @@
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "common/hashfn.h"
+#include "doltgres/hooks.h"
 #include "executor/instrument.h"
 #include "lib/binaryheap.h"
 #include "miscadmin.h"
@@ -4689,6 +4690,10 @@ RelationGetNumberOfBlocksInFork(Relation relation, ForkNumber forkNum)
 	}
 	else if (RELKIND_HAS_STORAGE(relation->rd_rel->relkind))
 	{
+		BlockNumber blocks;
+
+		if (doltgres_index_blocks(relation, forkNum, &blocks))
+			return blocks;
 		return smgrnblocks(RelationGetSmgr(relation), forkNum);
 	}
 	else

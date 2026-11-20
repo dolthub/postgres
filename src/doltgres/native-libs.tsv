@@ -1,0 +1,27 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The system libraries Rust's standard library needs, per host target (design item 18): first as
+# `rustc --print native-static-libs` reports them with the pinned toolchain, which cargo.pl checks at every build,
+# then those of them the postgres link must add because the C compiler's driver doesn't already link them, which
+# meson passes. Adding a library the driver links anyway would change how Postgres' own references bind. The first
+# lists are recorded for every target on one machine (a static library needs no linker); the second list is checked
+# on each platform's own machine.
+
+aarch64-apple-darwin	-lSystem -lc -lm	
+x86_64-apple-darwin	-lSystem -lc -lm	
+aarch64-unknown-linux-gnu	-lgcc_s -lutil -lrt -lpthread -lm -ldl -lc	
+x86_64-unknown-linux-gnu	-lgcc_s -lutil -lrt -lpthread -lm -ldl -lc	
+x86_64-pc-windows-msvc	kernel32.lib ntdll.lib userenv.lib ws2_32.lib dbghelp.lib /defaultlib:msvcrt	kernel32.lib ntdll.lib userenv.lib ws2_32.lib dbghelp.lib
+aarch64-pc-windows-msvc	kernel32.lib ntdll.lib userenv.lib ws2_32.lib dbghelp.lib /defaultlib:msvcrt	kernel32.lib ntdll.lib userenv.lib ws2_32.lib dbghelp.lib

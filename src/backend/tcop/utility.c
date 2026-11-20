@@ -57,6 +57,7 @@
 #include "commands/vacuum.h"
 #include "commands/view.h"
 #include "commands/wait.h"
+#include "doltgres/hooks.h"
 #include "miscadmin.h"
 #include "parser/parse_utilcmd.h"
 #include "postmaster/bgwriter.h"
@@ -512,6 +513,8 @@ ProcessUtility(PlannedStmt *pstmt,
 	Assert(queryString != NULL);	/* required as of 8.4 */
 	Assert(qc == NULL || qc->commandTag == CMDTAG_UNKNOWN);
 
+	doltgres_key_level_opened();
+
 	/*
 	 * We provide a function hook variable that lets loadable plugins get
 	 * control when ProcessUtility is called.  Such a plugin would normally
@@ -525,6 +528,8 @@ ProcessUtility(PlannedStmt *pstmt,
 		standard_ProcessUtility(pstmt, queryString, readOnlyTree,
 								context, params, queryEnv,
 								dest, qc);
+
+	doltgres_key_level_settled();
 }
 
 /*

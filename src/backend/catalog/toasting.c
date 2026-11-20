@@ -28,6 +28,7 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/toasting.h"
+#include "doltgres/hooks.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "utils/fmgroids.h"
@@ -402,6 +403,8 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	 * Make changes visible
 	 */
 	CommandCounterIncrement();
+
+	doltgres_toast_created(rel, toast_relid);
 
 	return true;
 }

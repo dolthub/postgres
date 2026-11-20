@@ -1,0 +1,38 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The C globals the binding defines for Postgres to keep or write (design items 6 and 17), one per line, tab-separated:
+# its name, its C type, its initializer (a struct's fields between braces), and what it is. Rust keeps no pointer to
+# Postgres' memory past a call, so what Postgres keeps or writes between calls lives here.
+
+doltgres_shmem_base	void *	NULL	the address of the fork's shared memory region in this process, which ShmemRequestStruct writes
+doltgres_shmem_callbacks	const ShmemCallbacks	{.request_fn = doltgres_shmem_request, .init_fn = doltgres_shmem_init}	the fork's shared memory callbacks, which RegisterShmemCallbacks keeps
+doltgres_rmgr_id	RmgrId	190	the fork's resource manager's id (design item 8), which RegisterCustomRmgr takes and every fork record carries
+doltgres_rmgr	const RmgrData	{.rm_name = "Versioned", .rm_redo = doltgres_rmgr_redo, .rm_desc = doltgres_rmgr_desc, .rm_identify = doltgres_rmgr_identify}	the fork's resource manager (design item 8), which RegisterCustomRmgr copies
+doltgres_cache_base	void *	NULL	the address of the shared node cache in this process, which ShmemRequestStruct writes
+doltgres_keys_base	void *	NULL	the address of the key lock's stripes in this process, which ShmemRequestStruct writes
+doltgres_cache_table	HTAB *	NULL	this process's handle of the shared node cache's table, which ShmemRequestHash writes
+doltgres_local_cache	void *	NULL	the backend's own node cache, made at its first temporary write
+doltgres_local_cache_table	HTAB *	NULL	the table of the backend's own node cache
+doltgres_pin_desc	const ResourceOwnerDesc	{.name = "versioned node cache pin", .release_phase = RESOURCE_RELEASE_BEFORE_LOCKS, .release_priority = RELEASE_PRIO_FIRST, .ReleaseResource = doltgres_cache_release}	the resource owner kind of a node cache pin, released before locks and before every other kind, so another kind's release that drops a pin finds it released
+doltgres_owned_desc	const ResourceOwnerDesc	{.name = "versioned owned record", .release_phase = RESOURCE_RELEASE_BEFORE_LOCKS, .release_priority = RELEASE_PRIO_FIRST + 1, .ReleaseResource = doltgres_owned_release}	the resource owner kind of a record a backend owns, released before locks and right after the node cache's pins, so a record's release finds its kept pins already released
+doltgres_delta_base	void *	NULL	the address of the delta's region of blocks in this process, which ShmemRequestStruct writes
+doltgres_delta_directory	void *	NULL	the address of the delta's page directory in this process, which ShmemRequestStruct writes
+doltgres_slot_ops	const TupleTableSlotOps	{.base_slot_size = sizeof(DoltgresSlot), .init = doltgres_slot_init, .release = doltgres_slot_release, .clear = doltgres_slot_clear, .getsomeattrs = doltgres_slot_getsomeattrs, .getsysattr = doltgres_slot_getsysattr, .is_current_xact_tuple = doltgres_slot_is_current_xact_tuple, .materialize = doltgres_slot_materialize, .copyslot = doltgres_slot_copyslot, .copy_heap_tuple = doltgres_slot_copy_heap_tuple, .copy_minimal_tuple = doltgres_slot_copy_minimal_tuple}	the fork's kind of tuple table slot (design item 5), which holds a row as its table's tree stores it and deforms it on demand, and which the table access method's slot_callbacks names
+doltgres_old_entries	DoltgresOldEntries *	NULL	the backend's removals of old entries (the btree text's D2b), a slot for each table, in TopMemoryContext
+doltgres_old_entries_slots	int	0	the slots doltgres_old_entries has
+doltgres_old_entries_registered	bool	false	whether the backend registered the relcache callback that marks a removal's state stale
+doltgres_collection_base	void *	NULL	the address of the collection's and the base backups' meeting point in this process, which ShmemRequestStruct writes
+DoltgresReservedWorkers	int	0	the background worker slots, with their processes, the fork reserves beside max_worker_processes, which doltgres_shared_preload sets in every process before shared memory is sized
+doltgres_table_am	const TableAmRoutine	{.type = T_TableAmRoutine, .slot_callbacks = doltgres_table_slot_callbacks, .scan_begin = doltgres_scan_begin, .scan_end = doltgres_scan_end, .scan_rescan = doltgres_scan_rescan, .scan_getnextslot = doltgres_scan_getnextslot, .scan_set_tidrange = doltgres_scan_set_tidrange, .scan_getnextslot_tidrange = doltgres_scan_getnextslot_tidrange, .scan_bitmap_next_tuple = doltgres_scan_bitmap_next_tuple, .scan_sample_next_block = doltgres_scan_sample_next_block, .scan_sample_next_tuple = doltgres_scan_sample_next_tuple, .scan_analyze_next_block = doltgres_scan_analyze_next_block, .scan_analyze_next_tuple = doltgres_scan_analyze_next_tuple, .parallelscan_estimate = doltgres_parallelscan_estimate, .parallelscan_initialize = doltgres_parallelscan_initialize, .parallelscan_reinitialize = doltgres_parallelscan_reinitialize, .index_fetch_begin = doltgres_index_fetch_begin, .index_fetch_reset = doltgres_index_fetch_reset, .index_fetch_end = doltgres_index_fetch_end, .index_fetch_tuple = doltgres_index_fetch_tuple, .tuple_fetch_row_version = doltgres_tuple_fetch_row_version, .tuple_tid_valid = doltgres_tuple_tid_valid, .tuple_get_latest_tid = doltgres_tuple_get_latest_tid, .tuple_satisfies_snapshot = doltgres_tuple_satisfies_snapshot, .tuple_insert = doltgres_tuple_insert, .tuple_insert_speculative = doltgres_tuple_insert_speculative, .tuple_complete_speculative = doltgres_tuple_complete_speculative, .multi_insert = doltgres_multi_insert, .tuple_delete = doltgres_tuple_delete, .tuple_update = doltgres_tuple_update, .tuple_lock = doltgres_tuple_lock, .index_delete_tuples = doltgres_index_delete_tuples, .index_build_range_scan = doltgres_index_build_range_scan, .index_validate_scan = doltgres_index_validate_scan, .relation_set_new_filelocator = doltgres_relation_set_new_filelocator, .relation_nontransactional_truncate = doltgres_relation_nontransactional_truncate, .relation_copy_data = doltgres_relation_copy_data, .relation_copy_for_cluster = doltgres_relation_copy_for_cluster, .relation_vacuum = doltgres_relation_vacuum, .relation_size = doltgres_relation_size, .relation_needs_toast_table = doltgres_relation_needs_toast_table, .relation_toast_am = doltgres_relation_toast_am, .relation_fetch_toast_slice = doltgres_relation_fetch_toast_slice, .relation_estimate_size = doltgres_relation_estimate_size}	the fork's table access method routine (design item 9), which the relcache gives every relation the fork stores whatever access method it names; a member joins it when its callback is written
