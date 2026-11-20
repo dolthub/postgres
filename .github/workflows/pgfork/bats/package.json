@@ -1,0 +1,9 @@
+{
+  "name": "pgfork-bats",
+  "description": "The bats the fork's CI runs Doltgrust's bats with, pinned with its lockfile",
+  "private": true,
+  "license": "Apache-2.0",
+  "dependencies": {
+    "bats": "1.13.0"
+  }
+}
