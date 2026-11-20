@@ -23,7 +23,8 @@
 # so a push runs only the pull request's side until main moves. The run fails only for a test that passes on main and
 # fails on the pull request, since the fork is unfinished and tests may fail on both, and leaves one comment per suite
 # as an artifact, which pgfork-comment.yml posts. The scripts come from main, or from the pull request while main has
-# none. Every job has a read-only token and no secret.
+# none. A comment also counts the lines the pull request adds and removes, by category (pgfork/lines.py). Every job
+# has a read-only token and no secret.
 
 name: Fork CI
 
@@ -428,6 +429,14 @@ jobs:
             --platform ubuntu-24.04 results/bats-ubuntu-24.04-main.json results/bats-ubuntu-24.04-pr.json \
             --platform macos-15 results/bats-macos-15-main.json results/bats-macos-15-pr.json || status=1
           echo "status=$status" >> "$GITHUB_OUTPUT"
+      # The lines the pull request adds and removes, by category, from the merge commit's main parent to the commit.
+      - name: Check out the pull request merged with main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: lines-tree
+          fetch-depth: 2
+      - name: Count the lines
+        run: python3 .github/workflows/pgfork/lines.py lines-tree "$MAIN_SHA" HEAD comments/lines.md
       - name: Upload the comments
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
