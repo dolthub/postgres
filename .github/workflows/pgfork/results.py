@@ -20,18 +20,22 @@ reads the log `meson test` writes, or with --checks the lines of checks.sh, with
 meson test that runs pg_regress is recorded once per pg_regress test, under `<meson test>:<pg_regress test>`, every
 other meson test once under its meson name (`<suite>/<test>`), a check under `checks:<check>`, a bats test under
 `bats:<test>`, and a cargo test under `<test binary>:<test>`. A pg_regress test whose every difference from one of its
-expected files is rows reordered under a statement with no ORDER BY passes, since Postgres leaves that order undefined
-(its regression chapter's "Row Ordering Differences"). Each meson test, bats run, and test binary is marked
+expected files is an order its statement leaves undefined passes, as Postgres' regression chapter's "Row Ordering
+Differences" says: rows with no ORDER BY, rows tied under one, and the rows a LIMIT or OFFSET cuts from a tied run, as
+Doltgrust's regression runner decides them. Each meson test, bats run, and test binary is marked
 complete when it ran to its end (a failed meson test that printed no pg_regress results never did), so a comparison
 can tell a test the branch removed from one a crash or a timeout never reached; --incomplete marks the whole run as
 stopped before its end. --not-run records a run whose tree, by pgfork/targets.sh, builds no server, so its suites
 were never meant to run. The setup suite's steps are left out."""
 
+import difflib
 import glob
 import json
 import os
 import re
 import sys
+
+from pglast import ast, enums, parse_sql, parser
 
 # A pg_regress status line: `ok 12   + boolean   34 ms` or `not ok 12 - boolean   34 ms`, as pg_regress.c prints it.
 STATUS = re.compile(r"^\s*(not )?ok\s+\d+\s+[-+]\s+(\S+)\s+\d+ ms\s*$")
@@ -92,39 +96,367 @@ def checks(log):
 
 # The header pg_regress writes above each test's diff in regression.diffs, naming the expected and the results file.
 DIFF_HEADER = re.compile(r"^diff (?:--strip-trailing-cr )?-U3 (\S+) (\S+)$")
-# The line under a psql table's column names, and the row count that closes the table.
-SEPARATOR = re.compile(r"^-+(\+-+)*$")
-ROWS = re.compile(r"^\(\d+ rows?\)$")
+# psql's count of a table's rows, as `(3 rows)`.
+ROW_COUNT = re.compile(r"^\(\d+ rows?\)$")
+# The end of a COPY that reads its data from the script that follows it.
+COPY_FROM = re.compile(r"\bfrom\s+stdin\b.*;\s*$|^\s*\\copy\b.*\bfrom\s+(?:stdin|pstdin)\b", re.IGNORECASE)
+# A COPY to psql's output, its source, and its options.
+COPY_TO = re.compile(r"^\s*copy\s+(.*?)\s+to\s+stdout\b(.*?);?\s*$", re.IGNORECASE | re.DOTALL)
+# An option of a COPY to psql's output that is on unless it is followed by a false value.
+COPY_OPTION = r"\b{}\b(?!\s*(?:=\s*)?(?:false|off|0)\b)"
+
+# The orders a statement returns its rows in, as Doltgrust's harness decides them: `ANY` when Postgres returns them in
+# no defined order, `DEFINED` for the one order of a statement that defines it, and `(keys, cut_start, cut_end)` for
+# rows sorted by keys, each run of rows with equal keys in no defined order. A cut start or end means the first or last
+# run may hold any of the tied rows, as an OFFSET or LIMIT that cuts the run picks. A key is the output column at an
+# index, or `(name, index)`: the one output column of a name, or when no output column has the name, the column at an
+# index whose expression is the key, as Postgres looks up a bare name in ORDER BY.
+ANY, DEFINED = "any", "defined"
+
+# The units of tests whose valid outputs are more than Postgres' expected output shows, as Doltgrust's regression
+# runner lists them: by test and statement, how a received table with the expected table's columns and number of rows
+# is checked. `some_of` takes different ones of every row Postgres returns for the statement without its LIMIT,
+# recorded at the same point of its test, as LIMIT without ORDER BY picks any of them; `joined` takes a `bytea` value
+# that is these values, in hex, in any order with the delimiter between them, as `string_agg` without ORDER BY joins
+# them; and `lines` takes the expected rows but for the order of the lines of each value, as a crosstab of `string_agg`
+# values joined by newlines without ORDER BY shows them.
+EXCEPTIONS = [
+    ("with", "WITH t AS (\n    UPDATE y SET a = a * 100 RETURNING *\n)\nSELECT * FROM t LIMIT 10;",
+     ("some_of", ["1100", "1200", "1300", "1400", "1500", "4200", "0", "-100", "-200", "-300", "-400", "-500", "-600",
+                  "-700", "-800", "-900", "-1000", "0", "-100", "-200", "-300", "-400"])),
+    ("aggregates", "select string_agg(v, '') from bytea_test_table;", ("joined", ["ff", "aa"], "")),
+    ("aggregates", "select string_agg(v, NULL) from bytea_test_table;", ("joined", ["ff", "aa"], "")),
+    ("aggregates", "select string_agg(v, decode('ee', 'hex')) from bytea_test_table;", ("joined", ["ff", "aa"], "ee")),
+    ("psql_crosstab", "SELECT v, h, string_agg(c, E'\\n') FROM ctv_data GROUP BY v, h ORDER BY 1,2,3\n"
+     " \\crosstabview 1 2 3", ("lines",)),
+    ("psql_crosstab", "SELECT v,h, string_agg(c, E'\\n') AS c, row_number() OVER(ORDER BY h) AS r\n"
+     "FROM ctv_data GROUP BY v, h ORDER BY 1,3,2\n \\crosstabview v h c r", ("lines",)),
+    ("psql_crosstab", "SELECT v, h, string_agg(c, E'\\n') AS c, row_number() OVER(ORDER BY h DESC) AS r\n"
+     "FROM ctv_data GROUP BY v, h ORDER BY 1,3,2\n \\crosstabview v h c r", ("lines",)),
+    ("psql_crosstab", "SELECT v,h, string_agg(c, E'\\n') AS c, row_number() OVER(ORDER BY h NULLS LAST) AS r\n"
+     "FROM ctv_data GROUP BY v, h ORDER BY 1,3,2\n \\crosstabview v h c r", ("lines",)),
+    ("psql_crosstab", "SELECT v,h, string_agg(i::text, E'\\n') AS i FROM ctv_data\nGROUP BY v, h ORDER BY h,v\n"
+     " \\crosstabview v h i", ("lines",)),
+    ("psql_crosstab", "SELECT v,h,string_agg(i::text, E'\\n'), string_agg(c, E'\\n')\n"
+     "FROM ctv_data GROUP BY v, h ORDER BY h,v\n \\crosstabview 2 1 4", ("lines",)),
+    ("psql_crosstab", "SELECT v,h, string_agg(i::text, E'\\n') AS i, string_agg(c, E'\\n') AS c\n"
+     "FROM ctv_data GROUP BY v, h ORDER BY h,v\n \\crosstabview 1 \"h\" 4", ("lines",)),
+]
 
 
-def unordered(lines):
-    """Returns a psql output's lines with each table's rows sorted, unless the statement above the table orders them
-    (an ORDER BY) or the table is a plan, whose rows' order is its meaning; a row continued over lines (`+`) moves
-    whole."""
-    out, statement, i = [], [], 0
-    while i < len(lines):
-        line = lines[i]
-        text = " ".join(statement).lower()
-        if (SEPARATOR.match(line) and i and lines[i - 1].strip() and not lines[i - 1].startswith("--")
-                and "order by" not in text and "explain" not in text and "QUERY PLAN" not in lines[i - 1]):
-            out.append(line)
-            i += 1
-            rows, row = [], []
-            while i < len(lines) and not ROWS.match(lines[i]):
-                row.append(lines[i])
-                if not lines[i].endswith("+"):
-                    rows.append(row)
-                    row = []
-                i += 1
-            if row:
-                rows.append(row)
-            out += [part for row in sorted(rows) for part in row]
-            statement = []
+def star(target):
+    """Returns whether a target is `*` or a table's `*`."""
+    return isinstance(target.val, ast.ColumnRef) and isinstance(target.val.fields[-1], ast.A_Star)
+
+
+def key(node, targets):
+    """Returns the output column a sort key names: by position, by output name, or by being the expression of a target
+    before any `*` target; None when it names none."""
+    column = None
+    for i, target in enumerate(targets):
+        if star(target):
+            break
+        if target.val == node:
+            column = i
+            break
+    if isinstance(node, ast.A_Const):
+        position = None if node.isnull or not isinstance(node.val, ast.Integer) else node.val.ival
+        return position - 1 if position and position > 0 else None
+    if isinstance(node, ast.ColumnRef) and len(node.fields) == 1 and isinstance(node.fields[0], ast.String):
+        return (node.fields[0].sval, column)
+    return column
+
+
+def select_order(select):
+    """Returns the order of a SELECT's rows: `ANY` without ORDER BY at its top level, sorted when every sort key names
+    an output column, and otherwise `DEFINED`, since rows tied on a key that is not output can't be told apart from
+    rows out of order."""
+    if not select.sortClause:
+        return ANY
+    targets = select.targetList or () if select.op == enums.SetOperation.SETOP_NONE else ()
+    keys = [key(sort.node, targets) if isinstance(sort, ast.SortBy) else None for sort in select.sortClause]
+    if None in keys:
+        return DEFINED
+    count = select.limitCount
+    limited = count is not None and not (isinstance(count, ast.A_Const) and count.isnull)
+    return (keys, select.limitOffset is not None,
+            limited and select.limitOption != enums.LimitOption.LIMIT_OPTION_WITH_TIES)
+
+
+def statement_order(stmt):
+    """Returns the order of a statement's rows: a SELECT's, `ANY` for an INSERT, UPDATE, DELETE, or MERGE with
+    RETURNING, and `DEFINED` for any other statement."""
+    if isinstance(stmt, ast.SelectStmt):
+        return select_order(stmt)
+    returning = isinstance(stmt, (ast.InsertStmt, ast.UpdateStmt, ast.DeleteStmt, ast.MergeStmt))
+    return ANY if returning and stmt.returningList else DEFINED
+
+
+class Statements:
+    """Reads a script's units in order, remembering the order of the rows of each declared cursor and prepared
+    statement."""
+
+    def __init__(self):
+        self.cursors, self.prepared = {}, {}
+
+    def order(self, script):
+        """Returns the order of the rows of a unit, the script psql read before its output, which is `DEFINED` unless
+        one statement ends on the unit's last line, psql read no command there, and that statement returns rows in
+        another order. A unit that copies to psql's output in no defined order returns `copy_order`'s order."""
+        lines = ["" if line.lstrip().startswith("\\") else line for line in script]
+        text = "\n".join(lines)
+        last = len(text) - len(lines[-1]) if lines else 0
+        try:
+            parts = parser.split(text, with_parser=False, only_slices=True)
+        except Exception:
+            parts = [slice(0, len(text))]
+        ending = []
+        for part in parts:
+            try:
+                stmts = parse_sql(text[part])
+            except Exception:
+                stmts = ()
+            for raw in stmts:
+                if isinstance(raw.stmt, ast.DeclareCursorStmt):
+                    self.cursors[raw.stmt.portalname] = statement_order(raw.stmt.query)
+                elif isinstance(raw.stmt, ast.PrepareStmt):
+                    self.prepared[raw.stmt.name] = statement_order(raw.stmt.query)
+            if part.stop > last:
+                ending.append((text[part], stmts))
+        if script and script[-1].lstrip().startswith("\\copy"):
+            copy = COPY_TO.match(script[-1].lstrip()[1:])
+            return copy_order(copy) if copy else DEFINED
+        if not script or script[-1].lstrip().startswith("\\") or len(ending) != 1:
+            return DEFINED
+        source, stmts = ending[0]
+        copy = COPY_TO.match("\n".join(line for line in source.split("\n") if not line.lstrip().startswith("--")))
+        if copy:
+            return copy_order(copy)
+        if len(stmts) != 1:
+            return DEFINED
+        stmt = stmts[0].stmt
+        if isinstance(stmt, ast.FetchStmt) and not stmt.ismove:
+            order = self.cursors.get(stmt.portalname, DEFINED)
+            return (order[0], True, True) if isinstance(order, tuple) else order
+        if isinstance(stmt, ast.ExecuteStmt):
+            return self.prepared.get(stmt.name, DEFINED)
+        return statement_order(stmt)
+
+
+def copy_order(copy):
+    """Returns how a COPY to psql's output orders its lines: `("copy", csv, header, array)`, in no defined order after
+    a CSV header and inside a JSON array's brackets, when it copies a table or a query with no defined order, and
+    otherwise `DEFINED`. Its options are read from its text, so that a format the parser doesn't know yet still
+    counts."""
+    source, options = copy.group(1).strip(), copy.group(2)
+    if not source.startswith("("):
+        source = re.sub(r"\(.*\)\s*$", "", source, flags=re.DOTALL)
+    try:
+        stmts = parse_sql(f"copy {source} to stdout")
+    except Exception:
+        return DEFINED
+    stmt = stmts[0].stmt
+    if stmt.query is not None and statement_order(stmt.query) != ANY:
+        return DEFINED
+    csv = re.search(r"\bcsv\b", options, re.IGNORECASE)
+    header = bool(csv) and bool(re.search(COPY_OPTION.format("header"), options, re.IGNORECASE))
+    array = bool(re.search(COPY_OPTION.format("force_array"), options, re.IGNORECASE))
+    return ("copy", bool(csv), header, array)
+
+
+def copied(order, expected, received):
+    """Returns whether a COPY's received lines are its expected lines in another order, a JSON array's rows each
+    keeping its own text after the comma or space before it, and a CSV header first; a CSV value over several lines
+    keeps the order defined, since its lines can't be told apart from rows."""
+    _, csv, header, array = order
+    fixed = (1 if header else 0) + (1 if array else 0)
+    if len(expected) != len(received) or expected[:fixed] != received[:fixed]:
+        return False
+    if array and (expected[-1:] != received[-1:] or len(expected) < 2):
+        return False
+    rows = lambda lines: sorted(line[1:] if array else line for line in lines[fixed:len(lines) - (1 if array else 0)])
+    if csv and any(line.count('"') % 2 for line in expected):
+        return False
+    return rows(expected) == rows(received)
+
+
+def row_count(line):
+    """Returns whether a line is psql's count of a table's rows."""
+    return bool(ROW_COUNT.match(line))
+
+
+def continues(separator, line):
+    """Returns whether a row's line ends with a value that continues on the next line, which psql marks with a `+` in
+    place of the space before a column's `|` or at the end of the last column's width."""
+    if len(line) == len(separator) and line.endswith("+"):
+        return True
+    return any(p > 0 and line[p - 1:p + 1] == "+|" for p, c in enumerate(separator) if c == "+")
+
+
+def table(lines):
+    """Returns an output's lines through the table header's separator, the lines of each row, and its lines from the
+    row count on, or None when it holds no table."""
+    separator = next((i for i, line in enumerate(lines)
+                      if all(part and set(part) == {"-"} for part in line.split("+"))), None)
+    if not separator:
+        return None
+    count = next((i for i in range(separator + 1, len(lines)) if row_count(lines[i])), None)
+    if count is None:
+        return None
+    rows, row = [], []
+    for line in lines[separator + 1:count]:
+        row.append(line)
+        if not continues(lines[separator], line):
+            rows.append(row)
+            row = []
+    return None if row else (lines[:separator + 1], rows, lines[count:])
+
+
+def cells(head, rows):
+    """Returns each row's lines and the text of its values, split at the columns of a table's head, whose last line is
+    the separator under the column names; a row's values are empty when a line has no `|` where a column ends. A
+    value's text leaves out the last place of its column, where psql marks a value that continues on the next line."""
+    separator = head[-1]
+    ends = [i for i, c in enumerate(separator) if c == "+"]
+    result = []
+    for lines in rows:
+        values = [[] for _ in range(len(ends) + 1)]
+        if any(line[end:end + 1] != "|" for line in lines for end in ends):
+            result.append((lines, []))
             continue
-        statement = [] if ROWS.match(line) else statement + [line]
-        out.append(line)
-        i += 1
-    return out
+        for line in lines:
+            for value, start, end in zip(values, [0] + [end + 1 for end in ends], ends + [len(separator)]):
+                value.append(line[start:end - 1].strip())
+        result.append((lines, ["\n".join(parts) for parts in values]))
+    return result
+
+
+def columns(keys, names):
+    """Returns the output columns that sort keys name among a result's column names, or None when one names no single
+    column."""
+    found = []
+    for k in keys:
+        if isinstance(k, tuple):
+            name, expression = k
+            count = names.count(name)
+            k = expression if count == 0 else names.index(name) if count == 1 else None
+        if k is None or k >= len(names):
+            return None
+        found.append(k)
+    return found
+
+
+def valid(order, expected, received):
+    """Returns whether two outputs in psql's aligned format hold the same table but for an order of its rows that a
+    statement's order allows, each row keeping the lines that continue its values."""
+    mine, theirs = table(expected), table(received)
+    if not mine or not theirs or mine[0] != theirs[0] or mine[2] != theirs[2] or len(mine[1]) != len(theirs[1]):
+        return False
+    head = mine[0]
+    rows, other = cells(head, mine[1]), cells(head, theirs[1])
+    names = cells(head, [[head[-2]]])[0][1] if all(values for _, values in rows + other) else []
+    if order == ANY:
+        return sorted(lines for lines, _ in rows) == sorted(lines for lines, _ in other)
+    keys = columns(order[0], names) if isinstance(order, tuple) else None
+    if keys is None:
+        return False
+    _, cut_start, cut_end = order
+    start = 0
+    while start < len(rows):
+        end = start + 1
+        while end < len(rows) and all(rows[end][1][k] == rows[start][1][k] for k in keys):
+            end += 1
+        if (cut_start and start == 0) or (cut_end and end == len(rows)):
+            if any(values[k] != rows[start][1][k] for _, values in other[start:end] for k in keys):
+                return False
+        elif sorted(lines for lines, _ in rows[start:end]) != sorted(lines for lines, _ in other[start:end]):
+            return False
+        start = end
+    return True
+
+
+def joined(text, values, delimiter):
+    """Returns whether a text is the values in some order with the delimiter between them."""
+    for i, value in enumerate(values):
+        rest = values[:i] + values[i + 1:]
+        if text.startswith(value):
+            after = text[len(value):]
+            if not rest and not after or rest and after.startswith(delimiter) and joined(
+                    after[len(delimiter):], rest, delimiter):
+                return True
+    return False
+
+
+def excepted(test, script, expected, received):
+    """Returns whether a unit of a test is one of `EXCEPTIONS` whose received table has the expected table's columns
+    and number of rows and passes its check."""
+    query = "\n".join(script)
+    check = next((valid for name, text, valid in EXCEPTIONS if name == test and query.endswith(text)), None)
+    mine, theirs = table(expected), table(received)
+    if not check or not mine or not theirs:
+        return False
+    names = lambda head: cells(head, [[head[-2]]])[0][1]
+    if (mine[0][:-2] != theirs[0][:-2] or names(mine[0]) != names(theirs[0]) or mine[2] != theirs[2]
+            or len(mine[1]) != len(theirs[1])):
+        return False
+    rows, other = cells(mine[0], mine[1]), cells(theirs[0], theirs[1])
+    if check[0] == "some_of":
+        full = list(check[1])
+        for _, values in other:
+            if len(values) != 1 or values[0] not in full:
+                return False
+            full.remove(values[0])
+        return True
+    if check[0] == "joined":
+        return (len(other) == 1 and len(other[0][1]) == 1 and other[0][1][0].startswith("\\x")
+                and joined(other[0][1][0][2:], check[1], check[2]))
+    return all(len(a) == len(b) and all(sorted(x.split("\n")) == sorted(y.split("\n")) for x, y in zip(a, b))
+               for (_, a), (_, b) in zip(rows, other))
+
+
+def units(script, output):
+    """Splits a test's output into units, each the script's lines psql echoed before a stretch of output and that
+    output. The script's blank lines are left out, since psql's own blank lines can't be told apart from them, and so
+    is the data a COPY reads from the script, which psql doesn't echo."""
+    sql, data = [], False
+    for line in script:
+        if data:
+            data = line != "\\."
+        elif line.strip():
+            sql.append(line)
+            data = bool(COPY_FROM.search(line))
+    echoed = set()
+    for block in difflib.SequenceMatcher(None, sql, output, autojunk=False).get_matching_blocks():
+        echoed.update(range(block.b, block.b + block.size))
+    found = []
+    for i, line in enumerate(output):
+        if i in echoed:
+            if not found or found[-1][1]:
+                found.append(([], []))
+            found[-1][0].append(line)
+        elif found:
+            found[-1][1].append(line)
+        else:
+            found.append(([], [line]))
+    return found
+
+
+def same(test, script, expected, received):
+    """Returns whether a test's results differ from an expected output only in orders its statements leave undefined."""
+    mine, theirs = units(script, expected), units(script, received)
+    if [lines for lines, _ in mine] != [lines for lines, _ in theirs]:
+        return False
+    statements = Statements()
+    for (lines, out), (_, other) in zip(mine, theirs):
+        order = statements.order(lines)
+        if out == other:
+            continue
+        if isinstance(order, tuple) and order[0] == "copy":
+            if not copied(order, out, other):
+                return False
+        elif not (valid(order, out, other) or excepted(test, lines, out, other)):
+            return False
+    return True
 
 
 def read(path):
@@ -134,8 +466,8 @@ def read(path):
 
 
 def reordered(build, name):
-    """Returns the pg_regress tests of a meson test whose results differ from one of their expected files only in the
-    order of rows no ORDER BY orders, read from the diffs it left."""
+    """Returns the pg_regress tests of a meson test whose results differ from one of their expected files only in
+    orders their statements leave undefined, read from the diffs it left."""
     diffs = os.path.join(build, "testrun", *name.split("/"), "regression.diffs")
     if not os.path.exists(diffs):
         return set()
@@ -144,8 +476,11 @@ def reordered(build, name):
         expected, results = header.group(1), header.group(2)
         test = os.path.basename(results)[:-len(".out")]
         stem = os.path.join(os.path.dirname(expected), test)
-        result = unordered(read(results))
-        if any(unordered(read(path)) == result for path in [stem + ".out", *glob.glob(stem + "_*.out")]
+        script = os.path.join(os.path.dirname(os.path.dirname(expected)), "sql", test + ".sql")
+        if not os.path.exists(script):
+            continue
+        sql, result = read(script), read(results)
+        if any(same(test, sql, read(path), result) for path in [stem + ".out", *glob.glob(stem + "_*.out")]
                if os.path.exists(path)):
             found.add(test)
     return found

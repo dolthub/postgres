@@ -376,6 +376,8 @@ jobs:
           incomplete=()
           [ -f "$RUNNER_TEMP/finished" ] || incomplete=(--incomplete)
           results="ci/.github/workflows/pgfork/results.py"
+          python3 -m pip install --quiet --break-system-packages --require-hashes --only-binary=:all: \
+            -r ci/.github/workflows/pgfork/requirements.txt
           if [ -f "$RUNNER_TEMP/checks.txt" ]; then
             python3 "$results" --checks "$RUNNER_TEMP/checks.txt" "$RESULTS"
           elif [ -f "$RUNNER_TEMP/bats.tap" ]; then
@@ -482,6 +484,8 @@ jobs:
         run: |
           mkdir -p results
           if [ -f build/meson-logs/testlog.json ]; then
+            python -m pip install --quiet --break-system-packages --require-hashes --only-binary=:all: \
+              -r ci/.github/workflows/pgfork/requirements.txt
             incomplete=()
             [ -f "$RUNNER_TEMP/finished" ] || incomplete=(--incomplete)
             python ci/.github/workflows/pgfork/results.py build/meson-logs/testlog.json "$RESULTS" "${incomplete[@]}"
