@@ -25,7 +25,8 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import results  # noqa: E402
-from results import ANY, DEFINED, Statements, columns, copied, excepted, joined, noticed, same, valid  # noqa: E402
+from results import (ANY, DEFINED, Statements, array_elements, columns, copied, excepted,  # noqa: E402
+                     gathered, joined, noticed, same, unordered, valid)
 
 
 def sorted_by(keys, cut_start=False, cut_end=False):
@@ -37,6 +38,14 @@ def render(rows, names=("k", "v")):
     """Returns the psql table of rows of one-character values under one-character column names."""
     head = [" " + " | ".join(names) + " ", "+".join("---" for _ in names)]
     return head + [" " + " | ".join(row) for row in rows] + [f"({len(rows)} {'row' if len(rows) == 1 else 'rows'})", ""]
+
+
+def aligned(rows, names):
+    """Returns the psql table of rows under column names, each column as wide as its widest value."""
+    widths = [max(len(v) for v in column) for column in zip(names, *rows)]
+    line = lambda values: " " + " | ".join(v.ljust(w) for v, w in zip(values, widths)).rstrip()
+    head = [line(names) + " ", "+".join("-" * (w + 2) for w in widths)]
+    return head + [line(row) for row in rows] + [f"({len(rows)} {'row' if len(rows) == 1 else 'rows'})", ""]
 
 
 def order(query, statements=None):
@@ -251,6 +260,49 @@ class Exceptions(unittest.TestCase):
         self.assertFalse(noticed(triggers, DEFINED, expected, crossed))
         self.assertFalse(noticed(triggers, DEFINED, expected, [reordered[1]] + [statement] + reordered[2:]))
 
+
+    def test_array_elements_are_read_as_written(self):
+        self.assertEqual(array_elements("{1,2,3}"), ["1", "2", "3"])
+        self.assertEqual(array_elements('{"a,b",c,"d\\"e"}'), ['"a,b"', "c", '"d\\"e"'])
+        self.assertEqual(array_elements("{{1,2},{3,4}}"), ["{1,2}", "{3,4}"])
+        self.assertEqual(array_elements("{}"), [])
+        self.assertIsNone(array_elements("1,2"))
+        self.assertIsNone(array_elements('{"a}'))
+
+    def test_aggregated_elements_come_in_any_order(self):
+        check = ("elements", "array", "agg", (), None)
+        expected = aligned([("a", "{1,2,3}"), ("b", "{1,2}")], ("f", "agg"))
+        self.assertTrue(gathered(check, expected, aligned([("a", "{3,1,2}"), ("b", "{2,1}")], ("f", "agg"))))
+        for wrong in [[("a", "{3,1,1}"), ("b", "{2,1}")], [("a", "{3,1}"), ("b", "{2,1}")],
+                      [("a", "{3,1,2,4}"), ("b", "{2,1}")], [("x", "{3,1,2}"), ("b", "{2,1}")], [("a", "{3,1,2}")]]:
+            self.assertFalse(gathered(check, expected, aligned(wrong, ("f", "agg"))))
+        self.assertFalse(gathered(("elements", "array", "other", (), None), expected, expected))
+
+    def test_a_pool_takes_as_many_different_ones(self):
+        check = ("elements", "array", "g", (), ["1", "1", "5", "5", "5"])
+        expected = aligned([("{1,1,5}",)], ("g",))
+        self.assertTrue(gathered(check, expected, aligned([("{5,1,5}",)], ("g",))))
+        self.assertTrue(gathered(check, expected, aligned([("{5,5,5}",)], ("g",))))
+        self.assertFalse(gathered(check, expected, aligned([("{1,1,1}",)], ("g",))))
+        self.assertFalse(gathered(check, expected, aligned([("{5,1}",)], ("g",))))
+        self.assertFalse(gathered(check, expected, aligned([("{5,1,6}",)], ("g",))))
+
+    def test_only_the_named_json_members_are_unordered(self):
+        value = '{"t" : { "1" : {"n" : "a", "k" : "x"}, "2" : {"n" : "b", "k" : "y"} }}'
+        swapped = '{"t" : { "2" : {"n" : "b", "k" : "y"}, "1" : {"n" : "a", "k" : "x"} }}'
+        inner = '{"t" : { "1" : {"k" : "x", "n" : "a"}, "2" : {"n" : "b", "k" : "y"} }}'
+        self.assertEqual(unordered("json", value, ("t",)), unordered("json", swapped, ("t",)))
+        self.assertNotEqual(unordered("json", value, ("t",)), unordered("json", inner, ("t",)))
+        self.assertNotEqual(unordered("json", value, ()), unordered("json", swapped, ()))
+        self.assertNotEqual(unordered("json", value, ("t",)), unordered("json", value.replace('"b"', '"c"'), ("t",)))
+        self.assertIsNone(unordered("json", "{", ()))
+
+    def test_xml_children_come_in_any_order(self):
+        value = "<e><n>a</n><n>b</n></e>"
+        self.assertEqual(unordered("xml", value, ()), unordered("xml", "<e><n>b</n><n>a</n></e>", ()))
+        self.assertNotEqual(unordered("xml", value, ()), unordered("xml", "<e><n>b</n><n>b</n></e>", ()))
+        self.assertNotEqual(unordered("xml", value, ()), unordered("xml", "<f><n>b</n><n>a</n></f>", ()))
+        self.assertIsNone(unordered("xml", "<e>", ()))
 
 
 class Copies(unittest.TestCase):

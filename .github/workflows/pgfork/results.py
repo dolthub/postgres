@@ -34,6 +34,7 @@ import json
 import os
 import re
 import sys
+import xml.etree.ElementTree as ElementTree
 
 from pglast import ast, enums, parse_sql, parser
 
@@ -122,6 +123,7 @@ TATTLED = ("notices", r"^NOTICE:  x = \d+, y = \d+$")
 RAISED_ROWS = ("notices", r"^NOTICE:  \d+$")
 ENCODINGS = ("notices", r"^NOTICE:  (EUC_\w+|LATIN1|UTF8) ")
 ROW_TRIGGERS = ("notices", r"^NOTICE:  (?P<phase>BEFORE|AFTER) (INSERT|UPDATE|DELETE) ROW trigger row: (?P<key>.*)$")
+BLEATS = ("notices", r"^NOTICE:  bleat -?\d+$")
 
 # The units of tests whose valid outputs are more than Postgres' expected output shows, as Doltgrust's regression
 # runner lists them: by test and statement, how a received table with the expected table's columns and number of rows
@@ -129,8 +131,10 @@ ROW_TRIGGERS = ("notices", r"^NOTICE:  (?P<phase>BEFORE|AFTER) (INSERT|UPDATE|DE
 # recorded at the same point of its test, as LIMIT without ORDER BY picks any of them; `joined` takes a `bytea` value
 # that is these values, in hex, in any order with the delimiter between them, as `string_agg` without ORDER BY joins
 # them; `lines` takes the expected rows but for the order of the lines of each value, as a crosstab of `string_agg`
-# values joined by newlines without ORDER BY shows them; and `notices` takes the lines a pattern matches, the NOTICEs a
-# statement raises once per row it reads, in any order within each run of them, as `noticed` checks.
+# values joined by newlines without ORDER BY shows them; `notices` takes the lines a pattern matches, the NOTICEs a
+# statement raises once per row it reads, in any order within each run of them, as `noticed` checks; and `elements`
+# takes a column's values as an aggregate without ORDER BY builds them, the same elements in any order (or, given a
+# list, as many different ones of it as Postgres' value holds), as `gathered` checks.
 EXCEPTIONS = [
     ("with", "WITH t AS (\n    UPDATE y SET a = a * 100 RETURNING *\n)\nSELECT * FROM t LIMIT 10;",
      ("some_of", ["1100", "1200", "1300", "1400", "1500", "4200", "0", "-100", "-200", "-300", "-400", "-500", "-600",
@@ -152,38 +156,83 @@ EXCEPTIONS = [
      "FROM ctv_data GROUP BY v, h ORDER BY h,v\n \\crosstabview 2 1 4", ("lines",)),
     ("psql_crosstab", "SELECT v,h, string_agg(i::text, E'\\n') AS i, string_agg(c, E'\\n') AS c\n"
      "FROM ctv_data GROUP BY v, h ORDER BY h,v\n \\crosstabview 1 \"h\" 4", ("lines",)),
-    ('rowsecurity', 'SELECT * FROM t1 WHERE f_leak(b);', F_LEAK),
-    ('rowsecurity', 'SELECT * FROM part_document WHERE f_leak(dtitle) ORDER BY did;', F_LEAK),
-    ('rowsecurity', 'SELECT * FROM part_document_satire WHERE f_leak(dtitle) ORDER BY did;', F_LEAK),
-    ('rowsecurity', 'UPDATE t1 SET b = b WHERE f_leak(b) RETURNING *;', F_LEAK),
-    ('rowsecurity', 'UPDATE t1 SET b = b WHERE f_leak(b) RETURNING tableoid::regclass, *, t1;', F_LEAK),
-    ('rowsecurity', 'DELETE FROM t1 WHERE f_leak(b) RETURNING tableoid::regclass, *, t1;', F_LEAK),
-    ('rowsecurity', 'SELECT * FROM bv1 WHERE f_leak(b);', F_LEAK),
-    ('rowsecurity', 'SELECT * FROM z1 WHERE f_leak(b);', F_LEAK),
-    ('rowsecurity', 'SELECT * FROM rls_view;', F_LEAK),
-    ('rowsecurity', 'SELECT * FROM x1 WHERE f_leak(b) ORDER BY a ASC;', F_LEAK),
-    ('rowsecurity', "UPDATE x1 SET b = b || '_updt' WHERE f_leak(b) RETURNING *;", F_LEAK),
-    ('rowsecurity', 'DELETE FROM x1 WHERE f_leak(b) RETURNING *;', F_LEAK),
-    ('rowsecurity', 'SELECT * FROM y2 WHERE f_leak(b);', F_LEAK),
-    ('rowsecurity', 'SELECT * FROM y2 JOIN test_qual_pushdown ON (b = abc) WHERE f_leak(b);', F_LEAK),
-    ('rowsecurity', 'WITH cte1 AS MATERIALIZED (SELECT * FROM t1 WHERE f_leak(b)) SELECT * FROM cte1;', F_LEAK),
-    ('select_views', 'SELECT * FROM my_credit_card_normal WHERE f_leak(cnum);', F_LEAK),
-    ('merge', 'MERGE INTO target t\nUSING source AS s\nON t.tid = s.sid\nWHEN MATCHED AND t.balance > s.delta THEN\n\tUPDATE SET balance = t.balance - s.delta\nWHEN MATCHED THEN\n\tDELETE\nWHEN NOT MATCHED THEN\n\tINSERT VALUES (s.sid, s.delta);', ROW_TRIGGERS),
-    ('merge', 'MERGE INTO target t\nUSING source AS s\nON t.tid = s.sid\nWHEN MATCHED AND t.balance > s.delta THEN\n    UPDATE SET balance = t.balance - s.delta\nWHEN MATCHED THEN\n\tUPDATE SET balance = 0\nWHEN NOT MATCHED THEN\n    INSERT VALUES (s.sid, s.delta)\nWHEN NOT MATCHED BY SOURCE AND tid = 1 THEN\n\tUPDATE SET balance = 0\nWHEN NOT MATCHED BY SOURCE THEN\n\tDELETE\nRETURNING merge_action(), old, new, t.*;', ROW_TRIGGERS),
-    ('merge', "DO $$\nDECLARE\n  result integer;\nBEGIN\nMERGE INTO target t\nUSING source AS s\nON t.tid = s.sid\nWHEN MATCHED AND s.sid = 3 THEN UPDATE SET balance = t.balance + s.delta\nWHEN MATCHED THEN DELETE\nWHEN NOT MATCHED THEN INSERT VALUES (sid, delta);\nIF FOUND THEN\n  RAISE NOTICE 'Found';\nELSE\n  RAISE NOTICE 'Not found';\nEND IF;\nGET DIAGNOSTICS result := ROW_COUNT;\nRAISE NOTICE 'ROW_COUNT = %', result;\nEND;\n$$;", ROW_TRIGGERS),
-    ('merge', 'MERGE INTO target t1\nUSING target t2\nON t1.tid = t2.tid\nWHEN MATCHED THEN\n\tUPDATE SET balance = t1.balance + t2.balance\nWHEN NOT MATCHED THEN\n\tINSERT VALUES (t2.tid, t2.balance);', ROW_TRIGGERS),
-    ('plancache', 'select cachebug();', RAISED_ROWS),
-    ('encoding', 'SELECT COUNT(test_encoding(encoding, description, input)) > 0\nFROM encoding_tests;', ENCODINGS),
-    ('updatable_views', 'SELECT * FROM rw_view1 WHERE snoop(person);', SNOOPED),
-    ('updatable_views', 'UPDATE rw_view1 SET person=person WHERE snoop(person);', SNOOPED),
-    ('updatable_views', 'DELETE FROM rw_view1 WHERE NOT snoop(person);', SNOOPED),
-    ('updatable_views', "MERGE INTO rw_view1 t\n  USING (VALUES ('Tom'), ('Dick'), ('Harry')) AS v(person) ON t.person = v.person\n  WHEN MATCHED AND snoop(t.person) THEN UPDATE SET person = v.person;", SNOOPED),
-    ('updatable_views', 'SELECT * FROM rw_view2 WHERE snoop(person);', SNOOPED),
-    ('updatable_views', 'UPDATE rw_view2 SET person=person WHERE snoop(person);', SNOOPED),
-    ('updatable_views', 'DELETE FROM rw_view2 WHERE NOT snoop(person);', SNOOPED),
-    ('updatable_views', "MERGE INTO rw_view2 t\n  USING (VALUES ('Tom'), ('Dick'), ('Harry')) AS v(person) ON t.person = v.person\n  WHEN MATCHED AND snoop(t.person) THEN UPDATE SET person = v.person;", SNOOPED),
-    ('updatable_views', 'DELETE FROM v1 WHERE snoop(a) AND leakproof(a); -- should not delete everything, just where a>5', SNOOPED),
-    ('subselect', 'select * from\n  (select tattle(3, ten) as v, count(*) from tenk1 where unique1 < 3 group by 1) ss\n  where ss.v;', TATTLED),
+    ("rowsecurity", "SELECT * FROM t1 WHERE f_leak(b);", F_LEAK),
+    ("rowsecurity", "SELECT * FROM part_document WHERE f_leak(dtitle) ORDER BY did;", F_LEAK),
+    ("rowsecurity", "SELECT * FROM part_document_satire WHERE f_leak(dtitle) ORDER BY did;", F_LEAK),
+    ("rowsecurity", "UPDATE t1 SET b = b WHERE f_leak(b) RETURNING *;", F_LEAK),
+    ("rowsecurity", "UPDATE t1 SET b = b WHERE f_leak(b) RETURNING tableoid::regclass, *, t1;", F_LEAK),
+    ("rowsecurity", "DELETE FROM t1 WHERE f_leak(b) RETURNING tableoid::regclass, *, t1;", F_LEAK),
+    ("rowsecurity", "SELECT * FROM bv1 WHERE f_leak(b);", F_LEAK),
+    ("rowsecurity", "SELECT * FROM z1 WHERE f_leak(b);", F_LEAK),
+    ("rowsecurity", "SELECT * FROM rls_view;", F_LEAK),
+    ("rowsecurity", "SELECT * FROM x1 WHERE f_leak(b) ORDER BY a ASC;", F_LEAK),
+    ("rowsecurity", "UPDATE x1 SET b = b || '_updt' WHERE f_leak(b) RETURNING *;", F_LEAK),
+    ("rowsecurity", "DELETE FROM x1 WHERE f_leak(b) RETURNING *;", F_LEAK),
+    ("rowsecurity", "SELECT * FROM y2 WHERE f_leak(b);", F_LEAK),
+    ("rowsecurity", "SELECT * FROM y2 JOIN test_qual_pushdown ON (b = abc) WHERE f_leak(b);", F_LEAK),
+    ("rowsecurity", "WITH cte1 AS MATERIALIZED (SELECT * FROM t1 WHERE f_leak(b)) SELECT * FROM cte1;", F_LEAK),
+    ("select_views", "SELECT * FROM my_credit_card_normal WHERE f_leak(cnum);", F_LEAK),
+    ("merge", "MERGE INTO target t\nUSING source AS s\nON t.tid = s.sid\nWHEN MATCHED AND t.balance > s.delta THEN\n"
+     "\tUPDATE SET balance = t.balance - s.delta\nWHEN MATCHED THEN\n\tDELETE\nWHEN NOT MATCHED THEN\n"
+     "\tINSERT VALUES (s.sid, s.delta);", ROW_TRIGGERS),
+    ("merge", "MERGE INTO target t\nUSING source AS s\nON t.tid = s.sid\nWHEN MATCHED AND t.balance > s.delta THEN\n"
+     "    UPDATE SET balance = t.balance - s.delta\nWHEN MATCHED THEN\n\tUPDATE SET balance = 0\n"
+     "WHEN NOT MATCHED THEN\n    INSERT VALUES (s.sid, s.delta)\nWHEN NOT MATCHED BY SOURCE AND tid = 1 THEN\n"
+     "\tUPDATE SET balance = 0\nWHEN NOT MATCHED BY SOURCE THEN\n\tDELETE\nRETURNING merge_action(), old, new, t.*;",
+     ROW_TRIGGERS),
+    ("merge", "DO $$\nDECLARE\n  result integer;\nBEGIN\nMERGE INTO target t\nUSING source AS s\nON t.tid = s.sid\n"
+     "WHEN MATCHED AND s.sid = 3 THEN UPDATE SET balance = t.balance + s.delta\nWHEN MATCHED THEN DELETE\n"
+     "WHEN NOT MATCHED THEN INSERT VALUES (sid, delta);\nIF FOUND THEN\n  RAISE NOTICE 'Found';\nELSE\n"
+     "  RAISE NOTICE 'Not found';\nEND IF;\nGET DIAGNOSTICS result := ROW_COUNT;\n"
+     "RAISE NOTICE 'ROW_COUNT = %', result;\nEND;\n$$;", ROW_TRIGGERS),
+    ("merge", "MERGE INTO target t1\nUSING target t2\nON t1.tid = t2.tid\nWHEN MATCHED THEN\n"
+     "\tUPDATE SET balance = t1.balance + t2.balance\nWHEN NOT MATCHED THEN\n\tINSERT VALUES (t2.tid, t2.balance);",
+     ROW_TRIGGERS),
+    ("plancache", "select cachebug();", RAISED_ROWS),
+    ("encoding", "SELECT COUNT(test_encoding(encoding, description, input)) > 0\nFROM encoding_tests;", ENCODINGS),
+    ("updatable_views", "SELECT * FROM rw_view1 WHERE snoop(person);", SNOOPED),
+    ("updatable_views", "UPDATE rw_view1 SET person=person WHERE snoop(person);", SNOOPED),
+    ("updatable_views", "DELETE FROM rw_view1 WHERE NOT snoop(person);", SNOOPED),
+    ("updatable_views", "MERGE INTO rw_view1 t\n"
+     "  USING (VALUES ('Tom'), ('Dick'), ('Harry')) AS v(person) ON t.person = v.person\n"
+     "  WHEN MATCHED AND snoop(t.person) THEN UPDATE SET person = v.person;", SNOOPED),
+    ("updatable_views", "SELECT * FROM rw_view2 WHERE snoop(person);", SNOOPED),
+    ("updatable_views", "UPDATE rw_view2 SET person=person WHERE snoop(person);", SNOOPED),
+    ("updatable_views", "DELETE FROM rw_view2 WHERE NOT snoop(person);", SNOOPED),
+    ("updatable_views", "MERGE INTO rw_view2 t\n"
+     "  USING (VALUES ('Tom'), ('Dick'), ('Harry')) AS v(person) ON t.person = v.person\n"
+     "  WHEN MATCHED AND snoop(t.person) THEN UPDATE SET person = v.person;", SNOOPED),
+    ("updatable_views", "DELETE FROM v1 WHERE snoop(a) AND leakproof(a); "
+     "-- should not delete everything, just where a>5",
+     SNOOPED),
+    ("subselect", "select * from\n  (select tattle(3, ten) as v, count(*) from tenk1 where unique1 < 3 group by 1) ss\n"
+     "  where ss.v;", TATTLED),
+    ("polymorphism", "select f3, myaggp05a(f1) from t group by f3 order by f3;",
+     ("elements", "array", "myaggp05a", (), None)),
+    ("polymorphism", "select f3, myaggp10a(f1) from t group by f3 order by f3;",
+     ("elements", "array", "myaggp10a", (), None)),
+    ("polymorphism", "select f3, myaggp10b(f1) from t group by f3 order by f3;",
+     ("elements", "array", "myaggp10b", (), None)),
+    ("polymorphism", "select f3, myaggp20a(f1) from t group by f3 order by f3;",
+     ("elements", "array", "myaggp20a", (), None)),
+    ("polymorphism", "select f3, myaggp20b(f1) from t group by f3 order by f3;",
+     ("elements", "array", "myaggp20b", (), None)),
+    ("polymorphism", "select f3, myaggn05a(f1) from t group by f3 order by f3;",
+     ("elements", "array", "myaggn05a", (), None)),
+    ("polymorphism", "select f3, myaggn05b(f1) from t group by f3 order by f3;",
+     ("elements", "array", "myaggn05b", (), None)),
+    ("polymorphism", "select f3, myaggn10a(f1) from t group by f3 order by f3;",
+     ("elements", "array", "myaggn10a", (), None)),
+    ("polymorphism", "select f1, sql_if(f1 > 0, bleat(f1), bleat(f1 + 1)) from int4_tbl;", BLEATS),
+    ("polymorphism", "select build_group(q1,3) from int8_tbl;",
+     ("elements", "array", "build_group", (), ["123", "123", "4567890123456789", "4567890123456789",
+                                              "4567890123456789"])),
+    ("json", "SELECT json_object_agg(name, type) FROM foo;", ("elements", "json", "json_object_agg", (), None)),
+    ("json", "SELECT json_build_object('turbines',"
+     "json_object_agg(serial_num,json_build_object('name',name,'type',type)))\nFROM foo;",
+     ("elements", "json", "json_build_object", ("turbines",), None)),
+    ("xml", "SELECT xmlelement(name employees, xmlagg(xmlelement(name name, name))) FROM emp;",
+     ("elements", "xml", "xmlelement", (), None)),
 ]
 
 
@@ -465,6 +514,89 @@ def noticed(pattern, order, expected, received):
     return True
 
 
+def array_elements(text):
+    """Returns the top-level elements of an array's text output, each as it is written, or None when the text isn't
+    one."""
+    if not (text.startswith("{") and text.endswith("}")):
+        return None
+    found, element, depth, quoted, escaped = [], "", 0, False, False
+    for c in text[1:-1]:
+        if escaped:
+            escaped = False
+        elif c == "\\" and quoted:
+            escaped = True
+        elif c == '"':
+            quoted = not quoted
+        elif not quoted and c in "{}":
+            depth += 1 if c == "{" else -1
+        elif not quoted and depth == 0 and c == ",":
+            found.append(element)
+            element = ""
+            continue
+        element += c
+    return None if quoted or depth else found + [element] if text != "{}" else []
+
+
+def unordered(syntax, text, path):
+    """Returns a value's text in a form where the members at a path (an object's members or an array's elements for
+    JSON, the root's children for XML, the elements for an array) are in one canonical order and everything else keeps
+    its own, or None when the text doesn't parse."""
+    if syntax == "array":
+        found = array_elements(text)
+        return None if found is None else sorted(found)
+    if syntax == "xml":
+        try:
+            root = ElementTree.fromstring(text)
+        except ElementTree.ParseError:
+            return None
+        return (root.tag, sorted(root.attrib.items()), root.text, root.tail,
+                sorted(ElementTree.tostring(child, encoding="unicode") for child in root))
+    try:
+        value = json.loads(text, object_pairs_hook=lambda pairs: ("object", pairs))
+    except ValueError:
+        return None
+
+    def canonical(node, rest):
+        if isinstance(node, tuple):
+            members = [(k, canonical(v, rest[1:] if rest and rest[0] == k else None)) for k, v in node[1]]
+            return ("object", sorted(members, key=repr) if rest == () else members)
+        if isinstance(node, list):
+            items = [canonical(v, None) for v in node]
+            return sorted(items, key=repr) if rest == () else items
+        return node
+    return repr(canonical(value, tuple(path)))
+
+
+def gathered(check, expected, received):
+    """Returns whether two tables differ only in a column whose values an aggregate without ORDER BY builds: each
+    received value is the expected value with the members `unordered` names in another order, or, given a list, holds
+    as many different ones of the list as the expected value holds; every other value is equal."""
+    _, syntax, column, path, pool = check
+    mine, theirs = table(expected), table(received)
+    if not mine or not theirs or len(mine[1]) != len(theirs[1]):
+        return False
+    rows, other = cells(mine[0], mine[1]), cells(theirs[0], theirs[1])
+    names = cells(mine[0], [[mine[0][-2]]])[0][1]
+    if column not in names or names != cells(theirs[0], [[theirs[0][-2]]])[0][1] or mine[2] != theirs[2]:
+        return False
+    k = names.index(column)
+    for (_, a), (_, b) in zip(rows, other):
+        if not a or not b or a[:k] + a[k + 1:] != b[:k] + b[k + 1:]:
+            return False
+        if pool is None:
+            if unordered(syntax, a[k], path) is None or unordered(syntax, a[k], path) != unordered(syntax, b[k], path):
+                return False
+            continue
+        mine_elements, theirs_elements, left = array_elements(a[k]), array_elements(b[k]), list(pool)
+        if mine_elements is None or theirs_elements is None or len(mine_elements) != len(theirs_elements):
+            return False
+        for element in theirs_elements:
+            if element not in left:
+                return False
+            left.remove(element)
+    return True
+
+
 def excepted(test, script, expected, received, order=DEFINED):
     """Returns whether a unit of a test, whose statement returns rows in an order, is one of `EXCEPTIONS` and passes its
     check: `notices` by `noticed`, and every other check only when the received table has the expected table's columns
@@ -473,6 +605,8 @@ def excepted(test, script, expected, received, order=DEFINED):
     check = next((valid for name, text, valid in EXCEPTIONS if name == test and query.endswith(text)), None)
     if check and check[0] == "notices":
         return noticed(check[1], order, expected, received)
+    if check and check[0] == "elements":
+        return gathered(check, expected, received)
     mine, theirs = table(expected), table(received)
     if not check or not mine or not theirs:
         return False
