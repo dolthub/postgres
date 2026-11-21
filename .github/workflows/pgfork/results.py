@@ -554,34 +554,138 @@ def array_elements(text):
     return None if quoted or depth else found + [element] if text != "{}" else []
 
 
+def json_end(text, at):
+    """Returns where the JSON value starting at an index of a text ends, and for an object or array the spans of its
+    members (an object's as `(key, start, end)` with the key's raw text, an array's elements with key None), or None
+    when the text there isn't one."""
+    if at >= len(text):
+        return None
+    if text[at] == '"':
+        escaped = False
+        for i in range(at + 1, len(text)):
+            if escaped:
+                escaped = False
+            elif text[i] == "\\":
+                escaped = True
+            elif text[i] == '"':
+                return i + 1, None
+        return None
+    if text[at] not in "{[":
+        end = at
+        while end < len(text) and text[end] not in ",]} \t\n":
+            end += 1
+        return (end, None) if end > at else None
+    close, members, i = "}" if text[at] == "{" else "]", [], at + 1
+    while True:
+        while i < len(text) and text[i] in " \t\n":
+            i += 1
+        if i < len(text) and text[i] == close and not members:
+            return i + 1, members
+        start, key = i, None
+        if close == "}":
+            found = json_end(text, i)
+            if not found or text[i] != '"':
+                return None
+            key, i = text[i:found[0]], found[0]
+            while i < len(text) and text[i] in " \t\n:":
+                i += 1
+        found = json_end(text, i)
+        if not found:
+            return None
+        members.append((key, start, found[0]))
+        i = found[0]
+        while i < len(text) and text[i] in " \t\n":
+            i += 1
+        if i < len(text) and text[i] == close:
+            return i + 1, members
+        if i >= len(text) or text[i] != ",":
+            return None
+        i += 1
+
+
+def xml_children(text):
+    """Returns the spans of an XML element's top-level child nodes (elements, comments, CDATA, and processing
+    instructions) inside its root element, or None when the text isn't one element with its own end tag."""
+    if not text.startswith("<") or not text.endswith(">"):
+        return None
+    head = re.match(r"<([^\s/>]+)(?:[^>\"']|\"[^\"]*\"|'[^']*')*>", text)
+    if not head or head.group(0).endswith("/>") or not text.endswith(f"</{head.group(1)}>"):
+        return None
+    spans, depth, i, end = [], 0, head.end(), len(text) - len(f"</{head.group(1)}>")
+    start = None
+    while i < end:
+        if text.startswith("<!--", i) or text.startswith("<![CDATA[", i) or text.startswith("<?", i):
+            close = "-->" if text.startswith("<!--", i) else "]]>" if text.startswith("<![", i) else "?>"
+            after = text.find(close, i)
+            if after < 0:
+                return None
+            if depth == 0:
+                spans.append((i, after + len(close)))
+            i = after + len(close)
+        elif text[i] == "<":
+            tag = re.match(r"</?[^\s/>]+(?:[^>\"']|\"[^\"]*\"|'[^']*')*>", text[i:end])
+            if not tag:
+                return None
+            if tag.group(0).startswith("</"):
+                depth -= 1
+                if depth < 0:
+                    return None
+                if depth == 0:
+                    spans.append((start, i + tag.end()))
+            elif tag.group(0).endswith("/>"):
+                if depth == 0:
+                    spans.append((i, i + tag.end()))
+            else:
+                if depth == 0:
+                    start = i
+                depth += 1
+            i += tag.end()
+        else:
+            i += 1
+    return spans if depth == 0 else None
+
+
 def unordered(syntax, text, path):
     """Returns a value's text in a form where the members at a path (an object's members or an array's elements for
-    JSON, the root's children for XML, the elements for an array) are in one canonical order and everything else keeps
-    its own, or None when the text doesn't parse."""
+    JSON, the root's child nodes for XML, the elements for an array) are in one canonical order, each as its own raw
+    text, and every other character of the text is kept as it is, or None when the text isn't well formed."""
     if syntax == "array":
         found = array_elements(text)
         return None if found is None else sorted(found)
     if syntax == "xml":
         try:
-            root = ElementTree.fromstring(text)
+            ElementTree.fromstring(text)
         except ElementTree.ParseError:
             return None
-        return (root.tag, sorted(root.attrib.items()), root.text, root.tail,
-                sorted(ElementTree.tostring(child, encoding="unicode") for child in root))
-    try:
-        value = json.loads(text, object_pairs_hook=lambda pairs: ("object", pairs))
-    except ValueError:
+        spans = xml_children(text)
+    else:
+        try:
+            json.loads(text)
+        except ValueError:
+            return None
+        start = len(text) - len(text.lstrip())
+        found = json_end(text, start)
+        for key in path:
+            if not found or not found[1]:
+                return None
+            member = next(((s, e) for k, s, e in found[1] if k == json.dumps(key)), None)
+            if member is None:
+                return None
+            start = member[0] + len(json.dumps(key))
+            while text[start] in " \t\n:":
+                start += 1
+            found = json_end(text, start)
+        if not found or found[1] is None:
+            return None
+        spans = [(s, e) for _, s, e in found[1]]
+    if spans is None:
         return None
-
-    def canonical(node, rest):
-        if isinstance(node, tuple):
-            members = [(k, canonical(v, rest[1:] if rest and rest[0] == k else None)) for k, v in node[1]]
-            return ("object", sorted(members, key=repr) if rest == () else members)
-        if isinstance(node, list):
-            items = [canonical(v, None) for v in node]
-            return sorted(items, key=repr) if rest == () else items
-        return node
-    return repr(canonical(value, tuple(path)))
+    frame, at = [], 0
+    for s, e in spans:
+        frame.append(text[at:s])
+        at = e
+    frame.append(text[at:])
+    return frame, sorted(text[s:e] for s, e in spans)
 
 
 def gathered(check, expected, received):

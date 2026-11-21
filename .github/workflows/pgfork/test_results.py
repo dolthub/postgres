@@ -301,6 +301,22 @@ class Exceptions(unittest.TestCase):
         self.assertNotEqual(unordered("json", value, ("t",)), unordered("json", value.replace('"b"', '"c"'), ("t",)))
         self.assertIsNone(unordered("json", "{", ()))
 
+    def test_members_keep_their_own_text(self):
+        value = '{ "t15" : "GE1043", "t16" : "GE1043", "sub" : 1.0 }'
+        self.assertEqual(unordered("json", value, ()),
+                         unordered("json", '{ "t16" : "GE1043", "sub" : 1.0, "t15" : "GE1043" }', ()))
+        self.assertNotEqual(unordered("json", value, ()),
+                            unordered("json", '{ "t16":"GE1043","sub" : 1.0, "t15" : "GE1043" }', ()))
+        self.assertNotEqual(unordered("json", value, ()),
+                            unordered("json", '{ "t16" : "GE1043", "sub" : 1.00, "t15" : "GE1043" }', ()))
+        self.assertNotEqual(unordered("json", value, ()),
+                            unordered("json", '{ "t16" : "GE1043", "sub" : 1.0, "t15" : "GE1043"}', ()))
+        xml = "<e><n>a</n><n></n><!-- c --></e>"
+        self.assertEqual(unordered("xml", xml, ()), unordered("xml", "<e><!-- c --><n></n><n>a</n></e>", ()))
+        self.assertNotEqual(unordered("xml", xml, ()), unordered("xml", "<e><n/><n>a</n><!-- c --></e>", ()))
+        self.assertNotEqual(unordered("xml", xml, ()), unordered("xml", "<e><n >a</n><n></n><!-- c --></e>", ()))
+        self.assertNotEqual(unordered("xml", xml, ()), unordered("xml", "<e><n>&#97;</n><n></n><!-- c --></e>", ()))
+
     def test_xml_children_come_in_any_order(self):
         value = "<e><n>a</n><n>b</n></e>"
         self.assertEqual(unordered("xml", value, ()), unordered("xml", "<e><n>b</n><n>a</n></e>", ()))
