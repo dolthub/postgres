@@ -38,6 +38,9 @@ import xml.etree.ElementTree as ElementTree
 
 from pglast import ast, enums, parse_sql, parser
 
+# The alternative expected outputs record.py records for the core regression suite: stock Postgres' own output of a
+# test when its deciding tables hold their rows in the order the fork reads them.
+ALTERNATIVES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alternatives")
 # A pg_regress status line: `ok 12   + boolean   34 ms` or `not ok 12 - boolean   34 ms`, as pg_regress.c prints it.
 STATUS = re.compile(r"^\s*(not )?ok\s+\d+\s+[-+]\s+(\S+)\s+\d+ ms\s*$")
 # The TAP plan pg_regress prints after its last test.
@@ -793,7 +796,9 @@ def reordered(build, name):
         if not os.path.exists(script):
             continue
         sql, result = read(script), read(results)
-        if any(same(test, sql, read(path), result) for path in [stem + ".out", *glob.glob(stem + "_*.out")]
+        recorded = [] if name != "regress/regress" else glob.glob(os.path.join(ALTERNATIVES,
+                                                                            glob.escape(test) + "_*.out"))
+        if any(same(test, sql, read(path), result) for path in [stem + ".out", *glob.glob(stem + "_*.out"), *recorded]
                if os.path.exists(path)):
             found.add(test)
     return found
