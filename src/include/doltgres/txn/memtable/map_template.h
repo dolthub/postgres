@@ -81,6 +81,8 @@ extern bool TXN_MEMTABLE_MAP_CAT(txn_memtable_map_finish_, TXN_MEMTABLE_MAP_TS) 
 																				 TxnMemtableTablePreparedState *prepared,
 																				 size_t take,
 																				 TxnMemtableVersionWriter writer,
+																				 bool has_roomed,
+																				 TxnStatusRoomed roomed,
 																				 bool has_lsn, uint64 lsn,
 																				 bool has_base, const uint8 *base,
 																				 size_t base_len,
@@ -103,6 +105,7 @@ extern bool TXN_MEMTABLE_MAP_CAT(txn_memtable_map_took_, TXN_MEMTABLE_MAP_TS) (H
 																			   TxnMemtableTablePreparedState *prepared,
 																			   size_t take,
 																			   TxnMemtableVersionWriter writer,
+																			   bool has_roomed, TxnStatusRoomed roomed,
 																			   bool has_lsn, uint64 lsn, bool has_claim,
 																			   HostRow claim_tid, uint64 claim_bytes,
 																			   bool has_base, const uint8 *base,
@@ -186,7 +189,8 @@ TXN_MEMTABLE_MAP_CAT(txn_memtable_map_prepare_, TXN_MEMTABLE_MAP_RS) (HostIoIo *
 
 	return txn_memtable_table_readied(io, false, none, NULL, 0, takes, takes_len, false,
 									  TXN_MEMTABLE_MAP_RNAME(txn_memtable_map_inside), &captures,
-									  TXN_MEMTABLE_MAP_RNAME(txn_memtable_map_dropped), TXN_MEMTABLE_MAP_RESULT_ERROR);
+									  TXN_MEMTABLE_MAP_RNAME(txn_memtable_map_dropped), NULL,
+									  TXN_MEMTABLE_MAP_RESULT_ERROR);
 }
 
 #undef TXN_MEMTABLE_MAP_RNAME
@@ -284,6 +288,8 @@ typedef struct TXN_MEMTABLE_MAP_TNAME (txn_memtable_map_took_frame_t)
 	TxnMemtableTablePreparedState *prepared;
 	size_t		take;
 	TxnMemtableVersionWriter writer;
+	bool		has_roomed;
+	TxnStatusRoomed roomed;
 	bool		has_lsn;
 	uint64		lsn;
 	bool		has_claim;
@@ -319,8 +325,9 @@ TXN_MEMTABLE_MAP_TNAME(txn_memtable_map_took_body) (void *frame_)
 {
 	TXN_MEMTABLE_MAP_TNAME(txn_memtable_map_took_frame_t) * frame = frame_;
 
-	frame->ok = txn_memtable_map_took_core(frame->io, frame->prepared, frame->take, frame->writer, frame->has_lsn,
-										   frame->lsn, frame->has_claim, frame->claim_tid, frame->claim_bytes,
+	frame->ok = txn_memtable_map_took_core(frame->io, frame->prepared, frame->take, frame->writer, frame->has_roomed,
+										   frame->roomed, frame->has_lsn, frame->lsn, frame->has_claim,
+										   frame->claim_tid, frame->claim_bytes,
 										   frame->has_base, frame->base, frame->base_len,
 										   TXN_MEMTABLE_MAP_TNAME(txn_memtable_map_took_step),
 										   TXN_MEMTABLE_MAP_TNAME(txn_memtable_map_took_tuple),
@@ -335,6 +342,7 @@ bool
 TXN_MEMTABLE_MAP_CAT(txn_memtable_map_finish_, TXN_MEMTABLE_MAP_TS) (HostIoTakesShort io,
 																	 TxnMemtableTablePreparedState *prepared,
 																	 size_t take, TxnMemtableVersionWriter writer,
+																	 bool has_roomed, TxnStatusRoomed roomed,
 																	 bool has_lsn, uint64 lsn, bool has_base,
 																	 const uint8 *base, size_t base_len,
 																	 TxnMemtableMapStep (*step) (void *captures,
@@ -354,7 +362,8 @@ TXN_MEMTABLE_MAP_CAT(txn_memtable_map_finish_, TXN_MEMTABLE_MAP_TS) (HostIoTakes
 {
 	TXN_MEMTABLE_MAP_TNAME(txn_memtable_map_took_frame_t) frame =
 	{
-		.io = io, .prepared = prepared, .take = take, .writer = writer, .has_lsn = has_lsn, .lsn = lsn,
+		.io = io, .prepared = prepared, .take = take, .writer = writer, .has_roomed = has_roomed, .roomed = roomed,
+			.has_lsn = has_lsn, .lsn = lsn,
 			.has_base = has_base, .base = base, .base_len = base_len,
 			.captures =
 		{
@@ -374,7 +383,8 @@ TXN_MEMTABLE_MAP_CAT(txn_memtable_map_finish_, TXN_MEMTABLE_MAP_TS) (HostIoTakes
 bool
 TXN_MEMTABLE_MAP_CAT(txn_memtable_map_took_, TXN_MEMTABLE_MAP_TS) (HostIoTakesShort io,
 																   TxnMemtableTablePreparedState *prepared, size_t take,
-																   TxnMemtableVersionWriter writer, bool has_lsn,
+																   TxnMemtableVersionWriter writer, bool has_roomed,
+																   TxnStatusRoomed roomed, bool has_lsn,
 																   uint64 lsn, bool has_claim, HostRow claim_tid,
 																   uint64 claim_bytes, bool has_base,
 																   const uint8 *base, size_t base_len,
@@ -399,7 +409,8 @@ TXN_MEMTABLE_MAP_CAT(txn_memtable_map_took_, TXN_MEMTABLE_MAP_TS) (HostIoTakesSh
 {
 	TXN_MEMTABLE_MAP_TNAME(txn_memtable_map_took_frame_t) frame =
 	{
-		.io = io, .prepared = prepared, .take = take, .writer = writer, .has_lsn = has_lsn, .lsn = lsn,
+		.io = io, .prepared = prepared, .take = take, .writer = writer, .has_roomed = has_roomed, .roomed = roomed,
+			.has_lsn = has_lsn, .lsn = lsn,
 			.has_claim = has_claim, .claim_tid = claim_tid, .claim_bytes = claim_bytes, .has_base = has_base,
 			.base = base, .base_len = base_len,
 			.captures =

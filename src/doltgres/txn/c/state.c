@@ -85,6 +85,20 @@
 #define TXN_STATE_REACHED_SINCE (25 + TXN_FREE_SPACE_CATEGORIES)
 #define TXN_STATE_RECOUNTING (28 + TXN_FREE_SPACE_CATEGORIES)
 
+/*
+ * TXN_STATE_COMMITTING_INDEX is Committing, one past the id of the process
+ * whose turn it is at spilling the state's committed versions, so no two
+ * spill one key's versions at once, or zero.
+ */
+#define TXN_STATE_COMMITTING_INDEX (29 + TXN_FREE_SPACE_CATEGORIES)
+
+/*
+ * TXN_STATE_NUMBERED is Numbered, the highest number a spill file of an ended
+ * transaction of the state took, by the committed arm or a fold's residual,
+ * which take their numbers through it, so two of them never take one number.
+ */
+#define TXN_STATE_NUMBERED (30 + TXN_FREE_SPACE_CATEGORIES)
+
 /* The makers' atomics, Tokens and Generations. */
 #define TXN_STATE_TOKENS 0
 #define TXN_STATE_GENERATIONS 1
@@ -350,6 +364,23 @@ uint64
 txn_state_generation(HostSharedRecord record)
 {
 	return txn_state_load(record, TXN_STATE_BASE_GENERATION);
+}
+
+/*
+ * txn_state_moved_past reports whether an install moved a state's base
+ * generation past the one a reader took its base at, loaded after every read
+ * before it (bugs rows 240 and 241). An install moves the generation by an
+ * atomic add, which has full barrier semantics, under the state's lock, and
+ * its drop starts only after the install returns; the load follows a read
+ * barrier, so a reader that read the delta and then finds the generation
+ * unmoved read no version a newer base's drop took out.
+ */
+bool
+txn_state_moved_past(HostSharedRecord record, uint64 generation)
+{
+	HostSharedOp op = {.tag = HOST_SHARED_OP_LOAD_ACQUIRE};
+
+	return host_shared_Record_atomic(record, TXN_STATE_BASE_GENERATION, op) != generation;
 }
 
 /* txn_state_find_frame_0_t is find's state across its pad: the sweep and the handle being looked at, while live. */
@@ -816,7 +847,7 @@ static const size_t TXN_STATE_BLOBS[] = {TXN_STATE_BASE_BYTES, TXN_STATE_BASE_BY
 
 /* TXN_STATE_STATE_POOL_OPS is State's Shape and Pool: two locks, its atomics, and two base records' blobs. */
 const HostSharedPoolOps TXN_STATE_STATE_POOL_OPS = {
-	.shape = {.id = UINT64CONST(0x74786e000002), .locks = 2, .atomics = 29 + TXN_FREE_SPACE_CATEGORIES,
+	.shape = {.id = UINT64CONST(0x74786e000002), .locks = 2, .atomics = 31 + TXN_FREE_SPACE_CATEGORIES,
 	.blobs = TXN_STATE_BLOBS, .blobs_len = lengthof(TXN_STATE_BLOBS)},
 	.name = {"storage state", 13},
 	.count = txn_state_State_Pool_count,
@@ -1172,13 +1203,18 @@ txn_state_state(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *read
 	return frame.ok;
 }
 
-/* txn_state_base_record_frame_0_t is base_record's state across its pad: the state's shared guard and its blob, while live. */
+/*
+ * txn_state_base_record_frame_0_t is base_record's state across its pad: the
+ * base generation read with the base, when asked for, and the state's shared
+ * guard and its blob, while live.
+ */
 typedef struct txn_state_base_record_frame_0_t
 {
 	HostIoIo   *io;
-	const HostSharedHeld *held;
+	HostSharedRecord record;
 	bool	   *some;
 	TxnBaseBase *result;
+	uint64	   *generation;
 	HostError  *error;
 	bool		ok;
 	HostSharedGuard guard;
@@ -1211,12 +1247,14 @@ txn_state_base_record_body_0(void *frame_)
 {
 	txn_state_base_record_frame_0_t *frame = frame_;
 
-	if (!host_shared_Record_lock_shared(host_shared_Held_record(frame->held), HOST_IO_IO_TAKES_SHORT(frame->io),
-										TXN_STATE_STATE_LOCK_INDEX, &frame->guard, frame->error))
+	if (!host_shared_Record_lock_shared(frame->record, HOST_IO_IO_TAKES_SHORT(frame->io), TXN_STATE_STATE_LOCK_INDEX,
+										&frame->guard, frame->error))
 		return;
 	frame->guard_live = true;
 	frame->blob = host_shared_Guard_read_blob(&frame->guard, 0);
 	frame->blob_live = true;
+	if (frame->generation != NULL)
+		*frame->generation = txn_state_generation(frame->record);
 	frame->guard_live = false;
 	host_shared_Guard_drop(&frame->guard);
 	frame->ok = txn_state_unkept(frame->blob.ptr, frame->blob.len, txn_state_internal, frame->some, frame->result,
@@ -1231,10 +1269,71 @@ txn_state_base_record_body_0(void *frame_)
 bool
 txn_state_base_record(HostIoIo *io, const HostSharedHeld *held, bool *some, TxnBaseBase *result, HostError *error)
 {
-	txn_state_base_record_frame_0_t frame = {.io = io, .held = held, .some = some, .result = result, .error = error};
+	txn_state_base_record_frame_0_t frame = {.io = io, .record = host_shared_Held_record(held), .some = some,
+	.result = result, .error = error};
 
 	std_landing(&frame, txn_state_base_record_body_0, txn_state_base_record_pad_0);
 	return frame.ok;
+}
+
+/* txn_state_read_point returns the read point of a state's newest base, or 0 for a state with none, read under the state's lock. */
+bool
+txn_state_read_point(HostIoIo *io, HostSharedRecord record, uint64 *result, HostError *error)
+{
+	bool		some;
+	TxnBaseBase newest;
+	txn_state_base_record_frame_0_t frame = {.io = io, .record = record, .some = &some, .result = &newest,
+	.error = error};
+
+	std_landing(&frame, txn_state_base_record_body_0, txn_state_base_record_pad_0);
+	if (!frame.ok)
+		return false;
+	*result = some ? newest.read : 0;
+	if (some)
+		txn_base_Base_drop(&newest);
+	return true;
+}
+
+/* txn_state_committed_taken takes a process's turn at spilling a state's committed versions, answering whether it took it. */
+bool
+txn_state_committed_taken(HostSharedRecord record, uint64 id)
+{
+	return txn_state_exchange(record, TXN_STATE_COMMITTING_INDEX, 0, id + 1) == 0;
+}
+
+/* txn_state_committed_given gives a process's turn at spilling a state's committed versions back. */
+void
+txn_state_committed_given(HostSharedRecord record, uint64 id)
+{
+	txn_state_exchange(record, TXN_STATE_COMMITTING_INDEX, id + 1, 0);
+}
+
+/*
+ * txn_state_numbered takes the number of a spill file of an ended transaction
+ * of a state: past past, one past the transaction's files of the kind listed
+ * or pended, and past every number such a file of the state took before.
+ */
+uint32
+txn_state_numbered(HostSharedRecord record, uint32 past)
+{
+	uint64		taken = txn_state_load(record, TXN_STATE_NUMBERED);
+
+	for (;;)
+	{
+		uint64		number = Max(taken + 1, (uint64) past);
+		uint64		seen = txn_state_exchange(record, TXN_STATE_NUMBERED, taken, number);
+
+		if (seen == taken)
+			return (uint32) number;
+		taken = seen;
+	}
+}
+
+/* txn_state_delta_bytes returns the encoded bytes of every version in a state's delta. */
+uint64
+txn_state_delta_bytes(HostSharedRecord record)
+{
+	return txn_state_load(record, TXN_STATE_DELTA_BYTES);
 }
 
 /*
@@ -1388,32 +1487,31 @@ txn_state_recounted_pad_0(void *frame_)
  * txn_state_recounted_counting runs recounted's count while the backend
  * holds the state's Recounting, answering false on the count's error, which
  * it gives back only after clearing RECOUNT and Recounting, and setting
- * counted when the count answered sizes.
+ * counted when the count answered sizes. A count that a commit's move of the
+ * totals met leaves them unknown, and one a fold's install met counts again
+ * (bugs rows 240 and 316).
  */
 static bool
 txn_state_recounted_counting(txn_state_recounted_frame_0_t *frame, HostSharedRecord record,
 							 HostSharedPlaceCell *cell, bool *counted)
 {
 	uint64		moved;
+	uint64		generation;
 	bool		ok;
 	TxnBaseSizes sizes;
 
 	host_shared_PlaceCell_set(cell, true, host_shared_Held_place(frame->held));
 	moved = txn_state_load(record, TXN_STATE_TOTALS_MOVED);
+	generation = txn_state_generation(record);
 	ok = host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-state-recounting", frame->error);
-	if (ok)
+	frame->count_live = false;
+	if (!ok && frame->count_drop != NULL)
+		frame->count_drop(frame->count_captures);
+	while (ok)
 	{
-		frame->count_live = false;
 		ok = frame->count(frame->count_captures, frame->io, counted, &sizes, frame->error);
-	}
-	else
-	{
-		frame->count_live = false;
-		if (frame->count_drop != NULL)
-			frame->count_drop(frame->count_captures);
-	}
-	if (ok && *counted)
-	{
+		if (!ok || !*counted)
+			break;
 		txn_state_total_stored(record, 0, sizes.entries);
 		txn_state_total_stored(record, 1, sizes.leaf_bytes);
 		txn_state_total_stored(record, 2, sizes.key_bytes);
@@ -1422,6 +1520,11 @@ txn_state_recounted_counting(txn_state_recounted_frame_0_t *frame, HostSharedRec
 		txn_state_exchange(record, TXN_STATE_TOTALS_KNOWN, 0, 1);
 		if (txn_state_load(record, TXN_STATE_TOTALS_MOVED) != moved)
 			txn_state_totals_unknown(record);
+		if (!txn_state_moved_past(record, generation))
+			break;
+		txn_state_totals_unknown(record);
+		moved = txn_state_load(record, TXN_STATE_TOTALS_MOVED);
+		generation = txn_state_generation(record);
 	}
 	host_shared_PlaceCell_set(cell, false, host_shared_Held_place(frame->held));
 	txn_state_exchange(record, TXN_STATE_RECOUNTING, 1, 0);
@@ -2673,6 +2776,8 @@ txn_state_marked(HostIoIo *io, uint32 database, bool *result, HostError *error)
 bool
 txn_state_found(HostIoIo *io, const HostStorage *storage, bool *some, HostSharedHeld *result, HostError *error)
 {
+	if (!host_pause(HOST_SHARED_IO_PAUSES(io), "doltgres-state-found", error))
+		return false;
 	return txn_state_find(HOST_SHARED_IO_WITHIN(io), storage, some, result, error);
 }
 
@@ -3018,6 +3123,26 @@ txn_state_stored_base(HostIoIo *io, const RepoRepo *repo, const HostSharedReader
 }
 
 /*
+ * txn_state_checked refuses, as an internal error, a base an MVCC or historic
+ * snapshot whose xmin doesn't pass its maxFolded would read.
+ */
+static bool
+txn_state_checked(const HostSnapshot *snapshot, bool *some, TxnBaseBase *result, HostError *error)
+{
+	if (*some &&
+		(snapshot->kind == HOST_SNAPSHOT_KIND_MVCC || snapshot->kind == HOST_SNAPSHOT_KIND_HISTORIC_MVCC) &&
+		snapshot->xmin.f0 <= result->max_folded)
+	{
+		txn_base_Base_drop(result);
+		*some = false;
+		*error = txn_state_internal("a snapshot reads a base folded at or past its xmin",
+									strlen("a snapshot reads a base folded at or past its xmin"));
+		return false;
+	}
+	return true;
+}
+
+/*
  * txn_state_readable returns the base of a filled state's that a snapshot
  * reads: its newest, which every snapshot may read, since every fold's point
  * is bounded by the storage's horizon, below every MVCC and historic
@@ -3031,19 +3156,30 @@ bool
 txn_state_readable(HostIoIo *io, const HostSharedHeld *held, const HostSnapshot *snapshot, bool *some,
 				   TxnBaseBase *result, HostError *error)
 {
-	if (!txn_state_newest(io, held, some, result, error))
-		return false;
-	if (*some &&
-		(snapshot->kind == HOST_SNAPSHOT_KIND_MVCC || snapshot->kind == HOST_SNAPSHOT_KIND_HISTORIC_MVCC) &&
-		snapshot->xmin.f0 <= result->max_folded)
-	{
-		txn_base_Base_drop(result);
-		*some = false;
-		*error = txn_state_internal("a snapshot reads a base folded at or past its xmin",
-									strlen("a snapshot reads a base folded at or past its xmin"));
-		return false;
-	}
-	return true;
+	return txn_state_newest(io, held, some, result, error) && txn_state_checked(snapshot, some, result, error);
+}
+
+/*
+ * txn_state_readable_since answers whether an install moved a filled state's
+ * base generation past the one a reader took its base at (bugs rows 240 and
+ * 241), costing one load when it hasn't, and when it has, returns the newest
+ * base for a snapshot to read, as readable returns it, with the generation
+ * it read it at, both read under the state's lock, under which an install
+ * moves both.
+ */
+bool
+txn_state_readable_since(HostIoIo *io, HostSharedRecord record, const HostSnapshot *snapshot, uint64 generation,
+						 bool *moved, bool *some, TxnBaseBase *result, uint64 *now, HostError *error)
+{
+	txn_state_base_record_frame_0_t frame = {.io = io, .record = record, .some = some, .result = result,
+	.generation = now, .error = error};
+
+	*moved = txn_state_generation(record) != generation;
+	*some = false;
+	if (!*moved)
+		return true;
+	std_landing(&frame, txn_state_base_record_body_0, txn_state_base_record_pad_0);
+	return frame.ok && txn_state_checked(snapshot, some, result, error);
 }
 
 /* txn_state_reset_frame_0_t is reset's state across its pad: the saved base it takes, the handle, the guard, the empty base, and its blob, while live. */
@@ -3218,15 +3354,14 @@ txn_state_uncounted_body_0(void *frame_)
 	frame->versions_live = true;
 	for (size_t k = 0, k_len = frame->versions.len; k < k_len; k++)
 	{
-		TxnMemtableVersionRecord record =
-			txn_memtable_version_Version_record(&STD_VEC_AT(&frame->versions, TxnMemtableVersionVersion, k));
+		const TxnMemtableVersionVersion *version = &STD_VEC_AT(&frame->versions, TxnMemtableVersionVersion, k);
+		TxnMemtableVersionRecord record = txn_memtable_version_Version_record(version);
 		TxnMemtableVersionWriter writer = txn_memtable_version_Record_writer(&record);
-		TxnMemtableVersionOpRefTag op = txn_memtable_version_Record_op(&record).tag;
 		HostXid		xid = {writer.has_top ? writer.top : writer.xid};
 		bool		has;
 		uint64		added;
 
-		if (op == TXN_MEMTABLE_VERSION_OP_REF_LOCK || op == TXN_MEMTABLE_VERSION_OP_REF_LOCK_ROW)
+		if (!txn_memtable_version_Version_counted(version))
 			continue;
 		if (!txn_status_add(frame->io, xid, PG_UINT64_MAX, &has, &added, frame->error))
 		{
@@ -4099,6 +4234,20 @@ txn_state_unlogged(HostIoIo *io, StdVec *result, HostError *error)
 	return frame.sweep.ok;
 }
 
+/*
+ * txn_state_delta_clear reports whether a state's delta holds no version or
+ * take, in its memtables or in a spill file: its rows', free space map's, and
+ * tuple id table's words are clear, its spills' manifest lists no file, and
+ * no spill is pending.
+ */
+static bool
+txn_state_delta_clear(HostSharedRecord record)
+{
+	return (txn_state_load(record, TXN_STATE_MEMTABLE_WORD_INDEX) | txn_state_load(record, TXN_STATE_FREE_WORD_INDEX) |
+			txn_state_load(record, TXN_STATE_TUPLES_WORD_INDEX) | txn_state_load(record, TXN_STATE_SPILLS_INDEX) |
+			txn_state_load(record, TXN_STATE_SPILLS_PENDING)) == 0;
+}
+
 /* txn_state_gathered_frame_0_t is gathered's frame: the slot reads' frame, the save's token, and the edit it gives. */
 typedef struct txn_state_gathered_frame_0_t
 {
@@ -4143,8 +4292,7 @@ txn_state_gathered_body_0(void *frame_)
 		txn_state_gathered_pad_0(frame);
 		return;
 	}
-	if ((txn_state_load(record, TXN_STATE_MEMTABLE_WORD_INDEX) | txn_state_load(record, TXN_STATE_FREE_WORD_INDEX) |
-		 txn_state_load(record, TXN_STATE_TUPLES_WORD_INDEX)) == 0)
+	if (txn_state_delta_clear(record))
 	{
 		txn_state_stored(record, TXN_STATE_COUNTER, some ? frame->slot.base.fresh_end : 1);
 		if (!some)
@@ -4186,9 +4334,9 @@ txn_state_gathered_body_0(void *frame_)
  * txn_state_gathered is one state's part of a save: under the state's lock,
  * for a ready state whose saved isn't clean, it first lets the tuple id
  * counter fall back to the next tuple id past every row its base record
- * holds, (0,1) for no base, when no memtable of its rows or its free space
- * map and no tuple id table is linked, since no version or entry then names
- * a tuple id or a place past it and no insert has taken one; then it stores
+ * holds, (0,1) for no base, when its delta holds no version or take, in its
+ * memtables or in a spill file, since no version or entry then names a tuple
+ * id or a place past it and no insert has taken one; then it stores
  * the save's token in saved and returns the record a make would read back,
  * its counter the word's one load, which it keeps in the blob, so the blob
  * is the record the manifest holds once the save lands. A storage with no
@@ -5156,7 +5304,7 @@ test_txn_state_tests_a_state_is_filled_from_its_base_and_found_again(void)
 }
 
 /* txn_state_tests_reopened returns a process's own handle on a database's repository. */
-static bool
+bool
 txn_state_tests_reopened(HostIoIo *io, uint32 database, RepoRepo *result, HostError *error)
 {
 	ChunksErrorError failed;
@@ -5718,7 +5866,7 @@ txn_state_tests_saved_closure_1(void *captures, HostIoIo *io, ChunksErrorError *
 }
 
 /* txn_state_tests_saved saves a database's repository through the gathering, running between after the manifest's write landed and before saved. */
-static void
+void
 txn_state_tests_saved(HostIoIo *io, const RepoRepo *repo, uint32 database,
 					  void (*between) (void *captures, HostIoIo *io), void *between_captures)
 {
@@ -6334,6 +6482,54 @@ test_txn_state_tests_a_linked_free_space_map_or_tuple_id_table_keeps_the_counter
 	simc_TestIo_drop(&test_io);
 }
 
+/*
+ * The fall-back words and spills: a state whose rows', free space map's, and
+ * tuple id table's words are clear but whose spills are linked, or one of
+ * whose spills is pending, keeps its counter through a save, since a spill
+ * holds versions of rows and takes of places past its base's; it falls back
+ * once both are clear.
+ */
+void
+test_txn_state_tests_a_state_with_spills_keeps_the_counter_from_falling_back(void)
+{
+	static const size_t words[] = {TXN_STATE_SPILLS_INDEX, TXN_STATE_SPILLS_PENDING};
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostStorage s = txn_state_tests_storage(9216, 16384);
+	RepoRepo	repo = txn_state_tests_created(io, 9216);
+	TxnBaseBase put = txn_base_tests_full();
+	HostSharedReader reading;
+	HostError	error;
+	HostSharedHeld held;
+	HostSharedRecord record;
+
+	put.counter = 5;
+	put.fresh_end = 3;
+	txn_state_tests_put(io, &repo, &s, &put);
+	if (!host_shared_read(io, &reading, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	held = txn_state_tests_made(__LINE__, 9, io, &repo, &reading, &s);
+	record = host_shared_Held_record(&held);
+	for (size_t k = 0; k < lengthof(words); k++)
+	{
+		txn_state_exchange(record, TXN_STATE_COUNTER, txn_state_load(record, TXN_STATE_COUNTER), 2 << 16 | 4);
+		txn_state_exchange(record, TXN_STATE_SAVED, TXN_STATE_CLEAN, 0);
+		txn_state_exchange(record, words[k], 0, 1);
+		txn_state_tests_saved(io, &repo, 9216, txn_state_tests_nothing, NULL);
+		txn_state_tests_counter_is(__LINE__, 9, record, 2 << 16 | 4, k);
+		txn_state_exchange(record, words[k], 1, 0);
+		txn_state_exchange(record, TXN_STATE_SAVED, TXN_STATE_CLEAN, 0);
+		txn_state_tests_saved(io, &repo, 9216, txn_state_tests_nothing, NULL);
+		txn_state_tests_counter_is(__LINE__, 9, record, 3, k);
+	}
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	txn_base_Base_drop(&put);
+	simc_TestIo_drop(&test_io);
+}
+
 /* txn_state_tests_column is the key case's key column of an attribute number. */
 static TxnBaseKeyColumn
 txn_state_tests_column(uint16 attnum)
@@ -6460,6 +6656,7 @@ txn_state_tests_folded(uint64 folded)
 	TxnBaseBase base = txn_base_tests_full();
 
 	base.folded = folded;
+	base.read = folded;
 	return base;
 }
 

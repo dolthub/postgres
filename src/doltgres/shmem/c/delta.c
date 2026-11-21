@@ -17,9 +17,10 @@
 /*
  * The delta's memory in the server (design item 14's S6): the page
  * directory, a fixed region of a header, one slot of eight words for each 1
- * KiB of delta_memory, three words for each block of the region, and a word of
+ * KiB of delta_memory, three words for each block of the region, a word of
  * the free hint for each 64 slots below the block past the budget's (bugs row
- * 150); and the region of blocks, a region of its own that holds the pages'
+ * 150), and a slot's link in the retired list for each slot (bugs row 309);
+ * and the region of blocks, a region of its own that holds the pages'
  * bodies and nothing else (bugs row 116). The postmaster makes both. Postgres
  * keeps the regions' addresses in pg's C globals, so this module keeps only
  * numbers and translates them inside a call.
@@ -43,16 +44,16 @@ static const char SHMEM_DELTA_WAIT[] = "versioned delta budget";
 /* SHMEM_DELTA_REFUSAL is the most bytes of a refusal's detail, its ending zero byte included. */
 #define SHMEM_DELTA_REFUSAL ((size_t) 384)
 
-/* SHMEM_DELTA_SLOTS is the offset of the slots in the directory: after the header's ten cache lines. */
-#define SHMEM_DELTA_SLOTS ((size_t) 640)
+/* SHMEM_DELTA_SLOTS is the offset of the slots in the directory: after the header's eleven cache lines. */
+#define SHMEM_DELTA_SLOTS ((size_t) 704)
 
 /*
  * ShmemDeltaHeader is the directory's fixed part, on its first cache lines:
  * the count of frees, the hand of an allocation's sweep, the allocation lock,
  * the condition variable of the budget's wait with its wait event, the count
  * of slots, the overshoot word, the region's words, lock, and count of
- * blocks, the fold launcher's asks and process, and a standby's root
- * mismatch.
+ * blocks, the fold launcher's asks and process, a standby's root mismatch,
+ * and the retired list's head and the free pass's lock.
  */
 typedef struct ShmemDeltaHeader
 {
@@ -112,6 +113,12 @@ typedef struct ShmemDeltaHeader
 	pg_atomic_uint64 refused;
 
 	/*
+	 * retired is the first slot plus one of the retired list, the slots the
+	 * free pass has yet to free, 0 for none (bugs row 309).
+	 */
+	pg_atomic_uint64 retired;
+
+	/*
 	 * refusal is the detail of the startup process's FATAL, ended by a zero
 	 * byte, once refused is 2.
 	 */
@@ -119,6 +126,8 @@ typedef struct ShmemDeltaHeader
 	LWLock		lock;
 	/* region_lock is the region's lock, held only for a block's take or give. */
 	LWLock		region_lock;
+	/* pass_lock is the free pass's lock, which runs one pass at a time. */
+	LWLock		pass_lock;
 	ConditionVariable wait;
 	uint32		wait_event;
 	uint32		slots;
@@ -215,6 +224,22 @@ shmem_delta_hint_word(uint32 word)
 }
 
 /*
+ * shmem_delta_link_word returns the address of a slot's link in the retired
+ * list, which follow the free hint's words: the next slot plus one, 0 for the
+ * list's last (bugs row 309).
+ */
+static pg_atomic_uint32 *
+shmem_delta_link_word(uint32 slot)
+{
+	size_t		slots = (size_t) shmem_delta_slots();
+	size_t		words = (size_t) shmem_delta_blocks() * SHMEM_DELTA_BLOCK_WORDS + shmem_delta_hints(slots);
+	size_t		links = SHMEM_DELTA_SLOTS + slots * sizeof(ShmemDeltaSlot) + words * sizeof(pg_atomic_uint64);
+
+	Assert(slot < slots);
+	return (pg_atomic_uint32 *) STD_PTR_AT(pg_calls_delta_directory(), links + (size_t) slot * sizeof(pg_atomic_uint32), 1);
+}
+
+/*
  * shmem_delta_hints returns the count of the free hint's words of a directory
  * of a count of slots: one for each SHMEM_DELTA_HINTED of those below the
  * block past the budget, whose slots are a block's last.
@@ -230,8 +255,8 @@ shmem_delta_hints(size_t slots)
 /*
  * shmem_delta_request asks Postgres for the delta's two regions, in the
  * postmaster's request callback: the region of blocks, of its bytes, and the
- * directory, of its header, its slots, its blocks' words, and the free
- * hint's words.
+ * directory, of its header, its slots, its blocks' words, the free hint's
+ * words, and the retired list's links.
  */
 bool
 shmem_delta_request(const PgMayRaise *raise, size_t slots, size_t blocks, size_t bytes, PgPgError *error)
@@ -242,16 +267,17 @@ shmem_delta_request(const PgMayRaise *raise, size_t slots, size_t blocks, size_t
 	size_t		tmp_3 = STD_MUL(usize, slots, sizeof(ShmemDeltaSlot), 147, 45);
 	size_t		tmp_4 = STD_ADD(usize, SHMEM_DELTA_SLOTS, tmp_3, 147, 37);
 	size_t		tmp_5 = STD_ADD(usize, tmp_4, words, 147, 37);
+	size_t		links = std_mul_usize(slots, sizeof(pg_atomic_uint32), __FILE__, __LINE__, 0);
 
-	return pg_calls_request_delta(raise, bytes, tmp_5, error);
+	return pg_calls_request_delta(raise, bytes, std_add_usize(tmp_5, links, __FILE__, __LINE__, 0), error);
 }
 
 /*
  * shmem_delta_initialize sets the delta's directory up in the postmaster's
  * initialization callback, after the fork's region: the header, every slot
- * free at its first generation, every block free and never taken, and every
- * bit of the free hint set, since every slot is free. The region's bodies are
- * zeroed as each is taken.
+ * free at its first generation, every block free and never taken, every bit
+ * of the free hint set, since every slot is free, and the retired list empty.
+ * The region's bodies are zeroed as each is taken.
  */
 bool
 shmem_delta_initialize(const PgMayRaise *raise, size_t slots, size_t blocks, PgPgError *error)
@@ -284,8 +310,10 @@ shmem_delta_initialize(const PgMayRaise *raise, size_t slots, size_t blocks, PgP
 	pg_calls_atomic_init_u64(&header->asked, 0);
 	pg_calls_atomic_init_u64(&header->launcher, 0);
 	pg_calls_atomic_init_u64(&header->refused, 0);
+	pg_calls_atomic_init_u64(&header->retired, 0);
 	pg_calls_lwlock_initialize(&header->lock, tranche);
 	pg_calls_lwlock_initialize(&header->region_lock, tranche);
+	pg_calls_lwlock_initialize(&header->pass_lock, tranche);
 	pg_calls_cv_init(&header->wait);
 	header->wait_event = wait_event;
 	header->slots = (uint32) slots;
@@ -299,6 +327,8 @@ shmem_delta_initialize(const PgMayRaise *raise, size_t slots, size_t blocks, PgP
 	tmp_5 = STD_ADD(usize, tmp_4, words, 185, 43);
 	std_ptr_write_bytes(STD_PTR_AT(shmem_delta_slot(0), tmp_5, 1), 0xff,
 						STD_MUL(usize, shmem_delta_hints(slots), 8, 185, 96), 1, 1);
+	for (uint32 slot = 0; slot < (uint32) slots; slot++)
+		pg_calls_atomic_init_u32(shmem_delta_link_word(slot), 0);
 	return true;
 }
 
@@ -543,6 +573,51 @@ shmem_delta_hand(void)
 	return (uint32) STD_REM(u64, hand, tmp_1, 417, 6);
 }
 
+/* shmem_delta_retired loads the retired list's head: its first slot plus one, 0 for none. */
+uint64
+shmem_delta_retired(void)
+{
+	return pg_calls_atomic_read_u64(&shmem_delta_header()->retired);
+}
+
+/* shmem_delta_retired_swap stores the retired list's head over the one loaded, reporting whether it was still there. */
+bool
+shmem_delta_retired_swap(uint64 loaded, uint64 word)
+{
+	uint64		seen = loaded;
+
+	pg_calls_atomic_exchange_u64(&shmem_delta_header()->retired, &seen, word);
+	return seen == loaded;
+}
+
+/* shmem_delta_link loads a slot's link in the retired list: the next slot plus one, 0 for the last. */
+uint32
+shmem_delta_link(uint32 slot)
+{
+	return pg_calls_atomic_read_u32(shmem_delta_link_word(slot));
+}
+
+/* shmem_delta_set_link stores a slot's link in the retired list. */
+void
+shmem_delta_set_link(uint32 slot, uint32 value)
+{
+	pg_calls_atomic_write_u32(shmem_delta_link_word(slot), value);
+}
+
+/* shmem_delta_lock_pass takes the free pass's lock exclusively, which can't fail. */
+void
+shmem_delta_lock_pass(void)
+{
+	pg_calls_lwlock_acquire_sure(&shmem_delta_header()->pass_lock, LW_EXCLUSIVE);
+}
+
+/* shmem_delta_unlock_pass releases the free pass's lock, which its caller holds. */
+void
+shmem_delta_unlock_pass(void)
+{
+	pg_calls_lwlock_release(&shmem_delta_header()->pass_lock);
+}
+
 /* shmem_delta_lock takes the allocation lock exclusively. */
 bool
 shmem_delta_lock(const PgMayRaise *raise, PgPgError *error)
@@ -771,6 +846,9 @@ shmem_delta_body_word(uint64 pointer, uint64 index, ShmemRecordsOp op)
 				pg_calls_atomic_exchange_u64(word, &seen, op.u.exchange.f1);
 				return seen;
 			}
+		case SHMEM_RECORDS_OP_LOAD_ACQUIRE:
+			pg_calls_read_barrier();
+			return pg_calls_atomic_read_u64(word);
 	}
 	pg_unreachable();
 }

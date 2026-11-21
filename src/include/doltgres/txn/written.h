@@ -30,11 +30,17 @@
 /* TXN_WRITTEN_CAP is CAP, the most keys the list keeps; past it the list stops growing and is marked overflowed. */
 #define TXN_WRITTEN_CAP ((size_t) 64 * 1024)
 
-/* TxnWrittenOf is Of: the tree a touched key is in, a storage's rows, its value map, its database's identity tree, or its repository's chunk tree. */
+/*
+ * TxnWrittenOf is Of: the tree a touched key is in, a storage's rows, its
+ * value map, its free space map, its database's identity tree, or its
+ * repository's chunk tree. A free space map's take isn't taken back, so only
+ * its bytes are counted, for its spill.
+ */
 typedef enum TxnWrittenOf
 {
 	TXN_WRITTEN_OF_ROWS,
 	TXN_WRITTEN_OF_VALUES,
+	TXN_WRITTEN_OF_FREE,
 	TXN_WRITTEN_OF_IDENTITY,
 	TXN_WRITTEN_OF_CHUNKS,
 } TxnWrittenOf;
@@ -104,7 +110,7 @@ extern bool txn_written_spilled(HostIoIo *io, const HostStorage *storage, TxnWri
 extern bool txn_written_keys(HostIoIo *io, bool *some, txn_TupleU64VecTupleStorageOfVecVecU8_t *result,
 							 HostError *error);
 extern bool txn_written_ended(HostIoIo *io, HostError *error);
-extern bool txn_written_aborted(HostIoIo *io, HostError *error);
+extern bool txn_written_aborted(HostIoIo *io, uint64 end, HostError *error);
 extern bool txn_written_sub_started(HostIoIo *io, uint32 sub, HostError *error);
 extern bool txn_written_sub_committed(HostIoIo *io, uint32 sub, HostError *error);
 extern bool txn_written_sub_aborted(HostIoIo *io, uint32 sub, HostError *error);

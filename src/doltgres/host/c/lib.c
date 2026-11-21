@@ -382,6 +382,9 @@ host_WalKind_of(uint8 value, HostWalKind *result)
 		case 13:
 			*result = HOST_WAL_KIND_DATABASE_CHANGE;
 			return true;
+		case 14:
+			*result = HOST_WAL_KIND_CARRY_UNLISTED;
+			return true;
 		default:
 			return false;
 	}
@@ -423,6 +426,8 @@ host_WalKind_value(HostWalKind self)
 			return 12;
 		case HOST_WAL_KIND_DATABASE_CHANGE:
 			return 13;
+		case HOST_WAL_KIND_CARRY_UNLISTED:
+			return 14;
 	}
 	pg_unreachable();
 }
@@ -459,6 +464,8 @@ host_WalKind_name(HostWalKind self)
 			return "MapCarried";
 		case HOST_WAL_KIND_DATABASE_CHANGE:
 			return "DatabaseChange";
+		case HOST_WAL_KIND_CARRY_UNLISTED:
+			return "CarryUnlisted";
 #ifdef USE_INJECTION_POINTS
 		case HOST_WAL_KIND_TEST:
 			return "Test";
@@ -578,6 +585,17 @@ host_Xid_Debug_fmt(const void *value, StdFormatter *f)
 	StdDebugTuple t = std_fmt_debug_tuple(f, "Xid", 3);
 
 	std_DebugTuple_field(&t, &self->f0, std_u64_Debug_fmt);
+	return std_DebugTuple_finish(&t);
+}
+
+/* host_Command_Debug_fmt is Command's derived Debug. */
+bool
+host_Command_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const HostCommand *self = value;
+	StdDebugTuple t = std_fmt_debug_tuple(f, "Command", 7);
+
+	std_DebugTuple_field(&t, &self->f0, std_u32_Debug_fmt);
 	return std_DebugTuple_finish(&t);
 }
 
@@ -1441,6 +1459,22 @@ host_wal_insert(HostIoIoDoors io, HostWalKind kind, const uint8 *body, size_t bo
 	return host.ops->wal_insert(host.self, &raise, kind, body, body_len, result, error);
 }
 
+/* host_NewCid_Debug_fmt is NewCid's derived Debug. */
+bool
+host_NewCid_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const HostNewCid *self = value;
+	StdOptionRef cmin = {self->has_cmin, {&self->cmin, host_Command_Debug_fmt}};
+	StdOptionRef cmax = {self->has_cmax, {&self->cmax, host_Command_Debug_fmt}};
+	StdOptionRef combo = {self->has_combo, {&self->combo, host_Command_Debug_fmt}};
+	StdDebugStruct s = std_fmt_debug_struct(f, "NewCid", 6);
+
+	std_DebugStruct_field(&s, "cmin", 4, &cmin, std_option_Debug_fmt);
+	std_DebugStruct_field(&s, "cmax", 4, &cmax, std_option_Debug_fmt);
+	std_DebugStruct_field(&s, "combo", 5, &combo, std_option_Debug_fmt);
+	return std_DebugStruct_finish(&s);
+}
+
 /*
  * host_wal_new_cid appends heap's own record of the command ids of a row a
  * transaction wrote or changed in a relation logical decoding reads, so
@@ -2028,6 +2062,21 @@ host_refuse_recovery(HostIoIoDoors io, const char *detail, size_t detail_len)
 }
 
 /*
+ * host_load_pauses loads pauses a later checkpoint window runs, so a failure
+ * to load one comes before the change the window finishes, as Postgres'
+ * INJECTION_POINT_LOAD comes before its START_CRIT_SECTION; with no pauses
+ * built in, it does nothing.
+ */
+bool
+host_load_pauses(HostIoIoDoors io, const char *const *pauses, size_t pauses_len, HostError *error)
+{
+	HostHost	host = host_current();
+	HostMayRaise raise = host_doors_of_io_doors(io);
+
+	return host.ops->load_pauses(host.self, &raise, pauses, pauses_len, error);
+}
+
+/*
  * host_delay_checkpoint opens a window holding off the start of a checkpoint
  * until it finishes, with the names of the pauses inside it, which its open
  * loads.
@@ -2189,30 +2238,31 @@ host_collection_end(void)
 
 /*
  * host_collection_ask asks the collector worker for a full collection of a
- * database's repository and waits for its answer, the packs it retired, those
+ * database's repository, emptying a tablespace unless that is
+ * CHUNKS_PACKS_DEFAULT_SPACE, and waits for its answer, the packs it retired, those
  * it copied out, and its live bytes, each PG_UINT64_MAX when it failed (the
  * collector text's §8.2); a cancel ends the wait with Postgres' error, the ask
  * taken back, and the collection goes on.
  */
 bool
-host_collection_ask(HostIoIo *io, uint32 database, uint64 *result, HostError *error)
+host_collection_ask(HostIoIo *io, uint32 database, uint32 emptied, uint64 *result, HostError *error)
 {
 	HostHost	host = host_current();
 	HostMayRaise raise = host_doors(HOST_IO_IO_READ_DOORS(io));
 
-	return host.ops->collection_ask(host.self, &raise, database, result, error);
+	return host.ops->collection_ask(host.self, &raise, database, emptied, result, error);
 }
 
 /*
- * host_collection_asked returns the unanswered ask's word and the database it
- * asks for, which the collector worker reads.
+ * host_collection_asked returns the unanswered ask's word, the database it
+ * asks for, and the tablespace it empties, which the collector worker reads.
  */
 bool
-host_collection_asked(uint64 *result_0, uint32 *result_1)
+host_collection_asked(uint64 *result_0, uint32 *result_1, uint32 *result_2)
 {
 	HostHost	host = host_current();
 
-	return host.ops->collection_asked(host.self, result_0, result_1);
+	return host.ops->collection_asked(host.self, result_0, result_1, result_2);
 }
 
 /* host_collection_answer answers an ask, by its word, with the collection's counts, and wakes its asker. */
@@ -2231,6 +2281,15 @@ host_collector_started(void)
 	HostHost	host = host_current();
 
 	host.ops->collector_started(host.self);
+}
+
+/* host_collector_running reports whether a collector worker has started, without which an ask would wait for good. */
+bool
+host_collector_running(void)
+{
+	HostHost	host = host_current();
+
+	return host.ops->collector_running(host.self);
 }
 
 /*
@@ -2740,6 +2799,19 @@ host_tests_Test_Host_refuse_recovery(void *self, const char *detail, size_t deta
 	static const char text[] = "internal error: entered unreachable code: only `pghost` recovers";
 
 	std_panic(RUST_FILE, 2157, 13, text, sizeof(text) - 1);
+}
+
+/* host_tests_Test_Host_load_pauses loads nothing: the test host runs no pause. */
+static bool
+host_tests_Test_Host_load_pauses(void *self, const HostMayRaise *raise, const char *const *pauses, size_t pauses_len,
+								 HostError *error)
+{
+	(void) self;
+	(void) raise;
+	(void) pauses;
+	(void) pauses_len;
+	(void) error;
+	return true;
 }
 
 /* host_tests_Test_Host_delay_checkpoints is unreachable here: only `pghost` makes the capability a WAL seam takes. */
@@ -3646,7 +3718,8 @@ host_tests_Test_Host_collection_end(void *self)
 
 /* host_tests_Test_Host_collection_ask is unreachable here: no test of `host` collects. */
 static bool
-host_tests_Test_Host_collection_ask(void *self, const HostMayRaise *raise, uint32 database, uint64 *result, HostError *error)
+host_tests_Test_Host_collection_ask(void *self, const HostMayRaise *raise, uint32 database, uint32 emptied,
+									uint64 *result, HostError *error)
 {
 	static const char text[] = "internal error: entered unreachable code: no test of `host` collects";
 
@@ -3655,7 +3728,7 @@ host_tests_Test_Host_collection_ask(void *self, const HostMayRaise *raise, uint3
 
 /* host_tests_Test_Host_collection_asked is unreachable here: no test of `host` collects. */
 static bool
-host_tests_Test_Host_collection_asked(void *self, uint64 *result_0, uint32 *result_1)
+host_tests_Test_Host_collection_asked(void *self, uint64 *result_0, uint32 *result_1, uint32 *result_2)
 {
 	static const char text[] = "internal error: entered unreachable code: no test of `host` collects";
 
@@ -3678,6 +3751,15 @@ host_tests_Test_Host_collector_started(void *self)
 	static const char text[] = "internal error: entered unreachable code: no test of `host` collects";
 
 	std_panic(RUST_FILE, 2590, 13, text, sizeof(text) - 1);
+}
+
+/* host_tests_Test_Host_collector_running is unreachable here: no test of `host` collects. */
+static bool
+host_tests_Test_Host_collector_running(void *self)
+{
+	static const char text[] = "internal error: entered unreachable code: no test of `host` collects";
+
+	std_panic(__FILE__, __LINE__, 0, text, sizeof(text) - 1);
 }
 
 /* host_tests_Test_Host_database_locked is unreachable here: no test of `host` collects. */
@@ -3889,6 +3971,7 @@ static const HostHostOps HOST_TESTS_TEST_HOST_OPS = {
 	.log = host_tests_Test_Host_log,
 	.refuse_recovery = host_tests_Test_Host_refuse_recovery,
 	.delay_checkpoints = host_tests_Test_Host_delay_checkpoints,
+	.load_pauses = host_tests_Test_Host_load_pauses,
 	.resume_checkpoints = host_tests_Test_Host_resume_checkpoints,
 	.xid_status = host_tests_Test_Host_xid_status,
 	.xid_in_progress = host_tests_Test_Host_xid_in_progress,
@@ -3995,6 +4078,7 @@ static const HostHostOps HOST_TESTS_TEST_HOST_OPS = {
 	.collection_asked = host_tests_Test_Host_collection_asked,
 	.collection_answer = host_tests_Test_Host_collection_answer,
 	.collector_started = host_tests_Test_Host_collector_started,
+	.collector_running = host_tests_Test_Host_collector_running,
 	.database_locked = host_tests_Test_Host_database_locked,
 	.database_unlocked = host_tests_Test_Host_database_unlocked,
 	.database_lock_waited = host_tests_Test_Host_database_lock_waited,

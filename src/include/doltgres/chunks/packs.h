@@ -168,6 +168,7 @@ extern void chunks_packs_table_packs_insert(StdVec *packs, uint64 number, const 
 extern bool chunks_packs_table_packs_remove(StdVec *packs, uint64 number);
 extern ChunksPacksTail *chunks_packs_table_runs_get(const StdVec *runs, uint32 space);
 extern void chunks_packs_table_runs_insert(StdVec *runs, uint32 space, ChunksPacksTail tail);
+extern void chunks_packs_table_runs_remove(StdVec *runs, uint32 space);
 extern void chunks_packs_Table_whole(const ChunksPacksTable *self, StdVec *result);
 extern void chunks_packs_Table_added(const ChunksPacksTableEntry *entry, ChunksPacksTail runs, StdVec *result);
 extern void chunks_packs_Table_reserved(uint64 bound, StdVec *result);

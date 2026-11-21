@@ -802,7 +802,7 @@ typedef struct txn_insert_seen_frame_t
 	bool		ok;
 } txn_insert_seen_frame_t;
 
-/* txn_insert_seen_body reads the block's newest entry, the delta's else the base's, and decodes it. */
+/* txn_insert_seen_body reads the block's newest entry, the memtable's, else its spills', else the base's, and decodes it. */
 static void
 txn_insert_seen_body(void *frame_)
 {
@@ -813,14 +813,27 @@ txn_insert_seen_body(void *frame_)
 	ChunksErrorError failed;
 	uint8		key[4];
 	bool		some;
+	bool		spilled;
 
-	if (!txn_memtable_map_newest(frame->io, frame->record, TXN_MEMTABLE_MAP_MAP_FREE, frame->block, &some, &newest,
-								 frame->error))
+	if (!txn_memtable_map_in_memtable(frame->io, frame->record, TXN_MEMTABLE_MAP_MAP_FREE, frame->block, &some,
+									  &newest, frame->error))
 		return;
 	if (some)
 	{
 		result->has_current = newest.has_value;
 		result->current = newest.value;
+	}
+	else if (!txn_memtable_map_spilled_newest(frame->io, frame->record, frame->block, &spilled, &newest, frame->error))
+		return;
+	else if (spilled)
+	{
+		result->has_below = newest.has_value;
+		result->below = newest.value;
+		if (result->has_below)
+		{
+			std_slice_to_vec_Checked(&result->current, result->below.ptr, result->below.len, 1, 1);
+			result->has_current = true;
+		}
 	}
 	else if (frame->base->has_tree)
 	{
@@ -860,7 +873,8 @@ txn_insert_seen_pad(void *frame_)
  * txn_insert_seen reads a block's entry outside any window, the delta's
  * newest else the base's, and decodes it there, so a corrupt entry raises
  * XX001 outside the critical section; it returns the bytes a take compares
- * under its lock, and the base's entry the take falls back to.
+ * under its lock, and the entry below the memtable the take falls back to:
+ * the spills' newest, else the base's.
  */
 static bool
 txn_insert_seen(HostIoIo *io, TreesStoreNodeStore store, HostSharedRecord record, const TxnInsertBase *base,
@@ -2015,15 +2029,12 @@ txn_insert_turn_closure_9_body(void *frame_)
 		bool		fresh = turn->target.tag == TXN_INSERT_TARGET_FRESH;
 		HostRow		unclaimed = {0};
 
-		if (!txn_memtable_map_took_Got(io, frame->prepared, 0, writer, false, 0, false, unclaimed, 0,
-									   turn->seen.has_below, turn->seen.below.ptr, turn->seen.below.len,
-									   fresh ? txn_insert_take_fresh : txn_insert_take_block, &step, NULL,
-									   txn_insert_Got_tuple, NULL, NULL,
+		if (!txn_memtable_map_took_Got(io, frame->prepared, 0, writer, w->has_roomed, w->roomed, false, 0, false,
+									   unclaimed, 0, turn->seen.has_below, turn->seen.below.ptr,
+									   turn->seen.below.len, fresh ? txn_insert_take_fresh : txn_insert_take_block,
+									   &step, NULL, txn_insert_Got_tuple, NULL, NULL,
 									   fresh ? txn_insert_fresh_moved : txn_insert_nothing_got, &step, NULL,
 									   &taken, &got, frame->error))
-			return;
-		if (taken == TXN_MEMTABLE_MAP_TAKEN_TOOK &&
-			!txn_memtable_table_counted(io, frame->prepared, w->has_roomed, w->roomed, frame->error))
 			return;
 	}
 	if (taken == TXN_MEMTABLE_MAP_TAKEN_RETRY ||
@@ -2082,17 +2093,15 @@ txn_insert_turn_closure_9_body(void *frame_)
 	}
 	for (size_t at = 0; at < turn->stored; at++)
 	{
-		if (!txn_memtable_map_finish_Unit(io, frame->prepared, at + turn->first, writer, false, 0, false, NULL, 0,
-										  txn_insert_stored, (void *) &w->entries[at], NULL, txn_insert_nothing, NULL,
-										  NULL, &taken, frame->error))
+		if (!txn_memtable_map_finish_Unit(io, frame->prepared, at + turn->first, writer, w->has_roomed, w->roomed,
+										  false, 0, false, NULL, 0, txn_insert_stored, (void *) &w->entries[at], NULL,
+										  txn_insert_nothing, NULL, NULL, &taken, frame->error))
 			return;
 		if (taken != TXN_MEMTABLE_MAP_TAKEN_TOOK)
 		{
 			txn_insert_turn_closure_9_finish(frame, TXN_INSERT_TURN_RETRY);
 			return;
 		}
-		if (!txn_memtable_table_counted(io, frame->prepared, w->has_roomed, w->roomed, frame->error))
-			return;
 	}
 	if (w->toast != NULL)
 	{
@@ -2177,9 +2186,10 @@ txn_insert_turn_closure_9_body(void *frame_)
 	{
 		const TxnInsertKept *read = &STD_VEC_AT(turn->kept, TxnInsertKept, at);
 
-		if (!txn_memtable_map_finish_Unit(io, frame->prepared, turn->first + turn->stored + at, writer, has_lsn, lsn,
-										  read->has_f0, read->f0.ptr, read->f0.len, txn_insert_added, NULL, NULL,
-										  txn_insert_nothing, NULL, NULL, &taken, frame->error))
+		if (!txn_memtable_map_finish_Unit(io, frame->prepared, turn->first + turn->stored + at, writer,
+										  w->has_roomed, w->roomed, has_lsn, lsn, read->has_f0, read->f0.ptr,
+										  read->f0.len, txn_insert_added, NULL, NULL, txn_insert_nothing, NULL, NULL,
+										  &taken, frame->error))
 			return;
 		if (taken != TXN_MEMTABLE_MAP_TAKEN_TOOK)
 		{
@@ -2187,8 +2197,6 @@ txn_insert_turn_closure_9_body(void *frame_)
 			*frame->error = host_Error_fork((const uint8 *) "XX001", &message);
 			return;
 		}
-		if (!txn_memtable_table_counted(io, frame->prepared, w->has_roomed, w->roomed, frame->error))
-			return;
 	}
 	if (turn->marks_live && turn->marks.len > 0)
 	{
@@ -2196,9 +2204,8 @@ txn_insert_turn_closure_9_body(void *frame_)
 		StdVec		marks = turn->marks;
 
 		std_vec_new(&turn->marks, TXN_INSERT_ID);
-		if (!txn_memtable_map_named(io, frame->prepared, turn->marking, writer, has_lsn, lsn, row, &marks,
-									frame->error) ||
-			!txn_memtable_table_counted(io, frame->prepared, w->has_roomed, w->roomed, frame->error))
+		if (!txn_memtable_map_named(io, frame->prepared, turn->marking, writer, w->has_roomed, w->roomed, has_lsn,
+									lsn, row, &marks, frame->error))
 			return;
 	}
 	if (!host_pause(HOST_SHARED_KEY_IO_PAUSES(&key_io), "doltgres-insert-logged", frame->error))
@@ -2246,8 +2253,8 @@ txn_insert_turn_closure_9_body(void *frame_)
 		txn_insert_TakeStep_t step = {.record = turn->record, .base = turn->base, .room = room,
 		.block = turn->flagged};
 
-		if (!txn_memtable_map_finish_Unit(io, frame->prepared, turn->flagging, writer, false, 0,
-										  turn->flagged_seen.has_below, turn->flagged_seen.below.ptr,
+		if (!txn_memtable_map_finish_Unit(io, frame->prepared, turn->flagging, writer, w->has_roomed, w->roomed,
+										  false, 0, turn->flagged_seen.has_below, turn->flagged_seen.below.ptr,
 										  turn->flagged_seen.below.len, txn_insert_filled, &step, NULL,
 										  txn_insert_nothing, NULL, NULL, &taken, frame->error))
 			return;
@@ -2313,7 +2320,7 @@ txn_insert_turn_take(HostSharedRecord state, TxnMemtableMapMap map, uint32 key, 
  */
 static bool
 txn_insert_turn_touched(HostIoIo *io, uint64 top, const HostStorage *storage, TxnWrittenOf of, const uint8 *key,
-						size_t key_len, size_t need, bool unique, HostStorage over[3], TxnWrittenOf overs[3],
+						size_t key_len, size_t need, bool unique, HostStorage over[4], TxnWrittenOf overs[4],
 						size_t *over_len, HostError *error)
 {
 	uint64		touched;
@@ -2341,8 +2348,8 @@ txn_insert_turn_body(void *frame_)
 	const TxnMemtablePut *put;
 	size_t		free_most = txn_free_space_most_len(w->room->most);
 	uint64		top = change->writer.has_top ? change->writer.top : change->writer.xid;
-	HostStorage over[3];
-	TxnWrittenOf overs[3];
+	HostStorage over[4];
+	TxnWrittenOf overs[4];
 	size_t		over_len = 0;
 	TxnMemtableMapTake take;
 	txn_TupleRefSliceU8Usize_t row;
@@ -2483,6 +2490,18 @@ txn_insert_turn_body(void *frame_)
 											 TXN_VALUES_MOST, true, over, overs, &over_len, frame->error))
 					return;
 			}
+	}
+	for (size_t i = 0; i < frame->takes.len; i++)
+	{
+		const TxnMemtableMapTake *take = &STD_VEC_AT(&frame->takes, TxnMemtableMapTake, i);
+		uint8		block[4];
+
+		if (take->map != TXN_MEMTABLE_MAP_MAP_FREE)
+			continue;
+		std_u32_to_be_bytes(take->key, block);
+		if (!txn_insert_turn_touched(frame->io, top, &change->storage, TXN_WRITTEN_OF_FREE, block, sizeof(block),
+									 take->most, true, over, overs, &over_len, frame->error))
+			return;
 	}
 	for (size_t i = 0; i < over_len; i++)
 	{
@@ -3104,20 +3123,17 @@ typedef struct txn_insert_jump_closure_0_captures_t
 	TxnStatusRoomed roomed;
 } txn_insert_jump_closure_0_captures_t;
 
-/* txn_insert_jump_closure_0 is a jump's prepare's closure: the counter block's take, counted when it took. */
+/* txn_insert_jump_closure_0 is a jump's prepare's closure: the counter block's take. */
 static bool
 txn_insert_jump_closure_0(void *captures, HostIoIo *io, TxnMemtableTablePreparedState *prepared,
 						  TxnMemtableMapTaken *result, HostError *error)
 {
 	txn_insert_jump_closure_0_captures_t *inside = captures;
 
-	if (!txn_memtable_map_finish_Unit(HOST_IO_IO_TAKES_SHORT(io), prepared, 0, inside->writer, false, 0,
-									  inside->seen->has_below, inside->seen->below.ptr, inside->seen->below.len,
-									  inside->step, inside->captures, NULL, txn_insert_jump_moved, inside->captures,
-									  NULL, result, error))
-		return false;
-	return *result != TXN_MEMTABLE_MAP_TAKEN_TOOK ||
-		txn_memtable_table_counted(HOST_IO_IO_TAKES_SHORT(io), prepared, inside->has_roomed, inside->roomed, error);
+	return txn_memtable_map_finish_Unit(HOST_IO_IO_TAKES_SHORT(io), prepared, 0, inside->writer, inside->has_roomed,
+										inside->roomed, false, 0, inside->seen->has_below, inside->seen->below.ptr,
+										inside->seen->below.len, inside->step, inside->captures, NULL,
+										txn_insert_jump_moved, inside->captures, NULL, result, error);
 }
 
 /* txn_insert_jump_frame_t is jump's state across its pad: the counter block's entries it read. */
@@ -3147,14 +3163,28 @@ txn_insert_jump_body(void *frame_)
 	TxnMemtableVersionWriter none = TXN_MEMTABLE_VERSION_NO_TRANSACTION;
 	txn_insert_jump_closure_0_captures_t inside = {.writer = frame->writer, .seen = &frame->seen,
 	.step = frame->step, .captures = &frame->step_captures};
-	TxnMemtableMapTake take;
+	TxnMemtableMapTake take = txn_insert_turn_take(record, TXN_MEMTABLE_MAP_MAP_FREE, block,
+												   txn_free_space_most_len(frame->step_captures.room->most));
+	HostStorage storage;
+	TxnStatePersistence persistence;
 
+	if (!txn_memtable_version_Writer_PartialEq_eq(&frame->writer, &none) &&
+		txn_state_described(record, &storage, &persistence))
+	{
+		uint64		top = frame->writer.has_top ? frame->writer.top : frame->writer.xid;
+		uint64		bytes;
+		bool		spilled;
+
+		if (!txn_spill_replayed(frame->io, &storage, TXN_WRITTEN_OF_FREE, top, take.most + 4, &bytes, frame->error))
+			return;
+		if (bytes >= txn_spill_threshold() &&
+			!txn_spill_spilled(frame->io, &storage, TXN_WRITTEN_OF_FREE, top, &spilled, frame->error))
+			return;
+	}
 	if (!txn_insert_read_base(frame->io, frame->held, &frame->base, frame->error) ||
 		!txn_insert_seen(frame->io, frame->store, record, &frame->base, frame->step_captures.room, block,
 						 &frame->seen, frame->error))
 		return;
-	take = txn_insert_turn_take(record, TXN_MEMTABLE_MAP_MAP_FREE, block,
-								txn_free_space_most_len(frame->step_captures.room->most));
 	if (!txn_memtable_version_Writer_PartialEq_eq(&frame->writer, &none) &&
 		!txn_status_redo_roomed(frame->io, &frame->writer, &inside.has_roomed, &inside.roomed, frame->error))
 		return;
@@ -3174,7 +3204,10 @@ txn_insert_jump_pad(void *frame_)
 /*
  * txn_insert_jump moves the counter from its load to a later tuple id by one
  * map-only prepare and a take of the counter block's entry, whose step says
- * what the entry becomes, and answers what the take did.
+ * what the entry becomes, and answers what the take did. A replayed writer's
+ * take counts toward its transaction's free space map spill, as redo counts
+ * its rows, before the entry is read, so a spill it makes moves no version
+ * from under the entry the take falls back to.
  */
 static bool
 txn_insert_jump(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held, TxnMemtableVersionWriter writer,
@@ -3291,6 +3324,20 @@ txn_insert_Placed_drop(TxnInsertPlaced *self)
 	self->has_below = false;
 }
 
+/* txn_insert_unfree returns the internal error of a carried version's place its storage's base doesn't hold free. */
+static HostError
+txn_insert_unfree(uint64 tid)
+{
+	StdFmtPiece pieces[] = {STD_FMT_LIT("a carried version's place "), STD_FMT_ARG(0),
+	STD_FMT_LIT(" isn't free in its storage's base")};
+	StdFmtArg	args[] = {{&tid, std_u64_Display_fmt}};
+	StdFmtArguments arguments = {pieces, lengthof(pieces), args};
+	StdString	message;
+
+	std_fmt_format_Checked(&message, &arguments);
+	return host_Error_fork((const uint8 *) "XX000", &message);
+}
+
 /*
  * txn_insert_place_taken takes a placed tuple id's place out of its block's
  * entry inside the window of the prepare whose take Placed_take readied it,
@@ -3299,29 +3346,201 @@ txn_insert_Placed_drop(TxnInsertPlaced *self)
  */
 bool
 txn_insert_place_taken(HostIoTakesShort io, TxnMemtableTablePreparedState *prepared, size_t take,
-					   HostSharedRecord record, TxnMemtableVersionWriter writer, const TxnInsertPlaced *placed,
-					   HostError *error)
+					   HostSharedRecord record, TxnMemtableVersionWriter writer, bool has_roomed,
+					   TxnStatusRoomed roomed, const TxnInsertPlaced *placed, HostError *error)
 {
 	txn_insert_ReplayStep_t step = {.record = record, .base = &placed->base, .room = &placed->room,
 	.counter = placed->counter, .tid = placed->tid};
 	HostRow		unclaimed = {0};
 	TxnMemtableMapTaken taken;
-	StdFmtPiece pieces[] = {STD_FMT_LIT("a carried version's place "), STD_FMT_ARG(0),
-	STD_FMT_LIT(" isn't free in its storage's base")};
-	StdFmtArg	args[] = {{&placed->tid, std_u64_Display_fmt}};
-	StdFmtArguments arguments = {pieces, lengthof(pieces), args};
-	StdString	message;
 
-	if (!txn_memtable_map_took_Unit(io, prepared, take, writer, false, 0, false, unclaimed, 0, placed->has_below,
-									placed->below.ptr, placed->below.len, txn_insert_replayed, &step, NULL,
+	if (!txn_memtable_map_took_Unit(io, prepared, take, writer, has_roomed, roomed, false, 0, false, unclaimed, 0,
+									placed->has_below, placed->below.ptr, placed->below.len, txn_insert_replayed,
+									&step, NULL,
 									txn_insert_replayed_tuple, &step, NULL, txn_insert_nothing, NULL, NULL, &taken,
 									error))
 		return false;
 	if (taken == TXN_MEMTABLE_MAP_TAKEN_TOOK)
 		return true;
-	std_fmt_format_Checked(&message, &arguments);
-	*error = host_Error_fork((const uint8 *) "XX000", &message);
+	*error = txn_insert_unfree(placed->tid);
 	return false;
+}
+
+/* txn_insert_carried_entry_t is carried_takes' block entry: the block and its entry after the takes so far, none for a removal. */
+typedef struct txn_insert_carried_entry_t
+{
+	uint32		block;
+	bool		has_current;
+	StdVec		current;
+} txn_insert_carried_entry_t;
+
+/* txn_insert_carried_frame_t is carried_takes' state across its pad: the blocks' entries, a block's seen, and the takes, while live. */
+typedef struct txn_insert_carried_frame_t
+{
+	HostIoIo   *io;
+	TreesStoreNodeStore store;
+	const HostSharedHeld *held;
+	const TxnInsertCarriedPut *puts;
+	size_t		puts_len;
+	const TxnInsertPage *page;
+	StdVec	   *result;
+	HostError  *error;
+	bool		ok;
+	TxnInsertBase base;
+	StdVec		entries;
+	bool		entries_live;
+	TxnInsertSeen seen;
+	bool		result_live;
+} txn_insert_carried_frame_t;
+
+/* txn_insert_carried_pad frees what carried_takes holds live. */
+static void
+txn_insert_carried_pad(void *frame_)
+{
+	txn_insert_carried_frame_t *frame = frame_;
+
+	txn_insert_Seen_drop(&frame->seen);
+	if (frame->entries_live)
+	{
+		for (size_t k = 0; k < frame->entries.len; k++)
+		{
+			txn_insert_carried_entry_t *entry = &STD_VEC_AT(&frame->entries, txn_insert_carried_entry_t, k);
+
+			if (entry->has_current)
+				std_vec_free_Checked(&entry->current, 1, 1);
+		}
+		std_vec_free_Checked(&frame->entries, sizeof(txn_insert_carried_entry_t),
+							 _Alignof(txn_insert_carried_entry_t));
+	}
+	if (frame->result_live)
+		txn_insert_carried_takes_drop(frame->result);
+	frame->entries_live = frame->result_live = false;
+}
+
+/* txn_insert_carried_body takes each put's place after the take before it of its block, the first from the block's entry below the memtable. */
+static void
+txn_insert_carried_body(void *frame_)
+{
+	txn_insert_carried_frame_t *frame = frame_;
+	HostSharedRecord record = host_shared_Held_record(frame->held);
+	uint64		counter = txn_state_counter(record);
+
+	std_vec_new(frame->result, sizeof(TxnInsertCarriedTake), _Alignof(TxnInsertCarriedTake));
+	frame->result_live = true;
+	std_vec_new(&frame->entries, sizeof(txn_insert_carried_entry_t), _Alignof(txn_insert_carried_entry_t));
+	frame->entries_live = true;
+	if (!txn_insert_read_base(frame->io, frame->held, &frame->base, frame->error))
+		return;
+	if (!std_vec_try_reserve_exact(frame->result, frame->puts_len, sizeof(TxnInsertCarriedTake),
+								   _Alignof(TxnInsertCarriedTake)))
+	{
+		*frame->error = host_Error_out_of_memory();
+		return;
+	}
+	for (size_t k = 0; k < frame->puts_len; k++)
+	{
+		const TxnInsertCarriedPut *put = &frame->puts[k];
+		TxnInsertRoom room = {.bytes = put->heap_bytes, .page = frame->page->bytes, .most = frame->page->most};
+		uint32		block = (uint32) (put->tid.f0 >> 16);
+		txn_insert_carried_entry_t *entry = NULL;
+		txn_insert_ReplayStep_t step = {.record = record, .base = &frame->base, .room = &room, .counter = counter,
+		.tid = put->tid.f0};
+		TxnMemtableVersionShown command = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND};
+		TxnMemtableOp op = {0};
+		TxnInsertCarriedTake take = {.block = block};
+		StdVec		value;
+
+		for (size_t at = 0; at < frame->entries.len && entry == NULL; at++)
+			if (STD_VEC_AT(&frame->entries, txn_insert_carried_entry_t, at).block == block)
+				entry = &STD_VEC_AT(&frame->entries, txn_insert_carried_entry_t, at);
+		if (entry == NULL)
+		{
+			txn_insert_carried_entry_t seen = {.block = block};
+
+			if (!txn_insert_seen(frame->io, frame->store, record, &frame->base, &room, block, &frame->seen,
+								 frame->error))
+				return;
+			seen.has_current = frame->seen.has_current;
+			seen.current = frame->seen.current;
+			frame->seen.has_current = false;
+			txn_insert_Seen_drop(&frame->seen);
+			if (!std_vec_try_reserve(&frame->entries, 1, sizeof(seen), _Alignof(txn_insert_carried_entry_t)))
+			{
+				if (seen.has_current)
+					std_vec_free_Checked(&seen.current, 1, 1);
+				*frame->error = host_Error_out_of_memory();
+				return;
+			}
+			std_vec_push_Checked(&frame->entries, &seen, sizeof(seen), _Alignof(txn_insert_carried_entry_t));
+			entry = &STD_VEC_AT(&frame->entries, txn_insert_carried_entry_t, frame->entries.len - 1);
+		}
+		std_vec_new(&value, 1, 1);
+		switch (txn_insert_replayed(&step, entry->has_current, entry->current.ptr, entry->current.len, &value))
+		{
+			case TXN_MEMTABLE_MAP_STEP_PUT:
+				op.tag = TXN_MEMTABLE_OP_PUT;
+				op.u.put.value = value;
+				std_vec_new(&op.u.put.addresses, sizeof(chunks_TupleU32Locator_t), _Alignof(chunks_TupleU32Locator_t));
+				std_vec_new(&op.u.put.values, sizeof(uint32), _Alignof(uint32));
+				op.u.put.tuple = put->tid;
+				break;
+			case TXN_MEMTABLE_MAP_STEP_REMOVE:
+				std_vec_free_Checked(&value, 1, 1);
+				op.tag = TXN_MEMTABLE_OP_EMPTIED;
+				op.u.emptied = put->tid;
+				break;
+			case TXN_MEMTABLE_MAP_STEP_RETRY:
+			case TXN_MEMTABLE_MAP_STEP_REFUSE:
+				std_vec_free_Checked(&value, 1, 1);
+				*frame->error = txn_insert_unfree(put->tid.f0);
+				return;
+		}
+		std_vec_new(&take.record, 1, 1);
+		txn_memtable_version_encode(&put->writer, &op, TXN_MEMTABLE_LOCK_MODE_UPDATE, command, false, 0, &take.record);
+		if (entry->has_current)
+			std_vec_free_Checked(&entry->current, 1, 1);
+		entry->has_current = op.tag == TXN_MEMTABLE_OP_PUT;
+		if (entry->has_current)
+		{
+			entry->current = op.u.put.value;
+			std_vec_free_Checked(&op.u.put.addresses, sizeof(chunks_TupleU32Locator_t),
+								 _Alignof(chunks_TupleU32Locator_t));
+			std_vec_free_Checked(&op.u.put.values, sizeof(uint32), _Alignof(uint32));
+		}
+		std_vec_push_Checked(frame->result, &take, sizeof(take), _Alignof(TxnInsertCarriedTake));
+	}
+	frame->result_live = false;
+	frame->ok = true;
+}
+
+/* txn_insert_carried_takes_drop frees a carry's takes. */
+void
+txn_insert_carried_takes_drop(StdVec *takes)
+{
+	for (size_t k = 0; k < takes->len; k++)
+		std_vec_free_Checked(&STD_VEC_AT(takes, TxnInsertCarriedTake, k).record, 1, 1);
+	std_vec_free_Checked(takes, sizeof(TxnInsertCarriedTake), _Alignof(TxnInsertCarriedTake));
+}
+
+/*
+ * txn_insert_carried_takes returns the free space map versions by which a
+ * carry's puts of other writers take their places in a new storage whose
+ * spill files they go to (P2), each put's block and its take's record, in
+ * the puts' order: each as place_taken takes it after the take before it of
+ * its block, the first from the block's entry below the memtable, so their
+ * chains read as the memtable's would have.
+ */
+bool
+txn_insert_carried_takes(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held,
+						 const TxnInsertCarriedPut *puts, size_t puts_len, const TxnInsertPage *page, StdVec *result,
+						 HostError *error)
+{
+	txn_insert_carried_frame_t frame = {.io = io, .store = store, .held = held, .puts = puts, .puts_len = puts_len,
+	.page = page, .result = result, .error = error};
+
+	std_landing(&frame, txn_insert_carried_body, txn_insert_carried_pad);
+	txn_insert_carried_pad(&frame);
+	return frame.ok;
 }
 
 /* txn_insert_redo_spent_closure_0_captures_t is redo_spent's prepare's closure's captures. */
@@ -3344,7 +3563,7 @@ txn_insert_redo_spent_moved(void *captures)
 		txn_state_moved(step->record, step->counter, STD_ADD(u64, step->tid, 1, 1479, 55));
 }
 
-/* txn_insert_redo_spent_closure_0 is redo_spent's prepare's closure: the place's take, counted when it took. */
+/* txn_insert_redo_spent_closure_0 is redo_spent's prepare's closure: the place's take. */
 static bool
 txn_insert_redo_spent_closure_0(void *captures, HostIoIo *io, TxnMemtableTablePreparedState *prepared,
 								HostError *error)
@@ -3353,14 +3572,11 @@ txn_insert_redo_spent_closure_0(void *captures, HostIoIo *io, TxnMemtableTablePr
 	HostRow		unclaimed = {0};
 	TxnMemtableMapTaken taken;
 
-	if (!txn_memtable_map_took_Unit(HOST_IO_IO_TAKES_SHORT(io), prepared, 0, inside->writer, false, 0, false,
-									unclaimed, 0, inside->seen->has_below, inside->seen->below.ptr,
-									inside->seen->below.len, txn_insert_replayed, inside->step, NULL,
-									txn_insert_replayed_tuple, inside->step, NULL, txn_insert_redo_spent_moved,
-									inside->step, NULL, &taken, error))
-		return false;
-	return taken != TXN_MEMTABLE_MAP_TAKEN_TOOK ||
-		txn_memtable_table_counted(HOST_IO_IO_TAKES_SHORT(io), prepared, inside->has_roomed, inside->roomed, error);
+	return txn_memtable_map_took_Unit(HOST_IO_IO_TAKES_SHORT(io), prepared, 0, inside->writer, inside->has_roomed,
+									  inside->roomed, false, 0, false, unclaimed, 0, inside->seen->has_below,
+									  inside->seen->below.ptr, inside->seen->below.len, txn_insert_replayed,
+									  inside->step, NULL, txn_insert_replayed_tuple, inside->step, NULL,
+									  txn_insert_redo_spent_moved, inside->step, NULL, &taken, error);
 }
 
 /* txn_insert_redo_spent_frame_t is redo_spent's state across its pad: the block's entries it read. */
@@ -3580,6 +3796,13 @@ typedef struct txn_insert_redo_frame_t
 	uint64		tid;
 	size_t		need;
 	bool		pushed;
+
+	/*
+	 * mark is the state's mark the entries were read at, and done whether the
+	 * window found it unmoved.
+	 */
+	std_TupleU64U64_t mark;
+	bool		done;
 	StdVec		stored;
 	bool		stored_live;
 	StdVec		kept;
@@ -3623,23 +3846,23 @@ txn_insert_redo_closure_9(void *captures, HostIoIo *io_, TxnMemtableTablePrepare
 	TxnMemtableMapTaken taken;
 	TxnMemtableVersionHandle handle;
 	StdString	message;
+	std_TupleU64U64_t mark = txn_values_mark(step.record);
 
-	if (!txn_memtable_map_took_Unit(io, prepared, 0, change->writer, false, 0, false, unclaimed, 0,
-									frame->seen.has_below, frame->seen.below.ptr, frame->seen.below.len,
-									txn_insert_replayed, &step, NULL, txn_insert_replayed_tuple, &step, NULL,
-									txn_insert_replayed_moved, &step, NULL, &taken, error))
-		return false;
-	if (taken == TXN_MEMTABLE_MAP_TAKEN_TOOK &&
-		!txn_memtable_table_counted(io, prepared, frame->has_roomed, frame->roomed, error))
+	frame->done = mark.f0 == frame->mark.f0 && mark.f1 == frame->mark.f1;
+	if (!frame->done)
+		return true;
+	if (!txn_memtable_map_took_Unit(io, prepared, 0, change->writer, frame->has_roomed, frame->roomed, false, 0, false,
+									unclaimed, 0, frame->seen.has_below, frame->seen.below.ptr,
+									frame->seen.below.len, txn_insert_replayed, &step, NULL,
+									txn_insert_replayed_tuple, &step, NULL, txn_insert_replayed_moved, &step, NULL,
+									&taken, error))
 		return false;
 	for (size_t at = 0; frame->toast != NULL && at < frame->entries_len; at++)
 	{
-		if (!txn_memtable_map_finish_Unit(io, prepared, at + 1, change->writer, false, 0, false, NULL, 0,
-										  txn_insert_redo_refuse, (void *) &frame->entries[at], NULL,
-										  txn_insert_nothing, NULL, NULL, &taken, error))
-			return false;
-		if (taken == TXN_MEMTABLE_MAP_TAKEN_TOOK &&
-			!txn_memtable_table_counted(io, prepared, frame->has_roomed, frame->roomed, error))
+		if (!txn_memtable_map_finish_Unit(io, prepared, at + 1, change->writer, frame->has_roomed, frame->roomed,
+										  false, 0, false, NULL, 0, txn_insert_redo_refuse,
+										  (void *) &frame->entries[at], NULL, txn_insert_nothing, NULL, NULL, &taken,
+										  error))
 			return false;
 	}
 	for (size_t at = 0; at < frame->kept.len; at++)
@@ -3647,8 +3870,9 @@ txn_insert_redo_closure_9(void *captures, HostIoIo *io_, TxnMemtableTablePrepare
 		const txn_insert_TupleU32OptionVecU8_t *kept = &STD_VEC_AT(&frame->kept, txn_insert_TupleU32OptionVecU8_t,
 																   at);
 
-		if (!txn_memtable_map_finish_Unit(io, prepared, 1 + frame->stored.len + at, change->writer, true, frame->lsn,
-										  kept->has_f1, kept->f1.ptr, kept->f1.len, txn_insert_added, NULL, NULL,
+		if (!txn_memtable_map_finish_Unit(io, prepared, 1 + frame->stored.len + at, change->writer,
+										  frame->has_roomed, frame->roomed, true, frame->lsn, kept->has_f1,
+										  kept->f1.ptr, kept->f1.len, txn_insert_added, NULL, NULL,
 										  txn_insert_nothing, NULL, NULL, &taken, error))
 			return false;
 		if (taken != TXN_MEMTABLE_MAP_TAKEN_TOOK)
@@ -3657,17 +3881,14 @@ txn_insert_redo_closure_9(void *captures, HostIoIo *io_, TxnMemtableTablePrepare
 			*error = host_Error_fork((const uint8 *) "XX001", &message);
 			return false;
 		}
-		if (!txn_memtable_table_counted(io, prepared, frame->has_roomed, frame->roomed, error))
-			return false;
 	}
 	if (frame->marks.len > 0)
 	{
 		StdVec		marks = frame->marks;
 
 		std_vec_new(&frame->marks, TXN_INSERT_ID);
-		if (!txn_memtable_map_named(io, prepared, frame->marking, change->writer, true, frame->lsn, row, &marks,
-									error) ||
-			!txn_memtable_table_counted(io, prepared, frame->has_roomed, frame->roomed, error))
+		if (!txn_memtable_map_named(io, prepared, frame->marking, change->writer, frame->has_roomed, frame->roomed,
+									true, frame->lsn, row, &marks, error))
 			return false;
 	}
 	if (!frame->pushed)
@@ -3686,8 +3907,9 @@ txn_insert_redo_closure_9(void *captures, HostIoIo *io_, TxnMemtableTablePrepare
 		txn_insert_TakeStep_t filled = {.record = step.record, .base = &frame->base, .room = &frame->room,
 		.block = frame->flagged};
 
-		if (!txn_memtable_map_finish_Unit(io, prepared, frame->takes.len - 1, change->writer, false, 0,
-										  frame->flagged_seen.has_below, frame->flagged_seen.below.ptr,
+		if (!txn_memtable_map_finish_Unit(io, prepared, frame->takes.len - 1, change->writer, frame->has_roomed,
+										  frame->roomed, false, 0, frame->flagged_seen.has_below,
+										  frame->flagged_seen.below.ptr,
 										  frame->flagged_seen.below.len, txn_insert_filled, &filled, NULL,
 										  txn_insert_nothing, NULL, NULL, &taken, error))
 			return false;
@@ -3771,6 +3993,20 @@ txn_insert_redo_body(void *frame_)
 			!txn_spill_spilled(frame->io, &change->storage, TXN_WRITTEN_OF_ROWS, top, &spilled, frame->error))
 			return;
 	}
+	if (!frame->pushed)
+	{
+		size_t		frees = 1 + (change->has_replaced && change->replaced.f0 >> 16 != frame->tid >> 16);
+		size_t		freeing = frees * (txn_free_space_most_len(frame->room.most) + 4);
+		uint64		bytes;
+		bool		spilled;
+
+		if (!txn_spill_replayed(frame->io, &change->storage, TXN_WRITTEN_OF_FREE, top, freeing, &bytes,
+								frame->error))
+			return;
+		if (bytes >= txn_spill_threshold() &&
+			!txn_spill_spilled(frame->io, &change->storage, TXN_WRITTEN_OF_FREE, top, &spilled, frame->error))
+			return;
+	}
 	for (;;)
 	{
 		uint32		block;
@@ -3787,8 +4023,10 @@ txn_insert_redo_body(void *frame_)
 			continue;
 		}
 		block = (uint32) (frame->tid >> 16);
+		frame->mark = txn_values_mark(record);
 		if (!txn_insert_seen(frame->io, frame->store, record, &frame->base, &frame->room, block, &frame->seen,
-							 frame->error))
+							 frame->error) ||
+			!host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-redo-take-seen", frame->error))
 			return;
 		std_vec_new(&frame->takes, TXN_INSERT_TAKE);
 		frame->takes_live = true;
@@ -3836,9 +4074,22 @@ txn_insert_redo_body(void *frame_)
 		row.f0.ptr = change->key.ptr;
 		row.f0.len = change->key.len;
 		row.f1 = frame->need;
-		frame->ok = txn_memtable_table_prepare_Unit(frame->io, record, &row, 1, frame->takes.ptr, frame->takes.len,
-													true, txn_insert_redo_closure_9, frame, NULL, frame->error);
-		return;
+		if (!txn_memtable_table_prepare_Unit(frame->io, record, &row, 1, frame->takes.ptr, frame->takes.len, true,
+											 txn_insert_redo_closure_9, frame, NULL, frame->error))
+			return;
+		if (frame->done)
+		{
+			frame->ok = true;
+			return;
+		}
+		if (frame->has_flagged)
+			txn_insert_Seen_drop(&frame->flagged_seen);
+		frame->has_flagged = false;
+		std_vec_free_Checked(&frame->marks, TXN_INSERT_ID);
+		frame->marks_live = false;
+		std_vec_free_Checked(&frame->takes, TXN_INSERT_TAKE);
+		frame->takes_live = false;
+		txn_insert_Seen_drop(&frame->seen);
 	}
 }
 
@@ -3884,7 +4135,10 @@ txn_insert_redo_pad(void *frame_)
  * values has each value's map entry written unless the map holds the id
  * already. A row version the checkpoint's runs brought back isn't pushed
  * again, while the record's map changes and its tuple id's slot apply either
- * way.
+ * way. The entries a take falls back to are read before its prepare, which
+ * may spill at the delta's budget or meet a fold's install; a window that
+ * finds the state's mark moved since writes nothing and reads them again, so
+ * no take compares against an entry a spill moved out of the memtable.
  */
 bool
 txn_insert_redo(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held, const TxnRecordRowChange *change,
@@ -3899,3 +4153,4167 @@ txn_insert_redo(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *h
 	txn_insert_redo_pad(&frame);
 	return frame.ok;
 }
+
+#ifdef DOLTGRES_TEST_TXN
+#include "doltgres/chunks/trailer.h"
+#include "doltgres/repo/lib.h"
+#include "doltgres/simc/simc.h"
+#include "doltgres/std/test.h"
+#include "doltgres/txn/blobs.h"
+#include "doltgres/txn/change.h"
+#include "doltgres/txn/memtable/branch.h"
+#include "doltgres/txn/record.h"
+#include "doltgres/txn/runs.h"
+#include "doltgres/txn/values.h"
+#include "doltgres/txn/visible.h"
+
+/*
+ * txn_insert_tests_taken inserts a row as a test does, taking its key's
+ * stripe with a test's Waits and no resolve, and returns its tuple id.
+ */
+bool
+txn_insert_tests_taken(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held, TxnInsertInsert *row,
+					   const TxnInsertRoom *room, const HostSharedHeld *toast, const TxnValuesEntry *toast_entries,
+					   size_t toast_entries_len, uint64 *result, HostError *error)
+{
+	static const StdFmtPiece pieces[] = {STD_FMT_LIT("a test's insert gave "), STD_FMT_ARG(0)};
+	HostIoWaits waits = host_io_Waits_testing();
+	TxnInsertKeyed keyed = {.stripe = txn_change_stripe(&row->storage, row->key.ptr, row->key.len, true)};
+	TxnInsertInserted inserted;
+	TxnInsertInsertedRef other = {&inserted, {NULL, std_unit_Debug_fmt}};
+	StdFmtArg	args[] = {{&other, txn_insert_Inserted_Debug_fmt}};
+	StdFmtArguments arguments = {pieces, lengthof(pieces), args};
+	StdString	message;
+
+	if (!txn_insert_insert(io, store, held, row, room, NULL, toast, toast_entries, toast_entries_len, keyed, &waits,
+						   &inserted, error))
+		return false;
+	if (inserted.tag == TXN_INSERT_INSERTED_TOOK)
+	{
+		*result = inserted.u.took.tuple;
+		return true;
+	}
+	std_fmt_format_Checked(&message, &arguments);
+	*error = host_Error_fork((const uint8 *) "XX000", &message);
+	return false;
+}
+
+/* txn_insert_tests_stored returns a test's storage in pg_default, by its database. */
+HostStorage
+txn_insert_tests_stored(uint32 database)
+{
+	return (HostStorage)
+	{
+		.tablespace = HOST_PG_DEFAULT, .database = database, .relation = 16384
+	};
+}
+
+/* txn_insert_tests_row returns a keyed row's insert by its key's number, written by a transaction's first command. */
+TxnInsertInsert
+txn_insert_tests_row(HostStorage storage, uint64 n)
+{
+	TxnInsertInsert row = {.storage = storage, .table = 16385, .put = {.heap_bytes = 32}, .writer = {.xid = 41},
+	.logged = true};
+	uint8		key[8];
+
+	std_u64_to_be_bytes(n, key);
+	std_slice_to_vec_Checked(&row.key, key, sizeof(key), 1, 1);
+	std_slice_to_vec_Checked(&row.put.value, (const uint8 *) "row", 3, 1, 1);
+	std_vec_new(&row.put.addresses, sizeof(chunks_TupleU32Locator_t), _Alignof(chunks_TupleU32Locator_t));
+	std_vec_new(&row.put.values, sizeof(uint32), _Alignof(uint32));
+	std_vec_new(&row.kept, sizeof(size_t), _Alignof(size_t));
+	return row;
+}
+
+/* TXN_INSERT_TESTS_UNWRAP_FAILED is a Result's unwrap's panic on a HostError at a line and column. */
+#define TXN_INSERT_TESTS_UNWRAP_FAILED(line, col, error) \
+	STD_RESULT_EXPECT_FAILED((line), (col), "called `Result::unwrap()` on an `Err` value", (error), \
+							 host_Error_Debug_fmt)
+
+/* TXN_INSERT_TESTS_PAGE is an 8 kB heap page as redo knows it: its bytes past its header and its most tuples. */
+static const TxnInsertPage TXN_INSERT_TESTS_PAGE = {.bytes = 8168, .most = 291};
+
+/* txn_insert_tests_room returns what a row of some heap bytes needs of an 8 kB heap page, with no fill factor's reserve. */
+static TxnInsertRoom
+txn_insert_tests_room(uint64 bytes)
+{
+	TxnInsertRoom room = {.bytes = bytes, .page = 8168, .most = 291};
+
+	return room;
+}
+
+/* txn_insert_tests_repository makes a test's repository of a database and a reader of the shared state, unwrapped at the lines a case gives. */
+static void
+txn_insert_tests_repository(HostIoIo *io, uint32 database, uint32 create_line, uint32 create_col, uint32 read_line,
+							uint32 read_col, RepoRepo *repo, HostSharedReader *reading)
+{
+	ChunksErrorError failed;
+	HostError	error;
+
+	if (!repo_Repo_create(io, database, HOST_PG_DEFAULT, repo, &failed))
+		STD_RESULT_EXPECT_FAILED(create_line, create_col, "called `Result::unwrap()` on an `Err` value", &failed,
+								 chunks_error_Error_Debug_fmt);
+	if (!host_shared_read(io, reading, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(read_line, read_col, &error);
+}
+
+/* txn_insert_tests_stated returns the state of a storage, unwrapped at a line and column. */
+static HostSharedHeld
+txn_insert_tests_stated(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading, HostStorage storage,
+						uint32 line, uint32 col)
+{
+	HostSharedHeld held;
+	HostError	error;
+
+	if (!txn_state_state(io, repo, reading, &storage, TXN_STATE_PERSISTENCE_PERMANENT, false, NULL, &held, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(line, col, &error);
+	return held;
+}
+
+/* txn_insert_tests_took inserts a row as taken does, unwrapped at a line and column, and returns its tuple id. */
+static uint64
+txn_insert_tests_took(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held, TxnInsertInsert row,
+					  uint64 bytes, const HostSharedHeld *toast, const TxnValuesEntry *entries, size_t entries_len,
+					  uint32 line, uint32 col)
+{
+	TxnInsertRoom room = txn_insert_tests_room(bytes);
+	HostError	error;
+	uint64		tid;
+
+	if (!txn_insert_tests_taken(io, store, held, &row, &room, toast, entries, entries_len, &tid, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(line, col, &error);
+	return tid;
+}
+
+/* txn_insert_tests_ended ends the test's transaction as its commit's callbacks do, unwrapped at a line and column. */
+static void
+txn_insert_tests_ended(HostIoIo *io, uint32 line, uint32 col)
+{
+	HostError	error;
+
+	if (!txn_written_ended(io, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(line, col, &error);
+}
+
+/* txn_insert_tests_inserted returns the tuple ids a new storage's inserts of a row's heap bytes take, one row a key. */
+static StdVec
+txn_insert_tests_inserted(HostIoIo *io, uint32 database, uint64 bytes, uint64 rows)
+{
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	TreesStoreReader store;
+	StdVec		tids;
+
+	txn_insert_tests_repository(io, database, 1740, 91, 1741, 46, &repo, &reading);
+	held = txn_insert_tests_stated(io, &repo, &reading, txn_insert_tests_stored(database), 1742, 110);
+	store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	std_vec_with_capacity_Checked(&tids, rows, sizeof(uint64), _Alignof(uint64));
+	for (uint64 n = 0; n < rows; n++)
+	{
+		uint64		tid = txn_insert_tests_took(io, TREES_STORE_READER_NODE_STORE(&store), &held,
+												txn_insert_tests_row(txn_insert_tests_stored(database), n), bytes,
+												NULL, NULL, 0, 1745, 91);
+
+		std_vec_push_Checked(&tids, &tid, sizeof(tid), _Alignof(uint64));
+	}
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	return tids;
+}
+
+/* txn_insert_tests_u64s_is asserts at a line and column that some u64s are those wanted, as slices compare. */
+static void
+txn_insert_tests_u64s_is(uint32 line, uint32 col, const uint64 *got, size_t got_len, const uint64 *want,
+						 size_t want_len)
+{
+	StdVec		left = {(void *) got, got_len, got_len};
+	StdVec		right = {(void *) want, want_len, want_len};
+
+	STD_ASSERT_EQ(line, col, got_len == want_len && memcmp(got, want, got_len * sizeof(uint64)) == 0, &left,
+				  chunks_trailer_VecU64_Debug_fmt, &right, chunks_trailer_VecU64_Debug_fmt);
+}
+
+/*
+ * PLAN item 2's allocation on a new table, heap's packing: rows of 28 heap
+ * bytes take (0,1) up to (0,291), a page's most tuples, then (1,1); rows of
+ * 240 heap bytes fill a page by its bytes at its 34th row, and the 35th goes
+ * to (1,1).
+ */
+void
+test_txn_insert_tests_inserts_take_heaps_tuple_ids_by_offsets_and_by_bytes(void)
+{
+	static const uint64 first[] = {1, 2};
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	StdVec		narrow = txn_insert_tests_inserted(io, 9301, 28, 292);
+	StdVec		wide;
+
+	txn_insert_tests_u64s_is(1756, 9, narrow.ptr, 2, first, lengthof(first));
+	STD_ASSERT_EQ_U64(1757, 9, STD_VEC_AT(&narrow, uint64, 290), 291);
+	STD_ASSERT_EQ_U64(1758, 9, STD_VEC_AT(&narrow, uint64, 291), 1 << 16 | 1);
+	wide = txn_insert_tests_inserted(io, 9302, 240, 35);
+	STD_ASSERT_EQ_U64(1760, 9, STD_VEC_AT(&wide, uint64, 33), 34);
+	STD_ASSERT_EQ_U64(1761, 9, STD_VEC_AT(&wide, uint64, 34), 1 << 16 | 1);
+	txn_insert_tests_ended(io, 1762, 35);
+	std_vec_free_Checked(&wide, sizeof(uint64), _Alignof(uint64));
+	std_vec_free_Checked(&narrow, sizeof(uint64), _Alignof(uint64));
+	simc_TestIo_drop(&test_io);
+}
+
+/* txn_insert_tests_last_page_t is the last page case's captures: its storage, its state and store, the rows put, and the block the last took. */
+typedef struct txn_insert_tests_last_page_t
+{
+	HostStorage storage;
+	TreesStoreNodeStore store;
+	const HostSharedHeld *held;
+	uint64		n;
+	bool		has_target;
+	uint32		target;
+} txn_insert_tests_last_page_t;
+
+/* txn_insert_tests_last_page_put is the last page case's put: the next key's row of some heap bytes, at the block the last row took. */
+static uint64
+txn_insert_tests_last_page_put(txn_insert_tests_last_page_t *c, HostIoIo *io, uint64 bytes)
+{
+	TxnInsertInsert row;
+	uint64		tid;
+
+	c->n++;
+	row = txn_insert_tests_row(c->storage, c->n);
+	row.has_target = c->has_target;
+	row.target = c->target;
+	tid = txn_insert_tests_took(io, c->store, c->held, row, bytes, NULL, NULL, 0, 1781, 93);
+	c->has_target = true;
+	c->target = (uint32) (tid >> 16);
+	return tid;
+}
+
+/*
+ * PLAN item 2's allocation in RelationGetBufferForTuple's order, with a fresh
+ * page left by its bytes handing its counter offsets to the map: rows of 3000
+ * heap bytes take (0,1), (0,2), then (1,1), (1,2), (2,1); rows that fit the
+ * last page go there, (2,2) and (2,3); and a row the last page can't hold
+ * goes to the lowest page whose room the map shows, the page left first, at
+ * its first counter offset, (0,3).
+ */
+void
+test_txn_insert_tests_a_row_the_last_page_cant_hold_goes_to_the_lowest_page_left_with_room(void)
+{
+	static const uint64 sizes[] = {3000, 3000, 3000, 3000, 3000, 2000, 3000, 2000};
+	static const uint64 want[] = {1, 2, 1 << 16 | 1, 1 << 16 | 2, 2 << 16 | 1, 2 << 16 | 2, 2 << 16 | 3, 3};
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	TreesStoreReader store;
+	txn_insert_tests_last_page_t c = {.storage = txn_insert_tests_stored(9303)};
+	uint64		taken[lengthof(sizes)];
+
+	txn_insert_tests_repository(io, 9303, 1773, 87, 1774, 46, &repo, &reading);
+	held = txn_insert_tests_stated(io, &repo, &reading, c.storage, 1775, 95);
+	store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	c.store = TREES_STORE_READER_NODE_STORE(&store);
+	c.held = &held;
+	for (size_t k = 0; k < lengthof(sizes); k++)
+		taken[k] = txn_insert_tests_last_page_put(&c, io, sizes[k]);
+	txn_insert_tests_u64s_is(1787, 9, taken, lengthof(taken), want, lengthof(want));
+	txn_insert_tests_ended(io, 1788, 35);
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	simc_TestIo_drop(&test_io);
+}
+
+/* txn_insert_tests_logged_tag_t is Logged's variants. */
+typedef enum txn_insert_tests_logged_tag_t
+{
+	/* A row change with its record's end. */
+	TXN_INSERT_TESTS_LOGGED_ROW,
+	/* A fresh page's leave. */
+	TXN_INSERT_TESTS_LOGGED_LEFT,
+	/* A chunk with its record's end. */
+	TXN_INSERT_TESTS_LOGGED_CHUNK,
+} txn_insert_tests_logged_tag_t;
+
+/*
+ * txn_insert_tests_logged_t is Logged: one of a database's logged writes, as
+ * redo reads it back, a row change with its record's end, a fresh page's
+ * leave, or a chunk with its record's end.
+ */
+typedef struct txn_insert_tests_logged_t
+{
+	txn_insert_tests_logged_tag_t tag;
+	union
+	{
+		TxnRecordRowChange row;
+		TxnRecordPageLeft left;
+		TxnRecordChunkWrite chunk;
+	}			u;
+	HostLsn		end;
+} txn_insert_tests_logged_t;
+
+/* txn_insert_tests_logged_drop drops a logged write. */
+static void
+txn_insert_tests_logged_drop(txn_insert_tests_logged_t *write)
+{
+	if (write->tag == TXN_INSERT_TESTS_LOGGED_ROW)
+		txn_record_RowChange_drop(&write->u.row);
+	else if (write->tag == TXN_INSERT_TESTS_LOGGED_CHUNK)
+		txn_record_ChunkWrite_drop(&write->u.chunk);
+}
+
+/* txn_insert_tests_logged_free frees a Vec<Logged> and its writes. */
+static void
+txn_insert_tests_logged_free(StdVec *writes)
+{
+	for (size_t k = 0; k < writes->len; k++)
+		txn_insert_tests_logged_drop(&STD_VEC_AT(writes, txn_insert_tests_logged_t, k));
+	std_vec_free_Checked(writes, sizeof(txn_insert_tests_logged_t), _Alignof(txn_insert_tests_logged_t));
+}
+
+/* txn_insert_tests_logged returns the writes the simulation logged for a database's storages and its repository, in their order. */
+static StdVec
+txn_insert_tests_logged(uint32 database)
+{
+	StdVec		logged = simc_logged();
+	StdVec		writes;
+
+	std_vec_new(&writes, sizeof(txn_insert_tests_logged_t), _Alignof(txn_insert_tests_logged_t));
+	for (size_t k = 0; k < logged.len; k++)
+	{
+		simc_TupleU8VecU8Lsn_t *one = &STD_VEC_AT(&logged, simc_TupleU8VecU8Lsn_t, k);
+		txn_insert_tests_logged_t write = {.end = one->f2};
+		HostWalKind kind;
+		HostError	error;
+		bool		kept = false;
+
+		if (!host_WalKind_of(one->f0, &kind))
+			kind = HOST_WAL_KIND_REPOSITORY_CREATED;
+		if (kind == HOST_WAL_KIND_ROW_CHANGE)
+		{
+			write.tag = TXN_INSERT_TESTS_LOGGED_ROW;
+			if (!txn_record_RowChange_decode(one->f1.ptr, one->f1.len, &write.u.row, &error))
+				host_Error_drop(&error);
+			else if (!(kept = write.u.row.storage.database == database))
+				txn_record_RowChange_drop(&write.u.row);
+		}
+		else if (kind == HOST_WAL_KIND_PAGE_LEFT)
+		{
+			write.tag = TXN_INSERT_TESTS_LOGGED_LEFT;
+			if (!txn_record_PageLeft_decode(one->f1.ptr, one->f1.len, &write.u.left, &error))
+				host_Error_drop(&error);
+			else
+				kept = write.u.left.storage.database == database;
+		}
+		else if (kind == HOST_WAL_KIND_CHUNK)
+		{
+			write.tag = TXN_INSERT_TESTS_LOGGED_CHUNK;
+			if (!txn_record_ChunkWrite_decode(one->f1.ptr, one->f1.len, &write.u.chunk, &error))
+				host_Error_drop(&error);
+			else if (!(kept = write.u.chunk.repository == database))
+				txn_record_ChunkWrite_drop(&write.u.chunk);
+		}
+		if (kept)
+			std_vec_push_Checked(&writes, &write, sizeof(write), _Alignof(txn_insert_tests_logged_t));
+		std_vec_free_Checked(&one->f1, 1, 1);
+	}
+	std_vec_free_Checked(&logged, sizeof(simc_TupleU8VecU8Lsn_t), _Alignof(simc_TupleU8VecU8Lsn_t));
+	return writes;
+}
+
+/* txn_insert_tests_count returns how many of some logged writes are of a variant. */
+static size_t
+txn_insert_tests_count(const StdVec *writes, txn_insert_tests_logged_tag_t tag)
+{
+	size_t		count = 0;
+
+	for (size_t k = 0; k < writes->len; k++)
+		count += STD_VEC_AT(writes, txn_insert_tests_logged_t, k).tag == tag;
+	return count;
+}
+
+/* txn_insert_tests_mapped_t is an Option<Option<Vec<u8>>>: a key's newest map entry, a removal's none, or none. */
+typedef struct txn_insert_tests_mapped_t
+{
+	bool		some;
+	TxnMemtableMapEntry entry;
+} txn_insert_tests_mapped_t;
+
+/* txn_insert_tests_mapped_Debug_fmt is an Option<Option<Vec<u8>>>'s Debug. */
+static bool
+txn_insert_tests_mapped_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const txn_insert_tests_mapped_t *mapped = value;
+	StdBytes	bytes = {mapped->entry.value.ptr, mapped->entry.value.len};
+	StdOptionRef inner = {mapped->some && mapped->entry.has_value, {&bytes, std_bytes_Debug_fmt}};
+	StdOptionRef outer = {mapped->some, {&inner, std_option_Debug_fmt}};
+
+	return std_option_Debug_fmt(&outer, f);
+}
+
+/* txn_insert_tests_mapped_eq reports whether two Option<Option<Vec<u8>>>s are equal. */
+static bool
+txn_insert_tests_mapped_eq(const txn_insert_tests_mapped_t *a, const txn_insert_tests_mapped_t *b)
+{
+	return a->some == b->some &&
+		(!a->some || (a->entry.has_value == b->entry.has_value &&
+					  (!a->entry.has_value ||
+					   trees_store_VecU8_PartialEq_eq(&a->entry.value, &b->entry.value))));
+}
+
+/* txn_insert_tests_mapped_drop drops a map entry's value. */
+static void
+txn_insert_tests_mapped_drop(txn_insert_tests_mapped_t *mapped)
+{
+	if (mapped->some && mapped->entry.has_value)
+		std_vec_free_Checked(&mapped->entry.value, 1, 1);
+}
+
+/* txn_insert_tests_newest returns a map's newest entry of a key, unwrapped at a line and column. */
+static txn_insert_tests_mapped_t
+txn_insert_tests_newest(HostIoIo *io, HostSharedRecord record, TxnMemtableMapMap map, uint32 key, uint32 line,
+						uint32 col)
+{
+	txn_insert_tests_mapped_t mapped = {0};
+	HostError	error;
+
+	if (!txn_memtable_map_newest(io, record, map, key, &mapped.some, &mapped.entry, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(line, col, &error);
+	return mapped;
+}
+
+/* txn_insert_tests_free_t is a state's free space map entries of its first four blocks, and its counter. */
+typedef struct txn_insert_tests_free_t
+{
+	txn_insert_tests_mapped_t entries[4];
+	uint64		counter;
+} txn_insert_tests_free_t;
+
+/* txn_insert_tests_free_entries returns a state's free space map entries of its first four blocks, with its counter. */
+static txn_insert_tests_free_t
+txn_insert_tests_free_entries(HostIoIo *io, HostSharedRecord record)
+{
+	txn_insert_tests_free_t free;
+
+	for (uint32 block = 0; block < 4; block++)
+		free.entries[block] = txn_insert_tests_newest(io, record, TXN_MEMTABLE_MAP_MAP_FREE, block, 1821, 70);
+	free.counter = txn_state_counter(record);
+	return free;
+}
+
+/* txn_insert_tests_mappeds_Debug_fmt is a Vec<Option<Option<Vec<u8>>>>'s Debug. */
+static bool
+txn_insert_tests_mappeds_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const StdVec *mappeds = value;
+	StdDebugList list = std_fmt_debug_list(f);
+
+	for (size_t k = 0; k < mappeds->len; k++)
+		std_DebugList_entry(&list, &STD_VEC_AT(mappeds, txn_insert_tests_mapped_t, k),
+							txn_insert_tests_mapped_Debug_fmt);
+	return std_DebugList_finish(&list);
+}
+
+/* txn_insert_tests_free_Debug_fmt is the Debug of a state's first four blocks' entries with its counter, the tuple (entries, counter). */
+static bool
+txn_insert_tests_free_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const txn_insert_tests_free_t *free = value;
+	StdVec		entries = {(void *) free->entries, lengthof(free->entries), lengthof(free->entries)};
+	StdTupleRef tuple = STD_TUPLE(2, STD_ITEM(&entries, txn_insert_tests_mappeds_Debug_fmt),
+								  STD_ITEM(&free->counter, std_u64_Debug_fmt));
+
+	return std_tuple_Debug_fmt(&tuple, f);
+}
+
+/* txn_insert_tests_free_drop drops a state's first four blocks' entries. */
+static void
+txn_insert_tests_free_drop(txn_insert_tests_free_t *free)
+{
+	for (size_t k = 0; k < lengthof(free->entries); k++)
+		txn_insert_tests_mapped_drop(&free->entries[k]);
+}
+
+/*
+ * txn_insert_tests_free_is asserts at a line and column, with a message or
+ * none, that a replica's entries and counter are the primary's.
+ */
+static void
+txn_insert_tests_free_is(uint32 line, uint32 col, const txn_insert_tests_free_t *got,
+						 const txn_insert_tests_free_t *want, const StdFmtArguments *message)
+{
+	bool		eq = got->counter == want->counter;
+
+	for (size_t k = 0; eq && k < lengthof(got->entries); k++)
+		eq = txn_insert_tests_mapped_eq(&got->entries[k], &want->entries[k]);
+	if (!eq)
+		std_assert_failed(RUST_FILE, line, col, "==", got, txn_insert_tests_free_Debug_fmt, want,
+						  txn_insert_tests_free_Debug_fmt, message);
+}
+
+/*
+ * txn_insert_tests_replica_t is Replica: a new database's storage a
+ * primary's logged writes were redone on, its state, its TOAST relation's
+ * state when a row change named one, and its repository's working state's
+ * delta of chunks.
+ */
+typedef struct txn_insert_tests_replica_t
+{
+	HostSharedHeld held;
+	bool		has_toast;
+	HostSharedHeld toast;
+	HostSharedHeld deltas;
+} txn_insert_tests_replica_t;
+
+/* txn_insert_tests_replica_drop drops a replica's states and its delta of chunks. */
+static void
+txn_insert_tests_replica_drop(txn_insert_tests_replica_t *replica)
+{
+	host_shared_Held_drop(&replica->held);
+	if (replica->has_toast)
+		host_shared_Held_drop(&replica->toast);
+	host_shared_Held_drop(&replica->deltas);
+}
+
+/*
+ * txn_insert_tests_redone redoes a primary's logged writes, in their given
+ * order, on a state as the fork's resource manager does: each row change with
+ * its TOAST relation's state when it named one, each leave, and each chunk
+ * into deltas. It takes the writes.
+ */
+static void
+txn_insert_tests_redone(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held,
+						const HostSharedHeld *toast, const HostSharedHeld *deltas, StdVec *writes)
+{
+	for (size_t k = 0; k < writes->len; k++)
+	{
+		txn_insert_tests_logged_t *write = &STD_VEC_AT(writes, txn_insert_tests_logged_t, k);
+		HostError	error;
+
+		if (write->tag == TXN_INSERT_TESTS_LOGGED_ROW)
+		{
+			const TxnRecordRowChange *change = &write->u.row;
+			const HostSharedHeld *named = change->has_toast ? toast : NULL;
+			StdVec		entries;
+			bool		ok;
+
+			std_vec_with_capacity_Checked(&entries, change->blobs.len, sizeof(TxnValuesEntry),
+										  _Alignof(TxnValuesEntry));
+			for (size_t b = 0; b < change->blobs.len; b++)
+			{
+				const chunks_TupleAddressU64_t *blob = &STD_VEC_AT(&change->blobs, chunks_TupleAddressU64_t, b);
+				TxnValuesEntry entry = txn_values_Entry_new(blob->f0, blob->f1);
+
+				std_vec_push_Checked(&entries, &entry, sizeof(entry), _Alignof(TxnValuesEntry));
+			}
+			ok = txn_insert_redo(io, store, held, change, write->end, &TXN_INSERT_TESTS_PAGE, named,
+								 named == NULL ? NULL : entries.ptr, named == NULL ? 0 : entries.len, &error);
+			std_vec_free_Checked(&entries, sizeof(TxnValuesEntry), _Alignof(TxnValuesEntry));
+			if (!ok)
+				TXN_INSERT_TESTS_UNWRAP_FAILED(1870, 71, &error);
+			txn_record_RowChange_drop(&write->u.row);
+		}
+		else if (write->tag == TXN_INSERT_TESTS_LOGGED_LEFT)
+		{
+			if (!txn_insert_redo_left(io, store, held, &write->u.left, &TXN_INSERT_TESTS_PAGE, &error))
+				TXN_INSERT_TESTS_UNWRAP_FAILED(1872, 80, &error);
+		}
+		else if (!txn_blobs_redo(io, deltas, write->u.chunk, write->end, &error))
+			TXN_INSERT_TESTS_UNWRAP_FAILED(1873, 82, &error);
+	}
+	std_vec_free_Checked(writes, sizeof(txn_insert_tests_logged_t), _Alignof(txn_insert_tests_logged_t));
+}
+
+/*
+ * txn_insert_tests_replica redoes a primary's logged writes, in their given
+ * order, on a new database's storage with no catalog, as the fork's resource
+ * manager does: each row change with its TOAST relation's state and the
+ * value map entries its field 24 gives, each leave, and each chunk into the
+ * new repository's working state. It takes the writes.
+ */
+static txn_insert_tests_replica_t
+txn_insert_tests_replica(HostIoIo *io, uint32 database, StdVec *writes)
+{
+	txn_insert_tests_replica_t replica = {0};
+	RepoRepo	repo;
+	HostSharedReader reading;
+	TreesStoreReader store;
+	HostError	error;
+
+	txn_insert_tests_repository(io, database, 1836, 91, 1837, 46, &repo, &reading);
+	replica.held = txn_insert_tests_stated(io, &repo, &reading, txn_insert_tests_stored(database), 1838, 110);
+	for (size_t k = 0; !replica.has_toast && k < writes->len; k++)
+	{
+		const txn_insert_tests_logged_t *write = &STD_VEC_AT(writes, txn_insert_tests_logged_t, k);
+
+		if (write->tag == TXN_INSERT_TESTS_LOGGED_ROW && write->u.row.has_toast)
+		{
+			HostStorage storage = {.tablespace = write->u.row.toast.tablespace, .database = database,
+			.relation = write->u.row.toast.relation};
+
+			replica.toast = txn_insert_tests_stated(io, &repo, &reading, storage, 1845, 94);
+			replica.has_toast = true;
+		}
+	}
+	if (!txn_memtable_branch_deltas(io, database, HOST_PG_DEFAULT, &replica.deltas, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(1847, 97, &error);
+	store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	txn_insert_tests_redone(io, TREES_STORE_READER_NODE_STORE(&store), &replica.held,
+							replica.has_toast ? &replica.toast : NULL, &replica.deltas, writes);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	return replica;
+}
+
+/*
+ * txn_insert_tests_replayed redoes a primary's writes on a new database's
+ * replica and compares its entries and counter with the primary's, with a
+ * message naming the replica when named.
+ */
+static void
+txn_insert_tests_replayed(HostIoIo *io, uint32 database, StdVec *writes, const txn_insert_tests_free_t *expected,
+						  bool named, uint32 line, uint32 col)
+{
+	static const StdFmtPiece pieces[] = {STD_FMT_LIT("replica "), STD_FMT_ARG(0)};
+	StdFmtArg	args[] = {{&database, std_u32_Display_fmt}};
+	StdFmtArguments message = {pieces, lengthof(pieces), args};
+	txn_insert_tests_replica_t replica = txn_insert_tests_replica(io, database, writes);
+	txn_insert_tests_free_t got;
+
+	if (replica.has_toast)
+	{
+		host_shared_Held_drop(&replica.toast);
+		replica.has_toast = false;
+	}
+	host_shared_Held_drop(&replica.deltas);
+	got = txn_insert_tests_free_entries(io, host_shared_Held_record(&replica.held));
+	txn_insert_tests_free_is(line, col, &got, expected, named ? &message : NULL);
+	txn_insert_tests_free_drop(&got);
+	host_shared_Held_drop(&replica.held);
+}
+
+/*
+ * CommPF 5's redo cases: the primary's inserts, replayed on another storage
+ * from their logged records with no catalog, leave every block's free space
+ * entry and the counter as the primary's, the reference placement's case
+ * among them, whose last row goes to (0,3) after page 2 is left; in the
+ * records' order, and with two row changes logged out of their tuple ids'
+ * order, as two inserts' windows allow.
+ */
+void
+test_txn_insert_tests_redo_leaves_the_free_space_map_and_the_counter_as_the_primarys(void)
+{
+	static const uint64 sizes[] = {3000, 3000, 3000, 3000, 3000, 2000, 3000, 2000};
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	RepoRepo	primary;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	TreesStoreReader store;
+	bool		has_target = false;
+	uint32		target = 0;
+	txn_insert_tests_free_t expected;
+	StdVec		writes;
+	StdVec		swapped;
+
+	txn_insert_tests_repository(io, 9304, 1888, 95, 1889, 50, &primary, &reading);
+	held = txn_insert_tests_stated(io, &primary, &reading, txn_insert_tests_stored(9304), 1893, 109);
+	store = repo_Repo_reader(&primary, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	for (uint64 n = 0; n < lengthof(sizes); n++)
+	{
+		TxnInsertInsert row = txn_insert_tests_row(txn_insert_tests_stored(9304), n);
+		uint64		tid;
+
+		row.has_target = has_target;
+		row.target = target;
+		tid = txn_insert_tests_took(io, TREES_STORE_READER_NODE_STORE(&store), &held, row, sizes[n], NULL, NULL, 0,
+									1898, 104);
+		has_target = true;
+		target = (uint32) (tid >> 16);
+	}
+	expected = txn_insert_tests_free_entries(io, host_shared_Held_record(&held));
+	writes = txn_insert_tests_logged(9304);
+	STD_ASSERT_EQ_U64(1902, 9, txn_insert_tests_count(&writes, TXN_INSERT_TESTS_LOGGED_LEFT), 3);
+	txn_insert_tests_logged_free(&writes);
+	swapped = txn_insert_tests_logged(9304);
+	{
+		txn_insert_tests_logged_t first = STD_VEC_AT(&swapped, txn_insert_tests_logged_t, 0);
+
+		STD_VEC_AT(&swapped, txn_insert_tests_logged_t, 0) = STD_VEC_AT(&swapped, txn_insert_tests_logged_t, 1);
+		STD_VEC_AT(&swapped, txn_insert_tests_logged_t, 1) = first;
+	}
+	writes = txn_insert_tests_logged(9304);
+	txn_insert_tests_replayed(io, 9305, &writes, &expected, true, 1908, 13);
+	txn_insert_tests_replayed(io, 9306, &swapped, &expected, true, 1908, 13);
+	txn_insert_tests_ended(io, 1910, 35);
+	txn_insert_tests_free_drop(&expected);
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&primary);
+	simc_TestIo_drop(&test_io);
+}
+
+/* txn_insert_tests_appended moves the writes of one vector onto the end of another. */
+static void
+txn_insert_tests_appended(StdVec *to, StdVec *from)
+{
+	std_vec_extend_from_slice_Checked(to, from->ptr, from->len, sizeof(txn_insert_tests_logged_t),
+									  _Alignof(txn_insert_tests_logged_t));
+	std_vec_free_Checked(from, sizeof(txn_insert_tests_logged_t), _Alignof(txn_insert_tests_logged_t));
+}
+
+/*
+ * PLAN's I12 for a free space take: the reference placement's inserts redone
+ * with each record twice in a row, and redone whole and then whole again, as
+ * a checkpoint's runs that hold a window's take can be followed by its
+ * record, leave every block's free space entry and the counter as the
+ * primary's, since a take whose offset is no longer free and not past the
+ * counter changes nothing.
+ */
+void
+test_txn_insert_tests_a_take_redone_again_changes_nothing(void)
+{
+	static const uint64 sizes[] = {3000, 3000, 3000, 3000, 3000, 2000, 3000, 2000};
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	TreesStoreReader store;
+	txn_insert_tests_free_t expected;
+	StdVec		a;
+	StdVec		b;
+	StdVec		twice;
+	StdVec		again;
+
+	txn_insert_tests_repository(io, 9307, 1920, 87, 1921, 46, &repo, &reading);
+	held = txn_insert_tests_stated(io, &repo, &reading, txn_insert_tests_stored(9307), 1922, 106);
+	store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	for (uint64 n = 0; n < lengthof(sizes); n++)
+		txn_insert_tests_took(io, TREES_STORE_READER_NODE_STORE(&store), &held,
+							  txn_insert_tests_row(txn_insert_tests_stored(9307), n), sizes[n], NULL, NULL, 0,
+							  1926, 73);
+	expected = txn_insert_tests_free_entries(io, host_shared_Held_record(&held));
+	a = txn_insert_tests_logged(9307);
+	b = txn_insert_tests_logged(9307);
+	std_vec_with_capacity_Checked(&twice, a.len + b.len, sizeof(txn_insert_tests_logged_t),
+								  _Alignof(txn_insert_tests_logged_t));
+	for (size_t k = 0; k < a.len && k < b.len; k++)
+	{
+		std_vec_push_Checked(&twice, &STD_VEC_AT(&a, txn_insert_tests_logged_t, k), sizeof(txn_insert_tests_logged_t),
+							 _Alignof(txn_insert_tests_logged_t));
+		std_vec_push_Checked(&twice, &STD_VEC_AT(&b, txn_insert_tests_logged_t, k), sizeof(txn_insert_tests_logged_t),
+							 _Alignof(txn_insert_tests_logged_t));
+	}
+	std_vec_free_Checked(&a, sizeof(txn_insert_tests_logged_t), _Alignof(txn_insert_tests_logged_t));
+	std_vec_free_Checked(&b, sizeof(txn_insert_tests_logged_t), _Alignof(txn_insert_tests_logged_t));
+	again = txn_insert_tests_logged(9307);
+	b = txn_insert_tests_logged(9307);
+	txn_insert_tests_appended(&again, &b);
+	txn_insert_tests_replayed(io, 9308, &twice, &expected, true, 1934, 13);
+	txn_insert_tests_replayed(io, 9309, &again, &expected, true, 1934, 13);
+	txn_insert_tests_ended(io, 1936, 35);
+	txn_insert_tests_free_drop(&expected);
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	simc_TestIo_drop(&test_io);
+}
+
+/* txn_insert_tests_toasted returns the state of a test's TOAST relation 16390 in a database, unwrapped at a line and column. */
+static HostSharedHeld
+txn_insert_tests_toasted(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading, uint32 database,
+						 uint32 line, uint32 col)
+{
+	HostStorage storage = txn_insert_tests_stored(database);
+
+	storage.relation = 16390;
+	return txn_insert_tests_stated(io, repo, reading, storage, line, col);
+}
+
+/* TXN_INSERT_TESTS_TOAST is the TOAST relation a test's valued rows name: pg_default's 16390, of table 16391. */
+static const TxnRecordToast TXN_INSERT_TESTS_TOAST = {.tablespace = HOST_PG_DEFAULT, .relation = 16390, .table = 16391};
+
+/* TXN_INSERT_TESTS_IDS is the value ids a test's valued rows name. */
+static const uint32 TXN_INSERT_TESTS_IDS[] = {16400, 16401};
+
+/* txn_insert_tests_values sets an insert's value ids to the test's two, naming its TOAST relation. */
+static void
+txn_insert_tests_values(TxnInsertInsert *row)
+{
+	std_vec_free_Checked(&row->put.values, sizeof(uint32), _Alignof(uint32));
+	std_slice_to_vec_Checked(&row->put.values, TXN_INSERT_TESTS_IDS, lengthof(TXN_INSERT_TESTS_IDS), sizeof(uint32),
+							 _Alignof(uint32));
+	row->has_toast = true;
+	row->toast = TXN_INSERT_TESTS_TOAST;
+}
+
+/* txn_insert_tests_row_changes returns pointers to the row changes among some logged writes, in their order. */
+static StdVec
+txn_insert_tests_row_changes(const StdVec *writes)
+{
+	StdVec		rows;
+
+	std_vec_new(&rows, sizeof(const TxnRecordRowChange *), _Alignof(const TxnRecordRowChange *));
+	for (size_t k = 0; k < writes->len; k++)
+	{
+		const txn_insert_tests_logged_t *write = &STD_VEC_AT(writes, txn_insert_tests_logged_t, k);
+		const TxnRecordRowChange *row = &write->u.row;
+
+		if (write->tag == TXN_INSERT_TESTS_LOGGED_ROW)
+			std_vec_push_Checked(&rows, &row, sizeof(row), _Alignof(const TxnRecordRowChange *));
+	}
+	return rows;
+}
+
+/*
+ * Rule (C) of the out-of-line values text: an insert of a row with two
+ * out-of-line values writes each value's map entry, with a count of one,
+ * into its TOAST relation's value map in the row's window, and logs the
+ * value ids with their TOAST relation in the row's record (fields 24 to 27).
+ */
+void
+test_txn_insert_tests_an_insert_maps_its_out_of_line_values_in_its_window(void)
+{
+	static const char *const bytes[] = {"one", "two"};
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	HostSharedHeld toast;
+	TreesStoreReader store;
+	TxnValuesEntry entries[2];
+	TxnInsertInsert valued;
+	StdVec		writes;
+	StdVec		logged;
+	StdVec		ids = {(void *) TXN_INSERT_TESTS_IDS, 2, 2};
+
+	txn_insert_tests_repository(io, 9311, 1946, 87, 1947, 46, &repo, &reading);
+	held = txn_insert_tests_stated(io, &repo, &reading, txn_insert_tests_stored(9311), 1948, 106);
+	toast = txn_insert_tests_toasted(io, &repo, &reading, 9311, 1950, 102);
+	store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	for (size_t k = 0; k < lengthof(entries); k++)
+	{
+		entries[k].address = chunks_address_Address_of((const uint8 *) bytes[k], strlen(bytes[k]));
+		entries[k].locator = chunks_trailer_Locator_Default_default();
+		entries[k].raw = 4000;
+		entries[k].stored = 4000;
+		entries[k].count = 1;
+	}
+	valued = txn_insert_tests_row(txn_insert_tests_stored(9311), 1);
+	txn_insert_tests_values(&valued);
+	txn_insert_tests_took(io, TREES_STORE_READER_NODE_STORE(&store), &held, valued, 60, &toast, entries,
+						  lengthof(entries), 1963, 75);
+	for (size_t k = 0; k < lengthof(entries); k++)
+	{
+		txn_insert_tests_mapped_t mapped = txn_insert_tests_newest(io, host_shared_Held_record(&toast),
+																   TXN_MEMTABLE_MAP_MAP_VALUES,
+																   TXN_INSERT_TESTS_IDS[k], 1965, 75);
+		TxnValuesEntry entry;
+		HostError	error;
+
+		if (!mapped.some)
+			STD_OPTION_UNWRAP_FAILED(1965, 84);
+		if (!mapped.entry.has_value)
+			STD_OPTION_UNWRAP_FAILED(1965, 93);
+		if (!txn_values_Entry_decode(mapped.entry.value.ptr, mapped.entry.value.len, &entry, &error))
+			TXN_INSERT_TESTS_UNWRAP_FAILED(1966, 48, &error);
+		STD_ASSERT_EQ(1966, 13, txn_values_Entry_PartialEq_eq(&entry, &entries[k]), &entry,
+					  txn_values_Entry_Debug_fmt, &entries[k], txn_values_Entry_Debug_fmt);
+		txn_insert_tests_mapped_drop(&mapped);
+	}
+	writes = txn_insert_tests_logged(9311);
+	logged = txn_insert_tests_row_changes(&writes);
+	STD_ASSERT_EQ_U64(1974, 9, logged.len, 1);
+	{
+		const TxnRecordRowChange *change = STD_VEC_AT(&logged, const TxnRecordRowChange *, 0);
+		const TxnMemtablePut *put;
+		StdOptionRef got = {change->has_toast, {&change->toast, txn_record_Toast_Debug_fmt}};
+		StdOptionRef want = {true, {&TXN_INSERT_TESTS_TOAST, txn_record_Toast_Debug_fmt}};
+
+		if (!txn_record_RowChange_put(change, &put))
+			STD_OPTION_UNWRAP_FAILED(1975, 36);
+		STD_ASSERT_EQ(1975, 9, put->values.len == 2 &&
+					  memcmp(put->values.ptr, TXN_INSERT_TESTS_IDS, sizeof(TXN_INSERT_TESTS_IDS)) == 0,
+					  &put->values, chunks_header_VecU32_Debug_fmt, &ids, chunks_header_VecU32_Debug_fmt);
+		STD_ASSERT_EQ(1976, 9, change->has_toast &&
+					  txn_record_Toast_PartialEq_eq(&change->toast, &TXN_INSERT_TESTS_TOAST), &got,
+					  std_option_Debug_fmt, &want, std_option_Debug_fmt);
+	}
+	std_vec_free_Checked(&logged, sizeof(const TxnRecordRowChange *), _Alignof(const TxnRecordRowChange *));
+	txn_insert_tests_logged_free(&writes);
+	txn_insert_tests_ended(io, 1977, 35);
+	host_shared_Held_drop(&toast);
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	simc_TestIo_drop(&test_io);
+}
+
+/* txn_insert_tests_linked reports whether a state's rows' memtable, free space map, and tuple id table are each linked. */
+static void
+txn_insert_tests_linked(HostSharedRecord record, bool linked[3])
+{
+	static const HostSharedOp load = {.tag = HOST_SHARED_OP_LOAD};
+
+	linked[0] = host_shared_Record_atomic(record, TXN_STATE_MEMTABLE_WORD_INDEX, load) != 0;
+	linked[1] = host_shared_Record_atomic(record, TXN_STATE_FREE_WORD_INDEX, load) != 0;
+	linked[2] = host_shared_Record_atomic(record, TXN_STATE_TUPLES_WORD_INDEX, load) != 0;
+}
+
+/* txn_insert_tests_gathering_fork returns a gathering case's actor's error, the fork's internal one, of a formatted message. */
+static HostError
+txn_insert_tests_gathering_fork(const StdFmtArguments *arguments)
+{
+	StdString	message;
+
+	std_fmt_format_Checked(&message, arguments);
+	return host_Error_fork((const uint8 *) "XX000", &message);
+}
+
+/* txn_insert_tests_opened opens a storage's database's repository, a reader, and the storage's state, dropping what it opened on a failure. */
+static bool
+txn_insert_tests_opened(HostIoIo *io, HostStorage storage, RepoRepo *repo, HostSharedReader *reading, HostSharedHeld *held,
+						HostError *error)
+{
+	if (!txn_state_tests_reopened(io, storage.database, repo, error))
+		return false;
+	if (!host_shared_read(io, reading, error))
+	{
+		repo_Repo_drop(repo);
+		return false;
+	}
+	if (!txn_state_state(io, repo, reading, &storage, TXN_STATE_PERSISTENCE_PERMANENT, false, NULL, held, error))
+	{
+		host_shared_Reader_drop(reading);
+		repo_Repo_drop(repo);
+		return false;
+	}
+	return true;
+}
+
+/* txn_insert_tests_gathering_inserter is the gathering case's inserter: its row takes (0,1). */
+static bool
+txn_insert_tests_gathering_inserter(void *captures, HostIoIo *io, HostError *error)
+{
+	static const StdFmtPiece pieces[] = {STD_FMT_LIT("the insert took "), STD_FMT_ARG(0)};
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	TxnInsertRoom room = txn_insert_tests_room(28);
+	uint64		tid;
+	bool		ok;
+
+	if (!txn_insert_tests_opened(io, txn_insert_tests_stored(9312), &repo, &reading, &held, error))
+		return false;
+	{
+		TreesStoreReader store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+		TxnInsertInsert row = txn_insert_tests_row(txn_insert_tests_stored(9312), 1);
+
+		ok = txn_insert_tests_taken(io, TREES_STORE_READER_NODE_STORE(&store), &held, &row, &room, NULL, NULL, 0,
+									&tid, error);
+	}
+	if (ok && tid != 1)
+	{
+		StdFmtArg	args[] = {{&tid, std_u64_Display_fmt}};
+		StdFmtArguments arguments = {pieces, lengthof(pieces), args};
+
+		*error = txn_insert_tests_gathering_fork(&arguments);
+		ok = false;
+	}
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	return ok;
+}
+
+/* txn_insert_tests_gathering_between is the gathering case's step between a save's manifest write and its saved, which does nothing. */
+static void
+txn_insert_tests_gathering_between(void *captures, HostIoIo *io)
+{
+}
+
+/* txn_insert_tests_found_t is what a gathering found: whether the state's three words are linked, and its counter. */
+typedef struct txn_insert_tests_found_t
+{
+	bool		linked[3];
+	uint64		counter;
+} txn_insert_tests_found_t;
+
+/* txn_insert_tests_linked_Debug_fmt is a [bool; 3]'s Debug. */
+static bool
+txn_insert_tests_linked_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const bool *linked = value;
+	StdDebugList list = std_fmt_debug_list(f);
+
+	for (size_t k = 0; k < 3; k++)
+		std_DebugList_entry(&list, &linked[k], std_bool_Debug_fmt);
+	return std_DebugList_finish(&list);
+}
+
+/* txn_insert_tests_found_Debug_fmt is what a gathering found's Debug, the tuple ([bool; 3], u64). */
+static bool
+txn_insert_tests_found_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const txn_insert_tests_found_t *found = value;
+	StdTupleRef tuple = STD_TUPLE(2, STD_ITEM(found->linked, txn_insert_tests_linked_Debug_fmt),
+								  STD_ITEM(&found->counter, std_u64_Debug_fmt));
+
+	return std_tuple_Debug_fmt(&tuple, f);
+}
+
+/* txn_insert_tests_gathering_gatherer is one of the gathering case's gatherers: a save's gathering finds the state's words linked and its counter where the insert put it. */
+static bool
+txn_insert_tests_gathering_gatherer(void *captures, HostIoIo *io, HostError *error)
+{
+	static const StdFmtPiece pieces[] = {STD_FMT_LIT("a gathering found "), STD_FMT_ARG(0)};
+	uint64		counter = *(const uint64 *) captures;
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	txn_insert_tests_found_t found;
+	bool		ok = true;
+
+	if (!txn_insert_tests_opened(io, txn_insert_tests_stored(9312), &repo, &reading, &held, error))
+		return false;
+	txn_state_tests_saved(io, &repo, 9312, txn_insert_tests_gathering_between, NULL);
+	txn_insert_tests_linked(host_shared_Held_record(&held), found.linked);
+	found.counter = txn_state_counter(host_shared_Held_record(&held));
+	if (!(found.linked[0] && found.linked[1] && found.linked[2] && found.counter == counter))
+	{
+		StdFmtArg	args[] = {{&found, txn_insert_tests_found_Debug_fmt}};
+		StdFmtArguments arguments = {pieces, lengthof(pieces), args};
+
+		*error = txn_insert_tests_gathering_fork(&arguments);
+		ok = false;
+	}
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	return ok;
+}
+
+/*
+ * PLAN item 7's tuple id counter: a save's gathering held at each point from
+ * an insert's prepare to its push, at the prepare's pause before the take, at
+ * the window's pause between the row's record and its push, and at the
+ * settle's pause after the push, finds the storage's rows' memtable, free
+ * space map, and tuple id table linked, and keeps the counter where the
+ * insert put it, so the row's tuple id is never handed out again.
+ */
+void
+test_txn_insert_tests_a_gathering_from_an_inserts_prepare_to_its_push_keeps_the_counter(void)
+{
+	static const uint64 counters[] = {1, 2, 2};
+	static const char *const names[] = {"before", "logged", "pushed"};
+	static const SimcStep before[] = {{"before", 6, UINT64_MAX}};
+	static const SimcStep logged[] = {{"logged", 6, UINT64_MAX}};
+	static const SimcStep pushed[] = {{"pushed", 6, UINT64_MAX}, {"inserter", 8, UINT64_MAX}};
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	SimcActor	inserter = {txn_insert_tests_gathering_inserter};
+	RepoRepo	repo;
+	ChunksErrorError failed;
+	SimcRun		run;
+	SimcReport	report;
+
+	if (!repo_Repo_create(io, 9312, HOST_PG_DEFAULT, &repo, &failed))
+		STD_RESULT_EXPECT_FAILED(1999, 81, "called `Result::unwrap()` on an `Err` value", &failed,
+								 chunks_error_Error_Debug_fmt);
+	repo_Repo_drop(&repo);
+	run = simc_Run_new(163);
+	simc_Run_actor(&run, "inserter", 8, inserter);
+	for (size_t k = 0; k < lengthof(counters); k++)
+	{
+		SimcActor	gatherer = {txn_insert_tests_gathering_gatherer, (void *) &counters[k]};
+
+		simc_Run_actor(&run, names[k], strlen(names[k]), gatherer);
+	}
+	simc_Run_until(&run, "inserter", 8, "doltgres-memtable-prepared");
+	simc_Run_script(&run, before, lengthof(before));
+	simc_Run_until(&run, "inserter", 8, "doltgres-insert-logged");
+	simc_Run_script(&run, logged, lengthof(logged));
+	simc_Run_until(&run, "inserter", 8, "doltgres-memtable-unpinned");
+	simc_Run_script(&run, pushed, lengthof(pushed));
+	report = simc_Run_finish(run);
+	txn_vacuum_tests_returned(&report, RUST_FILE, 2029, 67, 2030, 9);
+	simc_Report_drop(&report);
+	simc_TestIo_drop(&test_io);
+}
+
+/* txn_insert_tests_failed_is asserts at a line and column that an insert failed with the fork's internal error, and drops the error. */
+static void
+txn_insert_tests_failed_is(uint32 line, uint32 col, bool failed, HostError *error)
+{
+	bool		internal = failed && memcmp(host_Error_sqlstate(error), "XX000", 5) == 0;
+
+	if (failed)
+		host_Error_drop(error);
+	STD_ASSERT(line, col, internal, "failed.is_err_and(|error| error.sqlstate() == b\"XX000\")");
+}
+
+/*
+ * The leave case: an insert that leaves the fresh page and then fails before
+ * its row's record, a crash, and redo of the logged records on another
+ * storage leave every block's free space entry and the counter as the
+ * primary's, since the leave's record hands the page's counter offsets to the
+ * map and the failed turn logged nothing.
+ */
+void
+test_txn_insert_tests_an_insert_that_leaves_the_fresh_page_and_fails_redoes_as_the_primary(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	TreesStoreReader store;
+	TxnInsertRoom room = txn_insert_tests_room(3000);
+	TxnInsertInsert row;
+	HostError	error;
+	uint64		tid;
+	bool		failed;
+	txn_insert_tests_free_t expected;
+	StdVec		writes;
+
+	txn_insert_tests_repository(io, 9313, 2041, 87, 2042, 46, &repo, &reading);
+	held = txn_insert_tests_stated(io, &repo, &reading, txn_insert_tests_stored(9313), 2043, 106);
+	store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	for (uint64 n = 0; n < 2; n++)
+		txn_insert_tests_took(io, TREES_STORE_READER_NODE_STORE(&store), &held,
+							  txn_insert_tests_row(txn_insert_tests_stored(9313), n), 3000, NULL, NULL, 0,
+							  2047, 73);
+	simc_refuse_any_take(1);
+	row = txn_insert_tests_row(txn_insert_tests_stored(9313), 2);
+	failed = !txn_insert_tests_taken(io, TREES_STORE_READER_NODE_STORE(&store), &held, &row, &room, NULL, NULL, 0,
+									 &tid, &error);
+	simc_refuse_nothing();
+	txn_insert_tests_failed_is(2052, 9, failed, &error);
+	writes = txn_insert_tests_logged(9313);
+	STD_ASSERT_EQ_U64(2054, 9, txn_insert_tests_count(&writes, TXN_INSERT_TESTS_LOGGED_ROW), 2);
+	STD_ASSERT_EQ_U64(2055, 9, txn_insert_tests_count(&writes, TXN_INSERT_TESTS_LOGGED_LEFT), 1);
+	expected = txn_insert_tests_free_entries(io, host_shared_Held_record(&held));
+	STD_ASSERT_EQ_U64(2057, 9, expected.counter, 1 << 16 | 1);
+	txn_insert_tests_replayed(io, 9314, &writes, &expected, false, 2059, 9);
+	txn_insert_tests_ended(io, 2060, 35);
+	txn_insert_tests_free_drop(&expected);
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	simc_TestIo_drop(&test_io);
+}
+
+/* txn_insert_tests_mapped returns a TOAST relation's value map entries for the test's two value ids. */
+static void
+txn_insert_tests_mapped(HostIoIo *io, const HostSharedHeld *toast, txn_insert_tests_mapped_t mapped[2])
+{
+	for (size_t k = 0; k < lengthof(TXN_INSERT_TESTS_IDS); k++)
+		mapped[k] = txn_insert_tests_newest(io, host_shared_Held_record(toast), TXN_MEMTABLE_MAP_MAP_VALUES,
+											TXN_INSERT_TESTS_IDS[k], 2065, 79);
+}
+
+/*
+ * txn_insert_tests_valued returns an insert of a row with two out-of-line
+ * values whose references sit in an overflow chunk, so the row's own bytes
+ * hold only that chunk's address, with each value's map entry.
+ */
+static TxnInsertInsert
+txn_insert_tests_valued(uint32 database, TxnValuesEntry entries[2])
+{
+	static const char *const bytes[] = {"one", "two"};
+	static const uint64 lengths[] = {4000, 300000};
+	TxnInsertInsert valued = txn_insert_tests_row(txn_insert_tests_stored(database), 1);
+	ChunksAddressAddress overflow = chunks_address_Address_of((const uint8 *) "overflow", 8);
+	chunks_TupleU32Locator_t address = {.f0 = 0, .f1 = chunks_trailer_Locator_Default_default()};
+
+	std_vec_free_Checked(&valued.put.value, 1, 1);
+	std_slice_to_vec_Checked(&valued.put.value, overflow.f0, sizeof(overflow.f0), 1, 1);
+	std_vec_free_Checked(&valued.put.addresses, sizeof(chunks_TupleU32Locator_t), _Alignof(chunks_TupleU32Locator_t));
+	std_slice_to_vec_Checked(&valued.put.addresses, &address, 1, sizeof(chunks_TupleU32Locator_t),
+							 _Alignof(chunks_TupleU32Locator_t));
+	txn_insert_tests_values(&valued);
+	for (size_t k = 0; k < 2; k++)
+		entries[k] = txn_values_Entry_new(chunks_address_Address_of((const uint8 *) bytes[k], 3), lengths[k]);
+	return valued;
+}
+
+/* txn_insert_tests_valued_t is a storage's first four blocks' free space entries with its TOAST relation's entries of the test's two value ids. */
+typedef struct txn_insert_tests_valued_t
+{
+	txn_insert_tests_mapped_t entries[4];
+	txn_insert_tests_mapped_t values[2];
+} txn_insert_tests_valued_t;
+
+/* txn_insert_tests_valued_Debug_fmt is the Debug of a storage's entries with its value map's, the tuple of their two lists. */
+static bool
+txn_insert_tests_valued_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const txn_insert_tests_valued_t *valued = value;
+	StdVec		entries = {(void *) valued->entries, 4, 4};
+	StdVec		values = {(void *) valued->values, 2, 2};
+	StdTupleRef tuple = STD_TUPLE(2, STD_ITEM(&entries, txn_insert_tests_mappeds_Debug_fmt),
+								  STD_ITEM(&values, txn_insert_tests_mappeds_Debug_fmt));
+
+	return std_tuple_Debug_fmt(&tuple, f);
+}
+
+/* txn_insert_tests_valued_of returns a storage's first four blocks' entries with its TOAST relation's two value entries. */
+static txn_insert_tests_valued_t
+txn_insert_tests_valued_of(HostIoIo *io, const HostSharedHeld *held, const HostSharedHeld *toast)
+{
+	txn_insert_tests_free_t free = txn_insert_tests_free_entries(io, host_shared_Held_record(held));
+	txn_insert_tests_valued_t valued;
+
+	memcpy(valued.entries, free.entries, sizeof(valued.entries));
+	txn_insert_tests_mapped(io, toast, valued.values);
+	return valued;
+}
+
+/* txn_insert_tests_valued_drop drops a storage's entries and its value map's. */
+static void
+txn_insert_tests_valued_drop(txn_insert_tests_valued_t *valued)
+{
+	for (size_t k = 0; k < 4; k++)
+		txn_insert_tests_mapped_drop(&valued->entries[k]);
+	for (size_t k = 0; k < 2; k++)
+		txn_insert_tests_mapped_drop(&valued->values[k]);
+}
+
+/* txn_insert_tests_row_is asserts at a line and column that a tuple id table's row is key 1's. */
+static void
+txn_insert_tests_row_is(uint32 line, uint32 col, bool some, const StdVec *row)
+{
+	static const uint8 one[8] = {0, 0, 0, 0, 0, 0, 0, 1};
+	StdBytes	got = {some ? row->ptr : NULL, some ? row->len : 0};
+	StdBytes	want = {one, sizeof(one)};
+	StdOptionRef left = {some, {&got, std_bytes_Debug_fmt}};
+	StdOptionRef right = {true, {&want, std_bytes_Debug_fmt}};
+
+	STD_ASSERT_EQ(line, col, some && row->len == sizeof(one) && memcmp(row->ptr, one, sizeof(one)) == 0, &left,
+				  std_option_Debug_fmt, &right, std_option_Debug_fmt);
+}
+
+/*
+ * The overflow chunk case: a row whose out-of-line values' references sit in
+ * an overflow chunk, so its own bytes name none, redone after a crash from
+ * its record's field 24 alone, leaves its tuple id, its free space entries,
+ * and its TOAST relation's value map entries as the primary's.
+ */
+void
+test_txn_insert_tests_a_row_whose_value_references_sit_in_an_overflow_chunk_redoes_its_map_entries(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	HostSharedHeld toast;
+	TreesStoreReader store;
+	TxnValuesEntry entries[2];
+	TxnInsertInsert row;
+	uint64		tid;
+	HostRow		tuple;
+	txn_insert_tests_valued_t expected;
+	txn_insert_tests_valued_t got;
+	txn_insert_tests_replica_t replica;
+	StdVec		writes;
+	StdVec		tupled;
+	HostError	error;
+	bool		some;
+	bool		eq = true;
+
+	txn_insert_tests_repository(io, 9315, 2088, 87, 2089, 46, &repo, &reading);
+	held = txn_insert_tests_stated(io, &repo, &reading, txn_insert_tests_stored(9315), 2090, 106);
+	toast = txn_insert_tests_toasted(io, &repo, &reading, 9315, 2099, 10);
+	store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	row = txn_insert_tests_valued(9315, entries);
+	tid = txn_insert_tests_took(io, TREES_STORE_READER_NODE_STORE(&store), &held, row, 60, &toast, entries, 2,
+								2103, 82);
+	expected = txn_insert_tests_valued_of(io, &held, &toast);
+	STD_ASSERT(2105, 9, expected.values[0].some && expected.values[0].entry.has_value &&
+			   expected.values[1].some && expected.values[1].entry.has_value,
+			   "expected.1.iter().all(|entry| matches!(entry, Some(Some(_))))");
+	writes = txn_insert_tests_logged(9315);
+	replica = txn_insert_tests_replica(io, 9316, &writes);
+	if (!replica.has_toast)
+		STD_OPTION_UNWRAP_FAILED(2107, 47);
+	got = txn_insert_tests_valued_of(io, &replica.held, &replica.toast);
+	for (size_t k = 0; eq && k < 4; k++)
+		eq = txn_insert_tests_mapped_eq(&got.entries[k], &expected.entries[k]);
+	for (size_t k = 0; eq && k < 2; k++)
+		eq = txn_insert_tests_mapped_eq(&got.values[k], &expected.values[k]);
+	STD_ASSERT_EQ(2108, 9, eq, &got, txn_insert_tests_valued_Debug_fmt, &expected,
+				  txn_insert_tests_valued_Debug_fmt);
+	tuple.f0 = tid;
+	if (!txn_memtable_tuples_get(io, host_shared_Held_record(&replica.held), tuple, &some, &tupled, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(2109, 70, &error);
+	txn_insert_tests_row_is(2109, 9, some, &tupled);
+	if (some)
+		std_vec_free_Checked(&tupled, 1, 1);
+	txn_insert_tests_ended(io, 2110, 35);
+	txn_insert_tests_valued_drop(&got);
+	txn_insert_tests_replica_drop(&replica);
+	txn_insert_tests_valued_drop(&expected);
+	host_shared_Held_drop(&toast);
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	simc_TestIo_drop(&test_io);
+}
+
+/* txn_insert_tests_unpacked is written's answer for a chunk's packing: no chunk is in a pack yet. */
+static bool
+txn_insert_tests_unpacked(void *captures, HostIoIo *io, const ChunksAddressAddress *address, bool *result,
+						  HostError *error)
+{
+	*result = false;
+	return true;
+}
+
+/*
+ * txn_insert_tests_written writes a row's two out-of-line values' chunks
+ * into its repository's working state, logged, under the row's writer, as the
+ * fork's insert entry does before the row's window, and returns their working
+ * state.
+ */
+static HostSharedHeld
+txn_insert_tests_written(HostIoIo *io, uint32 database, TxnMemtableVersionWriter writer,
+						 const TxnValuesEntry entries[2])
+{
+	static const char *const bytes[] = {"one", "two"};
+	HostSharedHeld deltas;
+	HostError	error;
+	StdVec		chunks;
+	bool		named = true;
+
+	if (!txn_memtable_branch_deltas(io, database, HOST_PG_DEFAULT, &deltas, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(2117, 73, &error);
+	std_vec_with_capacity_Checked(&chunks, 2, sizeof(txn_TupleAddressVecU8_t), _Alignof(txn_TupleAddressVecU8_t));
+	for (size_t k = 0; k < 2; k++)
+	{
+		txn_TupleAddressVecU8_t chunk = {.f0 = chunks_address_Address_of((const uint8 *) bytes[k], 3)};
+
+		std_slice_to_vec_Checked(&chunk.f1, (const uint8 *) bytes[k], 3, 1, 1);
+		std_vec_push_Checked(&chunks, &chunk, sizeof(chunk), _Alignof(txn_TupleAddressVecU8_t));
+	}
+	for (size_t k = 0; named && k < 2; k++)
+		named = memcmp(STD_VEC_AT(&chunks, txn_TupleAddressVecU8_t, k).f0.f0, entries[k].address.f0,
+					   sizeof(entries[k].address.f0)) == 0;
+	STD_ASSERT(2119, 9, named, "chunks.iter().zip(entries).all(|((address, _), entry)| *address == entry.address)");
+	if (!txn_blobs_written(io, &deltas, database, writer, &chunks, true, txn_insert_tests_unpacked, NULL, NULL,
+						   &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(2120, 91, &error);
+	return deltas;
+}
+
+/* txn_insert_tests_mappeds_is asserts at a line and column, with a message or none, that two value map entries are those wanted. */
+static void
+txn_insert_tests_mappeds_is(uint32 line, uint32 col, const txn_insert_tests_mapped_t got[2],
+							const txn_insert_tests_mapped_t want[2], const StdFmtArguments *message)
+{
+	StdVec		left = {(void *) got, 2, 2};
+	StdVec		right = {(void *) want, 2, 2};
+
+	if (!txn_insert_tests_mapped_eq(&got[0], &want[0]) || !txn_insert_tests_mapped_eq(&got[1], &want[1]))
+		std_assert_failed(RUST_FILE, line, col, "==", &left, txn_insert_tests_mappeds_Debug_fmt, &right,
+						  txn_insert_tests_mappeds_Debug_fmt, message);
+}
+
+/* txn_insert_tests_durable reports whether a chunk of a repository's working state is durable, unwrapped at a line and column. */
+static bool
+txn_insert_tests_durable(HostIoIo *io, const HostSharedHeld *deltas, const TxnValuesEntry *entry, uint32 line,
+						 uint32 col)
+{
+	HostError	error;
+	bool		durable;
+
+	if (!txn_memtable_branch_durable(io, host_shared_Held_record(deltas), entry->address.f0,
+									 sizeof(entry->address.f0), &durable, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(line, col, &error);
+	return durable;
+}
+
+/*
+ * Rule (C)'s first case: an insert with two out-of-line values that fails
+ * after its chunks' records and before its window leaves no value map entry
+ * and logs no row change, and its chunks stay in the working state
+ * unreferenced.
+ */
+void
+test_txn_insert_tests_an_insert_that_fails_after_its_chunks_maps_no_value(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	HostSharedHeld toast;
+	HostSharedHeld deltas;
+	TreesStoreReader store;
+	TxnValuesEntry entries[2];
+	TxnInsertInsert row;
+	TxnInsertRoom room = txn_insert_tests_room(60);
+	txn_insert_tests_mapped_t mapped[2];
+	txn_insert_tests_mapped_t none[2] = {0};
+	HostError	error;
+	uint64		tid;
+	bool		failed;
+	StdVec		writes;
+
+	txn_insert_tests_repository(io, 9317, 2130, 87, 2131, 46, &repo, &reading);
+	held = txn_insert_tests_stated(io, &repo, &reading, txn_insert_tests_stored(9317), 2132, 106);
+	toast = txn_insert_tests_toasted(io, &repo, &reading, 9317, 2141, 10);
+	store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	row = txn_insert_tests_valued(9317, entries);
+	deltas = txn_insert_tests_written(io, 9317, row.writer, entries);
+	simc_refuse_any_take(0);
+	failed = !txn_insert_tests_taken(io, TREES_STORE_READER_NODE_STORE(&store), &held, &row, &room, &toast, entries,
+									 2, &tid, &error);
+	simc_refuse_nothing();
+	txn_insert_tests_failed_is(2149, 9, failed, &error);
+	txn_insert_tests_mapped(io, &toast, mapped);
+	txn_insert_tests_mappeds_is(2150, 9, mapped, none, NULL);
+	writes = txn_insert_tests_logged(9317);
+	STD_ASSERT_EQ_U64(2152, 9, txn_insert_tests_count(&writes, TXN_INSERT_TESTS_LOGGED_CHUNK), 2);
+	STD_ASSERT(2153, 9, txn_insert_tests_count(&writes, TXN_INSERT_TESTS_LOGGED_ROW) == 0,
+			   "!writes.iter().any(|write| matches!(write, Logged::Row(..)))");
+	for (size_t k = 0; k < 2; k++)
+		STD_ASSERT(2155, 13, txn_insert_tests_durable(io, &deltas, &entries[k], 2155, 76),
+				   "branch::durable(io, deltas.record(), &entry.address.0).unwrap()");
+	txn_insert_tests_ended(io, 2157, 35);
+	txn_insert_tests_logged_free(&writes);
+	for (size_t k = 0; k < 2; k++)
+		txn_insert_tests_mapped_drop(&mapped[k]);
+	host_shared_Held_drop(&deltas);
+	host_shared_Held_drop(&toast);
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	simc_TestIo_drop(&test_io);
+}
+
+/* txn_insert_tests_from_t is what a replica redone from a point holds: its row by the tuple id, and its two value map entries. */
+typedef struct txn_insert_tests_from_t
+{
+	bool		some;
+	StdVec		row;
+	txn_insert_tests_mapped_t values[2];
+} txn_insert_tests_from_t;
+
+/* txn_insert_tests_from_Debug_fmt is the Debug of what a replica holds, the tuple (row, values). */
+static bool
+txn_insert_tests_from_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const txn_insert_tests_from_t *from = value;
+	StdBytes	row = {from->row.ptr, from->row.len};
+	StdOptionRef some = {from->some, {&row, std_bytes_Debug_fmt}};
+	StdVec		values = {(void *) from->values, 2, 2};
+	StdTupleRef tuple = STD_TUPLE(2, STD_ITEM(&some, std_option_Debug_fmt),
+								  STD_ITEM(&values, txn_insert_tests_mappeds_Debug_fmt));
+
+	return std_tuple_Debug_fmt(&tuple, f);
+}
+
+/* txn_insert_tests_from_eq reports whether what two replicas hold is equal. */
+static bool
+txn_insert_tests_from_eq(const txn_insert_tests_from_t *a, const txn_insert_tests_from_t *b)
+{
+	return a->some == b->some && (!a->some || trees_store_VecU8_PartialEq_eq(&a->row, &b->row)) &&
+		txn_insert_tests_mapped_eq(&a->values[0], &b->values[0]) &&
+		txn_insert_tests_mapped_eq(&a->values[1], &b->values[1]);
+}
+
+/*
+ * Rule (C)'s second case, as far as the logged records show it: redo started
+ * at each R across an insert with two out-of-line values, before its chunks'
+ * records, between them and its row change, and after the row change, gives
+ * the row with every value map entry or neither, since field 24 makes the
+ * row and its entries one record.
+ */
+void
+test_txn_insert_tests_redo_from_any_point_gives_a_row_with_all_its_map_entries_or_none(void)
+{
+	static const struct
+	{
+		uint32		database;
+		size_t		from;
+	}			froms[] = {{9319, 0}, {9320, 2}, {9321, 3}};
+	static const uint8 one[8] = {0, 0, 0, 0, 0, 0, 0, 1};
+	static const StdFmtPiece pieces[] = {STD_FMT_LIT("from "), STD_FMT_ARG(0)};
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	HostSharedHeld toast;
+	HostSharedHeld deltas;
+	TreesStoreReader store;
+	TxnValuesEntry entries[2];
+	TxnInsertInsert row;
+	txn_insert_tests_mapped_t primary[2];
+	uint64		tid;
+	StdVec		writes;
+
+	txn_insert_tests_repository(io, 9318, 2168, 87, 2169, 46, &repo, &reading);
+	held = txn_insert_tests_stated(io, &repo, &reading, txn_insert_tests_stored(9318), 2170, 106);
+	toast = txn_insert_tests_toasted(io, &repo, &reading, 9318, 2179, 10);
+	store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	row = txn_insert_tests_valued(9318, entries);
+	deltas = txn_insert_tests_written(io, 9318, row.writer, entries);
+	host_shared_Held_drop(&deltas);
+	tid = txn_insert_tests_took(io, TREES_STORE_READER_NODE_STORE(&store), &held, row, 60, &toast, entries, 2,
+								2184, 82);
+	txn_insert_tests_mapped(io, &toast, primary);
+	writes = txn_insert_tests_logged(9318);
+	STD_ASSERT_EQ_U64(2186, 9, writes.len, 3);
+	txn_insert_tests_logged_free(&writes);
+	for (size_t k = 0; k < lengthof(froms); k++)
+	{
+		StdFmtArg	args[] = {{&froms[k].from, std_usize_Display_fmt}};
+		StdFmtArguments message = {pieces, lengthof(pieces), args};
+		txn_insert_tests_replica_t replica;
+		txn_insert_tests_from_t got = {0};
+		txn_insert_tests_from_t want = {0};
+		HostRow		tuple = {tid};
+		HostError	error;
+
+		writes = txn_insert_tests_logged(9318);
+		for (size_t w = 0; w < froms[k].from && w < writes.len; w++)
+			txn_insert_tests_logged_drop(&STD_VEC_AT(&writes, txn_insert_tests_logged_t, w));
+		{
+			size_t		skipped = Min(froms[k].from, writes.len);
+
+			memmove(writes.ptr, &STD_VEC_AT(&writes, txn_insert_tests_logged_t, skipped),
+					(writes.len - skipped) * sizeof(txn_insert_tests_logged_t));
+			writes.len -= skipped;
+		}
+		replica = txn_insert_tests_replica(io, froms[k].database, &writes);
+		if (!txn_memtable_tuples_get(io, host_shared_Held_record(&replica.held), tuple, &got.some, &got.row, &error))
+			TXN_INSERT_TESTS_UNWRAP_FAILED(2190, 73, &error);
+		if (replica.has_toast)
+			txn_insert_tests_mapped(io, &replica.toast, got.values);
+		if (froms[k].from != 3)
+		{
+			want.some = true;
+			want.row = (StdVec)
+			{
+				(void *) one, sizeof(one), sizeof(one)
+			};
+			want.values[0] = primary[0];
+			want.values[1] = primary[1];
+		}
+		if (!txn_insert_tests_from_eq(&got, &want) && froms[k].from == 3)
+			std_assert_failed(RUST_FILE, 2196, 22, "==", &got, txn_insert_tests_from_Debug_fmt, &want,
+							  txn_insert_tests_from_Debug_fmt, &message);
+		if (!txn_insert_tests_from_eq(&got, &want))
+			std_assert_failed(RUST_FILE, 2197, 22, "==", &got, txn_insert_tests_from_Debug_fmt, &want,
+							  txn_insert_tests_from_Debug_fmt, &message);
+		for (size_t e = 0; e < 2; e++)
+		{
+			bool		durable = txn_insert_tests_durable(io, &replica.deltas, &entries[e], 2200, 92);
+			bool		wanted = froms[k].from == 0;
+
+			STD_ASSERT_EQ(2200, 17, durable == wanted, &durable, std_bool_Debug_fmt, &wanted,
+						  std_bool_Debug_fmt);
+		}
+		for (size_t e = 0; e < 2; e++)
+			txn_insert_tests_mapped_drop(&got.values[e]);
+		if (got.some)
+			std_vec_free_Checked(&got.row, 1, 1);
+		txn_insert_tests_replica_drop(&replica);
+	}
+	txn_insert_tests_ended(io, 2203, 35);
+	for (size_t k = 0; k < 2; k++)
+		txn_insert_tests_mapped_drop(&primary[k]);
+	host_shared_Held_drop(&toast);
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	simc_TestIo_drop(&test_io);
+}
+
+/* txn_insert_tests_counts reads the map counts of the test's two value ids in a TOAST relation, unwrapped at the lines and columns a case gives. */
+static void
+txn_insert_tests_counts(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *toast, uint32 error_line,
+						uint32 error_col, uint32 none_line, uint32 none_col, uint64 counts[2])
+{
+	for (size_t k = 0; k < 2; k++)
+	{
+		TxnValuesEntry entry;
+		HostError	error;
+		bool		has;
+
+		if (!txn_values_entry(io, store, toast, TXN_INSERT_TESTS_IDS[k], &has, &entry, &error))
+			TXN_INSERT_TESTS_UNWRAP_FAILED(error_line, error_col, &error);
+		if (!has)
+			STD_OPTION_UNWRAP_FAILED(none_line, none_col);
+		counts[k] = entry.count;
+	}
+}
+
+/*
+ * (4b)'s section 5: an update that keeps a row's two out-of-line values,
+ * field 28, redone adds one to each kept value's map entry with the record's
+ * LSN, and redone again, which the map holds by the id and that LSN, adds
+ * nothing.
+ */
+void
+test_txn_insert_tests_a_kept_values_count_add_is_redone_once(void)
+{
+	static const uint64 once[] = {1, 1};
+	static const uint64 twice[] = {2, 2};
+	static const size_t kept[] = {0, 1};
+	static const uint8 one[8] = {0, 0, 0, 0, 0, 0, 0, 1};
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	HostSharedHeld toast;
+	HostSharedHeld deltas;
+	TreesStoreReader store;
+	TxnValuesEntry entries[2];
+	TxnInsertInsert row;
+	bool		has_relation;
+	TxnRecordToast relation;
+	uint64		tid;
+	TxnRecordRowChange update = {.writer = {.xid = 42}, .table = 16385, .heap_bytes = 60};
+	ChunksAddressAddress overflow = chunks_address_Address_of((const uint8 *) "overflow", 8);
+	chunks_TupleU32Locator_t address = {.f0 = 0, .f1 = chunks_trailer_Locator_Default_default()};
+	uint64		counts[2];
+	HostError	error;
+
+	txn_insert_tests_repository(io, 9323, 2212, 87, 2213, 46, &repo, &reading);
+	held = txn_insert_tests_stated(io, &repo, &reading, txn_insert_tests_stored(9323), 2214, 106);
+	toast = txn_insert_tests_toasted(io, &repo, &reading, 9323, 2223, 10);
+	store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	row = txn_insert_tests_valued(9323, entries);
+	deltas = txn_insert_tests_written(io, 9323, row.writer, entries);
+	host_shared_Held_drop(&deltas);
+	has_relation = row.has_toast;
+	relation = row.toast;
+	tid = txn_insert_tests_took(io, TREES_STORE_READER_NODE_STORE(&store), &held, row, 60, &toast, entries, 2,
+								2229, 82);
+	update.storage = txn_insert_tests_stored(9323);
+	std_slice_to_vec_Checked(&update.key, one, sizeof(one), 1, 1);
+	update.op.tag = TXN_MEMTABLE_OP_PUT;
+	std_slice_to_vec_Checked(&update.op.u.put.value, overflow.f0, sizeof(overflow.f0), 1, 1);
+	std_slice_to_vec_Checked(&update.op.u.put.addresses, &address, 1, sizeof(chunks_TupleU32Locator_t),
+							 _Alignof(chunks_TupleU32Locator_t));
+	std_slice_to_vec_Checked(&update.op.u.put.values, TXN_INSERT_TESTS_IDS, 2, sizeof(uint32), _Alignof(uint32));
+	update.op.u.put.tuple.f0 = tid + 1;
+	update.op.u.put.heap_bytes = 60;
+	update.has_toast = has_relation;
+	update.toast = relation;
+	std_vec_new(&update.blobs, sizeof(chunks_TupleAddressU64_t), _Alignof(chunks_TupleAddressU64_t));
+	std_slice_to_vec_Checked(&update.kept, kept, lengthof(kept), sizeof(size_t), _Alignof(size_t));
+	txn_insert_tests_counts(io, TREES_STORE_READER_NODE_STORE(&store), &toast, 2254, 82, 2254, 91, counts);
+	txn_insert_tests_u64s_is(2256, 9, counts, 2, once, 2);
+	if (!txn_insert_redo(io, TREES_STORE_READER_NODE_STORE(&store), &held, &update, 0x100000, &TXN_INSERT_TESTS_PAGE,
+						 &toast, NULL, 0, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(2257, 81, &error);
+	txn_insert_tests_counts(io, TREES_STORE_READER_NODE_STORE(&store), &toast, 2254, 82, 2254, 91, counts);
+	txn_insert_tests_u64s_is(2258, 9, counts, 2, twice, 2);
+	if (!txn_insert_redo(io, TREES_STORE_READER_NODE_STORE(&store), &held, &update, 0x100000, &TXN_INSERT_TESTS_PAGE,
+						 &toast, NULL, 0, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(2259, 81, &error);
+	txn_insert_tests_counts(io, TREES_STORE_READER_NODE_STORE(&store), &toast, 2254, 82, 2254, 91, counts);
+	txn_insert_tests_u64s_is(2260, 9, counts, 2, twice, 2);
+	txn_insert_tests_ended(io, 2261, 35);
+	txn_record_RowChange_drop(&update);
+	host_shared_Held_drop(&toast);
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	simc_TestIo_drop(&test_io);
+}
+
+/* txn_insert_tests_left_t is the load case's captures: the bytes of the free space entry a leave handed to the map. */
+typedef struct txn_insert_tests_left_t
+{
+	StdVec		left;
+} txn_insert_tests_left_t;
+
+/* txn_insert_tests_left_step is the load case's take's step: it puts the left page's entry. */
+static TxnMemtableMapStep
+txn_insert_tests_left_step(void *captures, bool has_current, const uint8 *current, size_t current_len, StdVec *out)
+{
+	const txn_insert_tests_left_t *c = captures;
+
+	std_vec_extend_from_slice_Checked(out, c->left.ptr, c->left.len, 1, 1);
+	return TXN_MEMTABLE_MAP_STEP_PUT;
+}
+
+/* txn_insert_tests_left_then is the load case's take's then, which does nothing. */
+static void
+txn_insert_tests_left_then(void *captures)
+{
+}
+
+/* txn_insert_tests_left_inside is the load case's prepare's closure: block 0's take of the left page's entry, with no transaction. */
+static bool
+txn_insert_tests_left_inside(void *captures, HostIoIo *io, TxnMemtableTablePreparedState *prepared,
+							 TxnMemtableMapTaken *result, HostError *error)
+{
+	TxnStatusRoomed unroomed = {0};
+
+	return txn_memtable_map_finish_Unit(HOST_IO_IO_TAKES_SHORT(io), prepared, 0, TXN_MEMTABLE_VERSION_NO_TRANSACTION,
+										false, unroomed,
+										false, 0, false, NULL, 0, txn_insert_tests_left_step, captures, NULL,
+										txn_insert_tests_left_then, NULL, NULL, result, error);
+}
+
+/* txn_insert_tests_loaded_t is the load case's state: the counter and the first four blocks' free space entries. */
+typedef txn_insert_tests_free_t txn_insert_tests_loaded_t;
+
+/* txn_insert_tests_loaded_Debug_fmt is the load case's state's Debug, the tuple (counter, entries). */
+static bool
+txn_insert_tests_loaded_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const txn_insert_tests_free_t *loaded = value;
+	StdVec		entries = {(void *) loaded->entries, lengthof(loaded->entries), lengthof(loaded->entries)};
+	StdTupleRef tuple = STD_TUPLE(2, STD_ITEM(&loaded->counter, std_u64_Debug_fmt),
+								  STD_ITEM(&entries, txn_insert_tests_mappeds_Debug_fmt));
+
+	return std_tuple_Debug_fmt(&tuple, f);
+}
+
+/* txn_insert_tests_load runs the runs' loader on a storage up to a tuple id, unwrapped at a line and column. */
+static void
+txn_insert_tests_load(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held, uint64 to, uint32 line,
+					  uint32 col)
+{
+	HostError	error;
+
+	if (!txn_insert_loaded(io, store, held, &TXN_INSERT_TESTS_PAGE, to, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(line, col, &error);
+}
+
+/*
+ * The checkpoint runs text's L2: a restart whose loaded runs hold rows up to
+ * (1,5), and block 0's free space entry from a page a leave handed to the
+ * map, offsets 3 on, moves the counter to (1,6), the tuple id its loader
+ * gives, and leaves the entry as loaded; a second load changes nothing; an
+ * unrelated transaction's abort leaves the move and the entry; and the next
+ * inserts take (0,3) and (0,4), never a loaded row's tuple id.
+ */
+void
+test_txn_insert_tests_a_load_moves_the_counter_past_every_loaded_tid_and_left_page(void)
+{
+	static const uint64 want[] = {3, 4};
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	TreesStoreReader store;
+	txn_insert_tests_left_t c;
+	uint16		offsets[289];
+	TxnFreeSpaceFree free;
+	TxnMemtableMapTake take;
+	TxnMemtableMapTaken taken;
+	txn_insert_tests_free_t expected;
+	txn_insert_tests_free_t again;
+	HostXid		unrelated;
+	HostError	error;
+	uint64		tids[2];
+	bool		eq;
+
+	txn_insert_tests_repository(io, 9322, 2273, 87, 2274, 46, &repo, &reading);
+	held = txn_insert_tests_stated(io, &repo, &reading, txn_insert_tests_stored(9322), 2275, 106);
+	store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	for (uint16 offset = 3; offset <= 291; offset++)
+		offsets[offset - 3] = offset;
+	free = txn_free_space_Free_new(8168 - 6000, offsets, lengthof(offsets), 291);
+	std_vec_new(&c.left, 1, 1);
+	txn_free_space_Free_encode_into(&free, &c.left);
+	take.state = host_shared_Held_record(&held);
+	take.map = TXN_MEMTABLE_MAP_MAP_FREE;
+	take.key = 0;
+	take.most = txn_free_space_most_len(291);
+	if (!txn_memtable_map_prepare_Taken(io, &take, 1, txn_insert_tests_left_inside, &c, NULL, &taken, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(2287, 10, &error);
+	txn_insert_tests_load(io, TREES_STORE_READER_NODE_STORE(&store), &held, 1 << 16 | 6, 2290, 55);
+	expected = txn_insert_tests_free_entries(io, host_shared_Held_record(&held));
+	STD_ASSERT_EQ_U64(2292, 9, expected.counter, 1 << 16 | 6);
+	{
+		txn_insert_tests_mapped_t left = {.some = true, .entry = {.has_value = true, .value = c.left}};
+
+		STD_ASSERT_EQ(2293, 9, txn_insert_tests_mapped_eq(&expected.entries[0], &left), &expected.entries[0],
+					  txn_insert_tests_mapped_Debug_fmt, &left, txn_insert_tests_mapped_Debug_fmt);
+	}
+	txn_insert_tests_load(io, TREES_STORE_READER_NODE_STORE(&store), &held, 1 << 16 | 6, 2294, 55);
+	unrelated = simc_begin();
+	simc_abort(unrelated);
+	again = txn_insert_tests_free_entries(io, host_shared_Held_record(&held));
+	eq = again.counter == expected.counter;
+	for (size_t k = 0; eq && k < lengthof(again.entries); k++)
+		eq = txn_insert_tests_mapped_eq(&again.entries[k], &expected.entries[k]);
+	STD_ASSERT_EQ(2297, 9, eq, &again, txn_insert_tests_loaded_Debug_fmt, &expected,
+				  txn_insert_tests_loaded_Debug_fmt);
+	for (uint64 n = 10; n < 12; n++)
+		tids[n - 10] = txn_insert_tests_took(io, TREES_STORE_READER_NODE_STORE(&store), &held,
+											 txn_insert_tests_row(txn_insert_tests_stored(9322), n), 28, NULL, NULL, 0,
+											 2300, 90);
+	txn_insert_tests_u64s_is(2301, 9, tids, 2, want, 2);
+	txn_insert_tests_ended(io, 2302, 35);
+	txn_insert_tests_free_drop(&again);
+	txn_insert_tests_free_drop(&expected);
+	std_vec_free_Checked(&c.left, 1, 1);
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	simc_TestIo_drop(&test_io);
+}
+
+/* txn_insert_tests_ours returns the new cid records the simulation's WAL took for database 9324's storages, in their order. */
+static StdVec
+txn_insert_tests_ours(void)
+{
+	StdVec		cids = simc_new_cids();
+	StdVec		ours;
+
+	std_vec_new(&ours, sizeof(simc_TupleStorageRowNewCidLsn_t), _Alignof(simc_TupleStorageRowNewCidLsn_t));
+	for (size_t k = 0; k < cids.len; k++)
+	{
+		const simc_TupleStorageRowNewCidLsn_t *cid = &STD_VEC_AT(&cids, simc_TupleStorageRowNewCidLsn_t, k);
+
+		if (cid->f0.database == 9324)
+			std_vec_push_Checked(&ours, cid, sizeof(*cid), _Alignof(simc_TupleStorageRowNewCidLsn_t));
+	}
+	std_vec_free_Checked(&cids, sizeof(simc_TupleStorageRowNewCidLsn_t), _Alignof(simc_TupleStorageRowNewCidLsn_t));
+	return ours;
+}
+
+/* txn_insert_tests_own returns the end of the newest row change database 9324's storages logged, if any. */
+static bool
+txn_insert_tests_own(HostLsn *end)
+{
+	StdVec		writes = txn_insert_tests_logged(9324);
+	bool		found = false;
+
+	for (size_t k = writes.len; !found && k > 0; k--)
+	{
+		const txn_insert_tests_logged_t *write = &STD_VEC_AT(&writes, txn_insert_tests_logged_t, k - 1);
+
+		if (write->tag == TXN_INSERT_TESTS_LOGGED_ROW)
+		{
+			*end = write->end;
+			found = true;
+		}
+	}
+	txn_insert_tests_logged_free(&writes);
+	return found;
+}
+
+/*
+ * CommPF 5's NEW_CID ruling: a logged insert into a relation logical
+ * decoding reads logs heap's record of its row's command before its own
+ * record, with the row's tuple id and the inserting command, as heap_insert
+ * does; one into any other relation, or an unlogged one, logs none.
+ */
+void
+test_txn_insert_tests_an_insert_logical_decoding_reads_logs_heaps_record_of_its_command(void)
+{
+	static const struct
+	{
+		bool		logged;
+		bool		decoded;
+	}			cases[] = {{true, false}, {false, true}, {true, true}};
+	static const StdFmtPiece pieces[] = {STD_FMT_LIT("logged "), STD_FMT_ARG(0), STD_FMT_LIT(", decoded "),
+	STD_FMT_ARG(1)};
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	TreesStoreReader store;
+
+	txn_insert_tests_repository(io, 9324, 2312, 87, 2313, 46, &repo, &reading);
+	held = txn_insert_tests_stated(io, &repo, &reading, txn_insert_tests_stored(9324), 2314, 106);
+	store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	for (size_t n = 0; n < lengthof(cases); n++)
+	{
+		bool		logged = cases[n].logged;
+		bool		decoded = cases[n].decoded;
+		TxnInsertInsert inserted = txn_insert_tests_row(txn_insert_tests_stored(9324), n);
+		uint64		tid;
+		StdVec		cids;
+
+		inserted.logged = logged;
+		inserted.decoded = decoded;
+		inserted.writer.command = 5;
+		tid = txn_insert_tests_took(io, TREES_STORE_READER_NODE_STORE(&store), &held, inserted, 28, NULL, NULL, 0,
+									2328, 71);
+		cids = txn_insert_tests_ours();
+		if (cids.len == 1 && logged && decoded)
+		{
+			const simc_TupleStorageRowNewCidLsn_t *cid = &STD_VEC_AT(&cids, simc_TupleStorageRowNewCidLsn_t, 0);
+			HostStorage storage = txn_insert_tests_stored(9324);
+			HostRow		row = {tid};
+			HostNewCid	want = {.has_cmin = true, .cmin = {5}};
+			StdTupleRef got = STD_TUPLE(3, STD_ITEM(&cid->f0, host_Storage_Debug_fmt),
+										STD_ITEM(&cid->f1, host_Row_Debug_fmt),
+										STD_ITEM(&cid->f2, host_NewCid_Debug_fmt));
+			StdTupleRef wanted = STD_TUPLE(3, STD_ITEM(&storage, host_Storage_Debug_fmt),
+										   STD_ITEM(&row, host_Row_Debug_fmt),
+										   STD_ITEM(&want, host_NewCid_Debug_fmt));
+			HostLsn		own;
+
+			STD_ASSERT_EQ(2333, 21, host_Storage_PartialEq_eq(&cid->f0, &storage) && cid->f1.f0 == tid &&
+						  cid->f2.has_cmin && cid->f2.cmin.f0 == 5 && !cid->f2.has_cmax && !cid->f2.has_combo,
+						  &got, std_tuple_Debug_fmt, &wanted, std_tuple_Debug_fmt);
+			STD_ASSERT(2334, 21, txn_insert_tests_own(&own) && cid->f3 < own,
+					   "own().is_some_and(|own| end < own)");
+		}
+		else if (!(cids.len == 0 && !(logged && decoded)))
+		{
+			StdFmtArg	args[] = {{&logged, std_bool_Display_fmt}, {&decoded, std_bool_Display_fmt}};
+			StdFmtArguments message = {pieces, lengthof(pieces), args};
+
+			std_panic_fmt(RUST_FILE, 2336, 22, &message);
+		}
+		std_vec_free_Checked(&cids, sizeof(simc_TupleStorageRowNewCidLsn_t),
+							 _Alignof(simc_TupleStorageRowNewCidLsn_t));
+	}
+	txn_insert_tests_ended(io, 2339, 35);
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	simc_TestIo_drop(&test_io);
+}
+
+/* txn_insert_tests_chain_t is a key of a storage's rows with its count of versions, as a walk hands them out. */
+typedef struct txn_insert_tests_chain_t
+{
+	StdVec		key;
+	size_t		versions;
+} txn_insert_tests_chain_t;
+
+/* txn_insert_tests_chains_each is chains' step: a key and its count of versions pushed onto the list. */
+static bool
+txn_insert_tests_chains_each(void *captures, HostIoIo *io, const uint8 *key, size_t key_len, const StdVec *values,
+							 size_t values_len, HostError *error)
+{
+	txn_insert_tests_chain_t chain = {.versions = values_len};
+
+	std_slice_to_vec_Checked(&chain.key, key, key_len, 1, 1);
+	std_vec_push_Checked(captures, &chain, sizeof(chain), _Alignof(txn_insert_tests_chain_t));
+	return true;
+}
+
+/* txn_insert_tests_chains returns each key of a storage's rows with its count of versions, as a walk hands them out. */
+static StdVec
+txn_insert_tests_chains(HostIoIo *io, HostSharedRecord record)
+{
+	StdVec		chains;
+	HostError	error;
+
+	std_vec_new(&chains, sizeof(txn_insert_tests_chain_t), _Alignof(txn_insert_tests_chain_t));
+	if (!txn_memtable_table_walked(&TXN_MEMTABLE_TABLE_ROWS_TREE_OPS, io, record, txn_insert_tests_chains_each,
+								   &chains, NULL, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(2349, 56, &error);
+	return chains;
+}
+
+/* txn_insert_tests_chains_free frees a list of a storage's keys with their counts. */
+static void
+txn_insert_tests_chains_free(StdVec *chains)
+{
+	for (size_t k = 0; k < chains->len; k++)
+		std_vec_free_Checked(&STD_VEC_AT(chains, txn_insert_tests_chain_t, k).key, 1, 1);
+	std_vec_free_Checked(chains, sizeof(txn_insert_tests_chain_t), _Alignof(txn_insert_tests_chain_t));
+}
+
+/* txn_insert_tests_chain_Debug_fmt is a key and its count's Debug, the tuple (key, count). */
+static bool
+txn_insert_tests_chain_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const txn_insert_tests_chain_t *chain = value;
+	StdBytes	key = {chain->key.ptr, chain->key.len};
+	StdTupleRef tuple = STD_TUPLE(2, STD_ITEM(&key, std_bytes_Debug_fmt),
+								  STD_ITEM(&chain->versions, std_usize_Debug_fmt));
+
+	return std_tuple_Debug_fmt(&tuple, f);
+}
+
+/* txn_insert_tests_chains_Debug_fmt is a Vec<(Vec<u8>, usize)>'s Debug. */
+static bool
+txn_insert_tests_chains_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const StdVec *chains = value;
+	StdDebugList list = std_fmt_debug_list(f);
+
+	for (size_t k = 0; k < chains->len; k++)
+		std_DebugList_entry(&list, &STD_VEC_AT(chains, txn_insert_tests_chain_t, k), txn_insert_tests_chain_Debug_fmt);
+	return std_DebugList_finish(&list);
+}
+
+/* txn_insert_tests_chains_eq reports whether two lists of a storage's keys with their counts are equal, as Vec<(Vec<u8>, usize)>s compare. */
+static bool
+txn_insert_tests_chains_eq(const StdVec *a, const StdVec *b)
+{
+	bool		eq = a->len == b->len;
+
+	for (size_t k = 0; eq && k < a->len; k++)
+	{
+		const txn_insert_tests_chain_t *left = &STD_VEC_AT(a, txn_insert_tests_chain_t, k);
+		const txn_insert_tests_chain_t *right = &STD_VEC_AT(b, txn_insert_tests_chain_t, k);
+
+		eq = left->versions == right->versions && trees_store_VecU8_PartialEq_eq(&left->key, &right->key);
+	}
+	return eq;
+}
+
+/*
+ * txn_insert_tests_held_once asserts at a line and column, with a message or
+ * none, that a storage's rows are keys 0 up to a count, each with one
+ * version, and frees the list.
+ */
+static void
+txn_insert_tests_held_once(uint32 line, uint32 col, StdVec *chains, uint64 count, const StdFmtArguments *message)
+{
+	StdVec		want;
+
+	std_vec_new(&want, sizeof(txn_insert_tests_chain_t), _Alignof(txn_insert_tests_chain_t));
+	for (uint64 n = 0; n < count; n++)
+	{
+		txn_insert_tests_chain_t chain = {.versions = 1};
+		uint8		key[8];
+
+		std_u64_to_be_bytes(n, key);
+		std_slice_to_vec_Checked(&chain.key, key, sizeof(key), 1, 1);
+		std_vec_push_Checked(&want, &chain, sizeof(chain), _Alignof(txn_insert_tests_chain_t));
+	}
+	if (!txn_insert_tests_chains_eq(chains, &want))
+		std_assert_failed(RUST_FILE, line, col, "==", chains, txn_insert_tests_chains_Debug_fmt, &want,
+						  txn_insert_tests_chains_Debug_fmt, message);
+	txn_insert_tests_chains_free(&want);
+	txn_insert_tests_chains_free(chains);
+}
+
+/* txn_insert_tests_no_edits is the checkpoint case's save's gathering, which edits nothing. */
+static bool
+txn_insert_tests_no_edits(void *captures, HostIoIo *io, const RepoRead *read, StdVec *result, ChunksErrorError *error)
+{
+	std_vec_new(result, sizeof(RepoGathered), _Alignof(RepoGathered));
+	return true;
+}
+
+/* txn_insert_tests_no_marks is the checkpoint case's save's marks, which mark nothing. */
+static bool
+txn_insert_tests_no_marks(void *captures, HostIoIo *io, ChunksErrorError *error)
+{
+	return true;
+}
+
+/*
+ * I12 and the checkpoint runs text's straddle case: a checkpoint's runs
+ * loaded after a crash and followed by every logged record leave each
+ * block's free space entry and the counter as the primary's, so no tid is
+ * handed out twice, and every row held once: when the runs hold everything,
+ * so redo pushes no row again; when they hold the inserts' free space takes
+ * but not their rows; and when they are a restartpoint's, written in the
+ * middle of the records' redo.
+ */
+void
+test_txn_insert_tests_a_checkpoints_runs_and_every_record_after_redo_as_the_primary(void)
+{
+	static const struct
+	{
+		uint32		source;
+		uint32		database;
+		bool		rows;
+		size_t		redone_before;
+	}			cases[] = {{9326, 9327, true, SIZE_MAX}, {9328, 9329, false, SIZE_MAX}, {9331, 9332, true, 5}};
+	static const uint64 sizes[] = {3000, 3000, 3000, 3000, 3000, 2000, 3000, 2000};
+	static const StdFmtPiece pieces[] = {STD_FMT_ARG(0)};
+	SimcProcess process = simc_process();
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+
+	for (size_t k = 0; k < lengthof(cases); k++)
+	{
+		uint32		database = cases[k].database;
+		StdFmtArg	args[] = {{&database, std_u32_Display_fmt}};
+		StdFmtArguments message = {pieces, lengthof(pieces), args};
+		RepoRepo	primary;
+		RepoRepo	repo;
+		HostSharedReader reading;
+		HostSharedHeld held;
+		HostSharedHeld deltas;
+		TreesStoreReader store;
+		txn_insert_tests_free_t expected;
+		txn_insert_tests_free_t got;
+		txn_insert_tests_replica_t replica;
+		StdArcInner *manifest;
+		const RepoManifest *newest;
+		RepoRuns	runs;
+		StdVec		before;
+		StdVec		writes;
+		StdVec		chains;
+		ChunksErrorError failed;
+		HostError	error;
+		size_t		held_before;
+		size_t		kept = 0;
+
+		txn_insert_tests_repository(io, cases[k].source, 2367, 96, 2368, 50, &primary, &reading);
+		held = txn_insert_tests_stated(io, &primary, &reading, txn_insert_tests_stored(cases[k].source),
+									   2370, 108);
+		store = repo_Repo_reader(&primary, HOST_CACHE_PLACEMENT_SERVER, &reading);
+		for (uint64 n = 0; n < lengthof(sizes); n++)
+			txn_insert_tests_took(io, TREES_STORE_READER_NODE_STORE(&store), &held,
+								  txn_insert_tests_row(txn_insert_tests_stored(cases[k].source), n), sizes[n], NULL,
+								  NULL, 0, 2374, 79);
+		expected = txn_insert_tests_free_entries(io, host_shared_Held_record(&held));
+		before = txn_insert_tests_logged(cases[k].source);
+		for (size_t w = Min(cases[k].redone_before, before.len); w < before.len; w++)
+			txn_insert_tests_logged_drop(&STD_VEC_AT(&before, txn_insert_tests_logged_t, w));
+		before.len = Min(cases[k].redone_before, before.len);
+		held_before = txn_insert_tests_count(&before, TXN_INSERT_TESTS_LOGGED_ROW);
+		replica = txn_insert_tests_replica(io, database, &before);
+		txn_insert_tests_replica_drop(&replica);
+		host_shared_Held_drop(&held);
+		simc_checkpointed(UINT64CONST(0x100000000));
+		if (!txn_runs_checkpoint(io, UINT64CONST(0x100000001), &error))
+			TXN_INSERT_TESTS_UNWRAP_FAILED(2383, 56, &error);
+		if (!repo_Repo_open(io, database, HOST_PG_DEFAULT, &repo, &failed))
+			STD_RESULT_EXPECT_FAILED(2384, 61, "called `Result::unwrap()` on an `Err` value", &failed,
+									 chunks_error_Error_Debug_fmt);
+		if (!repo_Repo_manifest(&repo, io, &manifest, &failed))
+			STD_RESULT_EXPECT_FAILED(2385, 46, "called `Result::unwrap()` on an `Err` value", &failed,
+									 chunks_error_Error_Debug_fmt);
+		newest = repo_Repo_newest(manifest);
+		if (!newest->has_runs)
+			STD_OPTION_UNWRAP_FAILED(2385, 68);
+		repo_Runs_Clone_clone(&newest->runs, &runs);
+		repo_ArcManifest_drop(manifest);
+		for (size_t f = 0; f < runs.files.len; f++)
+		{
+			const RepoRunFile *file = &STD_VEC_AT(&runs.files, RepoRunFile, f);
+
+			if (cases[k].rows || file->kind != TXN_RUNS_KIND_ROWS)
+				STD_VEC_AT(&runs.files, RepoRunFile, kept++) = *file;
+		}
+		runs.files.len = kept;
+		if (!repo_Repo_save(&repo, io, &reading, true, &runs, txn_insert_tests_no_edits, NULL,
+							txn_insert_tests_no_marks, NULL, &failed))
+			STD_RESULT_EXPECT_FAILED(2387, 84, "called `Result::unwrap()` on an `Err` value", &failed,
+									 chunks_error_Error_Debug_fmt);
+		for (size_t u = 0; u < 2; u++)
+		{
+			HostStorage unlinked = txn_insert_tests_stored(u == 0 ? cases[k].source : database);
+
+			if (!txn_state_unlinked(io, &unlinked, &error))
+				TXN_INSERT_TESTS_UNWRAP_FAILED(2389, 56, &error);
+		}
+		if (!txn_runs_loaded(io, &TXN_INSERT_TESTS_PAGE, &error))
+			TXN_INSERT_TESTS_UNWRAP_FAILED(2391, 71, &error);
+		held = txn_insert_tests_stated(io, &repo, &reading, txn_insert_tests_stored(database), 2393, 107);
+		chains = txn_insert_tests_chains(io, host_shared_Held_record(&held));
+		{
+			size_t		len = chains.len;
+			size_t		want = cases[k].rows ? held_before : 0;
+
+			if (len != want)
+				std_assert_failed(RUST_FILE, 2394, 13, "==", &len, std_usize_Debug_fmt, &want,
+								  std_usize_Debug_fmt, &message);
+		}
+		txn_insert_tests_chains_free(&chains);
+		if (!txn_memtable_branch_deltas(io, database, HOST_PG_DEFAULT, &deltas, &error))
+			TXN_INSERT_TESTS_UNWRAP_FAILED(2395, 69, &error);
+		store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+		writes = txn_insert_tests_logged(cases[k].source);
+		txn_insert_tests_redone(io, TREES_STORE_READER_NODE_STORE(&store), &held, NULL, &deltas, &writes);
+		got = txn_insert_tests_free_entries(io, host_shared_Held_record(&held));
+		txn_insert_tests_free_is(2398, 13, &got, &expected, &message);
+		txn_insert_tests_free_drop(&got);
+		chains = txn_insert_tests_chains(io, host_shared_Held_record(&held));
+		txn_insert_tests_held_once(2400, 13, &chains, 8, &message);
+		writes = txn_insert_tests_logged(cases[k].source);
+		for (size_t w = 0; w < writes.len; w++)
+		{
+			const txn_insert_tests_logged_t *write = &STD_VEC_AT(&writes, txn_insert_tests_logged_t, w);
+			const TxnMemtablePut *put;
+			StdVec		tupled;
+			bool		some;
+
+			if (write->tag != TXN_INSERT_TESTS_LOGGED_ROW || !txn_record_RowChange_put(&write->u.row, &put))
+				continue;
+			if (!txn_memtable_tuples_get(io, host_shared_Held_record(&held), put->tuple, &some, &tupled, &error))
+				TXN_INSERT_TESTS_UNWRAP_FAILED(2405, 74, &error);
+			if (!some || !trees_store_VecU8_PartialEq_eq(&tupled, &write->u.row.key))
+			{
+				StdBytes	row = {some ? tupled.ptr : NULL, some ? tupled.len : 0};
+				StdBytes	key = {write->u.row.key.ptr, write->u.row.key.len};
+				StdOptionRef left = {some, {&row, std_bytes_Debug_fmt}};
+				StdOptionRef right = {true, {&key, std_bytes_Debug_fmt}};
+
+				std_assert_failed(RUST_FILE, 2405, 21, "==", &left, std_option_Debug_fmt, &right,
+								  std_option_Debug_fmt, &message);
+			}
+			std_vec_free_Checked(&tupled, 1, 1);
+		}
+		txn_insert_tests_logged_free(&writes);
+		host_shared_Held_drop(&deltas);
+		host_shared_Held_drop(&held);
+		repo_Repo_drop(&repo);
+		txn_insert_tests_free_drop(&expected);
+		host_shared_Reader_drop(&reading);
+		repo_Repo_drop(&primary);
+	}
+	txn_insert_tests_ended(io, 2409, 35);
+	simc_TestIo_drop(&test_io);
+	simc_Process_drop(&process);
+}
+
+/* txn_insert_tests_straddle_t is the straddle's inserter's captures: its database, its count of inserts, and its rows' heap bytes. */
+typedef struct txn_insert_tests_straddle_t
+{
+	uint32		database;
+	uint64		inserts;
+	uint64		bytes;
+} txn_insert_tests_straddle_t;
+
+/* txn_insert_tests_checkpointer is a case's checkpointer: a checkpoint whose redo is past the test's last. */
+static bool
+txn_insert_tests_checkpointer(void *captures, HostIoIo *io, HostError *error)
+{
+	return txn_runs_checkpoint(io, UINT64CONST(0x100000001), error);
+}
+
+/* txn_insert_tests_straddle_inserter is the straddle's inserter: its inserts, one window each, while the checkpoint waits. */
+static bool
+txn_insert_tests_straddle_inserter(void *captures, HostIoIo *io, HostError *error)
+{
+	const txn_insert_tests_straddle_t *c = captures;
+	HostStorage storage = txn_insert_tests_stored(c->database);
+	TxnInsertRoom room = txn_insert_tests_room(c->bytes);
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	bool		ok = true;
+
+	if (!txn_insert_tests_opened(io, storage, &repo, &reading, &held, error))
+		return false;
+	{
+		TreesStoreReader store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+
+		for (uint64 n = 1; ok && n <= c->inserts; n++)
+		{
+			TxnInsertInsert row = txn_insert_tests_row(storage, n);
+			uint64		tid;
+
+			ok = txn_insert_tests_taken(io, TREES_STORE_READER_NODE_STORE(&store), &held, &row, &room, NULL, NULL, 0,
+										&tid, error);
+		}
+	}
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	return ok;
+}
+
+/*
+ * txn_insert_tests_straddled runs a count of inserts of rows of some heap
+ * bytes, each a whole window, while a checkpoint waits at a pause of its sweep
+ * of their storage, which holds one such row already, then crashes, loads the
+ * checkpoint's runs, which hold that one row, and redoes the logged records,
+ * and checks every block's free space entry and the counter are as they were
+ * before the crash and each row is held once.
+ */
+static void
+txn_insert_tests_straddled(uint32 database, const char *pause, uint64 bytes, uint64 inserts)
+{
+	static const SimcStep steps[] = {{"inserter", 8, UINT64_MAX}, {"checkpointer", 12, UINT64_MAX}};
+	SimcProcess process = simc_process();
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostStorage storage = txn_insert_tests_stored(database);
+	txn_insert_tests_straddle_t c = {.database = database, .inserts = inserts, .bytes = bytes};
+	SimcActor	checkpointer = {txn_insert_tests_checkpointer};
+	SimcActor	inserter = {txn_insert_tests_straddle_inserter, &c};
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	HostSharedHeld deltas;
+	TreesStoreReader store;
+	txn_insert_tests_free_t expected;
+	txn_insert_tests_free_t got;
+	SimcRun		run;
+	SimcReport	report;
+	StdVec		writes;
+	HostError	error;
+
+	txn_insert_tests_repository(io, database, 2422, 59, 2423, 46, &repo, &reading);
+	held = txn_insert_tests_stated(io, &repo, &reading, storage, 2426, 99);
+	store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	txn_insert_tests_took(io, TREES_STORE_READER_NODE_STORE(&store), &held, txn_insert_tests_row(storage, 0), bytes,
+						  NULL, NULL, 0, 2428, 62);
+	host_shared_Held_drop(&held);
+	simc_checkpointed(UINT64CONST(0x100000000));
+	run = simc_Run_new(1);
+	simc_Run_actor(&run, "checkpointer", 12, checkpointer);
+	simc_Run_actor(&run, "inserter", 8, inserter);
+	simc_Run_until(&run, "checkpointer", 12, pause);
+	simc_Run_script(&run, steps, lengthof(steps));
+	report = simc_Run_finish(run);
+	txn_vacuum_tests_returned(&report, RUST_FILE, 2442, 67, 2443, 9);
+	simc_Report_drop(&report);
+	held = txn_insert_tests_stated(io, &repo, &reading, storage, 2446, 99);
+	expected = txn_insert_tests_free_entries(io, host_shared_Held_record(&held));
+	host_shared_Held_drop(&held);
+	if (!txn_state_unlinked(io, &storage, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(2449, 33, &error);
+	if (!txn_runs_loaded(io, &TXN_INSERT_TESTS_PAGE, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(2450, 67, &error);
+	held = txn_insert_tests_stated(io, &repo, &reading, storage, 2451, 95);
+	{
+		StdVec		chains = txn_insert_tests_chains(io, host_shared_Held_record(&held));
+
+		txn_insert_tests_held_once(2453, 9, &chains, 1, NULL);
+	}
+	if (!txn_memtable_branch_deltas(io, database, HOST_PG_DEFAULT, &deltas, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(2454, 65, &error);
+	store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	writes = txn_insert_tests_logged(database);
+	txn_insert_tests_redone(io, TREES_STORE_READER_NODE_STORE(&store), &held, NULL, &deltas, &writes);
+	got = txn_insert_tests_free_entries(io, host_shared_Held_record(&held));
+	txn_insert_tests_free_is(2457, 9, &got, &expected, NULL);
+	txn_insert_tests_free_drop(&got);
+	{
+		StdVec		chains = txn_insert_tests_chains(io, host_shared_Held_record(&held));
+
+		txn_insert_tests_held_once(2458, 9, &chains, 1 + inserts, NULL);
+	}
+	txn_insert_tests_ended(io, 2459, 35);
+	host_shared_Held_drop(&deltas);
+	host_shared_Held_drop(&held);
+	txn_insert_tests_free_drop(&expected);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	simc_TestIo_drop(&test_io);
+	simc_Process_drop(&process);
+}
+
+/*
+ * The sweep's order: an insert whose whole window runs between a
+ * checkpoint's sweep of its storage's rows and its cut of the free space map
+ * leaves the runs its take without its row, under the cut's counter, so redo
+ * pushes the row and takes nothing twice.
+ */
+void
+test_txn_insert_tests_a_window_between_a_sweeps_rows_and_its_cut_leaves_its_take_without_its_row(void)
+{
+	txn_insert_tests_straddled(9330, "doltgres-runs-rows-swept", 28, 1);
+}
+
+/*
+ * The cut: inserts whose whole windows run after a checkpoint's cut of the
+ * free space map, before the cut's walk, are in the runs with neither their
+ * rows nor their takes, whatever the walk meets after of the counter's block
+ * and of the block the inserts go on to once they leave it, so redo applies
+ * each once.
+ */
+void
+test_txn_insert_tests_windows_after_a_sweeps_cut_are_in_its_runs_with_neither_their_rows_nor_their_takes(void)
+{
+	txn_insert_tests_straddled(9333, "doltgres-runs-free-cut", 3000, 3);
+}
+
+/* txn_insert_tests_value_entry returns a value's map entry of 4000 bytes, counted once, by its bytes' address. */
+static TxnValuesEntry
+txn_insert_tests_value_entry(const char *bytes)
+{
+	TxnValuesEntry entry = {.raw = 4000, .stored = 4000, .count = 1};
+
+	entry.address = chunks_address_Address_of((const uint8 *) bytes, strlen(bytes));
+	entry.locator = chunks_trailer_Locator_Default_default();
+	return entry;
+}
+
+/* txn_insert_tests_valued_by returns a key's row written by a transaction, naming one value id in the test's TOAST relation. */
+static TxnInsertInsert
+txn_insert_tests_valued_by(uint64 key, HostXid xid, uint32 id)
+{
+	TxnInsertInsert row = txn_insert_tests_row(txn_insert_tests_stored(9388), key);
+
+	row.writer.xid = xid.f0;
+	std_vec_free_Checked(&row.put.values, sizeof(uint32), _Alignof(uint32));
+	std_slice_to_vec_Checked(&row.put.values, &id, 1, sizeof(uint32), _Alignof(uint32));
+	row.has_toast = true;
+	row.toast = TXN_INSERT_TESTS_TOAST;
+	return row;
+}
+
+/*
+ * Bugs row 44, CommPF 7's condition on 2g's take-back: an aborted insert's
+ * value map entries go with its row at its take-back, since its list holds
+ * their keys, and a committed insert's stay; its free space take stays, for
+ * the fold or VACUUM to free as heap's VACUUM frees a dead row's tuple id.
+ */
+void
+test_txn_insert_tests_an_aborted_inserts_value_map_versions_go_at_its_take_back_and_its_free_space_take_stays(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	HostSharedHeld toast;
+	TreesStoreReader store;
+	TxnValuesEntry one = txn_insert_tests_value_entry("one");
+	TxnValuesEntry two = txn_insert_tests_value_entry("two");
+	HostXid		committed;
+	HostXid		aborted;
+	txn_insert_tests_mapped_t mapped;
+	txn_insert_tests_mapped_t free;
+	txn_insert_tests_mapped_t now;
+	txn_insert_tests_mapped_t none = {0};
+	HostDeltaHold hold;
+	HostError	error;
+	StdVec		chain;
+	uint8		key[8];
+
+	txn_insert_tests_repository(io, 9388, 2486, 87, 2487, 46, &repo, &reading);
+	held = txn_insert_tests_stated(io, &repo, &reading, txn_insert_tests_stored(9388), 2488, 106);
+	toast = txn_insert_tests_toasted(io, &repo, &reading, 9388, 2490, 102);
+	store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	committed = simc_begin();
+	aborted = simc_begin();
+	txn_insert_tests_took(io, TREES_STORE_READER_NODE_STORE(&store), &held,
+						  txn_insert_tests_valued_by(1, committed, 16400), 60, &toast, &one, 1, 2505, 82);
+	simc_commit(committed);
+	txn_insert_tests_ended(io, 2507, 28);
+	txn_insert_tests_took(io, TREES_STORE_READER_NODE_STORE(&store), &held,
+						  txn_insert_tests_valued_by(2, aborted, 16401), 60, &toast, &two, 1, 2512, 83);
+	mapped = txn_insert_tests_newest(io, host_shared_Held_record(&toast), TXN_MEMTABLE_MAP_MAP_VALUES, 16401,
+									 2513, 69);
+	STD_ASSERT(2513, 9, mapped.some,
+			   "map::newest(io, toast.record(), Map::Values, 16401).unwrap().is_some()");
+	txn_insert_tests_mapped_drop(&mapped);
+	free = txn_insert_tests_newest(io, host_shared_Held_record(&held), TXN_MEMTABLE_MAP_MAP_FREE, 0, 2514, 65);
+	simc_abort(aborted);
+	if (!txn_written_aborted(io, 0, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(2516, 30, &error);
+	mapped = txn_insert_tests_newest(io, host_shared_Held_record(&toast), TXN_MEMTABLE_MAP_MAP_VALUES, 16401,
+									 2517, 72);
+	STD_ASSERT_EQ(2517, 9, txn_insert_tests_mapped_eq(&mapped, &none), &mapped,
+				  txn_insert_tests_mapped_Debug_fmt, &none, txn_insert_tests_mapped_Debug_fmt);
+	txn_insert_tests_mapped_drop(&mapped);
+	mapped = txn_insert_tests_newest(io, host_shared_Held_record(&toast), TXN_MEMTABLE_MAP_MAP_VALUES, 16400,
+									 2518, 69);
+	STD_ASSERT(2518, 9, mapped.some,
+			   "map::newest(io, toast.record(), Map::Values, 16400).unwrap().is_some()");
+	txn_insert_tests_mapped_drop(&mapped);
+	now = txn_insert_tests_newest(io, host_shared_Held_record(&held), TXN_MEMTABLE_MAP_MAP_FREE, 0, 2519, 65);
+	STD_ASSERT_EQ(2519, 9, txn_insert_tests_mapped_eq(&now, &free), &now, txn_insert_tests_mapped_Debug_fmt,
+				  &free, txn_insert_tests_mapped_Debug_fmt);
+	txn_insert_tests_mapped_drop(&now);
+	if (!host_delta_hold(io, &hold, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(2520, 42, &error);
+	std_u64_to_be_bytes(2, key);
+	if (!txn_memtable_table_versions(io, &hold, host_shared_Held_record(&held), key, sizeof(key), &chain, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(2521, 80, &error);
+	STD_ASSERT(2521, 9, chain.len == 0,
+			   "table::versions(io, &hold, held.record(), &2u64.to_be_bytes()).unwrap().is_empty()");
+	txn_memtable_version_versions_drop(&chain, 0);
+	std_u64_to_be_bytes(1, key);
+	if (!txn_memtable_table_versions(io, &hold, host_shared_Held_record(&held), key, sizeof(key), &chain, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(2522, 83, &error);
+	STD_ASSERT_EQ_U64(2522, 9, chain.len, 1);
+	txn_memtable_version_versions_drop(&chain, 0);
+	host_delta_Hold_drop(&hold);
+	txn_insert_tests_mapped_drop(&free);
+	host_shared_Held_drop(&toast);
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	simc_TestIo_drop(&test_io);
+}
+
+/* txn_insert_tests_op_t is what a version of a key does, by its name, with the tuple ids it names or writes. */
+typedef struct txn_insert_tests_op_t
+{
+	const char *name;
+	uint64		at;
+} txn_insert_tests_op_t;
+
+/* txn_insert_tests_named returns the tuple id at the end of a successor's key, or 0 for any other successor. */
+static uint64
+txn_insert_tests_named(bool has, const TxnMemtableVersionSuccessorRef *successor)
+{
+	if (has && successor->tag == TXN_MEMTABLE_VERSION_SUCCESSOR_REF_KEY && successor->u.key.len > 8)
+		return std_u64_from_be_bytes(successor->u.key.ptr + successor->u.key.len - 8);
+	return 0;
+}
+
+/* txn_insert_tests_ops returns what each version of a key does, newest first, with the tuple ids it names or writes. */
+static StdVec
+txn_insert_tests_ops(HostIoIo *io, HostSharedRecord record, const uint8 *key, size_t key_len)
+{
+	HostDeltaHold hold;
+	HostError	error;
+	StdVec		versions;
+	StdVec		ops;
+
+	if (!host_delta_hold(io, &hold, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(2528, 42, &error);
+	if (!txn_memtable_table_versions(io, &hold, record, key, key_len, &versions, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(2529, 64, &error);
+	std_vec_with_capacity_Checked(&ops, versions.len, sizeof(txn_insert_tests_op_t), _Alignof(txn_insert_tests_op_t));
+	for (size_t k = 0; k < versions.len; k++)
+	{
+		TxnMemtableVersionRecord got = txn_memtable_version_Version_record(&STD_VEC_AT(&versions,
+																					   TxnMemtableVersionVersion, k));
+		TxnMemtableVersionOpRef op = txn_memtable_version_Record_op(&got);
+		txn_insert_tests_op_t one = {"other", 0};
+
+		switch (op.tag)
+		{
+			case TXN_MEMTABLE_VERSION_OP_REF_PUT:
+				one = (txn_insert_tests_op_t)
+				{
+					"put", op.u.put.tuple.f0
+				};
+				break;
+			case TXN_MEMTABLE_VERSION_OP_REF_ADD:
+				one = (txn_insert_tests_op_t)
+				{
+					"add", op.u.add.tuple.f0
+				};
+				break;
+			case TXN_MEMTABLE_VERSION_OP_REF_ADD_ROW:
+				one = (txn_insert_tests_op_t)
+				{
+					"add row", op.u.add_row.tuple.f0
+				};
+				break;
+			case TXN_MEMTABLE_VERSION_OP_REF_UPDATE_ROW:
+				one = (txn_insert_tests_op_t)
+				{
+					"update row", op.u.update_row.f0.f0 << 32 | op.u.update_row.f1.tuple.f0
+				};
+				break;
+			case TXN_MEMTABLE_VERSION_OP_REF_MOVE:
+				one = (txn_insert_tests_op_t)
+				{
+					"move", 0
+				};
+				break;
+			case TXN_MEMTABLE_VERSION_OP_REF_REMOVE:
+				one = (txn_insert_tests_op_t)
+				{
+					"remove", op.u.remove.f0.f0 << 32 |
+						txn_insert_tests_named(op.u.remove.has_f1, &op.u.remove.f1)
+				};
+				break;
+			case TXN_MEMTABLE_VERSION_OP_REF_DELETE_ROW:
+				one = (txn_insert_tests_op_t)
+				{
+					"delete row", op.u.delete_row.f0.f0 << 32 |
+						txn_insert_tests_named(op.u.delete_row.has_f1, &op.u.delete_row.f1)
+				};
+				break;
+			default:
+				break;
+		}
+		std_vec_push_Checked(&ops, &one, sizeof(one), _Alignof(txn_insert_tests_op_t));
+	}
+	txn_memtable_version_versions_drop(&versions, 0);
+	host_delta_Hold_drop(&hold);
+	return ops;
+}
+
+/* txn_insert_tests_op_Debug_fmt is what a version does's Debug, the tuple (name, tuple id). */
+static bool
+txn_insert_tests_op_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const txn_insert_tests_op_t *op = value;
+	StdStr		name = {op->name, strlen(op->name)};
+	StdTupleRef tuple = STD_TUPLE(2, STD_ITEM(&name, std_str_Debug_fmt), STD_ITEM(&op->at, std_u64_Debug_fmt));
+
+	return std_tuple_Debug_fmt(&tuple, f);
+}
+
+/* txn_insert_tests_ops_Debug_fmt is a Vec<(&str, u64)>'s Debug. */
+static bool
+txn_insert_tests_ops_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const StdVec *ops = value;
+	StdDebugList list = std_fmt_debug_list(f);
+
+	for (size_t k = 0; k < ops->len; k++)
+		std_DebugList_entry(&list, &STD_VEC_AT(ops, txn_insert_tests_op_t, k), txn_insert_tests_op_Debug_fmt);
+	return std_DebugList_finish(&list);
+}
+
+/* txn_insert_tests_ops_is asserts at a line and column that a key's versions do what another list says, and frees both lists. */
+static void
+txn_insert_tests_ops_is(uint32 line, uint32 col, StdVec *got, StdVec *want)
+{
+	bool		eq = got->len == want->len;
+
+	for (size_t k = 0; eq && k < got->len; k++)
+	{
+		const txn_insert_tests_op_t *a = &STD_VEC_AT(got, txn_insert_tests_op_t, k);
+		const txn_insert_tests_op_t *b = &STD_VEC_AT(want, txn_insert_tests_op_t, k);
+
+		eq = a->at == b->at && strcmp(a->name, b->name) == 0;
+	}
+	STD_ASSERT_EQ(line, col, eq, got, txn_insert_tests_ops_Debug_fmt, want, txn_insert_tests_ops_Debug_fmt);
+	std_vec_free_Checked(got, sizeof(txn_insert_tests_op_t), _Alignof(txn_insert_tests_op_t));
+	std_vec_free_Checked(want, sizeof(txn_insert_tests_op_t), _Alignof(txn_insert_tests_op_t));
+}
+
+/* txn_insert_tests_ops_are asserts at a line and column that a key's versions do what an array says, and frees the list. */
+static void
+txn_insert_tests_ops_are(uint32 line, uint32 col, StdVec got, const txn_insert_tests_op_t *want, size_t want_len)
+{
+	StdVec		wanted;
+
+	std_slice_to_vec_Checked(&wanted, want, want_len, sizeof(txn_insert_tests_op_t), _Alignof(txn_insert_tests_op_t));
+	txn_insert_tests_ops_is(line, col, &got, &wanted);
+}
+
+/* txn_insert_tests_updated_decide is updated's read: on with the command go shows, over the newest, or with none a stop with the count of versions it read. */
+static bool
+txn_insert_tests_updated_decide(void *captures, HostIoIo *io, TxnMemtableVersionVersion *versions, size_t versions_len,
+								TxnChangeRead *result, void *stopped, HostError *error)
+{
+	const TxnMemtableVersionShown *go = captures;
+
+	if (go == NULL)
+	{
+		*(size_t *) stopped = versions_len;
+		result->tag = TXN_CHANGE_READ_STOP;
+		return true;
+	}
+	result->tag = TXN_CHANGE_READ_GO;
+	result->u.go.shown = *go;
+	result->u.go.cmin = 0;
+	result->u.go.has_row = versions_len > 0;
+	if (versions_len > 0)
+		result->u.go.row = versions[0].handle;
+	return true;
+}
+
+/*
+ * txn_insert_tests_updated runs an update of a test's row with a test's
+ * Waits, each key's stripe by its bytes, and a read that goes on with the
+ * command go shows, or with none stops with the count of versions it read,
+ * which it writes to stopped. It takes the row and the replaced key.
+ */
+static TxnInsertInserted
+txn_insert_tests_updated(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held, TxnInsertInsert row,
+						 StdVec key, uint64 tuple, const TxnInsertRoom *room, const TxnInsertUniqueness *unique,
+						 const TxnMemtableVersionShown *go, size_t *stopped)
+{
+	HostIoWaits waits = host_io_Waits_testing();
+	TxnInsertReplaces replaces = {.key = key, .tuple = {tuple}, .lock = TXN_MEMTABLE_LOCK_MODE_NO_KEY_UPDATE};
+	TxnInsertKeyed keyed = {.stripe = txn_change_stripe(&row.storage, row.key.ptr, row.key.len, true)};
+	TxnInsertInserted inserted;
+	HostError	error;
+
+	replaces.stripe = txn_change_stripe(&row.storage, key.ptr, key.len, true);
+	if (unique != NULL)
+	{
+		keyed.has_unique = true;
+		keyed.unique = *unique;
+	}
+	if (!txn_insert_update(io, store, held, &row, &replaces, room, NULL, NULL, NULL, 0, keyed, &waits,
+						   txn_insert_tests_updated_decide, (void *) go, NULL, stopped, &inserted, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(2577, 95, &error);
+	return inserted;
+}
+
+/* txn_insert_tests_replayed_rows replays a database's logged row changes of a relation on another storage, each by its kind: a put's by the insert's redo, an end's by the change's. */
+static void
+txn_insert_tests_replayed_rows(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held, uint32 database,
+							   uint32 relation)
+{
+	StdVec		writes = txn_insert_tests_logged(database);
+
+	for (size_t k = 0; k < writes.len; k++)
+	{
+		const txn_insert_tests_logged_t *write = &STD_VEC_AT(&writes, txn_insert_tests_logged_t, k);
+		const TxnMemtablePut *put;
+		HostError	error;
+
+		if (write->tag != TXN_INSERT_TESTS_LOGGED_ROW || write->u.row.storage.relation != relation)
+			continue;
+		if (txn_record_RowChange_put(&write->u.row, &put))
+		{
+			if (!txn_insert_redo(io, store, held, &write->u.row, write->end, &TXN_INSERT_TESTS_PAGE, NULL, NULL, 0,
+								 &error))
+				TXN_INSERT_TESTS_UNWRAP_FAILED(2589, 81, &error);
+		}
+		else if (!txn_change_redo(io, held, &write->u.row, write->end, &error))
+			TXN_INSERT_TESTS_UNWRAP_FAILED(2590, 73, &error);
+	}
+	txn_insert_tests_logged_free(&writes);
+}
+
+/* txn_insert_tests_usize_eq reports whether two usizes are equal, a Stopped's T compared. */
+static bool
+txn_insert_tests_usize_eq(const void *a, const void *b)
+{
+	return *(const size_t *) a == *(const size_t *) b;
+}
+
+/* txn_insert_tests_inserted_is asserts at a line and column that an update did what was wanted, a Stopped's count compared too. */
+static void
+txn_insert_tests_inserted_is(uint32 line, uint32 col, const TxnInsertInserted *got, size_t got_stopped,
+							 const TxnInsertInserted *want, size_t want_stopped)
+{
+	TxnInsertInsertedRef left = {got, {&got_stopped, std_usize_Debug_fmt}};
+	TxnInsertInsertedRef right = {want, {&want_stopped, std_usize_Debug_fmt}};
+
+	STD_ASSERT_EQ(line, col, txn_insert_Inserted_PartialEq_eq(got, &got_stopped, want, &want_stopped,
+															  txn_insert_tests_usize_eq),
+				  &left, txn_insert_Inserted_Debug_fmt, &right, txn_insert_Inserted_Debug_fmt);
+}
+
+/* txn_insert_tests_key returns a test's key by its number, its bytes big-endian. */
+static StdVec
+txn_insert_tests_key(uint64 n)
+{
+	uint8		bytes[8];
+	StdVec		key;
+
+	std_u64_to_be_bytes(n, bytes);
+	std_slice_to_vec_Checked(&key, bytes, sizeof(bytes), 1, 1);
+	return key;
+}
+
+/* txn_insert_tests_key_ops returns what each version of a test's numbered key does. */
+static StdVec
+txn_insert_tests_key_ops(HostIoIo *io, const HostSharedHeld *held, uint64 n)
+{
+	StdVec		key = txn_insert_tests_key(n);
+	StdVec		ops = txn_insert_tests_ops(io, host_shared_Held_record(held), key.ptr, key.len);
+
+	std_vec_free_Checked(&key, 1, 1);
+	return ops;
+}
+
+/* txn_insert_tests_update_made makes the update case's database's repository, a reader, and its storage's state. */
+static void
+txn_insert_tests_update_made(HostIoIo *io, uint32 database, RepoRepo *repo, HostSharedReader *reading,
+							 HostSharedHeld *held)
+{
+	txn_insert_tests_repository(io, database, 2606, 95, 2607, 50, repo, reading);
+	*held = txn_insert_tests_stated(io, repo, reading, txn_insert_tests_stored(database), 2609, 105);
+}
+
+/*
+ * (4b)'s section 4, an update's forms: one that keeps its key pushes its new
+ * row's Put over the row, on the row's block while it has room, with no end
+ * of its own; one that moves its row to another key pushes the old key's Move
+ * with its own record before the new key's Put; a read that stops pushes and
+ * logs nothing and gives back what it stopped with; an immediate key's move
+ * onto a live row's key finds it; and the records replayed on another storage
+ * give each key's chain as the primary's.
+ */
+void
+test_txn_insert_tests_an_update_keeps_its_key_or_moves_it_and_redoes_as_the_primary(void)
+{
+	static const TxnMemtableVersionShown command = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND};
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	RepoRepo	replica_repo;
+	HostSharedReader replica_reading;
+	HostSharedHeld replica;
+	TreesStoreReader store;
+	TreesStoreReader replica_store;
+	TxnInsertRoom room = txn_insert_tests_room(28);
+	TxnInsertInsert row;
+	TxnInsertInserted inserted;
+	TxnInsertInserted want = {.tag = TXN_INSERT_INSERTED_TOOK};
+	TreesKeyOrder order = {.tag = TREES_KEY_ORDER_BYTES};
+	TxnInsertUniqueness unique = {.order = &order, .index = 16386};
+	HostXid		committed;
+	uint64		first;
+	uint64		other;
+	size_t		stopped = 0;
+	size_t		records;
+	StdVec		writes;
+	StdVec		changes;
+
+	txn_insert_tests_update_made(io, 9340, &repo, &reading, &held);
+	store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	first = txn_insert_tests_took(io, TREES_STORE_READER_NODE_STORE(&store), &held,
+								  txn_insert_tests_row(txn_insert_tests_stored(9340), 1), 28, NULL, NULL, 0,
+								  2616, 81);
+	committed = simc_begin();
+	simc_commit(committed);
+	row = txn_insert_tests_row(txn_insert_tests_stored(9340), 3);
+	row.writer.xid = committed.f0;
+	other = txn_insert_tests_took(io, TREES_STORE_READER_NODE_STORE(&store), &held, row, 28, NULL, NULL, 0,
+								  2620, 102);
+	inserted = txn_insert_tests_updated(io, TREES_STORE_READER_NODE_STORE(&store), &held,
+										txn_insert_tests_row(txn_insert_tests_stored(9340), 1),
+										txn_insert_tests_key(1), first, &room, NULL, &command, &stopped);
+	want.u.took.tuple = 3;
+	txn_insert_tests_inserted_is(2622, 9, &inserted, stopped, &want, 0);
+	{
+		txn_insert_tests_op_t ops[] = {{"put", 3}, {"put", first}};
+
+		txn_insert_tests_ops_are(2623, 9, txn_insert_tests_key_ops(io, &held, 1), ops, lengthof(ops));
+	}
+	writes = txn_insert_tests_logged(9340);
+	records = writes.len;
+	txn_insert_tests_logged_free(&writes);
+	inserted = txn_insert_tests_updated(io, TREES_STORE_READER_NODE_STORE(&store), &held,
+										txn_insert_tests_row(txn_insert_tests_stored(9340), 2),
+										txn_insert_tests_key(1), 3, &room, NULL, NULL, &stopped);
+	want.tag = TXN_INSERT_INSERTED_STOPPED;
+	txn_insert_tests_inserted_is(2626, 9, &inserted, stopped, &want, 2);
+	writes = txn_insert_tests_logged(9340);
+	STD_ASSERT_EQ_U64(2627, 9, writes.len, records);
+	txn_insert_tests_logged_free(&writes);
+	inserted = txn_insert_tests_updated(io, TREES_STORE_READER_NODE_STORE(&store), &held,
+										txn_insert_tests_row(txn_insert_tests_stored(9340), 2),
+										txn_insert_tests_key(1), 3, &room, NULL, &command, &stopped);
+	want.tag = TXN_INSERT_INSERTED_TOOK;
+	want.u.took.tuple = 4;
+	txn_insert_tests_inserted_is(2629, 9, &inserted, stopped, &want, 0);
+	{
+		txn_insert_tests_op_t moved[] = {{"move", 0}, {"put", 3}, {"put", first}};
+		txn_insert_tests_op_t put[] = {{"put", 4}};
+
+		txn_insert_tests_ops_are(2630, 9, txn_insert_tests_key_ops(io, &held, 1), moved, lengthof(moved));
+		txn_insert_tests_ops_are(2631, 9, txn_insert_tests_key_ops(io, &held, 2), put, lengthof(put));
+	}
+	writes = txn_insert_tests_logged(9340);
+	std_vec_new(&changes, sizeof(const TxnRecordRowChange *), _Alignof(const TxnRecordRowChange *));
+	for (size_t k = records; k < writes.len; k++)
+	{
+		const txn_insert_tests_logged_t *write = &STD_VEC_AT(&writes, txn_insert_tests_logged_t, k);
+		const TxnRecordRowChange *change = &write->u.row;
+
+		if (write->tag == TXN_INSERT_TESTS_LOGGED_ROW)
+			std_vec_push_Checked(&changes, &change, sizeof(change), _Alignof(const TxnRecordRowChange *));
+	}
+	if (changes.len != 2)
+	{
+		static const StdFmtPiece pieces[] = {STD_FMT_ARG(0), STD_FMT_LIT(" row changes")};
+		StdFmtArg	args[] = {{&changes.len, std_usize_Display_fmt}};
+		StdFmtArguments message = {pieces, lengthof(pieces), args};
+
+		std_panic_fmt(RUST_FILE, 2640, 71, &message);
+	}
+	{
+		const TxnRecordRowChange *ended = STD_VEC_AT(&changes, const TxnRecordRowChange *, 0);
+		const TxnRecordRowChange *put = STD_VEC_AT(&changes, const TxnRecordRowChange *, 1);
+		StdVec		one = txn_insert_tests_key(1);
+		StdVec		two = txn_insert_tests_key(2);
+		uint8		four[8];
+		TxnMemtableOp end = {.tag = TXN_MEMTABLE_OP_MOVE, .u.move = {.tag = TXN_MEMTABLE_SUCCESSOR_KEY}};
+		bool		yes = true;
+		StdBytes	ended_key = {ended->key.ptr, ended->key.len};
+		StdBytes	one_key = {one.ptr, one.len};
+		StdBytes	put_key = {put->key.ptr, put->key.len};
+		StdBytes	two_key = {two.ptr, two.len};
+
+		std_vec_clone(&end.u.move.u.key, &two, 1, 1);
+		std_u64_to_be_bytes(4, four);
+		std_vec_extend_from_slice_Checked(&end.u.move.u.key, four, sizeof(four), 1, 1);
+		{
+			StdTupleRef got = STD_TUPLE(3, STD_ITEM(&ended_key, std_bytes_Debug_fmt),
+										STD_ITEM(&ended->op, txn_memtable_Op_Debug_fmt),
+										STD_ITEM(&ended->no_key, std_bool_Debug_fmt));
+			StdTupleRef wanted = STD_TUPLE(3, STD_ITEM(&one_key, std_bytes_Debug_fmt),
+										   STD_ITEM(&end, txn_memtable_Op_Debug_fmt),
+										   STD_ITEM(&yes, std_bool_Debug_fmt));
+
+			STD_ASSERT_EQ(2642, 9, trees_store_VecU8_PartialEq_eq(&ended->key, &one) &&
+						  txn_memtable_Op_PartialEq_eq(&ended->op, &end) && ended->no_key, &got, std_tuple_Debug_fmt,
+						  &wanted, std_tuple_Debug_fmt);
+		}
+		STD_ASSERT_EQ(2643, 9, trees_store_VecU8_PartialEq_eq(&put->key, &two), &put_key,
+					  std_bytes_Debug_fmt, &two_key, std_bytes_Debug_fmt);
+		txn_memtable_Op_drop(&end);
+		std_vec_free_Checked(&two, 1, 1);
+		std_vec_free_Checked(&one, 1, 1);
+	}
+	std_vec_free_Checked(&changes, sizeof(const TxnRecordRowChange *), _Alignof(const TxnRecordRowChange *));
+	txn_insert_tests_logged_free(&writes);
+	inserted = txn_insert_tests_updated(io, TREES_STORE_READER_NODE_STORE(&store), &held,
+										txn_insert_tests_row(txn_insert_tests_stored(9340), 3),
+										txn_insert_tests_key(2), 4, &room, &unique, &command, &stopped);
+	STD_ASSERT(2647, 9, inserted.tag == TXN_INSERT_INSERTED_EXISTS, "matches!(onto, Inserted::Exists(..))");
+	{
+		txn_insert_tests_op_t ops[] = {{"put", other}};
+
+		txn_insert_tests_ops_are(2648, 9, txn_insert_tests_key_ops(io, &held, 3), ops, lengthof(ops));
+	}
+	txn_insert_tests_update_made(io, 9341, &replica_repo, &replica_reading, &replica);
+	host_shared_Reader_drop(&replica_reading);
+	replica_store = repo_Repo_reader(&replica_repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	txn_insert_tests_replayed_rows(io, TREES_STORE_READER_NODE_STORE(&replica_store), &replica, 9340, 16384);
+	for (uint64 n = 1; n <= 3; n++)
+	{
+		StdVec		got = txn_insert_tests_key_ops(io, &replica, n);
+		StdVec		primary = txn_insert_tests_key_ops(io, &held, n);
+
+		txn_insert_tests_ops_is(2653, 13, &got, &primary);
+	}
+	txn_insert_tests_ended(io, 2655, 35);
+	host_shared_Held_drop(&replica);
+	repo_Repo_drop(&replica_repo);
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	simc_TestIo_drop(&test_io);
+}
+
+/* txn_insert_tests_made_in returns the state of one of a database's relations' storages, unwrapped where the keyless case's made unwraps it. */
+static HostSharedHeld
+txn_insert_tests_made_in(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading, uint32 database,
+						 uint32 relation)
+{
+	HostStorage storage = txn_insert_tests_stored(database);
+
+	storage.relation = relation;
+	return txn_insert_tests_stated(io, repo, reading, storage, 2671, 93);
+}
+
+/* txn_insert_tests_copy returns a keyless table's copy of a row by its number. */
+static TxnInsertInsert
+txn_insert_tests_copy(uint64 n)
+{
+	TxnInsertInsert row = txn_insert_tests_row(txn_insert_tests_stored(9342), n);
+
+	row.keyless = true;
+	return row;
+}
+
+/* txn_insert_tests_rowed returns a deferrable key's row of relation 16390 by its number. */
+static TxnInsertInsert
+txn_insert_tests_rowed(uint64 n)
+{
+	HostStorage storage = txn_insert_tests_stored(9342);
+	TxnInsertInsert row;
+
+	storage.relation = 16390;
+	row = txn_insert_tests_row(storage, n);
+	row.deferred = true;
+	return row;
+}
+
+/* txn_insert_tests_took_is asserts at a line and column that an update took a tuple id. */
+static void
+txn_insert_tests_took_is(uint32 line, uint32 col, const TxnInsertInserted *got, size_t stopped, uint64 tid)
+{
+	TxnInsertInserted want = {.tag = TXN_INSERT_INSERTED_TOOK, .u.took.tuple = tid};
+
+	txn_insert_tests_inserted_is(line, col, got, stopped, &want, 0);
+}
+
+/*
+ * (4b)'s sections 4 and 4a, the row-addressed forms: a keyless table's
+ * update removes the copy it replaces, naming the new copy's tuple id, then
+ * adds the new copy to the same key; a deferrable key's update that keeps its
+ * key replaces its row by its tuple id, and one that moves it deletes the row
+ * by its tuple id, naming the new row, and adds the new row to the new key;
+ * each replayed as the primary's.
+ */
+void
+test_txn_insert_tests_a_keyless_or_deferrable_update_names_its_rows_by_their_tuple_ids(void)
+{
+	static const TxnMemtableVersionShown command = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND};
+	static const uint32 relations[] = {16384, 16390};
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	RepoRepo	repo;
+	RepoRepo	replica_repo;
+	HostSharedReader reading;
+	HostSharedHeld keyless;
+	HostSharedHeld deferred;
+	TreesStoreReader store;
+	TreesStoreReader replica_store;
+	TxnInsertRoom room = txn_insert_tests_room(28);
+	TxnInsertInserted took;
+	ChunksErrorError failed;
+	size_t		stopped = 0;
+	uint64		first;
+
+	txn_insert_tests_repository(io, 9342, 2666, 87, 2667, 46, &repo, &reading);
+	store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	keyless = txn_insert_tests_made_in(io, &repo, &reading, 9342, 16384);
+	deferred = txn_insert_tests_made_in(io, &repo, &reading, 9342, 16390);
+	first = txn_insert_tests_took(io, TREES_STORE_READER_NODE_STORE(&store), &keyless, txn_insert_tests_copy(1), 28,
+								  NULL, NULL, 0, 2677, 71);
+	took = txn_insert_tests_updated(io, TREES_STORE_READER_NODE_STORE(&store), &keyless, txn_insert_tests_copy(1),
+									txn_insert_tests_key(1), first, &room, NULL, &command, &stopped);
+	txn_insert_tests_took_is(2679, 9, &took, stopped, 2);
+	{
+		txn_insert_tests_op_t ops[] = {{"add", 2}, {"remove", first << 32 | 2}, {"add", first}};
+
+		txn_insert_tests_ops_are(2680, 9, txn_insert_tests_key_ops(io, &keyless, 1), ops, lengthof(ops));
+	}
+	first = txn_insert_tests_took(io, TREES_STORE_READER_NODE_STORE(&store), &deferred, txn_insert_tests_rowed(1), 28,
+								  NULL, NULL, 0, 2682, 73);
+	took = txn_insert_tests_updated(io, TREES_STORE_READER_NODE_STORE(&store), &deferred, txn_insert_tests_rowed(1),
+									txn_insert_tests_key(1), first, &room, NULL, &command, &stopped);
+	txn_insert_tests_took_is(2684, 9, &took, stopped, 2);
+	{
+		txn_insert_tests_op_t ops[] = {{"update row", first << 32 | 2}, {"add row", first}};
+
+		txn_insert_tests_ops_are(2685, 9, txn_insert_tests_key_ops(io, &deferred, 1), ops, lengthof(ops));
+	}
+	took = txn_insert_tests_updated(io, TREES_STORE_READER_NODE_STORE(&store), &deferred, txn_insert_tests_rowed(2),
+									txn_insert_tests_key(1), 2, &room, NULL, &command, &stopped);
+	txn_insert_tests_took_is(2687, 9, &took, stopped, 3);
+	{
+		StdVec		ops = txn_insert_tests_key_ops(io, &deferred, 1);
+		txn_insert_tests_op_t want = {"delete row", UINT64CONST(2) << 32 | 3};
+		const txn_insert_tests_op_t *got = &STD_VEC_AT(&ops, txn_insert_tests_op_t, 0);
+
+		if (ops.len == 0)
+			std_index_check(0, 0, RUST_FILE, 2688, 20);
+		STD_ASSERT_EQ(2688, 9, got->at == want.at && strcmp(got->name, want.name) == 0, got,
+					  txn_insert_tests_op_Debug_fmt, &want, txn_insert_tests_op_Debug_fmt);
+		std_vec_free_Checked(&ops, sizeof(txn_insert_tests_op_t), _Alignof(txn_insert_tests_op_t));
+	}
+	{
+		txn_insert_tests_op_t ops[] = {{"add row", 3}};
+
+		txn_insert_tests_ops_are(2689, 9, txn_insert_tests_key_ops(io, &deferred, 2), ops, lengthof(ops));
+	}
+	if (!repo_Repo_create(io, 9343, HOST_PG_DEFAULT, &replica_repo, &failed))
+		STD_RESULT_EXPECT_FAILED(2690, 95, "called `Result::unwrap()` on an `Err` value", &failed,
+								 chunks_error_Error_Debug_fmt);
+	replica_store = repo_Repo_reader(&replica_repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	for (size_t r = 0; r < lengthof(relations); r++)
+	{
+		const HostSharedHeld *primary = r == 0 ? &keyless : &deferred;
+		HostSharedHeld replica = txn_insert_tests_made_in(io, &replica_repo, &reading, 9343, relations[r]);
+
+		txn_insert_tests_replayed_rows(io, TREES_STORE_READER_NODE_STORE(&replica_store), &replica, 9342,
+									   relations[r]);
+		for (uint64 n = 1; n <= 2; n++)
+		{
+			StdVec		got = txn_insert_tests_key_ops(io, &replica, n);
+			StdVec		want = txn_insert_tests_key_ops(io, primary, n);
+
+			txn_insert_tests_ops_is(2696, 17, &got, &want);
+		}
+		host_shared_Held_drop(&replica);
+	}
+	txn_insert_tests_ended(io, 2699, 35);
+	repo_Repo_drop(&replica_repo);
+	host_shared_Held_drop(&deferred);
+	host_shared_Held_drop(&keyless);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	simc_TestIo_drop(&test_io);
+}
+
+/* txn_insert_tests_shown_t is what a version shows: its raw command id and the command id that ended it. */
+typedef struct txn_insert_tests_shown_t
+{
+	uint32		raw;
+	uint32		ended;
+} txn_insert_tests_shown_t;
+
+/* txn_insert_tests_shown_Debug_fmt is what a version shows's Debug, the tuple (raw, ended). */
+static bool
+txn_insert_tests_shown_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const txn_insert_tests_shown_t *shown = value;
+	StdTupleRef tuple = STD_TUPLE(2, STD_ITEM(&shown->raw, std_u32_Debug_fmt),
+								  STD_ITEM(&shown->ended, std_u32_Debug_fmt));
+
+	return std_tuple_Debug_fmt(&tuple, f);
+}
+
+/* txn_insert_tests_showns_Debug_fmt is a Vec<(u32, u32)>'s Debug. */
+static bool
+txn_insert_tests_showns_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const StdVec *shows = value;
+	StdDebugList list = std_fmt_debug_list(f);
+
+	for (size_t k = 0; k < shows->len; k++)
+		std_DebugList_entry(&list, &STD_VEC_AT(shows, txn_insert_tests_shown_t, k), txn_insert_tests_shown_Debug_fmt);
+	return std_DebugList_finish(&list);
+}
+
+/* txn_insert_tests_shows returns what each version of a test's numbered key shows, newest first. */
+static StdVec
+txn_insert_tests_shows(HostIoIo *io, const HostSharedHeld *held, uint64 n)
+{
+	StdVec		key = txn_insert_tests_key(n);
+	HostDeltaHold hold;
+	HostError	error;
+	StdVec		versions;
+	StdVec		shows;
+
+	if (!host_delta_hold(io, &hold, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(2716, 46, &error);
+	if (!txn_memtable_table_versions(io, &hold, host_shared_Held_record(held), key.ptr, key.len, &versions, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(2717, 79, &error);
+	std_vec_with_capacity_Checked(&shows, versions.len, sizeof(txn_insert_tests_shown_t),
+								  _Alignof(txn_insert_tests_shown_t));
+	for (size_t k = 0; k < versions.len; k++)
+	{
+		TxnMemtableVersionRecord record = txn_memtable_version_Version_record(&STD_VEC_AT(&versions,
+																						  TxnMemtableVersionVersion,
+																						  k));
+		txn_insert_tests_shown_t shown = {txn_memtable_version_Record_raw(&record),
+		txn_memtable_version_Record_ended(&record)};
+
+		std_vec_push_Checked(&shows, &shown, sizeof(shown), _Alignof(txn_insert_tests_shown_t));
+	}
+	txn_memtable_version_versions_drop(&versions, 0);
+	host_delta_Hold_drop(&hold);
+	std_vec_free_Checked(&key, 1, 1);
+	return shows;
+}
+
+/* txn_insert_tests_shows_are asserts at a line and column that what a key's versions show is what was wanted, and frees the list. */
+static void
+txn_insert_tests_shows_are(uint32 line, uint32 col, StdVec shows, const txn_insert_tests_shown_t *want,
+						   size_t want_len)
+{
+	StdVec		wanted = {(void *) want, want_len, want_len};
+	bool		eq = shows.len == want_len &&
+		memcmp(shows.ptr, want, want_len * sizeof(txn_insert_tests_shown_t)) == 0;
+
+	STD_ASSERT_EQ(line, col, eq, &shows, txn_insert_tests_showns_Debug_fmt, &wanted,
+				  txn_insert_tests_showns_Debug_fmt);
+	std_vec_free_Checked(&shows, sizeof(txn_insert_tests_shown_t), _Alignof(txn_insert_tests_shown_t));
+}
+
+/*
+ * (4b)'s section 6 and CommPF 7's ruling on a same-key update: an update of a
+ * row its own transaction wrote shows the combo command id its read gave on
+ * the row it ends, the new row's Put showing its own command for its own row
+ * and the combo id for the row it ended, and a move's end showing the combo
+ * id as its own.
+ */
+void
+test_txn_insert_tests_an_updates_combo_command_shows_on_the_row_it_ends(void)
+{
+	static const txn_insert_tests_shown_t kept[] = {{1, 7}, {0, 0}};
+	static const txn_insert_tests_shown_t both = {8, 8};
+	static const txn_insert_tests_shown_t moved[] = {{2, 2}};
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	TreesStoreReader store;
+	TxnInsertRoom room = txn_insert_tests_room(28);
+	TxnMemtableVersionShown combo = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMBO, .u.combo = 7};
+	TxnInsertInsert row;
+	TxnInsertInserted took;
+	size_t		stopped = 0;
+	uint64		first;
+	uint64		second;
+
+	txn_insert_tests_repository(io, 9344, 2709, 87, 2710, 46, &repo, &reading);
+	held = txn_insert_tests_stated(io, &repo, &reading, txn_insert_tests_stored(9344), 2711, 106);
+	store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	first = txn_insert_tests_took(io, TREES_STORE_READER_NODE_STORE(&store), &held,
+								  txn_insert_tests_row(txn_insert_tests_stored(9344), 1), 28, NULL, NULL, 0,
+								  2720, 81);
+	row = txn_insert_tests_row(txn_insert_tests_stored(9344), 1);
+	row.writer.command = 1;
+	took = txn_insert_tests_updated(io, TREES_STORE_READER_NODE_STORE(&store), &held, row, txn_insert_tests_key(1),
+									first, &room, NULL, &combo, &stopped);
+	if (took.tag != TXN_INSERT_INSERTED_TOOK)
+	{
+		static const StdFmtPiece pieces[] = {STD_FMT_ARG(0)};
+		TxnInsertInsertedRef shown = {&took, {&stopped, std_usize_Debug_fmt}};
+		StdFmtArg	args[] = {{&shown, txn_insert_Inserted_Debug_fmt}};
+		StdFmtArguments message = {pieces, lengthof(pieces), args};
+
+		std_panic_fmt(RUST_FILE, 2723, 50, &message);
+	}
+	second = took.u.took.tuple;
+	txn_insert_tests_shows_are(2724, 9, txn_insert_tests_shows(io, &held, 1), kept, lengthof(kept));
+	row = txn_insert_tests_row(txn_insert_tests_stored(9344), 2);
+	row.writer.command = 2;
+	combo.u.combo = 8;
+	took = txn_insert_tests_updated(io, TREES_STORE_READER_NODE_STORE(&store), &held, row, txn_insert_tests_key(1),
+									second, &room, NULL, &combo, &stopped);
+	STD_ASSERT(2727, 9, took.tag == TXN_INSERT_INSERTED_TOOK, "matches!(took, Inserted::Took(_))");
+	{
+		StdVec		shows = txn_insert_tests_shows(io, &held, 1);
+
+		const txn_insert_tests_shown_t *got;
+
+		std_index_check(0, shows.len, RUST_FILE, 2728, 20);
+		got = &STD_VEC_AT(&shows, txn_insert_tests_shown_t, 0);
+		STD_ASSERT_EQ(2728, 9, got->raw == both.raw && got->ended == both.ended, got,
+					  txn_insert_tests_shown_Debug_fmt, &both, txn_insert_tests_shown_Debug_fmt);
+		std_vec_free_Checked(&shows, sizeof(txn_insert_tests_shown_t), _Alignof(txn_insert_tests_shown_t));
+	}
+	txn_insert_tests_shows_are(2729, 9, txn_insert_tests_shows(io, &held, 2), moved, lengthof(moved));
+	txn_insert_tests_ended(io, 2730, 35);
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	simc_TestIo_drop(&test_io);
+}
+
+/* txn_insert_tests_token_is asserts at a line and column that a key's newest version holds the token wanted, or none. */
+static void
+txn_insert_tests_token_is(uint32 line, uint32 col, const StdVec *versions, uint32 index_line, uint32 index_col,
+						  bool has_want, uint32 want)
+{
+	uint32		token = 0;
+	bool		has;
+	StdOptionRef got;
+	StdOptionRef wanted = {has_want, {&want, std_u32_Debug_fmt}};
+
+	std_index_check(0, versions->len, RUST_FILE, index_line, index_col);
+	has = txn_memtable_version_Version_token(&STD_VEC_AT(versions, TxnMemtableVersionVersion, 0), &token);
+	got = (StdOptionRef)
+	{
+		has,
+		{
+			&token, std_u32_Debug_fmt
+		}
+	};
+	STD_ASSERT_EQ(line, col, has == has_want && (!has || token == want), &got, std_option_Debug_fmt, &wanted,
+				  std_option_Debug_fmt);
+}
+
+/* txn_insert_tests_completion returns the completion of a speculative insert of a key at a tuple id, written by a writer. */
+static TxnRecordCompletion
+txn_insert_tests_completion(TxnMemtableVersionWriter writer, uint64 key, uint64 tid)
+{
+	TxnRecordCompletion completion = {.writer = writer, .storage = txn_insert_tests_stored(9345), .tuple = {tid}};
+
+	completion.key = txn_insert_tests_key(key);
+	return completion;
+}
+
+/* txn_insert_tests_completed runs a speculative insert's completion, logged or not, unwrapped at a line and column, and answers it. */
+static bool
+txn_insert_tests_completed(HostIoIo *io, const HostSharedHeld *held, TxnRecordCompletion completion,
+						   TxnInsertCompleted completed, bool logged, uint32 line, uint32 col)
+{
+	HostError	error;
+	bool		result;
+
+	if (!txn_insert_complete(io, held, &completion, completed, logged, &result, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(line, col, &error);
+	std_vec_free_Checked(&completion.key, 1, 1);
+	return result;
+}
+
+/* txn_insert_tests_bools_Debug_fmt is a Vec<bool>'s Debug. */
+static bool
+txn_insert_tests_bools_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const StdVec *bools = value;
+	StdDebugList list = std_fmt_debug_list(f);
+
+	for (size_t k = 0; k < bools->len; k++)
+		std_DebugList_entry(&list, &STD_VEC_AT(bools, bool, k), std_bool_Debug_fmt);
+	return std_DebugList_finish(&list);
+}
+
+/*
+ * (4b)'s speculative insert: an insert with a token pushes its version
+ * holding the token, which a Dirty read of the key reports with the running
+ * writer, and the insert's confirm clears it; a killed one is left out of
+ * what a checkpoint's runs write.
+ */
+void
+test_txn_insert_tests_a_speculative_insert_holds_its_token_until_confirmed(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	TreesStoreReader store;
+	HostXid		running;
+	TxnMemtableVersionWriter writer;
+	TxnInsertInsert row;
+	uint64		first;
+	uint64		second;
+	HostDeltaHold hold;
+	StdVec		versions;
+	SimcTaken	dirty;
+	HostSnapshot lent;
+	TxnVisibleRule rule;
+	TxnVisibleSeen seen;
+	HostError	error;
+	StdVec		writes;
+	StdVec		killed;
+	StdVec		chains;
+	uint8		one[8];
+
+	txn_insert_tests_repository(io, 9345, 2740, 87, 2741, 46, &repo, &reading);
+	held = txn_insert_tests_stated(io, &repo, &reading, txn_insert_tests_stored(9345), 2742, 106);
+	store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	running = simc_begin();
+	writer = (TxnMemtableVersionWriter)
+	{
+		.xid = running.f0
+	};
+	row = txn_insert_tests_row(txn_insert_tests_stored(9345), 1);
+	row.writer = writer;
+	row.has_token = true;
+	row.token = 5;
+	first = txn_insert_tests_took(io, TREES_STORE_READER_NODE_STORE(&store), &held, row, 28, NULL, NULL, 0,
+								  2748, 110);
+	if (!host_delta_hold(io, &hold, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(2749, 42, &error);
+	std_u64_to_be_bytes(1, one);
+	if (!txn_memtable_table_versions(io, &hold, host_shared_Held_record(&held), one, sizeof(one), &versions, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(2750, 87, &error);
+	txn_insert_tests_token_is(2751, 9, &versions, 2751, 20, true, 5);
+	dirty = simc_snapshot(HOST_SNAPSHOT_KIND_DIRTY, false);
+	lent = simc_Taken_lent(&dirty);
+	rule.ops = &TXN_VISIBLE_SNAPSHOT_RULE_OPS;
+	rule.self = &lent;
+	if (!txn_visible_seen(io, rule, versions.ptr, versions.len, NULL, &seen, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(2753, 70, &error);
+	std_index_check(0, seen.rows.len, RUST_FILE, 2754, 21);
+	{
+		const TxnVisibleDirty *found = &STD_VEC_AT(&seen.rows, TxnVisibleSeenRow, 0).dirty;
+		uint32		five = 5;
+		StdOptionRef xmin = {found->has_xmin, {&found->xmin, host_Xid_Debug_fmt}};
+		StdOptionRef token = {found->has_token, {&found->token, std_u32_Debug_fmt}};
+		StdOptionRef want_xmin = {true, {&running, host_Xid_Debug_fmt}};
+		StdOptionRef want_token = {true, {&five, std_u32_Debug_fmt}};
+		StdTupleRef got = STD_TUPLE(2, STD_ITEM(&xmin, std_option_Debug_fmt), STD_ITEM(&token, std_option_Debug_fmt));
+		StdTupleRef want = STD_TUPLE(2, STD_ITEM(&want_xmin, std_option_Debug_fmt),
+									 STD_ITEM(&want_token, std_option_Debug_fmt));
+
+		STD_ASSERT_EQ(2754, 9, found->has_xmin && found->xmin.f0 == running.f0 && found->has_token &&
+					  found->token == 5, &got, std_tuple_Debug_fmt, &want, std_tuple_Debug_fmt);
+	}
+	STD_ASSERT(2761, 9, txn_insert_tests_completed(io, &held, txn_insert_tests_completion(writer, 1, first),
+												   TXN_INSERT_COMPLETED_CONFIRMED, true, 2761, 90),
+			   "complete(io, &held, &completion(1, first), (Completed::Confirmed, true)).unwrap()");
+	txn_insert_tests_token_is(2762, 9, &versions, 2762, 20, false, 0);
+	txn_visible_Seen_drop(&seen);
+	txn_memtable_version_versions_drop(&versions, 0);
+	host_delta_Hold_drop(&hold);
+	row = txn_insert_tests_row(txn_insert_tests_stored(9345), 2);
+	row.writer = writer;
+	row.has_token = true;
+	row.token = 6;
+	second = txn_insert_tests_took(io, TREES_STORE_READER_NODE_STORE(&store), &held, row, 28, NULL, NULL, 0,
+								   2766, 110);
+	STD_ASSERT(2767, 9, txn_insert_tests_completed(io, &held, txn_insert_tests_completion(writer, 2, second),
+												   TXN_INSERT_COMPLETED_KILLED, true, 2767, 88),
+			   "complete(io, &held, &completion(2, second), (Completed::Killed, true)).unwrap()");
+	STD_ASSERT(2768, 9, !txn_insert_tests_completed(io, &held, txn_insert_tests_completion(writer, 3, second),
+													TXN_INSERT_COMPLETED_KILLED, false, 2768, 90),
+			   "!complete(io, &held, &completion(3, second), (Completed::Killed, false)).unwrap()");
+	writes = txn_insert_tests_logged(9345);
+	std_vec_new(&killed, sizeof(bool), _Alignof(bool));
+	for (size_t k = 0; k < writes.len; k++)
+	{
+		const txn_insert_tests_logged_t *write = &STD_VEC_AT(&writes, txn_insert_tests_logged_t, k);
+
+		if (write->tag == TXN_INSERT_TESTS_LOGGED_ROW)
+			std_vec_push_Checked(&killed, &write->u.row.speculative, sizeof(bool), _Alignof(bool));
+	}
+	{
+		static const bool both[] = {true, true};
+		StdVec		wanted = {(void *) both, 2, 2};
+		bool		eq = killed.len == 2 && STD_VEC_AT(&killed, bool, 0) && STD_VEC_AT(&killed, bool, 1);
+
+		STD_ASSERT_EQ(2773, 9, eq, &killed, txn_insert_tests_bools_Debug_fmt, &wanted,
+					  txn_insert_tests_bools_Debug_fmt);
+	}
+	std_vec_free_Checked(&killed, sizeof(bool), _Alignof(bool));
+	txn_insert_tests_logged_free(&writes);
+	chains = txn_insert_tests_chains(io, host_shared_Held_record(&held));
+	{
+		txn_insert_tests_chain_t want = {.key = {one, sizeof(one), sizeof(one)}, .versions = 1};
+		StdVec		wanted = {&want, 1, 1};
+
+		STD_ASSERT_EQ(2774, 9, txn_insert_tests_chains_eq(&chains, &wanted), &chains, txn_insert_tests_chains_Debug_fmt, &wanted,
+					  txn_insert_tests_chains_Debug_fmt);
+	}
+	txn_insert_tests_chains_free(&chains);
+	txn_insert_tests_ended(io, 2775, 35);
+	simc_Taken_drop(&dirty);
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * An aborted update that moves its row goes whole at its take-back: the new
+ * key's put and the old key's move, since turn records both keys in its list
+ * before its prepare, and the committed row's put stays its key's one
+ * version.
+ */
+void
+test_txn_insert_tests_an_aborted_updates_new_row_and_end_go_at_the_take_back(void)
+{
+	static const TxnMemtableVersionShown command = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND};
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	TreesStoreReader store;
+	TxnInsertRoom room = txn_insert_tests_room(28);
+	TxnInsertInsert row;
+	TxnInsertInserted moved;
+	HostXid		committed;
+	HostXid		aborted;
+	HostError	error;
+	size_t		stopped = 0;
+	uint64		first;
+
+	txn_insert_tests_repository(io, 9389, 2785, 87, 2786, 46, &repo, &reading);
+	held = txn_insert_tests_stated(io, &repo, &reading, txn_insert_tests_stored(9389), 2787, 106);
+	store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	committed = simc_begin();
+	aborted = simc_begin();
+	row = txn_insert_tests_row(txn_insert_tests_stored(9389), 1);
+	row.writer.xid = committed.f0;
+	first = txn_insert_tests_took(io, TREES_STORE_READER_NODE_STORE(&store), &held, row, 28, NULL, NULL, 0,
+								  2792, 66);
+	simc_commit(committed);
+	txn_insert_tests_ended(io, 2794, 28);
+	row = txn_insert_tests_row(txn_insert_tests_stored(9389), 2);
+	row.writer.xid = aborted.f0;
+	moved = txn_insert_tests_updated(io, TREES_STORE_READER_NODE_STORE(&store), &held, row, txn_insert_tests_key(1),
+									 first, &room, NULL, &command, &stopped);
+	STD_ASSERT(2798, 9, moved.tag == TXN_INSERT_INSERTED_TOOK, "matches!(moved, Inserted::Took(_))");
+	{
+		StdVec		ops = txn_insert_tests_key_ops(io, &held, 1);
+		StdStr		got;
+		StdStr		want = {"move", 4};
+
+		std_index_check(0, ops.len, RUST_FILE, 2799, 20);
+		got = (StdStr)
+		{
+			STD_VEC_AT(&ops, txn_insert_tests_op_t, 0).name,
+				strlen(STD_VEC_AT(&ops, txn_insert_tests_op_t, 0).name)
+		};
+		STD_ASSERT_EQ(2799, 9, strcmp(got.ptr, "move") == 0, &got, std_str_Debug_fmt, &want,
+					  std_str_Debug_fmt);
+		std_vec_free_Checked(&ops, sizeof(txn_insert_tests_op_t), _Alignof(txn_insert_tests_op_t));
+	}
+	simc_abort(aborted);
+	if (!txn_written_aborted(io, 0, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(2801, 30, &error);
+	{
+		txn_insert_tests_op_t put[] = {{"put", first}};
+
+		txn_insert_tests_ops_are(2802, 9, txn_insert_tests_key_ops(io, &held, 1), put, lengthof(put));
+		txn_insert_tests_ops_are(2803, 9, txn_insert_tests_key_ops(io, &held, 2), NULL, 0);
+	}
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	simc_TestIo_drop(&test_io);
+}
+
+/* txn_insert_tests_Folded_Equal_equal is Folded's Equal: keys are equal when their bytes are. */
+static bool
+txn_insert_tests_Folded_Equal_equal(void *self, HostIoIo *io, const uint8 *a, size_t a_len, const uint8 *b, size_t b_len,
+									bool *result, HostError *error)
+{
+	*result = a_len == b_len && memcmp(a, b, a_len) == 0;
+	return true;
+}
+
+/*
+ * TXN_INSERT_TESTS_FOLDED_OPS is Folded's Equal, a test's class equality
+ * that calls keys equal when their bytes are, so a resolve takes the path of
+ * a key whose class compares by a function, its stripe the storage's, with no
+ * key equal to another.
+ */
+static const TxnInsertEqualOps TXN_INSERT_TESTS_FOLDED_OPS = {txn_insert_tests_Folded_Equal_equal};
+
+/* txn_insert_tests_resolver is the stripe case's resolver: an immediate key's insert under the storage's stripe takes (0,4). */
+static bool
+txn_insert_tests_resolver(void *captures, HostIoIo *io, HostError *error)
+{
+	static const StdFmtPiece pieces[] = {STD_FMT_LIT("the resolve gave "), STD_FMT_ARG(0)};
+	HostStorage storage = txn_insert_tests_stored(9390);
+	TreesKeyOrder order = {.tag = TREES_KEY_ORDER_BYTES};
+	TxnInsertRoom room = txn_insert_tests_room(28);
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	TxnInsertInserted inserted;
+	bool		ok;
+
+	if (!txn_insert_tests_opened(io, storage, &repo, &reading, &held, error))
+		return false;
+	{
+		TreesStoreReader store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+		TxnInsertKeyed keyed = {.stripe = txn_change_stripe(&storage, NULL, 0, false), .has_unique = true,
+		.unique = {.order = &order, .index = 16386, .has_equal = true, .equal = {&TXN_INSERT_TESTS_FOLDED_OPS, NULL}}};
+		HostIoWaits waits = host_io_Waits_testing();
+		TxnInsertInsert row = txn_insert_tests_row(storage, 100);
+
+		ok = txn_insert_insert(io, TREES_STORE_READER_NODE_STORE(&store), &held, &row, &room, NULL, NULL, NULL, 0,
+							   keyed, &waits, &inserted, error);
+	}
+	if (ok && !(inserted.tag == TXN_INSERT_INSERTED_TOOK && inserted.u.took.tuple == 4))
+	{
+		TxnInsertInsertedRef other = {&inserted, {NULL, std_unit_Debug_fmt}};
+		StdFmtArg	args[] = {{&other, txn_insert_Inserted_Debug_fmt}};
+		StdFmtArguments arguments = {pieces, lengthof(pieces), args};
+
+		*error = txn_insert_tests_gathering_fork(&arguments);
+		ok = false;
+	}
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	return ok;
+}
+
+/* txn_insert_tests_inserteds_Debug_fmt is a Vec<Inserted<()>>'s Debug. */
+static bool
+txn_insert_tests_inserteds_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const StdVec *inserteds = value;
+	StdDebugList list = std_fmt_debug_list(f);
+
+	for (size_t k = 0; k < inserteds->len; k++)
+	{
+		TxnInsertInsertedRef one = {&STD_VEC_AT(inserteds, TxnInsertInserted, k), {NULL, std_unit_Debug_fmt}};
+
+		std_DebugList_entry(&list, &one, txn_insert_Inserted_Debug_fmt);
+	}
+	return std_DebugList_finish(&list);
+}
+
+/* txn_insert_tests_pusher is the stripe case's pusher: four keyless-striped inserts, the last after the resolve's. */
+static bool
+txn_insert_tests_pusher(void *captures, HostIoIo *io, HostError *error)
+{
+	static const StdFmtPiece pieces[] = {STD_FMT_LIT("the pushes gave "), STD_FMT_ARG(0)};
+	static const uint64 tids[] = {1, 2, 3, 5};
+	HostStorage storage = txn_insert_tests_stored(9390);
+	TxnInsertRoom room = txn_insert_tests_room(28);
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	StdVec		took;
+	bool		ok = true;
+
+	if (!txn_insert_tests_opened(io, storage, &repo, &reading, &held, error))
+		return false;
+	std_vec_new(&took, sizeof(TxnInsertInserted), _Alignof(TxnInsertInserted));
+	{
+		TreesStoreReader store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+		HostIoWaits waits = host_io_Waits_testing();
+
+		for (uint64 n = 1; ok && n <= 4; n++)
+		{
+			TxnInsertKeyed keyed = {.stripe = txn_change_stripe(&storage, NULL, 0, false)};
+			TxnInsertInsert row = txn_insert_tests_row(storage, n);
+			TxnInsertInserted inserted;
+
+			ok = txn_insert_insert(io, TREES_STORE_READER_NODE_STORE(&store), &held, &row, &room, NULL, NULL, NULL, 0,
+								   keyed, &waits, &inserted, error);
+			if (ok)
+				std_vec_push_Checked(&took, &inserted, sizeof(inserted), _Alignof(TxnInsertInserted));
+		}
+	}
+	if (ok)
+	{
+		bool		eq = took.len == lengthof(tids);
+
+		for (size_t k = 0; eq && k < took.len; k++)
+			eq = STD_VEC_AT(&took, TxnInsertInserted, k).tag == TXN_INSERT_INSERTED_TOOK &&
+				STD_VEC_AT(&took, TxnInsertInserted, k).u.took.tuple == tids[k];
+		if (!eq)
+		{
+			StdFmtArg	args[] = {{&took, txn_insert_tests_inserteds_Debug_fmt}};
+			StdFmtArguments arguments = {pieces, lengthof(pieces), args};
+
+			*error = txn_insert_tests_gathering_fork(&arguments);
+			ok = false;
+		}
+	}
+	std_vec_free_Checked(&took, sizeof(TxnInsertInserted), _Alignof(TxnInsertInserted));
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	return ok;
+}
+
+/*
+ * (4b)'s section 3's hold-back flag: a resolve over its storage's stripe,
+ * held at its read while another writer of the storage pushes a row three
+ * times, starts over three times and holds the stripe back at the third, so
+ * that writer's next insert sleeps before its read until the resolve
+ * finishes, within 3 plus 2 rounds, and takes the tuple id after the
+ * resolve's.
+ */
+void
+test_txn_insert_tests_a_resolve_whose_stripe_moves_three_times_holds_its_writers_back(void)
+{
+	static const SimcStep steps[] = {{"pusher", 6, UINT64_MAX}, {"resolver", 8, UINT64_MAX}, {"pusher", 6, UINT64_MAX}};
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	SimcActor	resolver = {txn_insert_tests_resolver};
+	SimcActor	pusher = {txn_insert_tests_pusher};
+	RepoRepo	repo;
+	ChunksErrorError failed;
+	SimcRun		run;
+	SimcReport	report;
+
+	if (!repo_Repo_create(io, 9390, HOST_PG_DEFAULT, &repo, &failed))
+		STD_RESULT_EXPECT_FAILED(2825, 81, "called `Result::unwrap()` on an `Err` value", &failed,
+								 chunks_error_Error_Debug_fmt);
+	repo_Repo_drop(&repo);
+	run = simc_Run_new(1);
+	simc_Run_actor(&run, "resolver", 8, resolver);
+	simc_Run_actor(&run, "pusher", 6, pusher);
+	for (int k = 0; k < 3; k++)
+	{
+		simc_Run_until(&run, "resolver", 8, "doltgres-insert-resolved");
+		simc_Run_until(&run, "pusher", 6, "doltgres-memtable-unpinned");
+	}
+	simc_Run_until(&run, "resolver", 8, "doltgres-insert-resolved");
+	simc_Run_script(&run, steps, lengthof(steps));
+	report = simc_Run_finish(run);
+	txn_vacuum_tests_returned(&report, RUST_FILE, 2863, 67, 2864, 9);
+	simc_Report_drop(&report);
+	simc_TestIo_drop(&test_io);
+}
+
+/* txn_insert_tests_go is an update's read that goes on as the transaction's command, naming no row. */
+static bool
+txn_insert_tests_go(void *captures, HostIoIo *io, TxnMemtableVersionVersion *versions, size_t versions_len,
+					TxnChangeRead *result, void *stopped, HostError *error)
+{
+	*result = (TxnChangeRead)
+	{
+		.tag = TXN_CHANGE_READ_GO, .u.go.shown.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND
+	};
+	return true;
+}
+
+/* txn_insert_tests_kept_t is kept_across's updater's captures: its database and its row's tuple id. */
+typedef struct txn_insert_tests_kept_t
+{
+	uint32		database;
+	uint64		tid;
+} txn_insert_tests_kept_t;
+
+/* txn_insert_tests_kept_updater is kept_across's updater: an update of the row that keeps its two out-of-line values. */
+static bool
+txn_insert_tests_kept_updater(void *captures, HostIoIo *io, HostError *error)
+{
+	static const size_t kept[] = {0, 1};
+	const txn_insert_tests_kept_t *c = captures;
+	HostStorage storage = txn_insert_tests_stored(c->database);
+	HostStorage toasted = storage;
+	TxnInsertRoom room = txn_insert_tests_room(60);
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	HostSharedHeld toast;
+	bool		ok;
+
+	toasted.relation = 16390;
+	if (!txn_insert_tests_opened(io, storage, &repo, &reading, &held, error))
+		return false;
+	if (!txn_state_state(io, &repo, &reading, &toasted, TXN_STATE_PERSISTENCE_PERMANENT, false, NULL, &toast, error))
+	{
+		host_shared_Held_drop(&held);
+		host_shared_Reader_drop(&reading);
+		repo_Repo_drop(&repo);
+		return false;
+	}
+	{
+		TreesStoreReader store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+		TxnValuesEntry entries[2];
+		TxnInsertInsert row = txn_insert_tests_valued(c->database, entries);
+		TxnInsertReplaces replaces = {.tuple = {c->tid}, .lock = TXN_MEMTABLE_LOCK_MODE_NO_KEY_UPDATE};
+		TxnInsertKeyed keyed = {.stripe = txn_change_stripe(&storage, row.key.ptr, row.key.len, true)};
+		HostIoWaits waits = host_io_Waits_testing();
+		TxnInsertInserted inserted;
+
+		std_vec_free_Checked(&row.kept, sizeof(size_t), _Alignof(size_t));
+		std_slice_to_vec_Checked(&row.kept, kept, lengthof(kept), sizeof(size_t), _Alignof(size_t));
+		std_vec_clone(&replaces.key, &row.key, 1, 1);
+		replaces.stripe = txn_change_stripe(&storage, replaces.key.ptr, replaces.key.len, true);
+		ok = txn_insert_update(io, TREES_STORE_READER_NODE_STORE(&store), &held, &row, &replaces, &room, NULL, &toast,
+							   NULL, 0, keyed, &waits, txn_insert_tests_go, NULL, NULL, NULL, &inserted, error);
+	}
+	host_shared_Held_drop(&toast);
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	return ok;
+}
+
+/*
+ * txn_insert_tests_kept_across runs an update that keeps a row's two
+ * out-of-line values while a checkpoint runs, placed by a script: with the
+ * update held between its count adds' push and its row's push, the
+ * checkpoint's runs hold the adds and not the row; run before the update,
+ * neither; after it, both. A crash and redo of every logged record then leave
+ * each kept value's count at 2, and a second crash during that redo and redo
+ * again leave it at 2.
+ */
+static void
+txn_insert_tests_kept_across(uint32 database, void (*script) (SimcRun *run))
+{
+	static const uint64 twice[] = {2, 2};
+	SimcProcess process = simc_process();
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostStorage storage = txn_insert_tests_stored(database);
+	HostStorage toasted = storage;
+	txn_insert_tests_kept_t c = {.database = database};
+	SimcActor	checkpointer = {txn_insert_tests_checkpointer};
+	SimcActor	updater = {txn_insert_tests_kept_updater, &c};
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	HostSharedHeld toast;
+	HostSharedHeld deltas;
+	TreesStoreReader store;
+	TxnValuesEntry entries[2];
+	TxnInsertInsert row;
+	SimcRun		run;
+	SimcReport	report;
+	HostError	error;
+
+	toasted.relation = 16390;
+	txn_insert_tests_repository(io, database, 2878, 59, 2879, 46, &repo, &reading);
+	row = txn_insert_tests_valued(database, entries);
+	deltas = txn_insert_tests_written(io, database, row.writer, entries);
+	host_shared_Held_drop(&deltas);
+	held = txn_insert_tests_stated(io, &repo, &reading, storage, 2884, 99);
+	toast = txn_insert_tests_toasted(io, &repo, &reading, database, 2885, 100);
+	store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	c.tid = txn_insert_tests_took(io, TREES_STORE_READER_NODE_STORE(&store), &held, row, 60, &toast, entries, 2,
+								  2887, 78);
+	host_shared_Held_drop(&toast);
+	host_shared_Held_drop(&held);
+	simc_checkpointed(UINT64CONST(0x100000000));
+	run = simc_Run_new(1);
+	simc_Run_actor(&run, "checkpointer", 12, checkpointer);
+	simc_Run_actor(&run, "updater", 7, updater);
+	script(&run);
+	report = simc_Run_finish(run);
+	txn_vacuum_tests_returned(&report, RUST_FILE, 2915, 67, 2916, 9);
+	simc_Report_drop(&report);
+	if (!txn_memtable_branch_deltas(io, database, HOST_PG_DEFAULT, &deltas, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(2918, 65, &error);
+	store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	for (int k = 0; k < 2; k++)
+	{
+		StdVec		writes;
+		uint64		counts[2];
+
+		if (!txn_state_unlinked(io, &storage, &error))
+			TXN_INSERT_TESTS_UNWRAP_FAILED(2921, 37, &error);
+		if (!txn_state_unlinked(io, &toasted, &error))
+			TXN_INSERT_TESTS_UNWRAP_FAILED(2922, 37, &error);
+		if (!txn_runs_loaded(io, &TXN_INSERT_TESTS_PAGE, &error))
+			TXN_INSERT_TESTS_UNWRAP_FAILED(2923, 71, &error);
+		held = txn_insert_tests_stated(io, &repo, &reading, storage, 2924, 99);
+		toast = txn_insert_tests_toasted(io, &repo, &reading, database, 2925, 100);
+		writes = txn_insert_tests_logged(database);
+		txn_insert_tests_redone(io, TREES_STORE_READER_NODE_STORE(&store), &held, &toast, &deltas, &writes);
+		txn_insert_tests_counts(io, TREES_STORE_READER_NODE_STORE(&store), &toast, 2927, 95,
+								2927, 104, counts);
+		txn_insert_tests_u64s_is(2928, 13, counts, 2, twice, 2);
+		host_shared_Held_drop(&toast);
+		host_shared_Held_drop(&held);
+	}
+	txn_insert_tests_ended(io, 2930, 35);
+	host_shared_Held_drop(&deltas);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	simc_TestIo_drop(&test_io);
+	simc_Process_drop(&process);
+}
+
+/* txn_insert_tests_kept_between holds the update between its count adds' push and its row's push while the checkpoint runs. */
+static void
+txn_insert_tests_kept_between(SimcRun *run)
+{
+	static const SimcStep steps[] = {{"checkpointer", 12, UINT64_MAX}, {"updater", 7, UINT64_MAX},
+	{"checkpointer", 12, UINT64_MAX}};
+
+	simc_Run_until(run, "updater", 7, "doltgres-insert-logged");
+	simc_Run_script(run, steps, lengthof(steps));
+}
+
+/*
+ * (4b)'s section 5: an update held between its kept values' count adds and
+ * its row's push while a checkpoint sweeps its storage's rows and then its
+ * maps, a crash, and redo leave each kept value's count at 2, not 3, and a
+ * second crash during that redo too.
+ */
+void
+test_txn_insert_tests_a_checkpoint_between_an_updates_count_adds_and_its_row_leaves_the_counts_once(void)
+{
+	txn_insert_tests_kept_across(9391, txn_insert_tests_kept_between);
+}
+
+/* txn_insert_tests_kept_before runs the checkpoint before the update. */
+static void
+txn_insert_tests_kept_before(SimcRun *run)
+{
+	static const SimcStep steps[] = {{"checkpointer", 12, UINT64_MAX}, {"updater", 7, UINT64_MAX}};
+
+	simc_Run_script(run, steps, lengthof(steps));
+}
+
+/* txn_insert_tests_kept_after runs the checkpoint after the update. */
+static void
+txn_insert_tests_kept_after(SimcRun *run)
+{
+	static const SimcStep steps[] = {{"updater", 7, UINT64_MAX}, {"checkpointer", 12, UINT64_MAX}};
+
+	simc_Run_script(run, steps, lengthof(steps));
+}
+
+/*
+ * (4b)'s section 5: a checkpoint before an update that keeps two values, or
+ * after it, a crash, and redo leave each kept value's count at 2.
+ */
+void
+test_txn_insert_tests_a_checkpoint_before_or_after_an_update_leaves_its_kept_counts_once(void)
+{
+	txn_insert_tests_kept_across(9392, txn_insert_tests_kept_before);
+	txn_insert_tests_kept_across(9393, txn_insert_tests_kept_after);
+}
+
+/* txn_insert_tests_moving_updater is the key change case's updater: an update that moves its row from key 1 to key 2. */
+static bool
+txn_insert_tests_moving_updater(void *captures, HostIoIo *io, HostError *error)
+{
+	const uint64 *tid = captures;
+	HostStorage storage = txn_insert_tests_stored(9394);
+	TxnInsertRoom room = txn_insert_tests_room(28);
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	bool		ok;
+
+	if (!txn_insert_tests_opened(io, storage, &repo, &reading, &held, error))
+		return false;
+	{
+		TreesStoreReader store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+		TxnInsertInsert row = txn_insert_tests_row(storage, 2);
+		TxnInsertReplaces replaces = {.key = txn_insert_tests_key(1), .tuple = {*tid},
+		.lock = TXN_MEMTABLE_LOCK_MODE_UPDATE};
+		TxnInsertKeyed keyed = {.stripe = txn_change_stripe(&storage, row.key.ptr, row.key.len, true)};
+		HostIoWaits waits = host_io_Waits_testing();
+		TxnInsertInserted inserted;
+
+		replaces.stripe = txn_change_stripe(&storage, replaces.key.ptr, replaces.key.len, true);
+		ok = txn_insert_update(io, TREES_STORE_READER_NODE_STORE(&store), &held, &row, &replaces, &room, NULL, NULL,
+							   NULL, 0, keyed, &waits, txn_insert_tests_go, NULL, NULL, NULL, &inserted, error);
+	}
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	return ok;
+}
+
+/*
+ * (4b)'s section 10: an update that moves its row from key 1 to key 2, held
+ * between its old key's move and its new key's put while a checkpoint runs,
+ * so the runs hold the move and not the put, a crash, and redo of every
+ * logged record leave both chains as the primary's, and a second crash
+ * during that redo too.
+ */
+void
+test_txn_insert_tests_a_crash_after_a_key_change_whose_runs_hold_one_chain_redoes_both(void)
+{
+	static const SimcStep steps[] = {{"checkpointer", 12, UINT64_MAX}, {"updater", 7, UINT64_MAX},
+	{"checkpointer", 12, UINT64_MAX}};
+	SimcProcess process = simc_process();
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostStorage storage = txn_insert_tests_stored(9394);
+	uint64		tid;
+	SimcActor	checkpointer = {txn_insert_tests_checkpointer};
+	SimcActor	updater = {txn_insert_tests_moving_updater, &tid};
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	TreesStoreReader store;
+	StdVec		wanted;
+	StdVec		primary;
+	SimcRun		run;
+	SimcReport	report;
+	HostError	error;
+
+	txn_insert_tests_repository(io, 9394, 2962, 59, 2963, 46, &repo, &reading);
+	held = txn_insert_tests_stated(io, &repo, &reading, storage, 2966, 99);
+	store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	tid = txn_insert_tests_took(io, TREES_STORE_READER_NODE_STORE(&store), &held, txn_insert_tests_row(storage, 1), 28,
+								NULL, NULL, 0, 2968, 64);
+	host_shared_Held_drop(&held);
+	simc_checkpointed(UINT64CONST(0x100000000));
+	run = simc_Run_new(1);
+	simc_Run_actor(&run, "checkpointer", 12, checkpointer);
+	simc_Run_actor(&run, "updater", 7, updater);
+	simc_Run_until(&run, "updater", 7, "doltgres-insert-logged");
+	simc_Run_script(&run, steps, lengthof(steps));
+	report = simc_Run_finish(run);
+	txn_vacuum_tests_returned(&report, RUST_FILE, 2993, 67, 2994, 9);
+	simc_Report_drop(&report);
+	held = txn_insert_tests_stated(io, &repo, &reading, storage, 2997, 99);
+	primary = txn_insert_tests_chains(io, host_shared_Held_record(&held));
+	host_shared_Held_drop(&held);
+	std_vec_new(&wanted, sizeof(txn_insert_tests_chain_t), _Alignof(txn_insert_tests_chain_t));
+	for (uint64 n = 1; n <= 2; n++)
+	{
+		txn_insert_tests_chain_t chain = {.key = txn_insert_tests_key(n), .versions = 3 - n};
+
+		std_vec_push_Checked(&wanted, &chain, sizeof(chain), _Alignof(txn_insert_tests_chain_t));
+	}
+	STD_ASSERT_EQ(3000, 9, txn_insert_tests_chains_eq(&primary, &wanted), &primary,
+				  txn_insert_tests_chains_Debug_fmt, &wanted, txn_insert_tests_chains_Debug_fmt);
+	txn_insert_tests_chains_free(&wanted);
+	store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+	for (int k = 0; k < 2; k++)
+	{
+		StdVec		chains;
+
+		if (!txn_state_unlinked(io, &storage, &error))
+			TXN_INSERT_TESTS_UNWRAP_FAILED(3003, 37, &error);
+		if (!txn_runs_loaded(io, &TXN_INSERT_TESTS_PAGE, &error))
+			TXN_INSERT_TESTS_UNWRAP_FAILED(3004, 71, &error);
+		held = txn_insert_tests_stated(io, &repo, &reading, storage, 3005, 99);
+		txn_insert_tests_replayed_rows(io, TREES_STORE_READER_NODE_STORE(&store), &held, 9394, 16384);
+		chains = txn_insert_tests_chains(io, host_shared_Held_record(&held));
+		STD_ASSERT_EQ(3007, 13, txn_insert_tests_chains_eq(&chains, &primary), &chains,
+					  txn_insert_tests_chains_Debug_fmt, &primary, txn_insert_tests_chains_Debug_fmt);
+		txn_insert_tests_chains_free(&chains);
+		host_shared_Held_drop(&held);
+	}
+	txn_insert_tests_ended(io, 3009, 35);
+	txn_insert_tests_chains_free(&primary);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	simc_TestIo_drop(&test_io);
+	simc_Process_drop(&process);
+}
+
+/* txn_insert_tests_resolving_t is resolving's resolver's captures: its storage's relation and the block it tries first, when given. */
+typedef struct txn_insert_tests_resolving_t
+{
+	uint32		relation;
+	bool		has_target;
+	uint32		target;
+} txn_insert_tests_resolving_t;
+
+/* txn_insert_tests_resolving_resolver is resolving's resolver: an insert of row 1 resolved over its storage's stripe, which takes a tuple id. */
+static bool
+txn_insert_tests_resolving_resolver(void *captures, HostIoIo *io, HostError *error)
+{
+	static const StdFmtPiece pieces[] = {STD_FMT_LIT("the resolve gave "), STD_FMT_ARG(0)};
+	const txn_insert_tests_resolving_t *c = captures;
+	HostStorage storage = txn_insert_tests_stored(9397);
+	TreesKeyOrder order = {.tag = TREES_KEY_ORDER_BYTES};
+	TxnInsertRoom room = txn_insert_tests_room(28);
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	TxnInsertInserted inserted;
+	bool		ok;
+
+	storage.relation = c->relation;
+	if (!txn_insert_tests_opened(io, storage, &repo, &reading, &held, error))
+		return false;
+	{
+		TreesStoreReader store = repo_Repo_reader(&repo, HOST_CACHE_PLACEMENT_SERVER, &reading);
+		TxnInsertKeyed keyed = {.stripe = txn_change_stripe(&storage, NULL, 0, false), .has_unique = true,
+		.unique = {.order = &order, .index = 16386, .has_equal = true, .equal = {&TXN_INSERT_TESTS_FOLDED_OPS, NULL}}};
+		HostIoWaits waits = host_io_Waits_testing();
+		TxnInsertInsert row = txn_insert_tests_row(storage, 1);
+
+		row.has_target = c->has_target;
+		row.target = c->target;
+		ok = txn_insert_insert(io, TREES_STORE_READER_NODE_STORE(&store), &held, &row, &room, NULL, NULL, NULL, 0,
+							   keyed, &waits, &inserted, error);
+	}
+	if (ok && inserted.tag != TXN_INSERT_INSERTED_TOOK)
+	{
+		TxnInsertInsertedRef other = {&inserted, {NULL, std_unit_Debug_fmt}};
+		StdFmtArg	args[] = {{&other, txn_insert_Inserted_Debug_fmt}};
+		StdFmtArguments arguments = {pieces, lengthof(pieces), args};
+
+		*error = txn_insert_tests_gathering_fork(&arguments);
+		ok = false;
+	}
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	return ok;
+}
+
+/*
+ * txn_insert_tests_resolving runs one insert of row 1 into a storage of
+ * database 9397 by its relation, resolved over the storage's stripe, trying
+ * the block target first when given, and terminates it past yields when
+ * given.
+ */
+static SimcReport
+txn_insert_tests_resolving(uint32 relation, bool has_target, uint32 target, bool has_yields, uint64 yields)
+{
+	txn_insert_tests_resolving_t c = {.relation = relation, .has_target = has_target, .target = target};
+	SimcActor	resolver = {txn_insert_tests_resolving_resolver, &c};
+	SimcRun		run = simc_Run_new(1);
+
+	simc_Run_actor(&run, "resolver", 8, resolver);
+	if (has_yields)
+		simc_Run_terminate_at(&run, "resolver", 8, yields);
+	return simc_Run_finish(run);
+}
+
+/* txn_insert_tests_returned_is asserts at a line and column that a run ended with every actor returning Ok, its message the run's outcome. */
+static void
+txn_insert_tests_returned_is(uint32 line, uint32 col, const SimcReport *report)
+{
+	static const StdFmtPiece pieces[] = {STD_FMT_ARG(0)};
+	StdFmtArg	args[] = {{&report->outcome, simc_Outcome_Debug_fmt}};
+	StdFmtArguments message = {pieces, lengthof(pieces), args};
+
+	if (!txn_vacuum_tests_all_returned(report))
+		std_panic_fmt(RUST_FILE, line, col, &message);
+}
+
+/*
+ * Bugs row 86: a resolve over its storage's stripe whose first target is
+ * refused goes on to its next target in the same pass, since its refused turn
+ * pushed nothing and so left the stripe's push count as the resolve read it,
+ * and the insert ends within twice the yields a plain insert of its row takes.
+ */
+void
+test_txn_insert_tests_a_resolve_whose_first_target_is_refused_ends_in_bounded_turns(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	RepoRepo	repo;
+	ChunksErrorError failed;
+	SimcReport	plain;
+	SimcReport	refused;
+	StdVec		trace;
+	uint64		bound;
+
+	if (!repo_Repo_create(io, 9397, HOST_PG_DEFAULT, &repo, &failed))
+		STD_RESULT_EXPECT_FAILED(3044, 81, "called `Result::unwrap()` on an `Err` value", &failed,
+								 chunks_error_Error_Debug_fmt);
+	repo_Repo_drop(&repo);
+	plain = txn_insert_tests_resolving(16384, false, 0, false, 0);
+	txn_insert_tests_returned_is(3050, 9, &plain);
+	trace = simc_Report_trace(&plain);
+	bound = 2 * (uint64) trace.len;
+	std_vec_free_Checked(&trace, sizeof(size_t), _Alignof(size_t));
+	simc_Report_drop(&plain);
+	refused = txn_insert_tests_resolving(16388, true, 5, true, bound);
+	txn_insert_tests_returned_is(3054, 9, &refused);
+	simc_Report_drop(&refused);
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * Bugs row 97: an insert written frozen, as COPY FREEZE writes it, takes no
+ * room in the commit status table, its writer FrozenTransactionId having no
+ * entry, and its row change replays on another storage the same way: the
+ * replay pushes the row and asks the table for nothing.
+ */
+void
+test_txn_insert_tests_a_frozen_inserts_row_change_replays_with_no_status_room(void)
+{
+	static const uint32 databases[] = {9464, 9465};
+	static const uint8 one[8] = {0, 0, 0, 0, 0, 0, 0, 1};
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedReader reading;
+	RepoRepo	repos[2];
+	HostSharedHeld helds[2];
+	TxnInsertInsert frozen = txn_insert_tests_row(txn_insert_tests_stored(9464), 1);
+	TreesStoreReader store;
+	TreesStoreReader replica;
+	HostDeltaHold hold;
+	StdVec		versions;
+	StdVec		tupled;
+	HostRow		tuple;
+	HostError	error;
+	bool		some;
+
+	if (!host_shared_read(io, &reading, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(3064, 46, &error);
+	for (size_t k = 0; k < lengthof(databases); k++)
+	{
+		ChunksErrorError failed;
+
+		if (!repo_Repo_create(io, databases[k], HOST_PG_DEFAULT, &repos[k], &failed))
+			STD_RESULT_EXPECT_FAILED(3067, 95, "called `Result::unwrap()` on an `Err` value", &failed,
+									 chunks_error_Error_Debug_fmt);
+		helds[k] = txn_insert_tests_stated(io, &repos[k], &reading, txn_insert_tests_stored(databases[k]),
+										   3069, 107);
+	}
+	frozen.writer = TXN_MEMTABLE_VERSION_NO_TRANSACTION;
+	frozen.frozen = true;
+	store = repo_Repo_reader(&repos[0], HOST_CACHE_PLACEMENT_SERVER, &reading);
+	tuple.f0 = txn_insert_tests_took(io, TREES_STORE_READER_NODE_STORE(&store), &helds[0], frozen, 28, NULL, NULL, 0,
+									 3075, 72);
+	replica = repo_Repo_reader(&repos[1], HOST_CACHE_PLACEMENT_SERVER, &reading);
+	txn_insert_tests_replayed_rows(io, TREES_STORE_READER_NODE_STORE(&replica), &helds[1], 9464, 16384);
+	if (!host_delta_hold(io, &hold, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(3078, 42, &error);
+	if (!txn_memtable_table_versions(io, &hold, host_shared_Held_record(&helds[1]), one, sizeof(one), &versions,
+									 &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(3079, 94, &error);
+	{
+		TxnMemtableVersionWriter none = TXN_MEMTABLE_VERSION_NO_TRANSACTION;
+		bool		matched = versions.len == 1;
+
+		if (matched)
+		{
+			TxnMemtableVersionRecord record = txn_memtable_version_Version_record(&STD_VEC_AT(&versions,
+																							  TxnMemtableVersionVersion,
+																							  0));
+			TxnMemtableVersionWriter writer = txn_memtable_version_Record_writer(&record);
+
+			matched = txn_memtable_version_Writer_PartialEq_eq(&writer, &none);
+		}
+		STD_ASSERT(3080, 9, matched,
+				   "matches!(versions[..], [ref version] if version.record().writer() == crate::memtable::version::NO_TRANSACTION)");
+	}
+	txn_memtable_version_versions_drop(&versions, 0);
+	host_delta_Hold_drop(&hold);
+	if (!txn_memtable_tuples_get(io, host_shared_Held_record(&helds[1]), tuple, &some, &tupled, &error))
+		TXN_INSERT_TESTS_UNWRAP_FAILED(3084, 68, &error);
+	txn_insert_tests_row_is(3084, 9, some, &tupled);
+	if (some)
+		std_vec_free_Checked(&tupled, 1, 1);
+	txn_insert_tests_ended(io, 3085, 35);
+	for (size_t k = lengthof(databases); k-- > 0;)
+	{
+		host_shared_Held_drop(&helds[k]);
+		repo_Repo_drop(&repos[k]);
+	}
+	host_shared_Reader_drop(&reading);
+	simc_TestIo_drop(&test_io);
+}
+#endif

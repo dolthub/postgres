@@ -117,11 +117,11 @@ queue's include-tree check lists.
 | src/backend/utils/adt/pg_locale_libc.c | `get_collation_actual_version_libc` | call site | libc-named collations report the vendored ICU's collator version (design item 12) |
 | src/backend/utils/adt/pg_locale_icu.c | `create_pg_locale_icu` | call sites | A libc-named locale's ICU tag comes from the fork, mapped from its stored name, in place of the catalog's locale name, which a libc row leaves null; the two guards skip only the two lines that read it (design item 12) |
 | src/backend/utils/adt/pg_locale_builtin.c | `create_pg_locale_builtin` | call sites | A libc locale of the C family, but `C` and `POSIX` alone, gets the builtin provider's locale of the name its ctype name stands for (`C.UTF-8` in a UTF-8 database, else `C`), which the fork gives in place of the catalog's locale name, which a libc row leaves null; the two guards skip only the two lines that read it (design item 12) |
-| contrib/pageinspect/heapfuncs.c, contrib/pageinspect/rawpage.c, contrib/pageinspect/btreefuncs.c, contrib/pageinspect/brinfuncs.c, contrib/pageinspect/gistfuncs.c, contrib/pageinspect/hashfuncs.c, contrib/pageinspect/ginfuncs.c | each function's access method check | call sites | Refuse fork relations with that check's own SQLSTATE and message (design item 5) |
+| contrib/pageinspect/heapfuncs.c, contrib/pageinspect/rawpage.c, contrib/pageinspect/btreefuncs.c, contrib/pageinspect/brinfuncs.c, contrib/pageinspect/gistfuncs.c, contrib/pageinspect/hashfuncs.c | each function's access method check (`rawpage.c`'s is `get_raw_page`'s relkind check; `ginfuncs.c` has none, since its functions take raw pages, which `get_raw_page` refuses) | call sites | Refuse fork relations with that check's own SQLSTATE and message (design item 5) |
 | contrib/pg_visibility/pg_visibility.c | `check_relation_relkind` | call site | As above (design item 5) |
 | contrib/pg_surgery/heap_surgery.c | the access method check | call site | As above (design item 5) |
 | contrib/pgstattuple/pgstattuple.c, contrib/pgstattuple/pgstatapprox.c, contrib/pgstattuple/pgstatindex.c | the access method checks | call sites | As above (design item 5) |
-| contrib/amcheck/verify_heapam.c, contrib/amcheck/verify_nbtree.c | the access method checks | call sites | As above (design item 5) |
+| contrib/amcheck/verify_heapam.c, contrib/amcheck/verify_common.c | the access method checks (an index's in `verify_common.c`'s `index_checkable`) | call sites | As above (design item 5) |
 | contrib/pg_prewarm/pg_prewarm.c | `pg_prewarm` | call site | Read a fork relation's trees into the node cache (design item 5) |
 | src/bin/initdb/initdb.c | `subdirs` | registration entry | Create `pg_versioned` (design item 5) |
 | src/bin/pg_checksums/pg_checksums.c | `scan_directory` | call site | Skip `pg_versioned` in a tablespace's version directory (design item 5) |
@@ -153,7 +153,7 @@ queue's include-tree check lists.
 | (existing hook) | `RegisterXactCallback`, `XACT_EVENT_ABORT`, `XACT_EVENT_PARALLEL_ABORT`; `RegisterSubXactCallback`, `SUBXACT_EVENT_ABORT_SUB` | existing hook | Take an aborted transaction's or subtransaction's versions back out of the memtable after its abort record (design item 7) |
 | (existing hook) | `ProcessUtility_hook` | existing hook | After the standard function, settle the tables whose primary key a cascaded drop changed outside ALTER TABLE (design item 5) |
 | src/backend/optimizer/path/costsize.c | `cost_index` | call site | A fork table's part of an index scan: primary key lookups, none for an index-only scan (design item 16) |
-| src/backend/optimizer/path/costsize.c | `cost_bitmap_heap_scan`, `compute_bitmap_pages` | call sites | A fork table's part of a bitmap scan: tid resolutions and primary key lookups (design item 16) |
+| src/backend/optimizer/path/costsize.c | `cost_bitmap_heap_scan` | call site | A fork table's cost per page fetched of a bitmap heap scan: a tuple id resolution and a primary key lookup a row, and a tuple id range scan a lossy block (design items 2 and 16) |
 | src/backend/access/transam/xlogrecovery.c | `PerformWalRecovery` | call site | Refuse a replay that stopped below the WAL position the fork's durable bases and runs prove (design item 8) |
 | src/backend/utils/adt/float.c | `float4in_internal`, `float8in_internal`, `float4recv`, `float8recv`, `float4send`, `float8send` | call sites | The correctly rounded parser and the quiet positive NaN (design item 15) |
 | src/port/snprintf.c | `fmtfloat` | call site | Float formatting with a precision through Ryu (design item 15) |

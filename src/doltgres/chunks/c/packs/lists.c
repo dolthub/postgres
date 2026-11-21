@@ -1071,6 +1071,68 @@ chunks_packs_lists_Rewrite_compact(ChunksPacksListsChange *self, bool all, Chunk
 	return chunks_packs_lists_run(&frame, chunks_packs_lists_Rewrite_compact_body_0);
 }
 
+/*
+ * chunks_packs_lists_Rewrite_remove_space_body_0 is remove_space's body: the
+ * deferred adds appended, nothing more when the table holds no runs tail of
+ * the tablespace, a refusal while the table lists a pack in it, then the
+ * table written whole without its runs tail, so no record after it names the
+ * tablespace, and the changer's view's read of its runs file dropped, so its
+ * next add writes the file whole again.
+ */
+static void
+chunks_packs_lists_Rewrite_remove_space_body_0(void *frame_)
+{
+	chunks_packs_lists_frame_0_t *frame = frame_;
+	ChunksPacksListsChange *self = frame->self;
+	ChunksPacksViewView *view = self->view;
+
+	frame->ok = false;
+	if (!chunks_packs_lists_flush(frame))
+		goto done;
+	if (chunks_packs_table_runs_get(&view->table.list.runs, frame->space) == NULL)
+	{
+		frame->ok = true;
+		goto done;
+	}
+	for (size_t k = 0, k_len = view->table.list.packs.len; k < k_len; k++)
+		if (STD_VEC_AT(&view->table.list.packs, chunks_TupleU64Listed_t, k).f1.space == frame->space)
+		{
+			StdFmtPiece pieces[] = {STD_FMT_LIT("tablespace "), STD_FMT_ARG(0), STD_FMT_LIT(" still holds packs")};
+			StdFmtArg	args[] = {{&frame->space, std_u32_Display_fmt}};
+			StdFmtArguments arguments = {pieces, lengthof(pieces), args};
+			StdString	message;
+
+			std_fmt_format_Checked(&message, &arguments);
+			*frame->error = chunks_error_Error_refused(&message);
+			goto done;
+		}
+	chunks_packs_table_runs_remove(&view->table.list.runs, frame->space);
+	chunks_packs_lists_path_into(frame, &view->dir, CHUNKS_PACKS_TABLE);
+	if (!chunks_packs_lists_Rewrite_whole(frame, &CHUNKS_PACKS_VIEW_TABLE_LIST_OPS, &view->table.list,
+										  &view->table.read, &frame->taken_table, sizeof(frame->taken_table)))
+		goto done;
+	self->snapshot.table = chunks_packs_lists_tail_of(&CHUNKS_PACKS_VIEW_TABLE_LIST_OPS, &view->table.read,
+													  &view->table.list);
+	chunks_packs_view_runs_remove(&view->runs, frame->space);
+	frame->ok = true;
+done:
+	chunks_packs_lists_pad_0(frame);
+}
+
+/*
+ * chunks_packs_lists_Rewrite_remove_space takes a tablespace out of the
+ * repository's lists once none of its packs is listed, as DROP TABLESPACE
+ * needs before it removes the tablespace's directory (bugs row 99), and
+ * refuses while one is.
+ */
+bool
+chunks_packs_lists_Rewrite_remove_space(ChunksPacksListsChange *self, uint32 space, ChunksErrorError *error)
+{
+	chunks_packs_lists_frame_0_t frame = {.self = self, .space = space, .error = error};
+
+	return chunks_packs_lists_run(&frame, chunks_packs_lists_Rewrite_remove_space_body_0);
+}
+
 #ifdef DOLTGRES_TEST_CHUNKS
 
 /* chunks_packs_lists_tests_TupleU64U64_Debug_fmt is a (u64, u64)'s Debug, in a tuple. */
@@ -2238,6 +2300,116 @@ test_chunks_packs_lists_tests_a_whole_write_that_fails_before_its_renames_leaves
 	chunks_packs_view_View_drop(&mine);
 	std_vec_free_Checked(&packs, sizeof(ChunksPacksTableEntry), _Alignof(ChunksPacksTableEntry));
 	host_shared_Owned_drop(&owned);
+	std_vec_free_Checked(&dir.bytes, 1, 1);
+	simc_TestIo_drop(&test_io);
+}
+
+/* chunks_packs_lists_tests_first_retired retires pack 1 in a change. */
+static void
+chunks_packs_lists_tests_first_retired(ChunksPacksListsChange *change, void *captures)
+{
+	static const uint64 numbers[] = {1};
+
+	(void) captures;
+	chunks_packs_lists_tests_retired(change, numbers, lengthof(numbers), 0, 0);
+}
+
+/* chunks_packs_lists_tests_space_removed takes a tablespace out of a view's repository's list files under their flag, answering whether it could. */
+static bool
+chunks_packs_lists_tests_space_removed(HostIoIo *io, HostSharedRecord record, ChunksPacksViewView *view, uint32 space,
+									   ChunksErrorError *error)
+{
+	HostSharedFlagGuard rewriting;
+	HostSharedFlagIo flag_io;
+	ChunksPacksListsChange rewrite;
+	HostError	host;
+	bool		ok;
+
+	if (!host_shared_Record_flag(record, HOST_IO_IO_TAKES_SHORT(io), CHUNKS_PACKS_SHARED_REWRITING_INDEX, &rewriting,
+								 &host))
+		chunks_packs_tests_host_unwrapped(RUST_FILE, &host, 0, 0);
+	flag_io = host_shared_FlagGuard_io(&rewriting);
+	if (!chunks_packs_lists_Rewrite_begin(view, record, &flag_io, &rewrite, error))
+		chunks_packs_tests_unwrapped(RUST_FILE, error, 0, 0);
+	if (!chunks_packs_lists_Rewrite_remove_space(&rewrite, space, error))
+	{
+		chunks_packs_lists_Change_drop(&rewrite);
+		ok = false;
+	}
+	else
+		ok = chunks_packs_lists_Change_install(&rewrite, error);
+	host_shared_FlagGuard_drop(&rewriting);
+	return ok;
+}
+
+/*
+ * test_chunks_packs_lists_tests_a_removed_tablespace_reads_a_runs_file_made_again_from_its_start:
+ * a tablespace's removal is refused while the table lists a pack in it, and
+ * once its pack is retired it takes the tablespace's runs tail out of the
+ * table, so a pack the tablespace gets again after its directory went, as a
+ * tablespace made again under a dropped one's id does, writes a fresh runs
+ * file every view reads from its start (bugs row 99).
+ */
+void
+test_chunks_packs_lists_tests_a_removed_tablespace_reads_a_runs_file_made_again_from_its_start(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	StdPathBuf	dir;
+	StdPathBuf	space;
+	StdIoError	io_error;
+	HostSharedOwned owned;
+	HostSharedRecord record;
+	ChunksPacksFixturesPacked packed;
+	ChunksPacksFixturesPacked again;
+	ChunksPacksTableEntry spaced;
+	ChunksPacksViewView mine;
+	ChunksPacksViewView other;
+	ChunksPacksViewView *views[2] = {&mine, &other};
+	ChunksErrorError error;
+	static const uint32 got_cols[] = {0, 0, 0};
+
+	chunks_packs_fixtures_home(&dir);
+	space = host_tablespace_dir(CHUNKS_PACKS_FIXTURES_REPOSITORY, 5);
+	if (!std_fs_create_dir_all(space.bytes.ptr, space.bytes.len, &io_error))
+		STD_RESULT_EXPECT_FAILED(0, 0, CHUNKS_PACKS_FIXTURES_UNWRAP, &io_error, std_io_Error_Debug_fmt);
+	owned = chunks_packs_lists_tests_repository(io, &dir);
+	record = host_shared_Owned_record(&owned);
+	packed = chunks_packs_fixtures_pack(io, &space, 1);
+	chunks_packs_fixtures_view(&mine);
+	chunks_packs_fixtures_view(&other);
+	spaced = packed.entry;
+	spaced.f1 = 5;
+	chunks_packs_lists_tests_one(io, record, &mine, &spaced, false, 0, 0);
+	STD_ASSERT_MSG(0, 0, !chunks_packs_lists_tests_space_removed(io, record, &mine, 5, &error) &&
+				   error.tag == CHUNKS_ERROR_ERROR_REFUSED, "a tablespace that lists a pack was taken out");
+	chunks_error_Error_drop(&error);
+	chunks_packs_lists_tests_changed(io, record, &mine, chunks_packs_lists_tests_first_retired, NULL);
+	if (!chunks_packs_lists_tests_space_removed(io, record, &mine, 5, &error))
+		chunks_packs_tests_unwrapped(RUST_FILE, &error, 0, 0);
+	for (size_t k = 0; k < lengthof(views); k++)
+	{
+		chunks_packs_tests_refreshed(RUST_FILE, views[k], io, record, 0, 0);
+		STD_ASSERT(0, 0, chunks_packs_table_runs_get(&chunks_packs_view_View_table(views[k])->runs, 5) == NULL,
+				   "!view.table().runs.contains_key(&5)");
+	}
+	if (!std_fs_remove_dir_all(space.bytes.ptr, space.bytes.len, &io_error) ||
+		!std_fs_create_dir_all(space.bytes.ptr, space.bytes.len, &io_error))
+		STD_RESULT_EXPECT_FAILED(0, 0, CHUNKS_PACKS_FIXTURES_UNWRAP, &io_error, std_io_Error_Debug_fmt);
+	again = chunks_packs_fixtures_pack(io, &space, 2);
+	spaced = again.entry;
+	spaced.f1 = 5;
+	chunks_packs_lists_tests_one(io, record, &mine, &spaced, false, 0, 0);
+	for (size_t k = 0; k < lengthof(views); k++)
+	{
+		chunks_packs_tests_refreshed(RUST_FILE, views[k], io, record, 0, 0);
+		chunks_packs_tests_listed(RUST_FILE, views[k], &spaced, 1, 0, 0);
+		chunks_packs_tests_got(RUST_FILE, views[k], io, 5, &again.address, &again.at, 0, got_cols);
+	}
+	chunks_packs_view_View_drop(&other);
+	chunks_packs_view_View_drop(&mine);
+	host_shared_Owned_drop(&owned);
+	std_vec_free_Checked(&space.bytes, 1, 1);
 	std_vec_free_Checked(&dir.bytes, 1, 1);
 	simc_TestIo_drop(&test_io);
 }

@@ -310,7 +310,8 @@ txn_memtable_testing_pushed_body_0(void *frame_)
 	std_vec_new(&frame->buffer, 1, 1);
 	frame->buffer_live = true;
 	frame->ok = txn_memtable_version_push(&open, &frame->hold, frame->key,
-										  frame->key_len, &change, &frame->has_fresh, &frame->fresh, &frame->pages,
+										  frame->key_len, &change, false, &frame->has_fresh, &frame->fresh,
+										  &frame->pages,
 										  &frame->buffer, frame->result, frame->error);
 	txn_memtable_testing_pushed_pad_0(frame);
 }

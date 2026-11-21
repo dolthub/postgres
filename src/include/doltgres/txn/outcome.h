@@ -29,4 +29,8 @@ extern bool txn_outcome_outcome(HostIoIo *io, TxnMemtableVersionVersion *version
 								HostError *error);
 extern bool txn_outcome_stamped(HostIoIo *io, uint64 xid, HostStatus *result, HostError *error);
 
+#ifdef DOLTGRES_TEST_TXN
+extern void test_txn_outcome_tests_a_writers_outcome_answers_frozen_with_no_door_and_caches_an_ended_writers(void);
+#endif
+
 #endif							/* DOLTGRES_TXN_OUTCOME_H */

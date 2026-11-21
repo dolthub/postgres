@@ -90,4 +90,14 @@ extern bool txn_entry_unique(HostIoIo *io, TreesStoreNodeStore store, const Host
 extern bool txn_entry_based(const uint8 *value, size_t value_len, const ChunksTrailerStamp *stamps,
 							size_t stamps_len, bool keyless, StdBytes *result, HostError *error);
 
+#ifdef DOLTGRES_TEST_TXN
+extern void test_txn_entry_tests_an_index_entrys_changes_are_logged_pushed_and_redone_once(void);
+extern void test_txn_entry_tests_an_index_base_entry_reads_back_and_refuses_a_keyed_stamp_and_an_uneven_count(void);
+extern void test_txn_entry_tests_an_index_storages_large_keys_spill_at_the_threshold(void);
+extern void test_txn_entry_tests_a_unique_entry_takes_a_free_key_and_answers_an_existing_entrys_value(void);
+extern void test_txn_entry_tests_a_counted_unique_entry_writes_nothing_for_its_own_copy_and_answers_another(void);
+extern void test_txn_entry_tests_a_partial_unique_check_answers_a_running_write_without_waiting(void);
+extern void test_txn_entry_tests_an_entry_and_its_record_change_together(void);
+#endif
+
 #endif							/* DOLTGRES_TXN_ENTRY_H */

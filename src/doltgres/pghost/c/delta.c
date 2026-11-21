@@ -216,11 +216,18 @@ pghost_delta_slot_of(uint32 aged, uint32 index)
 	return STD_ADD(u32, at, index, 112, 5);
 }
 
-/* pghost_delta_stamp_of returns the place among a record's atomics of the epoch of its retirement: its last. */
+/* pghost_delta_stamp_of returns the place among a record's atomics of the epoch of its retirement: the one before its last. */
 static size_t
 pghost_delta_stamp_of(size_t kind)
 {
-	return STD_SUB(usize, shmem_records_atomics(kind), 1, 117, 5);
+	return STD_SUB(usize, shmem_records_atomics(kind), 2, 117, 5);
+}
+
+/* pghost_delta_link_of returns the place among a record's atomics of its link in its kind's retired list: its last (bugs row 309). */
+static size_t
+pghost_delta_link_of(size_t kind)
+{
+	return shmem_records_atomics(kind) - 1;
 }
 
 /* pghost_delta_Pages_Directory_slots is the directory's count of slots. */
@@ -801,6 +808,101 @@ pghost_delta_Pages_Directory_unmade(void *self, uint32 kind, uint32 index)
 	std_RwLockWriteGuard_drop(&made);
 }
 
+/* pghost_delta_Pages_Directory_retired_head loads the retired list's head. */
+static uint64
+pghost_delta_Pages_Directory_retired_head(void *self)
+{
+	(void) self;
+	return shmem_delta_retired();
+}
+
+/* pghost_delta_Pages_Directory_retired_swap stores the retired list's head over the one loaded. */
+static bool
+pghost_delta_Pages_Directory_retired_swap(void *self, uint64 loaded, uint64 word)
+{
+	(void) self;
+	return shmem_delta_retired_swap(loaded, word);
+}
+
+/* pghost_delta_Pages_Directory_link loads a slot's link in the retired list. */
+static uint32
+pghost_delta_Pages_Directory_link(void *self, uint32 slot)
+{
+	(void) self;
+	return shmem_delta_link(slot);
+}
+
+/* pghost_delta_Pages_Directory_set_link stores a slot's link in the retired list. */
+static void
+pghost_delta_Pages_Directory_set_link(void *self, uint32 slot, uint32 value)
+{
+	(void) self;
+	shmem_delta_set_link(slot, value);
+}
+
+/* pghost_delta_Pages_Directory_record_retired_head loads an aged kind's retired list's head. */
+static uint64
+pghost_delta_Pages_Directory_record_retired_head(void *self, uint32 kind)
+{
+	(void) self;
+	return shmem_records_retired(pghost_delta_kind_of(kind));
+}
+
+/* pghost_delta_Pages_Directory_record_retired_swap stores an aged kind's retired list's head over the one loaded. */
+static bool
+pghost_delta_Pages_Directory_record_retired_swap(void *self, uint32 kind, uint64 loaded, uint64 word)
+{
+	(void) self;
+	return shmem_records_retired_swap(pghost_delta_kind_of(kind), loaded, word);
+}
+
+/* pghost_delta_Pages_Directory_record_link loads an aged record's link in its kind's retired list. */
+static uint64
+pghost_delta_Pages_Directory_record_link(void *self, uint32 kind, uint32 index)
+{
+	size_t		region_kind = pghost_delta_kind_of(kind);
+	ShmemRecordsOp load = {SHMEM_RECORDS_OP_LOAD};
+
+	(void) self;
+	return shmem_records_atomic(region_kind, index, pghost_delta_link_of(region_kind), load);
+}
+
+/* pghost_delta_Pages_Directory_set_record_link stores an aged record's link in its kind's retired list by exchanges. */
+static void
+pghost_delta_Pages_Directory_set_record_link(void *self, uint32 kind, uint32 index, uint64 value)
+{
+	size_t		region_kind = pghost_delta_kind_of(kind);
+	ShmemRecordsOp load = {SHMEM_RECORDS_OP_LOAD};
+	uint64		held = shmem_records_atomic(region_kind, index, pghost_delta_link_of(region_kind), load);
+
+	(void) self;
+	for (;;)
+	{
+		ShmemRecordsOp exchange = {SHMEM_RECORDS_OP_EXCHANGE, {.exchange = {held, value}}};
+		uint64		before = shmem_records_atomic(region_kind, index, pghost_delta_link_of(region_kind), exchange);
+
+		if (before == held)
+			return;
+		held = before;
+	}
+}
+
+/* pghost_delta_Pages_Directory_lock_pass takes the free pass's lock. */
+static void
+pghost_delta_Pages_Directory_lock_pass(void *self)
+{
+	(void) self;
+	shmem_delta_lock_pass();
+}
+
+/* pghost_delta_Pages_Directory_unlock_pass releases the free pass's lock. */
+static void
+pghost_delta_Pages_Directory_unlock_pass(void *self)
+{
+	(void) self;
+	shmem_delta_unlock_pass();
+}
+
 /* PGHOST_DELTA_PAGES_DIRECTORY_OPS is Pages' Directory table. */
 static const HostDeltaDirectoryDirectoryOps PGHOST_DELTA_PAGES_DIRECTORY_OPS = {
 	.slots = pghost_delta_Pages_Directory_slots,
@@ -858,6 +960,16 @@ static const HostDeltaDirectoryDirectoryOps PGHOST_DELTA_PAGES_DIRECTORY_OPS = {
 	.clear = pghost_delta_Pages_Directory_clear,
 	.made = pghost_delta_Pages_Directory_made,
 	.unmade = pghost_delta_Pages_Directory_unmade,
+	.retired_head = pghost_delta_Pages_Directory_retired_head,
+	.retired_swap = pghost_delta_Pages_Directory_retired_swap,
+	.link = pghost_delta_Pages_Directory_link,
+	.set_link = pghost_delta_Pages_Directory_set_link,
+	.record_retired_head = pghost_delta_Pages_Directory_record_retired_head,
+	.record_retired_swap = pghost_delta_Pages_Directory_record_retired_swap,
+	.record_link = pghost_delta_Pages_Directory_record_link,
+	.set_record_link = pghost_delta_Pages_Directory_set_record_link,
+	.lock_pass = pghost_delta_Pages_Directory_lock_pass,
+	.unlock_pass = pghost_delta_Pages_Directory_unlock_pass,
 };
 
 /* PGHOST_DELTA_DIRECTORY is &Pages as host's sequences take it. */

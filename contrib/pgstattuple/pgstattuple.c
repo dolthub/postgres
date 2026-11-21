@@ -32,6 +32,7 @@
 #include "access/tableam.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_am_d.h"
+#include "doltgres/hooks.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
@@ -268,7 +269,7 @@ pgstat_relation(Relation rel, FunctionCallInfo fcinfo)
 					 errmsg("index \"%s\" is not valid",
 							RelationGetRelationName(rel))));
 
-		switch (rel->rd_rel->relam)
+		switch (doltgres_heap_only_refused(rel) ? InvalidOid : rel->rd_rel->relam)
 		{
 			case BTREE_AM_OID:
 				return pgstat_index(rel, BTREE_METAPAGE + 1,
@@ -328,8 +329,8 @@ pgstat_heap(Relation rel, FunctionCallInfo fcinfo)
 	/*
 	 * Sequences always use heap AM, but they don't show that in the catalogs.
 	 */
-	if (rel->rd_rel->relkind != RELKIND_SEQUENCE &&
-		rel->rd_rel->relam != HEAP_TABLE_AM_OID)
+	if ((rel->rd_rel->relkind != RELKIND_SEQUENCE &&
+		 rel->rd_rel->relam != HEAP_TABLE_AM_OID) || doltgres_heap_only_refused(rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("only heap AM is supported")));

@@ -30,6 +30,7 @@
 #include "doltgres/chunks/file.h"
 #include "doltgres/chunks/header.h"
 #include "doltgres/chunks/pack.h"
+#include "doltgres/chunks/packs.h"
 #include "doltgres/chunks/packs/backend.h"
 #include "doltgres/chunks/packs/marking.h"
 #include "doltgres/chunks/packs/open.h"
@@ -45,6 +46,7 @@
 #include "doltgres/std/int128.h"
 #include "doltgres/std/num.h"
 #include "doltgres/std/slice.h"
+#include "doltgres/std/str.h"
 #include "doltgres/std/sync.h"
 #include "doltgres/std/time.h"
 #include "doltgres/std/tuple.h"
@@ -58,7 +60,6 @@
 #ifdef DOLTGRES_TEST_STORE
 #include "doltgres/chunks/address.h"
 #include "doltgres/simc/simc.h"
-#include "doltgres/std/str.h"
 #include "doltgres/std/test.h"
 #include "doltgres/store/fixtures.h"
 #endif
@@ -1869,6 +1870,7 @@ typedef struct store_collect_marked_frame_0_t
 	uint64		newest;
 	uint64		limit;
 	uint64		percent;
+	uint32		emptied;
 	bool	   *has_result;
 	StoreCollectCollected *result;
 	HostError  *error;
@@ -2131,6 +2133,8 @@ store_collect_marked_choose(store_collect_marked_frame_0_t *frame)
 		live = store_collect_bytes_get(&frame->marks.bytes, entry.f0);
 		if (live == 0)
 			std_vec_push_Checked(&frame->dead, &entry.f0, sizeof(uint64), _Alignof(uint64));
+		else if (entry.f1 == frame->emptied && frame->emptied != CHUNKS_PACKS_DEFAULT_SPACE)
+			store_collect_copied_push(&frame->copied, CHUNKS_PACKS_DEFAULT_SPACE, entry.f0);
 		else if (store_collect_over(chunks_pack_PackReader_records_len(std_arc_Deref_deref(reader,
 																						   _Alignof(ChunksPackPackReader))),
 									live, frame->percent))
@@ -2387,12 +2391,12 @@ done:
  */
 static bool
 store_collect_marked(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading, uint32 database,
-					 const StdVec *old, uint64 newest, uint64 limit, uint64 percent, bool *has_result,
+					 const StdVec *old, uint64 newest, uint64 limit, uint64 percent, uint32 emptied, bool *has_result,
 					 StoreCollectCollected *result, HostError *error)
 {
 	store_collect_marked_frame_0_t frame = {.io = io, .repo = repo, .reading = reading, .database = database,
-		.old = old, .newest = newest, .limit = limit, .percent = percent, .has_result = has_result, .result = result,
-	.error = error};
+		.old = old, .newest = newest, .limit = limit, .percent = percent, .emptied = emptied, .has_result = has_result,
+	.result = result, .error = error};
 
 	std_landing(&frame, store_collect_marked_body_0, store_collect_marked_pad_0);
 	return frame.ok;
@@ -2406,7 +2410,7 @@ store_collect_marked(HostIoIo *io, const RepoRepo *repo, const HostSharedReader 
  */
 static bool
 store_collect_marking(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading, uint32 database,
-					  const StdVec *old, uint64 limit, uint64 percent, bool *has_result,
+					  const StdVec *old, uint64 limit, uint64 percent, uint32 emptied, bool *has_result,
 					  StoreCollectCollected *result, HostError *error)
 {
 	const ChunksPacksBackendPacks *packs = &repo->packs;
@@ -2421,7 +2425,7 @@ store_collect_marking(HostIoIo *io, const RepoRepo *repo, const HostSharedReader
 
 	if (!chunks_packs_marking_Packs_begin_marking(packs, io, reading, &newest, &failed))
 		goto raised;
-	if (store_collect_marked(io, repo, reading, database, old, newest, limit, percent, has_result, result,
+	if (store_collect_marked(io, repo, reading, database, old, newest, limit, percent, emptied, has_result, result,
 							 &collect_error))
 	{
 		if (*has_result)
@@ -2451,11 +2455,14 @@ raised:
  * base backup is counted in. Its marking's reads and its copies run at limit
  * bytes a second, or unpaced at 0, and it copies out the live chunks of a
  * pack that passes them by percent. It answers nothing when a base backup
- * kept it from finishing.
+ * kept it from finishing. A tablespace it empties, unless that is
+ * CHUNKS_PACKS_DEFAULT_SPACE, has the live chunks of each of its packs copied
+ * into the repository's own directory whatever their share, so that the
+ * packs retire, as DROP TABLESPACE needs (bugs row 99).
  */
 bool
 store_collect_collected(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading, uint32 database,
-						uint64 limit, uint64 percent, const StdVec *old, bool *has_result,
+						uint64 limit, uint64 percent, uint32 emptied, const StdVec *old, bool *has_result,
 						StoreCollectCollected *result, HostError *error)
 {
 	bool		done;
@@ -2465,7 +2472,8 @@ store_collect_collected(HostIoIo *io, const RepoRepo *repo, const HostSharedRead
 		return false;
 	if (!host_collection_begin())
 		return true;
-	done = store_collect_marking(io, repo, reading, database, old, limit, percent, has_result, result, error);
+	done = store_collect_marking(io, repo, reading, database, old, limit, percent, emptied, has_result, result,
+								 error);
 	host_collection_end();
 	return done;
 }
@@ -2710,8 +2718,8 @@ store_collect_checked(HostIoIo *io, uint32 repository, const StoreCollectDatabas
 			old = held->old;
 			std_vec_new(&held->old, sizeof(uint64), _Alignof(uint64));
 		}
-		if (!store_collect_collected(io, &repo, reading, database->id, limit, settings->target_percent, &old, &has_done,
-									 &done, error))
+		if (!store_collect_collected(io, &repo, reading, database->id, limit, settings->target_percent,
+									 CHUNKS_PACKS_DEFAULT_SPACE, &old, &has_done, &done, error))
 		{
 			std_vec_free_Checked(&old, sizeof(uint64), _Alignof(uint64));
 			goto dropped;
@@ -2927,9 +2935,88 @@ store_collect_collect_due(HostIoIo *io, StoreCollectSchedule *schedule, const St
 	return frame.ok;
 }
 
-/* store_collect_asked is an ask's full collection under its database's lock, the repository opened for it and closed after; its caller gives the lock back however it ends. */
+/*
+ * store_collect_unlisted takes an emptied tablespace out of a repository's
+ * lists once the repository lists none of its packs (bugs row 99).
+ */
 static bool
-store_collect_asked(HostIoIo *io, uint32 repository, const StoreCollectDatabase *database,
+store_collect_unlisted(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading, uint32 emptied,
+					   HostError *error)
+{
+	ChunksErrorError failed;
+	StdVec		spaces;
+	bool		listed = false;
+
+	if (!chunks_packs_backend_Packs_spaces(&repo->packs, io, reading, &spaces, &failed))
+	{
+		*error = chunks_packs_shared_raised(&failed);
+		return false;
+	}
+	for (size_t k = 0, k_len = spaces.len; k < k_len; k++)
+		listed |= STD_VEC_AT(&spaces, std_TupleU64U32_t, k).f1 == emptied;
+	std_vec_free_Checked(&spaces, sizeof(std_TupleU64U32_t), _Alignof(std_TupleU64U32_t));
+	if (listed)
+		return true;
+	if (!chunks_packs_backend_Packs_remove_space(&repo->packs, HOST_IO_IO_TAKES_SHORT(io), reading, emptied, &failed))
+	{
+		*error = chunks_packs_shared_raised(&failed);
+		return false;
+	}
+	return true;
+}
+
+/*
+ * store_collect_emptied removes the files due removal, and then a
+ * repository's directory in an emptied tablespace once no pack file is left
+ * in it, every one either copied out and retired with its readers ended or
+ * never listed; a pack file still there, a pack being written included,
+ * leaves the directory for a later ask. A writer that opens in the
+ * tablespace after the directory's listing finds it gone and its pack's
+ * write fails, which leaves its fold's delta for a retry that makes the
+ * directory again, and its relation's own file there makes Postgres refuse
+ * the DROP.
+ */
+static bool
+store_collect_emptied(HostIoIo *io, uint32 database, uint32 emptied, HostError *error)
+{
+	ChunksErrorError failed;
+	StdPathBuf	dir;
+	StdVec		names;
+	bool		has;
+	bool		packed = false;
+	bool		removed;
+	bool		ok = true;
+
+	if (!chunks_packs_removal_remove_due(io, &failed))
+	{
+		*error = chunks_packs_shared_raised(&failed);
+		return false;
+	}
+	dir = host_tablespace_dir(database, emptied);
+	if (!host_list_dir_if_there(HOST_IO_IO_READ_DOORS(io), (const char *) dir.bytes.ptr, dir.bytes.len, &has, &names,
+								error))
+		ok = false;
+	else if (has)
+	{
+		for (size_t k = 0, k_len = names.len; k < k_len; k++)
+		{
+			const StdString *name = &STD_VEC_AT(&names, StdString, k);
+
+			packed |= (name->len >= 5 && memcmp((const char *) name->ptr + name->len - 5, ".pack", 5) == 0) ||
+				(name->len >= 9 && memcmp((const char *) name->ptr + name->len - 9, ".pack.tmp", 9) == 0);
+		}
+		std_vec_drop_Checked(&names, sizeof(StdString), _Alignof(StdString), std_String_drop);
+		if (!packed)
+			ok = host_remove_tree(HOST_IO_IO_IO_DOORS(io), (const char *) dir.bytes.ptr, dir.bytes.len, &removed,
+								  error);
+	}
+	std_vec_free_Checked(&dir.bytes, 1, 1);
+	return ok;
+}
+
+/* store_collect_asked is an ask's full collection under its database's lock, emptying the tablespace it names, the repository opened for it and closed after; its caller gives the lock back however it ends. */
+static bool
+store_collect_asked(HostIoIo *io, uint32 repository, const StoreCollectDatabase *database, uint32 emptied,
 					const StoreCollectSettings *settings, bool *has_result, StoreCollectCollected *result,
 					HostError *error)
 {
@@ -2947,8 +3034,14 @@ store_collect_asked(HostIoIo *io, uint32 repository, const StoreCollectDatabase 
 		return false;
 	}
 	std_vec_new(&none, sizeof(uint64), _Alignof(uint64));
-	ok = store_collect_collected(io, &repo, &reading, database->id, 0, settings->target_percent, &none, has_result,
-								 result, error);
+	ok = store_collect_collected(io, &repo, &reading, database->id, 0, settings->target_percent, emptied, &none,
+								 has_result, result, error);
+	if (ok && *has_result && emptied != CHUNKS_PACKS_DEFAULT_SPACE &&
+		!store_collect_unlisted(io, &repo, &reading, emptied, error))
+	{
+		store_collect_Collected_drop(result);
+		ok = false;
+	}
 	if (!ok)
 		repo_Repo_drop(&repo);
 	else if (!repo_Repo_close(&repo, io, &reading, &failed))
@@ -2959,12 +3052,18 @@ store_collect_asked(HostIoIo *io, uint32 repository, const StoreCollectDatabase 
 		ok = false;
 	}
 	host_shared_Reader_drop(&reading);
+	if (ok && *has_result && emptied != CHUNKS_PACKS_DEFAULT_SPACE && !store_collect_emptied(io, repository, emptied, error))
+	{
+		store_collect_Collected_drop(result);
+		ok = false;
+	}
 	return ok;
 }
 
 /*
  * store_collect_collect_asked runs the full collection a backend asked of the
- * collector worker in a database's repository, recorded in the schedule as
+ * collector worker in a database's repository, emptying the tablespace the
+ * ask names (collected), recorded in the schedule as
  * its own, under the database's lock as collect_due takes it, and returns its
  * counts, a [u64; 3]: the packs it retired, those it copied out, and its live
  * bytes, all 0 when the database may not be collected, a session holds its
@@ -2972,8 +3071,8 @@ store_collect_asked(HostIoIo *io, uint32 repository, const StoreCollectDatabase 
  */
 bool
 store_collect_collect_asked(HostIoIo *io, StoreCollectSchedule *schedule, const StoreCollectDatabase *databases,
-							size_t databases_len, uint32 id, const StoreCollectSettings *settings, uint64 *result,
-							HostError *error)
+							size_t databases_len, uint32 id, uint32 emptied, const StoreCollectSettings *settings,
+							uint64 *result, HostError *error)
 {
 	const StoreCollectDatabase *database = store_collect_find(databases, databases_len, id, true);
 	StoreCollectCollected done;
@@ -2996,7 +3095,7 @@ store_collect_collect_asked(HostIoIo *io, StoreCollectSchedule *schedule, const 
 		return false;
 	if (!locked)
 		return true;
-	ok = store_collect_asked(io, id, database, settings, &has, &done, error);
+	ok = store_collect_asked(io, id, database, emptied, settings, &has, &done, error);
 	host_database_unlocked(id);
 	if (!ok)
 		return false;
@@ -3238,8 +3337,8 @@ store_collect_tests_collected(HostIoIo *io, const RepoRepo *repo, const HostShar
 	bool		has;
 
 	std_vec_new(&none, sizeof(uint64), _Alignof(uint64));
-	store_collect_tests_ok(store_collect_collected(io, repo, reading, database, limit, 50, old == NULL ? &none : old,
-												   &has, &done, &error), &error, line, col);
+	store_collect_tests_ok(store_collect_collected(io, repo, reading, database, limit, 50, CHUNKS_PACKS_DEFAULT_SPACE,
+												   old == NULL ? &none : old, &has, &done, &error), &error, line, col);
 	if (!has)
 		std_option_unwrap_failed(RUST_FILE, line, some_col);
 	return done;
@@ -3408,8 +3507,8 @@ test_store_collect_tests_a_collection_runs_nothing_while_a_base_backup_is_counte
 	store_collect_tests_ok(host_backup_begin(io, &error), &error, 924, 32);
 	STD_ASSERT(925, 9, host_backups_running(), "host::backups_running()");
 	std_vec_new(&none, sizeof(uint64), _Alignof(uint64));
-	store_collect_tests_ok(store_collect_collected(io, &repo, &reading, 832, 0, 50, &none, &has, &collected, &error),
-						   &error, 926, 85);
+	store_collect_tests_ok(store_collect_collected(io, &repo, &reading, 832, 0, 50, CHUNKS_PACKS_DEFAULT_SPACE, &none,
+												   &has, &collected, &error), &error, 926, 85);
 	if (!store_collect_tests_option_eq(has, &collected, false, NULL))
 	{
 		StdOptionRef left = {has, STD_ITEM(&collected, store_collect_Collected_Debug_fmt)};

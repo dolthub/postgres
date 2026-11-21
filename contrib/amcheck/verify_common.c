@@ -20,6 +20,7 @@
 #include "catalog/pg_am.h"
 #include "commands/defrem.h"
 #include "commands/tablecmds.h"
+#include "doltgres/hooks.h"
 #include "utils/guc.h"
 #include "utils/syscache.h"
 
@@ -167,7 +168,7 @@ index_checkable(Relation rel, Oid am_id)
 				 errmsg("expected index as targets for verification"),
 				 errdetail_relkind_not_supported(rel->rd_rel->relkind)));
 
-	if (rel->rd_rel->relam != am_id)
+	if (rel->rd_rel->relam != am_id || doltgres_heap_only_refused(rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("expected \"%s\" index as targets for verification", get_am_name(am_id)),

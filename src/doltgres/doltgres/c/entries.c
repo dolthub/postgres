@@ -1574,7 +1574,8 @@ doltgres_entries_rows_closure_0_body(void *frame_)
 	DoltgresScanUnder under = {.state = host_shared_Held_record(frame->held), .snapshot = c->read,
 	.has_serial = c->has_check};
 	TreesStoreReader store = repo_Repo_reader(frame->repo, HOST_CACHE_PLACEMENT_SERVER, c->reading);
-	DoltgresScanTrees trees = {0};
+	uint64		generation = txn_state_generation(under.state);
+	DoltgresScanTrees trees;
 	uint32		epoch;
 	bool		has_chain;
 	TreesStoreTree chain;
@@ -1585,14 +1586,7 @@ doltgres_entries_rows_closure_0_body(void *frame_)
 	if (!txn_state_readable(frame->io, frame->held, c->read, &some, &frame->read_base, frame->error))
 		return;
 	frame->read_base_live = some;
-	if (some)
-	{
-		trees.has_root = frame->read_base.has_root;
-		trees.root = frame->read_base.root;
-		trees.has_tuple_ids = frame->read_base.has_tuple_ids;
-		trees.tuple_ids = frame->read_base.tuple_ids;
-		trees.folded = frame->read_base.folded;
-	}
+	trees = doltgres_scan_Trees_of(some ? &frame->read_base : NULL, generation);
 	doltgres_scan_Epochs_based(some ? &frame->read_base : NULL, &epoch, &has_chain, &chain);
 	if (!doltgres_scan_Epochs_of(frame->io, TREES_STORE_READER_NODE_STORE(&store), epoch, has_chain, chain,
 								 &frame->epochs, frame->error))
@@ -2306,6 +2300,73 @@ doltgres_entries_databases(const PgCatalogCaps *caps, StdVec *result, PgPgError 
 }
 
 /*
+ * doltgres_entries_swept empties the fork's packs out of each tablespace whose
+ * directory of repositories holds the dropped mark, one a standby's redo of
+ * DROP TABLESPACE couldn't empty, through the collection that empties a
+ * tablespace, and removes that directory once no repository's is left in it
+ * (bugs row 99).
+ */
+static bool
+doltgres_entries_swept(HostIoIo *io, StoreCollectSchedule *schedule, const StdVec *databases,
+					   const StoreCollectSettings *settings, PgPgError *error)
+{
+	StdVec		spaces;
+	HostError	failed;
+	bool		ok = true;
+
+	if (!host_tablespaces(HOST_IO_IO_READ_DOORS(io), &spaces, &failed))
+	{
+		*error = pghost_raised(&failed);
+		return false;
+	}
+	for (size_t s = 0, s_len = spaces.len; s < s_len && ok; s++)
+	{
+		uint32		space = STD_VEC_AT(&spaces, uint32, s);
+		StdPathBuf	versioned;
+		StdVec		names;
+		bool		has = false;
+		bool		marked = false;
+		bool		left = false;
+		bool		removed;
+
+		versioned = host_versioned_dir(space);
+		ok = host_list_dir_if_there(HOST_IO_IO_READ_DOORS(io), (const char *) versioned.bytes.ptr,
+									versioned.bytes.len, &has, &names, &failed);
+		has = ok && has;
+		for (size_t k = 0, k_len = has ? names.len : 0; k < k_len; k++)
+		{
+			const StdString *name = &STD_VEC_AT(&names, StdString, k);
+
+			marked |= name->len == strlen(DOLTGRES_DROPPED_MARK) &&
+				memcmp(name->ptr, DOLTGRES_DROPPED_MARK, name->len) == 0;
+		}
+		for (size_t k = 0, k_len = marked ? names.len : 0; k < k_len && ok; k++)
+		{
+			const StdString *name = &STD_VEC_AT(&names, StdString, k);
+			uint32		repository;
+			uint64		counts[3];
+			StdParseIntError parsed;
+
+			if (!std_str_parse_u32(name->ptr, name->len, &repository, &parsed) || repository == 0)
+				continue;
+			left = true;
+			ok = store_collect_collect_asked(io, schedule, databases->ptr, databases->len, repository, space,
+											 settings, counts, &failed);
+		}
+		if (has)
+			std_vec_drop_Checked(&names, sizeof(StdString), _Alignof(StdString), std_String_drop);
+		if (ok && marked && !left)
+			ok = host_remove_tree(HOST_IO_IO_IO_DOORS(io), (const char *) versioned.bytes.ptr, versioned.bytes.len,
+								  &removed, &failed);
+		std_vec_free_Checked(&versioned.bytes, 1, 1);
+		if (!ok)
+			*error = pghost_raised(&failed);
+	}
+	std_vec_free_Checked(&spaces, sizeof(uint32), _Alignof(uint32));
+	return ok;
+}
+
+/*
  * doltgres_entries_collect_frame_t is collect's state across its pad: the
  * collector's schedule and the databases of a check, each while live.
  */
@@ -2353,6 +2414,7 @@ doltgres_entries_collect_body(void *frame_)
 		HostError	failed;
 		uint64		word;
 		uint32		database;
+		uint32		emptied;
 
 		if (!pg_calls_latch_sleep(raise, (int64) pg_calls_settings_collector_naptime(), frame->error) ||
 			!pg_calls_config_reload_if_pending(raise, catalog, frame->error))
@@ -2362,12 +2424,13 @@ doltgres_entries_collect_body(void *frame_)
 			return;
 		frame->databases_live = true;
 		io = pghost_io(raise);
-		if (host_collection_asked(&word, &database))
+		if (host_collection_asked(&word, &database, &emptied))
 		{
 			uint64		counts[3] = {PG_UINT64_MAX, PG_UINT64_MAX, PG_UINT64_MAX};
 			uint64		done[3];
 			bool		ok = store_collect_collect_asked(&io, &frame->schedule, frame->databases.ptr,
-														 frame->databases.len, database, &settings, done, &failed);
+														 frame->databases.len, database, emptied, &settings, done,
+														 &failed);
 
 			host_collection_answer(word, ok ? done : counts);
 			if (!ok)
@@ -2376,6 +2439,8 @@ doltgres_entries_collect_body(void *frame_)
 				return;
 			}
 		}
+		if (!doltgres_entries_swept(&io, &frame->schedule, &frame->databases, &settings, frame->error))
+			return;
 		if (!store_collect_collect_due(&io, &frame->schedule, frame->databases.ptr, frame->databases.len, &settings,
 									   &failed))
 		{
@@ -2739,12 +2804,21 @@ doltgres_entries_doltgres_fold_work(const PgCatalogCaps *caps, PgDatum main_arg,
  * doltgres_entries_doltgres_fold_relation folds a relation's storage now,
  * inside a fold worker's transaction as its owner, and answers whether it
  * installed a base; heap is the relation, or an index's table, whose horizon
- * bounds the fold.
+ * bounds the fold. It first pauses at doltgres-fold-relation, with the
+ * transaction's snapshot taken and the relation locked.
  */
 bool
 doltgres_entries_doltgres_fold_relation(const PgCatalogCaps *caps, const PgRel *rel, const PgRel *heap, bool *result,
 										PgPgError *error)
 {
+	HostIoIo	io = pghost_io(pg_CatalogCaps_may_raise(caps));
+	HostError	failed;
+
+	if (!host_pause(HOST_SHARED_IO_PAUSES(&io), "doltgres-fold-relation", &failed))
+	{
+		*error = pghost_raised(&failed);
+		return false;
+	}
 	return doltgres_entries_folded_now(caps, rel, heap, result, error);
 }
 
@@ -3087,9 +3161,23 @@ doltgres_entries_redo_aborted_body(void *frame_)
 {
 	doltgres_entries_redo_aborted_frame_t *frame = frame_;
 	doltgres_entries_redo_aborted_captures_t captures = {&frame->rows};
+	uint32		aborted = pg_calls_aborted_xid(frame->record);
 	HostIoIo	io;
 	HostError	failed;
 
+	if (aborted != 0)
+	{
+		HostXid		xid;
+
+		if (!pg_calls_widened_xid(pg_Caps_may_raise(frame->caps), aborted, &xid.f0, frame->error))
+			return;
+		io = pghost_io(pg_Caps_may_raise(frame->caps));
+		if (!txn_spill_redo_aborted(&io, xid.f0, pg_calls_record_end(frame->record), &failed))
+		{
+			doltgres_entries_raised(false, &failed, frame->error);
+			return;
+		}
+	}
 	doltgres_entries_filled(DOLTGRES_ENTRIES_RELATION_ROW, pg_calls_aborted_relations, frame->record, &frame->rows);
 	frame->rows_live = true;
 	if (frame->rows.len < DOLTGRES_ENTRIES_RELATION_ROW)
@@ -3109,7 +3197,9 @@ doltgres_entries_redo_aborted_body(void *frame_)
  * deltas the built nodes of every storage a replayed abort drops, at the
  * start of xact_redo, before any branch's DropRelationFiles, so an aborted
  * rewrite's Chunk records leave nothing on a standby that never promotes; a
- * record of another kind drops none.
+ * record of another kind drops none. It first marks the replayed aborted
+ * transaction's free space map spills with the record's end, as its abort
+ * marked them on its primary.
  */
 bool
 doltgres_entries_doltgres_redo_aborted(const PgCaps *caps, const PgWalRecord *record, PgPgError *error)
@@ -3958,6 +4048,17 @@ doltgres_entries_doltgres_rmgr_redo_closure_11(void *captures, HostIoIo *io, Tre
 	return txn_rewrite_spaced(io, held, c->record, true, c->page.most, true, c->end, error);
 }
 
+/* doltgres_entries_doltgres_rmgr_redo_closure_12 is a carry's unlist's redo: the carry's versions taken back out. */
+static bool
+doltgres_entries_doltgres_rmgr_redo_closure_12(void *captures, HostIoIo *io, TreesStoreNodeStore store,
+											   const HostSharedHeld *held, const HostSharedHeld *toast,
+											   HostError *error)
+{
+	const doltgres_entries_redone_t *c = captures;
+
+	return txn_spill_redo_unlisted(io, held, c->record, error);
+}
+
 /*
  * doltgres_entries_doltgres_rmgr_redo_frame_t is rmgr_redo's state across its
  * pad: the record decoded, each while live, a row change's out-of-line
@@ -3987,6 +4088,8 @@ typedef struct doltgres_entries_doltgres_rmgr_redo_frame_t
 	bool		freed_live;
 	TxnRecordMapCarried carried;
 	bool		carried_live;
+	TxnRecordCarryUnlisted unlisted;
+	bool		unlisted_live;
 	StdArcInner *repo;
 	bool		repo_live;
 	HostSharedReader reading;
@@ -4023,9 +4126,11 @@ doltgres_entries_doltgres_rmgr_redo_pad(void *frame_)
 		txn_record_TidsFreed_drop(&frame->freed);
 	if (frame->carried_live)
 		txn_record_MapCarried_drop(&frame->carried);
+	if (frame->unlisted_live)
+		txn_record_CarryUnlisted_drop(&frame->unlisted);
 	frame->held_live = frame->reading_live = frame->repo_live = frame->entries_live = frame->completion_live =
 		frame->change_live = frame->advanced_live = frame->chunk_live = frame->database_change_live =
-		frame->freed_live = frame->carried_live = false;
+		frame->freed_live = frame->carried_live = frame->unlisted_live = false;
 }
 
 /* doltgres_entries_redo_raised raises a redo's host error as Postgres', into the frame's error, answering false. */
@@ -4349,6 +4454,17 @@ doltgres_entries_doltgres_rmgr_redo_body(void *frame_)
 			frame->ok = doltgres_entries_replayed(frame->caps, &frame->carried.storage, NULL, NULL,
 												  doltgres_entries_doltgres_rmgr_redo_closure_11, &c, frame->error);
 			return;
+		case HOST_WAL_KIND_CARRY_UNLISTED:
+			if (!txn_record_CarryUnlisted_decode(body, body_len, &frame->unlisted, &failed))
+			{
+				doltgres_entries_redo_raised(frame, &failed);
+				return;
+			}
+			frame->unlisted_live = true;
+			c.record = &frame->unlisted;
+			frame->ok = doltgres_entries_replayed(frame->caps, &frame->unlisted.storage, NULL, NULL,
+												  doltgres_entries_doltgres_rmgr_redo_closure_12, &c, frame->error);
+			return;
 		case HOST_WAL_KIND_REPOSITORY_CREATED:
 			frame->ok = doltgres_entries_store_redone(frame, store_databases_redo_created, false, body, body_len);
 			return;
@@ -4410,6 +4526,8 @@ typedef struct doltgres_entries_doltgres_rmgr_desc_frame_t
 	bool		freed_live;
 	TxnRecordMapCarried carried;
 	bool		carried_live;
+	TxnRecordCarryUnlisted unlisted;
+	bool		unlisted_live;
 	StdString text;
 	bool		text_live;
 } doltgres_entries_doltgres_rmgr_desc_frame_t;
@@ -4434,8 +4552,10 @@ doltgres_entries_doltgres_rmgr_desc_pad(void *frame_)
 		txn_record_TidsFreed_drop(&frame->freed);
 	if (frame->carried_live)
 		txn_record_MapCarried_drop(&frame->carried);
+	if (frame->unlisted_live)
+		txn_record_CarryUnlisted_drop(&frame->unlisted);
 	frame->text_live = frame->change_live = frame->advanced_live = frame->chunk_live = false;
-	frame->database_change_live = frame->freed_live = frame->carried_live = false;
+	frame->database_change_live = frame->freed_live = frame->carried_live = frame->unlisted_live = false;
 }
 
 /* doltgres_entries_described formats a description into the frame's text. */
@@ -4678,6 +4798,30 @@ doltgres_entries_rmgr_desc_carried(doltgres_entries_doltgres_rmgr_desc_frame_t *
 	return true;
 }
 
+/* doltgres_entries_rmgr_desc_unlisted describes a carry's unlist: the storage and how many of the carry's records' ends it names. */
+static bool
+doltgres_entries_rmgr_desc_unlisted(doltgres_entries_doltgres_rmgr_desc_frame_t *frame, const uint8 *body,
+									size_t body_len, HostError *failed)
+{
+	StdFmtPiece pieces[] = {STD_FMT_LIT("rel "), STD_FMT_ARG(0), STD_FMT_LIT("/"), STD_FMT_ARG(1), STD_FMT_LIT("/"),
+	STD_FMT_ARG(2), STD_FMT_LIT("; "), STD_FMT_ARG(3), STD_FMT_LIT(" ends")};
+	const HostStorage *s;
+	size_t		ends;
+
+	if (!txn_record_CarryUnlisted_decode(body, body_len, &frame->unlisted, failed))
+		return false;
+	frame->unlisted_live = true;
+	s = &frame->unlisted.storage;
+	ends = frame->unlisted.ends.len;
+	{
+		StdFmtArg	args[] = {{&s->tablespace, std_u32_Display_fmt}, {&s->database, std_u32_Display_fmt},
+		{&s->relation, std_u32_Display_fmt}, {&ends, std_usize_Display_fmt}};
+
+		doltgres_entries_described(frame, pieces, lengthof(pieces), args);
+	}
+	return true;
+}
+
 /* doltgres_entries_doltgres_rmgr_desc_body describes the record by its kind, then appends the description. */
 static void
 doltgres_entries_doltgres_rmgr_desc_body(void *frame_)
@@ -4722,6 +4866,9 @@ doltgres_entries_doltgres_rmgr_desc_body(void *frame_)
 				break;
 			case HOST_WAL_KIND_MAP_CARRIED:
 				ok = doltgres_entries_rmgr_desc_carried(frame, body, body_len, &failed);
+				break;
+			case HOST_WAL_KIND_CARRY_UNLISTED:
+				ok = doltgres_entries_rmgr_desc_unlisted(frame, body, body_len, &failed);
 				break;
 			case HOST_WAL_KIND_REPOSITORY_CREATED:
 				ok = store_databases_describe_created(body, body_len, &frame->text, &failed);
@@ -4867,44 +5014,57 @@ typedef struct doltgres_entries_committing_t
 /*
  * doltgres_entries_committing_closure_0 is committing's lent call over a
  * value map: each written value's entry with the transaction's versions
- * against without, recorded for the commit to add.
+ * against without, recorded for the commit to add, read again from the
+ * newest base when an install moved the base before the entries were read
+ * (bugs rows 240 and 316). It pauses at doltgres-commit-valued after each
+ * read of the base.
  */
 static bool
 doltgres_entries_committing_closure_0(void *captures, HostIoIo *io, const RepoRepo *repo, const HostSharedHeld *held,
 									  HostError *error)
 {
 	const doltgres_entries_committing_t *c = captures;
-	TreesStoreReader store;
-	TxnBaseSizes adds = {0};
-	TxnBaseSizes takes = {0};
-	TxnBaseBase base;
-	TreesStoreTree root = {0};
-	bool		has_root = false;
-	bool		some;
+	HostSharedRecord record = host_shared_Held_record(held);
+	TreesStoreReader store = repo_Repo_reader(repo, HOST_CACHE_PLACEMENT_SERVER, c->reading);
 
-	if (!txn_state_base_record(io, held, &some, &base, error))
-		return false;
-	if (some)
+	for (;;)
 	{
-		has_root = base.has_root;
-		root = base.root;
-		txn_base_Base_drop(&base);
-	}
-	store = repo_Repo_reader(repo, HOST_CACHE_PLACEMENT_SERVER, c->reading);
-	for (size_t i = 0; i < c->keys->len; i++)
-	{
-		const StdVec *key = &STD_VEC_AT(c->keys, StdVec, i);
-		TxnBaseSizes added;
-		TxnBaseSizes taken;
+		uint64		generation = txn_state_generation(record);
+		TxnBaseSizes adds = {0};
+		TxnBaseSizes takes = {0};
+		TxnBaseBase base;
+		TreesStoreTree root = {0};
+		bool		has_root = false;
+		bool		some;
 
-		if (!txn_fold_committed_value_moves(io, TREES_STORE_READER_NODE_STORE(&store), held, has_root, root, c->own,
-											key->ptr, key->len, &added, &taken, error))
+		if (!txn_state_base_record(io, held, &some, &base, error))
 			return false;
-		adds = txn_base_Sizes_summed(adds, added);
-		takes = txn_base_Sizes_summed(takes, taken);
+		if (some)
+		{
+			has_root = base.has_root;
+			root = base.root;
+			txn_base_Base_drop(&base);
+		}
+		if (!host_pause(HOST_SHARED_IO_PAUSES(io), "doltgres-commit-valued", error))
+			return false;
+		for (size_t i = 0; i < c->keys->len; i++)
+		{
+			const StdVec *key = &STD_VEC_AT(c->keys, StdVec, i);
+			TxnBaseSizes added;
+			TxnBaseSizes taken;
+
+			if (!txn_fold_committed_value_moves(io, TREES_STORE_READER_NODE_STORE(&store), held, has_root, root,
+												c->own, key->ptr, key->len, &added, &taken, error))
+				return false;
+			adds = txn_base_Sizes_summed(adds, added);
+			takes = txn_base_Sizes_summed(takes, taken);
+		}
+		if (!txn_state_moved_past(record, generation))
+		{
+			txn_state_committing(held, adds, takes);
+			return true;
+		}
 	}
-	txn_state_committing(held, adds, takes);
-	return true;
 }
 
 /* doltgres_entries_committing_closure_1 is committing's based: the table and index its storage's base names. */
@@ -4939,48 +5099,63 @@ doltgres_entries_committing_closure_2(void *captures, HostIoIo *io, const RepoRe
 /*
  * doltgres_entries_committing_closure_3 is committing's lent call over a
  * table's or an index's rows: each written key's fold over the base with the
- * transaction's versions against without, recorded for the commit to add.
+ * transaction's versions against without, recorded for the commit to add,
+ * folded again over the newest base when an install moved the base before
+ * the keys' versions were read (bugs rows 240 and 316). It pauses at
+ * doltgres-commit-based after each read of the base.
  */
 static bool
 doltgres_entries_committing_closure_3(void *captures, HostIoIo *io, const RepoRepo *repo, const HostSharedHeld *held,
 									  HostError *error)
 {
 	const doltgres_entries_committing_t *c = captures;
-	TreesStoreReader store;
-	TxnBaseSizes adds = {0};
-	TxnBaseSizes takes = {0};
-	TxnBaseBase base;
-	TreesStoreTree root;
-	TreesStoreTree tuple_ids;
-	bool		has_root;
-	bool		has_tuple_ids;
-	bool		some;
+	HostSharedRecord record = host_shared_Held_record(held);
+	TreesStoreReader store = repo_Repo_reader(repo, HOST_CACHE_PLACEMENT_SERVER, c->reading);
 
-	if (!txn_state_base_record(io, held, &some, &base, error))
-		return false;
-	if (!some)
-		return true;
-	has_root = base.has_root;
-	root = base.root;
-	has_tuple_ids = base.has_tuple_ids;
-	tuple_ids = base.tuple_ids;
-	txn_base_Base_drop(&base);
-	store = repo_Repo_reader(repo, HOST_CACHE_PLACEMENT_SERVER, c->reading);
-	for (size_t i = 0; i < c->keys->len; i++)
+	for (;;)
 	{
-		const StdVec *key = &STD_VEC_AT(c->keys, StdVec, i);
-		TxnBaseSizes added;
-		TxnBaseSizes taken;
+		uint64		generation = txn_state_generation(record);
+		TxnBaseSizes adds = {0};
+		TxnBaseSizes takes = {0};
+		TxnBaseBase base;
+		TreesStoreTree root;
+		TreesStoreTree tuple_ids;
+		bool		has_root;
+		bool		has_tuple_ids;
+		HostLsn		folded;
+		bool		some;
 
-		if (!txn_fold_committed_moves(io, TREES_STORE_READER_NODE_STORE(&store), held, has_root, root, has_tuple_ids,
-									  tuple_ids, c->order, c->keyless, c->index, c->own, key->ptr, key->len, &added,
-									  &taken, error))
+		if (!txn_state_base_record(io, held, &some, &base, error))
 			return false;
-		adds = txn_base_Sizes_summed(adds, added);
-		takes = txn_base_Sizes_summed(takes, taken);
+		if (!some)
+			return true;
+		has_root = base.has_root;
+		root = base.root;
+		has_tuple_ids = base.has_tuple_ids;
+		tuple_ids = base.tuple_ids;
+		folded = base.folded;
+		txn_base_Base_drop(&base);
+		if (!host_pause(HOST_SHARED_IO_PAUSES(io), "doltgres-commit-based", error))
+			return false;
+		for (size_t i = 0; i < c->keys->len; i++)
+		{
+			const StdVec *key = &STD_VEC_AT(c->keys, StdVec, i);
+			TxnBaseSizes added;
+			TxnBaseSizes taken;
+
+			if (!txn_fold_committed_moves(io, TREES_STORE_READER_NODE_STORE(&store), held, has_root, root,
+										  has_tuple_ids, tuple_ids, c->order, c->keyless, c->index, folded, c->own,
+										  key->ptr, key->len, &added, &taken, error))
+				return false;
+			adds = txn_base_Sizes_summed(adds, added);
+			takes = txn_base_Sizes_summed(takes, taken);
+		}
+		if (!txn_state_moved_past(record, generation))
+		{
+			txn_state_committing(held, adds, takes);
+			return true;
+		}
 	}
-	txn_state_committing(held, adds, takes);
-	return true;
 }
 
 /* doltgres_entries_TupleStorageOfVecVecU8_drop is a written tree's drop glue: its keys. */
@@ -5274,7 +5449,7 @@ doltgres_entries_doltgres_xact_ended(const PgCatalogCaps *caps, int32 event, voi
 	}
 	else if (abort)
 	{
-		if (!txn_written_aborted(&io, &failed))
+		if (!txn_written_aborted(&io, pg_calls_last_record_end(), &failed))
 			return doltgres_entries_raised(false, &failed, error);
 		doltgres_settle_ended(&io, true);
 	}
@@ -5448,25 +5623,31 @@ doltgres_entries_handle(const PgScan *scan)
 #define TXN_STATE_RESULT_ERROR error
 #include "doltgres/txn/state_template.h"
 
-/* doltgres_entries_doltgres_scan_begin_captures_t is scan_begin's lent call's captures: the relation and the read. */
+/*
+ * doltgres_entries_doltgres_scan_begin_captures_t is scan_begin's lent
+ * call's captures: the relation, the read, and the base generation its base
+ * was read at.
+ */
 typedef struct doltgres_entries_doltgres_scan_begin_captures_t
 {
 	const PgRel *relation;
 	const HostSnapshot *read;
+	uint64		generation;
 } doltgres_entries_doltgres_scan_begin_captures_t;
 
 /*
  * doltgres_entries_doltgres_scan_begin_closure_0 is scan_begin's lent call:
  * the storage's block count and the base its read sees, or its newest when
- * it has no snapshot.
+ * it has no snapshot, with the generation read before it.
  */
 static bool
 doltgres_entries_doltgres_scan_begin_closure_0(void *captures, HostIoIo *io, const RepoRepo *repo,
 											   const HostSharedHeld *held, uint64 *result_0, bool *some,
 											   TxnBaseBase *result_1, HostError *error)
 {
-	const doltgres_entries_doltgres_scan_begin_captures_t *c = captures;
+	doltgres_entries_doltgres_scan_begin_captures_t *c = captures;
 
+	c->generation = txn_state_generation(host_shared_Held_record(held));
 	if (c->read != NULL ? !txn_state_readable(io, held, c->read, some, result_1, error) :
 		!txn_state_newest(io, held, some, result_1, error))
 		return false;
@@ -5543,10 +5724,48 @@ doltgres_entries_doltgres_scan_begin_pad(void *frame_)
 	frame->columns_live = frame->key_recorded_live = frame->reading_live = frame->repo_live = false;
 }
 
+/* txn::state::held at u64, which entries_tail.c defines and scan_begin and analyze_next_tuple take. */
+#define TXN_STATE_TS U64
+#define TXN_STATE_RETURNS bool
+#define TXN_STATE_RESULT_PARAMS , uint64 *result, HostError *error
+#define TXN_STATE_DECLARE
+#include "doltgres/txn/state_template.h"
+
+/*
+ * doltgres_entries_doltgres_scan_begin_closure_1 is a parallel scan's lent
+ * call: the base generation its worker reads at, one before the state's when
+ * the base the leader shared is no longer the storage's newest, so the
+ * worker's first read moves to the newest (rebased).
+ */
+static bool
+doltgres_entries_doltgres_scan_begin_closure_1(void *captures, HostIoIo *io, const RepoRepo *repo,
+											   const HostSharedHeld *held, uint64 *result, HostError *error)
+{
+	const DoltgresScanShared *shared = captures;
+	uint64		generation = txn_state_generation(host_shared_Held_record(held));
+	TxnBaseBase newest;
+	bool		some;
+	bool		same;
+
+	if (!txn_state_newest(io, held, &some, &newest, error))
+		return false;
+	same = !some ||
+		(newest.has_root == shared->has_tree &&
+		 (!newest.has_root || trees_store_Tree_PartialEq_eq(&newest.root, &shared->tree)) &&
+		 newest.has_tuple_ids == shared->has_tuple_ids &&
+		 (!newest.has_tuple_ids || trees_store_Tree_PartialEq_eq(&newest.tuple_ids, &shared->tuple_ids)) &&
+		 newest.read == shared->folded);
+	if (some)
+		txn_base_Base_drop(&newest);
+	*result = same ? generation : generation - 1;
+	return true;
+}
+
 /*
  * doltgres_entries_doltgres_scan_begin_parallel makes a parallel scan's
  * record over the base the leader shared: its trees, its split keys, its
- * epochs, and its count of entries and units.
+ * epochs, its count of entries and units, and the base generation its
+ * worker reads at.
  */
 static bool
 doltgres_entries_doltgres_scan_begin_parallel(doltgres_entries_doltgres_scan_begin_frame_t *frame,
@@ -5561,9 +5780,20 @@ doltgres_entries_doltgres_scan_begin_parallel(doltgres_entries_doltgres_scan_beg
 	bool		has_chain;
 	TreesStoreReader store;
 	HostError	failed;
+	uint64		generation;
 
 	frame->shared.has_tree = doltgres_entries_root(&parts.table, &frame->shared.tree);
 	frame->shared.has_tuple_ids = doltgres_entries_root(&parts.tuples, &frame->shared.tuple_ids);
+	frame->shared.folded = parts.folded;
+	if (!doltgres_entries_making(frame->caps, &frame->io, frame->relation, &frame->found, frame->error))
+		return false;
+	if (!txn_state_held_U64(&frame->io, repo, &frame->reading, frame->found,
+							doltgres_entries_doltgres_scan_begin_closure_1, &frame->shared, NULL, &generation,
+							&failed))
+	{
+		*frame->error = pghost_raised(&failed);
+		return false;
+	}
 	if (!doltgres_scan_split_keys(splits, splits_len, &frame->splits, &failed))
 	{
 		*frame->error = pghost_raised(&failed);
@@ -5572,7 +5802,6 @@ doltgres_entries_doltgres_scan_begin_parallel(doltgres_entries_doltgres_scan_beg
 	frame->splits_live = true;
 	frame->shared.fresh_end = parts.fresh;
 	frame->shared.entries = parts.entries;
-	frame->shared.folded = parts.folded;
 	frame->shared.units = units;
 	store = repo_Repo_reader(repo, HOST_CACHE_PLACEMENT_SERVER, &frame->reading);
 	has_chain = doltgres_entries_root(&parts.chain, &chain);
@@ -5584,8 +5813,8 @@ doltgres_entries_doltgres_scan_begin_parallel(doltgres_entries_doltgres_scan_beg
 	}
 	frame->shared.splits = frame->splits;
 	frame->splits_live = frame->keyed_live = frame->order_live = false;
-	if (!doltgres_scan_begin_parallel(&frame->io, &frame->shared, &frame->keyed, pg_calls_rel_id(frame->relation),
-									  &frame->order, owned, &failed))
+	if (!doltgres_scan_begin_parallel(&frame->io, &frame->shared, generation, &frame->keyed,
+									  pg_calls_rel_id(frame->relation), &frame->order, owned, &failed))
 	{
 		*frame->error = pghost_raised(&failed);
 		return false;
@@ -5630,7 +5859,7 @@ doltgres_entries_doltgres_scan_begin_serial(doltgres_entries_doltgres_scan_begin
 	store = repo_Repo_reader(repo, HOST_CACHE_PLACEMENT_SERVER, &frame->reading);
 	frame->keyed_live = frame->order_live = false;
 	if (!doltgres_scan_scan_begin(&frame->io, TREES_STORE_READER_NODE_STORE(&store), blocks,
-								  has_base ? &frame->read_base : NULL, &frame->keyed,
+								  has_base ? &frame->read_base : NULL, c.generation, &frame->keyed,
 								  pg_calls_rel_id(frame->relation), &frame->order, owned, &failed))
 	{
 		*frame->error = pghost_raised(&failed);
@@ -6412,13 +6641,6 @@ doltgres_entries_sampled(HostIoIo *io, const DoltgresScanRow *row, DoltgresEntri
 		*result = DOLTGRES_ENTRIES_SAMPLED_DEAD;
 	return true;
 }
-
-/* txn::state::held at u64, which entries_tail.c defines and analyze_next_tuple takes. */
-#define TXN_STATE_TS U64
-#define TXN_STATE_RETURNS bool
-#define TXN_STATE_RESULT_PARAMS , uint64 *result, HostError *error
-#define TXN_STATE_DECLARE
-#include "doltgres/txn/state_template.h"
 
 /* doltgres_entries_spent_t is analyze_next_tuple's lent call's captures: the reader and the block's first tid. */
 typedef struct doltgres_entries_spent_t

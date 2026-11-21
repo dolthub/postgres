@@ -1919,17 +1919,17 @@ pghost_PgHost_Host_refuse_recovery(void *self, const char *detail, size_t detail
 	shmem_delta_refuse(detail, detail_len);
 }
 
-/* pghost_PgHost_Host_delay_checkpoints holds checkpoints off, loading first the pauses its window runs inside its critical section. */
+/* pghost_PgHost_Host_load_pauses loads pauses' callbacks, as INJECTION_POINT_LOAD does, and does nothing in a build without injection points. */
 static bool
-pghost_PgHost_Host_delay_checkpoints(void *self, const HostMayRaise *raise, const char *const *pauses,
-									 size_t pauses_len, HostError *error)
+pghost_PgHost_Host_load_pauses(void *self, const HostMayRaise *raise, const char *const *pauses, size_t pauses_len,
+							   HostError *error)
 {
-	PgPgError	error_;
-
 	(void) self;
 #ifdef USE_INJECTION_POINTS
 	for (size_t i = 0, i_len = pauses_len; i < i_len; i++)
 	{
+		PgPgError	error_;
+
 		if (!pg_calls_injection_point_load(pghost_pg_raise(raise), pauses[i], &error_))
 		{
 			*error = pghost_held(&error_);
@@ -1937,9 +1937,23 @@ pghost_PgHost_Host_delay_checkpoints(void *self, const HostMayRaise *raise, cons
 		}
 	}
 #else
+	(void) raise;
 	(void) pauses;
 	(void) pauses_len;
+	(void) error;
 #endif
+	return true;
+}
+
+/* pghost_PgHost_Host_delay_checkpoints holds checkpoints off, loading first the pauses its window runs inside its critical section. */
+static bool
+pghost_PgHost_Host_delay_checkpoints(void *self, const HostMayRaise *raise, const char *const *pauses,
+									 size_t pauses_len, HostError *error)
+{
+	PgPgError	error_;
+
+	if (!pghost_PgHost_Host_load_pauses(self, raise, pauses, pauses_len, error))
+		return false;
 	if (!pg_calls_delay_checkpoints(pghost_pg_raise(raise), &error_))
 	{
 		*error = pghost_held(&error_);
@@ -2519,6 +2533,9 @@ pghost_PgHost_Host_atomic(void *self, uint64 place, size_t atomic, HostSharedOp 
 			records_op.u.exchange.f0 = op.u.exchange.f0;
 			records_op.u.exchange.f1 = op.u.exchange.f1;
 			break;
+		case HOST_SHARED_OP_LOAD_ACQUIRE:
+			records_op.tag = SHMEM_RECORDS_OP_LOAD_ACQUIRE;
+			break;
 	}
 	pghost_shared_placed(place, &kind, &index);
 	return shmem_records_atomic(kind, index, atomic, records_op);
@@ -3088,15 +3105,15 @@ pghost_PgHost_Host_collection_end(void *self)
 	shmem_collection_collection_end();
 }
 
-/* pghost_PgHost_Host_collection_ask asks the collector to collect a database and waits for its counts. */
+/* pghost_PgHost_Host_collection_ask asks the collector to collect a database, emptying a tablespace, and waits for its counts. */
 static bool
-pghost_PgHost_Host_collection_ask(void *self, const HostMayRaise *raise, uint32 database, uint64 *result,
-								  HostError *error)
+pghost_PgHost_Host_collection_ask(void *self, const HostMayRaise *raise, uint32 database, uint32 emptied,
+								  uint64 *result, HostError *error)
 {
 	PgPgError	error_;
 
 	(void) self;
-	if (!shmem_collection_ask(pghost_pg_raise(raise), database, result, &error_))
+	if (!shmem_collection_ask(pghost_pg_raise(raise), database, emptied, result, &error_))
 	{
 		*error = pghost_held(&error_);
 		return false;
@@ -3104,14 +3121,14 @@ pghost_PgHost_Host_collection_ask(void *self, const HostMayRaise *raise, uint32 
 	return true;
 }
 
-/* pghost_PgHost_Host_collection_asked returns the unanswered ask's word and the database it asks for. */
+/* pghost_PgHost_Host_collection_asked returns the unanswered ask's word, the database it asks for, and the tablespace it empties. */
 static bool
-pghost_PgHost_Host_collection_asked(void *self, uint64 *result_0, uint32 *result_1)
+pghost_PgHost_Host_collection_asked(void *self, uint64 *result_0, uint32 *result_1, uint32 *result_2)
 {
 	std_TupleU64U32_t asked;
 
 	(void) self;
-	if (!shmem_collection_asked_for(&asked))
+	if (!shmem_collection_asked_for(&asked, result_2))
 		return false;
 	*result_0 = asked.f0;
 	*result_1 = asked.f1;
@@ -3132,6 +3149,14 @@ pghost_PgHost_Host_collector_started(void *self)
 {
 	(void) self;
 	shmem_collection_worker_started();
+}
+
+/* pghost_PgHost_Host_collector_running reports whether a collector worker has started. */
+static bool
+pghost_PgHost_Host_collector_running(void *self)
+{
+	(void) self;
+	return shmem_collection_worker_running();
 }
 
 /* pghost_PgHost_Host_database_locked takes a database's lock without waiting, reporting whether it did. */
@@ -4138,6 +4163,7 @@ static const HostHostOps PGHOST_PG_HOST_HOST_OPS = {
 	.log = pghost_PgHost_Host_log,
 	.refuse_recovery = pghost_PgHost_Host_refuse_recovery,
 	.delay_checkpoints = pghost_PgHost_Host_delay_checkpoints,
+	.load_pauses = pghost_PgHost_Host_load_pauses,
 	.resume_checkpoints = pghost_PgHost_Host_resume_checkpoints,
 	.xid_status = pghost_PgHost_Host_xid_status,
 	.xid_in_progress = pghost_PgHost_Host_xid_in_progress,
@@ -4244,6 +4270,7 @@ static const HostHostOps PGHOST_PG_HOST_HOST_OPS = {
 	.collection_asked = pghost_PgHost_Host_collection_asked,
 	.collection_answer = pghost_PgHost_Host_collection_answer,
 	.collector_started = pghost_PgHost_Host_collector_started,
+	.collector_running = pghost_PgHost_Host_collector_running,
 	.database_locked = pghost_PgHost_Host_database_locked,
 	.database_unlocked = pghost_PgHost_Host_database_unlocked,
 	.database_lock_waited = pghost_PgHost_Host_database_lock_waited,

@@ -338,8 +338,6 @@ doltgres_entries_chained_closure_0_body(void *frame_)
 	TreesStoreReader store = repo_Repo_reader(frame->repo, HOST_CACHE_PLACEMENT_SERVER, c->reading);
 	TxnBaseBase newest;
 	bool		some;
-	bool		has_tuple_ids = false;
-	TreesStoreTree tuple_ids = {0};
 	HostLsn		folded = 0;
 	bool		has_key;
 	bool		keyless;
@@ -350,13 +348,11 @@ doltgres_entries_chained_closure_0_body(void *frame_)
 		return;
 	if (some)
 	{
-		has_tuple_ids = newest.has_tuple_ids;
-		tuple_ids = newest.tuple_ids;
-		folded = newest.folded;
+		folded = newest.read;
 		txn_base_Base_drop(&newest);
 	}
-	if (!doltgres_scan_keyed(frame->io, TREES_STORE_READER_NODE_STORE(&store), host_shared_Held_record(frame->held),
-							 has_tuple_ids, tuple_ids, c->tuple, &has_key, &frame->key, &keyless, frame->error))
+	if (!doltgres_scan_keyed(frame->io, TREES_STORE_READER_NODE_STORE(&store), frame->held, c->tuple, &has_key,
+							 &frame->key, &keyless, frame->error))
 		return;
 	*frame->some = false;
 	if (!has_key)
@@ -1214,7 +1210,7 @@ doltgres_entries_doltgres_relation_nontransactional_truncate(const PgCatalogCaps
 static void
 doltgres_entries_Carry_drop(void *carry)
 {
-	txn_record_RowChange_drop(&((DoltgresRewriteCarry *) carry)->f0);
+	txn_record_RowChange_drop(&((TxnRewriteCarry *) carry)->f0);
 }
 
 /* doltgres_entries_Copied_drop is Copied's drop glue, an element of copied's answer. */
@@ -1380,7 +1376,7 @@ doltgres_entries_doltgres_relation_copy_for_cluster_closure_5_body(void *frame_)
 {
 	doltgres_entries_doltgres_relation_copy_for_cluster_closure_5_frame_t *frame = frame_;
 	doltgres_entries_doltgres_relation_copy_for_cluster_captures_t *c = frame->c;
-	const DoltgresRewriteCarry *carried = c->carried->ptr;
+	const TxnRewriteCarry *carried = c->carried->ptr;
 	TxnInsertPage page = doltgres_entries_page();
 	bool		some;
 	bool		first = true;
@@ -1433,10 +1429,9 @@ doltgres_entries_doltgres_relation_copy_for_cluster_closure_5_body(void *frame_)
 		return;
 	}
 	store = repo_Repo_reader(frame->repo, HOST_CACHE_PLACEMENT_SERVER, c->reading);
-	for (size_t i = 0; i < c->carried->len; i++)
-		if (!txn_rewrite_carried(frame->io, TREES_STORE_READER_NODE_STORE(&store), frame->held, &carried[i].f0,
-								 carried[i].f1, carried[i].f2, c->logged, &page, frame->error))
-			return;
+	if (!txn_rewrite_carried(frame->io, TREES_STORE_READER_NODE_STORE(&store), frame->held, NULL, 0, carried,
+							 c->carried->len, c->logged, &page, pg_calls_max_heap_tuples_per_page(), frame->error))
+		return;
 	*frame->result = true;
 	frame->ok = true;
 }
@@ -1524,7 +1519,7 @@ doltgres_entries_doltgres_relation_copy_for_cluster_pad(void *frame_)
 		std_vec_drop_Checked(&frame->copied, sizeof(TxnRewriteCopied), _Alignof(TxnRewriteCopied),
 							 doltgres_entries_Copied_drop);
 	if (frame->carried_live)
-		std_vec_drop_Checked(&frame->carried, sizeof(DoltgresRewriteCarry), _Alignof(DoltgresRewriteCarry),
+		std_vec_drop_Checked(&frame->carried, sizeof(TxnRewriteCarry), _Alignof(TxnRewriteCarry),
 							 doltgres_entries_Carry_drop);
 	if (frame->toast_live)
 		host_shared_Held_drop(&frame->values);
@@ -1693,7 +1688,7 @@ doltgres_entries_doltgres_relation_copy_for_cluster_body(void *frame_)
 		return;
 	for (size_t i = 0; i < frame->carried.len; i++)
 	{
-		const TxnMemtableVersionWriter *writer = &STD_VEC_AT(&frame->carried, DoltgresRewriteCarry, i).f0.writer;
+		const TxnMemtableVersionWriter *writer = &STD_VEC_AT(&frame->carried, TxnRewriteCarry, i).f0.writer;
 		uint64		xid = writer->has_top ? writer->top : writer->xid;
 
 		if (xid < TXN_STATUS_FIRST_NORMAL || (has_oldest && xid >= oldest))
@@ -1830,7 +1825,7 @@ typedef struct doltgres_entries_moved_into_captures_t
 	bool		logged;
 	const TxnRecordMapCarried *spaces;
 	size_t		spaces_len;
-	const DoltgresRewriteCarry *carried;
+	const TxnRewriteCarry *carried;
 	size_t		carried_len;
 } doltgres_entries_moved_into_captures_t;
 
@@ -1869,14 +1864,38 @@ doltgres_entries_moved_into_closure_0_body(void *frame_)
 	doltgres_entries_moved_into_closure_0_frame_t *frame = frame_;
 	doltgres_entries_moved_into_captures_t *c = frame->c;
 	HostLsn		point = c->newest->folded;
+	HostLsn		read;
 	bool		copied;
 	TreesStoreReader store;
+	StdVec		writers;
+	bool		ok;
 
 	std_vec_new(&frame->copies.copies, sizeof(txn_TupleLocatorLocator_t), _Alignof(txn_TupleLocatorLocator_t));
 	frame->copies_live = true;
 	*c->newest_live = false;
-	if (!txn_fold_copied(frame->io, frame->repo, c->reading, frame->held, c->newest, point, c->has_nodes, c->nodes,
-						 &frame->copies, &copied, frame->error))
+	std_vec_new(&writers, sizeof(uint64), _Alignof(uint64));
+	for (size_t i = 0; i < c->spaces_len; i++)
+		for (size_t v = 0; v < c->spaces[i].versions.len; v++)
+		{
+			const TxnMemtableVersionWriter *writer = &STD_VEC_AT(&c->spaces[i].versions, TxnRecordCarriedTake,
+																 v).writer;
+			uint64		top = writer->has_top ? writer->top : writer->xid;
+
+			std_vec_push_Checked(&writers, &top, sizeof(top), _Alignof(uint64));
+		}
+	for (size_t i = 0; i < c->carried_len; i++)
+	{
+		const TxnMemtableVersionWriter *writer = &c->carried[i].f0.writer;
+		uint64		top = writer->has_top ? writer->top : writer->xid;
+
+		std_vec_push_Checked(&writers, &top, sizeof(top), _Alignof(uint64));
+	}
+	ok = txn_rewrite_moved_point(frame->io, c->newest->read, writers.ptr, writers.len, &read, frame->error);
+	std_vec_free_Checked(&writers, sizeof(uint64), _Alignof(uint64));
+	if (!ok)
+		return;
+	if (!txn_fold_copied(frame->io, frame->repo, c->reading, frame->held, c->newest, point, read, c->has_nodes,
+						 c->nodes, &frame->copies, &copied, frame->error))
 		return;
 	if (!copied)
 	{
@@ -1884,15 +1903,11 @@ doltgres_entries_moved_into_closure_0_body(void *frame_)
 		frame->ok = true;
 		return;
 	}
-	for (size_t i = 0; i < c->spaces_len; i++)
-		if (!txn_rewrite_spaced(frame->io, frame->held, &c->spaces[i], c->logged, pg_calls_max_heap_tuples_per_page(),
-								false, 0, frame->error))
-			return;
 	store = repo_Repo_reader(frame->repo, HOST_CACHE_PLACEMENT_SERVER, c->reading);
-	for (size_t i = 0; i < c->carried_len; i++)
-		if (!txn_rewrite_carried(frame->io, TREES_STORE_READER_NODE_STORE(&store), frame->held, &c->carried[i].f0,
-								 c->carried[i].f1, c->carried[i].f2, c->logged, NULL, frame->error))
-			return;
+	if (!txn_rewrite_carried(frame->io, TREES_STORE_READER_NODE_STORE(&store), frame->held, c->spaces, c->spaces_len,
+							 c->carried, c->carried_len, c->logged, NULL, pg_calls_max_heap_tuples_per_page(),
+							 frame->error))
+		return;
 	*frame->result = true;
 	frame->ok = true;
 }
@@ -1997,7 +2012,7 @@ doltgres_entries_moved_into_body(void *frame_)
 static bool
 doltgres_entries_moved_into(const PgMayRaise *raise, HostIoIo *io, const RepoRepo *repo,
 							const HostSharedReader *reading, const PgRel *rel, HostStorage moved, TxnBaseBase *newest,
-							const TxnRecordMapCarried *spaces, size_t spaces_len, const DoltgresRewriteCarry *carried,
+							const TxnRecordMapCarried *spaces, size_t spaces_len, const TxnRewriteCarry *carried,
 							size_t carried_len, PgPgError *error)
 {
 	doltgres_entries_moved_into_frame_t frame = {.newest = *newest, .newest_live = true,
@@ -2066,7 +2081,7 @@ doltgres_entries_doltgres_relation_copy_data_closure_0_pad(void *frame_)
 	doltgres_entries_doltgres_relation_copy_data_closure_0_frame_t *frame = frame_;
 
 	if (frame->carried_live)
-		std_vec_drop_Checked(frame->carried, sizeof(DoltgresRewriteCarry), _Alignof(DoltgresRewriteCarry),
+		std_vec_drop_Checked(frame->carried, sizeof(TxnRewriteCarry), _Alignof(TxnRewriteCarry),
 							 doltgres_entries_Carry_drop);
 	if (frame->base_live)
 		txn_base_Base_drop(frame->base);
@@ -2102,7 +2117,7 @@ doltgres_entries_doltgres_relation_copy_data_closure_0_body(void *frame_)
 	if (!doltgres_entries_moved_base(frame->io, frame->held, frame->base, frame->error))
 		return;
 	frame->base_live = true;
-	if (!doltgres_rewrite_moving(frame->io, frame->held, frame->base->folded, c->moved, c->table, false, 0,
+	if (!doltgres_rewrite_moving(frame->io, frame->held, frame->base->read, c->moved, c->table, false, 0,
 								 frame->carried, frame->error))
 		return;
 	frame->carried_live = true;
@@ -2175,7 +2190,7 @@ doltgres_entries_doltgres_relation_copy_data_pad(void *frame_)
 		std_vec_drop_Checked(&frame->spaces, sizeof(TxnRecordMapCarried), _Alignof(TxnRecordMapCarried),
 							 doltgres_entries_MapCarried_drop);
 	if (frame->carried_live)
-		std_vec_drop_Checked(&frame->carried, sizeof(DoltgresRewriteCarry), _Alignof(DoltgresRewriteCarry),
+		std_vec_drop_Checked(&frame->carried, sizeof(TxnRewriteCarry), _Alignof(TxnRewriteCarry),
 							 doltgres_entries_Carry_drop);
 	if (frame->base_live)
 		txn_base_Base_drop(&frame->base);
@@ -2208,7 +2223,7 @@ doltgres_entries_doltgres_relation_copy_data_named(doltgres_entries_doltgres_rel
 							 &frame->opened.reading);
 	for (size_t i = 0; i < frame->carried.len; i++)
 	{
-		TxnRecordRowChange *change = &STD_VEC_AT(&frame->carried, DoltgresRewriteCarry, i).f0;
+		TxnRecordRowChange *change = &STD_VEC_AT(&frame->carried, TxnRewriteCarry, i).f0;
 		const TxnMemtablePut *put;
 		const uint32 *ids = NULL;
 		size_t		ids_len = 0;
@@ -2326,7 +2341,7 @@ doltgres_entries_doltgres_relation_copy_data_body(void *frame_)
 	{
 		const TxnMemtablePut *put;
 
-		valued = txn_record_RowChange_put(&STD_VEC_AT(&frame->carried, DoltgresRewriteCarry, i).f0, &put) &&
+		valued = txn_record_RowChange_put(&STD_VEC_AT(&frame->carried, TxnRewriteCarry, i).f0, &put) &&
 			put->values.len > 0;
 	}
 	if (valued && !doltgres_entries_doltgres_relation_copy_data_named(frame))
@@ -2429,7 +2444,7 @@ doltgres_entries_doltgres_index_copy_data_closure_0_body(void *frame_)
 	if (!doltgres_entries_moved_base(frame->io, frame->held, frame->base, frame->error))
 		return;
 	frame->base_live = true;
-	if (!doltgres_rewrite_moving(frame->io, frame->held, frame->base->folded, c->moved, c->table, true, c->index,
+	if (!doltgres_rewrite_moving(frame->io, frame->held, frame->base->read, c->moved, c->table, true, c->index,
 								 frame->carried, frame->error))
 		return;
 	frame->base_live = false;
@@ -2480,7 +2495,7 @@ doltgres_entries_doltgres_index_copy_data_pad(void *frame_)
 	doltgres_entries_doltgres_index_copy_data_frame_t *frame = frame_;
 
 	if (frame->carried_live)
-		std_vec_drop_Checked(&frame->carried, sizeof(DoltgresRewriteCarry), _Alignof(DoltgresRewriteCarry),
+		std_vec_drop_Checked(&frame->carried, sizeof(TxnRewriteCarry), _Alignof(TxnRewriteCarry),
 							 doltgres_entries_Carry_drop);
 	frame->carried_live = false;
 	doltgres_entries_opened_drop(&frame->opened);
@@ -2888,7 +2903,8 @@ doltgres_entries_doltgres_relation_size_body(void *frame_)
 /*
  * doltgres_entries_doltgres_relation_size is the fork's relation_size: the
  * main fork's block count times the block size, from the storage's tree's
- * totals and its tuple id counter (PLAN item 5's sizes for costs), and 0 for
+ * totals and its tuple id counter (PLAN item 5's sizes for costs), the free
+ * space map fork's own pages, which Postgres keeps (bugs row 87), and 0 for
  * every other fork, which the fork's relations don't have.
  */
 bool
@@ -2898,6 +2914,15 @@ doltgres_entries_doltgres_relation_size(const PgCatalogCaps *caps, const PgRel *
 	doltgres_entries_doltgres_relation_size_frame_t frame = {.caps = caps, .rel = rel, .result = result,
 	.error = error};
 
+	if (forkNumber == FSM_FORKNUM)
+	{
+		uint32		blocks;
+
+		if (!pg_calls_fork_blocks(pg_CatalogCaps_may_raise(caps), rel, forkNumber, &blocks, error))
+			return false;
+		*result = (uint64) blocks * BLCKSZ;
+		return true;
+	}
 	if (forkNumber != MAIN_FORKNUM)
 	{
 		*result = 0;
@@ -3038,7 +3063,8 @@ doltgres_entries_size_added(int64 size, uint64 added)
  * nothing, in pg_relation_size for the fork it names and in the sums over a
  * table's relations for every fork: a table's block count and an index's,
  * times BLCKSZ, and nothing for a relation the fork doesn't store or another
- * fork, which has no file.
+ * fork, which has no file but the free space map's, whose pages Postgres
+ * summed.
  */
 bool
 doltgres_entries_doltgres_relation_size_added(const PgCatalogCaps *caps, const PgRel *rel, const PgText *forkName,
@@ -3065,10 +3091,349 @@ doltgres_entries_doltgres_relation_size_added(const PgCatalogCaps *caps, const P
 
 		if (!doltgres_relation_stored(caps, rel, &stored, error))
 			return false;
-		if (stored && !doltgres_entries_doltgres_relation_size(caps, rel, fork_number, &added, error))
+		if (stored && fork_number == MAIN_FORKNUM &&
+			!doltgres_entries_doltgres_relation_size(caps, rel, fork_number, &added, error))
 			return false;
 	}
 	*result = doltgres_entries_size_added(size, added);
+	return true;
+}
+
+/*
+ * doltgres_entries_doltgres_visibility_counted counts every block of a table
+ * the fork stores all-visible and all-frozen, in visibilitymap_count, since
+ * the fork keeps no visibility map and every block is both (design items 5
+ * and 16): its block count, as RelationGetNumberOfBlocks gives it, the
+ * all-frozen count only where its caller asks for one; it answers nothing
+ * for a relation the fork doesn't store.
+ */
+bool
+doltgres_entries_doltgres_visibility_counted(const PgCatalogCaps *caps, const PgRel *rel, uint32 *all_visible,
+											 uint32 *all_frozen, bool *result, PgPgError *error)
+{
+	uint64		bytes;
+
+	if (!doltgres_relation_stored(caps, rel, result, error))
+		return false;
+	if (!*result)
+		return true;
+	if (!doltgres_entries_doltgres_relation_size(caps, rel, MAIN_FORKNUM, &bytes, error))
+		return false;
+	*all_visible = (uint32) ((bytes + (BLCKSZ - 1)) / BLCKSZ);
+	if (all_frozen != NULL)
+		*all_frozen = *all_visible;
+	return true;
+}
+
+/*
+ * doltgres_entries_doltgres_heap_only_refused answers whether the fork
+ * stores a relation, a table by access's rule and an index by whether its
+ * entries are the fork's, for the heap-only contrib modules' checks (PLAN
+ * item 5), which refuse it as they refuse a relation of another access
+ * method.
+ */
+bool
+doltgres_entries_doltgres_heap_only_refused(const PgCatalogCaps *caps, const PgRel *rel, bool *result,
+											PgPgError *error)
+{
+	if (pg_calls_rel_kind(rel) == RELKIND_INDEX)
+		return doltgres_index_ported(pg_CatalogCaps_may_raise(caps), pg_CatalogCaps_catalog(caps), rel, result,
+									 error);
+	return doltgres_relation_stored(caps, rel, result, error);
+}
+
+/*
+ * doltgres_entries_scan_frame_t is a scan cost's state across its pad: what
+ * it opened, the index and its table, and the table's recorded base, each
+ * while live, and the table's shape once read.
+ */
+typedef struct doltgres_entries_scan_frame_t
+{
+	doltgres_entries_opened_t opened;
+	PgRefRel	index;
+	bool		index_live;
+	PgRefRel	table;
+	bool		table_live;
+	TxnBaseBase recorded;
+	bool		recorded_live;
+	const PgCatalogCaps *caps;
+	HostIoIo	io;
+
+	/*
+	 * indexoid is the index a scan reads, or 0 for a bitmap scan's table
+	 * alone.
+	 */
+	uint32		indexoid;
+	uint32		tableoid;
+	/* stored is whether the fork stores the table, and so answers its costs. */
+	bool		stored;
+
+	/*
+	 * keyed is whether the index is the table's primary key's, whose leaves
+	 * are the table's rows.
+	 */
+	bool		keyed;
+
+	/*
+	 * rows and tuple_ids are the blocks of the table's tree and of its tuple
+	 * id tree.
+	 */
+	TxnBaseBlockCounts rows;
+	TxnBaseBlockCounts tuple_ids;
+	PgPgError  *error;
+	bool		ok;
+} doltgres_entries_scan_frame_t;
+
+/* doltgres_entries_scan_pad frees what a scan cost holds. */
+static void
+doltgres_entries_scan_pad(void *frame_)
+{
+	doltgres_entries_scan_frame_t *frame = frame_;
+
+	if (frame->recorded_live)
+		txn_base_Base_drop(&frame->recorded);
+	if (frame->table_live)
+		pg_RefRel_drop(&frame->table);
+	if (frame->index_live)
+		pg_RefRel_drop(&frame->index);
+	frame->recorded_live = frame->table_live = frame->index_live = false;
+	doltgres_entries_opened_drop(&frame->opened);
+}
+
+/* doltgres_entries_scan_opened opens a relation the planner holds a lock on, as a fork error when it is gone. */
+static bool
+doltgres_entries_scan_opened(doltgres_entries_scan_frame_t *frame, uint32 relid, PgRefRel *result, bool *live)
+{
+	bool		has;
+
+	if (!pg_RefRel_opened(pg_CatalogCaps_may_raise(frame->caps), pg_CatalogCaps_catalog(frame->caps), relid, &has,
+						  result, frame->error))
+		return false;
+	if (!has)
+	{
+		*frame->error = doltgres_entries_pg_fork("XX000", "a relation the planner costs is gone");
+		return false;
+	}
+	*live = true;
+	return true;
+}
+
+/*
+ * doltgres_entries_scan_bytes returns entries times a size each plus more
+ * bytes, saturating: a tuple id tree's bytes, whose entries are a tuple id's
+ * six bytes keying the row's key and its four bytes of heap length.
+ */
+static uint64
+doltgres_entries_scan_bytes(uint64 entries, uint64 each, uint64 more)
+{
+	uint64		product;
+	uint64		sum;
+
+	if (pg_mul_u64_overflow(entries, each, &product) || pg_add_u64_overflow(product, more, &sum))
+		return PG_UINT64_MAX;
+	return sum;
+}
+
+/*
+ * doltgres_entries_scan_body reads a scanned table's shape: whether the fork
+ * stores it, the blocks of its tree and of its tuple id tree from its
+ * storage's totals, and whether the index is its primary key's.
+ */
+static void
+doltgres_entries_scan_body(void *frame_)
+{
+	doltgres_entries_scan_frame_t *frame = frame_;
+	const PgMayRaise *raise = pg_CatalogCaps_may_raise(frame->caps);
+	const PgRel *table;
+	const RepoRepo *repo;
+	TxnStateFound found;
+	TxnBaseSizes totals;
+	TxnBaseSizes tuple_ids = {0};
+	HostError	failed;
+
+	if (frame->indexoid != 0)
+	{
+		if (!doltgres_entries_scan_opened(frame, frame->indexoid, &frame->index, &frame->index_live))
+			return;
+		frame->tableoid = pg_calls_index_table(pg_RefRel_rel(&frame->index));
+	}
+	if (!doltgres_entries_scan_opened(frame, frame->tableoid, &frame->table, &frame->table_live))
+		return;
+	table = pg_RefRel_rel(&frame->table);
+	if (!doltgres_relation_stored(frame->caps, table, &frame->stored, frame->error))
+		return;
+	if (!frame->stored)
+	{
+		frame->ok = true;
+		return;
+	}
+	frame->io = pghost_io_catalog(frame->caps);
+	if (!doltgres_entries_open(&frame->io, &frame->opened, frame->error))
+		return;
+	repo = doltgres_entries_opened_repo(&frame->opened);
+	if (!doltgres_entries_counted(frame->caps, &frame->io, repo, &frame->opened.reading, table, table, false,
+								  frame->error) ||
+		!doltgres_entries_making(frame->caps, &frame->io, table, &found, frame->error))
+		return;
+	if (!txn_state_held_Sizes(&frame->io, repo, &frame->opened.reading, found,
+							  doltgres_entries_doltgres_index_blocks_closure_1, NULL, NULL, &totals, &failed))
+	{
+		*frame->error = pghost_raised(&failed);
+		return;
+	}
+	frame->rows = txn_base_Sizes_counts(&totals, TREES_CHUNKER_DEFAULT_TARGET);
+	tuple_ids.entries = totals.entries;
+	tuple_ids.key_bytes = doltgres_entries_scan_bytes(totals.entries, 6, 0);
+	tuple_ids.leaf_bytes = doltgres_entries_scan_bytes(totals.entries, 10, totals.key_bytes);
+	frame->tuple_ids = txn_base_Sizes_counts(&tuple_ids, TREES_CHUNKER_DEFAULT_TARGET);
+	if (frame->indexoid != 0)
+	{
+		if (!doltgres_entries_recorded(frame->caps, &frame->io, repo, &frame->opened.reading, table,
+									   &frame->recorded, frame->error))
+			return;
+		frame->recorded_live = true;
+		if (!doltgres_index_keyed(raise, pg_CatalogCaps_catalog(frame->caps), pg_RefRel_rel(&frame->index),
+								  &frame->recorded.key, &frame->keyed, frame->error))
+			return;
+	}
+	frame->ok = true;
+}
+
+/*
+ * doltgres_entries_scanned reads a scanned table's shape for its scans'
+ * costs, by the index it is scanned through, or by the table itself when the
+ * index is 0.
+ */
+bool
+doltgres_entries_scanned(const PgCatalogCaps *caps, uint32 indexoid, uint32 tableoid, DoltgresEntriesScanned *result,
+						 PgPgError *error)
+{
+	doltgres_entries_scan_frame_t frame = {.caps = caps, .indexoid = indexoid, .tableoid = tableoid, .error = error};
+
+	std_landing(&frame, doltgres_entries_scan_body, doltgres_entries_scan_pad);
+	doltgres_entries_scan_pad(&frame);
+	if (!frame.ok)
+		return false;
+	result->stored = frame.stored;
+	result->keyed = frame.keyed;
+	result->rows = frame.rows;
+	result->tuple_ids = frame.tuple_ids;
+	return true;
+}
+
+/* doltgres_entries_cached_leaves returns the node cache's size in leaves of the default block size. */
+static float8
+doltgres_entries_cached_leaves(void)
+{
+	return (float8) pg_calls_settings_node_cache_size() * 1024.0 / BLCKSZ;
+}
+
+/*
+ * doltgres_entries_leaves_read is Mackert and Lohman's count of a tree's
+ * distinct leaves that fetches of its rows read past the node cache, as
+ * index_pages_fetched counts heap pages with the node cache in
+ * effective_cache_size's place, and none when the tree's leaves fit the
+ * cache, which then holds them.
+ */
+static float8
+doltgres_entries_leaves_read(float8 fetches, uint64 tree_leaves, float8 cached)
+{
+	float8		leaves = Max((float8) tree_leaves, 1.0);
+	float8		limit;
+
+	if (leaves <= cached)
+		return 0;
+	limit = 2.0 * leaves * cached / (2.0 * leaves - cached);
+	if (fetches <= limit)
+		return ceil(2.0 * leaves * fetches / (2.0 * leaves + fetches));
+	return ceil(cached + (fetches - limit) * (leaves - cached) / leaves);
+}
+
+/*
+ * doltgres_entries_doltgres_index_scan_io is a fork table's part of an index
+ * scan's costs (PLAN item 16): an index-only scan reads no row of the table;
+ * the primary key's own index reads its leaves, the table's rows, in key
+ * order, the first at random and the rest in sequence, when they don't fit
+ * the node cache; and a secondary index's entry leads to a descent of the
+ * table's tree by its row key, a keyless table's by the row's hash, its
+ * levels above the leaves held by the node cache at a comparison each and
+ * its leaf read at random when the leaves don't fit the cache. It leaves
+ * heap's costs for a table the fork doesn't store.
+ */
+bool
+doltgres_entries_doltgres_index_scan_io(const PgCatalogCaps *caps, uint32 indexoid, bool indexonly,
+										float8 tuples_fetched, float8 selectivity, float8 loop_count,
+										float8 random_page_cost, float8 seq_page_cost, float8 cpu_operator_cost,
+										float8 *max_io, float8 *min_io, float8 *rand_heap_pages, PgPgError *error)
+{
+	DoltgresEntriesScanned frame;
+	float8		cached = doltgres_entries_cached_leaves();
+	float8		read;
+	float8		io;
+
+	if (!doltgres_entries_scanned(caps, indexoid, 0, &frame, error))
+		return false;
+	if (!frame.stored)
+		return true;
+	if (indexonly)
+		read = io = 0;
+	else if (frame.keyed)
+	{
+		read = ceil(selectivity * Max((float8) frame.rows.leaves, 1.0));
+		if ((float8) frame.rows.leaves <= cached)
+			read = io = 0;
+		else if (loop_count > 1)
+		{
+			read = doltgres_entries_leaves_read(read * loop_count, frame.rows.leaves, cached);
+			io = read * random_page_cost / loop_count;
+		}
+		else
+			io = read > 0 ? random_page_cost + (read - 1) * seq_page_cost : 0;
+	}
+	else
+	{
+		read = doltgres_entries_leaves_read(tuples_fetched * loop_count, frame.rows.leaves, cached);
+		io = tuples_fetched * frame.rows.height * cpu_operator_cost + read * random_page_cost / loop_count;
+	}
+	*max_io = *min_io = io;
+	*rand_heap_pages = read;
+	return true;
+}
+
+/*
+ * doltgres_entries_doltgres_bitmap_page_cost is a fork table's cost per page
+ * fetched of a bitmap heap scan (PLAN item 16): each row costs its tuple id's
+ * resolution, a descent of the tuple id tree, and a descent of the table's
+ * tree by its row key, each level above the leaves a comparison and each
+ * leaf past the node cache read at random, and each lossy block, split from
+ * the pages it fetches by the bitmap's entries as compute_bitmap_pages splits
+ * them, costs a range scan of the tuple id tree: a descent and its leaf. It
+ * leaves heap's cost for a table the fork doesn't store.
+ */
+bool
+doltgres_entries_doltgres_bitmap_page_cost(const PgCatalogCaps *caps, uint32 relid, float8 tuples_fetched,
+										   float8 pages_fetched, uint32 pages, float8 maxentries,
+										   float8 random_page_cost, float8 cpu_operator_cost, float8 *cost_per_page,
+										   PgPgError *error)
+{
+	DoltgresEntriesScanned frame;
+	float8		cached = doltgres_entries_cached_leaves();
+	float8		heap_pages = Min(pages_fetched, (float8) pages);
+	float8		lossy = 0;
+	float8		io;
+
+	if (!doltgres_entries_scanned(caps, 0, relid, &frame, error))
+		return false;
+	if (!frame.stored)
+		return true;
+	if (maxentries < heap_pages)
+		lossy = Max(0, heap_pages - maxentries / 2);
+	io = tuples_fetched * (frame.tuple_ids.height + frame.rows.height) * cpu_operator_cost +
+		(doltgres_entries_leaves_read(tuples_fetched, frame.tuple_ids.leaves, cached) +
+		 doltgres_entries_leaves_read(tuples_fetched, frame.rows.leaves, cached)) * random_page_cost +
+		lossy * (frame.tuple_ids.height * cpu_operator_cost +
+				 ((float8) frame.tuple_ids.leaves > cached ? random_page_cost : 0));
+	*cost_per_page = pages_fetched > 0 ? io / pages_fetched : 0;
 	return true;
 }
 
@@ -3179,6 +3544,9 @@ typedef struct doltgres_entries_doltgres_tablespace_size_frame_t
 	bool		ok;
 } doltgres_entries_doltgres_tablespace_size_frame_t;
 
+/* DOLTGRES_ENTRIES_EMPTIED_NAP is the milliseconds DROP TABLESPACE sleeps between its asks to empty a tablespace. */
+#define DOLTGRES_ENTRIES_EMPTIED_NAP 1000
+
 /* doltgres_entries_doltgres_tablespace_size_pad frees what tablespace_size holds. */
 static void
 doltgres_entries_doltgres_tablespace_size_pad(void *frame_)
@@ -3224,6 +3592,249 @@ doltgres_entries_doltgres_tablespace_size(const PgCaps *caps, uint32 tblspcOid, 
 	doltgres_entries_doltgres_tablespace_size_pad(&frame);
 	if (frame.ok)
 		*result = doltgres_entries_size_added(size, frame.bytes);
+	return frame.ok;
+}
+
+/*
+ * doltgres_entries_doltgres_tablespace_emptied_frame_t is tablespace_emptied's
+ * state across its pad: the tablespace's directory of repositories, a path,
+ * and the names listed in each, while live.
+ */
+typedef struct doltgres_entries_doltgres_tablespace_emptied_frame_t
+{
+	StdPathBuf	versioned;
+	bool		versioned_live;
+	StdPathBuf	path;
+	bool		path_live;
+	StdVec		names;
+	bool		names_live;
+	StdVec		inner;
+	bool		inner_live;
+	const PgCaps *caps;
+	HostIoIo	io;
+	uint32		tablespace;
+	bool		redo;
+	PgPgError  *error;
+	bool		ok;
+} doltgres_entries_doltgres_tablespace_emptied_frame_t;
+
+/* doltgres_entries_doltgres_tablespace_emptied_pad frees what tablespace_emptied holds. */
+static void
+doltgres_entries_doltgres_tablespace_emptied_pad(void *frame_)
+{
+	doltgres_entries_doltgres_tablespace_emptied_frame_t *frame = frame_;
+
+	if (frame->inner_live)
+		std_vec_drop_Checked(&frame->inner, sizeof(StdString), _Alignof(StdString), std_String_drop);
+	if (frame->names_live)
+		std_vec_drop_Checked(&frame->names, sizeof(StdString), _Alignof(StdString), std_String_drop);
+	if (frame->path_live)
+		std_vec_free_Checked(&frame->path.bytes, 1, 1);
+	if (frame->versioned_live)
+		std_vec_free_Checked(&frame->versioned.bytes, 1, 1);
+	frame->inner_live = frame->names_live = frame->path_live = frame->versioned_live = false;
+}
+
+/*
+ * doltgres_entries_tablespace_held reports whether a directory of the
+ * tablespace's version directory other than the fork's holds a file, as
+ * Postgres' removal of its directories finds a relation's file there.
+ */
+static bool
+doltgres_entries_tablespace_held(doltgres_entries_doltgres_tablespace_emptied_frame_t *frame, bool *result,
+								 HostError *failed)
+{
+	StdStr		version = host_directory_of((const char *) frame->versioned.bytes.ptr, frame->versioned.bytes.len);
+	bool		has;
+
+	*result = false;
+	if (!host_list_dir_if_there(HOST_IO_IO_READ_DOORS(&frame->io), version.ptr, version.len, &has, &frame->names,
+								failed))
+		return false;
+	if (!has)
+		return true;
+	frame->names_live = true;
+	for (size_t k = 0, k_len = frame->names.len; k < k_len && !*result; k++)
+	{
+		const StdString *name = &STD_VEC_AT(&frame->names, StdString, k);
+		bool		listed;
+
+		if (name->len == strlen(HOST_VERSIONED) && memcmp(name->ptr, HOST_VERSIONED, name->len) == 0)
+			continue;
+		std_path_join(version.ptr, version.len, (const char *) name->ptr, name->len, &frame->path);
+		frame->path_live = true;
+		if (!host_list_dir_if_there(HOST_IO_IO_READ_DOORS(&frame->io), (const char *) frame->path.bytes.ptr,
+									frame->path.bytes.len, &listed, &frame->inner, failed))
+			return false;
+		if (listed)
+		{
+			frame->inner_live = true;
+			*result = frame->inner.len != 0;
+			frame->inner_live = false;
+			std_vec_drop_Checked(&frame->inner, sizeof(StdString), _Alignof(StdString), std_String_drop);
+		}
+		frame->path_live = false;
+		std_vec_free_Checked(&frame->path.bytes, 1, 1);
+	}
+	frame->names_live = false;
+	std_vec_drop_Checked(&frame->names, sizeof(StdString), _Alignof(StdString), std_String_drop);
+	return true;
+}
+
+/*
+ * doltgres_entries_tablespace_asked answers whether a repository's directory
+ * is in the tablespace's directory of repositories, asking the collector
+ * worker first to empty the tablespace out of each such repository when
+ * asking, and removes the directory of repositories once none is.
+ */
+static bool
+doltgres_entries_tablespace_asked(doltgres_entries_doltgres_tablespace_emptied_frame_t *frame, bool asking,
+								  bool *result, HostError *failed)
+{
+	bool		has;
+	bool		removed;
+
+	*result = false;
+	if (!host_list_dir_if_there(HOST_IO_IO_READ_DOORS(&frame->io), (const char *) frame->versioned.bytes.ptr,
+								frame->versioned.bytes.len, &has, &frame->names, failed))
+		return false;
+	if (!has)
+		return true;
+	frame->names_live = true;
+	for (size_t k = 0, k_len = frame->names.len; k < k_len; k++)
+	{
+		const StdString *name = &STD_VEC_AT(&frame->names, StdString, k);
+		uint32		repository;
+		uint64		counts[3];
+		StdParseIntError parsed;
+
+		if (!std_str_parse_u32(name->ptr, name->len, &repository, &parsed) || repository == 0)
+			continue;
+		*result = true;
+		if (!asking)
+			continue;
+		if (!host_collection_ask(&frame->io, repository, frame->tablespace, counts, failed))
+			return false;
+		if (counts[0] == PG_UINT64_MAX)
+		{
+			StdFmtPiece pieces[] = {STD_FMT_LIT("the collector's collection of database "), STD_FMT_ARG(0),
+			STD_FMT_LIT(" failed")};
+			StdFmtArg	args[] = {{&repository, std_u32_Display_fmt}};
+			StdFmtArguments arguments = {pieces, lengthof(pieces), args};
+			StdString	message;
+
+			std_fmt_format_Checked(&message, &arguments);
+			*failed = host_Error_fork((const uint8 *) "XX000", &message);
+			return false;
+		}
+	}
+	frame->names_live = false;
+	std_vec_drop_Checked(&frame->names, sizeof(StdString), _Alignof(StdString), std_String_drop);
+	if (*result)
+		return true;
+	return host_remove_tree(HOST_IO_IO_IO_DOORS(&frame->io), (const char *) frame->versioned.bytes.ptr,
+							frame->versioned.bytes.len, &removed, failed);
+}
+
+/*
+ * doltgres_entries_tablespace_marked leaves the dropped mark, durably, in the
+ * tablespace's directory of repositories when redo's attempt left it there.
+ */
+static bool
+doltgres_entries_tablespace_marked(doltgres_entries_doltgres_tablespace_emptied_frame_t *frame, HostError *failed)
+{
+	bool		there;
+	bool		made;
+	HostFile	mark;
+
+	if (!host_list_dir_if_there(HOST_IO_IO_READ_DOORS(&frame->io), (const char *) frame->versioned.bytes.ptr,
+								frame->versioned.bytes.len, &there, &frame->names, failed))
+		return false;
+	if (!there)
+		return true;
+	std_vec_drop_Checked(&frame->names, sizeof(StdString), _Alignof(StdString), std_String_drop);
+	std_path_join((const char *) frame->versioned.bytes.ptr, frame->versioned.bytes.len, DOLTGRES_DROPPED_MARK,
+				  strlen(DOLTGRES_DROPPED_MARK), &frame->path);
+	frame->path_live = true;
+	if (!host_create_if_absent(HOST_IO_IO_IO_DOORS(&frame->io), (const char *) frame->path.bytes.ptr,
+							   frame->path.bytes.len, &made, &mark, failed))
+		return false;
+	if (made)
+		host_File_drop(&mark);
+	return host_sync_path(HOST_IO_IO_IO_DOORS(&frame->io), (const char *) frame->versioned.bytes.ptr,
+						  frame->versioned.bytes.len, true, failed);
+}
+
+/*
+ * doltgres_entries_doltgres_tablespace_emptied_body empties the fork's packs
+ * out of the tablespace, round by round until its directory of repositories
+ * is gone or a relation's file appears in Postgres' directories there, for
+ * Postgres to refuse the DROP, or once in redo, which then leaves the dropped
+ * mark on what is left for the collector's sweep.
+ */
+static void
+doltgres_entries_doltgres_tablespace_emptied_body(void *frame_)
+{
+	doltgres_entries_doltgres_tablespace_emptied_frame_t *frame = frame_;
+	const PgMayRaise *raise = pg_Caps_may_raise(frame->caps);
+	HostError	failed;
+	bool		held;
+	bool		left;
+
+	frame->versioned = host_versioned_dir(frame->tablespace);
+	frame->versioned_live = true;
+	if (!doltgres_entries_tablespace_held(frame, &held, &failed))
+		goto raised;
+	if (held && !frame->redo)
+	{
+		if (!pg_calls_checkpoint_now(raise, frame->error))
+			return;
+		if (!doltgres_entries_tablespace_held(frame, &held, &failed))
+			goto raised;
+	}
+	for (bool asking = !held && (!frame->redo || host_collector_running()); asking;)
+	{
+		if (!doltgres_entries_tablespace_asked(frame, true, &left, &failed) ||
+			(left && !doltgres_entries_tablespace_asked(frame, false, &left, &failed)))
+			goto raised;
+		if (!left || frame->redo)
+			break;
+		if (!pg_calls_latch_sleep(raise, DOLTGRES_ENTRIES_EMPTIED_NAP, frame->error))
+			return;
+		if (!doltgres_entries_tablespace_held(frame, &held, &failed))
+			goto raised;
+		asking = !held;
+	}
+	if (frame->redo && !doltgres_entries_tablespace_marked(frame, &failed))
+		goto raised;
+	frame->ok = true;
+	return;
+raised:
+	*frame->error = pghost_raised(&failed);
+}
+
+/*
+ * doltgres_entries_doltgres_tablespace_emptied empties the fork's packs out of
+ * a tablespace and removes its directory of them before Postgres removes the
+ * tablespace's directories (design item 5, bugs row 99): when no directory of
+ * Postgres' there holds a file, after the checkpoint that removes the files
+ * of dropped relations, the collector worker copies every live chunk of
+ * each repository's packs there into the repository's own directory and
+ * retires them, the files go once their readers end, and a base backup
+ * keeps the collection from running, so DROP TABLESPACE waits for each,
+ * answering cancel. Redo makes one attempt, and none when no collector
+ * worker runs to answer, leaving the dropped mark on what is left, which
+ * the worker's sweep removes.
+ */
+bool
+doltgres_entries_doltgres_tablespace_emptied(const PgCaps *caps, uint32 tablespaceoid, bool redo, PgPgError *error)
+{
+	doltgres_entries_doltgres_tablespace_emptied_frame_t frame = {.caps = caps, .io = pghost_io(pg_Caps_may_raise(caps)),
+	.tablespace = tablespaceoid, .redo = redo, .error = error};
+
+	std_landing(&frame, doltgres_entries_doltgres_tablespace_emptied_body,
+				doltgres_entries_doltgres_tablespace_emptied_pad);
+	doltgres_entries_doltgres_tablespace_emptied_pad(&frame);
 	return frame.ok;
 }
 
@@ -4133,7 +4744,7 @@ doltgres_entries_doltgres_parallel_based_body(void *frame_)
 		frame->base_live = true;
 		base = &frame->base;
 		parts.fresh = base->fresh_end;
-		parts.folded = base->folded;
+		parts.folded = base->read;
 	}
 	doltgres_scan_Epochs_based(base, &epoch, &has_chain, &chain);
 	store = repo_Repo_reader(repo, HOST_CACHE_PLACEMENT_SERVER, &frame->opened.reading);
@@ -5093,17 +5704,20 @@ doltgres_entries_entry_pushed(HostIoIo *io, const RepoRepo *repo, const HostShar
 
 /*
  * doltgres_entries_index_read_captures_t is an index read's lent calls'
- * captures: the Dirty snapshot it reads under and the scan reader it steps.
+ * captures: the Dirty snapshot it reads under, the base generation its base
+ * was read at, and the scan reader it steps.
  */
 typedef struct doltgres_entries_index_read_captures_t
 {
 	const HostSnapshot *read;
+	uint64		generation;
 	HostOwnedHandle reader;
 } doltgres_entries_index_read_captures_t;
 
 /*
  * doltgres_entries_index_read_readable is an index read's first lent call's
- * body: the base the Dirty snapshot may read.
+ * body: the base the Dirty snapshot may read, with the generation read
+ * before it.
  */
 static bool
 doltgres_entries_index_read_readable(void *captures, HostIoIo *io, const RepoRepo *repo, const HostSharedHeld *held,
@@ -5111,6 +5725,7 @@ doltgres_entries_index_read_readable(void *captures, HostIoIo *io, const RepoRep
 {
 	doltgres_entries_index_read_captures_t *c = captures;
 
+	c->generation = txn_state_generation(host_shared_Held_record(held));
 	return txn_state_readable(io, held, c->read, some, result, error);
 }
 
@@ -5224,8 +5839,8 @@ doltgres_entries_index_read_begin(doltgres_entries_index_read_frame_t *frame, co
 	std_slice_to_vec_Checked(&keyed, frame->keyed, frame->keyed_len, 1, 1);
 	frame->order_live = false;
 	if (!doltgres_scan_scan_begin(frame->io, TREES_STORE_READER_NODE_STORE(&store), 0, some ? &frame->base : NULL,
-								  &keyed, pg_calls_index_table(frame->index), &frame->order, &frame->captures.reader,
-								  &failed) ||
+								  frame->captures.generation, &keyed, pg_calls_index_table(frame->index),
+								  &frame->order, &frame->captures.reader, &failed) ||
 		!doltgres_scan_seek(frame->io, &stores, frame->captures.reader, from, from_len,
 							DOLTGRES_SCAN_DIRECTION_FORWARD, &failed))
 	{
@@ -6435,10 +7050,6 @@ doltgres_entries_pushed_closure_0(void *captures, HostIoIo *io, const RepoRepo *
 	doltgres_entries_pushed_captures_t *c = captures;
 	const doltgres_entries_Ends *ends = c->ends;
 	HostIoWaits waits = pghost_waits();
-	bool		has_newest;
-	TxnBaseBase newest;
-	bool		has_tuple_ids = false;
-	TreesStoreTree tuple_ids = {0};
 	bool		has_key;
 	bool		keyless;
 	TxnChangeEnding row;
@@ -6446,16 +7057,8 @@ doltgres_entries_pushed_closure_0(void *captures, HostIoIo *io, const RepoRepo *
 
 	c->store = repo_Repo_reader(repo, HOST_CACHE_PLACEMENT_SERVER, c->reading);
 	c->held = held;
-	if (!txn_state_newest(io, held, &has_newest, &newest, error))
-		return false;
-	if (has_newest)
-	{
-		has_tuple_ids = newest.has_tuple_ids;
-		tuple_ids = newest.tuple_ids;
-		txn_base_Base_drop(&newest);
-	}
-	if (!doltgres_scan_keyed(io, TREES_STORE_READER_NODE_STORE(&c->store), host_shared_Held_record(held),
-							 has_tuple_ids, tuple_ids, c->tuple, &has_key, &row.key, &keyless, error))
+	if (!doltgres_scan_keyed(io, TREES_STORE_READER_NODE_STORE(&c->store), held, c->tuple, &has_key, &row.key,
+							 &keyless, error))
 		return false;
 	*some = has_key;
 	if (!has_key)
@@ -7273,10 +7876,6 @@ doltgres_entries_doltgres_tuple_update_closure_1_body(void *frame_)
 	doltgres_entries_doltgres_tuple_update_captures_t *c = frame->c;
 	const doltgres_entries_Written *w = c->written;
 	HostStorage storage = doltgres_entries_storage(c->rel);
-	bool		has_newest;
-	TxnBaseBase newest;
-	bool		has_tuple_ids = false;
-	TreesStoreTree tuple_ids = {0};
 	bool		has_key;
 	bool		keyless;
 	TxnInsertKeyed keyed = {.stripe = w->stripe};
@@ -7284,16 +7883,7 @@ doltgres_entries_doltgres_tuple_update_closure_1_body(void *frame_)
 
 	c->store = repo_Repo_reader(frame->repo, HOST_CACHE_PLACEMENT_SERVER, c->reading);
 	c->held = frame->held;
-	if (!txn_state_newest(frame->io, frame->held, &has_newest, &newest, frame->error))
-		return;
-	if (has_newest)
-	{
-		has_tuple_ids = newest.has_tuple_ids;
-		tuple_ids = newest.tuple_ids;
-		txn_base_Base_drop(&newest);
-	}
-	if (!doltgres_scan_keyed(frame->io, TREES_STORE_READER_NODE_STORE(&c->store),
-							 host_shared_Held_record(frame->held), has_tuple_ids, tuple_ids, c->tuple, &has_key,
+	if (!doltgres_scan_keyed(frame->io, TREES_STORE_READER_NODE_STORE(&c->store), frame->held, c->tuple, &has_key,
 							 &frame->replaces.key, &keyless, frame->error))
 		return;
 	*frame->some = has_key;
@@ -8114,8 +8704,20 @@ doltgres_entries_build_scanned(const PgCatalogCaps *caps, HostIoIo *io, const Re
 #include "doltgres/txn/state_template.h"
 
 /*
+ * doltgres_entries_doltgres_index_build_range_scan_captures_t is the build
+ * scan's lent call's captures: the table, and the base generation its base
+ * was read at.
+ */
+typedef struct doltgres_entries_doltgres_index_build_range_scan_captures_t
+{
+	const PgRel *table;
+	uint64		generation;
+} doltgres_entries_doltgres_index_build_range_scan_captures_t;
+
+/*
  * doltgres_entries_doltgres_index_build_range_scan_closure_0 is the build
- * scan's lent call: the table's blocks and newest base.
+ * scan's lent call: the table's blocks and newest base, with the generation
+ * read before it.
  */
 static bool
 doltgres_entries_doltgres_index_build_range_scan_closure_0(void *captures, HostIoIo *io, const RepoRepo *repo,
@@ -8123,7 +8725,10 @@ doltgres_entries_doltgres_index_build_range_scan_closure_0(void *captures, HostI
 														   bool *has_result_1, TxnBaseBase *result_1,
 														   HostError *error)
 {
-	*result_0 = doltgres_entries_blocks(captures, held);
+	doltgres_entries_doltgres_index_build_range_scan_captures_t *c = captures;
+
+	*result_0 = doltgres_entries_blocks(c->table, held);
+	c->generation = txn_state_generation(host_shared_Held_record(held));
 	return txn_state_newest(io, held, has_result_1, result_1, error);
 }
 
@@ -8209,6 +8814,7 @@ doltgres_entries_doltgres_index_build_range_scan_own(doltgres_entries_doltgres_i
 	TreesStoreReader store;
 	uint64		last;
 	HostError	failed;
+	doltgres_entries_doltgres_index_build_range_scan_captures_t c = {frame->table};
 
 	if (!doltgres_entries_recorded(frame->caps, &frame->io, repo, &frame->opened.reading, frame->table,
 								   &frame->recorded, frame->error))
@@ -8227,9 +8833,8 @@ doltgres_entries_doltgres_index_build_range_scan_own(doltgres_entries_doltgres_i
 	if (!doltgres_entries_making(frame->caps, &frame->io, frame->table, &found, frame->error))
 		return false;
 	if (!txn_state_held_TupleU64OptionBase(&frame->io, repo, &frame->opened.reading, found,
-										   doltgres_entries_doltgres_index_build_range_scan_closure_0,
-										   (void *) frame->table, NULL, blocks, &frame->base_live, &frame->base,
-										   &failed))
+										   doltgres_entries_doltgres_index_build_range_scan_closure_0, &c, NULL,
+										   blocks, &frame->base_live, &frame->base, &failed))
 	{
 		frame->base_live = false;
 		*frame->error = pghost_raised(&failed);
@@ -8238,7 +8843,7 @@ doltgres_entries_doltgres_index_build_range_scan_own(doltgres_entries_doltgres_i
 	store = repo_Repo_reader(repo, HOST_CACHE_PLACEMENT_SERVER, &frame->opened.reading);
 	frame->keyed_live = frame->order_live = false;
 	if (!doltgres_scan_scan_begin(&frame->io, TREES_STORE_READER_NODE_STORE(&store), *blocks,
-								  frame->base_live ? &frame->base : NULL, &frame->keyed,
+								  frame->base_live ? &frame->base : NULL, c.generation, &frame->keyed,
 								  pg_calls_rel_id(frame->table), &frame->order, handle, &failed))
 	{
 		*frame->error = pghost_raised(&failed);
@@ -8359,6 +8964,169 @@ doltgres_entries_doltgres_index_build_range_scan(const PgCatalogCaps *caps, cons
 	return frame.ok;
 }
 
+/*
+ * doltgres_entries_BuildSnapshot is a concurrent build's snapshot, which its
+ * validation reads in the same backend: the index built, and the snapshot's
+ * bounds, whether its subtransactions overflowed, and its running xids, each
+ * a Vec<u32>.
+ */
+typedef struct doltgres_entries_BuildSnapshot
+{
+	uint32		index;
+	uint64		xmin;
+	uint64		xmax;
+	bool		overflowed;
+	StdVec		xip;
+	StdVec		subxip;
+} doltgres_entries_BuildSnapshot;
+
+/* doltgres_entries_BuildSnapshot_drop is BuildSnapshot's drop: its running xids. */
+static void
+doltgres_entries_BuildSnapshot_drop(void *snapshot)
+{
+	doltgres_entries_BuildSnapshot *self = snapshot;
+
+	std_vec_free_Checked(&self->xip, sizeof(uint32), _Alignof(uint32));
+	std_vec_free_Checked(&self->subxip, sizeof(uint32), _Alignof(uint32));
+}
+
+/* doltgres_entries_VecBuildSnapshot_drop is Vec<BuildSnapshot>'s drop. */
+static void
+doltgres_entries_VecBuildSnapshot_drop(void *snapshots)
+{
+	std_vec_drop_Checked(snapshots, sizeof(doltgres_entries_BuildSnapshot), _Alignof(doltgres_entries_BuildSnapshot),
+						 doltgres_entries_BuildSnapshot_drop);
+}
+
+/* BUILD_SNAPSHOTS' IoMutex, host's lock at the backend's concurrent builds' snapshots. */
+#define HOST_LOCK_SCOPE static
+#define HOST_LOCK_DECLARE
+#define HOST_LOCK_DEFINE
+#define HOST_LOCK_TAKEN_TS VecBuildSnapshot
+#define HOST_LOCK_TAKEN_T StdVec
+#define HOST_LOCK_TAKEN_DEFAULT(place) \
+	std_vec_new((place), sizeof(doltgres_entries_BuildSnapshot), _Alignof(doltgres_entries_BuildSnapshot))
+#define HOST_LOCK_TAKEN_DROP(place) doltgres_entries_VecBuildSnapshot_drop(place)
+#define HOST_LOCK_TAKEN_TYPE DOLTGRES_ENTRIES_BUILD_SNAPSHOTS_LOCK_TYPE
+#define HOST_LOCK_IO_MUTEX
+#define HOST_LOCK_TS VecBuildSnapshot
+#define HOST_LOCK_T StdVec
+#define HOST_LOCK_DEFAULT(place) \
+	std_vec_new((place), sizeof(doltgres_entries_BuildSnapshot), _Alignof(doltgres_entries_BuildSnapshot))
+#include "doltgres/host/lock_template.h"
+
+/* doltgres_entries_IoMutexVecBuildSnapshot_drop is IoMutex<Vec<BuildSnapshot>>' drop glue: its value's. */
+static void
+doltgres_entries_IoMutexVecBuildSnapshot_drop(void *value)
+{
+	doltgres_entries_VecBuildSnapshot_drop(&((HostLockIoMutexVecBuildSnapshot *) value)->value);
+}
+
+/* DOLTGRES_ENTRIES_BUILD_SNAPSHOTS_TYPE is IoMutex<Vec<BuildSnapshot>>' size, Default, and drop. */
+static const StdDefaultType DOLTGRES_ENTRIES_BUILD_SNAPSHOTS_TYPE = {sizeof(HostLockIoMutexVecBuildSnapshot),
+	_Alignof(HostLockIoMutexVecBuildSnapshot), host_lock_IoMutexVecBuildSnapshot_Default_default,
+doltgres_entries_IoMutexVecBuildSnapshot_drop};
+
+/*
+ * DOLTGRES_ENTRIES_BUILD_SNAPSHOTS is BUILD_SNAPSHOTS: each concurrent build's
+ * snapshot from its build's end until its validation takes it, in backend
+ * memory alone (bugs row 313); its BackendLocal header and the process's
+ * value.
+ */
+static struct
+{
+	HostLocalBackendLocal local;
+	HostLockIoMutexVecBuildSnapshot process;
+}			DOLTGRES_ENTRIES_BUILD_SNAPSHOTS = {HOST_LOCAL_BACKEND_LOCAL_NEW};
+
+/* doltgres_entries_build_snapshot_kept_op moves a build's snapshot into BUILD_SNAPSHOTS, in place of its index's older one. */
+static void
+doltgres_entries_build_snapshot_kept_op(void *value, void *captures)
+{
+	StdVec	   *self = value;
+	doltgres_entries_BuildSnapshot *kept = captures;
+
+	for (size_t i = 0; i < self->len; i++)
+	{
+		doltgres_entries_BuildSnapshot *at = &STD_VEC_AT(self, doltgres_entries_BuildSnapshot, i);
+
+		if (at->index == kept->index)
+		{
+			doltgres_entries_BuildSnapshot_drop(at);
+			*at = *kept;
+			return;
+		}
+	}
+	std_vec_push_Checked(self, kept, sizeof(*kept), _Alignof(doltgres_entries_BuildSnapshot));
+}
+
+/* doltgres_entries_build_snapshot_taken_t is a take of BUILD_SNAPSHOTS' captures: the index, and its snapshot when it had one. */
+typedef struct doltgres_entries_build_snapshot_taken_t
+{
+	uint32		index;
+	bool		has;
+	doltgres_entries_BuildSnapshot snapshot;
+} doltgres_entries_build_snapshot_taken_t;
+
+/* doltgres_entries_build_snapshot_taken_op takes an index's build snapshot out of BUILD_SNAPSHOTS into its captures. */
+static void
+doltgres_entries_build_snapshot_taken_op(void *value, void *captures)
+{
+	StdVec	   *self = value;
+	doltgres_entries_build_snapshot_taken_t *taken = captures;
+
+	for (size_t i = 0; i < self->len; i++)
+		if (STD_VEC_AT(self, doltgres_entries_BuildSnapshot, i).index == taken->index)
+		{
+			std_vec_swap_remove(self, i, &taken->snapshot, sizeof(doltgres_entries_BuildSnapshot),
+								_Alignof(doltgres_entries_BuildSnapshot));
+			taken->has = true;
+			return;
+		}
+}
+
+/*
+ * doltgres_entries_build_snapshot_copied copies the transaction's snapshot
+ * for a concurrent build of an index, taken before the build reads a row, as
+ * heap's concurrent build scan takes its own.
+ */
+static bool
+doltgres_entries_build_snapshot_copied(const PgMayRaise *raise, uint32 index, doltgres_entries_BuildSnapshot *result,
+									   PgPgError *error)
+{
+	PgSnapshotView view;
+
+	if (!pg_transaction_snapshot_view(raise, &view, error))
+		return false;
+	result->index = index;
+	result->xmin = view.xmin;
+	result->xmax = view.xmax;
+	result->overflowed = view.overflowed;
+	std_slice_to_vec_Checked(&result->xip, view.xip, view.xip_len, sizeof(uint32), _Alignof(uint32));
+	std_slice_to_vec_Checked(&result->subxip, view.subxip, view.subxip_len, sizeof(uint32), _Alignof(uint32));
+	return true;
+}
+
+/*
+ * doltgres_entries_build_snapshot_saw reports whether a concurrent build's
+ * snapshot saw a row's writer ended, so that the build indexed the row: an
+ * xid the snapshot counts as no longer running, which an overflowed snapshot
+ * answers only below its xmin.
+ */
+static bool
+doltgres_entries_build_snapshot_saw(const doltgres_entries_BuildSnapshot *built, uint64 writer)
+{
+	HostSnapshot snapshot = {.kind = HOST_SNAPSHOT_KIND_MVCC, .xmin = {built->xmin}, .xmax = {built->xmax},
+	.overflowed = built->overflowed, .xip = built->xip.ptr, .xip_len = built->xip.len,
+	.subxip = built->subxip.ptr, .subxip_len = built->subxip.len};
+
+	if (writer == InvalidTransactionId)
+		return false;
+	if (built->overflowed)
+		return writer < built->xmin;
+	return !txn_visible_in_snapshot(&snapshot, writer, writer);
+}
+
 /* doltgres_entries_doltgres_index_validate_scan_closure_0 is the validate scan's lent call: the table's block count. */
 static bool
 doltgres_entries_doltgres_index_validate_scan_closure_0(void *captures, HostIoIo *io, const RepoRepo *repo,
@@ -8387,6 +9155,7 @@ typedef struct doltgres_entries_doltgres_index_validate_scan_frame_t
 	PgIndexInfo *info;
 	const PgSnapshot *snapshot;
 	PgValidateState *state;
+	doltgres_entries_build_snapshot_taken_t built;
 	PgPgError  *error;
 	bool		ok;
 } doltgres_entries_doltgres_index_validate_scan_frame_t;
@@ -8401,7 +9170,9 @@ doltgres_entries_doltgres_index_validate_scan_pad(void *frame_)
 		pg_OwnedBuild_drop(&frame->build);
 	if (frame->slot_live)
 		pg_OwnedSlot_drop(&frame->slot);
-	frame->build_live = frame->slot_live = false;
+	if (frame->built.has)
+		doltgres_entries_BuildSnapshot_drop(&frame->built.snapshot);
+	frame->build_live = frame->slot_live = frame->built.has = false;
 	doltgres_entries_opened_drop(&frame->opened);
 }
 
@@ -8430,6 +9201,10 @@ doltgres_entries_doltgres_index_validate_scan_body(void *frame_)
 	HostError	failed;
 
 	frame->io = pghost_io_catalog(frame->caps);
+	frame->built.index = pg_calls_rel_id(frame->index);
+	doltgres_entries_locked(&frame->io, &DOLTGRES_ENTRIES_BUILD_SNAPSHOTS.local, &DOLTGRES_ENTRIES_BUILD_SNAPSHOTS_TYPE,
+							&DOLTGRES_ENTRIES_BUILD_SNAPSHOTS_LOCK_TYPE, doltgres_entries_build_snapshot_taken_op,
+							&frame->built);
 	if (!doltgres_entries_open(&frame->io, &frame->opened, frame->error) ||
 		!doltgres_entries_making(frame->caps, &frame->io, frame->table, &found, frame->error))
 		return;
@@ -8487,6 +9262,7 @@ doltgres_entries_doltgres_index_validate_scan_body(void *frame_)
 			ended = !has_sorted;
 		}
 		if ((!has_sorted || sorted != tuple) &&
+			!(frame->built.has && doltgres_entries_build_snapshot_saw(&frame->built.snapshot, pg_calls_slot_writer(slot))) &&
 			!pg_calls_validate_insert(raise, catalog, pg_OwnedBuild_build(&frame->build), frame->index, frame->table,
 									  frame->info, slot, &added, frame->error))
 			return;
@@ -8513,11 +9289,13 @@ doltgres_entries_doltgres_index_validate_scan_body(void *frame_)
  * row whose tid the index lacks and the index's predicate admits is inserted
  * through the index's own aminsert, a unique index checking the row. An
  * index the fork stores hands the merge no tid, since its ambulkdelete
- * reports none, so each row is checked against the index's own entries
- * instead (index_holds, bugs row 168): VACUUM's callback, which would hand
- * the merge those tids, would make every VACUUM walk the whole index for
- * nothing, since no entry the fork stores names a dead row, and a keyed
- * table's entries hold no tids. It reports the scan's blocks to the build's
+ * reports none, so each row but one the build indexed is checked against the
+ * index's own entries instead (index_holds, bugs row 168): VACUUM's
+ * callback, which would hand the merge those tids, would make every VACUUM
+ * walk the whole index for nothing, since no entry the fork stores names a
+ * dead row, and a keyed table's entries hold no tids. A row the build indexed is one whose writer
+ * the build's snapshot saw ended (BUILD_SNAPSHOTS), and its key is not formed
+ * again (bugs row 313). It reports the scan's blocks to the build's
  * progress, counts the rows it read and inserted in the validation's state,
  * and clears the index's expression state, which lived in the scan's
  * executor state.
@@ -8765,7 +9543,7 @@ doltgres_entries_rekeyed_closure_4(void *captures, HostIoIo *io, const RepoRepo 
 	TxnBaseBase installing;
 	TreesStoreReader store;
 	const TxnRecordMapCarried *spaces = c->spaces->ptr;
-	const DoltgresRewriteCarry *carried = c->carried->ptr;
+	const TxnRewriteCarry *carried = c->carried->ptr;
 
 	if (!txn_state_base_record(io, held, &some, &installing, error))
 		return false;
@@ -8786,16 +9564,9 @@ doltgres_entries_rekeyed_closure_4(void *captures, HostIoIo *io, const RepoRepo 
 		return false;
 	if (!*result)
 		return true;
-	for (size_t i = 0; i < c->spaces->len; i++)
-		if (!txn_rewrite_spaced(io, held, &spaces[i], c->logged, pg_calls_max_heap_tuples_per_page(), false, 0,
-								error))
-			return false;
 	store = repo_Repo_reader(repo, HOST_CACHE_PLACEMENT_SERVER, c->reading);
-	for (size_t i = 0; i < c->carried->len; i++)
-		if (!txn_rewrite_carried(io, TREES_STORE_READER_NODE_STORE(&store), held, &carried[i].f0, carried[i].f1,
-								 carried[i].f2, c->logged, NULL, error))
-			return false;
-	return true;
+	return txn_rewrite_carried(io, TREES_STORE_READER_NODE_STORE(&store), held, spaces, c->spaces->len, carried,
+							   c->carried->len, c->logged, NULL, pg_calls_max_heap_tuples_per_page(), error);
 }
 
 /* doltgres_entries_Rekeyed_carried_drop is a rekeyed version's drop glue: its key's and its op's. */
@@ -8888,7 +9659,7 @@ doltgres_entries_rekeyed_pad(void *frame_)
 	if (frame->blobs_live)
 		std_vec_free_Checked(&frame->blobs, sizeof(chunks_TupleAddressU64_t), _Alignof(chunks_TupleAddressU64_t));
 	if (frame->carried_live)
-		std_vec_drop_Checked(&frame->carried, sizeof(DoltgresRewriteCarry), _Alignof(DoltgresRewriteCarry),
+		std_vec_drop_Checked(&frame->carried, sizeof(TxnRewriteCarry), _Alignof(TxnRewriteCarry),
 							 doltgres_entries_Carry_drop);
 	if (frame->toast_live)
 		host_shared_Held_drop(&frame->values);
@@ -8970,12 +9741,12 @@ doltgres_entries_rekeyed_carried(doltgres_entries_rekeyed_frame_t *frame, HostSt
 				_Alignof(doltgres_TupleVecU8OpWriterShownLockMode_t));
 	frame->versions_live = true;
 	std_vec_with_capacity_Checked(&frame->carried, std_VecIntoIter_len(&frame->versions),
-								  sizeof(DoltgresRewriteCarry), _Alignof(DoltgresRewriteCarry));
+								  sizeof(TxnRewriteCarry), _Alignof(TxnRewriteCarry));
 	frame->carried_live = true;
 	while (std_VecIntoIter_Iterator_next(&frame->versions, &version))
 	{
 		const TxnMemtablePut *put = NULL;
-		DoltgresRewriteCarry carry = {0};
+		TxnRewriteCarry carry = {0};
 		TxnRecordRowChange *change = &carry.f0;
 
 		if (version.f1.tag == TXN_MEMTABLE_OP_PUT)
@@ -9030,7 +9801,7 @@ doltgres_entries_rekeyed_carried(doltgres_entries_rekeyed_frame_t *frame, HostSt
 		std_vec_new(&change->kept, sizeof(size_t), _Alignof(size_t));
 		carry.f1 = version.f3;
 		carry.f2 = version.f4;
-		std_vec_push_Checked(&frame->carried, &carry, sizeof(DoltgresRewriteCarry), _Alignof(DoltgresRewriteCarry));
+		std_vec_push_Checked(&frame->carried, &carry, sizeof(TxnRewriteCarry), _Alignof(TxnRewriteCarry));
 	}
 	frame->versions_live = false;
 	std_VecIntoIter_drop(&frame->versions);
@@ -10444,6 +11215,7 @@ doltgres_entries_loaded_closure_7(void *captures, HostIoRegistering *registering
 	frame->installed.root =
 		trees_published_Published_base(&STD_VEC_AT(&frame->published, TreesPublishedPublished, 0));
 	frame->installed.folded = frame->point;
+	frame->installed.read = frame->point;
 	frame->installed.max_folded = frame->max_folded;
 	frame->installed.sizes = frame->sizes;
 	if (!txn_state_installed(io, &frame->held, frame->generation, &frame->installed, &installed, &failed))
@@ -10658,14 +11430,28 @@ doltgres_entries_loaded_body(void *frame_)
 	if (!doltgres_entries_loaded_advanced(frame))
 		return;
 	store = repo_Repo_reader(frame->repo, HOST_CACHE_PLACEMENT_SERVER, frame->reading);
-	for (size_t i = 0; i < frame->late.len; i++)
-		if (!txn_rewrite_carried(frame->io, TREES_STORE_READER_NODE_STORE(&store), &frame->held,
-								 &STD_VEC_AT(&frame->late, TxnRecordRowChange, i), shown, TXN_MEMTABLE_LOCK_MODE_UPDATE,
-								 pg_calls_rel_permanent(frame->index), NULL, &host))
+	{
+		StdVec		late;
+		bool		ok;
+
+		std_vec_with_capacity_Checked(&late, frame->late.len, sizeof(TxnRewriteCarry), _Alignof(TxnRewriteCarry));
+		for (size_t i = 0; i < frame->late.len; i++)
+		{
+			TxnRewriteCarry carry = {STD_VEC_AT(&frame->late, TxnRecordRowChange, i), shown,
+			TXN_MEMTABLE_LOCK_MODE_UPDATE};
+
+			std_vec_push_Checked(&late, &carry, sizeof(carry), _Alignof(TxnRewriteCarry));
+		}
+		ok = txn_rewrite_carried(frame->io, TREES_STORE_READER_NODE_STORE(&store), &frame->held, NULL, 0, late.ptr,
+								 late.len, pg_calls_rel_permanent(frame->index), NULL,
+								 pg_calls_max_heap_tuples_per_page(), &host);
+		std_vec_free_Checked(&late, sizeof(TxnRewriteCarry), _Alignof(TxnRewriteCarry));
+		if (!ok)
 		{
 			*frame->error = pghost_raised(&host);
 			return;
 		}
+	}
 	*frame->result = frame->sizes.rows + late_rows;
 	frame->ok = true;
 }
@@ -10742,6 +11528,8 @@ typedef struct doltgres_entries_doltgres_index_build_frame_t
 	bool		described_live;
 	PgOwnedSort sort;
 	bool		sort_live;
+	doltgres_entries_BuildSnapshot built;
+	bool		built_live;
 	const PgCatalogCaps *caps;
 	HostIoIo	io;
 	const PgRel *heap;
@@ -10767,8 +11555,22 @@ doltgres_entries_doltgres_index_build_pad(void *frame_)
 		doltgres_layout_VecKeyed_drop(&frame->table_key);
 	if (frame->key_live)
 		txn_base_Key_drop(&frame->key);
-	frame->sort_live = frame->described_live = frame->table_key_live = frame->key_live = false;
+	if (frame->built_live)
+		doltgres_entries_BuildSnapshot_drop(&frame->built);
+	frame->sort_live = frame->described_live = frame->table_key_live = frame->key_live = frame->built_live = false;
 	doltgres_entries_opened_drop(&frame->opened);
+}
+
+/* doltgres_entries_doltgres_index_build_kept moves a concurrent build's snapshot into BUILD_SNAPSHOTS once the build succeeds. */
+static void
+doltgres_entries_doltgres_index_build_kept(doltgres_entries_doltgres_index_build_frame_t *frame)
+{
+	if (!frame->ok || !frame->built_live)
+		return;
+	doltgres_entries_locked(&frame->io, &DOLTGRES_ENTRIES_BUILD_SNAPSHOTS.local, &DOLTGRES_ENTRIES_BUILD_SNAPSHOTS_TYPE,
+							&DOLTGRES_ENTRIES_BUILD_SNAPSHOTS_LOCK_TYPE, doltgres_entries_build_snapshot_kept_op,
+							&frame->built);
+	frame->built_live = false;
 }
 
 /* doltgres_entries_doltgres_index_build_body scans the table into the build's sort and loads the sorted entries. */
@@ -10824,6 +11626,12 @@ doltgres_entries_doltgres_index_build_body(void *frame_)
 		!pg_calls_sort_begin(raise, &frame->sort, frame->error))
 		return;
 	frame->sort_live = true;
+	if (pg_calls_index_info_concurrent(frame->info))
+	{
+		if (!doltgres_entries_build_snapshot_copied(raise, pg_calls_rel_id(frame->index), &frame->built, frame->error))
+			return;
+		frame->built_live = true;
+	}
 	pg_calls_progress_update(PROGRESS_CREATEIDX_SUBPHASE, PROGRESS_BTREE_PHASE_INDEXBUILD_TABLESCAN);
 	doltgres_entries_locked(&frame->io, &DOLTGRES_ENTRIES_BUILD_DESCRIBED.local, &DOLTGRES_ENTRIES_BUILD_DESCRIBED_TYPE,
 							&DOLTGRES_ENTRIES_BUILD_DESCRIBED_LOCK_TYPE, doltgres_entries_describing_replaced_op,
@@ -10839,6 +11647,7 @@ doltgres_entries_doltgres_index_build_body(void *frame_)
 	if (doltgres_index_Described_keyed(described))
 	{
 		frame->ok = pg_calls_build_result(raise, heap_tuples, (float8) put, frame->result, frame->error);
+		doltgres_entries_doltgres_index_build_kept(frame);
 		return;
 	}
 	pg_calls_progress_update_three(PROGRESS_CREATEIDX_TUPLES_TOTAL, put > PG_INT64_MAX ? PG_INT64_MAX : (int64) put,
@@ -10866,6 +11675,7 @@ doltgres_entries_doltgres_index_build_body(void *frame_)
 								 frame->info, &frame->sort, described, horizon, based, &entries, frame->error))
 		return;
 	frame->ok = pg_calls_build_result(raise, heap_tuples, (float8) entries, frame->result, frame->error);
+	doltgres_entries_doltgres_index_build_kept(frame);
 }
 
 /*
@@ -10879,7 +11689,8 @@ doltgres_entries_doltgres_index_build_body(void *frame_)
  * the sort as the load's total, with the scan's block counts reset in the
  * same update. It answers the table's live rows and the rows its entries
  * hold. A new index records its identity pairs first, in its creating
- * transaction (design item 10).
+ * transaction (design item 10). A concurrent build keeps the snapshot it took
+ * before its scan for its validation (BUILD_SNAPSHOTS).
  */
 bool
 doltgres_entries_doltgres_index_build(const PgCatalogCaps *caps, const PgRel *heap, const PgRel *index,
@@ -11267,13 +12078,11 @@ doltgres_entries_doltgres_index_delete_tuples(const PgCatalogCaps *caps, const P
 
 /*
  * doltgres_entries_doltgres_index_holds_captures_t is index_holds' lent call's
- * captures: the reader, the base's tuple ids, and the row's tuple id.
+ * captures: the reader and the row's tuple id.
  */
 typedef struct doltgres_entries_doltgres_index_holds_captures_t
 {
 	const HostSharedReader *reading;
-	bool		has_tuple_ids;
-	TreesStoreTree tuple_ids;
 	uint64		tuple;
 } doltgres_entries_doltgres_index_holds_captures_t;
 
@@ -11286,8 +12095,8 @@ doltgres_entries_doltgres_index_holds_closure_0(void *captures, HostIoIo *io, co
 	doltgres_entries_doltgres_index_holds_captures_t *c = captures;
 	TreesStoreReader store = repo_Repo_reader(repo, HOST_CACHE_PLACEMENT_SERVER, c->reading);
 
-	return doltgres_scan_keyed(io, TREES_STORE_READER_NODE_STORE(&store), host_shared_Held_record(held),
-							   c->has_tuple_ids, c->tuple_ids, c->tuple, some, result_0, result_1, error);
+	return doltgres_scan_keyed(io, TREES_STORE_READER_NODE_STORE(&store), held, c->tuple, some, result_0, result_1,
+							   error);
 }
 
 /*
@@ -11388,8 +12197,6 @@ doltgres_entries_doltgres_index_holds_body(void *frame_)
 		return;
 	}
 	captures.tuple = pg_calls_tid_value(frame->heap_tid);
-	captures.has_tuple_ids = frame->base.has_tuple_ids;
-	captures.tuple_ids = frame->base.tuple_ids;
 	if (!doltgres_entries_making(frame->caps, &frame->io, frame->heap, &made, frame->error))
 		return;
 	if (!txn_state_held_OptionTupleVecU8Bool(&frame->io, repo, &frame->opened.reading, made,

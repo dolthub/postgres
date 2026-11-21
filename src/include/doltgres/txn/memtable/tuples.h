@@ -38,7 +38,8 @@ extern bool txn_memtable_tuples_get(HostIoIo *io, HostSharedRecord state, HostRo
 extern bool txn_memtable_tuples_emptied(HostIoIo *io, HostSharedRecord state, HostError *error);
 
 extern bool txn_memtable_tuples_reserve(HostIoIo *io, HostSharedRecord state, const uint8 *key, size_t key_len,
-										TxnMemtableTableReservation *result, HostError *error);
+										TxnMemtableTableReservation *result, TxnMemtableTableRefusal *refused,
+										HostError *error);
 extern bool txn_memtable_tuples_given(HostIoIo *io, HostSharedRecord state, HostError *error);
 extern bool txn_memtable_tuples_retired(HostIoIo *io, HostSharedRecord state, HostError *error);
 extern bool txn_memtable_tuples_dropped(HostIoIo *io, HostSharedRecord state, const uint64 *tids, size_t tids_len,
@@ -52,6 +53,10 @@ extern void test_txn_memtable_tuples_tests_a_reservation_no_finish_stored_is_giv
 extern void test_txn_memtable_tuples_tests_two_tids_of_one_first_slot_are_each_found(void);
 extern void test_txn_memtable_tuples_tests_a_tables_first_pages_are_the_smallest_that_hold_them(void);
 extern void test_txn_memtable_tuples_tests_a_tables_tids_are_found_after_inserts_and_a_growth(void);
+extern void test_txn_memtable_tuples_tests_a_table_of_mostly_dropped_tids_is_compacted_at_its_load_factor(void);
+extern void test_txn_memtable_tuples_tests_a_compaction_with_a_reservation_outstanding_moves_no_byte_page(void);
+extern void test_txn_memtable_tuples_tests_a_writer_waits_on_a_compactions_exclusive_lock(void);
+extern void test_txn_memtable_tuples_tests_a_compaction_failed_at_any_step_leaves_every_tid_found(void);
 
 /* txn_memtable_tuples_tests_stored_t is stored's prepare's captures: the tid and the change. */
 typedef struct txn_memtable_tuples_tests_stored_t

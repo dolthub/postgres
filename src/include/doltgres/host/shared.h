@@ -160,9 +160,13 @@ typedef enum HostSharedOpTag
 	HOST_SHARED_OP_LOAD,
 	HOST_SHARED_OP_ADD,
 	HOST_SHARED_OP_EXCHANGE,
+	HOST_SHARED_OP_LOAD_ACQUIRE,
 } HostSharedOpTag;
 
-/* HostSharedOp is an operation on an atomic: a load, an add, or an exchange from a value to another. */
+/*
+ * HostSharedOp is an operation on an atomic: a load, an add, an exchange from
+ * a value to another, or a load after every read before it.
+ */
 typedef struct HostSharedOp
 {
 	HostSharedOpTag tag;

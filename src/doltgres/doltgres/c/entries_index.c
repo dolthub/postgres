@@ -1421,20 +1421,27 @@ typedef struct DoltgresEntriesOthers
 	StdBytes	keyed;
 } DoltgresEntriesOthers;
 
-/* doltgres_entries_others_closure_1 is others' read of the index's base the snapshot sees. */
+/*
+ * doltgres_entries_others_captures_t is others' lent calls' captures: the
+ * snapshot, the base generation its base was read at, and the reader.
+ */
+typedef struct doltgres_entries_others_captures_t
+{
+	const HostSnapshot *seen;
+	uint64		generation;
+	HostOwnedHandle reader;
+} doltgres_entries_others_captures_t;
+
+/* doltgres_entries_others_closure_1 is others' read of the index's base the snapshot sees, with the generation before it. */
 static bool
 doltgres_entries_others_closure_1(void *captures, HostIoIo *io, const RepoRepo *repo, const HostSharedHeld *held,
 								  bool *some, TxnBaseBase *result, HostError *error)
 {
-	return txn_state_readable(io, held, captures, some, result, error);
-}
+	doltgres_entries_others_captures_t *c = captures;
 
-/* doltgres_entries_others_captures_t is others' next's captures: the snapshot and the reader. */
-typedef struct doltgres_entries_others_captures_t
-{
-	const HostSnapshot *seen;
-	HostOwnedHandle reader;
-} doltgres_entries_others_captures_t;
+	c->generation = txn_state_generation(host_shared_Held_record(held));
+	return txn_state_readable(io, held, c->seen, some, result, error);
+}
 
 /* doltgres_entries_others_closure_2 is others' next: the reader's next entry under the snapshot. */
 static bool
@@ -1531,7 +1538,7 @@ doltgres_entries_others_entries(doltgres_entries_others_frame_t *frame)
 	if (!doltgres_entries_index_making(&frame->io, which->index, &found, frame->error))
 		return false;
 	if (!txn_state_held_OptionBase(&frame->io, which->repo, which->reading, found, doltgres_entries_others_closure_1,
-								   (void *) frame->seen, NULL, &some, &frame->base, &failed))
+								   &c, NULL, &some, &frame->base, &failed))
 	{
 		*frame->error = pghost_raised(&failed);
 		return false;
@@ -1543,7 +1550,8 @@ doltgres_entries_others_entries(doltgres_entries_others_frame_t *frame)
 	std_slice_to_vec_Checked(&keyed, which->keyed.ptr, which->keyed.len, 1, 1);
 	frame->order_live = false;
 	if (!doltgres_scan_scan_begin(&frame->io, TREES_STORE_READER_NODE_STORE(&store), 0, some ? &frame->base : NULL,
-								  &keyed, pg_calls_index_table(which->index), &frame->order, &c.reader, &failed) ||
+								  c.generation, &keyed, pg_calls_index_table(which->index), &frame->order, &c.reader,
+								  &failed) ||
 		!doltgres_scan_seek(&frame->io, &stores, c.reader, which->prefix.ptr, which->prefix.len,
 							DOLTGRES_SCAN_DIRECTION_FORWARD, &failed))
 	{
@@ -1964,11 +1972,10 @@ doltgres_entries_doltgres_index_insert_killed_op(void *value, void *captures)
 	}
 }
 
-/* doltgres_entries_doltgres_index_insert_captures_t is index_insert's key read's captures: the reader, the table's base, and the row's tuple id. */
+/* doltgres_entries_doltgres_index_insert_captures_t is index_insert's key read's captures: the reader and the row's tuple id. */
 typedef struct doltgres_entries_doltgres_index_insert_captures_t
 {
 	const HostSharedReader *reading;
-	const TxnBaseBase *base;
 	uint64		tuple;
 } doltgres_entries_doltgres_index_insert_captures_t;
 
@@ -1981,9 +1988,8 @@ doltgres_entries_doltgres_index_insert_closure_1(void *captures, HostIoIo *io, c
 	const doltgres_entries_doltgres_index_insert_captures_t *c = captures;
 	TreesStoreReader store = repo_Repo_reader(repo, HOST_CACHE_PLACEMENT_SERVER, c->reading);
 
-	return doltgres_scan_keyed(io, TREES_STORE_READER_NODE_STORE(&store), host_shared_Held_record(held),
-							   c->base->has_tuple_ids, c->base->tuple_ids, c->tuple, some, result_0,
-							   result_1, error);
+	return doltgres_scan_keyed(io, TREES_STORE_READER_NODE_STORE(&store), held, c->tuple, some, result_0, result_1,
+							   error);
 }
 
 /* doltgres_entries_Described_drop_glue is an Arc<Described>'s value's drop glue. */
@@ -2101,8 +2107,7 @@ doltgres_entries_doltgres_index_insert_body(void *frame_)
 	uint64		tuple = pg_calls_tid_value(frame->heap_tid);
 	doltgres_entries_doltgres_index_insert_killed_captures_t killed = {.relation = pg_calls_rel_id(frame->heap),
 	.tuple = tuple};
-	doltgres_entries_doltgres_index_insert_captures_t c = {.reading = &frame->opened.reading, .base = &frame->base,
-	.tuple = tuple};
+	doltgres_entries_doltgres_index_insert_captures_t c = {.reading = &frame->opened.reading, .tuple = tuple};
 	const RepoRepo *repo;
 	const DoltgresIndexDescribed *described;
 	TxnMemtableVersionWriter writer;

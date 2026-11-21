@@ -49,6 +49,7 @@
 #include "doltgres/txn/memtable/table.h"
 #include "doltgres/txn/memtable/tuples.h"
 #include "doltgres/txn/memtable/version.h"
+#include "doltgres/txn/record.h"
 #include "doltgres/txn/runs.h"
 #include "doltgres/txn/spill.h"
 #include "doltgres/txn/state.h"
@@ -101,6 +102,20 @@ struct TxnSpillHomeOps
 	bool		(*tree) (TxnWrittenOf of, const TxnMemtableTableTreeOps **result, HostError *error);
 	bool		(*untupled) (HostIoIo *io, HostSharedRecord record, const uint64 *tids, size_t tids_len,
 							 HostError *error);
+
+	/*
+	 * through returns the point the record's newest base is folded at, which
+	 * a map's spill at or below it has passed: the fold that installed the
+	 * base applied it or put its versions back.
+	 */
+	bool		(*through) (HostIoIo *io, HostSharedRecord record, uint64 *result, HostError *error);
+
+	/*
+	 * ended_number takes the number of a spill file of an ended transaction
+	 * past past, as state's numbered does for a storage's state; a working
+	 * state's chunk spills are only their running transactions'.
+	 */
+	uint32		(*ended_number) (HostSharedRecord record, uint32 past);
 };
 
 /* TXN_SPILL_IDENTITY is the error of a spill of a database's identity tree, which never spills. */
@@ -160,6 +175,9 @@ txn_spill_State_Home_kind(HostIoIo *io, const HostSharedHeld *held, TxnWrittenOf
 		case TXN_WRITTEN_OF_VALUES:
 			*kind = TXN_RUNS_KIND_SPILLED_VALUES;
 			return true;
+		case TXN_WRITTEN_OF_FREE:
+			*kind = TXN_RUNS_KIND_SPILLED_FREE;
+			return true;
 		case TXN_WRITTEN_OF_IDENTITY:
 			*error = txn_spill_identity();
 			return false;
@@ -170,7 +188,7 @@ txn_spill_State_Home_kind(HostIoIo *io, const HostSharedHeld *held, TxnWrittenOf
 	return false;
 }
 
-/* txn_spill_State_tree is the tree of a state's that copied, removed, and chain walk for an Of: its rows or its value map. */
+/* txn_spill_State_tree is the tree of a state's that copied, removed, and chain walk for an Of: its rows, its value map, or its free space map. */
 static bool
 txn_spill_State_tree(TxnWrittenOf of, const TxnMemtableTableTreeOps **result, HostError *error)
 {
@@ -181,6 +199,9 @@ txn_spill_State_tree(TxnWrittenOf of, const TxnMemtableTableTreeOps **result, Ho
 			return true;
 		case TXN_WRITTEN_OF_VALUES:
 			*result = &TXN_MEMTABLE_MAP_VALUES_TREE_OPS;
+			return true;
+		case TXN_WRITTEN_OF_FREE:
+			*result = &TXN_MEMTABLE_MAP_FREE_TREE_OPS;
 			return true;
 		case TXN_WRITTEN_OF_IDENTITY:
 			*error = txn_spill_identity();
@@ -199,6 +220,13 @@ txn_spill_State_Home_untupled(HostIoIo *io, HostSharedRecord record, const uint6
 	return txn_memtable_tuples_dropped(io, record, tids, tids_len, error);
 }
 
+/* txn_spill_State_Home_through is State's through: its newest base's read point. */
+static bool
+txn_spill_State_Home_through(HostIoIo *io, HostSharedRecord record, uint64 *result, HostError *error)
+{
+	return txn_state_read_point(io, record, result, error);
+}
+
 const TxnSpillHomeOps TXN_SPILL_STATE_HOME_OPS = {
 	.writing = TXN_STATE_SPILLS_WRITING_INDEX,
 	.short_ = TXN_STATE_STATE_LOCK_INDEX,
@@ -210,6 +238,8 @@ const TxnSpillHomeOps TXN_SPILL_STATE_HOME_OPS = {
 	.kind = txn_spill_State_Home_kind,
 	.tree = txn_spill_State_tree,
 	.untupled = txn_spill_State_Home_untupled,
+	.through = txn_spill_State_Home_through,
+	.ended_number = txn_state_numbered,
 };
 
 /* txn_spill_BranchDeltas_Home_described is BranchDeltas' described: a working state's chunk spills by its repository's chunk storage, logged. */
@@ -260,6 +290,21 @@ txn_spill_BranchDeltas_Home_untupled(HostIoIo *io, HostSharedRecord record, cons
 	return true;
 }
 
+/* txn_spill_BranchDeltas_Home_through is BranchDeltas' through: 0, since a working state's chunk spills hold no map's versions. */
+static bool
+txn_spill_BranchDeltas_Home_through(HostIoIo *io, HostSharedRecord record, uint64 *result, HostError *error)
+{
+	*result = 0;
+	return true;
+}
+
+/* txn_spill_BranchDeltas_Home_ended_number is BranchDeltas' ended_number: past itself. */
+static uint32
+txn_spill_BranchDeltas_Home_ended_number(HostSharedRecord record, uint32 past)
+{
+	return past;
+}
+
 const TxnSpillHomeOps TXN_SPILL_BRANCH_DELTAS_HOME_OPS = {
 	.writing = TXN_MEMTABLE_BRANCH_CHUNK_SPILLS_WRITING_INDEX,
 	.short_ = TXN_MEMTABLE_BRANCH_DELTAS_LOCK_INDEX,
@@ -271,13 +316,15 @@ const TxnSpillHomeOps TXN_SPILL_BRANCH_DELTAS_HOME_OPS = {
 	.kind = txn_spill_BranchDeltas_Home_kind,
 	.tree = txn_spill_BranchDeltas_tree,
 	.untupled = txn_spill_BranchDeltas_Home_untupled,
+	.through = txn_spill_BranchDeltas_Home_through,
+	.ended_number = txn_spill_BranchDeltas_Home_ended_number,
 };
 
 /* txn_spill_Home_copied hands every key of one of a home's trees that has a version to a walk's step, with no killed version. */
 static bool
 txn_spill_Home_copied(const TxnSpillHomeOps *home, HostIoIo *io, HostSharedRecord record, TxnWrittenOf of,
 					  bool (*each) (void *captures, HostIoIo *io, const uint8 *key, size_t key_len, const StdVec *records,
-									size_t records_len, const txn_TupleHandleU64_t *handles, size_t handles_len,
+									size_t records_len, const txn_TupleHandleU64Bool_t *handles, size_t handles_len,
 									HostError *error),
 					  void *captures, HostError *error)
 {
@@ -532,17 +579,18 @@ static bool
 txn_spill_File_PartialEq_eq(const TxnSpillFile *self, const TxnSpillFile *other)
 {
 	return self->xid == other->xid && self->kind == other->kind && self->number == other->number &&
-		self->len == other->len && self->hash == other->hash && self->bits == other->bits;
+		self->len == other->len && self->hash == other->hash && self->bits == other->bits &&
+		self->passed == other->passed && self->from == other->from;
 }
 
-/* txn_spill_File_line appends a file's line in its storage's manifest to a buffer: its xid, kind, number, length, xxh3, and bits. */
+/* txn_spill_File_line appends a file's line in its storage's manifest to a buffer: its xid, kind, number, length, xxh3, bits, abort's end, and residual's point. */
 static void
 txn_spill_File_line(const TxnSpillFile *self, StdString *lines)
 {
-	char		line[128];
+	char		line[192];
 	int			len = snprintf(line, sizeof(line), UINT64_FORMAT " %u %u " UINT64_FORMAT " " UINT64_FORMAT " "
-							   UINT64_FORMAT "\n", self->xid, (unsigned) self->kind, self->number, self->len,
-							   self->hash, self->bits);
+							   UINT64_FORMAT " " UINT64_FORMAT " " UINT64_FORMAT "\n", self->xid, (unsigned) self->kind,
+							   self->number, self->len, self->hash, self->bits, self->passed, self->from);
 
 	std_vec_extend_from_slice_Checked(lines, line, (size_t) len, 1, 1);
 }
@@ -551,11 +599,11 @@ txn_spill_File_line(const TxnSpillFile *self, StdString *lines)
 static bool
 txn_spill_File_parsed(const char *line, size_t len, TxnSpillFile *result)
 {
-	uint64		words[6];
+	uint64		words[8];
 	size_t		at = 0;
 	StdParseIntError failed;
 
-	for (size_t count = 0; count < 6; count++)
+	for (size_t count = 0; count < lengthof(words); count++)
 	{
 		size_t		end = at;
 
@@ -576,6 +624,8 @@ txn_spill_File_parsed(const char *line, size_t len, TxnSpillFile *result)
 	result->len = words[3];
 	result->hash = words[4];
 	result->bits = words[5];
+	result->passed = words[6];
+	result->from = words[7];
 	return result->bits > 0 && result->bits % 64 == 0;
 }
 
@@ -761,25 +811,16 @@ txn_spill_read(HostIoReadDoors io, HostSharedPauses pauses, const StdPathBuf *pa
 	return frame.ok;
 }
 
-/* txn_spill_changed_frame_0_t is changed's state across its pad: the manifest's path, its writers' lock, its files, and their write aside, while live. */
-typedef struct txn_spill_changed_frame_0_t
+/* txn_spill_rewrote_frame_0_t is rewrote's state across its pad: the manifest's lines, their write aside, and the record's lock, while live. */
+typedef struct txn_spill_rewrote_frame_0_t
 {
 	const TxnSpillHomeOps *home;
-	HostIoIo   *io;
+	HostSharedLongIo *io;
 	HostSharedRecord record;
-	const HostStorage *storage;
-	void		(*edit) (void *captures, StdVec *files);
-	void	   *captures;
+	const StdPathBuf *path;
+	const StdVec *files;
 	HostError  *error;
 	bool		ok;
-	StdPathBuf	path;
-	bool		path_live;
-	HostSharedLongGuard writing;
-	bool		writing_live;
-	HostSharedLongIo long_io;
-	/* files is a Vec<File>. */
-	StdVec		files;
-	bool		files_live;
 	StdString	lines;
 	bool		lines_live;
 	StdPathBuf	aside;
@@ -788,13 +829,13 @@ typedef struct txn_spill_changed_frame_0_t
 	bool		written_live;
 	HostSharedGuard exclusive;
 	bool		exclusive_live;
-} txn_spill_changed_frame_0_t;
+} txn_spill_rewrote_frame_0_t;
 
-/* txn_spill_changed_pad_0 is changed's pad: what it holds, while live. */
+/* txn_spill_rewrote_pad_0 is rewrote's pad: what it holds, while live. */
 static void
-txn_spill_changed_pad_0(void *frame_)
+txn_spill_rewrote_pad_0(void *frame_)
 {
-	txn_spill_changed_frame_0_t *frame = frame_;
+	txn_spill_rewrote_frame_0_t *frame = frame_;
 
 	if (frame->exclusive_live)
 	{
@@ -816,36 +857,21 @@ txn_spill_changed_pad_0(void *frame_)
 		frame->lines_live = false;
 		std_vec_free_Checked(&frame->lines, 1, 1);
 	}
-	if (frame->files_live)
-	{
-		frame->files_live = false;
-		std_vec_free_Checked(&frame->files, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
-	}
-	if (frame->writing_live)
-	{
-		frame->writing_live = false;
-		host_shared_LongGuard_drop(&frame->writing);
-	}
-	if (frame->path_live)
-	{
-		frame->path_live = false;
-		std_vec_free_Checked(&frame->path.bytes, 1, 1);
-	}
 }
 
-/* txn_spill_changed_written writes the frame's files' lines whole beside the manifest and renames them over it. */
+/* txn_spill_rewrote_written writes the frame's files' lines whole beside the manifest and renames them over it. */
 static bool
-txn_spill_changed_written(txn_spill_changed_frame_0_t *frame)
+txn_spill_rewrote_written(txn_spill_rewrote_frame_0_t *frame)
 {
-	HostIoIoDoors io = HOST_SHARED_LONG_IO_IO_DOORS(&frame->long_io);
+	HostIoIoDoors io = HOST_SHARED_LONG_IO_IO_DOORS(frame->io);
 	ChunksErrorError failed;
 	bool		some;
 
 	std_vec_new(&frame->lines, 1, 1);
 	frame->lines_live = true;
-	for (size_t k = 0; k < frame->files.len; k++)
-		txn_spill_File_line(&STD_VEC_AT(&frame->files, TxnSpillFile, k), &frame->lines);
-	std_path_with_extension(frame->path.bytes.ptr, frame->path.bytes.len, "new", 3, &frame->aside);
+	for (size_t k = 0; k < frame->files->len; k++)
+		txn_spill_File_line(&STD_VEC_AT(frame->files, TxnSpillFile, k), &frame->lines);
+	std_path_with_extension(frame->path->bytes.ptr, frame->path->bytes.len, "new", 3, &frame->aside);
 	frame->aside_live = true;
 	if (!host_create_if_absent(io, frame->aside.bytes.ptr, frame->aside.bytes.len, &some, &frame->written,
 							   frame->error))
@@ -868,13 +894,119 @@ txn_spill_changed_written(txn_spill_changed_frame_0_t *frame)
 	}
 	frame->written_live = false;
 	host_File_drop(&frame->written);
-	if (!chunks_file_rename(io, frame->aside.bytes.ptr, frame->aside.bytes.len, frame->path.bytes.ptr,
-							frame->path.bytes.len, &failed))
+	if (!chunks_file_rename(io, frame->aside.bytes.ptr, frame->aside.bytes.len, frame->path->bytes.ptr,
+							frame->path->bytes.len, &failed))
 	{
 		*frame->error = txn_base_storage(&failed);
 		return false;
 	}
 	return true;
+}
+
+/* txn_spill_rewrote_body_0 is rewrote's body. */
+static void
+txn_spill_rewrote_body_0(void *frame_)
+{
+	txn_spill_rewrote_frame_0_t *frame = frame_;
+	uint64		generation;
+	HostSharedOp load = {.tag = HOST_SHARED_OP_LOAD};
+	HostSharedOp exchange = {.tag = HOST_SHARED_OP_EXCHANGE};
+
+	if (frame->files->len == 0)
+	{
+		ChunksErrorError failed;
+		bool		removed;
+
+		if (!chunks_file_remove_if_there(HOST_SHARED_LONG_IO_IO_DOORS(frame->io), frame->path->bytes.ptr,
+										 frame->path->bytes.len, &removed, &failed))
+		{
+			*frame->error = txn_base_storage(&failed);
+			txn_spill_rewrote_pad_0(frame);
+			return;
+		}
+	}
+	else if (!txn_spill_rewrote_written(frame))
+	{
+		txn_spill_rewrote_pad_0(frame);
+		return;
+	}
+	if (!txn_state_spills_generation(&generation, frame->error) ||
+		!host_shared_LongIo_lock(frame->io, frame->home->short_, &frame->exclusive, frame->error))
+	{
+		txn_spill_rewrote_pad_0(frame);
+		return;
+	}
+	frame->exclusive_live = true;
+	exchange.u.exchange.f0 = host_shared_Record_atomic(frame->record, frame->home->listed, load);
+	exchange.u.exchange.f1 = (uint64) frame->files->len;
+	host_shared_Record_atomic(frame->record, frame->home->listed, exchange);
+	exchange.u.exchange.f0 = host_shared_Record_atomic(frame->record, frame->home->changed, load);
+	exchange.u.exchange.f1 = generation;
+	host_shared_Record_atomic(frame->record, frame->home->changed, exchange);
+	frame->ok = true;
+	txn_spill_rewrote_pad_0(frame);
+}
+
+/*
+ * txn_spill_rewrote writes a storage's manifest file under its writers' lock,
+ * its files' lines through a file set aside and renamed over it, unsynced, or
+ * removes it when it lists none, and then, under the record's lock held
+ * exclusively for the in-memory steps alone, moves the count and the
+ * generation its record holds.
+ */
+static bool
+txn_spill_rewrote(const TxnSpillHomeOps *home, HostSharedLongIo *io, HostSharedRecord record, const StdPathBuf *path,
+				  const StdVec *files, HostError *error)
+{
+	txn_spill_rewrote_frame_0_t frame = {.home = home, .io = io, .record = record, .path = path, .files = files,
+	.error = error};
+
+	std_landing(&frame, txn_spill_rewrote_body_0, txn_spill_rewrote_pad_0);
+	return frame.ok;
+}
+
+/* txn_spill_changed_frame_0_t is changed's state across its pad: the manifest's path, its writers' lock, and its files, while live. */
+typedef struct txn_spill_changed_frame_0_t
+{
+	const TxnSpillHomeOps *home;
+	HostIoIo   *io;
+	HostSharedRecord record;
+	const HostStorage *storage;
+	bool		(*edit) (void *captures, HostSharedLongIo *io, StdVec *files, HostError *error);
+	void	   *captures;
+	HostError  *error;
+	bool		ok;
+	StdPathBuf	path;
+	bool		path_live;
+	HostSharedLongGuard writing;
+	bool		writing_live;
+	HostSharedLongIo long_io;
+	/* files is a Vec<File>. */
+	StdVec		files;
+	bool		files_live;
+} txn_spill_changed_frame_0_t;
+
+/* txn_spill_changed_pad_0 is changed's pad: what it holds, while live. */
+static void
+txn_spill_changed_pad_0(void *frame_)
+{
+	txn_spill_changed_frame_0_t *frame = frame_;
+
+	if (frame->files_live)
+	{
+		frame->files_live = false;
+		std_vec_free_Checked(&frame->files, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	}
+	if (frame->writing_live)
+	{
+		frame->writing_live = false;
+		host_shared_LongGuard_drop(&frame->writing);
+	}
+	if (frame->path_live)
+	{
+		frame->path_live = false;
+		std_vec_free_Checked(&frame->path.bytes, 1, 1);
+	}
 }
 
 /* txn_spill_changed_body_0 is changed's body. */
@@ -883,9 +1015,6 @@ txn_spill_changed_body_0(void *frame_)
 {
 	txn_spill_changed_frame_0_t *frame = frame_;
 	HostIoIoDoors io;
-	uint64		generation;
-	HostSharedOp load = {.tag = HOST_SHARED_OP_LOAD};
-	HostSharedOp exchange = {.tag = HOST_SHARED_OP_EXCHANGE};
 
 	txn_spill_manifest(frame->home, frame->record, frame->storage, &frame->path);
 	frame->path_live = true;
@@ -905,57 +1034,28 @@ txn_spill_changed_body_0(void *frame_)
 		return;
 	}
 	frame->files_live = true;
-	if (!host_pause(HOST_SHARED_LONG_IO_PAUSES(&frame->long_io), "doltgres-spill-manifest-read", frame->error))
+	if (!host_pause(HOST_SHARED_LONG_IO_PAUSES(&frame->long_io), "doltgres-spill-manifest-read", frame->error) ||
+		!frame->edit(frame->captures, &frame->long_io, &frame->files, frame->error) ||
+		!txn_spill_rewrote(frame->home, &frame->long_io, frame->record, &frame->path, &frame->files, frame->error))
 	{
 		txn_spill_changed_pad_0(frame);
 		return;
 	}
-	frame->edit(frame->captures, &frame->files);
-	if (frame->files.len == 0)
-	{
-		ChunksErrorError failed;
-		bool		removed;
-
-		if (!chunks_file_remove_if_there(io, frame->path.bytes.ptr, frame->path.bytes.len, &removed, &failed))
-		{
-			*frame->error = txn_base_storage(&failed);
-			txn_spill_changed_pad_0(frame);
-			return;
-		}
-	}
-	else if (!txn_spill_changed_written(frame))
-	{
-		txn_spill_changed_pad_0(frame);
-		return;
-	}
-	if (!txn_state_spills_generation(&generation, frame->error) ||
-		!host_shared_LongIo_lock(&frame->long_io, frame->home->short_, &frame->exclusive, frame->error))
-	{
-		txn_spill_changed_pad_0(frame);
-		return;
-	}
-	frame->exclusive_live = true;
-	exchange.u.exchange.f0 = host_shared_Record_atomic(frame->record, frame->home->listed, load);
-	exchange.u.exchange.f1 = (uint64) frame->files.len;
-	host_shared_Record_atomic(frame->record, frame->home->listed, exchange);
-	exchange.u.exchange.f0 = host_shared_Record_atomic(frame->record, frame->home->changed, load);
-	exchange.u.exchange.f1 = generation;
-	host_shared_Record_atomic(frame->record, frame->home->changed, exchange);
 	frame->ok = true;
 	txn_spill_changed_pad_0(frame);
 }
 
 /*
  * txn_spill_changed changes a storage's spills' manifest under its writers'
- * lock: it reads the manifest file, edits its list, writes the list whole
- * beside it and renames it over the manifest, unsynced, or removes the file
- * once the list is empty; then, under the record's lock held exclusively for
- * the in-memory steps alone, it stores the list's count and a new
- * generation. What the edit answers it leaves in its captures.
+ * lock: it reads the manifest file, edits its list with an edit that may
+ * write files under the lock and fail, which leaves the manifest as it was,
+ * and rewrites the manifest with the edited list (rewrote). What the edit
+ * answers it leaves in its captures.
  */
 static bool
 txn_spill_changed(const TxnSpillHomeOps *home, HostIoIo *io, HostSharedRecord record, const HostStorage *storage,
-				  void (*edit) (void *captures, StdVec *files), void *captures, HostError *error)
+				  bool (*edit) (void *captures, HostSharedLongIo *io, StdVec *files, HostError *error),
+				  void *captures, HostError *error)
 {
 	txn_spill_changed_frame_0_t frame = {.home = home, .io = io, .record = record, .storage = storage, .edit = edit,
 	.captures = captures, .error = error};
@@ -973,12 +1073,17 @@ typedef struct txn_spill_linked_captures_t
 	txn_TupleU64KindU32OptionU32_t replacing;
 } txn_spill_linked_captures_t;
 
-/* txn_spill_linked_closure_0 is linked's edit: the files the merge replaces out, then each linked file once. */
-static void
-txn_spill_linked_closure_0(void *captures, StdVec *files)
+/*
+ * txn_spill_linked_closure_0 is linked's edit: the files the merge replaces
+ * out, then each linked file once, at the place of the newest file the
+ * merge replaces, or last when it replaces none.
+ */
+static bool
+txn_spill_linked_closure_0(void *captures, HostSharedLongIo *io, StdVec *files, HostError *error)
 {
 	txn_spill_linked_captures_t *c = captures;
 	size_t		kept = 0;
+	size_t		at = files->len;
 
 	for (size_t k = 0; k < files->len; k++)
 	{
@@ -986,6 +1091,8 @@ txn_spill_linked_closure_0(void *captures, StdVec *files)
 
 		if (!c->has_replacing || !txn_spill_replaced_by(&c->replacing, 1, file))
 			STD_VEC_AT(files, TxnSpillFile, kept++) = *file;
+		else
+			at = kept;
 	}
 	files->len = kept;
 	for (size_t j = 0; j < c->linking_len; j++)
@@ -995,14 +1102,21 @@ txn_spill_linked_closure_0(void *captures, StdVec *files)
 		for (size_t k = 0; k < files->len && !listed; k++)
 			listed = txn_spill_File_PartialEq_eq(&STD_VEC_AT(files, TxnSpillFile, k), &c->linking[j]);
 		if (!listed)
-			std_vec_push_Checked(files, &c->linking[j], sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+		{
+			std_vec_insert(files, at, &c->linking[j], sizeof(TxnSpillFile), _Alignof(TxnSpillFile), RUST_FILE, 523,
+						   23);
+			at++;
+		}
 	}
+	return true;
 }
 
 /*
  * txn_spill_linked lists a spill's files in its storage's manifest, the
  * newest, a row spill's tuple-id file after its row file, each once; a
- * merge's files take the place of the files it replaces, in the same change.
+ * merge's files take the place of the files it replaces, in the same change,
+ * at the newest one's place, so its versions stay below every later file's
+ * of their keys (bugs row 228).
  */
 bool
 txn_spill_linked(const TxnSpillHomeOps *home, HostIoIo *io, HostSharedRecord record, const HostStorage *storage,
@@ -1023,8 +1137,8 @@ typedef struct txn_spill_removed_captures_t
 } txn_spill_removed_captures_t;
 
 /* txn_spill_removed_closure_0 is removed's edit: the files its test picks out, kept in order, and the rest left. */
-static void
-txn_spill_removed_closure_0(void *captures, StdVec *files)
+static bool
+txn_spill_removed_closure_0(void *captures, HostSharedLongIo *io, StdVec *files, HostError *error)
 {
 	txn_spill_removed_captures_t *c = captures;
 	size_t		kept = 0;
@@ -1039,6 +1153,7 @@ txn_spill_removed_closure_0(void *captures, StdVec *files)
 			STD_VEC_AT(files, TxnSpillFile, kept++) = file;
 	}
 	files->len = kept;
+	return true;
 }
 
 /* txn_spill_removed_frame_0_t is removed's state across its pad: the files it takes, while live. */
@@ -1086,7 +1201,7 @@ txn_spill_removed_body_0(void *frame_)
 }
 
 /* txn_spill_removed takes the files of a storage's spills that a test picks out of its manifest, answering them. */
-static bool
+bool
 txn_spill_removed(const TxnSpillHomeOps *home, HostIoIo *io, HostSharedRecord record, const HostStorage *storage,
 				  bool (*picked) (void *captures, const TxnSpillFile *file), void *picked_captures, StdVec *result,
 				  HostError *error)
@@ -2034,6 +2149,296 @@ txn_spill_replayed_locked(HostIoIo *io, void (*step) (void *captures, StdVec *re
 	std_landing(&frame, txn_spill_replayed_body_0, txn_spill_replayed_pad_0);
 }
 
+/* taken at Vec<u64> and IoMutex<Vec<u64>>, which spill.c alone uses. */
+#define HOST_LOCK_SCOPE static
+#define HOST_LOCK_DECLARE
+#define HOST_LOCK_DEFINE
+#define HOST_LOCK_TAKEN_TS VecU64
+#define HOST_LOCK_TAKEN_T StdVec
+#define HOST_LOCK_TAKEN_DEFAULT(place) std_vec_new((place), sizeof(uint64), _Alignof(uint64))
+#define HOST_LOCK_TAKEN_DROP(place) std_vec_free_Checked((place), sizeof(uint64), _Alignof(uint64))
+#define HOST_LOCK_TAKEN_TYPE TXN_SPILL_SPILLERS_LOCK_TYPE
+#define HOST_LOCK_IO_MUTEX
+#define HOST_LOCK_TS VecU64
+#define HOST_LOCK_T StdVec
+#define HOST_LOCK_DEFAULT(place) std_vec_new((place), sizeof(uint64), _Alignof(uint64))
+#include "doltgres/host/lock_template.h"
+
+/* txn_spill_IoMutexVecU64_drop is IoMutex<Vec<u64>>' drop glue: its value's. */
+static void
+txn_spill_IoMutexVecU64_drop(void *value)
+{
+	HostLockIoMutexVecU64 *self = value;
+
+	std_vec_free_Checked(&self->value, sizeof(uint64), _Alignof(uint64));
+}
+
+/* TXN_SPILL_SPILLERS_TYPE is IoMutex<Vec<u64>>' size, Default, and drop. */
+static const StdDefaultType TXN_SPILL_SPILLERS_TYPE = {sizeof(HostLockIoMutexVecU64),
+	_Alignof(HostLockIoMutexVecU64), host_lock_IoMutexVecU64_Default_default,
+txn_spill_IoMutexVecU64_drop};
+
+/*
+ * TXN_SPILL_FREE_SPILLERS is FREE_SPILLERS: the startup process's xids whose
+ * free space map spills it listed, by its load of a checkpoint's runs or a
+ * replayed spill, so that a replayed abort sweeps the states for its
+ * transaction's spills only when it has some; its BackendLocal header and
+ * the process's value, which follows it.
+ */
+static struct
+{
+	HostLocalBackendLocal local;
+	HostLockIoMutexVecU64 process;
+}			TXN_SPILL_FREE_SPILLERS = {HOST_LOCAL_BACKEND_LOCAL_NEW};
+
+/* txn_spill_spillers_frame_0_t is the state of a step under FREE_SPILLERS' lock across its pad: the local and its guard, while live. */
+typedef struct txn_spill_spillers_frame_0_t
+{
+	HostIoIo   *io;
+	void		(*step) (void *captures, StdVec *spillers);
+	void	   *captures;
+	HostLocalLocal local;
+	bool		local_live;
+	HostLockLockedRwLockWriteGuard guard;
+	bool		guard_live;
+} txn_spill_spillers_frame_0_t;
+
+/* txn_spill_spillers_pad_0 is the pad of a step under FREE_SPILLERS' lock: the guard, then the local, while live. */
+static void
+txn_spill_spillers_pad_0(void *frame_)
+{
+	txn_spill_spillers_frame_0_t *frame = frame_;
+
+	if (frame->guard_live)
+	{
+		frame->guard_live = false;
+		host_lock_LockedRwLockWriteGuard_drop(&frame->guard);
+	}
+	if (frame->local_live)
+	{
+		frame->local_live = false;
+		host_local_Local_drop(&frame->local, &TXN_SPILL_SPILLERS_TYPE);
+	}
+}
+
+/* txn_spill_spillers_body_0 runs a step on FREE_SPILLERS under its lock. */
+static void
+txn_spill_spillers_body_0(void *frame_)
+{
+	txn_spill_spillers_frame_0_t *frame = frame_;
+
+	frame->local = host_local_BackendLocal_get(&TXN_SPILL_FREE_SPILLERS.local, &TXN_SPILL_SPILLERS_TYPE);
+	frame->local_live = true;
+	frame->guard = host_lock_IoMutex_lock((HostLockIoMutex *) host_local_Local_Deref_deref(&frame->local,
+																						   &TXN_SPILL_SPILLERS_TYPE),
+										  &TXN_SPILL_SPILLERS_LOCK_TYPE, &frame->io->held);
+	frame->guard_live = true;
+	frame->step(frame->captures, host_lock_LockedRwLockWriteGuard_DerefMut_deref_mut(&frame->guard));
+	txn_spill_spillers_pad_0(frame);
+}
+
+/* txn_spill_spillers_locked runs a step on the process's FREE_SPILLERS under its lock. */
+static void
+txn_spill_spillers_locked(HostIoIo *io, void (*step) (void *captures, StdVec *spillers), void *captures)
+{
+	txn_spill_spillers_frame_0_t frame = {.io = io, .step = step, .captures = captures};
+
+	std_landing(&frame, txn_spill_spillers_body_0, txn_spill_spillers_pad_0);
+}
+
+/* txn_spill_spillers_t is the steps' captures on FREE_SPILLERS: the xid, and whether the step found or recorded it. */
+typedef struct txn_spill_spillers_t
+{
+	uint64		xid;
+	bool		done;
+} txn_spill_spillers_t;
+
+/* txn_spill_spilled_free_closure_0 is spilled_free's step: the xid recorded once, done unless the list's growth failed. */
+static void
+txn_spill_spilled_free_closure_0(void *captures, StdVec *spillers)
+{
+	txn_spill_spillers_t *c = captures;
+
+	for (size_t k = 0; k < spillers->len; k++)
+		if (STD_VEC_AT(spillers, uint64, k) == c->xid)
+		{
+			c->done = true;
+			return;
+		}
+	c->done = std_vec_try_reserve(spillers, 1, sizeof(uint64), _Alignof(uint64));
+	if (c->done)
+		std_vec_push_Checked(spillers, &c->xid, sizeof(uint64), _Alignof(uint64));
+}
+
+/* txn_spill_spilled_free records, in the startup process, an xid whose free space map spill it listed. */
+bool
+txn_spill_spilled_free(HostIoIo *io, uint64 xid, HostError *error)
+{
+	txn_spill_spillers_t captures = {xid};
+
+	txn_spill_spillers_locked(io, txn_spill_spilled_free_closure_0, &captures);
+	if (!captures.done)
+		*error = host_Error_out_of_memory();
+	return captures.done;
+}
+
+/* txn_spill_redo_aborted_closure_0 is redo_aborted's step on FREE_SPILLERS: the xid taken out, done when it was there. */
+static void
+txn_spill_redo_aborted_closure_0(void *captures, StdVec *spillers)
+{
+	txn_spill_spillers_t *c = captures;
+
+	for (size_t k = 0; k < spillers->len; k++)
+		if (STD_VEC_AT(spillers, uint64, k) == c->xid)
+		{
+			uint64		taken;
+
+			std_vec_swap_remove(spillers, k, &taken, sizeof(uint64), _Alignof(uint64));
+			c->done = true;
+			return;
+		}
+}
+
+/* txn_spill_marked_t is the edit's captures that marks a transaction's free space map spills: the xid and the end. */
+typedef struct txn_spill_marked_t
+{
+	uint64		xid;
+	uint64		end;
+} txn_spill_marked_t;
+
+/* txn_spill_marked_closure_0 marks each of a transaction's free space map spills with an abort record's end. */
+static bool
+txn_spill_marked_closure_0(void *captures, HostSharedLongIo *io, StdVec *files, HostError *error)
+{
+	const txn_spill_marked_t *c = captures;
+
+	for (size_t k = 0; k < files->len; k++)
+	{
+		TxnSpillFile *file = &STD_VEC_AT(files, TxnSpillFile, k);
+
+		if (file->kind == TXN_RUNS_KIND_SPILLED_FREE && file->xid == c->xid)
+			file->passed = c->end;
+	}
+	return true;
+}
+
+/* txn_spill_redo_aborted_frame_0_t is redo_aborted's state across its pad: the swept states, a state opened, and its files, while live. */
+typedef struct txn_spill_redo_aborted_frame_0_t
+{
+	HostIoIo   *io;
+	txn_spill_marked_t marked;
+	HostError  *error;
+	bool		ok;
+	/* swept is a Vec<(u64, u64)> of the swept states' locations. */
+	StdVec		swept;
+	bool		swept_live;
+	HostSharedHeld held;
+	bool		held_live;
+	txn_TupleVecFileU64_t listed;
+	bool		listed_live;
+} txn_spill_redo_aborted_frame_0_t;
+
+/* txn_spill_redo_aborted_pad_0 is redo_aborted's pad: the files, the state, and the swept list, while live. */
+static void
+txn_spill_redo_aborted_pad_0(void *frame_)
+{
+	txn_spill_redo_aborted_frame_0_t *frame = frame_;
+
+	if (frame->listed_live)
+	{
+		frame->listed_live = false;
+		std_vec_free_Checked(&frame->listed.f0, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	}
+	if (frame->held_live)
+	{
+		frame->held_live = false;
+		host_shared_Held_drop(&frame->held);
+	}
+	if (frame->swept_live)
+	{
+		frame->swept_live = false;
+		std_vec_free_Checked(&frame->swept, sizeof(std_TupleU64U64_t), _Alignof(std_TupleU64U64_t));
+	}
+}
+
+/* txn_spill_redo_aborted_body_0 is redo_aborted's body, for a transaction spilled_free recorded. */
+static void
+txn_spill_redo_aborted_body_0(void *frame_)
+{
+	txn_spill_redo_aborted_frame_0_t *frame = frame_;
+
+	if (!host_shared_sweep(HOST_SHARED_IO_WITHIN(frame->io), &TXN_STATE_STATE_POOL_OPS, TXN_STATE_SPILLS_INDEX,
+						   &frame->swept, frame->error))
+		return;
+	frame->swept_live = true;
+	for (size_t k = 0; k < frame->swept.len; k++)
+	{
+		bool		some;
+		bool		spilled = false;
+		HostStorage storage;
+		TxnStatePersistence persistence;
+		HostSharedRecord record;
+
+		if (!host_shared_open(HOST_SHARED_IO_WITHIN(frame->io), &TXN_STATE_STATE_POOL_OPS,
+							  STD_VEC_AT(&frame->swept, std_TupleU64U64_t, k).f0, &some, &frame->held, frame->error))
+		{
+			txn_spill_redo_aborted_pad_0(frame);
+			return;
+		}
+		if (!some)
+			continue;
+		frame->held_live = true;
+		record = host_shared_Held_record(&frame->held);
+		if (txn_state_described(record, &storage, &persistence))
+		{
+			if (!txn_spill_listed(&TXN_SPILL_STATE_HOME_OPS, frame->io, record, &storage, &frame->listed,
+								  frame->error))
+			{
+				txn_spill_redo_aborted_pad_0(frame);
+				return;
+			}
+			frame->listed_live = true;
+			for (size_t j = 0; j < frame->listed.f0.len && !spilled; j++)
+			{
+				const TxnSpillFile *file = &STD_VEC_AT(&frame->listed.f0, TxnSpillFile, j);
+
+				spilled = file->kind == TXN_RUNS_KIND_SPILLED_FREE && file->xid == frame->marked.xid;
+			}
+			frame->listed_live = false;
+			std_vec_free_Checked(&frame->listed.f0, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+			if (spilled && !txn_spill_changed(&TXN_SPILL_STATE_HOME_OPS, frame->io, record, &storage,
+											  txn_spill_marked_closure_0, &frame->marked, frame->error))
+			{
+				txn_spill_redo_aborted_pad_0(frame);
+				return;
+			}
+		}
+		frame->held_live = false;
+		host_shared_Held_drop(&frame->held);
+	}
+	frame->ok = true;
+	txn_spill_redo_aborted_pad_0(frame);
+}
+
+/*
+ * txn_spill_redo_aborted marks a replayed aborted transaction's free space
+ * map spills with its abort record's end, as its abort marked them on its
+ * primary, so a standby's folds pass them where its primary's do; it sweeps
+ * the states that list spills only for a transaction spilled_free recorded.
+ */
+bool
+txn_spill_redo_aborted(HostIoIo *io, uint64 xid, HostLsn end, HostError *error)
+{
+	txn_spill_spillers_t known = {xid};
+	txn_spill_redo_aborted_frame_0_t frame = {.io = io, .marked = {xid, end}, .error = error};
+
+	txn_spill_spillers_locked(io, txn_spill_redo_aborted_closure_0, &known);
+	if (!known.done)
+		return true;
+	std_landing(&frame, txn_spill_redo_aborted_body_0, txn_spill_redo_aborted_pad_0);
+	return frame.ok;
+}
+
 /* txn_spill_relieved_own_closure_0 is relieved_own's step on REPLAYED: the tree a replayed transaction wrote the most to, the last of equals as max_by_key takes it. */
 static void
 txn_spill_relieved_own_closure_0(void *captures, StdVec *replayed)
@@ -2172,8 +2577,8 @@ txn_spill_unreplayed(HostIoIo *io, const HostStorage *storage, TxnWrittenOf of, 
 }
 
 static bool txn_spill_spilled_from(const TxnSpillHomeOps *home, HostIoIo *io, const HostSharedHeld *held,
-								   const HostStorage *storage, TxnWrittenOf of, uint64 xid, bool *result,
-								   HostError *error);
+								   const HostStorage *storage, TxnWrittenOf of, uint64 xid, bool oldest,
+								   bool *result, HostError *error);
 
 /* txn_spill_spilled_turn_captures_t is spilled_turn's step's captures: the tree, the xid, and the answer. */
 typedef struct txn_spill_spilled_turn_captures_t
@@ -2204,7 +2609,7 @@ txn_spill_spilled_turn_closure_0(void *captures, const TxnSpillHomeOps *home, co
 
 	if (c->of == TXN_WRITTEN_OF_IDENTITY)
 		return txn_spill_spilled_turn_none(c, error);
-	return txn_spill_spilled_from(home, c->io, held, c->storage, c->of, c->xid, c->result, error);
+	return txn_spill_spilled_from(home, c->io, held, c->storage, c->of, c->xid, false, c->result, error);
 }
 
 /* txn_spill_spilled_turn spills a storage's tree's versions of a transaction from the tree's home, by a process whose turn it is; a database's identity tree never spills. */
@@ -2340,13 +2745,10 @@ txn_spill_removed_keys(const TxnSpillHomeOps *home, HostIoIo *io, HostSharedReco
 	return frame.ok;
 }
 
-/* txn_spill_tid returns the tuple id a row version's record holds, the row a put, an add, an added row, or an update names. */
+/* txn_spill_op_tid returns the tuple id a row version's op holds, the row a put, an add, an added row, or an update names. */
 static bool
-txn_spill_tid(const uint8 *record, size_t record_len, uint64 *result)
+txn_spill_op_tid(TxnMemtableVersionOpRef op, uint64 *result)
 {
-	TxnMemtableVersionRecord stored = txn_memtable_version_Record_of(record, record_len);
-	TxnMemtableVersionOpRef op = txn_memtable_version_Record_op(&stored);
-
 	switch (op.tag)
 	{
 		case TXN_MEMTABLE_VERSION_OP_REF_PUT:
@@ -2364,6 +2766,15 @@ txn_spill_tid(const uint8 *record, size_t record_len, uint64 *result)
 		default:
 			return false;
 	}
+}
+
+/* txn_spill_tid returns the tuple id a row version's record holds, as op_tid gives it. */
+static bool
+txn_spill_tid(const uint8 *record, size_t record_len, uint64 *result)
+{
+	TxnMemtableVersionRecord stored = txn_memtable_version_Record_of(record, record_len);
+
+	return txn_spill_op_tid(txn_memtable_version_Record_op(&stored), result);
 }
 
 /* txn_spill_numbered returns the number of a transaction's next spill file of a storage's kind: one past its newest listed. */
@@ -2396,6 +2807,12 @@ typedef struct txn_spill_from_frame_0_t
 	const HostStorage *storage;
 	TxnWrittenOf of;
 	uint64		xid;
+
+	/*
+	 * oldest is the budget's committed arm's spill, of keys whose oldest
+	 * versions are the transaction's alone.
+	 */
+	bool		oldest;
 	bool	   *result;
 	HostError  *error;
 	bool		ok;
@@ -2463,18 +2880,38 @@ txn_spill_from_pad_0(void *frame_)
 	}
 }
 
-/* txn_spill_from_closure_0 is spilled_from's walk's step: a key whose chain holds only the transaction's versions written, its tuple ids and its handles taken. */
+/*
+ * txn_spill_from_closure_0 is spilled_from's walk's step: of a key whose
+ * chain holds only the transaction's versions, or, for the committed arm,
+ * whose oldest versions are the transaction's alone, those versions written,
+ * their tuple ids and their handles taken, so every spilled version stays
+ * older than the versions the chain keeps.
+ */
 static bool
 txn_spill_from_closure_0(void *captures, HostIoIo *io, const uint8 *key, size_t key_len, const StdVec *records,
-						 size_t records_len, const txn_TupleHandleU64_t *handles, size_t handles_len,
+						 size_t records_len, const txn_TupleHandleU64Bool_t *handles, size_t handles_len,
 						 HostError *error)
 {
 	txn_spill_from_frame_0_t *frame = captures;
 	txn_TupleVecU8VecHandle_t took;
+	size_t		below = 0;
+	size_t		kept = 0;
 
-	for (size_t k = 0; k < handles_len; k++)
-		if (handles[k].f1 != frame->xid)
+	for (size_t k = handles_len; k > 0 && below == 0; k--)
+		if (handles[k - 1].f1 != frame->xid)
+			below = k;
+	if (below == handles_len || (below > 0 && !frame->oldest))
+		return true;
+	for (size_t k = 0; k < below; k++)
+	{
+		if (handles[k].f1 == frame->xid)
 			return true;
+		kept += !handles[k].f2;
+	}
+	records += kept;
+	records_len -= kept;
+	handles += below;
+	handles_len -= below;
 	if (records_len > 0)
 	{
 		frame->records.len = 0;
@@ -2484,7 +2921,7 @@ txn_spill_from_closure_0(void *captures, HostIoIo *io, const uint8 *key, size_t 
 
 			std_vec_push_Checked(&frame->records, &record, sizeof(record), _Alignof(StdBytes));
 		}
-		if (!txn_runs_Writing_key(frame->writing, io, key, key_len, frame->records.ptr, frame->records.len, error))
+		if (!txn_runs_Writing_key(frame->writing, HOST_IO_IO_IO_DOORS(io), key, key_len, frame->records.ptr, frame->records.len, error))
 			return false;
 	}
 	for (size_t k = 0; frame->kind == TXN_RUNS_KIND_SPILLED_ROWS && k < records_len; k++)
@@ -2515,24 +2952,30 @@ txn_spill_from_closure_0(void *captures, HostIoIo *io, const uint8 *key, size_t 
 	return true;
 }
 
-static bool txn_spill_tupled(const TxnSpillHomeOps *home, HostIoIo *io, HostSharedRecord record,
+static bool txn_spill_tupled(const TxnSpillHomeOps *home, HostIoIoDoors io, HostSharedRecord record,
 							 const HostStorage *storage, const StdPathBuf *dir, uint64 xid, uint32 number,
 							 StdVec *tuples, TxnSpillFile *result_0, StdVec *result_1, HostError *error);
 static bool txn_spill_merged(const TxnSpillHomeOps *home, HostIoIo *io, HostSharedRecord record,
 							 const HostStorage *storage, uint64 xid, TxnRunsKind kind, TxnRunsTail tail,
 							 HostError *error);
 
-/* txn_spill_from_ended ends a spill that took its tree's count down, as every way out of spilled_from does. */
+/* txn_spill_from_ended ends a spill that took its tree's count down, as every way out of spilled_from does but the committed arm's, which leaves the count to its transaction's spills. */
 static bool
 txn_spill_from_ended(txn_spill_from_frame_0_t *frame)
 {
+	if (frame->oldest)
+		return true;
 	if (!txn_written_spilled(frame->io, frame->storage, frame->of, frame->error))
 		return false;
 	txn_spill_unreplayed(frame->io, frame->storage, frame->of, frame->xid);
 	return true;
 }
 
-/* txn_spill_from_listed pends, unchains, and lists a spill's files, then settles its slot and merges the transaction's files. */
+/*
+ * txn_spill_from_listed pends, unchains, and lists a spill's files, then
+ * settles its slot and merges the transaction's files, but the committed
+ * arm's; the startup process records a free space map's spiller.
+ */
 static bool
 txn_spill_from_listed(txn_spill_from_frame_0_t *frame, HostSharedRecord record, const TxnSpillFile *listing,
 					  size_t listing_len, TxnRunsTail tail)
@@ -2541,6 +2984,8 @@ txn_spill_from_listed(txn_spill_from_frame_0_t *frame, HostSharedRecord record, 
 
 	if (!txn_spill_pend(frame->home, frame->io, record, frame->storage, &listing[0], listing_len > 1, false, 0,
 						frame->error) ||
+		(frame->kind == TXN_RUNS_KIND_SPILLED_FREE && host_wal_stand(HOST_IO_IO_IO_DOORS(frame->io)).recovering &&
+		 !txn_spill_spilled_free(frame->io, frame->xid, frame->error)) ||
 		!host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-spill-pended", frame->error) ||
 		!txn_spill_removed_keys(frame->home, frame->io, record, frame->of, &frame->taken, frame->error) ||
 		(frame->tids_live &&
@@ -2551,9 +2996,10 @@ txn_spill_from_listed(txn_spill_from_frame_0_t *frame, HostSharedRecord record, 
 		!host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-spill-linked", frame->error) ||
 		!txn_spill_settled(frame->home, frame->io, &record, frame->error))
 		return false;
-	return txn_spill_merged(frame->home, frame->io, record, frame->storage, frame->xid, frame->kind, tail,
-							frame->error) &&
-		txn_spill_from_ended(frame);
+	return frame->oldest ||
+		(txn_spill_merged(frame->home, frame->io, record, frame->storage, frame->xid, frame->kind, tail,
+						  frame->error) &&
+		 txn_spill_from_ended(frame));
 }
 
 /* txn_spill_from_body_0 is spilled_from's body. */
@@ -2569,7 +3015,7 @@ txn_spill_from_body_0(void *frame_)
 	uint32		number;
 	bool		some;
 	RepoRunFile run;
-	TxnSpillFile listing[2];
+	TxnSpillFile listing[2] = {0};
 
 	*frame->result = false;
 	if (!frame->home->kind(frame->io, frame->held, frame->of, &frame->kind, &tail, frame->error) ||
@@ -2595,6 +3041,8 @@ txn_spill_from_body_0(void *frame_)
 		txn_spill_from_pad_0(frame);
 		return;
 	}
+	if (frame->oldest)
+		number = frame->home->ended_number(record, number);
 	frame->writing = txn_runs_Writing_spill(frame->dir.bytes.ptr, frame->dir.bytes.len, &names, tail, number);
 	frame->writing_live = true;
 	std_vec_new(&frame->taken, sizeof(txn_TupleVecU8VecHandle_t), _Alignof(txn_TupleVecU8VecHandle_t));
@@ -2617,7 +3065,7 @@ txn_spill_from_body_0(void *frame_)
 
 		txn_spill_Filter_add(&frame->filter, key->ptr, key->len);
 	}
-	if (!txn_runs_Writing_end(frame->writing, frame->io, frame->filter.words.ptr, frame->filter.words.len, &some,
+	if (!txn_runs_Writing_end(frame->writing, HOST_IO_IO_IO_DOORS(frame->io), frame->filter.words.ptr, frame->filter.words.len, &some,
 							  &run, frame->error))
 	{
 		txn_spill_from_pad_0(frame);
@@ -2639,7 +3087,7 @@ txn_spill_from_body_0(void *frame_)
 	if (frame->tuples.len > 0)
 	{
 		frame->tuples_live = false;
-		if (!txn_spill_tupled(frame->home, frame->io, record, frame->storage, &frame->dir, frame->xid, number,
+		if (!txn_spill_tupled(frame->home, HOST_IO_IO_IO_DOORS(frame->io), record, frame->storage, &frame->dir, frame->xid, number,
 							  &frame->tuples, &listing[1], &frame->tids, frame->error))
 		{
 			txn_spill_from_pad_0(frame);
@@ -2660,19 +3108,24 @@ txn_spill_from_body_0(void *frame_)
 /*
  * txn_spill_spilled_from spills a tree's versions of a transaction from its
  * home: it walks the tree and writes, in key order, each key whose chain
- * holds only the transaction's versions to a new spill file with its filter,
- * and a row spill's tuple ids to a tuple-id file of its number; it names the
- * files in the process's slot, takes the versions out of the memtable, lists
- * the files in the storage's manifest, clears the slot, and merges the
- * transaction's files. It zeroes the tree's count, and reports whether it
- * spilled a key.
+ * holds only the transaction's versions, or, for the budget's committed arm
+ * (oldest), the oldest versions in the memtable that are the transaction's
+ * alone, to a new spill file with its filter, and a row spill's tuple ids to
+ * a tuple-id file of its number; it names the files in the process's slot,
+ * takes the versions out of the memtable, lists the files in the storage's
+ * manifest, clears the slot, and merges the transaction's files. It zeroes
+ * the tree's count, and reports whether it spilled a key. The committed arm
+ * takes its file's number through the home's ended_number, since a fold's
+ * residual numbers the same transaction's files, and neither merges nor
+ * zeroes a count.
  */
 static bool
 txn_spill_spilled_from(const TxnSpillHomeOps *home, HostIoIo *io, const HostSharedHeld *held,
-					   const HostStorage *storage, TxnWrittenOf of, uint64 xid, bool *result, HostError *error)
+					   const HostStorage *storage, TxnWrittenOf of, uint64 xid, bool oldest, bool *result,
+					   HostError *error)
 {
 	txn_spill_from_frame_0_t frame = {.home = home, .io = io, .held = held, .storage = storage, .of = of, .xid = xid,
-	.result = result, .error = error};
+	.oldest = oldest, .result = result, .error = error};
 
 	std_landing(&frame, txn_spill_from_body_0, txn_spill_from_pad_0);
 	return frame.ok;
@@ -2716,7 +3169,7 @@ txn_spill_TupleU64VecU8_lt(void *captures, const void *a, const void *b)
 typedef struct txn_spill_tupled_frame_0_t
 {
 	const TxnSpillHomeOps *home;
-	HostIoIo   *io;
+	HostIoIoDoors io;
 	HostSharedRecord record;
 	const HostStorage *storage;
 	const StdPathBuf *dir;
@@ -2846,12 +3299,11 @@ txn_spill_tupled_body_0(void *frame_)
 		txn_spill_tupled_pad_0(frame);
 		return;
 	}
-	frame->result_0->xid = frame->xid;
-	frame->result_0->kind = TXN_RUNS_KIND_SPILLED_TUPLES;
-	frame->result_0->number = frame->number;
-	frame->result_0->len = run.len;
-	frame->result_0->hash = run.hash;
-	frame->result_0->bits = txn_spill_Filter_bits(&frame->filter);
+	*frame->result_0 = (TxnSpillFile)
+	{
+		.xid = frame->xid, .kind = TXN_RUNS_KIND_SPILLED_TUPLES, .number = frame->number, .len = run.len,
+			.hash = run.hash, .bits = txn_spill_Filter_bits(&frame->filter)
+	};
 	frame->result_1_live = false;
 	frame->ok = true;
 	txn_spill_tupled_pad_0(frame);
@@ -2864,7 +3316,7 @@ txn_spill_tupled_body_0(void *frame_)
  * with its tids. It takes the tuples.
  */
 static bool
-txn_spill_tupled(const TxnSpillHomeOps *home, HostIoIo *io, HostSharedRecord record, const HostStorage *storage,
+txn_spill_tupled(const TxnSpillHomeOps *home, HostIoIoDoors io, HostSharedRecord record, const HostStorage *storage,
 				 const StdPathBuf *dir, uint64 xid, uint32 number, StdVec *tuples, TxnSpillFile *result_0,
 				 StdVec *result_1, HostError *error)
 {
@@ -3030,13 +3482,294 @@ txn_spill_helped(HostIoIo *io, bool *result, HostError *error)
 	return frame.ok;
 }
 
-/* txn_spill_relieved spills, for a writer that found the delta full, its own trees, or else another transaction's, and reports whether one spilled a key. */
+/* TxnSpillCommittedState is a state the committed arm may spill: its delta's bytes, the state held, and its storage. */
+typedef struct TxnSpillCommittedState
+{
+	uint64		bytes;
+	HostSharedHeld held;
+	HostStorage storage;
+} TxnSpillCommittedState;
+
+/* TxnSpillOldest is a writer of a chain's oldest memtable version that committed: its commit's end, its top-level xid, and the tree. */
+typedef struct TxnSpillOldest
+{
+	HostLsn		end;
+	uint64		xid;
+	TxnWrittenOf of;
+} TxnSpillOldest;
+
+/* txn_spill_committed_frame_0_t is committed's state across its pad: the swept locations, a state opened, and the states held, while live. */
+typedef struct txn_spill_committed_frame_0_t
+{
+	HostIoIo   *io;
+	bool	   *result;
+	HostError  *error;
+	bool		ok;
+	/* swept is a Vec<(u64, u64)> of a sweep's locations and words. */
+	StdVec		swept;
+	bool		swept_live;
+	HostSharedHeld held;
+	bool		held_live;
+	/* states is a Vec<CommittedState>. */
+	StdVec		states;
+	bool		states_live;
+	/* oldest is a Vec<Oldest> of one state's writers. */
+	StdVec		oldest;
+	bool		oldest_live;
+
+	/*
+	 * turned is the state whose turn the process holds, as id, while
+	 * turn_live.
+	 */
+	HostSharedRecord turned;
+	uint64		id;
+	bool		turn_live;
+} txn_spill_committed_frame_0_t;
+
+/* txn_spill_committed_pad_0 is committed's pad: the turn taken, the writers, the states held, the state opened, and the swept list, while live. */
+static void
+txn_spill_committed_pad_0(void *frame_)
+{
+	txn_spill_committed_frame_0_t *frame = frame_;
+
+	if (frame->turn_live)
+	{
+		frame->turn_live = false;
+		txn_state_committed_given(frame->turned, frame->id);
+	}
+	if (frame->oldest_live)
+	{
+		frame->oldest_live = false;
+		std_vec_free_Checked(&frame->oldest, sizeof(TxnSpillOldest), _Alignof(TxnSpillOldest));
+	}
+	if (frame->states_live)
+	{
+		frame->states_live = false;
+		for (size_t k = 0; k < frame->states.len; k++)
+			host_shared_Held_drop(&STD_VEC_AT(&frame->states, TxnSpillCommittedState, k).held);
+		std_vec_free_Checked(&frame->states, sizeof(TxnSpillCommittedState), _Alignof(TxnSpillCommittedState));
+	}
+	if (frame->held_live)
+	{
+		frame->held_live = false;
+		host_shared_Held_drop(&frame->held);
+	}
+	if (frame->swept_live)
+	{
+		frame->swept_live = false;
+		std_vec_free_Checked(&frame->swept, sizeof(std_TupleU64U64_t), _Alignof(std_TupleU64U64_t));
+	}
+}
+
+/* txn_spill_committed_bytes_cmp orders committed's states by their delta's bytes, the most first. */
+static int
+txn_spill_committed_bytes_cmp(const void *a, const void *b)
+{
+	uint64		x = ((const TxnSpillCommittedState *) a)->bytes;
+	uint64		y = ((const TxnSpillCommittedState *) b)->bytes;
+
+	return x > y ? -1 : x < y;
+}
+
+/* txn_spill_oldest_cmp orders a state's oldest writers by their commits' ends, then their xids. */
+static int
+txn_spill_oldest_cmp(const void *a, const void *b)
+{
+	const TxnSpillOldest *x = a;
+	const TxnSpillOldest *y = b;
+
+	if (x->end != y->end)
+		return x->end < y->end ? -1 : 1;
+	return x->xid < y->xid ? -1 : x->xid > y->xid;
+}
+
+/* txn_spill_committed_oldest_t is committed_from's walk's captures: the frame and the tree walked. */
+typedef struct txn_spill_committed_oldest_t
+{
+	txn_spill_committed_frame_0_t *frame;
+	TxnWrittenOf of;
+} txn_spill_committed_oldest_t;
+
+/* txn_spill_committed_closure_0 is committed_from's walk's step: the writer of a chain's oldest memtable version, once, when it committed. */
+static bool
+txn_spill_committed_closure_0(void *captures, HostIoIo *io, const uint8 *key, size_t key_len, const StdVec *records,
+							  size_t records_len, const txn_TupleHandleU64Bool_t *handles, size_t handles_len,
+							  HostError *error)
+{
+	txn_spill_committed_oldest_t *c = captures;
+	StdVec	   *oldest = &c->frame->oldest;
+	TxnSpillOldest writer = {.of = c->of};
+	HostXid		xid;
+	TxnStatusCommit commit;
+
+	if (handles_len == 0)
+		return true;
+	writer.xid = handles[handles_len - 1].f1;
+	for (size_t k = 0; k < oldest->len; k++)
+	{
+		const TxnSpillOldest *at = &STD_VEC_AT(oldest, TxnSpillOldest, k);
+
+		if (at->xid == writer.xid && at->of == writer.of)
+			return true;
+	}
+	xid.f0 = writer.xid;
+	if (!txn_status_committed(io, xid, &commit, error))
+		return false;
+	if (commit.tag != TXN_STATUS_COMMIT_AT)
+		return true;
+	writer.end = commit.u.at;
+	if (!std_vec_try_reserve(oldest, 1, sizeof(writer), _Alignof(TxnSpillOldest)))
+	{
+		*error = host_Error_out_of_memory();
+		return false;
+	}
+	std_vec_push_Checked(oldest, &writer, sizeof(writer), _Alignof(TxnSpillOldest));
+	return true;
+}
+
+/*
+ * txn_spill_committed_from spills a storage's committed versions as
+ * committed does, under the process's turn at it: the writers of its rows'
+ * and value map's chains' oldest memtable versions that committed, the
+ * oldest commit first.
+ */
+static bool
+txn_spill_committed_from(txn_spill_committed_frame_0_t *frame, const TxnSpillCommittedState *state)
+{
+	static const TxnWrittenOf ofs[] = {TXN_WRITTEN_OF_ROWS, TXN_WRITTEN_OF_VALUES};
+
+	std_vec_new(&frame->oldest, sizeof(TxnSpillOldest), _Alignof(TxnSpillOldest));
+	frame->oldest_live = true;
+	for (size_t k = 0; k < lengthof(ofs); k++)
+	{
+		txn_spill_committed_oldest_t captures = {frame, ofs[k]};
+
+		if (!txn_spill_Home_copied(&TXN_SPILL_STATE_HOME_OPS, frame->io, host_shared_Held_record(&state->held),
+								   ofs[k], txn_spill_committed_closure_0, &captures, frame->error))
+			return false;
+	}
+	if (frame->oldest.len > 1)
+		qsort(frame->oldest.ptr, frame->oldest.len, sizeof(TxnSpillOldest), txn_spill_oldest_cmp);
+	for (size_t k = 0; k < frame->oldest.len && !*frame->result; k++)
+	{
+		const TxnSpillOldest *writer = &STD_VEC_AT(&frame->oldest, TxnSpillOldest, k);
+
+		if (!txn_spill_spilled_from(&TXN_SPILL_STATE_HOME_OPS, frame->io, &state->held, &state->storage, writer->of,
+									writer->xid, true, frame->result, frame->error))
+			return false;
+	}
+	frame->oldest_live = false;
+	std_vec_free_Checked(&frame->oldest, sizeof(TxnSpillOldest), _Alignof(TxnSpillOldest));
+	return true;
+}
+
+/* txn_spill_committed_body_0 is committed's body. */
+static void
+txn_spill_committed_body_0(void *frame_)
+{
+	txn_spill_committed_frame_0_t *frame = frame_;
+	HostSharedMine mine;
+
+	*frame->result = false;
+	if (!txn_spill_mine(frame->io, &mine, frame->error) ||
+		!host_shared_sweep(HOST_SHARED_IO_WITHIN(frame->io), &TXN_STATE_STATE_POOL_OPS,
+						   TXN_STATE_MEMTABLE_WORD_INDEX, &frame->swept, frame->error))
+		return;
+	frame->id = host_shared_Mine_id(&mine);
+	frame->swept_live = true;
+	std_vec_new(&frame->states, sizeof(TxnSpillCommittedState), _Alignof(TxnSpillCommittedState));
+	frame->states_live = true;
+	for (size_t k = 0; k < frame->swept.len; k++)
+	{
+		bool		some;
+		TxnSpillCommittedState state;
+		TxnStatePersistence persistence;
+
+		if (!host_shared_open(HOST_SHARED_IO_WITHIN(frame->io), &TXN_STATE_STATE_POOL_OPS,
+							  STD_VEC_AT(&frame->swept, std_TupleU64U64_t, k).f0, &some, &frame->held, frame->error))
+		{
+			txn_spill_committed_pad_0(frame);
+			return;
+		}
+		if (!some)
+			continue;
+		frame->held_live = true;
+		if (!txn_state_described(host_shared_Held_record(&frame->held), &state.storage, &persistence))
+		{
+			frame->held_live = false;
+			host_shared_Held_drop(&frame->held);
+			continue;
+		}
+		if (!std_vec_try_reserve(&frame->states, 1, sizeof(state), _Alignof(TxnSpillCommittedState)))
+		{
+			*frame->error = host_Error_out_of_memory();
+			txn_spill_committed_pad_0(frame);
+			return;
+		}
+		state.bytes = txn_state_delta_bytes(host_shared_Held_record(&frame->held));
+		state.held = frame->held;
+		frame->held_live = false;
+		std_vec_push_Checked(&frame->states, &state, sizeof(state), _Alignof(TxnSpillCommittedState));
+	}
+	if (frame->states.len > 1)
+		qsort(frame->states.ptr, frame->states.len, sizeof(TxnSpillCommittedState), txn_spill_committed_bytes_cmp);
+	for (size_t k = 0; k < frame->states.len && !*frame->result; k++)
+	{
+		const TxnSpillCommittedState *state = &STD_VEC_AT(&frame->states, TxnSpillCommittedState, k);
+		HostSharedRecord record = host_shared_Held_record(&state->held);
+		bool		spilled;
+
+		if (!txn_state_committed_taken(record, frame->id))
+			continue;
+		frame->turned = record;
+		frame->turn_live = true;
+		spilled = txn_spill_committed_from(frame, state);
+		frame->turn_live = false;
+		txn_state_committed_given(record, frame->id);
+		if (!spilled)
+		{
+			txn_spill_committed_pad_0(frame);
+			return;
+		}
+	}
+	frame->ok = true;
+	txn_spill_committed_pad_0(frame);
+}
+
+/*
+ * txn_spill_committed spills, for a writer the full delta refused when no
+ * transaction had versions of its own left to spill, the committed versions
+ * a fold leaves in a storage's memtable, its point held below their commits
+ * by a snapshot (the budget's committed arm): of the storages, the most
+ * delta bytes first, each whose turn at it no other process holds, its
+ * committed transactions' versions of its rows and its value map, the oldest
+ * commit first, of every key whose oldest versions in the memtable are that
+ * transaction's alone, the spilled versions below them older still
+ * (spilled_from), until one spills a key; it answers whether one did.
+ */
+static bool
+txn_spill_committed(HostIoIo *io, bool *result, HostError *error)
+{
+	txn_spill_committed_frame_0_t frame = {.io = io, .result = result, .error = error};
+
+	std_landing(&frame, txn_spill_committed_body_0, txn_spill_committed_pad_0);
+	return frame.ok;
+}
+
+/*
+ * txn_spill_relieved spills, for a writer that found the delta full, its own
+ * trees, or else another transaction's, and reports whether one spilled a
+ * key; once no transaction has versions of its own left to spill, it spills
+ * committed versions a fold leaves (committed).
+ */
 bool
 txn_spill_relieved(HostIoIo *io, bool *result, HostError *error)
 {
 	if (!txn_spill_relieved_own(io, result, error))
 		return false;
-	return *result || txn_spill_helped(io, result, error);
+	if (!*result && !txn_spill_helped(io, result, error))
+		return false;
+	return *result || txn_spill_committed(io, result, error);
 }
 
 /* txn_spill_swept_frame_0_t is swept's state across its pad: the swept locations, a home opened, and the trees, while live. */
@@ -3127,14 +3860,14 @@ static void
 txn_spill_swept_body_0(void *frame_)
 {
 	txn_spill_swept_frame_0_t *frame = frame_;
-	static const TxnWrittenOf state_ofs[] = {TXN_WRITTEN_OF_ROWS, TXN_WRITTEN_OF_VALUES};
+	static const TxnWrittenOf state_ofs[] = {TXN_WRITTEN_OF_ROWS, TXN_WRITTEN_OF_VALUES, TXN_WRITTEN_OF_FREE};
 	static const TxnWrittenOf chunk_ofs[] = {TXN_WRITTEN_OF_CHUNKS};
 
 	*frame->result = false;
 	std_vec_new(&frame->trees, sizeof(txn_TupleStorageOf_t), _Alignof(txn_TupleStorageOf_t));
 	frame->trees_live = true;
 	if (!txn_spill_swept_pool(frame, &TXN_STATE_STATE_POOL_OPS, TXN_STATE_MEMTABLE_WORD_INDEX,
-							  &TXN_SPILL_STATE_HOME_OPS, state_ofs, 2) ||
+							  &TXN_SPILL_STATE_HOME_OPS, state_ofs, lengthof(state_ofs)) ||
 		!txn_spill_swept_pool(frame, &TXN_MEMTABLE_BRANCH_BRANCH_DELTAS_POOL_OPS,
 							  TXN_MEMTABLE_BRANCH_CHUNK_WORD_INDEX, &TXN_SPILL_BRANCH_DELTAS_HOME_OPS, chunk_ofs, 1))
 	{
@@ -3159,7 +3892,7 @@ txn_spill_swept_body_0(void *frame_)
 
 /*
  * txn_spill_swept spills a transaction's versions from every storage's
- * memtable, both trees, and every repository's chunk tree, for a helper
+ * memtable, its three trees, and every repository's chunk tree, for a helper
  * whose turn it is, and reports whether it spilled a key.
  */
 static bool
@@ -3178,13 +3911,48 @@ txn_spill_aborted_closure_0(void *captures, const TxnSpillFile *file)
 	return file->xid == *(const uint64 *) captures;
 }
 
-/* txn_spill_aborted_closure_1 is aborted's step on the home of its pending spill: the slot cleared. */
+/* txn_spill_aborted_pending_t is aborted's step's captures on the home of its pending spill: the backend's I/O and the spill's kind. */
+typedef struct txn_spill_aborted_pending_t
+{
+	HostIoIo   *io;
+	TxnRunsKind kind;
+} txn_spill_aborted_pending_t;
+
+/*
+ * txn_spill_aborted_closure_1 is aborted's step on the home of its pending
+ * spill: a free space map's spill of a storage listed from the slot, and any
+ * other the slot cleared.
+ */
 static bool
 txn_spill_aborted_closure_1(void *captures, const TxnSpillHomeOps *home, const HostSharedHeld *held, HostError *error)
 {
+	const txn_spill_aborted_pending_t *c = captures;
 	HostSharedRecord record = host_shared_Held_record(held);
 
-	return txn_spill_settled(home, captures, &record, error);
+	if (home == &TXN_SPILL_STATE_HOME_OPS && c->kind == TXN_RUNS_KIND_SPILLED_FREE)
+		return txn_spill_settle_pending(c->io, error);
+	return txn_spill_settled(home, c->io, &record, error);
+}
+
+/* txn_spill_aborted_kept_closure_0 is aborted's edit of a storage's manifest: the transaction's files out but its free space map's, which it marks with the abort's end. */
+static bool
+txn_spill_aborted_kept_closure_0(void *captures, HostSharedLongIo *io, StdVec *files, HostError *error)
+{
+	const txn_spill_marked_t *c = captures;
+	size_t		kept = 0;
+
+	for (size_t k = 0; k < files->len; k++)
+	{
+		TxnSpillFile file = STD_VEC_AT(files, TxnSpillFile, k);
+
+		if (file.xid == c->xid && file.kind != TXN_RUNS_KIND_SPILLED_FREE)
+			continue;
+		if (file.xid == c->xid)
+			file.passed = c->end;
+		STD_VEC_AT(files, TxnSpillFile, kept++) = file;
+	}
+	files->len = kept;
+	return true;
 }
 
 /* txn_spill_aborted_captures_t is aborted's step's captures on a storage it spilled: the backend's I/O, the storage, and the xid. */
@@ -3192,18 +3960,25 @@ typedef struct txn_spill_aborted_captures_t
 {
 	HostIoIo   *io;
 	const HostStorage *storage;
-	uint64		xid;
+	txn_spill_marked_t marked;
 } txn_spill_aborted_captures_t;
 
-/* txn_spill_aborted_closure_2 is aborted's step on a storage it spilled: the transaction's files taken out of its manifest. */
+/*
+ * txn_spill_aborted_closure_2 is aborted's step on a storage it spilled: the
+ * transaction's files taken out of its manifest, but a storage's free space
+ * map's spills, which stay, marked with the abort's end.
+ */
 static bool
 txn_spill_aborted_closure_2(void *captures, const TxnSpillHomeOps *home, const HostSharedHeld *held, HostError *error)
 {
 	txn_spill_aborted_captures_t *c = captures;
 	StdVec		gone;
 
+	if (home == &TXN_SPILL_STATE_HOME_OPS)
+		return txn_spill_changed(home, c->io, host_shared_Held_record(held), c->storage,
+								 txn_spill_aborted_kept_closure_0, &c->marked, error);
 	if (!txn_spill_removed(home, c->io, host_shared_Held_record(held), c->storage, txn_spill_aborted_closure_0,
-						   &c->xid, &gone, error))
+						   &c->marked.xid, &gone, error))
 		return false;
 	std_vec_free_Checked(&gone, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
 	return true;
@@ -3213,10 +3988,13 @@ txn_spill_aborted_closure_2(void *captures, const TxnSpillHomeOps *home, const H
  * txn_spill_aborted takes an aborted transaction's spills out of the
  * manifests of the storages it spilled, and clears the process's slot when
  * it names one of its spills; a storage whose state is gone took its spills
- * with it.
+ * with it. A free space map's spill stays, listed from the slot when the
+ * slot names it, since an aborted take keeps its place until a fold takes
+ * the file, marked with the abort's end, the point a fold passes it at.
  */
 bool
-txn_spill_aborted(HostIoIo *io, uint64 xid, const HostStorage *storages, size_t storages_len, HostError *error)
+txn_spill_aborted(HostIoIo *io, uint64 xid, const HostStorage *storages, size_t storages_len, HostLsn end,
+				  HostError *error)
 {
 	bool		some;
 	TxnSpillPended pended;
@@ -3225,14 +4003,16 @@ txn_spill_aborted(HostIoIo *io, uint64 xid, const HostStorage *storages, size_t 
 		return false;
 	if (some && pended.xid == xid)
 	{
-		if (!txn_spill_at_found(io, &pended.storage, txn_spill_aborted_closure_1, io, &some, error))
+		txn_spill_aborted_pending_t pending = {io, pended.kind};
+
+		if (!txn_spill_at_found(io, &pended.storage, txn_spill_aborted_closure_1, &pending, &some, error))
 			return false;
 		if (!some && !txn_spill_settled(&TXN_SPILL_STATE_HOME_OPS, io, NULL, error))
 			return false;
 	}
 	for (size_t k = 0; k < storages_len; k++)
 	{
-		txn_spill_aborted_captures_t captures = {io, &storages[k], xid};
+		txn_spill_aborted_captures_t captures = {io, &storages[k], {xid, end}};
 
 		if (!txn_spill_at_found(io, &storages[k], txn_spill_aborted_closure_2, &captures, &some, error))
 			return false;
@@ -3335,6 +4115,28 @@ txn_spill_Source_front(TxnSpillSource *self, HostIoIo *io, const TxnRunsNames *n
 	return true;
 }
 
+static bool txn_spill_ends_hold(const StdVec *ends, uint64 lsn);
+
+/*
+ * TxnSpillLeft is what a join leaves out of a carry its primary unlisted:
+ * the ends of the carry's records, ascending; the count of the versions it
+ * dropped; and the tuple ids of the rows it dropped, which a rows join adds
+ * and a tuple-id join of the same files leaves out, ascending by then.
+ */
+typedef struct TxnSpillLeft
+{
+	const StdVec *ends;
+
+	/*
+	 * carried is the carried rows' tuple ids, ascending, whose free space
+	 * takes, which carry no LSN, a free space run leaves out, or NULL.
+	 */
+	const StdVec *carried;
+	uint64		dropped;
+	/* tids is a Vec<u64>. */
+	StdVec		tids;
+} TxnSpillLeft;
+
 /* txn_spill_joined_frame_0_t is joined's state across its pad: the sources, the filter, the writing, the least key, and its versions, while live. */
 typedef struct txn_spill_joined_frame_0_t
 {
@@ -3345,6 +4147,12 @@ typedef struct txn_spill_joined_frame_0_t
 	const TxnSpillFile *files;
 	size_t		files_len;
 	uint32		number;
+
+	/*
+	 * left is what the join leaves out of an unlisted carry, or NULL for
+	 * none.
+	 */
+	TxnSpillLeft *left;
 	TxnSpillFile *result;
 	HostError  *error;
 	bool		ok;
@@ -3523,18 +4331,45 @@ txn_spill_joined_key(txn_spill_joined_frame_0_t *frame)
 	}
 	if (frame->names->kind == TXN_RUNS_KIND_SPILLED_TUPLES)
 		std_vec_truncate(&frame->versions, 1, sizeof(StdVec), txn_spill_vec_u8_drop);
+	if (frame->left != NULL && frame->names->kind == TXN_RUNS_KIND_SPILLED_TUPLES && frame->least.len == 8 &&
+		txn_spill_ends_hold(&frame->left->tids, std_u64_from_be_bytes(frame->least.ptr)))
+		std_vec_truncate(&frame->versions, 0, sizeof(StdVec), txn_spill_vec_u8_drop);
 	frame->records.len = 0;
 	for (size_t k = 0; k < frame->versions.len; k++)
 	{
 		const StdVec *version = &STD_VEC_AT(&frame->versions, StdVec, k);
 		StdBytes	record = {version->ptr, version->len};
 
+		if (frame->left != NULL && frame->names->kind != TXN_RUNS_KIND_SPILLED_TUPLES)
+		{
+			TxnMemtableVersionRecord stored = txn_memtable_version_Record_of(version->ptr, version->len);
+			uint64		lsn;
+			uint64		tid;
+
+			if (txn_memtable_version_Record_lsn(&stored, &lsn) && txn_spill_ends_hold(frame->left->ends, lsn))
+			{
+				frame->left->dropped++;
+				if (txn_spill_tid(version->ptr, version->len, &tid))
+					std_vec_push_Checked(&frame->left->tids, &tid, sizeof(uint64), _Alignof(uint64));
+				continue;
+			}
+			tid = txn_memtable_map_taken(txn_memtable_version_Record_op(&stored)).f0;
+			if (frame->left->carried != NULL && frame->names->kind == TXN_RUNS_KIND_SPILLED_FREE && tid != 0 &&
+				txn_spill_ends_hold(frame->left->carried, tid))
+			{
+				frame->left->dropped++;
+				continue;
+			}
+		}
 		std_vec_push_Checked(&frame->records, &record, sizeof(record), _Alignof(StdBytes));
 	}
-	if (!txn_runs_Writing_key(frame->writing, frame->io, frame->least.ptr, frame->least.len, frame->records.ptr,
-							  frame->records.len, frame->error))
-		return false;
-	txn_spill_Filter_add(&frame->filter, frame->least.ptr, frame->least.len);
+	if (frame->records.len > 0)
+	{
+		if (!txn_runs_Writing_key(frame->writing, HOST_IO_IO_IO_DOORS(frame->io), frame->least.ptr, frame->least.len,
+								  frame->records.ptr, frame->records.len, frame->error))
+			return false;
+		txn_spill_Filter_add(&frame->filter, frame->least.ptr, frame->least.len);
+	}
 	frame->versions_live = false;
 	txn_spill_versions_drop(&frame->versions);
 	return true;
@@ -3601,9 +4436,19 @@ txn_spill_joined_body_0(void *frame_)
 			return;
 		}
 	}
-	if (!txn_runs_Writing_end(frame->writing, frame->io, frame->filter.words.ptr, frame->filter.words.len, &some, &run,
+	if (!txn_runs_Writing_end(frame->writing, HOST_IO_IO_IO_DOORS(frame->io), frame->filter.words.ptr, frame->filter.words.len, &some, &run,
 							  frame->error))
 	{
+		txn_spill_joined_pad_0(frame);
+		return;
+	}
+	if (!some && frame->left != NULL)
+	{
+		*frame->result = (TxnSpillFile)
+		{
+			0
+		};
+		frame->ok = true;
 		txn_spill_joined_pad_0(frame);
 		return;
 	}
@@ -3613,12 +4458,11 @@ txn_spill_joined_body_0(void *frame_)
 		txn_spill_joined_pad_0(frame);
 		return;
 	}
-	frame->result->xid = frame->files_len > 0 ? frame->files[0].xid : 0;
-	frame->result->kind = frame->names->kind;
-	frame->result->number = frame->number;
-	frame->result->len = run.len;
-	frame->result->hash = run.hash;
-	frame->result->bits = txn_spill_Filter_bits(&frame->filter);
+	*frame->result = (TxnSpillFile)
+	{
+		.xid = frame->files_len > 0 ? frame->files[0].xid : 0, .kind = frame->names->kind, .number = frame->number,
+			.len = run.len, .hash = run.hash, .bits = txn_spill_Filter_bits(&frame->filter)
+	};
 	frame->ok = true;
 	txn_spill_joined_pad_0(frame);
 }
@@ -3627,14 +4471,18 @@ txn_spill_joined_body_0(void *frame_)
  * txn_spill_joined streams spill files of one kind into one new file of a
  * number with their header's tail, in key order, a key's versions the newer
  * file's first, a tuple id's key the newest file's alone, with a filter of
- * its keys, synced, and returns it.
+ * its keys, synced, and returns it; given what to leave out of an unlisted
+ * carry, it leaves out each version whose LSN its ends hold, adding the
+ * dropped rows' tuple ids, or for tuple ids each one it holds, and a key left
+ * with none, and answers a file of no length when it leaves out every one.
  */
 static bool
 txn_spill_joined(HostIoIo *io, const StdPathBuf *dir, const TxnRunsNames *names, TxnRunsTail tail,
-				 const TxnSpillFile *files, size_t files_len, uint32 number, TxnSpillFile *result, HostError *error)
+				 const TxnSpillFile *files, size_t files_len, uint32 number, TxnSpillLeft *left,
+				 TxnSpillFile *result, HostError *error)
 {
 	txn_spill_joined_frame_0_t frame = {.io = io, .dir = dir, .names = names, .tail = tail, .files = files,
-	.files_len = files_len, .number = number, .result = result, .error = error};
+	.files_len = files_len, .number = number, .left = left, .result = result, .error = error};
 
 	std_landing(&frame, txn_spill_joined_body_0, txn_spill_joined_pad_0);
 	return frame.ok;
@@ -3719,7 +4567,7 @@ txn_spill_merged_step(txn_spill_merged_frame_0_t *frame, const TxnRunsNames *nam
 	size_t		taken = 1;
 	uint32		number = 0;
 	uint32		lowest;
-	TxnSpillFile listing[2];
+	TxnSpillFile listing[2] = {0};
 	size_t		listing_len = 1;
 	TxnRunsTail none = {.tag = TXN_RUNS_TAIL_NONE};
 	txn_TupleU64KindU32OptionU32_t replacing;
@@ -3752,8 +4600,8 @@ txn_spill_merged_step(txn_spill_merged_frame_0_t *frame, const TxnRunsNames *nam
 	lowest = number;
 	for (size_t k = 0; k < taken; k++)
 		lowest = Min(lowest, STD_VEC_AT(&frame->own, TxnSpillFile, k).number);
-	if (!txn_spill_joined(frame->io, &frame->dir, names, frame->tail, frame->own.ptr, taken, number, &listing[0],
-						  frame->error))
+	if (!txn_spill_joined(frame->io, &frame->dir, names, frame->tail, frame->own.ptr, taken, number, NULL,
+						  &listing[0], frame->error))
 		return false;
 	txn_spill_merged_mine(frame, TXN_RUNS_KIND_SPILLED_TUPLES, &frame->named);
 	frame->named_live = true;
@@ -3765,7 +4613,7 @@ txn_spill_merged_step(txn_spill_merged_frame_0_t *frame, const TxnRunsNames *nam
 			const TxnSpillFile *tuples = &STD_VEC_AT(&frame->named, TxnSpillFile, j);
 			bool		merged = false;
 
-			for (size_t k = 0; k < taken && !merged; k++)
+			for (size_t k = 0; frame->kind == TXN_RUNS_KIND_SPILLED_ROWS && k < taken && !merged; k++)
 				merged = STD_VEC_AT(&frame->own, TxnSpillFile, k).number == tuples->number;
 			if (merged)
 				STD_VEC_AT(&frame->named, TxnSpillFile, kept++) = *tuples;
@@ -3775,7 +4623,7 @@ txn_spill_merged_step(txn_spill_merged_frame_0_t *frame, const TxnRunsNames *nam
 	if (frame->named.len > 0)
 	{
 		if (!txn_spill_joined(frame->io, &frame->dir, tuple_names, none, frame->named.ptr, frame->named.len, number,
-							  &listing[1], frame->error))
+							  NULL, &listing[1], frame->error))
 			return false;
 		listing_len = 2;
 	}
@@ -3835,10 +4683,11 @@ txn_spill_merged_body_0(void *frame_)
  * txn_spill_merged merges a transaction's newest spill file of a storage's
  * kind with its earlier files newest first while each is no larger than the
  * files merged so far, as an LSM's tiers merge: it joins them into one new
- * file, and the tuple-id files of the same numbers into one of the merged
- * file's number, pends the merged file in the process's slot with the lowest
- * number it replaces, lists it in place of the files it joined, and clears
- * the slot, until the newest file has no earlier file to take.
+ * file, and for a merge of rows the tuple-id files of the same numbers into
+ * one of the merged file's number, pends the merged file in the process's
+ * slot with the lowest number it replaces, lists it in place of the files it
+ * joined, and clears the slot, until the newest file has no earlier file to
+ * take.
  */
 static bool
 txn_spill_merged(const TxnSpillHomeOps *home, HostIoIo *io, HostSharedRecord record, const HostStorage *storage,
@@ -3875,23 +4724,24 @@ txn_spill_xids_closure_0(void *captures, const TxnSpillFile *file)
 	return txn_spill_has_xid(captures, file->xid);
 }
 
-/* txn_spill_folded_frame_0_t is folded's state across its pad: the files listed, the xids applied, the counts, a file's path and bytes and decoding, and the files removed, while live. */
-typedef struct txn_spill_folded_frame_0_t
+/* txn_spill_entered reports whether a spill file's kind counts its versions at its transaction's entry: rows, entries, and value and free space map versions. */
+static bool
+txn_spill_entered(TxnRunsKind kind)
+{
+	return kind == TXN_RUNS_KIND_SPILLED_ROWS || kind == TXN_RUNS_KIND_SPILLED_ENTRIES ||
+		kind == TXN_RUNS_KIND_SPILLED_VALUES || kind == TXN_RUNS_KIND_SPILLED_FREE;
+}
+
+/* txn_spill_file_counted_frame_0_t is file_counted's state across its pad: the file's path, its bytes, and their decoding, while live. */
+typedef struct txn_spill_file_counted_frame_0_t
 {
 	HostIoIo   *io;
 	HostSharedRecord state;
-	HostLsn		point;
+	const HostStorage *storage;
+	const TxnSpillFile *file;
+	uint64	   *result;
 	HostError  *error;
 	bool		ok;
-	HostStorage storage;
-	txn_TupleVecFileU64_t listed;
-	bool		listed_live;
-	/* applied is a Vec<u64>. */
-	StdVec		applied;
-	bool		applied_live;
-	/* counts is a Vec<(File, u64)>. */
-	StdVec		counts;
-	bool		counts_live;
 	StdPathBuf	path;
 	bool		path_live;
 	StdString	name;
@@ -3900,22 +4750,14 @@ typedef struct txn_spill_folded_frame_0_t
 	bool		bytes_live;
 	TxnRunsDecoded decoded;
 	bool		decoded_live;
-	/* gone is a Vec<File>. */
-	StdVec		gone;
-	bool		gone_live;
-} txn_spill_folded_frame_0_t;
+} txn_spill_file_counted_frame_0_t;
 
-/* txn_spill_folded_pad_0 is folded's pad: what it holds, while live. */
+/* txn_spill_file_counted_pad_0 is file_counted's pad: what it holds, while live. */
 static void
-txn_spill_folded_pad_0(void *frame_)
+txn_spill_file_counted_pad_0(void *frame_)
 {
-	txn_spill_folded_frame_0_t *frame = frame_;
+	txn_spill_file_counted_frame_0_t *frame = frame_;
 
-	if (frame->gone_live)
-	{
-		frame->gone_live = false;
-		std_vec_free_Checked(&frame->gone, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
-	}
 	if (frame->decoded_live)
 	{
 		frame->decoded_live = false;
@@ -3936,6 +4778,114 @@ txn_spill_folded_pad_0(void *frame_)
 		frame->path_live = false;
 		std_vec_free_Checked(&frame->path.bytes, 1, 1);
 	}
+}
+
+/* txn_spill_file_counted_body_0 is file_counted's body. */
+static void
+txn_spill_file_counted_body_0(void *frame_)
+{
+	txn_spill_file_counted_frame_0_t *frame = frame_;
+	TxnRunsNames names;
+	ChunksErrorError failed;
+	StdPathBuf	joined;
+
+	if (!txn_spill_names(&TXN_SPILL_STATE_HOME_OPS, frame->state, frame->storage, frame->file->kind,
+						 frame->file->xid, &names, frame->error))
+		return;
+	txn_runs_spill_directory(frame->storage->database, txn_state_own(frame->state), &frame->path);
+	frame->path_live = true;
+	txn_runs_spill_name(&names, frame->file->number, &frame->name);
+	frame->name_live = true;
+	std_path_join(frame->path.bytes.ptr, frame->path.bytes.len, (const char *) frame->name.ptr, frame->name.len,
+				  &joined);
+	std_vec_free_Checked(&frame->path.bytes, 1, 1);
+	frame->path = joined;
+	if (!chunks_file_read_file(HOST_IO_IO_READ_DOORS(frame->io), frame->path.bytes.ptr, frame->path.bytes.len,
+							   &frame->bytes, &failed))
+	{
+		*frame->error = txn_base_storage(&failed);
+		txn_spill_file_counted_pad_0(frame);
+		return;
+	}
+	frame->bytes_live = true;
+	if (!txn_runs_decode(frame->bytes.ptr, frame->bytes.len, &names, frame->file->hash, &frame->decoded,
+						 frame->error))
+	{
+		txn_spill_file_counted_pad_0(frame);
+		return;
+	}
+	frame->decoded_live = true;
+	*frame->result = txn_spill_counted(&frame->decoded);
+	frame->ok = true;
+	txn_spill_file_counted_pad_0(frame);
+}
+
+/* txn_spill_file_counted reads a storage's listed spill file back and counts its versions as they count at its transaction's entry. */
+static bool
+txn_spill_file_counted(HostIoIo *io, HostSharedRecord state, const HostStorage *storage, const TxnSpillFile *file,
+					   uint64 *result, HostError *error)
+{
+	txn_spill_file_counted_frame_0_t frame = {.io = io, .state = state, .storage = storage, .file = file,
+	.result = result, .error = error};
+
+	std_landing(&frame, txn_spill_file_counted_body_0, txn_spill_file_counted_pad_0);
+	return frame.ok;
+}
+
+/*
+ * txn_spill_uncounted takes back at a spill file's transaction's entry what
+ * its rows, entries, and value and free space map versions added, once its
+ * removal from its manifest took it out, read before any checkpoint after
+ * that removal unlinks it.
+ */
+static bool
+txn_spill_uncounted(HostIoIo *io, HostSharedRecord state, const HostStorage *storage, const TxnSpillFile *file,
+					HostError *error)
+{
+	uint64		count;
+	HostXid		xid = {file->xid};
+	bool		has;
+	uint64		added;
+
+	if (!txn_spill_entered(file->kind))
+		return true;
+	return txn_spill_file_counted(io, state, storage, file, &count, error) &&
+		txn_status_add(io, xid, std_wrapping_sub_u64(0, count), &has, &added, error);
+}
+
+/* txn_spill_folded_frame_0_t is folded's state across its pad: the files listed, the xids applied, the counts, and the files removed, while live. */
+typedef struct txn_spill_folded_frame_0_t
+{
+	HostIoIo   *io;
+	HostSharedRecord state;
+	HostLsn		point;
+	HostError  *error;
+	bool		ok;
+	HostStorage storage;
+	txn_TupleVecFileU64_t listed;
+	bool		listed_live;
+	/* applied is a Vec<u64>. */
+	StdVec		applied;
+	bool		applied_live;
+	/* counts is a Vec<(File, u64)>. */
+	StdVec		counts;
+	bool		counts_live;
+	/* gone is a Vec<File>. */
+	StdVec		gone;
+	bool		gone_live;
+} txn_spill_folded_frame_0_t;
+
+/* txn_spill_folded_pad_0 is folded's pad: what it holds, while live. */
+static void
+txn_spill_folded_pad_0(void *frame_)
+{
+	txn_spill_folded_frame_0_t *frame = frame_;
+
+	if (frame->gone_live)
+	{
+		frame->gone_live = false;
+		std_vec_free_Checked(&frame->gone, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	}
 	if (frame->counts_live)
 	{
 		frame->counts_live = false;
@@ -3953,87 +4903,97 @@ txn_spill_folded_pad_0(void *frame_)
 	}
 }
 
-/* txn_spill_folded_counted reads a listed spill file back and counts its versions at its transaction's entry, into the frame's counts. */
+/* txn_spill_folded_frozen reports whether a spill file is a frozen insert's, of a writer below the first normal xid, that a fold at a point passes. */
 static bool
-txn_spill_folded_counted(txn_spill_folded_frame_0_t *frame, const TxnSpillFile *file)
+txn_spill_folded_frozen(const TxnSpillFile *file, HostLsn point)
 {
-	TxnRunsNames names;
-	ChunksErrorError failed;
-	txn_TupleFileU64_t count = {*file};
-
-	if (!txn_spill_names(&TXN_SPILL_STATE_HOME_OPS, frame->state, &frame->storage, file->kind, file->xid, &names,
-						 frame->error))
-		return false;
-	txn_runs_spill_directory(frame->storage.database, txn_state_own(frame->state), &frame->path);
-	frame->path_live = true;
-	txn_runs_spill_name(&names, file->number, &frame->name);
-	frame->name_live = true;
-	{
-		StdPathBuf	joined;
-
-		std_path_join(frame->path.bytes.ptr, frame->path.bytes.len, (const char *) frame->name.ptr, frame->name.len,
-					  &joined);
-		std_vec_free_Checked(&frame->path.bytes, 1, 1);
-		frame->path = joined;
-	}
-	frame->name_live = false;
-	std_vec_free_Checked(&frame->name, 1, 1);
-	if (!chunks_file_read_file(HOST_IO_IO_READ_DOORS(frame->io), frame->path.bytes.ptr, frame->path.bytes.len,
-							   &frame->bytes, &failed))
-	{
-		*frame->error = txn_base_storage(&failed);
-		return false;
-	}
-	frame->bytes_live = true;
-	if (!std_vec_try_reserve(&frame->counts, 1, sizeof(count), _Alignof(txn_TupleFileU64_t)))
-	{
-		*frame->error = host_Error_out_of_memory();
-		return false;
-	}
-	if (!txn_runs_decode(frame->bytes.ptr, frame->bytes.len, &names, file->hash, &frame->decoded, frame->error))
-		return false;
-	frame->decoded_live = true;
-	count.f1 = txn_spill_counted(&frame->decoded);
-	frame->decoded_live = false;
-	txn_runs_Decoded_drop(&frame->decoded);
-	frame->bytes_live = false;
-	std_vec_free_Checked(&frame->bytes, 1, 1);
-	frame->path_live = false;
-	std_vec_free_Checked(&frame->path.bytes, 1, 1);
-	std_vec_push_Checked(&frame->counts, &count, sizeof(count), _Alignof(txn_TupleFileU64_t));
-	return true;
+	return file->xid < TXN_STATUS_FIRST_NORMAL && file->passed <= point;
 }
 
-/* txn_spill_folded_gather gathers the xids whose commits the fold applies and the counts of their files. */
+/* txn_spill_folded_freed reports whether the listed files hold a free space map's spill of an xid. */
+static bool
+txn_spill_folded_freed(const StdVec *listed, uint64 xid)
+{
+	for (size_t k = 0; k < listed->len; k++)
+	{
+		const TxnSpillFile *file = &STD_VEC_AT(listed, TxnSpillFile, k);
+
+		if (file->xid == xid && file->kind == TXN_RUNS_KIND_SPILLED_FREE)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * txn_spill_folded_gather gathers the xids whose versions the fold applies,
+ * by their commits or, for an xid with a free space map's spill listed, its
+ * abort, deciding every xid before it counts a file, so a transaction a crash
+ * ended, whose other spills stay listed until a checkpoint names them, is
+ * counted whatever its files' order; then it gathers the counts of their
+ * files, but the residuals the fold at the point listed.
+ */
 static bool
 txn_spill_folded_gather(txn_spill_folded_frame_0_t *frame)
 {
 	for (size_t k = 0; k < frame->listed.f0.len; k++)
 	{
 		const TxnSpillFile *file = &STD_VEC_AT(&frame->listed.f0, TxnSpillFile, k);
-		bool		known = txn_spill_has_xid(&frame->applied, file->xid);
+		HostXid		xid = {file->xid};
+		TxnStatusCommit commit;
+		bool		applies;
 
-		if (!known)
-		{
-			HostXid		xid = {file->xid};
-			TxnStatusCommit commit;
-
-			if (!txn_status_committed(frame->io, xid, &commit, frame->error))
-				return false;
-			if (commit.tag != TXN_STATUS_COMMIT_AT || commit.u.at > frame->point)
-				continue;
-			if (!std_vec_try_reserve(&frame->applied, 1, sizeof(uint64), _Alignof(uint64)))
-			{
-				*frame->error = host_Error_out_of_memory();
-				return false;
-			}
-			std_vec_push_Checked(&frame->applied, &file->xid, sizeof(uint64), _Alignof(uint64));
-		}
-		if ((file->kind == TXN_RUNS_KIND_SPILLED_ROWS || file->kind == TXN_RUNS_KIND_SPILLED_ENTRIES ||
-			 file->kind == TXN_RUNS_KIND_SPILLED_VALUES) && !txn_spill_folded_counted(frame, file))
+		if (file->xid < TXN_STATUS_FIRST_NORMAL || txn_spill_has_xid(&frame->applied, file->xid))
+			continue;
+		if (!txn_status_committed(frame->io, xid, &commit, frame->error))
 			return false;
+		if (commit.tag == TXN_STATUS_COMMIT_AT)
+			applies = commit.u.at <= frame->point;
+		else
+		{
+			HostStatus	status = HOST_STATUS_IN_PROGRESS;
+
+			if (txn_spill_folded_freed(&frame->listed.f0, file->xid) &&
+				!host_status(HOST_IO_IO_IO_DOORS(frame->io), xid, &status, frame->error))
+				return false;
+			applies = status == HOST_STATUS_ABORTED;
+		}
+		if (!applies)
+			continue;
+		if (!std_vec_try_reserve(&frame->applied, 1, sizeof(uint64), _Alignof(uint64)))
+		{
+			*frame->error = host_Error_out_of_memory();
+			return false;
+		}
+		std_vec_push_Checked(&frame->applied, &file->xid, sizeof(uint64), _Alignof(uint64));
+	}
+	for (size_t k = 0; k < frame->listed.f0.len; k++)
+	{
+		const TxnSpillFile *file = &STD_VEC_AT(&frame->listed.f0, TxnSpillFile, k);
+		txn_TupleFileU64_t count = {*file};
+
+		if (file->xid < TXN_STATUS_FIRST_NORMAL || !txn_spill_has_xid(&frame->applied, file->xid) ||
+			!txn_spill_entered(file->kind) || file->from == frame->point)
+			continue;
+		if (!std_vec_try_reserve(&frame->counts, 1, sizeof(count), _Alignof(txn_TupleFileU64_t)))
+		{
+			*frame->error = host_Error_out_of_memory();
+			return false;
+		}
+		if (!txn_spill_file_counted(frame->io, frame->state, &frame->storage, file, &count.f1, frame->error))
+			return false;
+		std_vec_push_Checked(&frame->counts, &count, sizeof(count), _Alignof(txn_TupleFileU64_t));
 	}
 	return true;
+}
+
+/* txn_spill_folded_closure_0 is folded's removal's test: a frozen file the point passes, or an applied transaction's file that is no residual of the fold. */
+static bool
+txn_spill_folded_closure_0(void *captures, const TxnSpillFile *file)
+{
+	const txn_spill_folded_frame_0_t *frame = captures;
+
+	return txn_spill_folded_frozen(file, frame->point) ||
+		(txn_spill_has_xid(&frame->applied, file->xid) && file->from != frame->point);
 }
 
 /* txn_spill_folded_body_0 is folded's body. */
@@ -4042,6 +5002,7 @@ txn_spill_folded_body_0(void *frame_)
 {
 	txn_spill_folded_frame_0_t *frame = frame_;
 	TxnStatePersistence persistence;
+	bool		frozen = false;
 
 	if (!txn_state_described(frame->state, &frame->storage, &persistence))
 	{
@@ -4061,7 +5022,9 @@ txn_spill_folded_body_0(void *frame_)
 		txn_spill_folded_pad_0(frame);
 		return;
 	}
-	if (frame->applied.len == 0)
+	for (size_t k = 0; k < frame->listed.f0.len && !frozen; k++)
+		frozen = txn_spill_folded_frozen(&STD_VEC_AT(&frame->listed.f0, TxnSpillFile, k), frame->point);
+	if (frame->applied.len == 0 && !frozen)
 	{
 		frame->ok = true;
 		txn_spill_folded_pad_0(frame);
@@ -4069,7 +5032,7 @@ txn_spill_folded_body_0(void *frame_)
 	}
 	if (!host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-spill-folded-counted", frame->error) ||
 		!txn_spill_removed(&TXN_SPILL_STATE_HOME_OPS, frame->io, frame->state, &frame->storage,
-						   txn_spill_xids_closure_0, &frame->applied, &frame->gone, frame->error))
+						   txn_spill_folded_closure_0, frame, &frame->gone, frame->error))
 	{
 		txn_spill_folded_pad_0(frame);
 		return;
@@ -4102,9 +5065,16 @@ txn_spill_folded_body_0(void *frame_)
 /*
  * txn_spill_folded takes out of a storage's manifest the spills of every
  * transaction whose commit a fold at a point applies, and takes back at
- * each transaction's entry what its spilled rows, entries, and value map
- * versions added, reading each file's count before it leaves the manifest;
- * only the counts of the files its own removal took out go back.
+ * each transaction's entry what its spilled rows, entries, and value and
+ * free space map versions added, reading each file's count before it leaves
+ * the manifest; only the counts of the files its own removal took out go
+ * back. An aborted transaction's free space map spill, which its abort
+ * left, goes too, the fold having applied its takes as it applies an aborted
+ * take in the memtable, and so does a file of a writer below the first
+ * normal xid, a frozen insert's, which counts nothing, once the point
+ * reaches its passing point. A residual the fold at the point listed stays,
+ * holding the versions it kept, and takes the place of the rest of its
+ * transaction's files of its kind (bugs row 228).
  */
 bool
 txn_spill_folded(HostIoIo *io, HostSharedRecord state, HostLsn point, HostError *error)
@@ -4113,6 +5083,1838 @@ txn_spill_folded(HostIoIo *io, HostSharedRecord state, HostLsn point, HostError 
 
 	std_landing(&frame, txn_spill_folded_body_0, txn_spill_folded_pad_0);
 	return frame.ok;
+}
+
+/* txn_TupleRefSliceU8RefSliceU8U_t is a residual's kept version, (&[u8], &[u8], usize): its key, its record's bytes, and its place among its group's. */
+typedef struct txn_TupleRefSliceU8RefSliceU8U_t
+{
+	StdBytes	f0;
+	StdBytes	f1;
+	size_t		f2;
+} txn_TupleRefSliceU8RefSliceU8U_t;
+
+/* TxnSpillGroup is Group: a residual's transaction and kind, its spill's names, and the kept versions it holds. */
+typedef struct TxnSpillGroup
+{
+	uint64		xid;
+	TxnRunsKind kind;
+	TxnRunsNames names;
+	/* versions is a Vec<(&[u8], &[u8], usize)>. */
+	StdVec		versions;
+} TxnSpillGroup;
+
+/* txn_spill_kept_cmp orders a group's kept versions by their keys, then their places, as a stable sort by key does. */
+static int
+txn_spill_kept_cmp(const void *a, const void *b)
+{
+	const txn_TupleRefSliceU8RefSliceU8U_t *x = a;
+	const txn_TupleRefSliceU8RefSliceU8U_t *y = b;
+	int			order = (int) std_bytes_Ord_cmp(x->f0.ptr, x->f0.len, y->f0.ptr, y->f0.len);
+
+	if (order != 0)
+		return order;
+	return x->f2 < y->f2 ? -1 : x->f2 > y->f2;
+}
+
+/* txn_spill_group_written_frame_0_t is group_written's state across its pad: the writing, the distinct keys, the filter, and a key's records, while live. */
+typedef struct txn_spill_group_written_frame_0_t
+{
+	HostIoIoDoors io;
+	const StdPathBuf *dir;
+	const TxnSpillGroup *group;
+	uint32		number;
+	HostLsn		point;
+	TxnSpillFile *result;
+	HostError  *error;
+	bool		ok;
+	TxnRunsWriting *writing;
+	bool		writing_live;
+	/* keys is a Vec<&[u8]> of the distinct keys. */
+	StdVec		keys;
+	bool		keys_live;
+	TxnSpillFilter filter;
+	bool		filter_live;
+	/* records is a Vec<&[u8]> of a key's records. */
+	StdVec		records;
+	bool		records_live;
+} txn_spill_group_written_frame_0_t;
+
+/* txn_spill_group_written_pad_0 is group_written's pad: what it holds, while live. */
+static void
+txn_spill_group_written_pad_0(void *frame_)
+{
+	txn_spill_group_written_frame_0_t *frame = frame_;
+
+	if (frame->records_live)
+	{
+		frame->records_live = false;
+		std_vec_free_Checked(&frame->records, sizeof(StdBytes), _Alignof(StdBytes));
+	}
+	if (frame->filter_live)
+	{
+		frame->filter_live = false;
+		std_vec_free_Checked(&frame->filter.words, sizeof(uint64), _Alignof(uint64));
+	}
+	if (frame->keys_live)
+	{
+		frame->keys_live = false;
+		std_vec_free_Checked(&frame->keys, sizeof(StdBytes), _Alignof(StdBytes));
+	}
+	if (frame->writing_live)
+	{
+		frame->writing_live = false;
+		txn_runs_Writing_drop(frame->writing);
+	}
+}
+
+/* txn_spill_group_written_body_0 is group_written's body. */
+static void
+txn_spill_group_written_body_0(void *frame_)
+{
+	txn_spill_group_written_frame_0_t *frame = frame_;
+	const StdVec *versions = &frame->group->versions;
+	TxnRunsTail none = {.tag = TXN_RUNS_TAIL_NONE};
+	bool		some;
+	RepoRunFile run;
+
+	std_vec_new(&frame->keys, sizeof(StdBytes), _Alignof(StdBytes));
+	frame->keys_live = true;
+	std_vec_new(&frame->records, sizeof(StdBytes), _Alignof(StdBytes));
+	frame->records_live = true;
+	if (!std_vec_try_reserve_exact(&frame->keys, versions->len, sizeof(StdBytes), _Alignof(StdBytes)) ||
+		!std_vec_try_reserve_exact(&frame->records, versions->len, sizeof(StdBytes), _Alignof(StdBytes)))
+	{
+		*frame->error = host_Error_out_of_memory();
+		txn_spill_group_written_pad_0(frame);
+		return;
+	}
+	for (size_t k = 0; k < versions->len; k++)
+	{
+		StdBytes	key = STD_VEC_AT(versions, txn_TupleRefSliceU8RefSliceU8U_t, k).f0;
+		const StdBytes *last = frame->keys.len == 0 ? NULL :
+			&STD_VEC_AT(&frame->keys, StdBytes, frame->keys.len - 1);
+
+		if (last == NULL || last->len != key.len || memcmp(last->ptr, key.ptr, key.len) != 0)
+			std_vec_push_Checked(&frame->keys, &key, sizeof(key), _Alignof(StdBytes));
+	}
+	if (!txn_spill_Filter_of(frame->keys.len, frame->keys.ptr, frame->keys.len, &frame->filter, frame->error))
+	{
+		txn_spill_group_written_pad_0(frame);
+		return;
+	}
+	frame->filter_live = true;
+	frame->writing = txn_runs_Writing_spill(frame->dir->bytes.ptr, frame->dir->bytes.len, &frame->group->names, none,
+											frame->number);
+	frame->writing_live = true;
+	for (size_t k = 0, at = 0; k < frame->keys.len; k++)
+	{
+		const StdBytes *key = &STD_VEC_AT(&frame->keys, StdBytes, k);
+
+		frame->records.len = 0;
+		for (; at < versions->len; at++)
+		{
+			const txn_TupleRefSliceU8RefSliceU8U_t *version = &STD_VEC_AT(versions, txn_TupleRefSliceU8RefSliceU8U_t,
+																		  at);
+
+			if (version->f0.len != key->len || memcmp(version->f0.ptr, key->ptr, key->len) != 0)
+				break;
+			std_vec_push_Checked(&frame->records, &version->f1, sizeof(StdBytes), _Alignof(StdBytes));
+		}
+		if (!txn_runs_Writing_key(frame->writing, frame->io, key->ptr, key->len, frame->records.ptr,
+								  frame->records.len, frame->error))
+		{
+			txn_spill_group_written_pad_0(frame);
+			return;
+		}
+	}
+	if (!txn_runs_Writing_end(frame->writing, frame->io, frame->filter.words.ptr, frame->filter.words.len, &some,
+							  &run, frame->error))
+	{
+		txn_spill_group_written_pad_0(frame);
+		return;
+	}
+	if (!some)
+	{
+		*frame->error = txn_spill_internal("a residual wrote no key");
+		txn_spill_group_written_pad_0(frame);
+		return;
+	}
+	*frame->result = (TxnSpillFile)
+	{
+		.xid = frame->group->xid, .kind = frame->group->kind, .number = frame->number, .len = run.len,
+			.hash = run.hash, .bits = txn_spill_Filter_bits(&frame->filter), .from = frame->point
+	};
+	frame->ok = true;
+	txn_spill_group_written_pad_0(frame);
+}
+
+/* txn_spill_group_written writes a residual's file of a group's kept versions, sorted by key, each key's newest first, with its filter, synced. */
+static bool
+txn_spill_group_written(HostIoIoDoors io, const StdPathBuf *dir, const TxnSpillGroup *group, uint32 number,
+						HostLsn point, TxnSpillFile *result, HostError *error)
+{
+	txn_spill_group_written_frame_0_t frame = {.io = io, .dir = dir, .group = group, .number = number,
+	.point = point, .result = result, .error = error};
+
+	std_landing(&frame, txn_spill_group_written_body_0, txn_spill_group_written_pad_0);
+	return frame.ok;
+}
+
+/* txn_spill_residual_captures_t is residual's edit's captures: the state, the groups, the slots' spills, the directory, the point, and the files it made. */
+typedef struct txn_spill_residual_captures_t
+{
+	HostSharedRecord state;
+	const StdVec *groups;
+	const StdVec *slotted;
+	const StdPathBuf *dir;
+	HostLsn		point;
+	StdVec	   *made;
+} txn_spill_residual_captures_t;
+
+/*
+ * txn_spill_residual_closure_0 is residual's edit: each group's file written,
+ * numbered past its transaction's newest file of the kind listed or pended in
+ * a slot through the state's numbered, and listed after that newest listed
+ * file.
+ */
+static bool
+txn_spill_residual_closure_0(void *captures, HostSharedLongIo *io, StdVec *files, HostError *error)
+{
+	const txn_spill_residual_captures_t *c = captures;
+
+	if (!std_vec_try_reserve_exact(c->made, c->groups->len, sizeof(TxnSpillFile), _Alignof(TxnSpillFile)))
+	{
+		*error = host_Error_out_of_memory();
+		return false;
+	}
+	for (size_t g = 0; g < c->groups->len; g++)
+	{
+		const TxnSpillGroup *group = &STD_VEC_AT(c->groups, TxnSpillGroup, g);
+		uint32		past = 0;
+		size_t		at = files->len;
+		TxnSpillFile file;
+
+		for (size_t k = 0; k < files->len; k++)
+		{
+			const TxnSpillFile *listed = &STD_VEC_AT(files, TxnSpillFile, k);
+
+			if (listed->xid == group->xid && listed->kind == group->kind)
+			{
+				past = Max(past, listed->number + 1);
+				at = k + 1;
+			}
+		}
+		for (size_t k = 0; k < c->slotted->len; k++)
+		{
+			const txn_TupleU64KindU32OptionU32_t *slot = &STD_VEC_AT(c->slotted, txn_TupleU64KindU32OptionU32_t, k);
+
+			if (slot->f0 == group->xid && slot->f1 == group->kind)
+				past = Max(past, slot->f2 + 1);
+		}
+		if (!txn_spill_group_written(HOST_SHARED_LONG_IO_IO_DOORS(io), c->dir, group,
+									 txn_state_numbered(c->state, past), c->point, &file, error))
+			return false;
+		std_vec_insert(files, at, &file, sizeof(file), _Alignof(TxnSpillFile), RUST_FILE, 1418, 13);
+		std_vec_push_Checked(c->made, &file, sizeof(file), _Alignof(TxnSpillFile));
+	}
+	return true;
+}
+
+/* txn_spill_residual_frame_0_t is residual's state across its pad: the groups, the slots' spills, and the directory, while live. */
+typedef struct txn_spill_residual_frame_0_t
+{
+	HostIoIo   *io;
+	HostSharedRecord state;
+	HostLsn		point;
+	const TxnSpillKept *kept;
+	size_t		kept_len;
+	StdVec	   *result;
+	HostError  *error;
+	bool		ok;
+	HostStorage storage;
+	/* groups is a Vec<Group>. */
+	StdVec		groups;
+	bool		groups_live;
+	/* slotted is a Vec<Slotted>. */
+	StdVec		slotted;
+	bool		slotted_live;
+	StdPathBuf	dir;
+	bool		dir_live;
+
+	/*
+	 * counted is how many groups have their counts added at their entries
+	 * with their files not yet listed, which the pad gives back.
+	 */
+	size_t		counted;
+} txn_spill_residual_frame_0_t;
+
+static void txn_spill_residual_given_back(txn_spill_residual_frame_0_t *frame, size_t groups);
+
+/* txn_spill_residual_pad_0 is residual's pad: the counts of groups not listed, then what it holds, while live. */
+static void
+txn_spill_residual_pad_0(void *frame_)
+{
+	txn_spill_residual_frame_0_t *frame = frame_;
+
+	if (frame->counted > 0)
+	{
+		txn_spill_residual_given_back(frame, frame->counted);
+		frame->counted = 0;
+	}
+	if (frame->dir_live)
+	{
+		frame->dir_live = false;
+		std_vec_free_Checked(&frame->dir.bytes, 1, 1);
+	}
+	if (frame->slotted_live)
+	{
+		frame->slotted_live = false;
+		std_vec_free_Checked(&frame->slotted, sizeof(txn_TupleU64KindU32OptionU32_t),
+							 _Alignof(txn_TupleU64KindU32OptionU32_t));
+	}
+	if (frame->groups_live)
+	{
+		frame->groups_live = false;
+		for (size_t k = 0; k < frame->groups.len; k++)
+			std_vec_free_Checked(&STD_VEC_AT(&frame->groups, TxnSpillGroup, k).versions,
+								 sizeof(txn_TupleRefSliceU8RefSliceU8U_t),
+								 _Alignof(txn_TupleRefSliceU8RefSliceU8U_t));
+		std_vec_free_Checked(&frame->groups, sizeof(TxnSpillGroup), _Alignof(TxnSpillGroup));
+	}
+}
+
+/* txn_spill_residual_grouped groups the kept versions by their writers' top-level xids and their kinds, each group with its spill's names. */
+static bool
+txn_spill_residual_grouped(txn_spill_residual_frame_0_t *frame)
+{
+	std_vec_new(&frame->groups, sizeof(TxnSpillGroup), _Alignof(TxnSpillGroup));
+	frame->groups_live = true;
+	for (size_t k = 0; k < frame->kept_len; k++)
+	{
+		const TxnSpillKept *kept = &frame->kept[k];
+		TxnMemtableVersionRecord record;
+		TxnMemtableVersionWriter writer;
+		uint64		xid;
+		TxnSpillGroup *group = NULL;
+		txn_TupleRefSliceU8RefSliceU8U_t version = {{kept->key.ptr, kept->key.len}, {kept->bytes.ptr, kept->bytes.len}};
+
+		if (!txn_memtable_version_stored(kept->bytes.ptr, kept->bytes.len, &record, frame->error))
+			return false;
+		writer = txn_memtable_version_Record_writer(&record);
+		xid = writer.has_top ? writer.top : writer.xid;
+		for (size_t g = 0; g < frame->groups.len && group == NULL; g++)
+		{
+			TxnSpillGroup *at = &STD_VEC_AT(&frame->groups, TxnSpillGroup, g);
+
+			if (at->xid == xid && at->kind == kept->kind)
+				group = at;
+		}
+		if (group == NULL)
+		{
+			TxnSpillGroup made = {.xid = xid, .kind = kept->kind};
+
+			if (!std_vec_try_reserve(&frame->groups, 1, sizeof(made), _Alignof(TxnSpillGroup)))
+			{
+				*frame->error = host_Error_out_of_memory();
+				return false;
+			}
+			if (!txn_spill_names(&TXN_SPILL_STATE_HOME_OPS, frame->state, &frame->storage, kept->kind, xid,
+								 &made.names, frame->error))
+				return false;
+			std_vec_new(&made.versions, sizeof(version), _Alignof(txn_TupleRefSliceU8RefSliceU8U_t));
+			std_vec_push_Checked(&frame->groups, &made, sizeof(made), _Alignof(TxnSpillGroup));
+			group = &STD_VEC_AT(&frame->groups, TxnSpillGroup, frame->groups.len - 1);
+		}
+		version.f2 = group->versions.len;
+		if (!std_vec_try_reserve(&group->versions, 1, sizeof(version), _Alignof(txn_TupleRefSliceU8RefSliceU8U_t)))
+		{
+			*frame->error = host_Error_out_of_memory();
+			return false;
+		}
+		std_vec_push_Checked(&group->versions, &version, sizeof(version), _Alignof(txn_TupleRefSliceU8RefSliceU8U_t));
+	}
+	for (size_t g = 0; g < frame->groups.len; g++)
+	{
+		StdVec	   *versions = &STD_VEC_AT(&frame->groups, TxnSpillGroup, g).versions;
+
+		qsort(versions->ptr, versions->len, sizeof(txn_TupleRefSliceU8RefSliceU8U_t), txn_spill_kept_cmp);
+	}
+	return true;
+}
+
+/*
+ * txn_spill_residual_given_back takes the counts of the first groups back
+ * from their transactions' entries after a failed listing or a panic; a give-back that
+ * fails leaves an overcount, which only keeps an entry longer, where an
+ * undercount could free it under its listed versions.
+ */
+static void
+txn_spill_residual_given_back(txn_spill_residual_frame_0_t *frame, size_t groups)
+{
+	for (size_t k = 0; k < groups; k++)
+	{
+		const TxnSpillGroup *group = &STD_VEC_AT(&frame->groups, TxnSpillGroup, k);
+		HostXid		xid = {group->xid};
+		HostError	error;
+		bool		has;
+		uint64		added;
+
+		if (!txn_status_add(frame->io, xid, std_wrapping_sub_u64(0, (uint64) group->versions.len), &has, &added,
+							&error))
+			host_Error_drop(&error);
+	}
+}
+
+/* txn_spill_residual_body_0 is residual's body. */
+static void
+txn_spill_residual_body_0(void *frame_)
+{
+	txn_spill_residual_frame_0_t *frame = frame_;
+	TxnStatePersistence persistence;
+	txn_spill_residual_captures_t captures;
+
+	std_vec_new(frame->result, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	if (frame->kept_len == 0 || !txn_state_described(frame->state, &frame->storage, &persistence))
+	{
+		frame->ok = true;
+		return;
+	}
+	if (!txn_spill_residual_grouped(frame))
+	{
+		txn_spill_residual_pad_0(frame);
+		return;
+	}
+	txn_runs_spill_directory(frame->storage.database, txn_state_own(frame->state), &frame->dir);
+	frame->dir_live = true;
+	if (!txn_spill_pended(&TXN_SPILL_STATE_HOME_OPS, frame->state, &frame->storage, &frame->slotted, frame->error))
+	{
+		txn_spill_residual_pad_0(frame);
+		return;
+	}
+	frame->slotted_live = true;
+	for (size_t k = 0; k < frame->groups.len; k++)
+	{
+		const TxnSpillGroup *group = &STD_VEC_AT(&frame->groups, TxnSpillGroup, k);
+		HostXid		xid = {group->xid};
+		bool		has;
+		uint64		added;
+
+		if (!txn_status_add(frame->io, xid, (uint64) group->versions.len, &has, &added, frame->error))
+		{
+			txn_spill_residual_pad_0(frame);
+			return;
+		}
+		frame->counted = k + 1;
+	}
+	captures = (txn_spill_residual_captures_t)
+	{
+		frame->state, &frame->groups, &frame->slotted, &frame->dir, frame->point, frame->result
+	};
+	if (!txn_spill_changed(&TXN_SPILL_STATE_HOME_OPS, frame->io, frame->state, &frame->storage,
+						   txn_spill_residual_closure_0, &captures, frame->error))
+	{
+		txn_spill_residual_pad_0(frame);
+		return;
+	}
+	frame->counted = 0;
+	frame->ok = true;
+	txn_spill_residual_pad_0(frame);
+}
+
+/*
+ * txn_spill_residual lists, before a fold at a point installs, a residual of
+ * each transaction's spills of a map kind whose versions the fold keeps
+ * (bugs row 228), all in one hold of the manifest's writers' lock, so a
+ * concurrent fold lists its own after: a file holding the kept versions
+ * alone, each key's newest first, numbered past the transaction's newest
+ * file of the kind listed or pended in a slot through the state's numbered,
+ * as the committed arm numbers its files, written and synced, listed at the
+ * place of that newest listed file, its versions counted at the
+ * transaction's entry before the hold, since the status lock can't be taken
+ * inside it, and given back if the listing fails, so a listed residual is
+ * always counted. Readers read it in place of every other file of its
+ * transaction and kind once the base's fold point reaches the fold's
+ * (files), so they see the kept versions in its sources until the install
+ * and in it after, and never hold its versions in the delta's budget. A fold
+ * at the same point keeps the same versions of the same sources, so two such
+ * residuals hold the same versions. It answers the files it listed, which a
+ * fold whose install is refused takes back out (unlisted).
+ */
+bool
+txn_spill_residual(HostIoIo *io, HostSharedRecord state, HostLsn point, const TxnSpillKept *kept, size_t kept_len,
+				   StdVec *result, HostError *error)
+{
+	txn_spill_residual_frame_0_t frame = {.io = io, .state = state, .point = point, .kept = kept,
+	.kept_len = kept_len, .result = result, .error = error};
+
+	std_landing(&frame, txn_spill_residual_body_0, txn_spill_residual_pad_0);
+	if (!frame.ok)
+		std_vec_free_Checked(result, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	return frame.ok;
+}
+
+/* txn_spill_unlisted_closure_0 is unlisted's removal's test: one of the fold's residuals. */
+static bool
+txn_spill_unlisted_closure_0(void *captures, const TxnSpillFile *file)
+{
+	const StdVec *residuals = captures;
+
+	for (size_t k = 0; k < residuals->len; k++)
+		if (txn_spill_File_PartialEq_eq(&STD_VEC_AT(residuals, TxnSpillFile, k), file))
+			return true;
+	return false;
+}
+
+/* txn_spill_unlisted_frame_t is unlisted's state across its pad: the files it took out, while live. */
+typedef struct txn_spill_unlisted_frame_t
+{
+	HostIoIo   *io;
+	HostSharedRecord state;
+	const StdVec *residuals;
+	StdVec		gone;
+	bool		gone_live;
+	HostError  *error;
+	bool		ok;
+} txn_spill_unlisted_frame_t;
+
+/* txn_spill_unlisted_body takes the residuals out and takes back each one's count. */
+static void
+txn_spill_unlisted_body(void *frame_)
+{
+	txn_spill_unlisted_frame_t *frame = frame_;
+	HostStorage storage;
+	TxnStatePersistence persistence;
+
+	if (frame->residuals->len == 0 || !txn_state_described(frame->state, &storage, &persistence))
+	{
+		frame->ok = true;
+		return;
+	}
+	if (!txn_spill_removed(&TXN_SPILL_STATE_HOME_OPS, frame->io, frame->state, &storage, txn_spill_unlisted_closure_0,
+						   (void *) frame->residuals, &frame->gone, frame->error))
+		return;
+	frame->gone_live = true;
+	for (size_t k = 0; k < frame->gone.len; k++)
+		if (!txn_spill_uncounted(frame->io, frame->state, &storage, &STD_VEC_AT(&frame->gone, TxnSpillFile, k),
+								 frame->error))
+			return;
+	frame->ok = true;
+}
+
+/* txn_spill_unlisted_pad frees the files unlisted took out, while live. */
+static void
+txn_spill_unlisted_pad(void *frame_)
+{
+	txn_spill_unlisted_frame_t *frame = frame_;
+
+	if (frame->gone_live)
+		std_vec_free_Checked(&frame->gone, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	frame->gone_live = false;
+}
+
+/*
+ * txn_spill_unlisted takes a fold's residuals back out of its storage's
+ * manifest when its install is refused, with their counts; a fold whose
+ * install raised leaves them for the next fold's drop or the start, which
+ * no reader reads meanwhile.
+ */
+bool
+txn_spill_unlisted(HostIoIo *io, HostSharedRecord state, const StdVec *residuals, HostError *error)
+{
+	txn_spill_unlisted_frame_t frame = {.io = io, .state = state, .residuals = residuals, .error = error};
+
+	std_landing(&frame, txn_spill_unlisted_body, txn_spill_unlisted_pad);
+	txn_spill_unlisted_pad(&frame);
+	return frame.ok;
+}
+
+/* txn_spill_Chain_drop frees a carry's chain: its key and its versions' records. */
+void
+txn_spill_Chain_drop(TxnSpillChain *self)
+{
+	std_vec_free_Checked(&self->key, 1, 1);
+	for (size_t k = 0; k < self->versions.len; k++)
+		std_vec_free_Checked(&STD_VEC_AT(&self->versions, txn_TupleU64VecU8_t, k).f1, 1, 1);
+	std_vec_free_Checked(&self->versions, sizeof(txn_TupleU64VecU8_t), _Alignof(txn_TupleU64VecU8_t));
+}
+
+/* TxnSpillLayerFile is one file of a carry's layer: its writer's top-level xid and tree, with its keys, each with its records newest first. */
+typedef struct TxnSpillLayerFile
+{
+	uint64		xid;
+	TxnWrittenOf of;
+	/* keys is a Vec<(Vec<u8>, Vec<Vec<u8>>)>. */
+	StdVec		keys;
+} TxnSpillLayerFile;
+
+/* txn_spill_KeyRecords_drop frees a key with its records. */
+static void
+txn_spill_KeyRecords_drop(txn_TupleVecU8VecVecU8_t *self)
+{
+	std_vec_free_Checked(&self->f0, 1, 1);
+	for (size_t k = 0; k < self->f1.len; k++)
+		std_vec_free_Checked(&STD_VEC_AT(&self->f1, StdVec, k), 1, 1);
+	std_vec_free_Checked(&self->f1, sizeof(StdVec), _Alignof(StdVec));
+}
+
+/* txn_spill_layers_drop frees a carry's layers, a Vec<Vec<LayerFile>>. */
+static void
+txn_spill_layers_drop(StdVec *layers)
+{
+	for (size_t d = 0; d < layers->len; d++)
+	{
+		StdVec	   *layer = &STD_VEC_AT(layers, StdVec, d);
+
+		for (size_t f = 0; f < layer->len; f++)
+		{
+			TxnSpillLayerFile *file = &STD_VEC_AT(layer, TxnSpillLayerFile, f);
+
+			for (size_t k = 0; k < file->keys.len; k++)
+				txn_spill_KeyRecords_drop(&STD_VEC_AT(&file->keys, txn_TupleVecU8VecVecU8_t, k));
+			std_vec_free_Checked(&file->keys, sizeof(txn_TupleVecU8VecVecU8_t), _Alignof(txn_TupleVecU8VecVecU8_t));
+		}
+		std_vec_free_Checked(layer, sizeof(TxnSpillLayerFile), _Alignof(TxnSpillLayerFile));
+	}
+	std_vec_free_Checked(layers, sizeof(StdVec), _Alignof(StdVec));
+}
+
+/* txn_spill_key_records_cmp orders a layer file's keys by their bytes. */
+static int
+txn_spill_key_records_cmp(const void *a, const void *b)
+{
+	const txn_TupleVecU8VecVecU8_t *x = a;
+	const txn_TupleVecU8VecVecU8_t *y = b;
+
+	return (int) std_bytes_Ord_cmp(x->f0.ptr, x->f0.len, y->f0.ptr, y->f0.len);
+}
+
+/*
+ * txn_spill_layered splits a carry's chains, which it takes, into layers of
+ * spill files (P2): each chain's versions, oldest first, into runs of one
+ * writer's, its first run in the first layer, its second in the second, and
+ * so on, so a layer's files hold a key of a tree once and listing the layers
+ * oldest first keeps every chain's order, as readers read a key's versions
+ * across files in their listing's order. A chain's key is copied into each
+ * layer it reaches, since each file owns its keys.
+ */
+static bool
+txn_spill_layered(StdVec *chains, StdVec *layers, HostError *error)
+{
+	bool		ok = true;
+
+	std_vec_new(layers, sizeof(StdVec), _Alignof(StdVec));
+	for (size_t c = 0; c < chains->len && ok; c++)
+	{
+		TxnSpillChain *chain = &STD_VEC_AT(chains, TxnSpillChain, c);
+		size_t		depth = 0;
+
+		for (size_t start = 0; start < chain->versions.len && ok; depth++)
+		{
+			uint64		xid = STD_VEC_AT(&chain->versions, txn_TupleU64VecU8_t, start).f0;
+			size_t		end = start;
+			txn_TupleVecU8VecVecU8_t keyed;
+			StdVec	   *layer;
+			TxnSpillLayerFile *file = NULL;
+
+			while (end < chain->versions.len && STD_VEC_AT(&chain->versions, txn_TupleU64VecU8_t, end).f0 == xid)
+				end++;
+			if (layers->len == depth)
+			{
+				StdVec		fresh;
+
+				ok = std_vec_try_reserve(layers, 1, sizeof(StdVec), _Alignof(StdVec));
+				if (!ok)
+					break;
+				std_vec_new(&fresh, sizeof(TxnSpillLayerFile), _Alignof(TxnSpillLayerFile));
+				std_vec_push_Checked(layers, &fresh, sizeof(fresh), _Alignof(StdVec));
+			}
+			layer = &STD_VEC_AT(layers, StdVec, depth);
+			for (size_t f = 0; f < layer->len && file == NULL; f++)
+				if (STD_VEC_AT(layer, TxnSpillLayerFile, f).xid == xid &&
+					STD_VEC_AT(layer, TxnSpillLayerFile, f).of == chain->of)
+					file = &STD_VEC_AT(layer, TxnSpillLayerFile, f);
+			if (file == NULL)
+			{
+				TxnSpillLayerFile made = {.xid = xid, .of = chain->of};
+
+				ok = std_vec_try_reserve(layer, 1, sizeof(made), _Alignof(TxnSpillLayerFile));
+				if (!ok)
+					break;
+				std_vec_new(&made.keys, sizeof(txn_TupleVecU8VecVecU8_t), _Alignof(txn_TupleVecU8VecVecU8_t));
+				std_vec_push_Checked(layer, &made, sizeof(made), _Alignof(TxnSpillLayerFile));
+				file = &STD_VEC_AT(layer, TxnSpillLayerFile, layer->len - 1);
+			}
+			ok = std_vec_try_reserve(&file->keys, 1, sizeof(keyed), _Alignof(txn_TupleVecU8VecVecU8_t));
+			if (!ok)
+				break;
+			std_vec_clone(&keyed.f0, &chain->key, 1, 1);
+			std_vec_with_capacity_Checked(&keyed.f1, end - start, sizeof(StdVec), _Alignof(StdVec));
+			for (size_t v = end; v > start; v--)
+			{
+				txn_TupleU64VecU8_t *version = &STD_VEC_AT(&chain->versions, txn_TupleU64VecU8_t, v - 1);
+
+				std_vec_push_Checked(&keyed.f1, &version->f1, sizeof(StdVec), _Alignof(StdVec));
+				std_vec_new(&version->f1, 1, 1);
+			}
+			std_vec_push_Checked(&file->keys, &keyed, sizeof(keyed), _Alignof(txn_TupleVecU8VecVecU8_t));
+			start = end;
+		}
+	}
+	for (size_t c = 0; c < chains->len; c++)
+		txn_spill_Chain_drop(&STD_VEC_AT(chains, TxnSpillChain, c));
+	std_vec_free_Checked(chains, sizeof(TxnSpillChain), _Alignof(TxnSpillChain));
+	if (!ok)
+	{
+		*error = host_Error_out_of_memory();
+		txn_spill_layers_drop(layers);
+		return false;
+	}
+	for (size_t d = 0; d < layers->len; d++)
+	{
+		StdVec	   *layer = &STD_VEC_AT(layers, StdVec, d);
+
+		for (size_t f = 0; f < layer->len; f++)
+		{
+			StdVec	   *keys = &STD_VEC_AT(layer, TxnSpillLayerFile, f).keys;
+
+			qsort(keys->ptr, keys->len, sizeof(txn_TupleVecU8VecVecU8_t), txn_spill_key_records_cmp);
+		}
+	}
+	return true;
+}
+
+/* TxnSpillSlot is a carried writer's status entry's slot, resolved before the carry's hold: its top-level xid, and its slot when it has an entry. */
+typedef struct TxnSpillSlot
+{
+	uint64		xid;
+	bool		has;
+	TxnStatusRoomed roomed;
+} TxnSpillSlot;
+
+/* txn_spill_carried_frame_0_t is carried's state across its pad: the spills' directory, the manifest's path, its writers' lock, the slots, the layers, the files, a file's writing, filter, keys, and tuples, and the counts, while live. */
+typedef struct txn_spill_carried_frame_0_t
+{
+	HostIoIo   *io;
+	const HostSharedHeld *held;
+	bool		(*logged) (void *captures, HostSharedLongIo *io, StdVec *chains, HostError *error);
+	void	   *captures;
+	HostError  *error;
+	bool		ok;
+	HostStorage storage;
+	TxnRunsKind kinds[3];
+	TxnRunsTail tails[3];
+	StdPathBuf	dir;
+	bool		dir_live;
+	StdPathBuf	path;
+	bool		path_live;
+	HostSharedLongGuard writing;
+	bool		writing_live;
+	HostSharedLongIo long_io;
+	StdVec		slotted;
+	bool		slotted_live;
+	StdVec		chains;
+	StdVec		layers;
+	bool		layers_live;
+	StdVec		files;
+	bool		files_live;
+	TxnRunsWriting *writer;
+	bool		writer_live;
+	TxnSpillFilter filter;
+	bool		filter_live;
+
+	/*
+	 * keys is a Vec<&[u8]> of a file's keys, and records a Vec<&[u8]> of a
+	 * key's records.
+	 */
+	StdVec		keys;
+	bool		keys_live;
+	StdVec		records;
+	bool		records_live;
+	/* tuples is a Vec<(u64, Vec<u8>)>. */
+	StdVec		tuples;
+	bool		tuples_live;
+
+	/*
+	 * counts is a Vec<(u64, u64)> of each file's writer and its versions'
+	 * count.
+	 */
+	StdVec		counts;
+	bool		counts_live;
+
+	/*
+	 * writers are the top-level xids the carry may spill under, and slots
+	 * their entries' slots.
+	 */
+	const uint64 *writers;
+	size_t		writers_len;
+	StdVec		slots;
+	bool		slots_live;
+	/* made_from is where the carry's files start in the files listed. */
+	size_t		made_from;
+
+	/*
+	 * ends are the ends of the carry's records, ascending, and made the files
+	 * it listed.
+	 */
+	StdVec		ends;
+	bool		ends_live;
+	StdVec		made;
+	bool		made_live;
+	StdVec		body;
+	bool		body_live;
+	HostDeltaHold hold;
+	bool		hold_live;
+	HostDelayCheckpoint window;
+	bool		window_live;
+} txn_spill_carried_frame_0_t;
+
+/* txn_spill_carried_file_drop frees what one file of carried's holds. */
+static void
+txn_spill_carried_file_drop(txn_spill_carried_frame_0_t *frame)
+{
+	if (frame->tuples_live)
+	{
+		frame->tuples_live = false;
+		for (size_t k = 0; k < frame->tuples.len; k++)
+			std_vec_free_Checked(&STD_VEC_AT(&frame->tuples, txn_TupleU64VecU8_t, k).f1, 1, 1);
+		std_vec_free_Checked(&frame->tuples, sizeof(txn_TupleU64VecU8_t), _Alignof(txn_TupleU64VecU8_t));
+	}
+	if (frame->records_live)
+	{
+		frame->records_live = false;
+		std_vec_free_Checked(&frame->records, sizeof(StdBytes), _Alignof(StdBytes));
+	}
+	if (frame->keys_live)
+	{
+		frame->keys_live = false;
+		std_vec_free_Checked(&frame->keys, sizeof(StdBytes), _Alignof(StdBytes));
+	}
+	if (frame->filter_live)
+	{
+		frame->filter_live = false;
+		std_vec_free_Checked(&frame->filter.words, sizeof(uint64), _Alignof(uint64));
+	}
+	if (frame->writer_live)
+	{
+		frame->writer_live = false;
+		txn_runs_Writing_drop(frame->writer);
+	}
+}
+
+/* txn_spill_carried_pad_0 is carried's pad: what it holds, while live. */
+static void
+txn_spill_carried_pad_0(void *frame_)
+{
+	txn_spill_carried_frame_0_t *frame = frame_;
+
+	if (frame->window_live)
+	{
+		frame->window_live = false;
+		host_DelayCheckpoint_drop(&frame->window);
+	}
+	if (frame->hold_live)
+	{
+		frame->hold_live = false;
+		host_delta_Hold_drop(&frame->hold);
+	}
+	if (frame->body_live)
+	{
+		frame->body_live = false;
+		std_vec_free_Checked(&frame->body, 1, 1);
+	}
+	if (frame->made_live)
+	{
+		frame->made_live = false;
+		std_vec_free_Checked(&frame->made, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	}
+	if (frame->ends_live)
+	{
+		frame->ends_live = false;
+		std_vec_free_Checked(&frame->ends, sizeof(uint64), _Alignof(uint64));
+	}
+	if (frame->slots_live)
+	{
+		frame->slots_live = false;
+		std_vec_free_Checked(&frame->slots, sizeof(TxnSpillSlot), _Alignof(TxnSpillSlot));
+	}
+	txn_spill_carried_file_drop(frame);
+	if (frame->counts_live)
+	{
+		frame->counts_live = false;
+		std_vec_free_Checked(&frame->counts, sizeof(std_TupleU64U64_t), _Alignof(std_TupleU64U64_t));
+	}
+	if (frame->files_live)
+	{
+		frame->files_live = false;
+		std_vec_free_Checked(&frame->files, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	}
+	if (frame->layers_live)
+	{
+		frame->layers_live = false;
+		txn_spill_layers_drop(&frame->layers);
+	}
+	if (frame->slotted_live)
+	{
+		frame->slotted_live = false;
+		std_vec_free_Checked(&frame->slotted, sizeof(txn_TupleU64KindU32OptionU32_t),
+							 _Alignof(txn_TupleU64KindU32OptionU32_t));
+	}
+	if (frame->writing_live)
+	{
+		frame->writing_live = false;
+		host_shared_LongGuard_drop(&frame->writing);
+	}
+	if (frame->path_live)
+	{
+		frame->path_live = false;
+		std_vec_free_Checked(&frame->path.bytes, 1, 1);
+	}
+	if (frame->dir_live)
+	{
+		frame->dir_live = false;
+		std_vec_free_Checked(&frame->dir.bytes, 1, 1);
+	}
+}
+
+/* txn_spill_carried_push adds an element to one of carried's vectors, refusing it when the vector can't grow. */
+static bool
+txn_spill_carried_push(txn_spill_carried_frame_0_t *frame, StdVec *vector, const void *elem, size_t size,
+					   size_t align)
+{
+	if (!std_vec_try_reserve(vector, 1, size, align))
+	{
+		*frame->error = host_Error_out_of_memory();
+		return false;
+	}
+	std_vec_push_Checked(vector, elem, size, align);
+	return true;
+}
+
+/*
+ * txn_spill_carried_file writes one file of a layer: its keys and records
+ * under its writer's xid, numbered through the state's numbered past the
+ * writer's files of the kind listed or pended, with a row file's spilled
+ * tuple ids, and lists it, counting its versions but its locks' and taking a
+ * frozen writer's passing point from its records' ends.
+ */
+static bool
+txn_spill_carried_file(txn_spill_carried_frame_0_t *frame, const TxnSpillLayerFile *layered)
+{
+	HostSharedRecord record = host_shared_Held_record(frame->held);
+	HostIoIoDoors doors = HOST_SHARED_LONG_IO_IO_DOORS(&frame->long_io);
+	size_t		at = layered->of == TXN_WRITTEN_OF_ROWS ? 0 : layered->of == TXN_WRITTEN_OF_FREE ? 1 : 2;
+	TxnRunsKind kind = frame->kinds[at];
+	TxnRunsNames names;
+	uint32		past = 0;
+	uint64		count = 0;
+	uint64		passed = 0;
+	bool		some;
+	RepoRunFile run;
+	TxnSpillFile file;
+	uint32		number;
+	std_TupleU64U64_t counted;
+
+	if (layered->of != TXN_WRITTEN_OF_ROWS && layered->of != TXN_WRITTEN_OF_FREE &&
+		layered->of != TXN_WRITTEN_OF_VALUES)
+	{
+		*frame->error = txn_spill_internal("a carry spills only a storage's rows and maps");
+		return false;
+	}
+	if (!txn_spill_names(&TXN_SPILL_STATE_HOME_OPS, record, &frame->storage, kind, layered->xid, &names,
+						 frame->error))
+		return false;
+	for (size_t k = 0; k < frame->files.len; k++)
+	{
+		const TxnSpillFile *listed = &STD_VEC_AT(&frame->files, TxnSpillFile, k);
+
+		if (listed->xid == layered->xid && listed->kind == kind)
+			past = Max(past, listed->number + 1);
+	}
+	for (size_t k = 0; k < frame->slotted.len; k++)
+	{
+		const txn_TupleU64KindU32OptionU32_t *slot = &STD_VEC_AT(&frame->slotted, txn_TupleU64KindU32OptionU32_t, k);
+
+		if (slot->f0 == layered->xid && slot->f1 == kind)
+			past = Max(past, slot->f2 + 1);
+	}
+	number = txn_state_numbered(record, past);
+	std_vec_with_capacity_Checked(&frame->keys, layered->keys.len, sizeof(StdBytes), _Alignof(StdBytes));
+	frame->keys_live = true;
+	for (size_t k = 0; k < layered->keys.len; k++)
+	{
+		const StdVec *key = &STD_VEC_AT(&layered->keys, txn_TupleVecU8VecVecU8_t, k).f0;
+		StdBytes	bytes = {key->ptr, key->len};
+
+		std_vec_push_Checked(&frame->keys, &bytes, sizeof(bytes), _Alignof(StdBytes));
+	}
+	if (!txn_spill_Filter_of(frame->keys.len, frame->keys.ptr, frame->keys.len, &frame->filter, frame->error))
+		return false;
+	frame->filter_live = true;
+	frame->writer = txn_runs_Writing_spill(frame->dir.bytes.ptr, frame->dir.bytes.len, &names, frame->tails[at],
+										   number);
+	frame->writer_live = true;
+	std_vec_new(&frame->records, sizeof(StdBytes), _Alignof(StdBytes));
+	frame->records_live = true;
+	std_vec_new(&frame->tuples, sizeof(txn_TupleU64VecU8_t), _Alignof(txn_TupleU64VecU8_t));
+	frame->tuples_live = true;
+	for (size_t k = 0; k < layered->keys.len; k++)
+	{
+		const txn_TupleVecU8VecVecU8_t *keyed = &STD_VEC_AT(&layered->keys, txn_TupleVecU8VecVecU8_t, k);
+
+		frame->records.len = 0;
+		if (!std_vec_try_reserve(&frame->records, keyed->f1.len, sizeof(StdBytes), _Alignof(StdBytes)))
+		{
+			*frame->error = host_Error_out_of_memory();
+			return false;
+		}
+		for (size_t r = 0; r < keyed->f1.len; r++)
+		{
+			const StdVec *bytes = &STD_VEC_AT(&keyed->f1, StdVec, r);
+			StdBytes	lent = {bytes->ptr, bytes->len};
+			TxnMemtableVersionRecord version;
+			TxnMemtableVersionOpRef op;
+			txn_TupleU64VecU8_t tuple;
+			uint64		lsn;
+
+			std_vec_push_Checked(&frame->records, &lent, sizeof(lent), _Alignof(StdBytes));
+			if (!txn_memtable_version_stored(bytes->ptr, bytes->len, &version, frame->error))
+				return false;
+			if (layered->xid < TXN_STATUS_FIRST_NORMAL)
+				passed = Max(passed, txn_memtable_version_Record_lsn(&version, &lsn) ? lsn : 1);
+			op = txn_memtable_version_Record_op(&version);
+			if (op.tag != TXN_MEMTABLE_VERSION_OP_REF_LOCK && op.tag != TXN_MEMTABLE_VERSION_OP_REF_LOCK_ROW)
+				count++;
+			if (kind == TXN_RUNS_KIND_SPILLED_ROWS && txn_spill_tid(bytes->ptr, bytes->len, &tuple.f0))
+			{
+				std_vec_clone(&tuple.f1, &keyed->f0, 1, 1);
+				if (!txn_spill_carried_push(frame, &frame->tuples, &tuple, sizeof(tuple),
+											_Alignof(txn_TupleU64VecU8_t)))
+				{
+					std_vec_free_Checked(&tuple.f1, 1, 1);
+					return false;
+				}
+			}
+		}
+		if (!txn_runs_Writing_key(frame->writer, doors, keyed->f0.ptr, keyed->f0.len, frame->records.ptr,
+								  frame->records.len, frame->error))
+			return false;
+	}
+	if (!txn_runs_Writing_end(frame->writer, doors, frame->filter.words.ptr, frame->filter.words.len, &some, &run,
+							  frame->error))
+		return false;
+	if (!some)
+	{
+		*frame->error = txn_spill_internal("a carry's file wrote no key");
+		return false;
+	}
+	file = (TxnSpillFile)
+	{
+		.xid = layered->xid, .kind = kind, .number = number, .len = run.len, .hash = run.hash,
+			.bits = txn_spill_Filter_bits(&frame->filter), .passed = passed
+	};
+	if (!txn_spill_carried_push(frame, &frame->files, &file, sizeof(file), _Alignof(TxnSpillFile)))
+		return false;
+	if (frame->tuples.len > 0)
+	{
+		TxnSpillFile tupled;
+		StdVec		tids;
+
+		frame->tuples_live = false;
+		if (!txn_spill_tupled(&TXN_SPILL_STATE_HOME_OPS, doors, record, &frame->storage, &frame->dir, layered->xid,
+							  number, &frame->tuples, &tupled, &tids, frame->error))
+			return false;
+		std_vec_free_Checked(&tids, sizeof(uint64), _Alignof(uint64));
+		tupled.passed = passed;
+		if (!txn_spill_carried_push(frame, &frame->files, &tupled, sizeof(tupled), _Alignof(TxnSpillFile)))
+			return false;
+	}
+	counted = (std_TupleU64U64_t)
+	{
+		layered->xid, count
+	};
+	if (!txn_spill_carried_push(frame, &frame->counts, &counted, sizeof(counted), _Alignof(std_TupleU64U64_t)))
+		return false;
+	txn_spill_carried_file_drop(frame);
+	return true;
+}
+
+/* txn_spill_carried_slots resolves each carried writer's status entry's slot before the carry's hold, as an entry with a count never moves or leaves. */
+static bool
+txn_spill_carried_slots(txn_spill_carried_frame_0_t *frame)
+{
+	std_vec_new(&frame->slots, sizeof(TxnSpillSlot), _Alignof(TxnSpillSlot));
+	frame->slots_live = true;
+	if (!std_vec_try_reserve_exact(&frame->slots, frame->writers_len, sizeof(TxnSpillSlot), _Alignof(TxnSpillSlot)))
+	{
+		*frame->error = host_Error_out_of_memory();
+		return false;
+	}
+	for (size_t k = 0; k < frame->writers_len; k++)
+	{
+		TxnMemtableVersionWriter writer = {.xid = frame->writers[k]};
+		TxnSpillSlot slot = {.xid = frame->writers[k]};
+
+		if (!txn_status_kept_roomed(frame->io, &writer, &slot.has, &slot.roomed, frame->error))
+			return false;
+		std_vec_push_Checked(&frame->slots, &slot, sizeof(slot), _Alignof(TxnSpillSlot));
+	}
+	return true;
+}
+
+/* txn_spill_u64_cmp orders u64s ascending. */
+static int
+txn_spill_u64_cmp(const void *a, const void *b)
+{
+	uint64		x = *(const uint64 *) a;
+	uint64		y = *(const uint64 *) b;
+
+	return x < y ? -1 : x > y;
+}
+
+/* txn_spill_carried_ends gathers the ends of the carry's records from its chains' versions, ascending and each once. */
+static bool
+txn_spill_carried_ends(txn_spill_carried_frame_0_t *frame)
+{
+	size_t		kept = 0;
+
+	std_vec_new(&frame->ends, sizeof(uint64), _Alignof(uint64));
+	frame->ends_live = true;
+	for (size_t k = 0; k < frame->chains.len; k++)
+	{
+		const TxnSpillChain *chain = &STD_VEC_AT(&frame->chains, TxnSpillChain, k);
+
+		for (size_t v = 0; v < chain->versions.len; v++)
+		{
+			const txn_TupleU64VecU8_t *version = &STD_VEC_AT(&chain->versions, txn_TupleU64VecU8_t, v);
+			TxnMemtableVersionRecord stored = txn_memtable_version_Record_of(version->f1.ptr, version->f1.len);
+			uint64		lsn;
+
+			if (!txn_memtable_version_Record_lsn(&stored, &lsn))
+				continue;
+			if (!std_vec_try_reserve(&frame->ends, 1, sizeof(uint64), _Alignof(uint64)))
+			{
+				*frame->error = host_Error_out_of_memory();
+				return false;
+			}
+			std_vec_push_Checked(&frame->ends, &lsn, sizeof(uint64), _Alignof(uint64));
+		}
+	}
+	if (frame->ends.len > 1)
+		qsort(frame->ends.ptr, frame->ends.len, sizeof(uint64), txn_spill_u64_cmp);
+	for (size_t k = 0; k < frame->ends.len; k++)
+		if (kept == 0 || STD_VEC_AT(&frame->ends, uint64, kept - 1) != STD_VEC_AT(&frame->ends, uint64, k))
+			STD_VEC_AT(&frame->ends, uint64, kept++) = STD_VEC_AT(&frame->ends, uint64, k);
+	frame->ends.len = kept;
+	return true;
+}
+
+/* txn_spill_unlist_pauses are the pauses an unlist's window runs, loaded before the carry's first count's add. */
+static const char *const txn_spill_unlist_pauses[] = {"doltgres-carry-unlisting", "doltgres-spill-manifest-opened",
+"doltgres-spill-manifest-read"};
+
+/*
+ * txn_spill_carried_made keeps the files the carry listed and, for a logged
+ * storage, its unlist's record, both made before an unlist's window so the
+ * window allocates neither.
+ */
+static bool
+txn_spill_carried_made(txn_spill_carried_frame_0_t *frame)
+{
+	size_t		made = frame->files.len - frame->made_from;
+
+	std_vec_new(&frame->made, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	frame->made_live = true;
+	if (!std_vec_try_reserve_exact(&frame->made, made, sizeof(TxnSpillFile), _Alignof(TxnSpillFile)))
+	{
+		*frame->error = host_Error_out_of_memory();
+		return false;
+	}
+	std_vec_extend_from_slice_Checked(&frame->made, &STD_VEC_AT(&frame->files, TxnSpillFile, frame->made_from), made,
+									  sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	if (frame->ends.len > 0)
+	{
+		TxnRecordCarryUnlisted unlisted = {.storage = frame->storage, .ends = frame->ends};
+
+		txn_record_CarryUnlisted_encode(&unlisted, &frame->body);
+		frame->body_live = true;
+	}
+	return true;
+}
+
+/*
+ * txn_spill_carried_counted adds an amount to a listed carried file's
+ * writer's count through the slot resolved before the hold; a writer below
+ * the first normal xid, or with no entry, takes none.
+ */
+static bool
+txn_spill_carried_counted(txn_spill_carried_frame_0_t *frame, const std_TupleU64U64_t *counted, uint64 amount)
+{
+	const TxnSpillSlot *slot = NULL;
+
+	if (counted->f1 == 0 || counted->f0 < TXN_STATUS_FIRST_NORMAL)
+		return true;
+	for (size_t k = 0; k < frame->slots.len && slot == NULL; k++)
+		if (STD_VEC_AT(&frame->slots, TxnSpillSlot, k).xid == counted->f0)
+			slot = &STD_VEC_AT(&frame->slots, TxnSpillSlot, k);
+
+	/*
+	 * The rewrite's AccessExclusiveLock, taken before its caller read the
+	 * writers, keeps the old storage from gaining a writer the carry spills
+	 * under.
+	 */
+	Assert(slot != NULL);
+	if (slot == NULL || !slot->has)
+		return true;
+	return txn_status_counted(HOST_IO_IO_TAKES_SHORT(frame->io), &frame->hold, slot->roomed, amount, frame->error);
+}
+
+/* txn_spill_carried_unlisted_closure_0 is the unlist's removal's test: one of the files the carry listed. */
+static bool
+txn_spill_carried_unlisted_closure_0(void *captures, const TxnSpillFile *file)
+{
+	const StdVec *made = captures;
+
+	for (size_t k = 0; k < made->len; k++)
+		if (txn_spill_File_PartialEq_eq(&STD_VEC_AT(made, TxnSpillFile, k), file))
+			return true;
+	return false;
+}
+
+/*
+ * txn_spill_carried_unlisted takes the carry's files back out of the
+ * manifest after the add of the count of file at failed did, in one
+ * checkpoint window, Postgres' critical section, so none of its steps can
+ * leave part of it done: it logs the unlist and flushes its record before
+ * the manifest loses a file, as RelationTruncate flushes before a truncate,
+ * takes the files out, and gives back the counts of the files before failed.
+ * A step's failure leaves the window open, which stops the server, as an
+ * error in a critical section does; its restart replays the carry's records
+ * and the unlist.
+ */
+static void
+txn_spill_carried_unlisted(txn_spill_carried_frame_0_t *frame, size_t failed)
+{
+	HostSharedRecord record = host_shared_Held_record(frame->held);
+	StdVec		gone;
+	uint64		lsn;
+
+	if (!host_delay_checkpoint(HOST_IO_IO_IO_DOORS(frame->io), txn_spill_unlist_pauses,
+							   lengthof(txn_spill_unlist_pauses), &frame->window, frame->error))
+		return;
+	frame->window_live = true;
+	if (frame->body_live &&
+		(!host_wal_insert(HOST_IO_IO_IO_DOORS(frame->io), HOST_WAL_KIND_CARRY_UNLISTED, frame->body.ptr, frame->body.len,
+						  &lsn, frame->error) ||
+		 !host_wal_flush(HOST_IO_IO_IO_DOORS(frame->io), lsn, frame->error)))
+		return;
+	if (!host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-carry-unlisting", frame->error) ||
+		!txn_spill_removed(&TXN_SPILL_STATE_HOME_OPS, frame->io, record, &frame->storage,
+						   txn_spill_carried_unlisted_closure_0, &frame->made, &gone, frame->error))
+		return;
+	std_vec_free_Checked(&gone, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	for (size_t k = 0; k < failed; k++)
+	{
+		const std_TupleU64U64_t *counted = &STD_VEC_AT(&frame->counts, std_TupleU64U64_t, k);
+
+		if (!txn_spill_carried_counted(frame, counted, std_wrapping_sub_u64(0, counted->f1)))
+			return;
+	}
+	frame->window_live = false;
+	host_DelayCheckpoint_finish(&frame->window);
+}
+
+/* txn_spill_carried_body_0 is carried's body. */
+static void
+txn_spill_carried_body_0(void *frame_)
+{
+	txn_spill_carried_frame_0_t *frame = frame_;
+	HostSharedRecord record = host_shared_Held_record(frame->held);
+	static const TxnWrittenOf ofs[3] = {TXN_WRITTEN_OF_ROWS, TXN_WRITTEN_OF_FREE, TXN_WRITTEN_OF_VALUES};
+	TxnStatePersistence persistence;
+	StdStr		parent;
+	ChunksErrorError failed;
+
+	if (!txn_state_described(record, &frame->storage, &persistence))
+	{
+		frame->ok = true;
+		return;
+	}
+	for (size_t k = 0; k < lengthof(ofs); k++)
+		if (!txn_spill_State_Home_kind(frame->io, frame->held, ofs[k], &frame->kinds[k], &frame->tails[k],
+									   frame->error))
+			return;
+	txn_runs_spill_directory(frame->storage.database, txn_state_own(record), &frame->dir);
+	frame->dir_live = true;
+	if (!std_path_parent(frame->dir.bytes.ptr, frame->dir.bytes.len, &parent))
+	{
+		parent.ptr = frame->dir.bytes.ptr;
+		parent.len = frame->dir.bytes.len;
+	}
+	if (!chunks_file_create_dir(HOST_IO_IO_IO_DOORS(frame->io), parent.ptr, parent.len, &failed) ||
+		!chunks_file_create_dir(HOST_IO_IO_IO_DOORS(frame->io), frame->dir.bytes.ptr, frame->dir.bytes.len, &failed))
+	{
+		*frame->error = txn_base_storage(&failed);
+		txn_spill_carried_pad_0(frame);
+		return;
+	}
+	txn_spill_manifest(&TXN_SPILL_STATE_HOME_OPS, record, &frame->storage, &frame->path);
+	frame->path_live = true;
+	if (!txn_spill_pended(&TXN_SPILL_STATE_HOME_OPS, record, &frame->storage, &frame->slotted, frame->error))
+	{
+		txn_spill_carried_pad_0(frame);
+		return;
+	}
+	frame->slotted_live = true;
+	if (!txn_spill_carried_slots(frame))
+	{
+		txn_spill_carried_pad_0(frame);
+		return;
+	}
+	if (!host_shared_Record_lock_long(record, HOST_IO_IO_TAKES_SHORT(frame->io), TXN_STATE_SPILLS_WRITING_INDEX,
+									  &frame->writing, frame->error))
+	{
+		txn_spill_carried_pad_0(frame);
+		return;
+	}
+	frame->writing_live = true;
+	frame->long_io = host_shared_LongGuard_io(&frame->writing);
+	std_vec_new(&frame->chains, sizeof(TxnSpillChain), _Alignof(TxnSpillChain));
+	if (!frame->logged(frame->captures, &frame->long_io, &frame->chains, frame->error))
+	{
+		for (size_t k = 0; k < frame->chains.len; k++)
+			txn_spill_Chain_drop(&STD_VEC_AT(&frame->chains, TxnSpillChain, k));
+		std_vec_free_Checked(&frame->chains, sizeof(TxnSpillChain), _Alignof(TxnSpillChain));
+		txn_spill_carried_pad_0(frame);
+		return;
+	}
+	if (!txn_spill_carried_ends(frame) || !txn_spill_layered(&frame->chains, &frame->layers, frame->error))
+	{
+		txn_spill_carried_pad_0(frame);
+		return;
+	}
+	frame->layers_live = true;
+	if (!host_pause(HOST_SHARED_LONG_IO_PAUSES(&frame->long_io), "doltgres-carry-logged", frame->error) ||
+		!txn_spill_read(HOST_IO_IO_DOORS_READ_DOORS(HOST_SHARED_LONG_IO_IO_DOORS(&frame->long_io)),
+						HOST_SHARED_LONG_IO_PAUSES(&frame->long_io), &frame->path, &frame->files, frame->error))
+	{
+		txn_spill_carried_pad_0(frame);
+		return;
+	}
+	frame->files_live = true;
+	frame->made_from = frame->files.len;
+	std_vec_new(&frame->counts, sizeof(std_TupleU64U64_t), _Alignof(std_TupleU64U64_t));
+	frame->counts_live = true;
+	for (size_t d = 0; d < frame->layers.len; d++)
+	{
+		const StdVec *layer = &STD_VEC_AT(&frame->layers, StdVec, d);
+
+		for (size_t f = 0; f < layer->len; f++)
+			if (!txn_spill_carried_file(frame, &STD_VEC_AT(layer, TxnSpillLayerFile, f)))
+			{
+				txn_spill_carried_pad_0(frame);
+				return;
+			}
+	}
+	if (!txn_spill_carried_made(frame) ||
+		!host_load_pauses(HOST_IO_IO_IO_DOORS(frame->io), txn_spill_unlist_pauses, lengthof(txn_spill_unlist_pauses),
+						  frame->error) ||
+		!host_delta_hold(frame->io, &frame->hold, frame->error))
+	{
+		txn_spill_carried_pad_0(frame);
+		return;
+	}
+	frame->hold_live = true;
+	if (!host_pause(HOST_SHARED_LONG_IO_PAUSES(&frame->long_io), "doltgres-carry-written", frame->error) ||
+		!txn_spill_rewrote(&TXN_SPILL_STATE_HOME_OPS, &frame->long_io, record, &frame->path, &frame->files,
+						   frame->error))
+	{
+		txn_spill_carried_pad_0(frame);
+		return;
+	}
+	frame->writing_live = false;
+	host_shared_LongGuard_drop(&frame->writing);
+	for (size_t k = 0; k < frame->counts.len; k++)
+	{
+		const std_TupleU64U64_t *counted = &STD_VEC_AT(&frame->counts, std_TupleU64U64_t, k);
+
+		if (!host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-carry-counting", frame->error) ||
+			!txn_spill_carried_counted(frame, counted, counted->f1))
+		{
+			txn_spill_carried_unlisted(frame, k);
+			txn_spill_carried_pad_0(frame);
+			return;
+		}
+	}
+	frame->ok = true;
+	txn_spill_carried_pad_0(frame);
+}
+
+/*
+ * txn_spill_carried writes a carry's versions of other writers into a
+ * rewrite's or a move's new storage as spill files under each writer's
+ * top-level xid (P2), disk to disk, so the carry never waits at the delta's
+ * budget on versions it can't spill: under one hold of the storage's
+ * manifest's writers' lock, taken before any record, logged logs their
+ * records and answers each tree's chains with every version's record, its
+ * LSN the record's end; their layers' files (layered) are written and
+ * synced, numbered through the state's numbered as a residual's are, a row
+ * file with its file of spilled tuple ids, and listed oldest layer first,
+ * newest last; after the hold each file's versions are counted at its
+ * writer's entry as their pushes would be, a lock's left out. A checkpoint
+ * whose redo point falls after the records names the files, since its naming
+ * takes the same lock (named); one before them replays the records, which
+ * redo's holds check applies once. A failed write raises its error, leaving
+ * the files unlisted for the sweep.
+ */
+bool
+txn_spill_carried(HostIoIo *io, const HostSharedHeld *held, const uint64 *writers, size_t writers_len,
+				  bool (*logged) (void *captures, HostSharedLongIo *io, StdVec *chains, HostError *error),
+				  void *captures, HostError *error)
+{
+	txn_spill_carried_frame_0_t frame = {.io = io, .held = held, .logged = logged, .captures = captures,
+	.error = error, .writers = writers, .writers_len = writers_len};
+
+	std_landing(&frame, txn_spill_carried_body_0, txn_spill_carried_pad_0);
+	return frame.ok;
+}
+
+/*
+ * txn_spill_unlisted_redo_captures_t is an unlist's redo's walk's captures:
+ * the state, the tree walked, the carry's ends, ascending, and for the rows
+ * the tuple ids of the rows taken out, or for the free space map those rows'
+ * tuple ids, ascending, whose takes go too.
+ */
+typedef struct txn_spill_unlisted_redo_captures_t
+{
+	HostSharedRecord record;
+	const TxnMemtableTableTreeOps *tree;
+	const StdVec *ends;
+	StdVec	   *tids;
+	const StdVec *carried;
+} txn_spill_unlisted_redo_captures_t;
+
+/* txn_spill_unlisted_redo_frame_t is the walk's state at one key across its pad: the hold, the key's versions, and the handles taken out, each while live. */
+typedef struct txn_spill_unlisted_redo_frame_t
+{
+	txn_spill_unlisted_redo_captures_t *walk;
+	HostIoIo   *io;
+	const uint8 *key;
+	size_t		key_len;
+	HostDeltaHold hold;
+	bool		hold_live;
+	StdVec		versions;
+	bool		versions_live;
+	StdVec		handles;
+	bool		handles_live;
+	StdVec		taken;
+	bool		taken_live;
+	HostError  *error;
+	bool		ok;
+} txn_spill_unlisted_redo_frame_t;
+
+/* txn_spill_ends_hold reports whether a carry's ends, ascending, hold an LSN. */
+static bool
+txn_spill_ends_hold(const StdVec *ends, uint64 lsn)
+{
+	size_t		low = 0;
+	size_t		high = ends->len;
+
+	while (low < high)
+	{
+		size_t		mid = low + (high - low) / 2;
+		uint64		at = STD_VEC_AT(ends, uint64, mid);
+
+		if (at == lsn)
+			return true;
+		if (at < lsn)
+			low = mid + 1;
+		else
+			high = mid;
+	}
+	return false;
+}
+
+/*
+ * txn_spill_unlisted_redo_body takes out the key's versions whose LSN is one
+ * of the carry's ends, and in the free space map the takes of the carried
+ * rows too, with their counts.
+ */
+static void
+txn_spill_unlisted_redo_body(void *frame_)
+{
+	txn_spill_unlisted_redo_frame_t *frame = frame_;
+	txn_spill_unlisted_redo_captures_t *walk = frame->walk;
+
+	if (!host_delta_hold(frame->io, &frame->hold, frame->error))
+		return;
+	frame->hold_live = true;
+	if (!txn_memtable_table_chain(walk->tree, frame->io, &frame->hold, walk->record, frame->key, frame->key_len,
+								  &frame->versions, frame->error))
+		return;
+	frame->versions_live = true;
+	std_vec_new(&frame->handles, sizeof(TxnMemtableVersionHandle), _Alignof(TxnMemtableVersionHandle));
+	frame->handles_live = true;
+	for (size_t i = 0; i < frame->versions.len; i++)
+	{
+		TxnMemtableVersionVersion *version = &STD_VEC_AT(&frame->versions, TxnMemtableVersionVersion, i);
+		TxnMemtableVersionRecord record = txn_memtable_version_Version_record(version);
+		uint64		lsn;
+
+		uint64		tid = txn_memtable_map_taken(txn_memtable_version_Record_op(&record)).f0;
+
+		if (!(txn_memtable_version_Record_lsn(&record, &lsn) && txn_spill_ends_hold(walk->ends, lsn)) &&
+			!(walk->carried != NULL && tid != 0 && txn_spill_ends_hold(walk->carried, tid)))
+			continue;
+		if (walk->tids != NULL && txn_spill_op_tid(txn_memtable_version_Record_op(&record), &tid))
+		{
+			if (!std_vec_try_reserve(walk->tids, 1, sizeof(uint64), _Alignof(uint64)))
+			{
+				*frame->error = host_Error_out_of_memory();
+				return;
+			}
+			std_vec_push_Checked(walk->tids, &tid, sizeof(uint64), _Alignof(uint64));
+		}
+		if (!std_vec_try_reserve(&frame->handles, 1, sizeof(TxnMemtableVersionHandle),
+								 _Alignof(TxnMemtableVersionHandle)))
+		{
+			*frame->error = host_Error_out_of_memory();
+			return;
+		}
+		std_vec_push_Checked(&frame->handles, &version->handle, sizeof(TxnMemtableVersionHandle),
+							 _Alignof(TxnMemtableVersionHandle));
+	}
+	if (frame->handles.len > 0)
+	{
+		if (!txn_memtable_table_removed(walk->tree, frame->io, walk->record, frame->key, frame->key_len,
+										frame->handles.ptr, frame->handles.len, &frame->taken, frame->error))
+			return;
+		frame->taken_live = true;
+	}
+	frame->ok = true;
+}
+
+/* txn_spill_unlisted_redo_pad frees what the walk holds live at its key. */
+static void
+txn_spill_unlisted_redo_pad(void *frame_)
+{
+	txn_spill_unlisted_redo_frame_t *frame = frame_;
+
+	if (frame->taken_live)
+		std_vec_free_Checked(&frame->taken, sizeof(bool), _Alignof(bool));
+	if (frame->handles_live)
+		std_vec_free_Checked(&frame->handles, sizeof(TxnMemtableVersionHandle), _Alignof(TxnMemtableVersionHandle));
+	if (frame->versions_live)
+		txn_memtable_version_versions_drop(&frame->versions, 0);
+	if (frame->hold_live)
+		host_delta_Hold_drop(&frame->hold);
+	frame->taken_live = frame->handles_live = frame->versions_live = frame->hold_live = false;
+}
+
+/* txn_spill_unlisted_redo_closure_0 is the unlist's redo's walk's closure, of one key of a tree. */
+static bool
+txn_spill_unlisted_redo_closure_0(void *captures, HostIoIo *io, const uint8 *key, size_t key_len,
+								  const StdVec *values, size_t values_len, HostError *error)
+{
+	txn_spill_unlisted_redo_frame_t frame = {.walk = captures, .io = io, .key = key, .key_len = key_len,
+	.error = error};
+
+	std_landing(&frame, txn_spill_unlisted_redo_body, txn_spill_unlisted_redo_pad);
+	txn_spill_unlisted_redo_pad(&frame);
+	return frame.ok;
+}
+
+/*
+ * txn_spill_unlisted_redone takes out of one of a storage's memtables each
+ * version whose LSN is one of an unlisted carry's ends, adding the rows'
+ * tuple ids to tids when given, and with the carried rows' tuple ids given,
+ * the free space takes of those rows too, which carry no LSN, each with its
+ * count, as its primary took the carry's files back out (bugs row 291's
+ * review R2, G1, and G2).
+ */
+static bool
+txn_spill_unlisted_redone(HostIoIo *io, const HostSharedHeld *held, const TxnMemtableTableTreeOps *tree,
+						  const TxnRecordCarryUnlisted *unlisted, StdVec *tids, const StdVec *carried,
+						  HostError *error)
+{
+	txn_spill_unlisted_redo_captures_t walk = {host_shared_Held_record(held), tree, &unlisted->ends, tids, carried};
+
+	return txn_memtable_table_walked_killed(tree, io, walk.record, txn_spill_unlisted_redo_closure_0, &walk, NULL,
+											error);
+}
+
+/*
+ * txn_spill_unlisted_run_frame_t is an unlist's redo's state at one writer's
+ * run of a kind across its pad: the files listed, the run's files and its
+ * rows' tuple-id files, and what the joins leave out, each while live.
+ */
+typedef struct txn_spill_unlisted_run_frame_t
+{
+	HostIoIo   *io;
+	HostSharedRecord record;
+	const HostStorage *storage;
+	const StdPathBuf *dir;
+	const StdVec *ends;
+	const StdVec *carried;
+	uint64		xid;
+	TxnRunsKind kind;
+	TxnRunsTail tail;
+	HostError  *error;
+	bool		ok;
+	txn_TupleVecFileU64_t listed;
+	bool		listed_live;
+	StdVec		own;
+	bool		own_live;
+	StdVec		named;
+	bool		named_live;
+	TxnSpillLeft left;
+	bool		left_live;
+	StdVec		gone;
+	bool		gone_live;
+} txn_spill_unlisted_run_frame_t;
+
+/* txn_spill_unlisted_run_pad frees what the run holds live. */
+static void
+txn_spill_unlisted_run_pad(void *frame_)
+{
+	txn_spill_unlisted_run_frame_t *frame = frame_;
+
+	if (frame->gone_live)
+		std_vec_free_Checked(&frame->gone, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	if (frame->left_live)
+		std_vec_free_Checked(&frame->left.tids, sizeof(uint64), _Alignof(uint64));
+	if (frame->named_live)
+		std_vec_free_Checked(&frame->named, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	if (frame->own_live)
+		std_vec_free_Checked(&frame->own, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	if (frame->listed_live)
+		std_vec_free_Checked(&frame->listed.f0, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	frame->gone_live = frame->left_live = frame->named_live = frame->own_live = frame->listed_live = false;
+}
+
+/* txn_spill_unlisted_run_closure_0 is the run's removal's test: one of the files the run's listing replaces. */
+static bool
+txn_spill_unlisted_run_closure_0(void *captures, const TxnSpillFile *file)
+{
+	return txn_spill_replaced_by(captures, 1, file);
+}
+
+/* txn_spill_tid_cmp orders tuple ids ascending. */
+static int
+txn_spill_tid_cmp(const void *a, const void *b)
+{
+	uint64		x = *(const uint64 *) a;
+	uint64		y = *(const uint64 *) b;
+
+	return x < y ? -1 : x > y;
+}
+
+/*
+ * txn_spill_unlisted_run_body joins the writer's whole run of the kind, and
+ * for rows its tuple-id files of the same numbers, without the carry's
+ * versions and their rows' tuple ids; when it left out any, it lists the
+ * join in place of the run, as a merge lists its file, or takes the run out
+ * whole when nothing is left, and gives the dropped versions' count back at
+ * the writer's entry.
+ */
+static void
+txn_spill_unlisted_run_body(void *frame_)
+{
+	txn_spill_unlisted_run_frame_t *frame = frame_;
+	TxnRunsNames names;
+	TxnRunsNames tuple_names;
+	TxnRunsTail none = {.tag = TXN_RUNS_TAIL_NONE};
+	TxnSpillFile listing[2] = {0};
+	size_t		listing_len = 1;
+	uint32		number = 0;
+	uint32		lowest = PG_UINT32_MAX;
+	txn_TupleU64KindU32OptionU32_t replacing;
+	HostXid		xid = {frame->xid};
+	bool		has;
+	uint64		added;
+
+	if (!txn_spill_listed(&TXN_SPILL_STATE_HOME_OPS, frame->io, frame->record, frame->storage, &frame->listed,
+						  frame->error))
+		return;
+	frame->listed_live = true;
+	std_vec_new(&frame->own, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	frame->own_live = true;
+	std_vec_new(&frame->named, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	frame->named_live = true;
+	for (size_t k = 0; k < frame->listed.f0.len; k++)
+	{
+		const TxnSpillFile *file = &STD_VEC_AT(&frame->listed.f0, TxnSpillFile, k);
+		StdVec	   *into = file->kind == frame->kind ? &frame->own :
+			file->kind == TXN_RUNS_KIND_SPILLED_TUPLES && frame->kind == TXN_RUNS_KIND_SPILLED_ROWS ? &frame->named :
+			NULL;
+
+		if (file->xid != frame->xid || into == NULL)
+			continue;
+		if (!std_vec_try_reserve(into, 1, sizeof(TxnSpillFile), _Alignof(TxnSpillFile)))
+		{
+			*frame->error = host_Error_out_of_memory();
+			return;
+		}
+		std_vec_push_Checked(into, file, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	}
+	if (frame->own.len == 0)
+	{
+		frame->ok = true;
+		return;
+	}
+	for (size_t k = 0; k < frame->own.len; k++)
+	{
+		number = Max(number, STD_ADD(u32, STD_VEC_AT(&frame->own, TxnSpillFile, k).number, 1, 0, 0));
+		lowest = Min(lowest, STD_VEC_AT(&frame->own, TxnSpillFile, k).number);
+	}
+	frame->left = (TxnSpillLeft)
+	{
+		.ends = frame->ends, .carried = frame->carried
+	};
+	std_vec_new(&frame->left.tids, sizeof(uint64), _Alignof(uint64));
+	frame->left_live = true;
+	if (!txn_spill_names(&TXN_SPILL_STATE_HOME_OPS, frame->record, frame->storage, frame->kind, frame->xid, &names,
+						 frame->error) ||
+		!txn_spill_joined(frame->io, frame->dir, &names, frame->tail, frame->own.ptr, frame->own.len, number,
+						  &frame->left, &listing[0], frame->error))
+		return;
+	if (frame->left.dropped == 0)
+	{
+		frame->ok = true;
+		return;
+	}
+	if (frame->left.tids.len > 1)
+		qsort(frame->left.tids.ptr, frame->left.tids.len, sizeof(uint64), txn_spill_tid_cmp);
+	if (frame->named.len > 0)
+	{
+		if (!txn_spill_names(&TXN_SPILL_STATE_HOME_OPS, frame->record, frame->storage, TXN_RUNS_KIND_SPILLED_TUPLES,
+							 frame->xid, &tuple_names, frame->error) ||
+			!txn_spill_joined(frame->io, frame->dir, &tuple_names, none, frame->named.ptr, frame->named.len, number,
+							  &frame->left, &listing[1], frame->error))
+			return;
+		listing_len = listing[1].len > 0 ? 2 : 1;
+	}
+	replacing.f0 = frame->xid;
+	replacing.f1 = frame->kind;
+	replacing.f2 = number;
+	replacing.has_f3 = true;
+	replacing.f3 = lowest;
+	if (listing[0].len == 0)
+	{
+		if (!txn_spill_removed(&TXN_SPILL_STATE_HOME_OPS, frame->io, frame->record, frame->storage,
+							   txn_spill_unlisted_run_closure_0, &replacing, &frame->gone, frame->error))
+			return;
+		frame->gone_live = true;
+	}
+	else if (!txn_spill_pend(&TXN_SPILL_STATE_HOME_OPS, frame->io, frame->record, frame->storage, &listing[0],
+							 listing_len > 1, true, lowest, frame->error) ||
+			 !txn_spill_linked(&TXN_SPILL_STATE_HOME_OPS, frame->io, frame->record, frame->storage, listing,
+							   listing_len, true, replacing, frame->error) ||
+			 !txn_spill_settled(&TXN_SPILL_STATE_HOME_OPS, frame->io, &frame->record, frame->error))
+		return;
+	if (frame->xid >= TXN_STATUS_FIRST_NORMAL &&
+		!txn_status_add(frame->io, xid, std_wrapping_sub_u64(0, frame->left.dropped), &has, &added, frame->error))
+		return;
+	frame->ok = true;
+}
+
+/* txn_spill_unlisted_run does one writer's run of a kind of an unlist's redo, as its body does. */
+static bool
+txn_spill_unlisted_run(HostIoIo *io, HostSharedRecord record, const HostStorage *storage, const StdPathBuf *dir,
+					   const StdVec *ends, const StdVec *carried, StdVec *tids, uint64 xid, TxnRunsKind kind,
+					   TxnRunsTail tail, HostError *error)
+{
+	txn_spill_unlisted_run_frame_t frame = {.io = io, .record = record, .storage = storage, .dir = dir, .ends = ends,
+	.carried = carried, .xid = xid, .kind = kind, .tail = tail, .error = error};
+
+	std_landing(&frame, txn_spill_unlisted_run_body, txn_spill_unlisted_run_pad);
+	if (frame.ok && frame.left_live && tids != NULL)
+		std_vec_extend_from_slice_Checked(tids, frame.left.tids.ptr, frame.left.tids.len, sizeof(uint64),
+										  _Alignof(uint64));
+	txn_spill_unlisted_run_pad(&frame);
+	return frame.ok;
+}
+
+/*
+ * txn_spill_unlisted_of redoes an unlist's spill files of one tree: each
+ * writer's run of its kind joined without the carry's versions, or for the
+ * free space map without the carried rows' takes, adding a rows run's
+ * dropped tuple ids to tids when given.
+ */
+static bool
+txn_spill_unlisted_of(HostIoIo *io, const HostSharedHeld *held, const HostStorage *storage, const StdPathBuf *dir,
+					  const TxnRecordCarryUnlisted *unlisted, TxnWrittenOf of, const StdVec *carried, StdVec *tids,
+					  HostError *error)
+{
+	HostSharedRecord record = host_shared_Held_record(held);
+	TxnRunsKind kind;
+	TxnRunsTail tail;
+	txn_TupleVecFileU64_t listed;
+	StdVec		xids;
+	bool		ok;
+
+	if (!txn_spill_State_Home_kind(io, held, of, &kind, &tail, error) ||
+		!txn_spill_listed(&TXN_SPILL_STATE_HOME_OPS, io, record, storage, &listed, error))
+		return false;
+	std_vec_new(&xids, sizeof(uint64), _Alignof(uint64));
+	for (size_t k = 0; k < listed.f0.len; k++)
+	{
+		const TxnSpillFile *file = &STD_VEC_AT(&listed.f0, TxnSpillFile, k);
+
+		if (file->kind == kind && !txn_spill_has_xid(&xids, file->xid))
+			std_vec_push_Checked(&xids, &file->xid, sizeof(uint64), _Alignof(uint64));
+	}
+	std_vec_free_Checked(&listed.f0, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	ok = true;
+	for (size_t k = 0; k < xids.len && ok; k++)
+		ok = txn_spill_unlisted_run(io, record, storage, dir, &unlisted->ends, carried, tids,
+									STD_VEC_AT(&xids, uint64, k), kind, tail, error);
+	std_vec_free_Checked(&xids, sizeof(uint64), _Alignof(uint64));
+	return ok;
+}
+
+/*
+ * txn_spill_redo_unlisted replays a carry's unlist (bugs row 291's review
+ * R2): it takes out of the storage's delta each version whose LSN is one of
+ * the record's ends, with its count, from the memtables and, for each
+ * writer's run of spill files of the rows, the free space map, or the value
+ * map holding one, by a join of the run without them listed in its place,
+ * and the free space takes of the rows it takes out, which carry no LSN, so
+ * a standby or a restart keeps none of a carry its primary took back.
+ */
+bool
+txn_spill_redo_unlisted(HostIoIo *io, const HostSharedHeld *held, const TxnRecordCarryUnlisted *unlisted,
+						HostError *error)
+{
+	HostSharedRecord record = host_shared_Held_record(held);
+	HostStorage storage;
+	TxnStatePersistence persistence;
+	StdPathBuf	dir;
+	bool		described = txn_state_described(record, &storage, &persistence);
+	bool		ok;
+	StdVec		tids;
+	size_t		kept = 0;
+
+	std_vec_new(&tids, sizeof(uint64), _Alignof(uint64));
+	if (described)
+		txn_runs_spill_directory(storage.database, txn_state_own(record), &dir);
+	ok = txn_spill_unlisted_redone(io, held, &TXN_MEMTABLE_TABLE_ROWS_TREE_OPS, unlisted, &tids, NULL, error) &&
+		(!described || txn_spill_unlisted_of(io, held, &storage, &dir, unlisted, TXN_WRITTEN_OF_ROWS, NULL, &tids,
+											 error));
+	if (ok && tids.len > 1)
+		qsort(tids.ptr, tids.len, sizeof(uint64), txn_spill_tid_cmp);
+	for (size_t k = 0; ok && k < tids.len; k++)
+		if (kept == 0 || STD_VEC_AT(&tids, uint64, kept - 1) != STD_VEC_AT(&tids, uint64, k))
+			STD_VEC_AT(&tids, uint64, kept++) = STD_VEC_AT(&tids, uint64, k);
+	tids.len = kept;
+	ok = ok && txn_spill_unlisted_redone(io, held, &TXN_MEMTABLE_MAP_FREE_TREE_OPS, unlisted, NULL, &tids, error) &&
+		txn_spill_unlisted_redone(io, held, &TXN_MEMTABLE_MAP_VALUES_TREE_OPS, unlisted, NULL, NULL, error) &&
+		(!described ||
+		 (txn_spill_unlisted_of(io, held, &storage, &dir, unlisted, TXN_WRITTEN_OF_FREE, &tids, NULL, error) &&
+		  txn_spill_unlisted_of(io, held, &storage, &dir, unlisted, TXN_WRITTEN_OF_VALUES, NULL, NULL, error)));
+	std_vec_free_Checked(&tids, sizeof(uint64), _Alignof(uint64));
+	if (described)
+		std_vec_free_Checked(&dir.bytes, 1, 1);
+	return ok;
 }
 
 /* txn_spill_unfolded_frame_0_t is unfolded_since's state across its pad: the newest base, the hold, and the next key found, while live. */
@@ -4130,6 +6932,8 @@ typedef struct txn_spill_unfolded_frame_0_t
 	bool		hold_live;
 	txn_TupleVecU8VecVersion_t next;
 	bool		next_live;
+	txn_TupleVecFileU64_t listed;
+	bool		listed_live;
 } txn_spill_unfolded_frame_0_t;
 
 /* txn_spill_unfolded_pad_0 is unfolded_since's pad: what it holds, while live. */
@@ -4138,6 +6942,11 @@ txn_spill_unfolded_pad_0(void *frame_)
 {
 	txn_spill_unfolded_frame_0_t *frame = frame_;
 
+	if (frame->listed_live)
+	{
+		frame->listed_live = false;
+		std_vec_free_Checked(&frame->listed.f0, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	}
 	if (frame->next_live)
 	{
 		frame->next_live = false;
@@ -4170,20 +6979,43 @@ txn_spill_unfolded_body_0(void *frame_)
 	if (!txn_state_newest(frame->io, frame->held, &some, &frame->base, frame->error))
 		return;
 	frame->base_live = some;
-	if (some && frame->base.folded >= frame->end)
+	if (some && frame->base.read >= frame->end)
 	{
 		frame->ok = true;
 		txn_spill_unfolded_pad_0(frame);
 		return;
 	}
-	if (host_shared_Record_atomic(record, TXN_STATE_SPILLS_INDEX, load) != 0 ||
-		host_shared_Record_atomic(record, TXN_STATE_SPILLS_PENDING_INDEX, load) != 0 ||
+	if (host_shared_Record_atomic(record, TXN_STATE_SPILLS_PENDING_INDEX, load) != 0 ||
 		txn_memtable_table_memtable(&TXN_MEMTABLE_MAP_VALUES_TREE_OPS, record, &word))
 	{
 		*frame->result = true;
 		frame->ok = true;
 		txn_spill_unfolded_pad_0(frame);
 		return;
+	}
+	if (host_shared_Record_atomic(record, TXN_STATE_SPILLS_INDEX, load) != 0)
+	{
+		HostStorage storage;
+		TxnStatePersistence persistence;
+
+		if (txn_state_described(record, &storage, &persistence))
+		{
+			if (!txn_spill_listed(&TXN_SPILL_STATE_HOME_OPS, frame->io, record, &storage, &frame->listed,
+								  frame->error))
+			{
+				txn_spill_unfolded_pad_0(frame);
+				return;
+			}
+			frame->listed_live = true;
+			for (size_t k = 0; k < frame->listed.f0.len && !*frame->result; k++)
+				*frame->result = STD_VEC_AT(&frame->listed.f0, TxnSpillFile, k).kind != TXN_RUNS_KIND_SPILLED_FREE;
+		}
+		if (*frame->result)
+		{
+			frame->ok = true;
+			txn_spill_unfolded_pad_0(frame);
+			return;
+		}
 	}
 	if (!host_delta_hold(frame->io, &frame->hold, frame->error))
 	{
@@ -4205,8 +7037,10 @@ txn_spill_unfolded_body_0(void *frame_)
 
 /*
  * txn_spill_unfolded_since reports whether a storage state's newest base is
- * folded below a commit's end while the state holds a row, entry, or value
- * map version that no fold applied, in its memtables or its spills.
+ * read below a commit's end while the state holds a row, entry, or value map
+ * version that no fold applied, in its memtables or its spills, which may
+ * name a chunk of that commit's transaction; its free space map's versions
+ * name none.
  */
 static bool
 txn_spill_unfolded_since(HostIoIo *io, const HostSharedHeld *held, HostLsn end, bool *result, HostError *error)
@@ -4945,7 +7779,24 @@ typedef struct txn_spill_files_frame_0_t
 	bool		name_live;
 	StdPathBuf	path;
 	bool		path_live;
+	/* through is the point the newest base passed a map's spills at, or 0. */
+	HostLsn		through;
+	/* residuals is a Vec<FilesResidual> of the residuals read at that point. */
+	StdVec		residuals;
+	bool		residuals_live;
+	/* passing is a Vec<(u64, u64)> of each transaction's passing point. */
+	StdVec		passing;
+	bool		passing_live;
 } txn_spill_files_frame_0_t;
+
+/* TxnSpillFilesResidual is a transaction's residual of a kind that files reads, with its fold's point and the greatest number. */
+typedef struct TxnSpillFilesResidual
+{
+	uint64		xid;
+	TxnRunsKind kind;
+	HostLsn		from;
+	uint32		number;
+} TxnSpillFilesResidual;
 
 /* txn_spill_files_pad_0 is files' pad: what it holds, while live. */
 static void
@@ -4953,6 +7804,16 @@ txn_spill_files_pad_0(void *frame_)
 {
 	txn_spill_files_frame_0_t *frame = frame_;
 
+	if (frame->passing_live)
+	{
+		frame->passing_live = false;
+		std_vec_free_Checked(&frame->passing, sizeof(std_TupleU64U64_t), _Alignof(std_TupleU64U64_t));
+	}
+	if (frame->residuals_live)
+	{
+		frame->residuals_live = false;
+		std_vec_free_Checked(&frame->residuals, sizeof(TxnSpillFilesResidual), _Alignof(TxnSpillFilesResidual));
+	}
 	if (frame->path_live)
 	{
 		frame->path_live = false;
@@ -5021,6 +7882,105 @@ txn_spill_files_hit(txn_spill_files_frame_0_t *frame, const TxnSpillFile *file, 
 	return true;
 }
 
+/* txn_spill_files_residuals gathers the residuals of the listed files read at the newest base's point: of each transaction and kind, the greatest number. */
+static bool
+txn_spill_files_residuals(txn_spill_files_frame_0_t *frame)
+{
+	std_vec_new(&frame->residuals, sizeof(TxnSpillFilesResidual), _Alignof(TxnSpillFilesResidual));
+	frame->residuals_live = true;
+	for (size_t k = 0; k < frame->listed.f0.len; k++)
+	{
+		const TxnSpillFile *file = &STD_VEC_AT(&frame->listed.f0, TxnSpillFile, k);
+		TxnSpillFilesResidual residual = {file->xid, file->kind, file->from, file->number};
+		bool		found = false;
+
+		if (file->from == 0 || file->from != frame->through)
+			continue;
+		for (size_t j = 0; j < frame->residuals.len && !found; j++)
+		{
+			TxnSpillFilesResidual *at = &STD_VEC_AT(&frame->residuals, TxnSpillFilesResidual, j);
+
+			found = at->xid == file->xid && at->kind == file->kind;
+			if (found && (file->from > at->from || (file->from == at->from && file->number > at->number)))
+				*at = residual;
+		}
+		if (found)
+			continue;
+		if (!std_vec_try_reserve(&frame->residuals, 1, sizeof(residual), _Alignof(TxnSpillFilesResidual)))
+		{
+			*frame->error = host_Error_out_of_memory();
+			return false;
+		}
+		std_vec_push_Checked(&frame->residuals, &residual, sizeof(residual), _Alignof(TxnSpillFilesResidual));
+	}
+	return true;
+}
+
+/*
+ * txn_spill_files_passed reports whether a listed file is left out of the
+ * read: of a residual's transaction and kind every file but that residual,
+ * any other residual, and a map's spill the newest base passed, a committed
+ * transaction's whose commit ends at or below the base's point or one
+ * marked with a passing point there.
+ */
+static bool
+txn_spill_files_passed(txn_spill_files_frame_0_t *frame, const TxnSpillFile *file, bool *result)
+{
+	uint64		point = 0;
+	bool		cached = false;
+
+	*result = false;
+	for (size_t j = 0; j < frame->residuals.len; j++)
+	{
+		const TxnSpillFilesResidual *residual = &STD_VEC_AT(&frame->residuals, TxnSpillFilesResidual, j);
+
+		if (residual->xid == file->xid && residual->kind == file->kind)
+		{
+			*result = file->from != residual->from || file->number != residual->number;
+			return true;
+		}
+	}
+	if (file->from != 0)
+	{
+		*result = true;
+		return true;
+	}
+	if (frame->through == 0)
+		return true;
+	for (size_t j = 0; j < frame->passing.len && !cached; j++)
+	{
+		const std_TupleU64U64_t *passing = &STD_VEC_AT(&frame->passing, std_TupleU64U64_t, j);
+
+		cached = passing->f0 == file->xid;
+		if (cached)
+			point = passing->f1;
+	}
+	if (!cached)
+	{
+		std_TupleU64U64_t passing = {file->xid, file->passed};
+
+		if (file->passed == 0)
+		{
+			HostXid		xid = {file->xid};
+			TxnStatusCommit commit;
+
+			if (!txn_status_committed(frame->io, xid, &commit, frame->error))
+				return false;
+			if (commit.tag == TXN_STATUS_COMMIT_AT)
+				passing.f1 = commit.u.at;
+		}
+		if (!std_vec_try_reserve(&frame->passing, 1, sizeof(passing), _Alignof(std_TupleU64U64_t)))
+		{
+			*frame->error = host_Error_out_of_memory();
+			return false;
+		}
+		std_vec_push_Checked(&frame->passing, &passing, sizeof(passing), _Alignof(std_TupleU64U64_t));
+		point = passing.f1;
+	}
+	*result = point != 0 && point <= frame->through;
+	return true;
+}
+
 /* txn_spill_files_body_0 is files' body. */
 static void
 txn_spill_files_body_0(void *frame_)
@@ -5037,6 +7997,15 @@ txn_spill_files_body_0(void *frame_)
 	frame->dir_live = true;
 	std_vec_new(frame->result, sizeof(TxnSpillReading), _Alignof(TxnSpillReading));
 	frame->result_live = true;
+	std_vec_new(&frame->passing, sizeof(std_TupleU64U64_t), _Alignof(std_TupleU64U64_t));
+	frame->passing_live = true;
+	if (((frame->kind == TXN_RUNS_KIND_SPILLED_FREE || frame->kind == TXN_RUNS_KIND_SPILLED_VALUES) &&
+		 !frame->home->through(frame->io, frame->state, &frame->through, frame->error)) ||
+		!txn_spill_files_residuals(frame))
+	{
+		txn_spill_files_pad_0(frame);
+		return;
+	}
 	for (size_t k = 0; k < frame->slotted.len; k++)
 	{
 		const txn_TupleU64KindU32OptionU32_t *slot = &STD_VEC_AT(&frame->slotted, txn_TupleU64KindU32OptionU32_t, k);
@@ -5054,6 +8023,7 @@ txn_spill_files_body_0(void *frame_)
 		TxnSpillReading reading = {file->xid, file->kind, file->number, true, file->len};
 		bool		seen = false;
 		bool		hit = true;
+		bool		passed;
 
 		for (size_t j = 0; j < frame->result->len && !seen; j++)
 		{
@@ -5063,6 +8033,13 @@ txn_spill_files_body_0(void *frame_)
 		}
 		if (!txn_spill_tree(file->kind, frame->kind) || seen ||
 			txn_spill_replaced_by(frame->slotted.ptr, frame->slotted.len, file))
+			continue;
+		if (!txn_spill_files_passed(frame, file, &passed))
+		{
+			txn_spill_files_pad_0(frame);
+			return;
+		}
+		if (passed)
 			continue;
 		if ((frame->has_key && !txn_spill_files_hit(frame, file, &hit)) ||
 			(hit && !txn_spill_files_push(frame, &reading)))
@@ -5080,7 +8057,16 @@ txn_spill_files_body_0(void *frame_)
  * txn_spill_files returns a storage's spill files of a kind's tree: those
  * processes' slots name first, then the listed newest-listed first, each
  * once, and, for a reader that looks for a key, only the listed whose
- * filters it hits.
+ * filters it hits. A map's listed spill the newest base has passed (the
+ * home's through) is left out: a committed transaction's whose commit ends
+ * at or below the base's fold point, or an aborted one's marked with an end
+ * there, which the fold that installed the base applied or left in a
+ * residual, so a reader sees its versions once. A residual is read only
+ * while that point is the residual's own, and of a transaction's residuals
+ * of a kind with that point only the one with the greatest number, which
+ * supersedes the rest and every other file of its transaction and kind
+ * (bugs row 228); a residual whose fold's install failed is never read,
+ * since no base has its point.
  */
 static bool
 txn_spill_files(const TxnSpillHomeOps *home, HostIoIo *io, HostSharedRecord state, const HostStorage *storage,
@@ -5918,7 +8904,11 @@ txn_spill_tuple_key(HostIoIo *io, const HostDeltaHold *hold, HostSharedRecord st
 	return frame.ok;
 }
 
-/* TxnSpillNaming is Naming: a spill file a checkpoint names, its xid, kind, and number, and its length and xxh3 when its manifest lists them. */
+/*
+ * TxnSpillNaming is Naming: a spill file a checkpoint names, its xid, kind,
+ * and number, its length and xxh3 when its manifest lists them, the point a
+ * fold passes it at, or 0 for none, and its residual's point, or 0 for none.
+ */
 typedef struct TxnSpillNaming
 {
 	uint64		xid;
@@ -5927,22 +8917,31 @@ typedef struct TxnSpillNaming
 	bool		has_read;
 	uint64		len;
 	uint64		hash;
+	uint64		passed;
+	uint64		from;
 } TxnSpillNaming;
 
-/* txn_spill_named_frame_0_t is named's state across its pad: the slots, the listed files, the namings, the aborted xids, the spills' directory, a file's path and file, and the named run files, while live. */
+/* txn_spill_named_frame_0_t is named's state across its pad: the manifest's path and its writers' lock, the slots, the listed files, the namings, the aborted and crashed xids, the spills' directory, a file's path and file, and the named run files, while live. */
 typedef struct txn_spill_named_frame_0_t
 {
 	const TxnSpillHomeOps *home;
 	HostIoIo   *io;
 	HostSharedRecord state;
 	const HostStorage *storage;
+	HostLsn		redo;
 	StdVec	   *result;
 	HostError  *error;
 	bool		ok;
 	bool		result_live;
+	StdPathBuf	manifest;
+	bool		manifest_live;
+	HostSharedLongGuard writing;
+	bool		writing_live;
+	HostSharedLongIo long_io;
 	StdVec		slotted;
 	bool		slotted_live;
-	txn_TupleVecFileU64_t listed;
+	/* listed is a Vec<File>, in the manifest's order. */
+	StdVec		listed;
 	bool		listed_live;
 	/* files is a Vec<Naming>. */
 	StdVec		files;
@@ -5950,8 +8949,13 @@ typedef struct txn_spill_named_frame_0_t
 	/* aborted is a Vec<u64> of xids. */
 	StdVec		aborted;
 	bool		aborted_live;
-	StdVec		gone;
-	bool		gone_live;
+
+	/*
+	 * crashed is a Vec<u64> of the xids of free space map spills a crash
+	 * ended.
+	 */
+	StdVec		crashed;
+	bool		crashed_live;
 	StdPathBuf	dir;
 	bool		dir_live;
 	StdString	name;
@@ -5988,10 +8992,10 @@ txn_spill_named_pad_0(void *frame_)
 		frame->dir_live = false;
 		std_vec_free_Checked(&frame->dir.bytes, 1, 1);
 	}
-	if (frame->gone_live)
+	if (frame->crashed_live)
 	{
-		frame->gone_live = false;
-		std_vec_free_Checked(&frame->gone, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+		frame->crashed_live = false;
+		std_vec_free_Checked(&frame->crashed, sizeof(uint64), _Alignof(uint64));
 	}
 	if (frame->aborted_live)
 	{
@@ -6006,13 +9010,23 @@ txn_spill_named_pad_0(void *frame_)
 	if (frame->listed_live)
 	{
 		frame->listed_live = false;
-		std_vec_free_Checked(&frame->listed.f0, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+		std_vec_free_Checked(&frame->listed, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
 	}
 	if (frame->slotted_live)
 	{
 		frame->slotted_live = false;
 		std_vec_free_Checked(&frame->slotted, sizeof(txn_TupleU64KindU32OptionU32_t),
 							 _Alignof(txn_TupleU64KindU32OptionU32_t));
+	}
+	if (frame->writing_live)
+	{
+		frame->writing_live = false;
+		host_shared_LongGuard_drop(&frame->writing);
+	}
+	if (frame->manifest_live)
+	{
+		frame->manifest_live = false;
+		std_vec_free_Checked(&frame->manifest.bytes, 1, 1);
 	}
 	if (frame->result_live)
 	{
@@ -6034,27 +9048,42 @@ txn_spill_named_push(txn_spill_named_frame_0_t *frame, StdVec *vector, const voi
 	return true;
 }
 
-/* txn_spill_named_listed gathers the namings of the listed files, oldest-linked first, passing over those a pending merge replaces and gathering the aborted. */
+/*
+ * txn_spill_named_listed gathers, under the manifest's writers' lock, the
+ * namings of the listed files in the manifest's order, oldest-linked first,
+ * passing over those a pending merge replaces and gathering the aborted: an
+ * aborted transaction's files leave the naming but its free space map's,
+ * and a free space map's spill of a transaction a crash ended, which no
+ * abort record marked, is marked with the checkpoint's redo point.
+ */
 static bool
 txn_spill_named_listed(txn_spill_named_frame_0_t *frame)
 {
-	for (size_t k = frame->listed.f0.len; k > 0; k--)
+	for (size_t k = 0; k < frame->listed.len; k++)
 	{
-		const TxnSpillFile *file = &STD_VEC_AT(&frame->listed.f0, TxnSpillFile, k - 1);
-		HostXid		xid = {file->xid};
-		HostStatus	status;
-		TxnSpillNaming naming = {file->xid, file->kind, file->number, true, file->len, file->hash};
+		const TxnSpillFile *file = &STD_VEC_AT(&frame->listed, TxnSpillFile, k);
+		bool		map_free = file->kind == TXN_RUNS_KIND_SPILLED_FREE;
+		TxnSpillNaming naming = {file->xid, file->kind, file->number, true, file->len, file->hash, file->passed,
+		file->from};
 
 		if (txn_spill_replaced_by(frame->slotted.ptr, frame->slotted.len, file))
 			continue;
-		if (!host_status(HOST_IO_IO_IO_DOORS(frame->io), xid, &status, frame->error))
-			return false;
-		if (status == HOST_STATUS_ABORTED)
+		if (!map_free || file->passed == 0)
 		{
-			if (!txn_spill_named_push(frame, &frame->aborted, &file->xid, sizeof(uint64), _Alignof(uint64)))
+			HostXid		xid = {file->xid};
+			HostStatus	status;
+
+			if (!host_status(HOST_SHARED_LONG_IO_IO_DOORS(&frame->long_io), xid, &status, frame->error))
 				return false;
-			continue;
+			if (status == HOST_STATUS_ABORTED &&
+				!txn_spill_named_push(frame, map_free ? &frame->crashed : &frame->aborted, &file->xid, sizeof(uint64),
+									  _Alignof(uint64)))
+				return false;
+			if (status == HOST_STATUS_ABORTED && !map_free)
+				continue;
 		}
+		if (map_free && txn_spill_has_xid(&frame->crashed, file->xid))
+			naming.passed = frame->redo;
 		if (!txn_spill_named_push(frame, &frame->files, &naming, sizeof(naming), _Alignof(TxnSpillNaming)))
 			return false;
 	}
@@ -6104,27 +9133,61 @@ txn_spill_named_body_0(void *frame_)
 	frame->files_live = true;
 	std_vec_new(&frame->aborted, sizeof(uint64), _Alignof(uint64));
 	frame->aborted_live = true;
-	if (!txn_spill_consistent(frame->home, frame->io, frame->state, frame->storage, &frame->slotted,
-							  &frame->slotted_live, &frame->listed, &frame->listed_live, frame->error))
+	std_vec_new(&frame->crashed, sizeof(uint64), _Alignof(uint64));
+	frame->crashed_live = true;
+	txn_spill_manifest(frame->home, frame->state, frame->storage, &frame->manifest);
+	frame->manifest_live = true;
+	if (!host_shared_Record_lock_long(frame->state, HOST_IO_IO_TAKES_SHORT(frame->io), frame->home->writing,
+									  &frame->writing, frame->error))
 	{
 		txn_spill_named_pad_0(frame);
 		return;
 	}
+	frame->writing_live = true;
+	frame->long_io = host_shared_LongGuard_io(&frame->writing);
+	if (!txn_spill_pended(frame->home, frame->state, frame->storage, &frame->slotted, frame->error))
+	{
+		txn_spill_named_pad_0(frame);
+		return;
+	}
+	frame->slotted_live = true;
+	if (!txn_spill_read(HOST_IO_IO_DOORS_READ_DOORS(HOST_SHARED_LONG_IO_IO_DOORS(&frame->long_io)),
+						HOST_SHARED_LONG_IO_PAUSES(&frame->long_io), &frame->manifest, &frame->listed, frame->error))
+	{
+		txn_spill_named_pad_0(frame);
+		return;
+	}
+	frame->listed_live = true;
 	if (!txn_spill_named_listed(frame))
 	{
 		txn_spill_named_pad_0(frame);
 		return;
 	}
-	if (frame->aborted.len > 0)
+	if (frame->aborted.len > 0 || frame->crashed.len > 0)
 	{
-		if (!txn_spill_removed(frame->home, frame->io, frame->state, frame->storage, txn_spill_xids_closure_0,
-							   &frame->aborted, &frame->gone, frame->error))
+		size_t		kept = 0;
+
+		for (size_t k = 0; k < frame->listed.len; k++)
+		{
+			TxnSpillFile file = STD_VEC_AT(&frame->listed, TxnSpillFile, k);
+			bool		map_free = file.kind == TXN_RUNS_KIND_SPILLED_FREE;
+
+			if (!map_free && txn_spill_has_xid(&frame->aborted, file.xid))
+				continue;
+			if (map_free && file.passed == 0 && txn_spill_has_xid(&frame->crashed, file.xid))
+				file.passed = frame->redo;
+			STD_VEC_AT(&frame->listed, TxnSpillFile, kept++) = file;
+		}
+		frame->listed.len = kept;
+		if (!txn_spill_rewrote(frame->home, &frame->long_io, frame->state, &frame->manifest, &frame->listed,
+							   frame->error))
 		{
 			txn_spill_named_pad_0(frame);
 			return;
 		}
-		frame->gone_live = true;
 	}
+	frame->writing_live = false;
+	host_shared_LongGuard_drop(&frame->writing);
 	for (size_t k = 0; k < frame->slotted.len; k++)
 	{
 		const txn_TupleU64KindU32OptionU32_t *slot = &STD_VEC_AT(&frame->slotted, txn_TupleU64KindU32OptionU32_t, k);
@@ -6158,7 +9221,8 @@ txn_spill_named_body_0(void *frame_)
 		const TxnSpillNaming *naming = &STD_VEC_AT(&frame->files, TxnSpillNaming, k);
 		RepoRunFile run = {.kind = (uint8) naming->kind, .tablespace = frame->storage->tablespace,
 			.relation = frame->storage->relation, .len = naming->len, .hash = naming->hash, .has_spilled = true,
-		.spilled = {naming->xid, naming->number}};
+			.spilled = {naming->xid, naming->number, naming->passed != 0, naming->passed, naming->from != 0,
+		naming->from}};
 
 		if (!naming->has_read && !txn_spill_named_read(frame, naming, &run.len, &run.hash))
 		{
@@ -6175,17 +9239,23 @@ txn_spill_named_body_0(void *frame_)
 /*
  * txn_spill_named returns the manifest's entries of a storage's spill files
  * a checkpoint names, each synced at its write: the listed oldest-linked
- * first, then those processes' slots name. It reads the slots and the
- * manifest as a reader does, so a merge pending its file names that file and
- * not the sources it replaces. A listed spill of a transaction the commit
- * log calls aborted leaves the manifest unnamed.
+ * first, then those processes' slots name. It reads the slots and then the
+ * manifest under the manifest's writers' lock, so a merge pending its file
+ * names that file and not the sources it replaces, and a carry that took the
+ * lock before it logged its versions' records lists their files before this
+ * naming reads. A listed spill of a transaction the commit log calls
+ * aborted, which only redo leaves, leaves the manifest unnamed, for the
+ * sweep, but a free space map's, which a fold takes; a free space map's
+ * spill of a transaction a crash ended, which wrote no abort record to mark
+ * it, is marked with the checkpoint's redo point, redo, the point a fold
+ * passes it at.
  */
 bool
 txn_spill_named(const TxnSpillHomeOps *home, HostIoIo *io, HostSharedRecord state, const HostStorage *storage,
-				StdVec *result, HostError *error)
+				HostLsn redo, StdVec *result, HostError *error)
 {
-	txn_spill_named_frame_0_t frame = {.home = home, .io = io, .state = state, .storage = storage, .result = result,
-	.error = error};
+	txn_spill_named_frame_0_t frame = {.home = home, .io = io, .state = state, .storage = storage, .redo = redo,
+	.result = result, .error = error};
 
 	std_landing(&frame, txn_spill_named_body_0, txn_spill_named_pad_0);
 	return frame.ok;
@@ -6325,10 +9395,10 @@ txn_spill_settled_from_read(txn_spill_settled_from_frame_0_t *frame, const TxnRu
 		return false;
 	}
 	*live = true;
-	result->xid = frame->pended->xid;
-	result->kind = names->kind;
-	result->number = frame->pended->number;
-	result->len = (uint64) bytes->len;
+	*result = (TxnSpillFile)
+	{
+		.xid = frame->pended->xid, .kind = names->kind, .number = frame->pended->number, .len = (uint64) bytes->len
+	};
 	return txn_runs_spill_hash(bytes->ptr, bytes->len, &result->hash, frame->error) &&
 		(!bits || txn_runs_spill_bits(bytes->ptr, bytes->len, &result->bits, frame->error));
 }
@@ -6402,7 +9472,7 @@ txn_spill_settled_from_body_0(void *frame_)
 	txn_spill_settled_from_frame_0_t *frame = frame_;
 	const TxnSpillPended *pended = frame->pended;
 	TxnRunsNames names;
-	TxnSpillFile listing[2];
+	TxnSpillFile listing[2] = {0};
 	size_t		listing_len = 1;
 	TxnWrittenOf of;
 	txn_TupleU64KindU32OptionU32_t replacing = {pended->xid, pended->kind, pended->number, true, pended->sources};
@@ -6424,6 +9494,9 @@ txn_spill_settled_from_body_0(void *frame_)
 			break;
 		case TXN_RUNS_KIND_SPILLED_VALUES:
 			of = TXN_WRITTEN_OF_VALUES;
+			break;
+		case TXN_RUNS_KIND_SPILLED_FREE:
+			of = TXN_WRITTEN_OF_FREE;
 			break;
 		case TXN_RUNS_KIND_SPILLED_CHUNKS:
 			of = TXN_WRITTEN_OF_CHUNKS;
@@ -6547,7 +9620,7 @@ txn_spill_settle_pending(HostIoIo *io, HostError *error)
 
 /* TXN_SPILL_TESTS_KIND_NAMES are Kind's variants' names, at their numbers, for its derived Debug. */
 static const char *const TXN_SPILL_TESTS_KIND_NAMES[] = {"Rows", "Free", "Values", "Chunks", "Status", "SpilledRows",
-"SpilledValues", "SpilledTuples", "Entries", "SpilledEntries", "Identity", NULL, "SpilledChunks"};
+"SpilledValues", "SpilledTuples", "Entries", "SpilledEntries", "Identity", "SpilledFree", "SpilledChunks"};
 
 /* txn_spill_tests_Kind_Debug_fmt is Kind's derived Debug, its variant's name, for the tests' asserts. */
 static bool
@@ -6712,13 +9785,13 @@ txn_spill_tests_written(HostIoIo *io, HostSharedRecord state, uint64 xid, uint32
 								 host_Error_Debug_fmt);
 	writing = txn_runs_Writing_spill(dir.bytes.ptr, dir.bytes.len, &names, tail, number);
 	for (size_t k = 0; k < keys_len; k++)
-		if (!txn_runs_Writing_key(writing, io, keys[k].ptr, keys[k].len, NULL, 0, &error))
+		if (!txn_runs_Writing_key(writing, HOST_IO_IO_IO_DOORS(io), keys[k].ptr, keys[k].len, NULL, 0, &error))
 			STD_RESULT_EXPECT_FAILED(1874, 39, "called `Result::unwrap()` on an `Err` value", &error,
 									 host_Error_Debug_fmt);
 	if (!txn_spill_Filter_of(keys_len, keys, keys_len, &filter, &error))
 		STD_RESULT_EXPECT_FAILED(1876, 67, "called `Result::unwrap()` on an `Err` value", &error,
 								 host_Error_Debug_fmt);
-	if (!txn_runs_Writing_end(writing, io, filter.words.ptr, filter.words.len, &some, &run, &error))
+	if (!txn_runs_Writing_end(writing, HOST_IO_IO_IO_DOORS(io), filter.words.ptr, filter.words.len, &some, &run, &error))
 		STD_RESULT_EXPECT_FAILED(1877, 50, "called `Result::unwrap()` on an `Err` value", &error,
 								 host_Error_Debug_fmt);
 	if (!some)
@@ -9162,7 +12235,7 @@ test_txn_spill_tests_an_abort_takes_its_spills_out_of_the_chain(void)
 								 host_Error_Debug_fmt);
 	STD_ASSERT(2701, 9, spilled, "spilled(io, &storage(9747), Of::Rows, mine).unwrap()");
 	simc_abort(aborted);
-	if (!txn_written_aborted(io, &error))
+	if (!txn_written_aborted(io, 0, &error))
 		STD_RESULT_EXPECT_FAILED(2703, 30, "called `Result::unwrap()` on an `Err` value", &error,
 								 host_Error_Debug_fmt);
 	files = txn_spill_tests_files_of(io, state);
@@ -9610,10 +12683,10 @@ test_txn_spill_tests_two_transactions_spilling_the_same_storages_crosswise_compl
 		}
 		host_shared_Held_drop(&state);
 	}
-	if (!txn_spill_aborted(io, one, storages, lengthof(storages), &error))
+	if (!txn_spill_aborted(io, one, storages, lengthof(storages), 0, &error))
 		STD_RESULT_EXPECT_FAILED(2875, 41, "called `Result::unwrap()` on an `Err` value", &error,
 								 host_Error_Debug_fmt);
-	if (!txn_spill_aborted(io, two, storages, lengthof(storages), &error))
+	if (!txn_spill_aborted(io, two, storages, lengthof(storages), 0, &error))
 		STD_RESULT_EXPECT_FAILED(2875, 41, "called `Result::unwrap()` on an `Err` value", &error,
 								 host_Error_Debug_fmt);
 	for (size_t k = 0; k < 2; k++)
@@ -9997,6 +13070,1171 @@ test_txn_spill_tests_a_lookup_reads_an_evicted_filter_page_again(void)
 	std_vec_free_Checked(&path.bytes, 1, 1);
 	host_shared_Held_drop(&held);
 	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * The free space map's spill: a spill of a storage's free space map takes
+ * out the blocks only its transaction wrote, and every reader finds a
+ * spilled block's entries below the memtable: its newest, a removal
+ * included, its takers, a seek past it, and a version by its WAL record's
+ * end.
+ */
+void
+test_txn_spill_tests_a_spilled_free_space_maps_entries_are_read_below_the_memtable(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedHeld held = txn_memtable_testing_created(io, 9762);
+	HostSharedRecord state = host_shared_Held_record(&held);
+	HostStorage storage = txn_memtable_testing_storage(9762);
+	uint64		mine = simc_begin().f0;
+	uint64		other = simc_begin().f0;
+	const struct
+	{
+		uint64		xid;
+		uint32		block;
+		const char *value;
+		bool		has_lsn;
+		uint64		lsn;
+	}			pushes[] = {{mine, 7, "e", true, 4242}, {mine, 8, "f"}, {mine, 8, NULL}, {other, 9, "g"},
+	{mine, 10, "h"}};
+	const struct
+	{
+		uint32		block;
+		bool		some;
+		const char *value;
+	}			newest[] = {{7, true, "e"}, {8, true, NULL}, {9, true, "g"}, {10, true, "h"}, {11, false, NULL}};
+	const struct
+	{
+		uint32		from;
+		bool		some;
+		uint32		block;
+		const char *value;
+	}			sought[] = {{0, true, 7, "e"}, {8, true, 8, NULL}, {9, true, 9, "g"}, {10, true, 10, "h"},
+	{11, false, 0, NULL}};
+	HostDeltaHold hold;
+	StdVec		versions;
+	StdVec		takers;
+	HostError	error;
+	bool		spilled;
+	bool		holds;
+
+	for (size_t k = 0; k < lengthof(pushes); k++)
+	{
+		TxnMemtableOp op = {.tag = TXN_MEMTABLE_OP_DELETE};
+		TxnMemtableVersionChange change = {.writer = txn_memtable_testing_writer(pushes[k].xid), .op = &op,
+			.lock = TXN_MEMTABLE_LOCK_MODE_UPDATE, .shown = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND},
+		.has_lsn = pushes[k].has_lsn, .lsn = pushes[k].lsn};
+		TxnMemtableVersionHandle handle;
+		uint8		key[4];
+
+		if (pushes[k].value != NULL)
+			op = txn_memtable_testing_put((const uint8 *) pushes[k].value, 1);
+		std_u32_to_be_bytes(pushes[k].block, key);
+		if (!txn_memtable_table_alone_State(io, state, true, TXN_MEMTABLE_MAP_MAP_FREE, key, sizeof(key), &change,
+											&handle, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		txn_memtable_Op_drop(&op);
+	}
+	if (!txn_spill_spilled(io, &storage, TXN_WRITTEN_OF_FREE, mine, &spilled, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT(__LINE__, 9, spilled, "spilled(io, &storage(9762), Of::Free, mine).unwrap()");
+	if (!host_delta_hold(io, &hold, &error) ||
+		!txn_memtable_map_versions(&TXN_MEMTABLE_MAP_FREE_TREE_OPS, io, &hold, state, 7, &versions, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT(__LINE__, 9, versions.len == 0, "map::versions::<map::Free>(io, &hold, state, 7).unwrap().is_empty()");
+	txn_spill_tests_versions_free(&versions);
+	host_delta_Hold_drop(&hold);
+	for (size_t k = 0; k < lengthof(newest); k++)
+	{
+		TxnMemtableMapEntry entry;
+		TxnMemtableMapEntry wanted = {.has_value = newest[k].value != NULL};
+		bool		some;
+		StdOptionRef left;
+		StdOptionRef right = {newest[k].some, STD_ITEM(&wanted, txn_memtable_map_tests_seen_Debug_fmt)};
+
+		if (wanted.has_value)
+			std_slice_to_vec_Checked(&wanted.value, (const uint8 *) newest[k].value, 1, 1, 1);
+		if (!txn_memtable_map_newest(io, state, TXN_MEMTABLE_MAP_MAP_FREE, newest[k].block, &some, &entry, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		left = (StdOptionRef)
+		{
+			some, STD_ITEM(&entry, txn_memtable_map_tests_seen_Debug_fmt)
+		};
+		STD_ASSERT_EQ(__LINE__, 9, some == newest[k].some && (!some || txn_memtable_map_tests_seen_eq(&entry, &wanted)),
+					  &left, std_option_Debug_fmt, &right, std_option_Debug_fmt);
+		if (some)
+			txn_memtable_map_tests_seen_drop(&entry);
+		txn_memtable_map_tests_seen_drop(&wanted);
+	}
+	if (!txn_memtable_map_takers(io, state, TXN_MEMTABLE_MAP_MAP_FREE, 8, &takers, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT_EQ_U64(__LINE__, 9, takers.len, 2);
+	for (size_t k = 0; k < takers.len; k++)
+	{
+		const txn_TupleWriterRowEntryU64TupleVecU32Bool_t *taker =
+			&STD_VEC_AT(&takers, txn_TupleWriterRowEntryU64TupleVecU32Bool_t, k);
+		TxnMemtableMapEntry wanted = {.has_value = k == 0};
+
+		if (wanted.has_value)
+			std_slice_to_vec_Checked(&wanted.value, (const uint8 *) "f", 1, 1, 1);
+		STD_ASSERT_EQ_U64(__LINE__, 9, taker->f0.xid, mine);
+		STD_ASSERT_EQ(__LINE__, 9, txn_memtable_map_tests_seen_eq(&taker->f2, &wanted), &taker->f2,
+					  txn_memtable_map_tests_seen_Debug_fmt, &wanted, txn_memtable_map_tests_seen_Debug_fmt);
+		txn_memtable_map_tests_seen_drop(&wanted);
+	}
+	txn_memtable_map_takers_drop(&takers);
+	for (size_t k = 0; k < lengthof(sought); k++)
+	{
+		txn_TupleU32Entry_t found;
+		TxnMemtableMapEntry wanted = {.has_value = sought[k].value != NULL};
+		bool		some;
+
+		if (wanted.has_value)
+			std_slice_to_vec_Checked(&wanted.value, (const uint8 *) sought[k].value, 1, 1, 1);
+		if (!txn_memtable_map_seek(io, state, TXN_MEMTABLE_MAP_MAP_FREE, sought[k].from, &some, &found, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		STD_ASSERT(__LINE__, 9, some == sought[k].some, "map::seek(io, state, Map::Free, from).unwrap().is_some()");
+		if (some)
+		{
+			STD_ASSERT_EQ_U64(__LINE__, 9, found.f0, sought[k].block);
+			STD_ASSERT_EQ(__LINE__, 9, txn_memtable_map_tests_seen_eq(&found.f1, &wanted), &found.f1,
+						  txn_memtable_map_tests_seen_Debug_fmt, &wanted, txn_memtable_map_tests_seen_Debug_fmt);
+			txn_memtable_map_tests_seen_drop(&found.f1);
+		}
+		txn_memtable_map_tests_seen_drop(&wanted);
+	}
+	if (!txn_memtable_map_holds(io, state, TXN_MEMTABLE_MAP_MAP_FREE, 7, 4242, &holds, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT(__LINE__, 9, holds, "map::holds(io, state, Map::Free, 7, 4242).unwrap()");
+	if (!txn_memtable_map_holds(io, state, TXN_MEMTABLE_MAP_MAP_FREE, 7, 4243, &holds, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT(__LINE__, 9, !holds, "!map::holds(io, state, Map::Free, 7, 4243).unwrap()");
+	host_shared_Held_drop(&held);
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * An aborted transaction's free space map spill, whose takes are never
+ * taken back: its abort and every checkpoint's naming keep it listed, it
+ * holds no repository's chunk spills back, and the fold's drop takes it out
+ * once a fold applied its takes; another transaction's helper at the budget
+ * spills a storage's free space map too.
+ */
+void
+test_txn_spill_tests_an_aborted_free_space_map_spill_stays_listed_until_a_fold(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedHeld held = txn_memtable_testing_created(io, 9763);
+	HostSharedRecord state = host_shared_Held_record(&held);
+	HostStorage storage = txn_memtable_testing_storage(9763);
+	HostXid		aborting = simc_begin();
+	HostXid		other = simc_begin();
+	const struct
+	{
+		uint64		xid;
+		uint32		block;
+	}			pushes[] = {{aborting.f0, 7}, {other.f0, 9}};
+	TxnMemtableMapEntry e = {.has_value = true};
+	TxnMemtableMapEntry entry;
+	txn_TupleVecFileU64_t listed;
+	StdVec		names;
+	HostError	error;
+	bool		spilled;
+	bool		unfolded;
+	bool		swept;
+	bool		some;
+
+	for (size_t k = 0; k < lengthof(pushes); k++)
+	{
+		TxnMemtableOp op = txn_memtable_testing_put((const uint8 *) "e", 1);
+		TxnMemtableVersionChange change = {.writer = txn_memtable_testing_writer(pushes[k].xid), .op = &op,
+		.lock = TXN_MEMTABLE_LOCK_MODE_UPDATE, .shown = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND}};
+		TxnMemtableVersionHandle handle;
+		uint8		key[4];
+
+		op.u.put.heap_bytes = 0;
+		std_u32_to_be_bytes(pushes[k].block, key);
+		if (!txn_memtable_table_alone_State(io, state, true, TXN_MEMTABLE_MAP_MAP_FREE, key, sizeof(key), &change,
+											&handle, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		txn_memtable_Op_drop(&op);
+	}
+	if (!txn_spill_spilled(io, &storage, TXN_WRITTEN_OF_FREE, aborting.f0, &spilled, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT(__LINE__, 9, spilled, "spilled(io, &storage(9763), Of::Free, aborting.0).unwrap()");
+	simc_abort(aborting);
+	if (!txn_spill_aborted(io, aborting.f0, &storage, 1, 150, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	if (!txn_spill_listed(&TXN_SPILL_STATE_HOME_OPS, io, state, &storage, &listed, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT_MSG(__LINE__, 9, listed.f0.len == 1 &&
+				   STD_VEC_AT(&listed.f0, TxnSpillFile, 0).kind == TXN_RUNS_KIND_SPILLED_FREE,
+				   "the abort keeps the spill");
+	std_vec_free_Checked(&listed.f0, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	if (!txn_spill_named(&TXN_SPILL_STATE_HOME_OPS, io, state, &storage, 1, &names, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT(__LINE__, 9, names.len == 1 && STD_VEC_AT(&names, RepoRunFile, 0).kind == TXN_RUNS_KIND_SPILLED_FREE,
+			   "names.iter().map(|file| file.kind).collect::<Vec<_>>() == [Kind::SpilledFree as u8]");
+	std_vec_free_Checked(&names, sizeof(RepoRunFile), _Alignof(RepoRunFile));
+	if (!txn_spill_listed(&TXN_SPILL_STATE_HOME_OPS, io, state, &storage, &listed, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT_MSG(__LINE__, 9, listed.f0.len == 1 &&
+				   STD_VEC_AT(&listed.f0, TxnSpillFile, 0).kind == TXN_RUNS_KIND_SPILLED_FREE,
+				   "a checkpoint's naming keeps the spill");
+	std_vec_free_Checked(&listed.f0, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	if (!txn_spill_unfolded_since(io, &held, 1, &unfolded, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT_MSG(__LINE__, 9, !unfolded, "a free space map spill holds no chunks back");
+	if (!txn_spill_swept(io, other.f0, &swept, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT_MSG(__LINE__, 9, swept, "a helper spills another transaction's free space map");
+	if (!txn_memtable_map_newest(io, state, TXN_MEMTABLE_MAP_MAP_FREE, 9, &some, &entry, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	std_slice_to_vec_Checked(&e.value, (const uint8 *) "e", 1, 1, 1);
+	STD_ASSERT(__LINE__, 9, some && txn_memtable_map_tests_seen_eq(&entry, &e),
+			   "map::newest(io, state, Map::Free, 9).unwrap() == Some(Some(b\"e\".to_vec()))");
+	txn_memtable_map_tests_seen_drop(&e);
+	if (some)
+		txn_memtable_map_tests_seen_drop(&entry);
+	if (!txn_spill_folded(io, state, 1, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	if (!txn_spill_listed(&TXN_SPILL_STATE_HOME_OPS, io, state, &storage, &listed, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT_MSG(__LINE__, 9, listed.f0.len == 1 && STD_VEC_AT(&listed.f0, TxnSpillFile, 0).xid == other.f0,
+				   "the fold's drop takes the aborted spill and keeps a running one's");
+	std_vec_free_Checked(&listed.f0, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	host_shared_Held_drop(&held);
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * The budget's committed arm: a key a running transaction and a committed
+ * one spilled, a third, committed, writing it again in the memtable, is
+ * relieved by spilling the third's versions, the chain's oldest in the
+ * memtable, which read newest above the spilled ones; a key whose oldest
+ * memtable version a running transaction wrote keeps the committed version
+ * above it, and the arm then has nothing left to spill.
+ */
+void
+test_txn_spill_tests_the_committed_arm_spills_a_keys_oldest_committed_versions_above_its_spills(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedHeld held = txn_memtable_testing_created(io, 9771);
+	HostSharedRecord state = host_shared_Held_record(&held);
+	HostStorage storage = txn_memtable_testing_storage(9771);
+	HostXid		running = simc_begin();
+	HostXid		spilled_committed = simc_begin();
+	HostXid		above = simc_begin();
+	HostXid		holder = {0};
+	HostXid		after = {0};
+	struct
+	{
+		HostXid		xid;
+		const char *key;
+		const char *value;
+		bool		spills;
+	}			pushes[] = {{running, "k", "1", true}, {spilled_committed, "k", "2", true}, {above, "k", "3"},
+	{{0}, "m", "4"}, {{0}, "m", "5"}};
+	struct
+	{
+		HostXid		xid;
+		HostLsn		end;
+	}			commits[3];
+	uint64		before[3];
+	HostDeltaHold hold;
+	StdVec		chain;
+	StdVec		versions;
+	HostError	error;
+	bool		spilled;
+	bool		relieved;
+
+	for (size_t k = 0; k < lengthof(pushes); k++)
+	{
+		TxnMemtableOp op = txn_memtable_testing_put((const uint8 *) pushes[k].value, 1);
+		TxnMemtableVersionChange change = {.op = &op, .lock = TXN_MEMTABLE_LOCK_MODE_UPDATE,
+		.shown = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND}};
+		TxnMemtableVersionHandle handle;
+
+		if (k == 3)
+		{
+			holder = simc_begin();
+			after = simc_begin();
+			pushes[3].xid = holder;
+			pushes[4].xid = after;
+		}
+		change.writer = txn_memtable_testing_writer(pushes[k].xid.f0);
+		if (!txn_memtable_table_push(io, state, (const uint8 *) pushes[k].key, 1, &change, &handle, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		txn_memtable_Op_drop(&op);
+		if (!pushes[k].spills)
+			continue;
+		if (!txn_spill_spilled(io, &storage, TXN_WRITTEN_OF_ROWS, pushes[k].xid.f0, &spilled, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		STD_ASSERT(__LINE__, 9, spilled, "spilled(io, &storage(9771), Of::Rows, xid.0).unwrap()");
+	}
+	commits[0].xid = spilled_committed;
+	commits[0].end = 100;
+	commits[1].xid = above;
+	commits[1].end = 200;
+	commits[2].xid = after;
+	commits[2].end = 300;
+	for (size_t k = 0; k < lengthof(commits); k++)
+	{
+		TxnStatusOutcome committed = {.tag = TXN_STATUS_OUTCOME_COMMITTED, .u.committed = commits[k].end};
+		TxnStatusRoomed roomed;
+		TxnStatusEntry entry;
+		bool		took;
+		bool		has;
+
+		if (!txn_status_take(io, commits[k].xid, committed, &roomed, &took, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		simc_commit(commits[k].xid);
+		if (!txn_status_lookup(io, commits[k].xid, &has, &entry, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		STD_ASSERT(__LINE__, 9, has, "status::lookup(io, xid).unwrap().is_some()");
+		before[k] = entry.count;
+	}
+	if (!txn_spill_relieved(io, &relieved, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT_MSG(__LINE__, 9, relieved, "the committed arm spills the third writer's versions");
+	if (!host_delta_hold(io, &hold, &error) ||
+		!txn_memtable_table_chain(&TXN_MEMTABLE_TABLE_ROWS_TREE_OPS, io, &hold, state, (const uint8 *) "k", 1, &chain,
+								  &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT_MSG(__LINE__, 9, chain.len == 0, "k left the memtable");
+	txn_spill_tests_versions_free(&chain);
+	if (!txn_spill_versions(&TXN_SPILL_STATE_HOME_OPS, io, &hold, state, TXN_RUNS_KIND_SPILLED_ROWS,
+							(const uint8 *) "k", 1, &versions, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	{
+		const uint64 wanted[] = {above.f0, spilled_committed.f0, running.f0};
+		bool		eq = versions.len == lengthof(wanted);
+
+		for (size_t k = 0; eq && k < versions.len; k++)
+		{
+			TxnMemtableVersionRecord record =
+				txn_memtable_version_Version_record(&STD_VEC_AT(&versions, TxnMemtableVersionVersion, k));
+
+			eq = txn_memtable_version_Record_writer(&record).xid == wanted[k];
+		}
+		STD_ASSERT_MSG(__LINE__, 9, eq, "newest first");
+	}
+	txn_spill_tests_versions_free(&versions);
+	if (!txn_memtable_table_chain(&TXN_MEMTABLE_TABLE_ROWS_TREE_OPS, io, &hold, state, (const uint8 *) "m", 1, &chain,
+								  &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT_EQ_U64(__LINE__, 9, chain.len, 2);
+	txn_spill_tests_versions_free(&chain);
+	host_delta_Hold_drop(&hold);
+	for (size_t k = 0; k < lengthof(commits); k++)
+	{
+		TxnStatusEntry entry;
+		bool		has;
+
+		if (!txn_status_lookup(io, commits[k].xid, &has, &entry, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		STD_ASSERT_MSG(__LINE__, 9, has && entry.count == before[k], "the spilled versions keep their counts");
+	}
+	if (!txn_spill_relieved(io, &relieved, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT_MSG(__LINE__, 9, !relieved, "nothing committed is left at a chain's bottom");
+	host_shared_Held_drop(&held);
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * The committed arm's spill after a restart: the versions it spilled, named
+ * by a checkpoint, read back after a restart in the order they read before
+ * it, newest first above the older transactions' spilled versions, each
+ * counted once at its writer's entry.
+ */
+void
+test_txn_spill_tests_the_committed_arms_spill_reads_back_in_order_after_a_restart(void)
+{
+	const TxnInsertPage page = {.bytes = 8160, .most = 291};
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedHeld held = txn_memtable_testing_created(io, 9772);
+	HostStorage storage = txn_memtable_testing_storage(9772);
+	HostXid		running = simc_begin();
+	HostXid		spilled_committed = simc_begin();
+	HostXid		above = simc_begin();
+	const HostXid pushes[] = {running, spilled_committed, above};
+	const char *const values[] = {"1", "2", "3"};
+	const HostXid committed[] = {spilled_committed, above};
+	const HostLsn ends[] = {100, 200};
+	const uint64 wanted[] = {above.f0, spilled_committed.f0, running.f0};
+	HostError	error;
+	bool		relieved;
+
+	for (size_t k = 0; k < lengthof(pushes); k++)
+	{
+		TxnMemtableOp op = txn_memtable_testing_put((const uint8 *) values[k], 1);
+		TxnMemtableVersionChange change = {.writer = txn_memtable_testing_writer(pushes[k].f0), .op = &op,
+		.lock = TXN_MEMTABLE_LOCK_MODE_UPDATE, .shown = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND}};
+		TxnMemtableVersionHandle handle;
+		bool		spilled;
+
+		if (!txn_memtable_table_push(io, host_shared_Held_record(&held), (const uint8 *) "k", 1, &change, &handle,
+									 &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		txn_memtable_Op_drop(&op);
+		if (k == 2)
+			continue;
+		if (!txn_spill_spilled(io, &storage, TXN_WRITTEN_OF_ROWS, pushes[k].f0, &spilled, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		STD_ASSERT(__LINE__, 9, spilled, "spilled(io, &storage(9772), Of::Rows, xid.0).unwrap()");
+	}
+	for (size_t k = 0; k < lengthof(committed); k++)
+	{
+		TxnStatusOutcome outcome = {.tag = TXN_STATUS_OUTCOME_COMMITTED, .u.committed = ends[k]};
+		TxnStatusRoomed roomed;
+		bool		took;
+
+		if (!txn_status_take(io, committed[k], outcome, &roomed, &took, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		simc_commit(committed[k]);
+	}
+	if (!txn_spill_relieved(io, &relieved, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT_MSG(__LINE__, 9, relieved, "the committed arm spills the third writer's version");
+	for (int restarted = 0; restarted < 2; restarted++)
+	{
+		HostDeltaHold hold;
+		StdVec		chain;
+		StdVec		versions;
+		bool		eq;
+
+		if (restarted)
+		{
+			host_shared_Held_drop(&held);
+			simc_checkpointed(UINT64CONST(0x100000a27));
+			if (!txn_runs_checkpoint(io, UINT64CONST(0x100000a28), &error) ||
+				!txn_state_unlinked(io, &storage, &error))
+				STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+										 host_Error_Debug_fmt);
+			for (size_t k = 0; k < lengthof(committed); k++)
+			{
+				bool		removed;
+
+				if (!txn_status_remove(io, committed[k], &removed, &error))
+					STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+											 host_Error_Debug_fmt);
+				STD_ASSERT(__LINE__, 9, removed, "status::remove(io, xid).unwrap()");
+			}
+			if (!txn_runs_loaded(io, &page, &error) || !txn_memtable_testing_stated(io, 9772, &held, &error))
+				STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+										 host_Error_Debug_fmt);
+		}
+		if (!host_delta_hold(io, &hold, &error) ||
+			!txn_memtable_table_chain(&TXN_MEMTABLE_TABLE_ROWS_TREE_OPS, io, &hold, host_shared_Held_record(&held),
+									  (const uint8 *) "k", 1, &chain, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		STD_ASSERT(__LINE__, 9, chain.len == 0, "table::chain::<Rows>(io, &hold, state, b\"k\").unwrap().is_empty()");
+		txn_spill_tests_versions_free(&chain);
+		if (!txn_spill_versions(&TXN_SPILL_STATE_HOME_OPS, io, &hold, host_shared_Held_record(&held),
+								TXN_RUNS_KIND_SPILLED_ROWS, (const uint8 *) "k", 1, &versions, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		eq = versions.len == lengthof(wanted);
+		for (size_t k = 0; eq && k < versions.len; k++)
+		{
+			TxnMemtableVersionRecord record =
+				txn_memtable_version_Version_record(&STD_VEC_AT(&versions, TxnMemtableVersionVersion, k));
+
+			eq = txn_memtable_version_Record_writer(&record).xid == wanted[k];
+		}
+		if (restarted)
+			STD_ASSERT_MSG(__LINE__, 9, eq, "the same order after the start");
+		else
+			STD_ASSERT_MSG(__LINE__, 9, eq, "newest first");
+		txn_spill_tests_versions_free(&versions);
+		host_delta_Hold_drop(&hold);
+	}
+	for (size_t k = 0; k < lengthof(committed); k++)
+	{
+		TxnStatusEntry entry;
+		bool		has;
+
+		if (!txn_status_lookup(io, committed[k], &has, &entry, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		STD_ASSERT(__LINE__, 9, has && entry.count == 1, "counts == [Some(1), Some(1)]");
+	}
+	host_shared_Held_drop(&held);
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * The crash mark, run file field 8: a running transaction's free space map
+ * spill that a checkpoint named, ended by a crash with no abort record, is
+ * marked by the next checkpoint's naming with that checkpoint's redo point,
+ * the point a fold passes it at, which a later start loads back with the
+ * file.
+ */
+void
+test_txn_spill_tests_a_free_space_spill_a_crash_ended_is_marked_with_the_next_checkpoints_redo_point(void)
+{
+	const TxnInsertPage page = {.bytes = 8160, .most = 291};
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedHeld held = txn_memtable_testing_created(io, 9773);
+	HostStorage storage = txn_memtable_testing_storage(9773);
+	HostXid		xid = simc_begin();
+	TxnFreeSpaceFree space = txn_free_space_Free_new(8000, NULL, 0, 291);
+	StdVec		value;
+	TxnMemtableOp op;
+	TxnMemtableVersionChange change = {.writer = txn_memtable_testing_writer(xid.f0), .op = &op,
+	.lock = TXN_MEMTABLE_LOCK_MODE_UPDATE, .shown = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND}};
+	TxnMemtableVersionHandle handle;
+	uint8		key[4];
+	HostError	error;
+	bool		spilled;
+
+	std_vec_new(&value, 1, 1);
+	txn_free_space_Free_encode_into(&space, &value);
+	op = txn_memtable_testing_put(value.ptr, value.len);
+	op.u.put.tuple.f0 = 7 << 16 | 1;
+	op.u.put.heap_bytes = 0;
+	std_vec_free_Checked(&value, 1, 1);
+	std_u32_to_be_bytes(7, key);
+	if (!txn_memtable_table_alone_State(io, host_shared_Held_record(&held), true, TXN_MEMTABLE_MAP_MAP_FREE, key,
+										sizeof(key), &change, &handle, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	txn_memtable_Op_drop(&op);
+	if (!txn_spill_spilled(io, &storage, TXN_WRITTEN_OF_FREE, xid.f0, &spilled, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT(__LINE__, 9, spilled, "spilled(io, &storage(9773), Of::Free, xid).unwrap()");
+	host_shared_Held_drop(&held);
+	simc_checkpointed(UINT64CONST(0x100000a27));
+	if (!txn_runs_checkpoint(io, UINT64CONST(0x100000a28), &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	for (int round = 0; round < 3; round++)
+	{
+		static const HostLsn marks[] = {0, UINT64CONST(0x100000b28), UINT64CONST(0x100000b28)};
+		static const char *const messages[] = {"named unmarked while its transaction ran",
+		"the crash's end marked at the next naming", "the mark loads back"};
+		txn_TupleVecFileU64_t listed;
+		size_t		found = 0;
+		bool		marked = true;
+
+		if (round == 1)
+		{
+			simc_abort(xid);
+			simc_checkpointed(UINT64CONST(0x100000b27));
+			if (!txn_runs_checkpoint(io, UINT64CONST(0x100000b28), &error))
+				STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+										 host_Error_Debug_fmt);
+		}
+		else if (!txn_state_unlinked(io, &storage, &error) || !txn_runs_loaded(io, &page, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		if (!txn_memtable_testing_stated(io, 9773, &held, &error) ||
+			!txn_spill_listed(&TXN_SPILL_STATE_HOME_OPS, io, host_shared_Held_record(&held), &storage, &listed,
+							  &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		for (size_t k = 0; k < listed.f0.len; k++)
+		{
+			const TxnSpillFile *file = &STD_VEC_AT(&listed.f0, TxnSpillFile, k);
+
+			if (file->xid != xid.f0)
+				continue;
+			found++;
+			marked &= file->passed == marks[round];
+		}
+		if (found != 1 || !marked)
+			std_panic(RUST_FILE, __LINE__, 9, messages[round], strlen(messages[round]));
+		std_vec_free_Checked(&listed.f0, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+		host_shared_Held_drop(&held);
+	}
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * A prepared transaction's spills: its rows' and its free space map's, its
+ * entry unowned once it prepared, are kept by a fold's drop at any point, as
+ * a commit it hasn't made can't apply, named by a checkpoint, and loaded
+ * back and read by a start, never taken as a committed or an aborted
+ * transaction's.
+ */
+void
+test_txn_spill_tests_a_prepared_transactions_spills_are_never_taken_out(void)
+{
+	const TxnInsertPage page = {.bytes = 8160, .most = 291};
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedHeld held = txn_memtable_testing_created(io, 9774);
+	HostStorage storage = txn_memtable_testing_storage(9774);
+	HostXid		xid = simc_begin();
+	TxnFreeSpaceFree space = txn_free_space_Free_new(8000, NULL, 0, 291);
+	TxnMemtableMapEntry entry = {.has_value = true};
+	TxnMemtableOp row = txn_memtable_testing_put((const uint8 *) "r", 1);
+	TxnMemtableOp take;
+	TxnMemtableVersionChange change = {.writer = txn_memtable_testing_writer(xid.f0), .op = &row,
+	.lock = TXN_MEMTABLE_LOCK_MODE_UPDATE, .shown = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND}};
+	TxnStatusOutcome unowned = {.tag = TXN_STATUS_OUTCOME_UNOWNED};
+	const TxnWrittenOf ofs[] = {TXN_WRITTEN_OF_ROWS, TXN_WRITTEN_OF_FREE};
+	TxnStatusRoomed roomed;
+	TxnMemtableVersionHandle handle;
+	uint8		key[4];
+	HostError	error;
+	bool		took;
+
+	std_vec_new(&entry.value, 1, 1);
+	txn_free_space_Free_encode_into(&space, &entry.value);
+	take = txn_memtable_testing_put(entry.value.ptr, entry.value.len);
+	take.u.put.tuple.f0 = 7 << 16 | 1;
+	take.u.put.heap_bytes = 0;
+	if (!txn_memtable_table_push(io, host_shared_Held_record(&held), (const uint8 *) "k", 1, &change, &handle, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	change.op = &take;
+	std_u32_to_be_bytes(7, key);
+	if (!txn_memtable_table_alone_State(io, host_shared_Held_record(&held), true, TXN_MEMTABLE_MAP_MAP_FREE, key,
+										sizeof(key), &change, &handle, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	txn_memtable_Op_drop(&take);
+	txn_memtable_Op_drop(&row);
+	for (size_t k = 0; k < lengthof(ofs); k++)
+	{
+		bool		spilled;
+
+		if (!txn_spill_spilled(io, &storage, ofs[k], xid.f0, &spilled, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		STD_ASSERT(__LINE__, 9, spilled, "spilled(io, &storage(9774), of, xid).unwrap()");
+	}
+	if (!txn_status_take(io, xid, unowned, &roomed, &took, &error) ||
+		!txn_spill_folded(io, host_shared_Held_record(&held), PG_UINT64_MAX >> 2, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	for (int restarted = 0; restarted < 2; restarted++)
+	{
+		txn_TupleVecFileU64_t listed;
+		TxnMemtableMapEntry newest;
+		HostDeltaHold hold;
+		StdVec		versions;
+		bool		some;
+		bool		kept;
+
+		if (restarted)
+		{
+			host_shared_Held_drop(&held);
+			simc_checkpointed(UINT64CONST(0x100000a27));
+			if (!txn_runs_checkpoint(io, UINT64CONST(0x100000a28), &error) ||
+				!txn_state_unlinked(io, &storage, &error) || !txn_runs_loaded(io, &page, &error) ||
+				!txn_memtable_testing_stated(io, 9774, &held, &error))
+				STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+										 host_Error_Debug_fmt);
+		}
+		if (!txn_spill_listed(&TXN_SPILL_STATE_HOME_OPS, io, host_shared_Held_record(&held), &storage, &listed,
+							  &error) ||
+			!host_delta_hold(io, &hold, &error) ||
+			!txn_spill_versions(&TXN_SPILL_STATE_HOME_OPS, io, &hold, host_shared_Held_record(&held),
+								TXN_RUNS_KIND_SPILLED_ROWS, (const uint8 *) "k", 1, &versions, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		host_delta_Hold_drop(&hold);
+		if (!txn_memtable_map_newest(io, host_shared_Held_record(&held), TXN_MEMTABLE_MAP_MAP_FREE, 7, &some, &newest,
+									 &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		kept = listed.f0.len == 3 && versions.len == 1 && some && txn_memtable_map_tests_seen_eq(&newest, &entry);
+		if (restarted)
+			STD_ASSERT_MSG(__LINE__, 9, kept, "named and loaded back");
+		else
+			STD_ASSERT_MSG(__LINE__, 9, kept, "kept by the drop");
+		if (some)
+			txn_memtable_map_tests_seen_drop(&newest);
+		txn_spill_tests_versions_free(&versions);
+		std_vec_free_Checked(&listed.f0, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	}
+	txn_memtable_map_tests_seen_drop(&entry);
+	host_shared_Held_drop(&held);
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * A free space map spill's merge joins its own files alone: a transaction
+ * whose rows spilled once, with their file of tuple ids, and whose free
+ * space map spilled twice, merges its two free space map files into one and
+ * leaves the rows' tuple ids as they were, listing no file of tuple ids no
+ * row file has, so every row's tuple id still finds its key.
+ */
+void
+test_txn_spill_tests_a_free_space_spills_merge_leaves_the_rows_tuple_ids_alone(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedHeld held = txn_memtable_testing_created(io, 9776);
+	HostSharedRecord state = host_shared_Held_record(&held);
+	HostStorage storage = txn_memtable_testing_storage(9776);
+	uint64		xid = simc_begin().f0;
+	TxnFreeSpaceFree space = txn_free_space_Free_new(8000, NULL, 0, 291);
+	static const uint32 blocks[] = {7, 8};
+	txn_TupleVecFileU64_t listed;
+	StdVec		value;
+	StdVec		rows;
+	StdVec		tuples;
+	HostDeltaHold hold;
+	HostError	error;
+	bool		spilled;
+	size_t		frees = 0;
+
+	for (uint64 n = 1; n <= 3; n++)
+	{
+		TxnMemtableOp row = txn_memtable_testing_put((const uint8 *) "row", 3);
+		TxnMemtableVersionChange change = {.writer = txn_memtable_testing_writer(xid), .op = &row,
+		.lock = TXN_MEMTABLE_LOCK_MODE_UPDATE, .shown = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND}};
+		TxnMemtableVersionHandle handle;
+		uint8		key[8];
+
+		row.u.put.tuple.f0 = 1 << 16 | n;
+		std_u64_to_be_bytes(n, key);
+		if (!txn_memtable_table_push(io, state, key, sizeof(key), &change, &handle, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		txn_memtable_Op_drop(&row);
+	}
+	if (!txn_spill_spilled(io, &storage, TXN_WRITTEN_OF_ROWS, xid, &spilled, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT(__LINE__, 9, spilled, "spilled(io, &storage(9776), Of::Rows, xid).unwrap()");
+	std_vec_new(&value, 1, 1);
+	txn_free_space_Free_encode_into(&space, &value);
+	for (size_t k = 0; k < lengthof(blocks); k++)
+	{
+		TxnMemtableOp take = txn_memtable_testing_put(value.ptr, value.len);
+		TxnMemtableVersionChange change = {.writer = txn_memtable_testing_writer(xid), .op = &take,
+		.lock = TXN_MEMTABLE_LOCK_MODE_UPDATE, .shown = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND}};
+		TxnMemtableVersionHandle handle;
+		uint8		key[4];
+
+		take.u.put.tuple.f0 = 7 << 16 | 1;
+		take.u.put.heap_bytes = 0;
+		std_u32_to_be_bytes(blocks[k], key);
+		if (!txn_memtable_table_alone_State(io, state, true, TXN_MEMTABLE_MAP_MAP_FREE, key, sizeof(key), &change,
+											&handle, &error) ||
+			!txn_spill_spilled(io, &storage, TXN_WRITTEN_OF_FREE, xid, &spilled, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		STD_ASSERT(__LINE__, 9, spilled, "spilled(io, &storage(9776), Of::Free, xid).unwrap()");
+		txn_memtable_Op_drop(&take);
+	}
+	std_vec_free_Checked(&value, 1, 1);
+	if (!txn_spill_listed(&TXN_SPILL_STATE_HOME_OPS, io, state, &storage, &listed, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	std_vec_new(&rows, sizeof(uint32), _Alignof(uint32));
+	std_vec_new(&tuples, sizeof(uint32), _Alignof(uint32));
+	for (size_t k = 0; k < listed.f0.len; k++)
+	{
+		const TxnSpillFile *file = &STD_VEC_AT(&listed.f0, TxnSpillFile, k);
+
+		if (file->kind == TXN_RUNS_KIND_SPILLED_FREE)
+			frees++;
+		else if (file->kind == TXN_RUNS_KIND_SPILLED_ROWS)
+			std_vec_push_Checked(&rows, &file->number, sizeof(uint32), _Alignof(uint32));
+		else if (file->kind == TXN_RUNS_KIND_SPILLED_TUPLES)
+			std_vec_push_Checked(&tuples, &file->number, sizeof(uint32), _Alignof(uint32));
+	}
+	STD_ASSERT_MSG(__LINE__, 9, frees == 1, "the free space map's files merged");
+	STD_ASSERT_MSG(__LINE__, 9, rows.len == tuples.len &&
+				   (rows.len == 0 || memcmp(rows.ptr, tuples.ptr, rows.len * sizeof(uint32)) == 0),
+				   "no tuple ids without their row file");
+	std_vec_free_Checked(&rows, sizeof(uint32), _Alignof(uint32));
+	std_vec_free_Checked(&tuples, sizeof(uint32), _Alignof(uint32));
+	std_vec_free_Checked(&listed.f0, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	if (!host_delta_hold(io, &hold, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	for (uint64 n = 1; n <= 3; n++)
+	{
+		HostRow		tid = {1 << 16 | n};
+		uint8		key[8];
+		StdVec		found;
+		bool		some;
+
+		std_u64_to_be_bytes(n, key);
+		if (!txn_spill_tuple_key(io, &hold, state, tid, &some, &found, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		STD_ASSERT(__LINE__, 9, some && found.len == sizeof(key) && memcmp(found.ptr, key, sizeof(key)) == 0,
+				   "tuple_key(io, &hold, state, Row(1 << 16 | n)).unwrap() == Some(n.to_be_bytes().to_vec())");
+		if (some)
+			std_vec_free_Checked(&found, 1, 1);
+	}
+	host_delta_Hold_drop(&hold);
+	host_shared_Held_drop(&held);
+	simc_TestIo_drop(&test_io);
+}
+
+
+/* txn_spill_tests_residual_t is a failed residual's captures: the io, the state, the kept version, the files listed, and whether it listed them. */
+typedef struct txn_spill_tests_residual_t
+{
+	HostIoIo   *io;
+	HostSharedRecord state;
+	const TxnSpillKept *kept;
+	StdVec		files;
+	bool		listed;
+	bool		must;
+} txn_spill_tests_residual_t;
+
+/* txn_spill_tests_residual_body lists the kept version's residual at a point, an error answering it unlisted. */
+static void
+txn_spill_tests_residual_body(void *captures)
+{
+	txn_spill_tests_residual_t *c = captures;
+	HostError	error;
+
+	c->listed = txn_spill_residual(c->io, c->state, 7, c->kept, 1, &c->files, &error);
+	if (!c->listed && c->must)
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	if (!c->listed)
+		host_Error_drop(&error);
+}
+
+/* txn_spill_tests_entry_count returns an xid's status entry's count. */
+static uint64
+txn_spill_tests_entry_count(HostIoIo *io, HostXid xid)
+{
+	TxnStatusEntry entry;
+	HostError	error;
+	bool		has;
+
+	if (!txn_status_lookup(io, xid, &has, &entry, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT(__LINE__, 9, has, "the writer has an entry");
+	return entry.count;
+}
+
+/*
+ * The residual's count order (bugs row 291's review R1): a residual adds its
+ * versions' count at their writer's entry before the manifest's hold, and
+ * its pad gives it back unless the listing finished, so a residual that
+ * fails or panics at any step lists no file and leaves the entry's count
+ * where it was, and one that finishes lists its file with the count added.
+ */
+void
+test_txn_spill_tests_a_residual_whose_listing_fails_lists_nothing_and_gives_its_count_back(void)
+{
+	bool		failed = false;
+
+	for (uint64 nth = 0; nth < 200; nth++)
+	{
+		SimcTestIo	test_io = simc_io();
+		HostIoIo   *io = &test_io.io;
+		HostSharedHeld held = txn_memtable_testing_created(io, 9760);
+		HostSharedRecord state = host_shared_Held_record(&held);
+		HostXid		writer = simc_begin();
+		TxnMemtableOp op = txn_memtable_testing_put((const uint8 *) "v", 1);
+		TxnMemtableVersionWriter written = txn_memtable_testing_writer(writer.f0);
+		TxnMemtableVersionShown shown = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND};
+		TxnSpillKept kept = {.kind = TXN_RUNS_KIND_ROWS};
+		txn_spill_tests_residual_t residual = {.io = io, .state = state, .kept = &kept, .must = nth == 0};
+		TxnStatusRoomed roomed;
+		HostError	error;
+		StdCaught	caught;
+		StdVec		listed;
+		uint64		before;
+
+		if (!txn_status_roomed(io, writer, &roomed, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		std_slice_to_vec_Checked(&kept.key, "a", 1, 1, 1);
+		std_vec_new(&kept.bytes, 1, 1);
+		txn_memtable_version_encode(&written, &op, TXN_MEMTABLE_LOCK_MODE_UPDATE, shown, false, 0, &kept.bytes);
+		before = txn_spill_tests_entry_count(io, writer);
+		simc_fail_allocation(nth);
+		if (!std_catch_unwind(txn_spill_tests_residual_body, &residual, &caught))
+			std_Caught_drop_Checked(&caught);
+		simc_fail_allocation(0);
+		listed = txn_spill_tests_files_of(io, state);
+		if (!residual.listed)
+		{
+			failed = true;
+			STD_ASSERT_EQ_U64(__LINE__, 9, listed.len, 0);
+			STD_ASSERT_EQ_U64(__LINE__, 9, txn_spill_tests_entry_count(io, writer), before);
+		}
+		else
+		{
+			STD_ASSERT_EQ_U64(__LINE__, 9, listed.len, 1);
+			STD_ASSERT_EQ_U64(__LINE__, 9, txn_spill_tests_entry_count(io, writer), before + 1);
+			std_vec_free_Checked(&residual.files, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+		}
+		std_vec_free_Checked(&listed, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+		std_vec_free_Checked(&kept.key, 1, 1);
+		std_vec_free_Checked(&kept.bytes, 1, 1);
+		txn_memtable_Op_drop(&op);
+		host_shared_Held_drop(&held);
+		simc_TestIo_drop(&test_io);
+		if (nth > 0 && residual.listed)
+			break;
+	}
+	STD_ASSERT(__LINE__, 9, failed, "a failed allocation failed the residual");
+}
+
+
+/* txn_spill_tests_crashed_spill spills a crashed transaction's rows or free space map versions, one version, a key or a block. */
+static void
+txn_spill_tests_crashed_spill(HostIoIo *io, HostSharedRecord state, const HostStorage *storage, HostXid xid,
+							  TxnWrittenOf of)
+{
+	TxnMemtableOp op = txn_memtable_testing_put((const uint8 *) "e", 1);
+	TxnMemtableVersionChange change = {.writer = txn_memtable_testing_writer(xid.f0), .op = &op,
+	.lock = TXN_MEMTABLE_LOCK_MODE_UPDATE, .shown = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND}};
+	TxnMemtableVersionHandle handle;
+	HostError	error;
+	bool		pushed;
+	bool		spilled;
+	uint8		key[4];
+
+	if (of == TXN_WRITTEN_OF_FREE)
+	{
+		op.u.put.heap_bytes = 0;
+		std_u32_to_be_bytes(7, key);
+		pushed = txn_memtable_table_alone_State(io, state, true, TXN_MEMTABLE_MAP_MAP_FREE, key, sizeof(key), &change,
+												&handle, &error);
+	}
+	else
+		pushed = txn_memtable_table_push(io, state, (const uint8 *) "a", 1, &change, &handle, &error);
+	if (!pushed || !txn_spill_spilled(io, storage, of, xid.f0, &spilled, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT(__LINE__, 9, spilled, "the version spilled");
+	txn_memtable_Op_drop(&op);
+}
+
+/*
+ * txn_spill_tests_crashed_count spills a transaction's rows and its free
+ * space map versions, in an order, ends it by a crash, with no abort record,
+ * drops what a fold passes, and returns its entry's count after the drop.
+ */
+static uint64
+txn_spill_tests_crashed_count(uint32 database, bool rows_first)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedHeld held = txn_memtable_testing_created(io, database);
+	HostSharedRecord state = host_shared_Held_record(&held);
+	HostStorage storage = txn_memtable_testing_storage(database);
+	HostXid		crashed = simc_begin();
+	TxnStatusRoomed roomed;
+	StdVec		listed;
+	HostError	error;
+	uint64		count;
+
+	if (!txn_status_roomed(io, crashed, &roomed, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	txn_spill_tests_crashed_spill(io, state, &storage, crashed, rows_first ? TXN_WRITTEN_OF_ROWS : TXN_WRITTEN_OF_FREE);
+	txn_spill_tests_crashed_spill(io, state, &storage, crashed, rows_first ? TXN_WRITTEN_OF_FREE : TXN_WRITTEN_OF_ROWS);
+	simc_abort(crashed);
+	if (!txn_spill_folded(io, state, 1, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	listed = txn_spill_tests_files_of(io, state);
+	STD_ASSERT_EQ_U64(__LINE__, 9, listed.len, 0);
+	std_vec_free_Checked(&listed, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	count = txn_spill_tests_entry_count(io, crashed);
+	host_shared_Held_drop(&held);
+	simc_TestIo_drop(&test_io);
+	return count;
+}
+
+/*
+ * The crashed transaction's counts (bugs row 291's review Q1): a drop decides
+ * every transaction whose files it reads before it counts a file, so a
+ * transaction a crash ended, whose rows spill stays listed beside its free
+ * space map spill until a checkpoint names them, has both files' counts
+ * taken back whichever is listed first.
+ */
+void
+test_txn_spill_tests_a_drop_counts_a_crashed_transactions_files_in_either_order(void)
+{
+	uint64		rows_first = txn_spill_tests_crashed_count(9764, true);
+	uint64		free_first = txn_spill_tests_crashed_count(9765, false);
+
+	STD_ASSERT_EQ_U64(__LINE__, 9, rows_first, free_first);
+}
+
+
+/* txn_spill_tests_carry_t is a carry case's captures: the io, the state, its writers, and whether the carry finished. */
+typedef struct txn_spill_tests_carry_t
+{
+	HostIoIo   *io;
+	const HostSharedHeld *held;
+	uint64		writers[3];
+	bool		carried;
+	HostError	error;
+} txn_spill_tests_carry_t;
+
+/* txn_spill_tests_carry_logged is the carry case's logged: one row version of each writer, each its own key, as a chain of the rows. */
+static bool
+txn_spill_tests_carry_logged(void *captures, HostSharedLongIo *io, StdVec *chains, HostError *error)
+{
+	const txn_spill_tests_carry_t *c = captures;
+	TxnMemtableVersionShown shown = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND};
+
+	for (size_t k = 0; k < lengthof(c->writers); k++)
+	{
+		TxnMemtableOp op = txn_memtable_testing_put((const uint8 *) "v", 1);
+		TxnMemtableVersionWriter writer = txn_memtable_testing_writer(c->writers[k]);
+		TxnSpillChain chain = {.of = TXN_WRITTEN_OF_ROWS};
+		txn_TupleU64VecU8_t version = {.f0 = c->writers[k]};
+		uint8		key = (uint8) ('a' + k);
+
+		op.u.put.tuple.f0 = (uint64) (k + 1);
+		std_slice_to_vec_Checked(&chain.key, &key, 1, 1, 1);
+		std_vec_new(&version.f1, 1, 1);
+		txn_memtable_version_encode(&writer, &op, TXN_MEMTABLE_LOCK_MODE_UPDATE, shown, false, 0, &version.f1);
+		std_vec_new(&chain.versions, sizeof(txn_TupleU64VecU8_t), _Alignof(txn_TupleU64VecU8_t));
+		std_vec_push_Checked(&chain.versions, &version, sizeof(version), _Alignof(txn_TupleU64VecU8_t));
+		std_vec_push_Checked(chains, &chain, sizeof(chain), _Alignof(TxnSpillChain));
+		txn_memtable_Op_drop(&op);
+	}
+	return true;
+}
+
+/* txn_spill_tests_carry_body carries the writers' versions, an error answering it unfinished. */
+static void
+txn_spill_tests_carry_body(void *captures)
+{
+	txn_spill_tests_carry_t *c = captures;
+
+	c->carried = txn_spill_carried(c->io, c->held, c->writers, lengthof(c->writers), txn_spill_tests_carry_logged, c,
+								   &c->error);
+}
+
+/*
+ * txn_spill_tests_carry_refused runs a carry of three writers' versions with
+ * one of its steps refused after a count of them, a page's open or an
+ * allocation, and checks it: a carry that failed lists no file and leaves
+ * every writer's count where it was, and one that finished lists its files
+ * with each writer's count one more; it answers whether the carry failed.
+ */
+static bool
+txn_spill_tests_carry_refused(bool opens, uint64 after)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedHeld held = txn_memtable_testing_created(io, 9766);
+	HostSharedRecord state = host_shared_Held_record(&held);
+	txn_spill_tests_carry_t carry = {.io = io, .held = &held};
+	uint64		before[3];
+	StdCaught	caught;
+	StdVec		listed;
+	HostError	error;
+	bool		panicked;
+
+	for (size_t k = 0; k < lengthof(carry.writers); k++)
+	{
+		HostXid		writer = simc_begin();
+		TxnStatusRoomed roomed;
+
+		carry.writers[k] = writer.f0;
+		if (!txn_status_roomed(io, writer, &roomed, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		before[k] = txn_spill_tests_entry_count(io, writer);
+	}
+	if (opens)
+		simc_refuse_any_open(after);
+	else
+		simc_fail_allocation(after);
+	panicked = !std_catch_unwind(txn_spill_tests_carry_body, &carry, &caught);
+	if (panicked)
+		std_Caught_drop_Checked(&caught);
+	simc_refuse_nothing();
+	simc_fail_allocation(0);
+	listed = txn_spill_tests_files_of(io, state);
+	if (!carry.carried && !panicked)
+		host_Error_drop(&carry.error);
+	STD_ASSERT(__LINE__, 9, carry.carried ? listed.len > 0 : listed.len == 0,
+			   "a carry lists its files when it finishes and none when it fails");
+	for (size_t k = 0; k < lengthof(carry.writers); k++)
+	{
+		HostXid		writer = {carry.writers[k]};
+
+		STD_ASSERT_EQ_U64(__LINE__, 9, txn_spill_tests_entry_count(io, writer), before[k] + (carry.carried ? 1 : 0));
+	}
+	std_vec_free_Checked(&listed, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	host_shared_Held_drop(&held);
+	simc_TestIo_drop(&test_io);
+	return !carry.carried;
+}
+
+/*
+ * The carry's count order (bugs row 291's review R2): a carry resolves its
+ * writers' slots before its hold and adds each listed file's count after it,
+ * and a failed add takes the carry's files back out with the counts already
+ * added in one checkpoint window, so a carry that fails at any page's open
+ * or allocation, the adds' included, lists no file and leaves every
+ * writer's count where it was, and one that finishes counts each writer's
+ * versions.
+ */
+void
+test_txn_spill_tests_a_carry_that_fails_at_any_step_lists_nothing_and_leaves_every_count(void)
+{
+	bool		failed = false;
+
+	for (uint64 after = 0; after < 400; after++)
+	{
+		bool		refused = txn_spill_tests_carry_refused(true, after);
+
+		failed |= refused;
+		if (!refused && after > 0)
+			break;
+	}
+	for (uint64 nth = 1; nth < 400; nth++)
+		if (!txn_spill_tests_carry_refused(false, nth))
+			break;
+	STD_ASSERT(__LINE__, 9, failed, "a refused open failed the carry");
 }
 
 #endif							/* DOLTGRES_TEST_TXN */

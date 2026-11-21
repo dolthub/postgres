@@ -377,12 +377,12 @@ txn_memtable_map_newest_reading(void *captures, const HostDeltaHold *hold, TxnMe
 }
 
 /*
- * txn_memtable_map_newest returns a key's newest entry in a storage's map
- * outside any window: nothing for a key with none, and none for a removal.
+ * txn_memtable_map_in_memtable returns a key's newest entry in a storage's
+ * map's memtable outside any window, as newest does, its spills unread.
  */
 bool
-txn_memtable_map_newest(HostIoIo *io, HostSharedRecord state, TxnMemtableMapMap map, uint32 key, bool *some,
-						TxnMemtableMapEntry *result, HostError *error)
+txn_memtable_map_in_memtable(HostIoIo *io, HostSharedRecord state, TxnMemtableMapMap map, uint32 key, bool *some,
+							 TxnMemtableMapEntry *result, HostError *error)
 {
 	uint8		bytes[TXN_MEMTABLE_MAP_KEY];
 	txn_memtable_map_newest_reading_t reading = {bytes};
@@ -397,6 +397,85 @@ txn_memtable_map_newest(HostIoIo *io, HostSharedRecord state, TxnMemtableMapMap 
 	if (*some)
 		*result = reading.entry;
 	return true;
+}
+
+/* txn_memtable_map_entry reports whether a map's version is an entry's, a put or a removal, and not a values mark. */
+static bool
+txn_memtable_map_entry(const TxnMemtableVersionVersion *version)
+{
+	TxnMemtableVersionRecord record = txn_memtable_version_Version_record(version);
+
+	return txn_memtable_version_Record_op(&record).tag != TXN_MEMTABLE_VERSION_OP_REF_NAMED;
+}
+
+/*
+ * txn_memtable_map_spilled returns a block's free space entry's versions in a
+ * storage's spills, newest first, read after its chain in the memtable: a
+ * spill takes only keys whose every version is its transaction's, so
+ * whatever the memtable holds of a spilled key came after.
+ */
+static bool
+txn_memtable_map_spilled(HostIoIo *io, HostSharedRecord state, const uint8 *key, StdVec *result, HostError *error)
+{
+	HostDeltaHold hold;
+	bool		ok;
+
+	if (!host_delta_hold(io, &hold, error))
+		return false;
+	ok = txn_spill_versions(&TXN_SPILL_STATE_HOME_OPS, io, &hold, state, TXN_RUNS_KIND_SPILLED_FREE, key,
+							TXN_MEMTABLE_MAP_KEY, result, error);
+	host_delta_Hold_drop(&hold);
+	return ok;
+}
+
+/*
+ * txn_memtable_map_spilled_newest returns a block's newest free space entry
+ * in a storage's spills, the entry below its memtable's chain, a values mark
+ * passed over as newest_in passes over one: nothing when they hold no version
+ * of it, and none for a removal.
+ */
+bool
+txn_memtable_map_spilled_newest(HostIoIo *io, HostSharedRecord state, uint32 key, bool *some,
+								TxnMemtableMapEntry *result, HostError *error)
+{
+	uint8		bytes[TXN_MEMTABLE_MAP_KEY];
+	StdVec		versions;
+	bool		ok = true;
+
+	*some = false;
+	std_u32_to_be_bytes(key, bytes);
+	if (!txn_memtable_map_spilled(io, state, bytes, &versions, error))
+		return false;
+	for (size_t k = 0; k < versions.len && !*some && ok; k++)
+	{
+		const TxnMemtableVersionVersion *version = &STD_VEC_AT(&versions, TxnMemtableVersionVersion, k);
+		StdBytes	value;
+
+		if (!txn_memtable_map_entry(version))
+			continue;
+		ok = txn_memtable_map_valued(version, &result->has_value, &value, error);
+		if (ok && result->has_value)
+			std_slice_to_vec_Checked(&result->value, value.ptr, value.len, 1, 1);
+		*some = ok;
+	}
+	txn_memtable_version_versions_drop(&versions, 0);
+	return ok;
+}
+
+/*
+ * txn_memtable_map_newest returns a key's newest entry in a storage's map
+ * outside any window: nothing for a key with none, and none for a removal. A
+ * free space entry with no version in the memtable is read in the storage's
+ * spills.
+ */
+bool
+txn_memtable_map_newest(HostIoIo *io, HostSharedRecord state, TxnMemtableMapMap map, uint32 key, bool *some,
+						TxnMemtableMapEntry *result, HostError *error)
+{
+	if (!txn_memtable_map_in_memtable(io, state, map, key, some, result, error))
+		return false;
+	return *some || map != TXN_MEMTABLE_MAP_MAP_FREE ||
+		txn_memtable_map_spilled_newest(io, state, key, some, result, error);
 }
 
 /* txn_memtable_map_taken returns the tuple id a free space entry's version took, or names as its take's values mark, or 0 for none. */
@@ -459,7 +538,7 @@ typedef struct txn_memtable_map_takers_reading_t
 } txn_memtable_map_takers_reading_t;
 
 /* txn_memtable_map_taker reads one version as a taker, answering false on an error. */
-static bool
+bool
 txn_memtable_map_taker(const TxnMemtableVersionVersion *version, txn_TupleWriterRowEntryU64TupleVecU32Bool_t *taker,
 					   HostError *error)
 {
@@ -576,12 +655,10 @@ txn_memtable_map_takers_reading_body_0(void *frame_)
 							 _Alignof(txn_TupleWriterRowEntryU64TupleVecU32Bool_t));
 		frame->taker_live = false;
 	}
-	std_slice_reverse(reading->takers.ptr, reading->takers.len, sizeof(txn_TupleWriterRowEntryU64TupleVecU32Bool_t),
-					  _Alignof(txn_TupleWriterRowEntryU64TupleVecU32Bool_t));
 	frame->ok = true;
 }
 
-/* txn_memtable_map_takers_reading reads a key's chain as takers, oldest first, under its range's shared lock. */
+/* txn_memtable_map_takers_reading reads a key's chain as takers, newest first, under its range's shared lock. */
 static bool
 txn_memtable_map_takers_reading(void *captures, const HostDeltaHold *hold, TxnMemtableTableAt at,
 								const HostSharedGuard *guard, HostError *error)
@@ -638,6 +715,40 @@ txn_memtable_map_takers_body_0(void *frame_)
 		txn_memtable_map_takers_pad_0(frame);
 		return;
 	}
+	if (frame->map == TXN_MEMTABLE_MAP_MAP_FREE)
+	{
+		StdVec		spilled;
+		bool		ok;
+
+		if (!txn_memtable_map_spilled(frame->io, frame->state, frame->bytes, &spilled, frame->error))
+		{
+			txn_memtable_map_takers_pad_0(frame);
+			return;
+		}
+		ok = std_vec_try_reserve(&frame->reading.takers, spilled.len,
+								 sizeof(txn_TupleWriterRowEntryU64TupleVecU32Bool_t),
+								 _Alignof(txn_TupleWriterRowEntryU64TupleVecU32Bool_t));
+		if (!ok)
+			*frame->error = host_Error_out_of_memory();
+		for (size_t k = 0; k < spilled.len && ok; k++)
+		{
+			txn_TupleWriterRowEntryU64TupleVecU32Bool_t taker;
+
+			ok = txn_memtable_map_taker(&STD_VEC_AT(&spilled, TxnMemtableVersionVersion, k), &taker, frame->error);
+			if (ok)
+				std_vec_push_Checked(&frame->reading.takers, &taker, sizeof(taker),
+									 _Alignof(txn_TupleWriterRowEntryU64TupleVecU32Bool_t));
+		}
+		txn_memtable_version_versions_drop(&spilled, 0);
+		if (!ok)
+		{
+			txn_memtable_map_takers_pad_0(frame);
+			return;
+		}
+	}
+	std_slice_reverse(frame->reading.takers.ptr, frame->reading.takers.len,
+					  sizeof(txn_TupleWriterRowEntryU64TupleVecU32Bool_t),
+					  _Alignof(txn_TupleWriterRowEntryU64TupleVecU32Bool_t));
 	*frame->result = frame->reading.takers;
 	frame->takers_live = false;
 	frame->ok = true;
@@ -647,7 +758,8 @@ txn_memtable_map_takers_body_0(void *frame_)
  * txn_memtable_map_takers returns a key's versions in a storage's map as
  * VACUUM reads them, oldest first: each one's writer, the tuple id its take
  * took or names, its entry, its ender widened to a full xid, and its row's
- * value ids with whether it is a values mark.
+ * value ids with whether it is a values mark. A free space entry's spilled
+ * versions come below its memtable's.
  */
 bool
 txn_memtable_map_takers(HostIoIo *io, HostSharedRecord state, TxnMemtableMapMap map, uint32 key, StdVec *result,
@@ -661,18 +773,72 @@ txn_memtable_map_takers(HostIoIo *io, HostSharedRecord state, TxnMemtableMapMap 
 	return frame.ok;
 }
 
-/* txn_memtable_map_rows_reading_t is a free space map reading's captures: the key, the tuple id, the ender or the LSN, and the answer. */
+/*
+ * txn_memtable_map_spilled_takes returns the tuple ids a block's free space
+ * entry's spilled versions took, which VACUUM frees only once a fold took
+ * their file and its base holds them, since a spilled version holds no
+ * ender.
+ */
+bool
+txn_memtable_map_spilled_takes(HostIoIo *io, HostSharedRecord state, uint32 block, StdVec *result, HostError *error)
+{
+	uint8		bytes[TXN_MEMTABLE_MAP_KEY];
+	StdVec		versions;
+	bool		ok = true;
+
+	std_u32_to_be_bytes(block, bytes);
+	if (!txn_memtable_map_spilled(io, state, bytes, &versions, error))
+		return false;
+	std_vec_new(result, sizeof(HostRow), _Alignof(HostRow));
+	for (size_t k = 0; k < versions.len && ok; k++)
+	{
+		TxnMemtableVersionRecord record = txn_memtable_version_Version_record(&STD_VEC_AT(&versions,
+																						  TxnMemtableVersionVersion,
+																						  k));
+		HostRow		tid = txn_memtable_map_taken(txn_memtable_version_Record_op(&record));
+
+		if (tid.f0 == 0)
+			continue;
+		ok = std_vec_try_reserve(result, 1, sizeof(tid), _Alignof(HostRow));
+		if (ok)
+			std_vec_push_Checked(result, &tid, sizeof(tid), _Alignof(HostRow));
+		else
+			*error = host_Error_out_of_memory();
+	}
+	txn_memtable_version_versions_drop(&versions, 0);
+	if (!ok)
+		std_vec_free_Checked(result, sizeof(HostRow), _Alignof(HostRow));
+	return ok;
+}
+
+/* txn_memtable_map_marker answers the tuple id a free space entry's version holds when it carries the end of a WAL record. */
+static bool
+txn_memtable_map_marker(const TxnMemtableVersionVersion *version, uint64 lsn, HostRow *result)
+{
+	TxnMemtableVersionRecord record = txn_memtable_version_Version_record(version);
+	TxnMemtableVersionOpRef op = txn_memtable_version_Record_op(&record);
+	uint64		at;
+
+	if (op.tag != TXN_MEMTABLE_VERSION_OP_REF_PUT || !txn_memtable_version_Record_lsn(&record, &at) || at != lsn ||
+		op.u.put.tuple.f0 == 0)
+		return false;
+	*result = op.u.put.tuple;
+	return true;
+}
+
+/* txn_memtable_map_rows_reading_t is a free space map reading's captures: the key, the tuple id, the ender or the LSN, the take's writer, and the answer. */
 typedef struct txn_memtable_map_rows_reading_t
 {
 	const uint8 *key;
 	HostRow		tid;
 	uint32		ender;
+	uint64		writer;
 	uint64		lsn;
 	bool		found;
 	StdVec		tids;
 } txn_memtable_map_rows_reading_t;
 
-/* txn_memtable_map_ended_reading stores the ender in the version of a free space entry that took the tuple id. */
+/* txn_memtable_map_ended_reading stores the ender in the version of a free space entry by which the writer took the tuple id. */
 static bool
 txn_memtable_map_ended_reading(void *captures, const HostDeltaHold *hold, TxnMemtableTableAt at,
 							   const HostSharedGuard *guard, HostError *error)
@@ -700,7 +866,8 @@ txn_memtable_map_ended_reading(void *captures, const HostDeltaHold *hold, TxnMem
 		if (!some)
 			return true;
 		record = txn_memtable_version_Version_record(&version);
-		taken = txn_memtable_map_taken(txn_memtable_version_Record_op(&record)).f0 == reading->tid.f0;
+		taken = txn_memtable_map_taken(txn_memtable_version_Record_op(&record)).f0 == reading->tid.f0 &&
+			txn_memtable_version_Record_writer(&record).xid == reading->writer;
 		if (taken)
 			txn_memtable_version_Version_end(&version, reading->ender);
 		txn_memtable_version_Version_drop(&version);
@@ -711,13 +878,16 @@ txn_memtable_map_ended_reading(void *captures, const HostDeltaHold *hold, TxnMem
 
 /*
  * txn_memtable_map_ended stores a fold's drop's ender in the free space
- * map's version that took a tuple id, so VACUUM reads the row's end.
+ * map's version by which the row's writer took its tuple id, so VACUUM reads
+ * the row's end; a standby whose fold lags may already hold a later take of
+ * the tuple id, which keeps no ender.
  */
 bool
-txn_memtable_map_ended(HostIoIo *io, HostSharedRecord state, HostRow tid, uint32 ender, HostError *error)
+txn_memtable_map_ended(HostIoIo *io, HostSharedRecord state, HostRow tid, uint64 writer, uint32 ender,
+					   HostError *error)
 {
 	uint8		bytes[TXN_MEMTABLE_MAP_KEY];
-	txn_memtable_map_rows_reading_t reading = {bytes, tid, ender};
+	txn_memtable_map_rows_reading_t reading = {.key = bytes, .tid = tid, .ender = ender, .writer = writer};
 	bool		some;
 
 	std_u32_to_be_bytes((uint32) STD_SHR_FOLDED(u64, tid.f0, 16), bytes);
@@ -745,26 +915,22 @@ txn_memtable_map_marked_reading(void *captures, const HostDeltaHold *hold, TxnMe
 	for (;;)
 	{
 		TxnMemtableVersionVersion version;
-		TxnMemtableVersionRecord record;
-		TxnMemtableVersionOpRef op;
-		uint64		at_lsn;
+		HostRow		tid;
 
 		if (!txn_memtable_map_Entries_next(&chain, &some, &version, error))
 			return false;
 		if (!some)
 			return true;
-		record = txn_memtable_version_Version_record(&version);
-		op = txn_memtable_version_Record_op(&record);
-		if (op.tag == TXN_MEMTABLE_VERSION_OP_REF_PUT && txn_memtable_version_Record_lsn(&record, &at_lsn) &&
-			at_lsn == reading->lsn && op.u.put.tuple.f0 != 0)
-			std_vec_push_Checked(&reading->tids, &op.u.put.tuple, sizeof(HostRow), _Alignof(HostRow));
+		if (txn_memtable_map_marker(&version, reading->lsn, &tid))
+			std_vec_push_Checked(&reading->tids, &tid, sizeof(HostRow), _Alignof(HostRow));
 		txn_memtable_version_Version_drop(&version);
 	}
 }
 
 /*
  * txn_memtable_map_marked returns the tuple ids a block's free space map
- * entries put with an LSN, the takes a row change record's redo made.
+ * entries put with an LSN, the takes a row change record's redo made, in its
+ * memtable and then its spills.
  */
 bool
 txn_memtable_map_marked(HostIoIo *io, HostSharedRecord state, uint32 block, uint64 lsn, StdVec *result,
@@ -773,11 +939,32 @@ txn_memtable_map_marked(HostIoIo *io, HostSharedRecord state, uint32 block, uint
 	uint8		bytes[TXN_MEMTABLE_MAP_KEY];
 	txn_memtable_map_rows_reading_t reading = {.key = bytes, .lsn = lsn};
 	bool		some;
+	StdVec		spilled;
+	bool		ok = true;
 
 	std_u32_to_be_bytes(block, bytes);
 	std_vec_new(&reading.tids, sizeof(HostRow), _Alignof(HostRow));
 	if (!txn_memtable_table_read(&TXN_MEMTABLE_MAP_FREE_TREE_OPS, io, state, bytes, sizeof(bytes),
-								 txn_memtable_map_marked_reading, &reading, &some, error))
+								 txn_memtable_map_marked_reading, &reading, &some, error) ||
+		!txn_memtable_map_spilled(io, state, bytes, &spilled, error))
+	{
+		std_vec_free_Checked(&reading.tids, sizeof(HostRow), _Alignof(HostRow));
+		return false;
+	}
+	for (size_t k = 0; k < spilled.len && ok; k++)
+	{
+		HostRow		tid;
+
+		if (!txn_memtable_map_marker(&STD_VEC_AT(&spilled, TxnMemtableVersionVersion, k), lsn, &tid))
+			continue;
+		ok = std_vec_try_reserve(&reading.tids, 1, sizeof(tid), _Alignof(HostRow));
+		if (ok)
+			std_vec_push_Checked(&reading.tids, &tid, sizeof(tid), _Alignof(HostRow));
+		else
+			*error = host_Error_out_of_memory();
+	}
+	txn_memtable_version_versions_drop(&spilled, 0);
+	if (!ok)
 	{
 		std_vec_free_Checked(&reading.tids, sizeof(HostRow), _Alignof(HostRow));
 		return false;
@@ -847,21 +1034,21 @@ txn_memtable_map_marks(HostIoIo *io, HostSharedRecord state, uint32 block, HostR
 }
 
 /*
- * txn_memtable_map_holds reports whether a storage's map, in its memtable
- * or, for the value map, its spills, holds the version a record of an LSN
- * pushed, so its redo skips the push.
+ * txn_memtable_map_holds reports whether a storage's map, in its memtable or
+ * its spills, holds the version a record of an LSN pushed, so its redo skips
+ * the push.
  */
 bool
 txn_memtable_map_holds(HostIoIo *io, HostSharedRecord state, TxnMemtableMapMap map, uint32 key, uint64 lsn,
 					   bool *result, HostError *error)
 {
 	uint8		bytes[TXN_MEMTABLE_MAP_KEY];
+	TxnRunsKind kind = map == TXN_MEMTABLE_MAP_MAP_FREE ? TXN_RUNS_KIND_SPILLED_FREE : TXN_RUNS_KIND_SPILLED_VALUES;
 
 	std_u32_to_be_bytes(key, bytes);
 	if (!txn_memtable_table_held(txn_memtable_map_tree(map), io, state, bytes, sizeof(bytes), lsn, result, error))
 		return false;
-	return map == TXN_MEMTABLE_MAP_MAP_FREE || *result ||
-		txn_spill_holds(io, state, TXN_RUNS_KIND_SPILLED_VALUES, bytes, sizeof(bytes), lsn, result, error);
+	return *result || txn_spill_holds(io, state, kind, bytes, sizeof(bytes), lsn, result, error);
 }
 
 /* txn_memtable_map_cut_reading_t is cut's reading's captures: the state and the cut read. */
@@ -1116,19 +1303,81 @@ txn_memtable_map_seek_body_0(void *frame_)
 }
 
 /*
- * txn_memtable_map_seek returns the first key at or past a key in a
- * storage's map with an entry, and that entry, walking step by step, or
- * nothing past the last.
+ * txn_memtable_map_sought returns the first key at or past a key in a
+ * storage's map's memtable with an entry, and that entry, walking step by
+ * step, or nothing past the last.
  */
-bool
-txn_memtable_map_seek(HostIoIo *io, HostSharedRecord state, TxnMemtableMapMap map, uint32 from, bool *some,
-					  txn_TupleU32Entry_t *result, HostError *error)
+static bool
+txn_memtable_map_sought(HostIoIo *io, HostSharedRecord state, TxnMemtableMapMap map, uint32 from, bool *some,
+						txn_TupleU32Entry_t *result, HostError *error)
 {
 	txn_memtable_map_seek_frame_0_t frame = {.io = io, .state = state, .map = map, .from = from, .some = some,
 	.result = result, .error = error};
 
 	std_landing(&frame, txn_memtable_map_seek_body_0, txn_memtable_map_seek_pad_0);
 	return frame.ok;
+}
+
+/*
+ * txn_memtable_map_seek returns the lowest key at or past a key with an
+ * entry in a storage's map, in its memtable or, for the free space map, its
+ * spills, with its newest value or none for a removal, so that allocation's
+ * merge masks the base's entry at every block the delta has one for; a key
+ * both hold takes the memtable's, which came after.
+ */
+bool
+txn_memtable_map_seek(HostIoIo *io, HostSharedRecord state, TxnMemtableMapMap map, uint32 from, bool *some,
+					  txn_TupleU32Entry_t *result, HostError *error)
+{
+	uint8		after[TXN_MEMTABLE_MAP_KEY];
+	HostDeltaHold hold;
+	bool		next;
+	txn_TupleVecU8VecVersion_t spilled;
+	const TxnMemtableVersionVersion *version = NULL;
+	uint32		block;
+	bool		ok;
+
+	if (!txn_memtable_map_sought(io, state, map, from, some, result, error))
+		return false;
+	if (map != TXN_MEMTABLE_MAP_MAP_FREE)
+		return true;
+	if (from > 0)
+		std_u32_to_be_bytes(from - 1, after);
+	if (!host_delta_hold(io, &hold, error))
+		return false;
+	ok = txn_spill_next(&TXN_SPILL_STATE_HOME_OPS, io, &hold, state, TXN_RUNS_KIND_SPILLED_FREE, from > 0, after,
+						sizeof(after), TXN_MEMTABLE_TABLE_DIRECTION_FORWARD, &next, &spilled, error);
+	host_delta_Hold_drop(&hold);
+	if (!ok || !next)
+		return ok;
+	if (spilled.f0.len != TXN_MEMTABLE_MAP_KEY)
+	{
+		*error = txn_memtable_map_internal("a map's key isn't 4 bytes");
+		ok = false;
+	}
+	block = ok ? std_u32_from_be_bytes(spilled.f0.ptr) : 0;
+	for (size_t k = 0; ok && k < spilled.f1.len && version == NULL; k++)
+		if (txn_memtable_map_entry(&STD_VEC_AT(&spilled.f1, TxnMemtableVersionVersion, k)))
+			version = &STD_VEC_AT(&spilled.f1, TxnMemtableVersionVersion, k);
+	if (ok && version != NULL && !(*some && result->f0 <= block))
+	{
+		StdBytes	value;
+		txn_TupleU32Entry_t below = {block};
+
+		ok = txn_memtable_map_valued(version, &below.f1.has_value, &value, error);
+		if (ok)
+		{
+			if (below.f1.has_value)
+				std_slice_to_vec_Checked(&below.f1.value, value.ptr, value.len, 1, 1);
+			if (*some && result->f1.has_value)
+				std_vec_free_Checked(&result->f1.value, 1, 1);
+			*result = below;
+			*some = true;
+		}
+	}
+	std_vec_free_Checked(&spilled.f0, 1, 1);
+	txn_memtable_version_versions_drop(&spilled.f1, 0);
+	return ok;
 }
 
 /* txn_memtable_map_named_t is named's step's captures: the change's writer, its LSN, the row's tuple id, and its value ids. */
@@ -1164,16 +1413,17 @@ txn_memtable_map_named_step(void *captures, TxnMemtableIndexKeyedOpen *open, con
 /*
  * txn_memtable_map_named pushes a take's values mark inside the window: the
  * row's tuple id and its value ids, under the take's key, changing no entry,
- * taking the value ids.
+ * taking the value ids, and counts it at its writer's entry when it names
+ * one.
  */
 bool
 txn_memtable_map_named(HostIoTakesShort io, TxnMemtableTablePreparedState *prepared, size_t take,
-					   TxnMemtableVersionWriter writer, bool has_lsn, uint64 lsn, HostRow tuple, StdVec *values,
-					   HostError *error)
+					   TxnMemtableVersionWriter writer, bool has_roomed, TxnStatusRoomed roomed, bool has_lsn,
+					   uint64 lsn, HostRow tuple, StdVec *values, HostError *error)
 {
 	txn_memtable_map_named_t named = {writer, has_lsn, lsn, tuple, values};
 	bool		ok = txn_memtable_table_within(io, prepared, txn_memtable_table_Prepared_target(prepared, take),
-											   txn_memtable_map_named_step, &named, error);
+											   has_roomed, roomed, txn_memtable_map_named_step, &named, error);
 
 	std_vec_free_Checked(values, sizeof(uint32), _Alignof(uint32));
 	return ok;
@@ -1318,11 +1568,13 @@ txn_memtable_map_took_step(void *captures, TxnMemtableIndexKeyedOpen *open, cons
  * tuple id the one the kept value names, a free space map's put lowers the
  * state's hints to the block, and then runs on the kept value. step, tuple,
  * and then share captures, through which the kept value goes; each runs at
- * most once.
+ * most once. A pushed version counts at its writer's entry when it names
+ * one.
  */
 bool
 txn_memtable_map_took_core(HostIoTakesShort io, TxnMemtableTablePreparedState *prepared, size_t take,
-						   TxnMemtableVersionWriter writer, bool has_lsn, uint64 lsn, bool has_claim,
+						   TxnMemtableVersionWriter writer, bool has_roomed, TxnStatusRoomed roomed, bool has_lsn,
+						   uint64 lsn, bool has_claim,
 						   HostRow claim_tid, uint64 claim_bytes, bool has_base, const uint8 *base, size_t base_len,
 						   TxnMemtableMapStep (*step) (void *captures, bool has_current, const uint8 *current,
 													   size_t current_len, StdVec *out),
@@ -1340,7 +1592,8 @@ txn_memtable_map_took_core(HostIoTakesShort io, TxnMemtableTablePreparedState *p
 		return false;
 	took.state = state;
 	took.free = tree == &TXN_MEMTABLE_MAP_FREE_TREE_OPS;
-	return txn_memtable_table_within(io, prepared, target, txn_memtable_map_took_step, &took, error);
+	return txn_memtable_table_within(io, prepared, target, has_roomed, roomed, txn_memtable_map_took_step, &took,
+									 error);
 }
 
 /* The map's takes that keep nothing, and its prepare whose closure returns nothing, which map.c defines. */
@@ -1503,7 +1756,8 @@ txn_memtable_map_tests_taken_inside(void *captures, HostIoIo *io, TxnMemtableTab
 	TxnStatusRoomed roomed = {0};
 
 	c->ran = 0;
-	if (!txn_memtable_map_finish_Seen(HOST_IO_IO_TAKES_SHORT(io), prepared, 0, txn_memtable_testing_writer(7), false, 0,
+	if (!txn_memtable_map_finish_Seen(HOST_IO_IO_TAKES_SHORT(io), prepared, 0, txn_memtable_testing_writer(7), false,
+									  roomed, false, 0,
 									  true, (const uint8 *) "base", 4, txn_memtable_map_tests_taken_step, c, NULL,
 									  txn_memtable_map_tests_taken_then, c, NULL, result_0, result_1, error))
 		return false;
@@ -2152,7 +2406,8 @@ txn_memtable_map_tests_map_only_inside(void *captures, HostIoIo *io, TxnMemtable
 	TxnStatusRoomed roomed = {0};
 	HostError	refused;
 
-	if (!txn_memtable_map_finish_Unit(HOST_IO_IO_TAKES_SHORT(io), prepared, 0, txn_memtable_testing_writer(7), false, 0,
+	if (!txn_memtable_map_finish_Unit(HOST_IO_IO_TAKES_SHORT(io), prepared, 0, txn_memtable_testing_writer(7), false,
+									  roomed, false, 0,
 									  false, NULL, 0, txn_memtable_map_tests_left, NULL, NULL,
 									  txn_memtable_map_tests_nothing, NULL, NULL, result_0, error))
 		return false;
@@ -2306,6 +2561,7 @@ txn_memtable_map_tests_window_inside(void *captures, HostIoIo *io, TxnMemtableTa
 
 	for (size_t take = 0; take < lengthof(values); take++)
 		if (!txn_memtable_map_finish_Unit(HOST_IO_IO_TAKES_SHORT(io), prepared, take, txn_memtable_testing_writer(7),
+										  false, roomed,
 										  false, 0, false, NULL, 0, txn_memtable_map_tests_written,
 										  (void *) values[take], NULL, txn_memtable_map_tests_nothing, NULL, NULL,
 										  &taken, error))

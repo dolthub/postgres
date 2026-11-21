@@ -109,8 +109,9 @@ host_shared_Kind_pool(const HostSharedPoolOps *s)
 
 /*
  * host_shared_Kind_aged returns the line of a pool the delta's epochs free,
- * whose records hold one atomic past their shape's, the host's, for the
- * epoch of their retirement.
+ * whose records hold two atomics past their shape's, the host's: the epoch of
+ * their retirement, and their link in their kind's retired list (bugs row
+ * 309).
  */
 HostSharedKind
 host_shared_Kind_aged(const HostSharedAgedOps *s)
@@ -122,7 +123,7 @@ host_shared_Kind_aged(const HostSharedAgedOps *s)
 	form.u.aged.names = s->names;
 	form.u.aged.names_len = s->names_len;
 	kind = host_shared_Kind_of(&s->shape, form);
-	kind.atomics = STD_ADD(usize, kind.atomics, 1, 221, 9);
+	kind.atomics = STD_ADD(usize, kind.atomics, 2, 221, 9);
 	return kind;
 }
 

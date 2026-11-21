@@ -32,11 +32,20 @@
 #include "doltgres/std/vec.h"
 #include "doltgres/trees/store.h"
 
-/* RepoSpilled is Spilled: a transaction's spill file among a checkpoint's runs, by its top-level xid and its number. */
+/*
+ * RepoSpilled is Spilled: a transaction's spill file among a checkpoint's
+ * runs, by its top-level xid and its number, for a free space map's spill its
+ * transaction's abort kept, the point a fold passes it at, and, for a fold's
+ * residual of a map's spills, the fold's point, from which readers read it.
+ */
 typedef struct RepoSpilled
 {
 	uint64		xid;
 	uint32		number;
+	bool		has_passed;
+	uint64		passed;
+	bool		has_from;
+	uint64		from;
 } RepoSpilled;
 
 /*

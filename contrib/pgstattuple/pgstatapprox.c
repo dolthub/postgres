@@ -18,6 +18,7 @@
 #include "access/visibilitymap.h"
 #include "catalog/pg_am_d.h"
 #include "commands/vacuum.h"
+#include "doltgres/hooks.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
@@ -345,7 +346,7 @@ pgstattuple_approx_internal(Oid relid, FunctionCallInfo fcinfo)
 						RelationGetRelationName(rel)),
 				 errdetail_relkind_not_supported(rel->rd_rel->relkind)));
 
-	if (rel->rd_rel->relam != HEAP_TABLE_AM_OID)
+	if (rel->rd_rel->relam != HEAP_TABLE_AM_OID || doltgres_heap_only_refused(rel))
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("only heap AM is supported")));
 

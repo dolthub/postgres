@@ -201,6 +201,9 @@ extern bool chunks_packs_backend_Packs_even_manifest(const ChunksPacksBackendPac
 													 ChunksErrorError *error);
 extern bool chunks_packs_backend_Packs_compact(const ChunksPacksBackendPacks *self, HostIoTakesShort io,
 											   const HostSharedReader *reading, bool all, ChunksErrorError *error);
+extern bool chunks_packs_backend_Packs_remove_space(const ChunksPacksBackendPacks *self, HostIoTakesShort io,
+													const HostSharedReader *reading, uint32 space,
+													ChunksErrorError *error);
 
 #ifdef DOLTGRES_TEST_CHUNKS
 extern void test_chunks_packs_backend_tests_a_collection_keeps_every_pack_from_the_lowest_a_process_has_open(void);

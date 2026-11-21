@@ -37,6 +37,12 @@
 #include "doltgres/txn/memtable/pages.h"
 #include "doltgres/txn/memtable/version.h"
 
+#ifdef DOLTGRES_TEST_TXN
+#include "doltgres/simc/simc.h"
+#include "doltgres/std/test.h"
+#include "doltgres/txn/memtable/testing.h"
+#endif
+
 #define RUST_FILE "txn" STD_SEP "src" STD_SEP "memtable" STD_SEP "version.rs"
 
 /*
@@ -92,6 +98,13 @@
 #define TXN_MEMTABLE_VERSION_TOKEN 32
 #define TXN_MEMTABLE_VERSION_ENDED UINT64CONST(16)
 #define TXN_MEMTABLE_VERSION_SHOWN UINT64CONST(8)
+
+/*
+ * TXN_MEMTABLE_VERSION_COUNTED is the hint word's mark of a version its push
+ * counted at its writer's commit status entry, which its removal gives back;
+ * it lives only in the delta, so no run or WAL record holds it.
+ */
+#define TXN_MEMTABLE_VERSION_COUNTED UINT64CONST(32)
 
 /* TXN_MEMTABLE_VERSION_SPILLED is the bit of a spilled version's handle. */
 #define TXN_MEMTABLE_VERSION_SPILLED (UINT64CONST(1) << 63)
@@ -1128,6 +1141,19 @@ txn_memtable_version_OpRef_owned(const TxnMemtableVersionOpRef *self)
 	return op;
 }
 
+#ifdef DOLTGRES_TEST_TXN
+/*
+ * txn_memtable_version_tests_raced is the tests' one-shot seam inside
+ * updated's read-modify-write: when set, updated runs it once between the
+ * word's load and its compare-exchange and clears it, as a reader's store
+ * landing there would.
+ */
+static void (*txn_memtable_version_tests_raced) (void *captures);
+
+/* txn_memtable_version_tests_raced_captures is the seam's captures. */
+static void *txn_memtable_version_tests_raced_captures;
+#endif
+
 /*
  * txn_memtable_version_updated changes a version's hint word by a
  * read-modify-write, a compare-exchange retried until it lands, so that
@@ -1141,8 +1167,18 @@ txn_memtable_version_updated(const HostDeltaWord *word, uint64 keep, uint64 set)
 
 	for (;;)
 	{
-		uint64		held = host_delta_Word_compare_exchange(word, current, (current & keep) | set);
+		uint64		held;
 
+#ifdef DOLTGRES_TEST_TXN
+		if (txn_memtable_version_tests_raced != NULL)
+		{
+			void		(*raced) (void *captures) = txn_memtable_version_tests_raced;
+
+			txn_memtable_version_tests_raced = NULL;
+			raced(txn_memtable_version_tests_raced_captures);
+		}
+#endif
+		held = host_delta_Word_compare_exchange(word, current, (current & keep) | set);
 		if (held == current)
 			return;
 		current = held;
@@ -1304,7 +1340,7 @@ txn_memtable_version_Version_ender(const TxnMemtableVersionVersion *self, uint32
 void
 txn_memtable_version_Version_end(TxnMemtableVersionVersion *self, uint32 ender)
 {
-	txn_memtable_version_Version_update(self, TXN_MEMTABLE_VERSION_HINT,
+	txn_memtable_version_Version_update(self, TXN_MEMTABLE_VERSION_HINT | TXN_MEMTABLE_VERSION_COUNTED,
 										TXN_MEMTABLE_VERSION_ENDED | (uint64) ender << TXN_MEMTABLE_VERSION_TOKEN);
 }
 
@@ -1321,10 +1357,15 @@ txn_memtable_version_Version_stored(const TxnMemtableVersionVersion *self, StdVe
 
 	std_slice_to_vec_Checked(result, record.f0.ptr, record.f0.len, 1, 1);
 	if (txn_memtable_version_Version_ender(self, &ender))
-	{
-		((uint8 *) result->ptr)[28] |= TXN_MEMTABLE_VERSION_ENDER;
-		txn_memtable_version_le(result, ender, 4);
-	}
+		txn_memtable_version_ended(result, ender);
+}
+
+/* txn_memtable_version_ended adds to a free space take's encoded record ENDER and the 32-bit xid of the ender of the row its tuple id held, as a run holds it. */
+void
+txn_memtable_version_ended(StdVec *record, uint32 ender)
+{
+	((uint8 *) record->ptr)[28] |= TXN_MEMTABLE_VERSION_ENDER;
+	txn_memtable_version_le(record, ender, 4);
 }
 
 /* txn_memtable_version_Version_confirm clears a speculative insert's token, as heap_finish_speculative does. */
@@ -1332,6 +1373,13 @@ void
 txn_memtable_version_Version_confirm(TxnMemtableVersionVersion *self)
 {
 	txn_memtable_version_Version_update(self, (UINT64CONST(1) << TXN_MEMTABLE_VERSION_TOKEN) - 1, 0);
+}
+
+/* txn_memtable_version_Version_counted reports whether the version's push counted it at its writer's entry. */
+bool
+txn_memtable_version_Version_counted(const TxnMemtableVersionVersion *self)
+{
+	return (txn_memtable_version_Version_word(self) & TXN_MEMTABLE_VERSION_COUNTED) != 0;
 }
 
 /* txn_memtable_version_Version_killed reports whether a speculative insert's writer killed the version. */
@@ -1567,7 +1615,9 @@ txn_memtable_version_show(const TxnMemtableIndexKeyedOps *keyed, const HostShare
 		return true;
 	if (!txn_memtable_version_version(keyed, guard, hold, handle, &version, error))
 		return false;
-	txn_memtable_version_Version_update(&version, TXN_MEMTABLE_VERSION_HINT | TXN_MEMTABLE_VERSION_KILLED,
+	txn_memtable_version_Version_update(&version,
+										TXN_MEMTABLE_VERSION_HINT | TXN_MEMTABLE_VERSION_KILLED |
+										TXN_MEMTABLE_VERSION_COUNTED,
 										TXN_MEMTABLE_VERSION_SHOWN | (uint64) combo << TXN_MEMTABLE_VERSION_TOKEN);
 	txn_memtable_version_Version_drop(&version);
 	return true;
@@ -1634,11 +1684,11 @@ txn_memtable_version_Chain_Iterator_next(TxnMemtableVersionChain *self, bool *ha
  * new key's node with the version as its head, are placed together on the
  * range's newest page or on the fresh page given; every step that can fail
  * runs first, and the store of the key's head, or of the new node's links,
- * publishes it.
+ * publishes it. A counted version's hint word carries the counted mark.
  */
 bool
 txn_memtable_version_push(TxnMemtableIndexKeyedOpen *open, const HostDeltaHold *hold, const uint8 *key,
-						  size_t key_len, const TxnMemtableVersionChange *change, bool *has_fresh,
+						  size_t key_len, const TxnMemtableVersionChange *change, bool counted, bool *has_fresh,
 						  HostDeltaOwned *fresh, StdVec *spare, StdVec *buffer, TxnMemtableVersionPushed *result,
 						  HostError *error)
 {
@@ -1679,7 +1729,9 @@ txn_memtable_version_push(TxnMemtableIndexKeyedOpen *open, const HostDeltaHold *
 	handle = txn_memtable_version_Handle_at(room.page, room.first);
 	if (!txn_memtable_pages_Room_append(&room, buffer->ptr, buffer->len, &offset, error) ||
 		!txn_memtable_pages_Room_store(&room, 0, txn_memtable_version_linked(offset, older), error) ||
-		!txn_memtable_pages_Room_store(&room, 1, TXN_MEMTABLE_VERSION_HINT_UNKNOWN, error))
+		!txn_memtable_pages_Room_store(&room, 1,
+									   TXN_MEMTABLE_VERSION_HINT_UNKNOWN | (counted ? TXN_MEMTABLE_VERSION_COUNTED : 0),
+									   error))
 	{
 		txn_memtable_pages_Room_drop(&room);
 		return false;
@@ -1721,6 +1773,7 @@ typedef struct txn_memtable_version_removed_frame_t
 	size_t		handles_len;
 	bool	   *taken;
 	size_t		taken_len;
+	StdVec	   *counted;
 	StdVec		touched;
 	bool		touched_live;
 	bool	   *result_0;
@@ -1738,6 +1791,42 @@ txn_memtable_version_removed_closure_0(const txn_memtable_version_removed_frame_
 {
 	return txn_memtable_version_line(frame->open->keyed, frame->open->open.guard, frame->hold, handle, page, word,
 									 error);
+}
+
+/*
+ * txn_memtable_version_removed_counted appends to removed's counted list the
+ * top-level xid of a version it takes out whose hint word carries the counted
+ * mark, read from its record at an offset of its page.
+ */
+static bool
+txn_memtable_version_removed_counted(txn_memtable_version_removed_frame_t *frame, const HostDeltaPageRef *page,
+									 uint64 word, uint64 offset, uint64 bytes)
+{
+	HostDeltaWord hint;
+	HostDeltaLent lent;
+	StdBytes	read;
+	TxnMemtableVersionRecord record;
+	TxnMemtableVersionWriter writer;
+	uint64		top;
+
+	if (!host_delta_PageRef_word(page, word + 1, &hint, frame->error))
+		return false;
+	if ((host_delta_Word_load(&hint) & TXN_MEMTABLE_VERSION_COUNTED) == 0)
+		return true;
+	if (!host_delta_PageRef_bytes(page, offset, bytes, &lent, frame->error))
+		return false;
+	read = host_delta_Lent_Deref_deref(&lent);
+	record = txn_memtable_version_Record_of(read.ptr, read.len);
+	writer = txn_memtable_version_Record_writer(&record);
+	top = writer.has_top ? writer.top : writer.xid;
+	host_delta_Lent_drop(&lent);
+	if (!std_vec_try_reserve(frame->counted, 1, sizeof(uint64), _Alignof(uint64)))
+	{
+		*frame->error = host_Error_out_of_memory();
+		return false;
+	}
+	std_vec_push_Checked(frame->counted, &top, sizeof(uint64), _Alignof(uint64));
+	return true;
 }
 
 /*
@@ -1802,6 +1891,9 @@ txn_memtable_version_removed_body(void *frame_)
 			removed = STD_ADD(u64, removed, bytes, 974, 17);
 			std_index_check(place, frame->taken_len, RUST_FILE, 975, 17);
 			frame->taken[place] = true;
+			if (!txn_memtable_version_removed_counted(frame, &page, word, host_delta_Word_load(&link) >>
+													  TXN_MEMTABLE_VERSION_OFFSET, bytes))
+				return;
 			for (size_t i = 0; i < frame->touched.len && !touched; i++)
 				touched = STD_VEC_AT(&frame->touched, uint64, i) == entry;
 			if (!touched)
@@ -1846,19 +1938,20 @@ txn_memtable_version_removed_pad(void *frame_)
  * the key's head moves to a removed newest version's older, or the newer
  * version's link takes the removed one's older, and each removed version's
  * page counts one live record less and its record's bytes dead. It marks
- * each handle it took out at its place in taken, and answers whether the
- * chain is left empty, the list entries of the pages it took versions from,
- * and the bytes of the records it took out.
+ * each handle it took out at its place in taken, appends to counted the
+ * top-level xid of each it took out that its push counted, and answers
+ * whether the chain is left empty, the list entries of the pages it took
+ * versions from, and the bytes of the records it took out.
  */
 bool
 txn_memtable_version_removed(const TxnMemtableIndexKeyedOpen *open, const HostDeltaHold *hold,
 							 TxnMemtableIndexNode node, const TxnMemtableVersionHandle *handles, size_t handles_len,
-							 bool *taken, size_t taken_len, bool *result_0, StdVec *result_1, uint64 *result_2,
-							 HostError *error)
+							 bool *taken, size_t taken_len, StdVec *counted, bool *result_0, StdVec *result_1,
+							 uint64 *result_2, HostError *error)
 {
 	txn_memtable_version_removed_frame_t frame = {.open = open, .hold = hold, .node = node, .handles = handles,
-		.handles_len = handles_len, .taken = taken, .taken_len = taken_len, .result_0 = result_0,
-	.result_1 = result_1, .result_2 = result_2, .error = error};
+		.handles_len = handles_len, .taken = taken, .taken_len = taken_len, .counted = counted,
+	.result_0 = result_0, .result_1 = result_1, .result_2 = result_2, .error = error};
 
 	std_landing(&frame, txn_memtable_version_removed_body, txn_memtable_version_removed_pad);
 	txn_memtable_version_removed_pad(&frame);
@@ -2109,3 +2202,768 @@ txn_memtable_version_Pushed_Debug_fmt(const void *value, StdFormatter *f)
 	return txn_memtable_version_variant_Debug_fmt(f, "Wants", &self->u.wants, txn_memtable_pages_Want_Debug_fmt, NULL,
 												  NULL);
 }
+
+#ifdef DOLTGRES_TEST_TXN
+/* TXN_MEMTABLE_VERSION_TESTS_UNWRAP is Result::unwrap's panic text. */
+#define TXN_MEMTABLE_VERSION_TESTS_UNWRAP "called `Result::unwrap()` on an `Err` value"
+
+/* txn_memtable_version_tests_ok unwraps a host result at a line. */
+static void
+txn_memtable_version_tests_ok(bool ok, HostError *error, uint32 line)
+{
+	if (!ok)
+		STD_RESULT_EXPECT_FAILED(line, 0, TXN_MEMTABLE_VERSION_TESTS_UNWRAP, error, host_Error_Debug_fmt);
+}
+
+/* txn_memtable_version_tests_read_t is read's (u64, Deleter, Hint): a version's handle, its older version's deleter, and its hint. */
+typedef struct txn_memtable_version_tests_read_t
+{
+	uint64		handle;
+	TxnMemtableVersionDeleter deleter;
+	TxnMemtableVersionHint hint;
+} txn_memtable_version_tests_read_t;
+
+/* txn_memtable_version_tests_opened takes a hold, the Keys record at a location, and its lock shared, then finds a key's node. */
+static void
+txn_memtable_version_tests_opened(HostIoIo *io, uint64 keys, const uint8 *key, size_t key_len, HostDeltaHold *hold,
+								  HostSharedGuard *guard, TxnMemtableIndexNode *node, uint32 line)
+{
+	HostSharedRecord record;
+	bool		some = false;
+	HostError	error;
+
+	txn_memtable_version_tests_ok(host_delta_hold(io, hold, &error) &&
+								  host_delta_Hold_record(hold, &TXN_MEMTABLE_TESTING_KEYS_AGED_OPS, keys, &record,
+														 &error) &&
+								  host_shared_Record_lock_shared(record, HOST_IO_IO_TAKES_SHORT(io),
+																 TXN_MEMTABLE_TESTING_KEYS_LOCK, guard, &error) &&
+								  txn_memtable_index_find(&TXN_MEMTABLE_TESTING_KEYS_KEYED_OPS, guard, hold, key,
+														  key_len, &some, node, &error), &error, line);
+	STD_ASSERT_MSG(line, 0, some, "no key");
+}
+
+/* txn_memtable_version_tests_newest returns a found key's newest version, which unwraps at a line. */
+static TxnMemtableVersionVersion
+txn_memtable_version_tests_newest(const HostSharedGuard *guard, const HostDeltaHold *hold, TxnMemtableIndexNode node,
+								  uint32 line)
+{
+	TxnMemtableVersionChain chain;
+	TxnMemtableVersionVersion version;
+	bool		some = false;
+	HostError	error;
+
+	txn_memtable_version_tests_ok(txn_memtable_version_chain(&TXN_MEMTABLE_TESTING_KEYS_KEYED_OPS, guard, hold, node,
+															 &chain, &error) &&
+								  txn_memtable_version_Chain_Iterator_next(&chain, &some, &version, &error), &error,
+								  line);
+	STD_ASSERT_MSG(line, 0, some, "a key with no version");
+	return version;
+}
+
+/* txn_memtable_version_tests_read reads a key's versions newest first, each as its handle, its older version's deleter, and its hint. */
+static StdVec
+txn_memtable_version_tests_read(HostIoIo *io, uint64 keys, const uint8 *key, size_t key_len)
+{
+	HostDeltaHold hold;
+	HostSharedGuard guard;
+	TxnMemtableIndexNode node;
+	TxnMemtableVersionChain chain;
+	StdVec		read;
+	HostError	error;
+
+	txn_memtable_version_tests_opened(io, keys, key, key_len, &hold, &guard, &node, __LINE__);
+	txn_memtable_version_tests_ok(txn_memtable_version_chain(&TXN_MEMTABLE_TESTING_KEYS_KEYED_OPS, &guard, &hold, node,
+															 &chain, &error), &error, __LINE__);
+	std_vec_new(&read, sizeof(txn_memtable_version_tests_read_t), _Alignof(txn_memtable_version_tests_read_t));
+	for (;;)
+	{
+		TxnMemtableVersionVersion version;
+		txn_memtable_version_tests_read_t one;
+		bool		some;
+
+		txn_memtable_version_tests_ok(txn_memtable_version_Chain_Iterator_next(&chain, &some, &version, &error),
+									  &error, __LINE__);
+		if (!some)
+			break;
+		one.handle = version.handle.f0;
+		one.deleter = txn_memtable_version_Version_deleter(&version);
+		one.hint = txn_memtable_version_Version_hint(&version);
+		txn_memtable_version_Version_drop(&version);
+		std_vec_push_Checked(&read, &one, sizeof(one), _Alignof(txn_memtable_version_tests_read_t));
+	}
+	host_shared_Guard_drop(&guard);
+	host_delta_Hold_drop(&hold);
+	return read;
+}
+
+/* txn_memtable_version_tests_pushed pushes a key's change, answering the version it pushed, which unwraps at a line. */
+static uint64
+txn_memtable_version_tests_pushed(HostIoIo *io, uint64 keys, const uint8 *key, size_t key_len, TxnMemtableOp op,
+								  HostDeltaPageSize size, uint32 line)
+{
+	TxnMemtableVersionPushed pushed;
+	HostError	error;
+
+	txn_memtable_version_tests_ok(txn_memtable_testing_pushed(io, keys, key, key_len, &op, size, &pushed, &error),
+								  &error, line);
+	txn_memtable_Op_drop(&op);
+	STD_ASSERT_MSG(line, 0, pushed.tag == TXN_MEMTABLE_VERSION_PUSHED_VERSION, "explicit panic");
+	return pushed.u.version.f0;
+}
+
+/* txn_memtable_version_tests_numbered returns key 1 of the testing keys. */
+static StdVec
+txn_memtable_version_tests_one_key(void)
+{
+	StdVec		key;
+
+	txn_memtable_testing_numbered(1, &key);
+	return key;
+}
+
+/* txn_memtable_version_tests_put returns a put of a test's value with its addresses and value ids, under row 9. */
+static TxnMemtableOp
+txn_memtable_version_tests_put(uint8 tag, size_t addresses, size_t values, uint32 heap_bytes)
+{
+	ChunksTrailerLocator locator = chunks_trailer_Locator_at(UINT64CONST(0xabcdef), UINT64CONST(0x123456789a),
+															 UINT64CONST(0xfedcba));
+	static const uint32 ids[] = {11, 0xfffffffe};
+	TxnMemtableOp op = {.tag = tag};
+
+	std_slice_to_vec_Checked(&op.u.put.value, "value", 5, 1, 1);
+	std_vec_new(&op.u.put.addresses, sizeof(chunks_TupleU32Locator_t), _Alignof(chunks_TupleU32Locator_t));
+	for (uint32 k = 0; k < addresses; k++)
+	{
+		chunks_TupleU32Locator_t address = {3 + k, locator};
+
+		std_vec_push_Checked(&op.u.put.addresses, &address, sizeof(address), _Alignof(chunks_TupleU32Locator_t));
+	}
+	std_slice_to_vec_Checked(&op.u.put.values, ids, values, sizeof(uint32), _Alignof(uint32));
+	op.u.put.tuple.f0 = 9;
+	op.u.put.heap_bytes = heap_bytes;
+	return op;
+}
+
+/* txn_memtable_version_tests_moved returns a successor: another key, "moved", or another table. */
+static TxnMemtableSuccessor
+txn_memtable_version_tests_moved(bool other)
+{
+	TxnMemtableSuccessor successor = {.tag = other ? TXN_MEMTABLE_SUCCESSOR_OTHER_TABLE : TXN_MEMTABLE_SUCCESSOR_KEY};
+
+	if (!other)
+		std_slice_to_vec_Checked(&successor.u.key, "moved", 5, 1, 1);
+	return successor;
+}
+
+/* txn_memtable_version_tests_ops returns every op the record test writes, in the Rust test's order. */
+static StdVec
+txn_memtable_version_tests_ops(void)
+{
+	StdVec		ops;
+	TxnMemtableOp op;
+
+	std_vec_new(&ops, sizeof(TxnMemtableOp), _Alignof(TxnMemtableOp));
+#define TXN_MEMTABLE_VERSION_TESTS_OP(made) \
+	do { op = (made); std_vec_push_Checked(&ops, &op, sizeof(op), _Alignof(TxnMemtableOp)); } while (0)
+	TXN_MEMTABLE_VERSION_TESTS_OP(txn_memtable_version_tests_put(TXN_MEMTABLE_OP_PUT, 2, 2, 44));
+	TXN_MEMTABLE_VERSION_TESTS_OP(txn_memtable_version_tests_put(TXN_MEMTABLE_OP_PUT, 1, 0, 32));
+	op = (TxnMemtableOp)
+	{
+		.tag = TXN_MEMTABLE_OP_DELETE
+	};
+	std_vec_push_Checked(&ops, &op, sizeof(op), _Alignof(TxnMemtableOp));
+	op = (TxnMemtableOp)
+	{
+		.tag = TXN_MEMTABLE_OP_EMPTIED
+	};
+	op.u.emptied.f0 = 9;
+	std_vec_push_Checked(&ops, &op, sizeof(op), _Alignof(TxnMemtableOp));
+	for (int other = 0; other < 2; other++)
+	{
+		op = (TxnMemtableOp)
+		{
+			.tag = TXN_MEMTABLE_OP_MOVE
+		};
+		op.u.move = txn_memtable_version_tests_moved(other);
+		std_vec_push_Checked(&ops, &op, sizeof(op), _Alignof(TxnMemtableOp));
+	}
+	TXN_MEMTABLE_VERSION_TESTS_OP(txn_memtable_version_tests_put(TXN_MEMTABLE_OP_ADD, 2, 2, 44));
+	for (int moved = 0; moved < 3; moved++)
+	{
+		op = (TxnMemtableOp)
+		{
+			.tag = TXN_MEMTABLE_OP_REMOVE
+		};
+		op.u.remove.f0.f0 = 5;
+		op.u.remove.has_f1 = moved != 0;
+		if (moved != 0)
+			op.u.remove.f1 = txn_memtable_version_tests_moved(moved == 2);
+		std_vec_push_Checked(&ops, &op, sizeof(op), _Alignof(TxnMemtableOp));
+	}
+	op = (TxnMemtableOp)
+	{
+		.tag = TXN_MEMTABLE_OP_LOCK
+	};
+	op.u.lock = TXN_MEMTABLE_LOCK_MODE_SHARE;
+	std_vec_push_Checked(&ops, &op, sizeof(op), _Alignof(TxnMemtableOp));
+	TXN_MEMTABLE_VERSION_TESTS_OP(txn_memtable_version_tests_put(TXN_MEMTABLE_OP_ADD_ROW, 2, 2, 44));
+	{
+		TxnMemtableOp put = txn_memtable_version_tests_put(TXN_MEMTABLE_OP_PUT, 2, 2, 44);
+
+		op = (TxnMemtableOp)
+		{
+			.tag = TXN_MEMTABLE_OP_UPDATE_ROW
+		};
+		op.u.update_row.f0.f0 = 6;
+		op.u.update_row.f1 = put.u.put;
+		std_vec_push_Checked(&ops, &op, sizeof(op), _Alignof(TxnMemtableOp));
+	}
+	for (int moved = 0; moved < 3; moved++)
+	{
+		op = (TxnMemtableOp)
+		{
+			.tag = TXN_MEMTABLE_OP_DELETE_ROW
+		};
+		op.u.delete_row.f0.f0 = 6;
+		op.u.delete_row.has_f1 = moved != 0;
+		if (moved != 0)
+			op.u.delete_row.f1 = txn_memtable_version_tests_moved(moved == 2);
+		std_vec_push_Checked(&ops, &op, sizeof(op), _Alignof(TxnMemtableOp));
+	}
+	op = (TxnMemtableOp)
+	{
+		.tag = TXN_MEMTABLE_OP_LOCK_ROW
+	};
+	op.u.lock_row.f0.f0 = 6;
+	op.u.lock_row.f1 = TXN_MEMTABLE_LOCK_MODE_KEY_SHARE;
+	std_vec_push_Checked(&ops, &op, sizeof(op), _Alignof(TxnMemtableOp));
+#undef TXN_MEMTABLE_VERSION_TESTS_OP
+	return ops;
+}
+
+/* txn_memtable_version_tests_puts reports whether a put read in place holds what a put was written with. */
+static bool
+txn_memtable_version_tests_puts(const TxnMemtableVersionPutRef *read, const TxnMemtablePut *put)
+{
+	TxnMemtableVersionAddresses addresses = txn_memtable_version_PutRef_addresses(read);
+	TxnMemtableVersionValues values = txn_memtable_version_PutRef_values(read);
+	chunks_TupleU32Locator_t address;
+	uint32		value;
+	size_t		k = 0;
+
+	if (read->value.len != put->value.len || memcmp(read->value.ptr, put->value.ptr, put->value.len) != 0 ||
+		read->tuple.f0 != put->tuple.f0)
+		return false;
+	for (; txn_memtable_version_Addresses_Iterator_next(&addresses, &address); k++)
+	{
+		const chunks_TupleU32Locator_t *written = &STD_VEC_AT(&put->addresses, chunks_TupleU32Locator_t, k);
+
+		if (k >= put->addresses.len || address.f0 != written->f0 ||
+			!chunks_trailer_Locator_PartialEq_eq(&address.f1, &written->f1))
+			return false;
+	}
+	if (k != put->addresses.len)
+		return false;
+	for (k = 0; txn_memtable_version_Values_Iterator_next(&values, &value); k++)
+		if (k >= put->values.len || value != STD_VEC_AT(&put->values, uint32, k))
+			return false;
+	return k == put->values.len;
+}
+
+/* txn_memtable_version_tests_one reports whether a successor read in place is the one written. */
+static bool
+txn_memtable_version_tests_one(const TxnMemtableVersionSuccessorRef *read, const TxnMemtableSuccessor *written)
+{
+	if (written->tag == TXN_MEMTABLE_SUCCESSOR_OTHER_TABLE)
+		return read->tag == TXN_MEMTABLE_VERSION_SUCCESSOR_REF_OTHER_TABLE;
+	return read->tag == TXN_MEMTABLE_VERSION_SUCCESSOR_REF_KEY && read->u.key.len == written->u.key.len &&
+		memcmp(read->u.key.ptr, written->u.key.ptr, read->u.key.len) == 0;
+}
+
+/* txn_memtable_version_tests_moved_is reports whether an optional successor read in place is the one written. */
+static bool
+txn_memtable_version_tests_moved_is(bool has_read, const TxnMemtableVersionSuccessorRef *read, bool has_written,
+									const TxnMemtableSuccessor *written)
+{
+	return has_read == has_written && (!has_read || txn_memtable_version_tests_one(read, written));
+}
+
+/* txn_memtable_version_tests_same reports whether a record's op reads back as the op it was written with. */
+static bool
+txn_memtable_version_tests_same(const TxnMemtableVersionOpRef *read, const TxnMemtableOp *op)
+{
+	switch (op->tag)
+	{
+		case TXN_MEMTABLE_OP_PUT:
+			return read->tag == TXN_MEMTABLE_VERSION_OP_REF_PUT && txn_memtable_version_tests_puts(&read->u.put,
+																								   &op->u.put);
+		case TXN_MEMTABLE_OP_ADD:
+			return read->tag == TXN_MEMTABLE_VERSION_OP_REF_ADD && txn_memtable_version_tests_puts(&read->u.add,
+																								   &op->u.add);
+		case TXN_MEMTABLE_OP_ADD_ROW:
+			return read->tag == TXN_MEMTABLE_VERSION_OP_REF_ADD_ROW &&
+				txn_memtable_version_tests_puts(&read->u.add_row, &op->u.add_row);
+		case TXN_MEMTABLE_OP_UPDATE_ROW:
+			return read->tag == TXN_MEMTABLE_VERSION_OP_REF_UPDATE_ROW &&
+				read->u.update_row.f0.f0 == op->u.update_row.f0.f0 &&
+				txn_memtable_version_tests_puts(&read->u.update_row.f1, &op->u.update_row.f1);
+		case TXN_MEMTABLE_OP_DELETE:
+			return read->tag == TXN_MEMTABLE_VERSION_OP_REF_DELETE;
+		case TXN_MEMTABLE_OP_EMPTIED:
+			return read->tag == TXN_MEMTABLE_VERSION_OP_REF_EMPTIED && read->u.emptied.f0 == op->u.emptied.f0;
+		case TXN_MEMTABLE_OP_MOVE:
+			return read->tag == TXN_MEMTABLE_VERSION_OP_REF_MOVE && txn_memtable_version_tests_one(&read->u.move,
+																								   &op->u.move);
+		case TXN_MEMTABLE_OP_REMOVE:
+			return read->tag == TXN_MEMTABLE_VERSION_OP_REF_REMOVE && read->u.remove.f0.f0 == op->u.remove.f0.f0 &&
+				txn_memtable_version_tests_moved_is(read->u.remove.has_f1, &read->u.remove.f1, op->u.remove.has_f1,
+													&op->u.remove.f1);
+		case TXN_MEMTABLE_OP_DELETE_ROW:
+			return read->tag == TXN_MEMTABLE_VERSION_OP_REF_DELETE_ROW &&
+				read->u.delete_row.f0.f0 == op->u.delete_row.f0.f0 &&
+				txn_memtable_version_tests_moved_is(read->u.delete_row.has_f1, &read->u.delete_row.f1,
+													op->u.delete_row.has_f1, &op->u.delete_row.f1);
+		case TXN_MEMTABLE_OP_LOCK:
+			return read->tag == TXN_MEMTABLE_VERSION_OP_REF_LOCK && read->u.lock == op->u.lock;
+		case TXN_MEMTABLE_OP_LOCK_ROW:
+			return read->tag == TXN_MEMTABLE_VERSION_OP_REF_LOCK_ROW &&
+				read->u.lock_row.f0.f0 == op->u.lock_row.f0.f0 && read->u.lock_row.f1 == op->u.lock_row.f1;
+		default:
+			return false;
+	}
+}
+
+/*
+ * test_txn_memtable_version_tests_every_ops_record_reads_back_as_written:
+ * every op's record reads back what it was written with, with and without a
+ * top-level transaction's id and an LSN (at 0, 1, and the largest), with
+ * each command it shows, a row, a value, addresses, and value ids, and its
+ * length is what its header and its count of value ids say.
+ */
+void
+test_txn_memtable_version_tests_every_ops_record_reads_back_as_written(void)
+{
+	StdVec		ops = txn_memtable_version_tests_ops();
+	TxnMemtableVersionShown shown[] = {{.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND},
+	{.tag = TXN_MEMTABLE_VERSION_SHOWN_COMBO, .u.combo = 0xfedcba98},
+	{.tag = TXN_MEMTABLE_VERSION_SHOWN_REPLAYED},
+	{.tag = TXN_MEMTABLE_VERSION_SHOWN_ENDING, .u.ending = 0x12345678}};
+	bool		has_lsns[] = {false, true, true, true};
+	uint64		lsns[] = {0, 0, 1, PG_UINT64_MAX};
+
+	for (int top = 0; top < 2; top++)
+		for (size_t l = 0; l < lengthof(lsns); l++)
+			for (size_t s = 0; s < lengthof(shown); s++)
+				for (size_t k = 0; k < ops.len; k++)
+				{
+					const TxnMemtableOp *op = &STD_VEC_AT(&ops, TxnMemtableOp, k);
+					TxnMemtableVersionWriter writer = {.xid = UINT64CONST(0x100000007), .has_top = top == 1,
+					.top = top == 1 ? UINT64CONST(0x100000002) : 0, .command = 3};
+					StdVec		bytes;
+					size_t		values = 0;
+					TxnMemtableVersionRecord record;
+					TxnMemtableVersionWriter read_writer;
+					uint64		lsn;
+					bool		has_lsn;
+					TxnMemtableVersionShown read_shown;
+					uint32		raw = 3;
+					uint32		ended = 3;
+					TxnMemtableVersionOpRef read_op;
+					HostError	error;
+
+					std_vec_new(&bytes, 1, 1);
+					txn_memtable_version_encode(&writer, op, TXN_MEMTABLE_LOCK_MODE_NO_KEY_UPDATE, shown[s],
+												has_lsns[l], lsns[l], &bytes);
+					STD_ASSERT_MSG(__LINE__, 9, bytes.len == txn_memtable_version_encoded(&writer, op, shown[s],
+																						  has_lsns[l], lsns[l]),
+								   "the record's length is what encoded says");
+					if ((((uint8 *) bytes.ptr)[28] & TXN_MEMTABLE_VERSION_VALUES) != 0)
+					{
+						size_t		at = txn_memtable_version_counted(((uint8 *) bytes.ptr)[28]);
+
+						values = ((uint8 *) bytes.ptr)[at] | (size_t) ((uint8 *) bytes.ptr)[at + 1] << 8;
+					}
+					STD_ASSERT_MSG(__LINE__, 9, txn_memtable_version_length(bytes.ptr, values) == bytes.len,
+								   "the header's length is the record's");
+					record = txn_memtable_version_Record_of(bytes.ptr, bytes.len);
+					read_writer = txn_memtable_version_Record_writer(&record);
+					has_lsn = txn_memtable_version_Record_lsn(&record, &lsn);
+					read_shown = txn_memtable_version_Record_shown(&record);
+					STD_ASSERT_MSG(__LINE__, 9, read_writer.xid == writer.xid && read_writer.has_top == writer.has_top &&
+								   read_writer.top == writer.top && read_writer.command == writer.command &&
+								   txn_memtable_version_Record_lock(&record) == TXN_MEMTABLE_LOCK_MODE_NO_KEY_UPDATE &&
+								   has_lsn == has_lsns[l] && (!has_lsn || lsn == lsns[l]) &&
+								   read_shown.tag == shown[s].tag &&
+								   (read_shown.tag != TXN_MEMTABLE_VERSION_SHOWN_COMBO ||
+									read_shown.u.combo == shown[s].u.combo) &&
+								   (read_shown.tag != TXN_MEMTABLE_VERSION_SHOWN_ENDING ||
+									read_shown.u.ending == shown[s].u.ending),
+								   "(record.writer(), record.lock(), record.lsn(), record.shown()) read back");
+					if (shown[s].tag == TXN_MEMTABLE_VERSION_SHOWN_COMBO)
+						raw = ended = shown[s].u.combo;
+					else if (shown[s].tag == TXN_MEMTABLE_VERSION_SHOWN_REPLAYED)
+						raw = ended = 0;
+					else if (shown[s].tag == TXN_MEMTABLE_VERSION_SHOWN_ENDING)
+						ended = shown[s].u.ending;
+					STD_ASSERT_MSG(__LINE__, 9, txn_memtable_version_Record_raw(&record) == raw &&
+								   txn_memtable_version_Record_ended(&record) == ended,
+								   "(record.raw(), record.ended()) == (raw, ended)");
+					read_op = txn_memtable_version_Record_op(&record);
+					STD_ASSERT_MSG(__LINE__, 9, txn_memtable_version_tests_same(&read_op, op), "an op read as another");
+					txn_memtable_version_tests_ok(txn_memtable_version_stored(bytes.ptr, bytes.len, &record, &error),
+												  &error, __LINE__);
+					{
+						StdBytes	stored = txn_memtable_version_Record_bytes(&record);
+
+						STD_ASSERT_MSG(__LINE__, 9, stored.len == bytes.len &&
+									   memcmp(stored.ptr, bytes.ptr, bytes.len) == 0,
+									   "stored(&bytes).unwrap().bytes() == &bytes[..]");
+					}
+					std_vec_free_Checked(&bytes, 1, 1);
+				}
+	for (size_t k = 0; k < ops.len; k++)
+		txn_memtable_Op_drop(&STD_VEC_AT(&ops, TxnMemtableOp, k));
+	std_vec_free_Checked(&ops, sizeof(TxnMemtableOp), _Alignof(TxnMemtableOp));
+}
+
+/* txn_memtable_version_tests_whole returns a record encode writes of an op, by writer 7 with LSN 9. */
+static StdVec
+txn_memtable_version_tests_whole(TxnMemtableOp op)
+{
+	TxnMemtableVersionWriter writer = {.xid = 7};
+	TxnMemtableVersionShown shown = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND};
+	StdVec		bytes;
+
+	std_vec_new(&bytes, 1, 1);
+	txn_memtable_version_encode(&writer, &op, TXN_MEMTABLE_LOCK_MODE_UPDATE, shown, true, 9, &bytes);
+	txn_memtable_Op_drop(&op);
+	return bytes;
+}
+
+/* txn_memtable_version_tests_changed returns a copy of a record with one byte changed. */
+static StdVec
+txn_memtable_version_tests_changed(const StdVec *bytes, size_t at, uint8 to)
+{
+	StdVec		changed;
+
+	std_slice_to_vec_Checked(&changed, bytes->ptr, bytes->len, 1, 1);
+	((uint8 *) changed.ptr)[at] = to;
+	return changed;
+}
+
+/* txn_memtable_version_tests_spliced inserts bytes into a record at a place. */
+static void
+txn_memtable_version_tests_spliced(StdVec *bytes, size_t at, const uint8 *inserted, size_t inserted_len)
+{
+	for (size_t k = 0; k < inserted_len; k++)
+		std_vec_insert(bytes, at + k, &inserted[k], 1, 1, RUST_FILE, 0, 0);
+}
+
+/*
+ * test_txn_memtable_version_tests_a_stored_record_is_refused_unless_encode_writes_it:
+ * a stored record is one encode writes: a record cut short in its header or
+ * after it, one with a byte past its end, a tag no op has, a row's op with
+ * no row, a flag no record has, a lock mode past the last, VALUES with no
+ * ids, REPLAYED with COMBO, and COMBO with ENDING are each refused as data
+ * corruption.
+ */
+void
+test_txn_memtable_version_tests_a_stored_record_is_refused_unless_encode_writes_it(void)
+{
+	static const uint8 count[] = {0, 0};
+	static const uint8 combo[] = {1, 0, 0, 0};
+	TxnMemtableOp locked = {.tag = TXN_MEMTABLE_OP_LOCK, .u.lock = TXN_MEMTABLE_LOCK_MODE_SHARE};
+	StdVec		row = txn_memtable_version_tests_whole(txn_memtable_testing_put((const uint8 *) "a value past a row's bytes",
+																				strlen("a value past a row's bytes")));
+	StdVec		lock = txn_memtable_version_tests_whole(locked);
+	uint8		flags = ((uint8 *) row.ptr)[28];
+	StdVec		refused[13];
+	TxnMemtableVersionRecord record;
+	HostError	error;
+
+	std_slice_to_vec_Checked(&refused[0], row.ptr, TXN_MEMTABLE_VERSION_HEADER - 1, 1, 1);
+	std_slice_to_vec_Checked(&refused[1], row.ptr, row.len - 1, 1, 1);
+	std_slice_to_vec_Checked(&refused[2], row.ptr, row.len, 1, 1);
+	std_vec_u8_push_Checked(&refused[2], 0);
+	refused[3] = txn_memtable_version_tests_changed(&row, 26, 13);
+	refused[4] = txn_memtable_version_tests_changed(&row, 26, 14);
+	refused[5] = txn_memtable_version_tests_changed(&row, 26, TXN_MEMTABLE_VERSION_LOCK_TAG + 4);
+	refused[6] = txn_memtable_version_tests_changed(&lock, 26, TXN_MEMTABLE_VERSION_ROW_TAG + 1);
+	refused[7] = txn_memtable_version_tests_changed(&lock, 26, TXN_MEMTABLE_VERSION_ROW_LOCK_TAG);
+	refused[8] = txn_memtable_version_tests_changed(&row, 28, flags | 128);
+	refused[9] = txn_memtable_version_tests_changed(&row, 27, 4);
+	refused[10] = txn_memtable_version_tests_changed(&row, 28, flags | TXN_MEMTABLE_VERSION_VALUES);
+	txn_memtable_version_tests_spliced(&refused[10], txn_memtable_version_counted(flags | TXN_MEMTABLE_VERSION_VALUES),
+									   count, sizeof(count));
+	refused[11] = txn_memtable_version_tests_changed(&row, 28, flags | TXN_MEMTABLE_VERSION_REPLAYED |
+													 TXN_MEMTABLE_VERSION_COMBO);
+	txn_memtable_version_tests_spliced(&refused[11], txn_memtable_version_counted(flags | TXN_MEMTABLE_VERSION_COMBO) - 4,
+									   combo, sizeof(combo));
+	refused[12] = txn_memtable_version_tests_changed(&row, 28, flags | TXN_MEMTABLE_VERSION_COMBO |
+													 TXN_MEMTABLE_VERSION_ENDING);
+	txn_memtable_version_tests_spliced(&refused[12], txn_memtable_version_counted(flags | TXN_MEMTABLE_VERSION_COMBO) - 4,
+									   combo, sizeof(combo));
+	txn_memtable_version_tests_ok(txn_memtable_version_stored(row.ptr, row.len, &record, &error), &error, __LINE__);
+	for (size_t at = 0; at < lengthof(refused); at++)
+	{
+		bool		corrupt = false;
+
+		if (!txn_memtable_version_stored(refused[at].ptr, refused[at].len, &record, &error))
+		{
+			corrupt = memcmp(host_Error_sqlstate(&error), "XX001", 5) == 0;
+			host_Error_drop(&error);
+		}
+		STD_ASSERT_EQ(__LINE__, 13, corrupt, &at, std_usize_Debug_fmt, &at, std_usize_Debug_fmt);
+		std_vec_free_Checked(&refused[at], 1, 1);
+	}
+	std_vec_free_Checked(&lock, 1, 1);
+	std_vec_free_Checked(&row, 1, 1);
+}
+
+/*
+ * test_txn_memtable_version_tests_a_link_holds_its_offset_and_older_handle_at_their_limits:
+ * a link holds its record's offset and its key's older version's handle at
+ * their limits.
+ */
+void
+test_txn_memtable_version_tests_a_link_holds_its_offset_and_older_handle_at_their_limits(void)
+{
+	uint64		handle = (HOST_DELTA_PAGE_SLOTS - 1) << TXN_MEMTABLE_VERSION_WORD |
+		((UINT64CONST(1) << TXN_MEMTABLE_VERSION_WORD) - 1);
+	uint64		link = txn_memtable_version_linked((uint32) (TXN_MEMTABLE_PAGES_LARGEST - 1), handle);
+	TxnMemtableVersionHandle named;
+	bool		has = txn_memtable_version_Handle_named(link & ((UINT64CONST(1) << TXN_MEMTABLE_VERSION_OFFSET) - 1),
+														&named);
+
+	STD_ASSERT_MSG(__LINE__, 9, link >> TXN_MEMTABLE_VERSION_OFFSET == TXN_MEMTABLE_PAGES_LARGEST - 1 && has &&
+				   named.f0 == handle, "(link >> OFFSET, Handle::named(...)) == (LARGEST - 1, Some(handle))");
+}
+
+/*
+ * test_txn_memtable_version_tests_a_keys_versions_read_newest_first_with_their_deleters:
+ * a key's versions read newest first, a new key's first version is its
+ * node's head, each version shows the next newer one as its deleter, a
+ * lock's with no command, and a hint is stored and loaded.
+ */
+void
+test_txn_memtable_version_tests_a_keys_versions_read_newest_first_with_their_deleters(void)
+{
+	SimcProcess process = simc_process();
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedHeld held;
+	uint64		keys;
+	StdVec		key = txn_memtable_version_tests_one_key();
+	TxnMemtableOp lock_op = {.tag = TXN_MEMTABLE_OP_LOCK, .u.lock = TXN_MEMTABLE_LOCK_MODE_UPDATE};
+	uint64		first;
+	uint64		lock;
+	uint64		last;
+	StdVec		versions;
+	HostError	error;
+
+	txn_memtable_version_tests_ok(txn_memtable_testing_keys(io, &held, &keys, &error), &error, __LINE__);
+	first = txn_memtable_version_tests_pushed(io, keys, key.ptr, key.len,
+											  txn_memtable_testing_put((const uint8 *) "a", 1),
+											  TXN_MEMTABLE_TESTING_PAGE, __LINE__);
+	versions = txn_memtable_version_tests_read(io, keys, key.ptr, key.len);
+	STD_ASSERT_MSG(__LINE__, 9, versions.len == 1 &&
+				   STD_VEC_AT(&versions, txn_memtable_version_tests_read_t, 0).handle == first,
+				   "a new key's first version is its node's head");
+	std_vec_free_Checked(&versions, sizeof(txn_memtable_version_tests_read_t),
+						 _Alignof(txn_memtable_version_tests_read_t));
+	lock = txn_memtable_version_tests_pushed(io, keys, key.ptr, key.len, lock_op, TXN_MEMTABLE_TESTING_PAGE, __LINE__);
+	last = txn_memtable_version_tests_pushed(io, keys, key.ptr, key.len,
+											 txn_memtable_testing_put((const uint8 *) "b", 1),
+											 TXN_MEMTABLE_TESTING_PAGE, __LINE__);
+	versions = txn_memtable_version_tests_read(io, keys, key.ptr, key.len);
+	{
+		const txn_memtable_version_tests_read_t *v = versions.ptr;
+
+		STD_ASSERT_MSG(__LINE__, 9, versions.len == 3 && v[0].handle == last && v[1].handle == lock &&
+					   v[2].handle == first, "the versions read newest first");
+		STD_ASSERT_MSG(__LINE__, 9, v[0].deleter.xid == 7 && v[0].deleter.has_command && v[0].deleter.command == 0,
+					   "versions[0].1 == Deleter { xid: 7, command: Some(0) }");
+		STD_ASSERT_MSG(__LINE__, 9, v[1].deleter.xid == 7 && !v[1].deleter.has_command,
+					   "versions[1].1 == Deleter { xid: 7, command: None }");
+		for (size_t k = 0; k < versions.len; k++)
+			STD_ASSERT_MSG(__LINE__, 9, v[k].hint == TXN_MEMTABLE_VERSION_HINT_UNKNOWN, "a version's hint is unknown");
+	}
+	std_vec_free_Checked(&versions, sizeof(txn_memtable_version_tests_read_t),
+						 _Alignof(txn_memtable_version_tests_read_t));
+	{
+		HostDeltaHold hold;
+		HostSharedGuard guard;
+		TxnMemtableIndexNode node;
+		TxnMemtableVersionVersion newest;
+
+		txn_memtable_version_tests_opened(io, keys, key.ptr, key.len, &hold, &guard, &node, __LINE__);
+		newest = txn_memtable_version_tests_newest(&guard, &hold, node, __LINE__);
+		txn_memtable_version_Version_set_hint(&newest, TXN_MEMTABLE_VERSION_HINT_COMMITTED);
+		txn_memtable_version_Version_drop(&newest);
+		host_shared_Guard_drop(&guard);
+		host_delta_Hold_drop(&hold);
+	}
+	versions = txn_memtable_version_tests_read(io, keys, key.ptr, key.len);
+	{
+		const txn_memtable_version_tests_read_t *v = versions.ptr;
+
+		STD_ASSERT_MSG(__LINE__, 9, versions.len == 3 && v[0].hint == TXN_MEMTABLE_VERSION_HINT_COMMITTED &&
+					   v[1].hint == TXN_MEMTABLE_VERSION_HINT_UNKNOWN && v[2].hint == TXN_MEMTABLE_VERSION_HINT_UNKNOWN,
+					   "hints == [Committed, Unknown, Unknown]");
+	}
+	std_vec_free_Checked(&versions, sizeof(txn_memtable_version_tests_read_t),
+						 _Alignof(txn_memtable_version_tests_read_t));
+	std_vec_free_Checked(&key, 1, 1);
+	host_shared_Held_drop(&held);
+	simc_TestIo_drop(&test_io);
+	simc_Process_drop(&process);
+}
+
+/*
+ * test_txn_memtable_version_tests_a_version_on_a_fresh_page_is_named_by_its_index_in_the_list:
+ * a version a push puts on a fresh page is named by that page's index in
+ * the range's list, read from its handle alone, with no walk of the index.
+ */
+void
+test_txn_memtable_version_tests_a_version_on_a_fresh_page_is_named_by_its_index_in_the_list(void)
+{
+	SimcProcess process = simc_process();
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedHeld held;
+	uint64		keys;
+	HostDeltaPageSize small = {(uint32) (TXN_MEMTABLE_VERSION_HEADER + 40 + 40),
+	(uint32) TXN_MEMTABLE_PAGES_FIRST + 2 + 2 + 8 + 2};
+	uint8		a[40];
+	uint8		b[40];
+	uint64		first;
+	uint64		second;
+	HostError	error;
+
+	memset(a, 'a', sizeof(a));
+	memset(b, 'b', sizeof(b));
+	txn_memtable_version_tests_ok(txn_memtable_testing_keys(io, &held, &keys, &error), &error, __LINE__);
+	first = txn_memtable_version_tests_pushed(io, keys, a, sizeof(a), txn_memtable_testing_put(NULL, 0), small,
+											  __LINE__);
+	second = txn_memtable_version_tests_pushed(io, keys, b, sizeof(b), txn_memtable_testing_put(NULL, 0), small,
+											   __LINE__);
+	STD_ASSERT_MSG(__LINE__, 9, first >> TXN_MEMTABLE_VERSION_WORD == 0 && second >> TXN_MEMTABLE_VERSION_WORD == 1,
+				   "(first.0 >> WORD, second.0 >> WORD) == (0, 1)");
+	host_shared_Held_drop(&held);
+	simc_TestIo_drop(&test_io);
+	simc_Process_drop(&process);
+}
+
+/* txn_memtable_version_tests_hinted is the race test's seam: a reader's hint store landing inside updated's read-modify-write. */
+static void
+txn_memtable_version_tests_hinted(void *captures)
+{
+	txn_memtable_version_Version_set_hint(captures, TXN_MEMTABLE_VERSION_HINT_COMMITTED);
+}
+
+/*
+ * test_txn_memtable_version_tests_a_hint_and_a_token_clear_racing_both_survive:
+ * the hint word's read-modify-write (CommPF 7, 17:02), a reader's hint store
+ * landing between a writer's read of the word and its compare-exchange makes
+ * the exchange retry, so the hint and the token's clear both survive; and a
+ * kill keeps the hint and clears the token.
+ */
+void
+test_txn_memtable_version_tests_a_hint_and_a_token_clear_racing_both_survive(void)
+{
+	SimcProcess process = simc_process();
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedHeld held;
+	uint64		keys;
+	StdVec		key = txn_memtable_version_tests_one_key();
+	HostDeltaHold hold;
+	HostSharedGuard guard;
+	TxnMemtableIndexNode node;
+	TxnMemtableVersionVersion version;
+	uint32		token;
+	HostError	error;
+
+	txn_memtable_version_tests_ok(txn_memtable_testing_keys(io, &held, &keys, &error), &error, __LINE__);
+	(void) txn_memtable_version_tests_pushed(io, keys, key.ptr, key.len,
+											 txn_memtable_testing_put((const uint8 *) "a", 1),
+											 TXN_MEMTABLE_TESTING_PAGE, __LINE__);
+	txn_memtable_version_tests_opened(io, keys, key.ptr, key.len, &hold, &guard, &node, __LINE__);
+	version = txn_memtable_version_tests_newest(&guard, &hold, node, __LINE__);
+	STD_ASSERT_MSG(__LINE__, 9, version.has_hint, "version.hint.as_ref().unwrap()");
+	host_delta_Word_store(&version.hint, UINT64CONST(7) << TXN_MEMTABLE_VERSION_TOKEN);
+	STD_ASSERT_MSG(__LINE__, 9, txn_memtable_version_Version_token(&version, &token) && token == 7,
+				   "version.token() == Some(7)");
+	txn_memtable_version_tests_raced = txn_memtable_version_tests_hinted;
+	txn_memtable_version_tests_raced_captures = &version;
+	txn_memtable_version_updated(&version.hint, (UINT64CONST(1) << TXN_MEMTABLE_VERSION_TOKEN) - 1, 0);
+	STD_ASSERT_MSG(__LINE__, 9, txn_memtable_version_tests_raced == NULL, "the seam ran inside the update");
+	STD_ASSERT_MSG(__LINE__, 9, txn_memtable_version_Version_hint(&version) == TXN_MEMTABLE_VERSION_HINT_COMMITTED &&
+				   !txn_memtable_version_Version_token(&version, &token) && !txn_memtable_version_Version_killed(&version),
+				   "(version.hint(), version.token(), version.killed()) == (Hint::Committed, None, false)");
+	host_delta_Word_store(&version.hint, UINT64CONST(9) << TXN_MEMTABLE_VERSION_TOKEN | TXN_MEMTABLE_VERSION_HINT_ABORTED);
+	txn_memtable_version_Version_kill(&version);
+	STD_ASSERT_MSG(__LINE__, 9, txn_memtable_version_Version_hint(&version) == TXN_MEMTABLE_VERSION_HINT_ABORTED &&
+				   !txn_memtable_version_Version_token(&version, &token) && txn_memtable_version_Version_killed(&version),
+				   "(version.hint(), version.token(), version.killed()) == (Hint::Aborted, None, true)");
+	txn_memtable_version_Version_drop(&version);
+	host_shared_Guard_drop(&guard);
+	host_delta_Hold_drop(&hold);
+	std_vec_free_Checked(&key, 1, 1);
+	host_shared_Held_drop(&held);
+	simc_TestIo_drop(&test_io);
+	simc_Process_drop(&process);
+}
+
+/*
+ * test_txn_memtable_version_tests_a_shown_combo_is_the_rows_raw_command_and_no_token:
+ * a combo command id show stores is the raw command the version's row
+ * shows, in place of its record's, keeps the hint a reader stored, and reads
+ * as no token; a version with none shows its record's.
+ */
+void
+test_txn_memtable_version_tests_a_shown_combo_is_the_rows_raw_command_and_no_token(void)
+{
+	SimcProcess process = simc_process();
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedHeld held;
+	uint64		keys;
+	StdVec		key = txn_memtable_version_tests_one_key();
+	HostDeltaHold hold;
+	HostSharedGuard guard;
+	TxnMemtableIndexNode node;
+	TxnMemtableVersionVersion version;
+	TxnMemtableVersionRecord record;
+	uint32		token;
+	HostError	error;
+
+	txn_memtable_version_tests_ok(txn_memtable_testing_keys(io, &held, &keys, &error), &error, __LINE__);
+	(void) txn_memtable_version_tests_pushed(io, keys, key.ptr, key.len,
+											 txn_memtable_testing_put((const uint8 *) "a", 1),
+											 TXN_MEMTABLE_TESTING_PAGE, __LINE__);
+	txn_memtable_version_tests_opened(io, keys, key.ptr, key.len, &hold, &guard, &node, __LINE__);
+	version = txn_memtable_version_tests_newest(&guard, &hold, node, __LINE__);
+	record = txn_memtable_version_Version_record(&version);
+	STD_ASSERT_MSG(__LINE__, 9, txn_memtable_version_Version_raw(&version) == txn_memtable_version_Record_raw(&record),
+				   "version.raw() == version.record().raw()");
+	txn_memtable_version_Version_set_hint(&version, TXN_MEMTABLE_VERSION_HINT_COMMITTED);
+	txn_memtable_version_tests_ok(txn_memtable_version_show(&TXN_MEMTABLE_TESTING_KEYS_KEYED_OPS, &guard, &hold,
+															version.handle, 0xfedcba98, &error), &error, __LINE__);
+	STD_ASSERT_MSG(__LINE__, 9, txn_memtable_version_Version_raw(&version) == 0xfedcba98 &&
+				   !txn_memtable_version_Version_token(&version, &token) &&
+				   txn_memtable_version_Version_hint(&version) == TXN_MEMTABLE_VERSION_HINT_COMMITTED,
+				   "(version.raw(), version.token(), version.hint()) == (0xfedc_ba98, None, Hint::Committed)");
+	txn_memtable_version_tests_ok(txn_memtable_version_show(&TXN_MEMTABLE_TESTING_KEYS_KEYED_OPS, &guard, &hold,
+															version.handle, 1, &error), &error, __LINE__);
+	STD_ASSERT_MSG(__LINE__, 9, txn_memtable_version_Version_raw(&version) == 1, "version.raw() == 1");
+	txn_memtable_version_Version_drop(&version);
+	host_shared_Guard_drop(&guard);
+	host_delta_Hold_drop(&hold);
+	std_vec_free_Checked(&key, 1, 1);
+	host_shared_Held_drop(&held);
+	simc_TestIo_drop(&test_io);
+	simc_Process_drop(&process);
+}
+
+#endif							/* DOLTGRES_TEST_TXN */

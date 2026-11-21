@@ -43,6 +43,16 @@
 #include "doltgres/txn/visible.h"
 #include "doltgres/txn/written.h"
 
+#ifdef DOLTGRES_TEST_TXN
+#include "doltgres/chunks/record.h"
+#include "doltgres/repo/lib.h"
+#include "doltgres/simc/simc.h"
+#include "doltgres/std/test.h"
+
+/* RUST_FILE is the file the tests' asserts name, identity.rs. */
+#define RUST_FILE "txn" STD_SEP "src" STD_SEP "identity.rs"
+#endif
+
 /* The prepare whose closure pushes an identity change's versions, or answers false to start over. */
 #define TXN_MEMTABLE_BRANCH_RS Bool
 #define TXN_MEMTABLE_BRANCH_WS Striping
@@ -94,27 +104,14 @@
 #define TXN_IDENTITY_OP sizeof(TxnMemtableOp), _Alignof(TxnMemtableOp)
 #define TXN_IDENTITY_NEED sizeof(txn_TupleRefSliceU8Usize_t), _Alignof(txn_TupleRefSliceU8Usize_t)
 #define TXN_IDENTITY_HANDLE sizeof(TxnMemtableVersionHandle), _Alignof(TxnMemtableVersionHandle)
-#define TXN_IDENTITY_FOLDED_VERSION sizeof(txn_TupleHandleOptionU64_t), _Alignof(txn_TupleHandleOptionU64_t)
-#define TXN_IDENTITY_FOLDED sizeof(txn_TupleVecU8VecTupleHandleOptionU64_t), \
-	_Alignof(txn_TupleVecU8VecTupleHandleOptionU64_t)
+#define TXN_IDENTITY_FOLDED sizeof(txn_TupleVecU8VecHandle_t), _Alignof(txn_TupleVecU8VecHandle_t)
 
-/* txn_TupleHandleOptionU64_t is dropped's (Handle, Option<u64>): a folded version and its top-level xid, or none. */
-typedef struct txn_TupleHandleOptionU64_t
-{
-	TxnMemtableVersionHandle f0;
-	bool		has_f1;
-	uint64		f1;
-} txn_TupleHandleOptionU64_t;
-
-/*
- * txn_TupleVecU8VecTupleHandleOptionU64_t is dropped's (Vec<u8>, Vec<(Handle,
- * Option<u64>)>): a key and its folded versions.
- */
-typedef struct txn_TupleVecU8VecTupleHandleOptionU64_t
+/* txn_TupleVecU8VecHandle_t is dropped's (Vec<u8>, Vec<Handle>): a key and its folded versions. */
+typedef struct txn_TupleVecU8VecHandle_t
 {
 	StdVec		f0;
 	StdVec		f1;
-} txn_TupleVecU8VecTupleHandleOptionU64_t;
+} txn_TupleVecU8VecHandle_t;
 
 /* TxnIdentityFoundTag is Found's variants. */
 typedef enum TxnIdentityFoundTag
@@ -839,8 +836,8 @@ typedef struct txn_identity_changed_closure_4_frame_t
 /*
  * txn_identity_changed_closure_4_body takes the tree's stripe, answers false
  * when another writer pushed under it since the caller's count, and else in
- * one checkpoint window appends each change's record and pushes its version
- * with its LSN.
+ * one checkpoint window appends each of the prepare's group's changes' records
+ * and pushes its version with its LSN.
  */
 static void
 txn_identity_changed_closure_4_body(void *frame_)
@@ -865,8 +862,9 @@ txn_identity_changed_closure_4_body(void *frame_)
 	if (!host_delay_checkpoint(HOST_IO_TAKES_SHORT_IO_DOORS(io), NULL, 0, &frame->window, frame->error))
 		return;
 	frame->window_live = true;
-	for (size_t at = 0; at < changed->bodies.len; at++)
+	for (size_t i = 0; i < frame->prepared->aims_len; i++)
 	{
+		size_t		at = frame->prepared->first + i;
 		const StdVec *body = &STD_VEC_AT(&changed->bodies, StdVec, at);
 		TxnMemtableVersionChange change = {.writer = changed->writer,
 			.op = &STD_VEC_AT(&changed->ops, TxnMemtableOp, at), .lock = TXN_MEMTABLE_LOCK_MODE_UPDATE,
@@ -875,7 +873,7 @@ txn_identity_changed_closure_4_body(void *frame_)
 
 		if (!host_wal_insert(HOST_IO_TAKES_SHORT_IO_DOORS(io), HOST_WAL_KIND_DATABASE_CHANGE, body->ptr, body->len,
 							 &change.lsn, frame->error) ||
-			!txn_memtable_branch_identity_finish(io, frame->prepared, at, &change, true, changed->roomed, &handle,
+			!txn_memtable_branch_identity_finish(io, frame->prepared, i, &change, true, changed->roomed, &handle,
 												 frame->error))
 			return;
 	}
@@ -1003,11 +1001,14 @@ txn_identity_changed_pad(void *frame_)
  * txn_identity_changed gives keys of a database's identity tree their
  * values, a removal for none, in the running transaction, taking the pairs:
  * it records each key in the transaction's list, which an abort prunes, then
- * in one prepare's window under the tree's stripe appends each change's
- * record and pushes its version with its LSN, every pair of a database being
+ * in the window of each of the prepare's groups under the tree's stripe
+ * appends each change's record and pushes its version with its LSN (bugs row
+ * 338), every pair of a database being
  * logged. With the push count the caller read before its probe, it pushes
  * nothing and answers false when another writer pushed under the stripe
- * since.
+ * since. A change with a count is at most TXN_MEMTABLE_TABLE_WHOLE pairs, one
+ * group, since a later group's check would meet the earlier groups' own
+ * pushes and start them over.
  */
 static bool
 txn_identity_changed(HostIoIo *io, HostIoWaits *waits, const HostSharedHeld *deltas, uint32 repository,
@@ -1018,6 +1019,7 @@ txn_identity_changed(HostIoIo *io, HostIoWaits *waits, const HostSharedHeld *del
 		.writer = writer, .roomed = roomed, .pairs = *pairs, .has_count = has_count, .count = count,
 	.result = result, .error = error};
 
+	Assert(!has_count || pairs->len <= TXN_MEMTABLE_TABLE_WHOLE);
 	std_landing(&frame, txn_identity_changed_body, txn_identity_changed_pad);
 	txn_identity_changed_pad(&frame);
 	return frame.ok;
@@ -1510,10 +1512,10 @@ txn_identity_folded(HostIoIo *io, uint32 repository, HostLsn point, StdVec *resu
 static void
 txn_identity_folded_drop(void *folded_)
 {
-	txn_TupleVecU8VecTupleHandleOptionU64_t *folded = folded_;
+	txn_TupleVecU8VecHandle_t *folded = folded_;
 
 	std_vec_free_Checked(&folded->f0, TXN_IDENTITY_BYTES);
-	std_vec_free_Checked(&folded->f1, TXN_IDENTITY_FOLDED_VERSION);
+	std_vec_free_Checked(&folded->f1, TXN_IDENTITY_HANDLE);
 }
 
 /*
@@ -1558,12 +1560,12 @@ txn_identity_dropped_closure_0_body(void *frame_)
 {
 	txn_identity_dropped_closure_0_frame_t *frame = frame_;
 	txn_identity_dropped_closure_0_captures_t *walk = frame->walk;
-	txn_TupleVecU8VecTupleHandleOptionU64_t folded;
+	txn_TupleVecU8VecHandle_t folded;
 
 	if (!host_delta_hold(frame->io, &frame->hold, frame->error))
 		return;
 	frame->hold_live = true;
-	std_vec_new(&frame->applied, TXN_IDENTITY_FOLDED_VERSION);
+	std_vec_new(&frame->applied, TXN_IDENTITY_HANDLE);
 	frame->applied_live = true;
 	if (!txn_memtable_branch_identity_versions(frame->io, &frame->hold, walk->deltas, frame->key, frame->key_len,
 											   &frame->versions, frame->error))
@@ -1578,15 +1580,12 @@ txn_identity_dropped_closure_0_body(void *frame_)
 			return;
 		if (applied.tag == TXN_FOLD_APPLIED_YES)
 		{
-			txn_TupleHandleOptionU64_t top = {.f0 = version->handle, .has_f1 = applied.u.yes.has_top,
-			.f1 = applied.u.yes.top};
-
-			if (!std_vec_try_reserve(&frame->applied, 1, TXN_IDENTITY_FOLDED_VERSION))
+			if (!std_vec_try_reserve(&frame->applied, 1, TXN_IDENTITY_HANDLE))
 			{
 				*frame->error = host_Error_out_of_memory();
 				return;
 			}
-			std_vec_push_Checked(&frame->applied, &top, TXN_IDENTITY_FOLDED_VERSION);
+			std_vec_push_Checked(&frame->applied, &version->handle, TXN_IDENTITY_HANDLE);
 		}
 		txn_memtable_version_Version_drop(version);
 	}
@@ -1614,7 +1613,7 @@ txn_identity_dropped_closure_0_pad(void *frame_)
 	if (frame->versions_live)
 		txn_memtable_version_versions_drop(&frame->versions, frame->at);
 	if (frame->applied_live)
-		std_vec_free_Checked(&frame->applied, TXN_IDENTITY_FOLDED_VERSION);
+		std_vec_free_Checked(&frame->applied, TXN_IDENTITY_HANDLE);
 	if (frame->hold_live)
 		host_delta_Hold_drop(&frame->hold);
 	frame->versions_live = frame->applied_live = frame->hold_live = false;
@@ -1648,18 +1647,14 @@ typedef struct txn_identity_dropped_frame_t
 	StdVec		folded;
 	size_t		at;
 	bool		folded_live;
-	StdVec		handles;
-	bool		handles_live;
-	StdVec		taken;
-	bool		taken_live;
 	HostError  *error;
 	bool		ok;
 } txn_identity_dropped_frame_t;
 
 /*
  * txn_identity_dropped_body lists each key's versions the fold applied, then
- * takes each key's out of its chain and gives each taken one's count back at
- * its top-level transaction's entry.
+ * takes each key's out of its chain, the remover giving back each counted
+ * one's count at its top-level transaction's entry.
  */
 static void
 txn_identity_dropped_body(void *frame_)
@@ -1685,66 +1680,33 @@ txn_identity_dropped_body(void *frame_)
 		return;
 	for (; frame->at < frame->folded.len; frame->at++)
 	{
-		txn_TupleVecU8VecTupleHandleOptionU64_t *key = &STD_VEC_AT(&frame->folded,
-																   txn_TupleVecU8VecTupleHandleOptionU64_t,
-																   frame->at);
-		size_t		zipped;
+		txn_TupleVecU8VecHandle_t *key = &STD_VEC_AT(&frame->folded, txn_TupleVecU8VecHandle_t, frame->at);
+		StdVec		taken;
 
-		std_vec_with_capacity_Checked(&frame->handles, key->f1.len, TXN_IDENTITY_HANDLE);
-		frame->handles_live = true;
-		for (size_t i = 0; i < key->f1.len; i++)
-			std_vec_push_Checked(&frame->handles, &STD_VEC_AT(&key->f1, txn_TupleHandleOptionU64_t, i).f0,
-								 TXN_IDENTITY_HANDLE);
 		if (!txn_memtable_table_removed(&TXN_MEMTABLE_BRANCH_IDENTITY_TREE_OPS, frame->io, walk.deltas, key->f0.ptr,
-										key->f0.len, frame->handles.ptr, frame->handles.len, &frame->taken,
-										frame->error))
+										key->f0.len, key->f1.ptr, key->f1.len, &taken, frame->error))
 			return;
-		frame->taken_live = true;
-		zipped = Min(key->f1.len, frame->taken.len);
-		for (size_t i = 0; i < zipped; i++)
-		{
-			const txn_TupleHandleOptionU64_t *top = &STD_VEC_AT(&key->f1, txn_TupleHandleOptionU64_t, i);
-			HostXid		xid = {top->f1};
-			bool		has_added;
-			uint64		added;
-
-			if (!STD_VEC_AT(&frame->taken, bool, i) || !top->has_f1)
-				continue;
-			if (!txn_status_add(frame->io, xid, PG_UINT64_MAX, &has_added, &added, frame->error))
-				return;
-		}
-		frame->taken_live = false;
-		std_vec_free_Checked(&frame->taken, sizeof(bool), _Alignof(bool));
-		frame->handles_live = false;
-		std_vec_free_Checked(&frame->handles, TXN_IDENTITY_HANDLE);
+		std_vec_free_Checked(&taken, sizeof(bool), _Alignof(bool));
 		txn_identity_folded_drop(key);
 	}
 	frame->ok = true;
 }
 
-/*
- * txn_identity_dropped_pad frees what dropped holds live: a key's removal and
- * handles, the folded keys left, and its deltas.
- */
+/* txn_identity_dropped_pad frees what dropped holds live: the folded keys left and its deltas. */
 static void
 txn_identity_dropped_pad(void *frame_)
 {
 	txn_identity_dropped_frame_t *frame = frame_;
 
-	if (frame->taken_live)
-		std_vec_free_Checked(&frame->taken, sizeof(bool), _Alignof(bool));
-	if (frame->handles_live)
-		std_vec_free_Checked(&frame->handles, TXN_IDENTITY_HANDLE);
 	if (frame->folded_live)
 	{
 		for (; frame->at < frame->folded.len; frame->at++)
-			txn_identity_folded_drop(&STD_VEC_AT(&frame->folded, txn_TupleVecU8VecTupleHandleOptionU64_t,
-												 frame->at));
+			txn_identity_folded_drop(&STD_VEC_AT(&frame->folded, txn_TupleVecU8VecHandle_t, frame->at));
 		std_vec_free_Checked(&frame->folded, TXN_IDENTITY_FOLDED);
 	}
 	if (frame->deltas_live)
 		host_shared_Held_drop(&frame->deltas);
-	frame->taken_live = frame->handles_live = frame->folded_live = frame->deltas_live = false;
+	frame->folded_live = frame->deltas_live = false;
 }
 
 /*
@@ -1885,3 +1847,858 @@ txn_identity_redo(HostIoIo *io, TxnRecordDatabaseChange *change, uint32 own, uin
 	txn_identity_redo_pad(&frame);
 	return frame.ok;
 }
+
+#ifdef DOLTGRES_TEST_TXN
+/* TXN_IDENTITY_TESTS_UNWRAP is Result::unwrap's panic text. */
+#define TXN_IDENTITY_TESTS_UNWRAP "called `Result::unwrap()` on an `Err` value"
+
+/* TXN_IDENTITY_TESTS_SCHEMA is the parent id the tests' tables derive their ids under. */
+#define TXN_IDENTITY_TESTS_SCHEMA (TXN_IDENTITY_OBJECT_ID_BIT | 5)
+
+/* txn_identity_tests_ok unwraps a host result at a line. */
+static void
+txn_identity_tests_ok(bool ok, HostError *error, uint32 line)
+{
+	if (!ok)
+		STD_RESULT_EXPECT_FAILED(line, 0, TXN_IDENTITY_TESTS_UNWRAP, error, host_Error_Debug_fmt);
+}
+
+/* txn_identity_tests_derived returns an object's derived id, which unwraps at a line. */
+static uint64
+txn_identity_tests_derived(TxnIdentityKind kind, uint64 parent, const char *name, size_t name_len, uint32 line)
+{
+	uint64		id;
+	HostError	error;
+
+	txn_identity_tests_ok(txn_identity_derive_object_id(kind, parent, (const uint8 *) name, name_len, &id, &error),
+						  &error, line);
+	return id;
+}
+
+/* txn_identity_tests_eq reports whether a key is the concatenation of a prefix and a big-endian number's bytes. */
+static bool
+txn_identity_tests_eq(const StdVec *key, const uint8 *prefix, size_t prefix_len, uint64 number, size_t number_len)
+{
+	if (key->len != prefix_len + number_len || memcmp(key->ptr, prefix, prefix_len) != 0)
+		return false;
+	for (size_t k = 0; k < number_len; k++)
+		if (((const uint8 *) key->ptr)[prefix_len + k] != (uint8) (number >> (8 * (number_len - 1 - k))))
+			return false;
+	return true;
+}
+
+/* txn_identity_tests_starts reports whether a key starts with a prefix's bytes. */
+static bool
+txn_identity_tests_starts(const StdVec *key, const StdVec *prefix)
+{
+	return key->len >= prefix->len && memcmp(key->ptr, prefix->ptr, prefix->len) == 0;
+}
+
+/*
+ * test_txn_identity_tests_an_objects_id_derives_from_its_kind_parent_and_name:
+ * §II.12's derivation, the same kind, parent, and name give the same id, with
+ * the user bit set; another name or parent gives another; a taken id moves
+ * to the next free one.
+ */
+void
+test_txn_identity_tests_an_objects_id_derives_from_its_kind_parent_and_name(void)
+{
+	uint64		schema = txn_identity_tests_derived(TXN_IDENTITY_KIND_SCHEMA, 0, "public", 6, __LINE__);
+	uint64		table = txn_identity_tests_derived(TXN_IDENTITY_KIND_RELATION, schema, "t", 1, __LINE__);
+
+	STD_ASSERT_MSG(__LINE__, 9, (schema & TXN_IDENTITY_OBJECT_ID_BIT) == TXN_IDENTITY_OBJECT_ID_BIT,
+				   "schema & OBJECT_ID_BIT == OBJECT_ID_BIT");
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_derived(TXN_IDENTITY_KIND_SCHEMA, 0, "public", 6, __LINE__) == schema,
+				   "the same derivation gives the same id");
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_derived(TXN_IDENTITY_KIND_RELATION, schema, "u", 1, __LINE__) !=
+				   table, "another name gives another id");
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_derived(TXN_IDENTITY_KIND_RELATION, table, "t", 1, __LINE__) !=
+				   table, "another parent gives another id");
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_next_id(table) == ((table + 1) | TXN_IDENTITY_OBJECT_ID_BIT),
+				   "next_id(table) == (table + 1) | OBJECT_ID_BIT");
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_next_id(PG_UINT64_MAX) == TXN_IDENTITY_OBJECT_ID_BIT,
+				   "next_id(u64::MAX) == OBJECT_ID_BIT");
+}
+
+/* txn_identity_tests_column returns a column's derived id under parent 7, by its name and category. */
+static uint64
+txn_identity_tests_column(uint8 category)
+{
+	StdVec		name;
+	uint64		id;
+
+	txn_identity_column_name((const uint8 *) "a", 1, category, &name);
+	id = txn_identity_tests_derived(TXN_IDENTITY_KIND_COLUMN, 7, name.ptr, name.len, __LINE__);
+	std_vec_free_Checked(&name, 1, 1);
+	return id;
+}
+
+/*
+ * test_txn_identity_tests_a_columns_id_holds_its_types_category: a column's
+ * name for its id holds its type's category, so the same name with another
+ * category is another column, and the same name and category the same
+ * column.
+ */
+void
+test_txn_identity_tests_a_columns_id_holds_its_types_category(void)
+{
+	uint64 numeric = txn_identity_tests_column('N');
+	uint64 text = txn_identity_tests_column('S');
+
+	STD_ASSERT_MSG(__LINE__, 9, numeric !=text, "int != text");
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_column('N') == numeric, "the same name and category, the same id");
+}
+
+/*
+ * test_txn_identity_tests_a_pairs_keys_find_it_from_either_side: the two key
+ * forms of a pair, and a table's columns' prefix, which every column key of
+ * the table starts with.
+ */
+void
+test_txn_identity_tests_a_pairs_keys_find_it_from_either_side(void)
+{
+	static const uint8 by_id_prefix[] = {1, 2};
+	static const uint8 by_oid_prefix[] = {2, 2};
+	static const uint8 column_prefix[] = {2, 3, 0, 0, 0, 0, 0, 0, 0, 9};
+	StdVec		key;
+	StdVec		column;
+	StdVec		prefix;
+
+	txn_identity_by_id(TXN_IDENTITY_KIND_RELATION, 5, &key);
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_eq(&key, by_id_prefix, 2, 5, 8),
+				   "by_id(Kind::Relation, 5) == [1, 2] ++ 5u64.to_be_bytes()");
+	std_vec_free_Checked(&key, 1, 1);
+	txn_identity_by_oid(TXN_IDENTITY_KIND_RELATION, 16384, &key);
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_eq(&key, by_oid_prefix, 2, 16384, 4),
+				   "by_oid(Kind::Relation, 16384) == [2, 2] ++ 16384u32.to_be_bytes()");
+	std_vec_free_Checked(&key, 1, 1);
+	txn_identity_column_by_number(9, 3, &column);
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_eq(&column, column_prefix, sizeof(column_prefix), 3, 2),
+				   "column_by_number(9, 3) == [2, 3] ++ 9u64.to_be_bytes() ++ 3u16.to_be_bytes()");
+	txn_identity_columns(9, false, &prefix);
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_starts(&column, &prefix), "column.starts_with(&columns(9, false))");
+	std_vec_free_Checked(&prefix, 1, 1);
+	std_vec_free_Checked(&column, 1, 1);
+	txn_identity_column_by_id(9, 11, &column);
+	txn_identity_columns(9, true, &prefix);
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_starts(&column, &prefix),
+				   "column_by_id(9, 11).starts_with(&columns(9, true))");
+	std_vec_free_Checked(&prefix, 1, 1);
+	std_vec_free_Checked(&column, 1, 1);
+}
+
+/* txn_identity_tests_writing_t is writing's (Writer, Roomed): the running transaction's writer and its entry's room. */
+typedef struct txn_identity_tests_writing_t
+{
+	TxnMemtableVersionWriter writer;
+	TxnStatusRoomed roomed;
+} txn_identity_tests_writing_t;
+
+/* txn_identity_tests_writing returns the running transaction's writer at its current command, with its entry's room taken. */
+static txn_identity_tests_writing_t
+txn_identity_tests_writing(HostIoIo *io)
+{
+	txn_identity_tests_writing_t writing = {0};
+	HostXid		sub;
+	HostXid		top;
+	HostError	error;
+
+	txn_identity_tests_ok(host_current_writer(HOST_IO_IO_IO_DOORS(io), &sub, &top, &error) &&
+						  txn_status_roomed(io, top, &writing.roomed, &error), &error, __LINE__);
+	writing.writer.xid = sub.f0;
+	writing.writer.has_top = sub.f0 != top.f0;
+	writing.writer.top = top.f0;
+	return writing;
+}
+
+/* txn_identity_tests_committed commits the running transaction as Postgres' commit leaves its entry once the commit's slot is settled: committed at the WAL's end. */
+static void
+txn_identity_tests_committed(HostIoIo *io)
+{
+	HostXid		sub;
+	HostXid		top;
+	TxnStatusEntry entry;
+	TxnStatusOutcome to = {.tag = TXN_STATUS_OUTCOME_COMMITTED};
+	bool		has;
+	bool		settled = false;
+	HostError	error;
+
+	txn_identity_tests_ok(host_current_writer(HOST_IO_IO_IO_DOORS(io), &sub, &top, &error), &error, __LINE__);
+	simc_end(true);
+	txn_identity_tests_ok(txn_status_lookup(io, top, &has, &entry, &error), &error, __LINE__);
+	STD_ASSERT_MSG(__LINE__, 0, has, "status::lookup(io, top).unwrap().unwrap()");
+	txn_identity_tests_ok(host_fold_point(HOST_IO_IO_IO_DOORS(io), &to.u.committed, &error) &&
+						  txn_status_settled(io, top, entry.outcome, to, &settled, &error), &error, __LINE__);
+	STD_ASSERT_MSG(__LINE__, 9, settled, "status::settled(io, top, entry.outcome, Committed(end)).unwrap()");
+}
+
+/* txn_identity_tests_repository makes a test's database's repository and returns its number. */
+static uint32
+txn_identity_tests_repository(HostIoIo *io, uint32 number)
+{
+	RepoRepo	repo;
+	ChunksErrorError failed;
+
+	if (!repo_Repo_create(io, number, HOST_PG_DEFAULT, &repo, &failed))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, TXN_IDENTITY_TESTS_UNWRAP, &failed, chunks_error_Error_Debug_fmt);
+	repo_Repo_drop(&repo);
+	return number;
+}
+
+/* txn_identity_tests_opened_t is opened's database: the repository opened, a reader, and its number. */
+typedef struct txn_identity_tests_opened_t
+{
+	RepoRepo	repo;
+	HostSharedReader reading;
+	uint32		repository;
+} txn_identity_tests_opened_t;
+
+/* txn_identity_tests_opened opens a test's database's repository and a reader, the identity tree as its readers reach it. */
+static txn_identity_tests_opened_t
+txn_identity_tests_opened(HostIoIo *io, uint32 repository)
+{
+	txn_identity_tests_opened_t opened = {.repository = repository};
+	ChunksErrorError failed;
+	HostError	error;
+
+	if (!repo_Repo_open(io, repository, HOST_PG_DEFAULT, &opened.repo, &failed))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, TXN_IDENTITY_TESTS_UNWRAP, &failed, chunks_error_Error_Debug_fmt);
+	txn_identity_tests_ok(host_shared_read(io, &opened.reading, &error), &error, __LINE__);
+	return opened;
+}
+
+/* txn_identity_tests_opened_database returns an opened repository as the identity tree's database. */
+static TxnIdentityDatabase
+txn_identity_tests_opened_database(const txn_identity_tests_opened_t *opened)
+{
+	TxnIdentityDatabase database = {&opened->repo, &opened->reading, opened->repository};
+
+	return database;
+}
+
+/* txn_identity_tests_opened_drop frees what opened returned. */
+static void
+txn_identity_tests_opened_drop(txn_identity_tests_opened_t *opened)
+{
+	host_shared_Reader_drop(&opened->reading);
+	repo_Repo_drop(&opened->repo);
+}
+
+/* txn_identity_tests_keyed is a table's keyed closure: an id's pair by id, as a relation. */
+static void
+txn_identity_tests_keyed(const void *captures, uint64 id, StdVec *result)
+{
+	(void) captures;
+	txn_identity_by_id(TXN_IDENTITY_KIND_RELATION, id, result);
+}
+
+/* txn_identity_tests_table records a table's pairs under SCHEMA in the running transaction and returns its id. */
+static uint64
+txn_identity_tests_table(HostIoIo *io, uint32 repository, const char *name, uint32 oid)
+{
+	txn_identity_tests_writing_t written = txn_identity_tests_writing(io);
+	txn_identity_tests_opened_t opened = txn_identity_tests_opened(io, repository);
+	HostIoWaits waits = host_io_Waits_testing();
+	StdVec		numbered;
+	uint64		id;
+	HostError	error;
+
+	txn_identity_by_oid(TXN_IDENTITY_KIND_RELATION, oid, &numbered);
+	txn_identity_tests_ok(txn_identity_derived(io, &waits, txn_identity_tests_opened_database(&opened), written.writer,
+											   written.roomed, TXN_IDENTITY_KIND_RELATION, TXN_IDENTITY_TESTS_SCHEMA,
+											   (const uint8 *) name, strlen(name), numbered.ptr, numbered.len, oid,
+											   txn_identity_tests_keyed, NULL, NULL, &id, &error), &error, __LINE__);
+	std_vec_free_Checked(&numbered, 1, 1);
+	txn_identity_tests_opened_drop(&opened);
+	return id;
+}
+
+/* txn_identity_tests_read reads a key of a database's identity tree for the running transaction, answering whether it holds one, into value when given. */
+static bool
+txn_identity_tests_read(HostIoIo *io, uint32 repository, const StdVec *key, StdVec *value)
+{
+	txn_identity_tests_opened_t opened = txn_identity_tests_opened(io, repository);
+	HostIoWaits waits = host_io_Waits_testing();
+	StdVec		read;
+	bool		has;
+	HostError	error;
+
+	txn_identity_tests_ok(txn_identity_looked_up(io, &waits, txn_identity_tests_opened_database(&opened), key->ptr,
+												 key->len, &has, &read, &error), &error, __LINE__);
+	txn_identity_tests_opened_drop(&opened);
+	if (has && value != NULL)
+		*value = read;
+	else if (has)
+		std_vec_free_Checked(&read, 1, 1);
+	return has;
+}
+
+/* txn_identity_tests_read_is reports whether a key of a database's identity tree reads as some bytes. */
+static bool
+txn_identity_tests_read_is(HostIoIo *io, uint32 repository, const StdVec *key, const uint8 *want, size_t want_len)
+{
+	StdVec		value;
+	bool		is;
+
+	if (!txn_identity_tests_read(io, repository, key, &value))
+		return false;
+	is = value.len == want_len && memcmp(value.ptr, want, want_len) == 0;
+	std_vec_free_Checked(&value, 1, 1);
+	return is;
+}
+
+/* txn_identity_tests_id_bytes returns an id's big-endian bytes. */
+static void
+txn_identity_tests_id_bytes(uint64 id, uint8 *bytes)
+{
+	for (int k = 0; k < 8; k++)
+		bytes[k] = (uint8) (id >> (8 * (7 - k)));
+}
+
+/* TXN_IDENTITY_TESTS_NUMBER is the pair by id's value of OID 16384, its varint. */
+static const uint8 TXN_IDENTITY_TESTS_NUMBER[] = {0x80, 0x80, 0x01};
+
+/* txn_identity_tests_pairs_read reports whether a table's two pairs read as its OID's and its id's. */
+static bool
+txn_identity_tests_pairs_read(HostIoIo *io, uint32 repository, uint32 oid, uint64 id)
+{
+	StdVec		by_oid;
+	StdVec		by_id;
+	uint8		bytes[8];
+	bool		read;
+
+	txn_identity_by_oid(TXN_IDENTITY_KIND_RELATION, oid, &by_oid);
+	txn_identity_by_id(TXN_IDENTITY_KIND_RELATION, id, &by_id);
+	txn_identity_tests_id_bytes(id, bytes);
+	read = txn_identity_tests_read_is(io, repository, &by_oid, bytes, sizeof(bytes)) &&
+		txn_identity_tests_read_is(io, repository, &by_id, TXN_IDENTITY_TESTS_NUMBER,
+								   sizeof(TXN_IDENTITY_TESTS_NUMBER));
+	std_vec_free_Checked(&by_id, 1, 1);
+	std_vec_free_Checked(&by_oid, 1, 1);
+	return read;
+}
+
+/* txn_identity_tests_pairs_gone reports whether neither of a table's two pairs reads. */
+static bool
+txn_identity_tests_pairs_gone(HostIoIo *io, uint32 repository, uint32 oid, uint64 id)
+{
+	StdVec		by_oid;
+	StdVec		by_id;
+	bool		gone;
+
+	txn_identity_by_oid(TXN_IDENTITY_KIND_RELATION, oid, &by_oid);
+	txn_identity_by_id(TXN_IDENTITY_KIND_RELATION, id, &by_id);
+	gone = !txn_identity_tests_read(io, repository, &by_oid, NULL) &&
+		!txn_identity_tests_read(io, repository, &by_id, NULL);
+	std_vec_free_Checked(&by_id, 1, 1);
+	std_vec_free_Checked(&by_oid, 1, 1);
+	return gone;
+}
+
+/* txn_identity_tests_logged_count returns how many database change records the simulation logged. */
+static size_t
+txn_identity_tests_logged_count(void)
+{
+	StdVec		logged = simc_logged();
+	size_t		count = 0;
+
+	for (size_t k = 0; k < logged.len; k++)
+	{
+		simc_TupleU8VecU8Lsn_t *one = &STD_VEC_AT(&logged, simc_TupleU8VecU8Lsn_t, k);
+		HostWalKind kind;
+
+		count += host_WalKind_of(one->f0, &kind) && kind == HOST_WAL_KIND_DATABASE_CHANGE;
+		std_vec_free_Checked(&one->f1, 1, 1);
+	}
+	std_vec_free_Checked(&logged, sizeof(simc_TupleU8VecU8Lsn_t), _Alignof(simc_TupleU8VecU8Lsn_t));
+	return count;
+}
+
+/* txn_identity_tests_versions returns how many identity versions the delta holds at a key. */
+static size_t
+txn_identity_tests_versions(HostIoIo *io, uint32 repository, const StdVec *key)
+{
+	HostSharedHeld deltas;
+	HostDeltaHold hold;
+	StdVec		versions;
+	size_t		count;
+	HostError	error;
+
+	txn_identity_tests_ok(txn_memtable_branch_deltas(io, repository, HOST_PG_DEFAULT, &deltas, &error) &&
+						  host_delta_hold(io, &hold, &error) &&
+						  txn_memtable_branch_identity_versions(io, &hold, host_shared_Held_record(&deltas), key->ptr,
+																key->len, &versions, &error), &error, __LINE__);
+	count = versions.len;
+	for (size_t k = 0; k < versions.len; k++)
+		txn_memtable_version_Version_drop(&STD_VEC_AT(&versions, TxnMemtableVersionVersion, k));
+	std_vec_free_Checked(&versions, sizeof(TxnMemtableVersionVersion), _Alignof(TxnMemtableVersionVersion));
+	host_delta_Hold_drop(&hold);
+	host_shared_Held_drop(&deltas);
+	return count;
+}
+
+/* txn_identity_tests_dropped drops a repository's branch state, which unwraps at a line. */
+static void
+txn_identity_tests_dropped(HostIoIo *io, uint32 repository, uint32 line)
+{
+	HostError	error;
+
+	txn_identity_tests_ok(txn_memtable_branch_dropped(io, repository, &error), &error, line);
+}
+
+/*
+ * test_txn_identity_tests_a_tables_pairs_read_back_by_its_oid_and_its_id:
+ * PLAN item 10's pairs, a table's derivation records its pair by OID and its
+ * pair by id, which read back in its transaction and, once it commits, in
+ * the next; the id is the derivation's, and recording the table again finds
+ * its id and pushes nothing.
+ */
+void
+test_txn_identity_tests_a_tables_pairs_read_back_by_its_oid_and_its_id(void)
+{
+	SimcProcess process = simc_process();
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	uint32		repository;
+	uint64		id;
+	size_t		logged;
+	StdVec		by_id;
+	HostError	error;
+
+	simc_end(false);
+	repository = txn_identity_tests_repository(io, 9470);
+	id = txn_identity_tests_table(io, repository, "t", 16384);
+	STD_ASSERT_MSG(__LINE__, 9, id == txn_identity_tests_derived(TXN_IDENTITY_KIND_RELATION, TXN_IDENTITY_TESTS_SCHEMA,
+																 "t", 1, __LINE__),
+				   "id == derive_object_id(Kind::Relation, SCHEMA, b\"t\").unwrap()");
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_pairs_read(io, repository, 16384, id),
+				   "the table's pairs read back in its transaction");
+	logged = txn_identity_tests_logged_count();
+	simc_end(true);
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_table(io, repository, "t", 16384) == id,
+				   "recording the table again finds its id");
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_logged_count() == logged, "recording it again pushed nothing");
+	txn_identity_by_id(TXN_IDENTITY_KIND_RELATION, id, &by_id);
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_read_is(io, repository, &by_id, TXN_IDENTITY_TESTS_NUMBER,
+														   sizeof(TXN_IDENTITY_TESTS_NUMBER)),
+				   "read(io, repository, &by_id(Kind::Relation, id)) == Some(vec![0x80, 0x80, 0x01])");
+	std_vec_free_Checked(&by_id, 1, 1);
+	simc_end(true);
+	txn_identity_tests_dropped(io, repository, __LINE__);
+	txn_identity_tests_ok(txn_written_ended(io, &error), &error, __LINE__);
+	simc_TestIo_drop(&test_io);
+	simc_Process_drop(&process);
+}
+
+/*
+ * test_txn_identity_tests_an_aborted_transactions_pairs_go_at_the_take_back:
+ * 2g's take-back for the identity tree, an aborted transaction's pairs go at
+ * its abort, so its table has none.
+ */
+void
+test_txn_identity_tests_an_aborted_transactions_pairs_go_at_the_take_back(void)
+{
+	SimcProcess process = simc_process();
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	uint32		repository;
+	uint64		id;
+	StdVec		by_id;
+	HostError	error;
+
+	simc_end(false);
+	repository = txn_identity_tests_repository(io, 9471);
+	id = txn_identity_tests_table(io, repository, "t", 16384);
+	simc_end(false);
+	txn_identity_tests_ok(txn_written_aborted(io, 0, &error), &error, __LINE__);
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_pairs_gone(io, repository, 16384, id),
+				   "an aborted transaction's pairs went at its abort");
+	txn_identity_by_id(TXN_IDENTITY_KIND_RELATION, id, &by_id);
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_versions(io, repository, &by_id) == 0,
+				   "branch::identity_versions(...).unwrap().is_empty()");
+	std_vec_free_Checked(&by_id, 1, 1);
+	txn_identity_tests_dropped(io, repository, __LINE__);
+	simc_TestIo_drop(&test_io);
+	simc_Process_drop(&process);
+}
+
+/*
+ * test_txn_identity_tests_a_taken_id_moves_on_and_a_removed_pair_frees_it:
+ * I14 in one process, a derivation whose id another object's live pair holds
+ * takes the next free id, and once that object's pairs are removed, an
+ * object made again under its name derives its id again.
+ */
+void
+test_txn_identity_tests_a_taken_id_moves_on_and_a_removed_pair_frees_it(void)
+{
+	SimcProcess process = simc_process();
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	uint32		repository;
+	uint64		first;
+	txn_identity_tests_writing_t written;
+	HostIoWaits waits = host_io_Waits_testing();
+	StdVec		keys;
+	StdVec		key;
+	HostError	error;
+
+	simc_end(false);
+	repository = txn_identity_tests_repository(io, 9472);
+	first = txn_identity_tests_table(io, repository, "t", 16384);
+	simc_end(true);
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_table(io, repository, "t", 16390) == txn_identity_next_id(first),
+				   "a taken id moves on to the next free one");
+	simc_end(true);
+	written = txn_identity_tests_writing(io);
+	std_vec_new(&keys, sizeof(StdVec), _Alignof(StdVec));
+	txn_identity_by_oid(TXN_IDENTITY_KIND_RELATION, 16384, &key);
+	std_vec_push_Checked(&keys, &key, sizeof(key), _Alignof(StdVec));
+	txn_identity_by_id(TXN_IDENTITY_KIND_RELATION, first, &key);
+	std_vec_push_Checked(&keys, &key, sizeof(key), _Alignof(StdVec));
+	txn_identity_tests_ok(txn_identity_removed(io, &waits, repository, HOST_PG_DEFAULT, written.writer, written.roomed,
+											   &keys, &error), &error, __LINE__);
+	txn_identity_by_oid(TXN_IDENTITY_KIND_RELATION, 16384, &key);
+	STD_ASSERT_MSG(__LINE__, 9, !txn_identity_tests_read(io, repository, &key, NULL),
+				   "read(io, repository, &by_oid(Kind::Relation, 16384)) == None");
+	std_vec_free_Checked(&key, 1, 1);
+	simc_end(true);
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_table(io, repository, "t", 16400) == first,
+				   "a removed pair frees its id");
+	simc_end(true);
+	txn_identity_tests_dropped(io, repository, __LINE__);
+	txn_identity_tests_ok(txn_written_ended(io, &error), &error, __LINE__);
+	simc_TestIo_drop(&test_io);
+	simc_Process_drop(&process);
+}
+
+/*
+ * test_txn_identity_tests_redone_identity_changes_give_the_same_pairs_once:
+ * I12's case for the identity tree, a database's logged identity changes,
+ * redone into another database's delta with no catalog, give it the same
+ * pairs, and a change redone again is held by its LSN and pushes nothing.
+ */
+void
+test_txn_identity_tests_redone_identity_changes_give_the_same_pairs_once(void)
+{
+	SimcProcess process = simc_process();
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	uint32		primary;
+	uint32		replica;
+	uint64		id;
+	StdVec		logged;
+	StdVec		records;
+	StdVec		by_id;
+	HostError	error;
+
+	simc_end(false);
+	primary = txn_identity_tests_repository(io, 9473);
+	replica = txn_identity_tests_repository(io, 9474);
+	id = txn_identity_tests_table(io, primary, "t", 16384);
+	simc_end(true);
+	logged = simc_logged();
+	std_vec_new(&records, sizeof(simc_TupleU8VecU8Lsn_t), _Alignof(simc_TupleU8VecU8Lsn_t));
+	for (size_t k = 0; k < logged.len; k++)
+	{
+		simc_TupleU8VecU8Lsn_t *one = &STD_VEC_AT(&logged, simc_TupleU8VecU8Lsn_t, k);
+		TxnRecordDatabaseChange change;
+		HostWalKind kind;
+		bool		kept = false;
+
+		if (host_WalKind_of(one->f0, &kind) && kind == HOST_WAL_KIND_DATABASE_CHANGE)
+		{
+			if (!txn_record_DatabaseChange_decode(one->f1.ptr, one->f1.len, &change, &error))
+				host_Error_drop(&error);
+			else
+			{
+				kept = change.repository == primary;
+				txn_record_DatabaseChange_drop(&change);
+			}
+		}
+		if (kept)
+			std_vec_push_Checked(&records, one, sizeof(*one), _Alignof(simc_TupleU8VecU8Lsn_t));
+		else
+			std_vec_free_Checked(&one->f1, 1, 1);
+	}
+	std_vec_free_Checked(&logged, sizeof(simc_TupleU8VecU8Lsn_t), _Alignof(simc_TupleU8VecU8Lsn_t));
+	STD_ASSERT_MSG(__LINE__, 9, records.len == 2, "records.len() == 2");
+	for (int pass = 0; pass < 2; pass++)
+		for (size_t k = 0; k < records.len; k++)
+		{
+			simc_TupleU8VecU8Lsn_t *one = &STD_VEC_AT(&records, simc_TupleU8VecU8Lsn_t, k);
+			TxnRecordDatabaseChange change;
+
+			txn_identity_tests_ok(txn_record_DatabaseChange_decode(one->f1.ptr, one->f1.len, &change, &error), &error,
+								  __LINE__);
+			change.repository = replica;
+			txn_identity_tests_ok(txn_identity_redo(io, &change, HOST_PG_DEFAULT, one->f2, &error), &error,
+								  __LINE__);
+		}
+	for (size_t k = 0; k < records.len; k++)
+		std_vec_free_Checked(&STD_VEC_AT(&records, simc_TupleU8VecU8Lsn_t, k).f1, 1, 1);
+	std_vec_free_Checked(&records, sizeof(simc_TupleU8VecU8Lsn_t), _Alignof(simc_TupleU8VecU8Lsn_t));
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_pairs_read(io, replica, 16384, id),
+				   "the replica's pairs read as the primary's");
+	txn_identity_by_id(TXN_IDENTITY_KIND_RELATION, id, &by_id);
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_versions(io, replica, &by_id) == 1,
+				   "a change redone again pushes nothing");
+	std_vec_free_Checked(&by_id, 1, 1);
+	txn_identity_tests_dropped(io, primary, __LINE__);
+	txn_identity_tests_dropped(io, replica, __LINE__);
+	txn_identity_tests_ok(txn_written_ended(io, &error), &error, __LINE__);
+	simc_TestIo_drop(&test_io);
+	simc_Process_drop(&process);
+}
+
+/* txn_identity_tests_refused reports whether a database change record's body is refused. */
+static bool
+txn_identity_tests_refused(ChunksRecordRecordWriter *w)
+{
+	StdVec		body = chunks_record_RecordWriter_finish(w);
+	TxnRecordDatabaseChange change;
+	HostError	error;
+	bool		refused = !txn_record_DatabaseChange_decode(body.ptr, body.len, &change, &error);
+
+	if (refused)
+		host_Error_drop(&error);
+	else
+		txn_record_DatabaseChange_drop(&change);
+	std_vec_free_Checked(&body, 1, 1);
+	return refused;
+}
+
+/*
+ * test_txn_identity_tests_an_identity_change_reads_back_as_written: the
+ * database change record's form, a subtransaction's writer, a put's value,
+ * and a removal's lack of one read back as written, and an unknown field
+ * and a tree none is are refused.
+ */
+void
+test_txn_identity_tests_an_identity_change_reads_back_as_written(void)
+{
+	TxnMemtableVersionWriter writer = {.xid = 41, .has_top = true, .top = 40, .command = 3};
+	ChunksRecordRecordWriter w;
+
+	for (int put = 0; put < 2; put++)
+	{
+		TxnRecordDatabaseChange change = {.tree = TXN_RECORD_TREE_IDENTITY, .writer = writer, .repository = 9475,
+		.has_value = put == 0};
+		TxnRecordDatabaseChange read;
+		StdVec		body;
+		HostError	error;
+
+		txn_identity_by_oid(TXN_IDENTITY_KIND_RELATION, 16384, &change.key);
+		if (put == 0)
+			std_slice_to_vec_Checked(&change.value, "v", 1, 1, 1);
+		txn_record_DatabaseChange_encode(&change, &body);
+		txn_identity_tests_ok(txn_record_DatabaseChange_decode(body.ptr, body.len, &read, &error), &error, __LINE__);
+		STD_ASSERT_MSG(__LINE__, 13, txn_record_DatabaseChange_PartialEq_eq(&read, &change),
+					   "DatabaseChange::decode(&change.encode()).unwrap() == change");
+		txn_record_DatabaseChange_drop(&read);
+		txn_record_DatabaseChange_drop(&change);
+		std_vec_free_Checked(&body, 1, 1);
+	}
+	w = chunks_record_RecordWriter_with_capacity(32);
+	chunks_record_RecordWriter_uint(chunks_record_RecordWriter_uint(chunks_record_RecordWriter_uint(
+																									chunks_record_RecordWriter_uint(&w, 1, 1), 2, 9475), 3, 40), 5, 0);
+	chunks_record_RecordWriter_uint(chunks_record_RecordWriter_field(&w, 6, (const uint8 *) "k", 1), 8, 1);
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_refused(&w), "an unknown field read back");
+	w = chunks_record_RecordWriter_with_capacity(32);
+	chunks_record_RecordWriter_uint(chunks_record_RecordWriter_uint(chunks_record_RecordWriter_uint(
+																									chunks_record_RecordWriter_uint(&w, 1, 2), 2, 9475), 3, 40), 5, 0);
+	chunks_record_RecordWriter_field(&w, 6, (const uint8 *) "k", 1);
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_refused(&w), "a tree none is read back");
+}
+
+/* txn_identity_tests_gather is a save's gather of the folded pairs, each as the identity tree's pair. */
+static bool
+txn_identity_tests_gather(void *captures, HostIoIo *io, const RepoRead *read, StdVec *result, ChunksErrorError *error)
+{
+	const StdVec *pairs = captures;
+
+	(void) io;
+	(void) read;
+	(void) error;
+	std_vec_new(result, sizeof(RepoGathered), _Alignof(RepoGathered));
+	for (size_t k = 0; k < pairs->len; k++)
+	{
+		const TxnIdentityPair *pair = &STD_VEC_AT(pairs, TxnIdentityPair, k);
+		RepoGathered gathered = {.tag = REPO_GATHERED_PAIR, .u.pair = {.has_value = pair->has_f1}};
+
+		std_slice_to_vec_Checked(&gathered.u.pair.key, pair->f0.ptr, pair->f0.len, 1, 1);
+		if (pair->has_f1)
+			std_slice_to_vec_Checked(&gathered.u.pair.value, pair->f1.ptr, pair->f1.len, 1, 1);
+		std_vec_push_Checked(result, &gathered, sizeof(gathered), _Alignof(RepoGathered));
+	}
+	return true;
+}
+
+/* txn_identity_tests_saved is a save's after-write call, which does nothing. */
+static bool
+txn_identity_tests_saved(void *captures, HostIoIo *io, ChunksErrorError *error)
+{
+	(void) captures;
+	(void) io;
+	(void) error;
+	return true;
+}
+
+/* txn_identity_tests_folded folds a repository's committed pairs at a point and saves them into the tree the manifest names, returning the pairs. */
+static StdVec
+txn_identity_tests_folded(HostIoIo *io, uint32 repository, HostLsn point)
+{
+	StdVec		pairs;
+	txn_identity_tests_opened_t opened;
+	ChunksErrorError failed;
+	HostError	error;
+
+	txn_identity_tests_ok(txn_identity_folded(io, repository, point, &pairs, &error), &error, __LINE__);
+	opened = txn_identity_tests_opened(io, repository);
+	if (!repo_Repo_save(&opened.repo, io, &opened.reading, false, NULL, txn_identity_tests_gather, &pairs,
+						txn_identity_tests_saved, NULL, &failed))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, TXN_IDENTITY_TESTS_UNWRAP, &failed, chunks_error_Error_Debug_fmt);
+	txn_identity_tests_opened_drop(&opened);
+	return pairs;
+}
+
+/* txn_identity_tests_pairs_drop drops folded's pairs. */
+static void
+txn_identity_tests_pairs_drop(StdVec *pairs)
+{
+	for (size_t k = 0; k < pairs->len; k++)
+	{
+		TxnIdentityPair *pair = &STD_VEC_AT(pairs, TxnIdentityPair, k);
+
+		std_vec_free_Checked(&pair->f0, 1, 1);
+		if (pair->has_f1)
+			std_vec_free_Checked(&pair->f1, 1, 1);
+	}
+	std_vec_free_Checked(pairs, sizeof(TxnIdentityPair), _Alignof(TxnIdentityPair));
+}
+
+/* txn_identity_tests_point returns the fold point the running fold position lowers to. */
+static HostLsn
+txn_identity_tests_point(HostIoIo *io)
+{
+	HostLsn		position;
+	HostLsn		point = 0;
+	HostError	error;
+
+	txn_identity_tests_ok(host_fold_point(HOST_IO_IO_IO_DOORS(io), &position, &error) &&
+						  txn_status_lowered(io, position, &point, &error), &error, __LINE__);
+	return point;
+}
+
+/*
+ * test_txn_identity_tests_a_saves_fold_keeps_its_committed_pairs_and_leaves_running_ones:
+ * §III.6's fold of the identity tree at a save, a save folds the pairs whose
+ * writers committed at or below its point into the tree the manifest names,
+ * a running writer's pair staying in the delta; with the delta's versions
+ * gone, the folded pairs read from the tree alone, and the running writer's
+ * pair is gone with them.
+ */
+void
+test_txn_identity_tests_a_saves_fold_keeps_its_committed_pairs_and_leaves_running_ones(void)
+{
+	SimcProcess process = simc_process();
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	uint32		repository;
+	uint64		id;
+	uint64		running;
+	HostLsn		point;
+	StdVec		pairs;
+	HostError	error;
+
+	simc_end(false);
+	repository = txn_identity_tests_repository(io, 9477);
+	id = txn_identity_tests_table(io, repository, "t", 16384);
+	txn_identity_tests_committed(io);
+	point = txn_identity_tests_point(io);
+	running = txn_identity_tests_table(io, repository, "u", 16385);
+	pairs = txn_identity_tests_folded(io, repository, point);
+	STD_ASSERT_MSG(__LINE__, 9, pairs.len == 2, "pairs.len() == 2");
+	txn_identity_tests_pairs_drop(&pairs);
+	simc_end(false);
+	txn_identity_tests_ok(txn_written_aborted(io, 0, &error), &error, __LINE__);
+	txn_identity_tests_dropped(io, repository, __LINE__);
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_pairs_read(io, repository, 16384, id),
+				   "the folded pairs read from the tree alone");
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_pairs_gone(io, repository, 16385, running),
+				   "the running writer's pair is gone");
+	txn_identity_tests_dropped(io, repository, __LINE__);
+	txn_identity_tests_ok(txn_written_ended(io, &error), &error, __LINE__);
+	simc_TestIo_drop(&test_io);
+	simc_Process_drop(&process);
+}
+
+/* txn_identity_tests_kept returns how many identity versions the delta holds at a table's two pairs. */
+static size_t
+txn_identity_tests_kept(HostIoIo *io, uint32 repository, uint32 oid, uint64 id)
+{
+	StdVec		key;
+	size_t		kept;
+
+	txn_identity_by_oid(TXN_IDENTITY_KIND_RELATION, oid, &key);
+	kept = txn_identity_tests_versions(io, repository, &key);
+	std_vec_free_Checked(&key, 1, 1);
+	txn_identity_by_id(TXN_IDENTITY_KIND_RELATION, id, &key);
+	kept += txn_identity_tests_versions(io, repository, &key);
+	std_vec_free_Checked(&key, 1, 1);
+	return kept;
+}
+
+/* txn_identity_tests_counted returns an xid's entry's count, 0 for none. */
+static uint64
+txn_identity_tests_counted(HostIoIo *io, HostXid top)
+{
+	TxnStatusEntry entry;
+	bool		has;
+	HostError	error;
+
+	txn_identity_tests_ok(txn_status_lookup(io, top, &has, &entry, &error), &error, __LINE__);
+	return has ? entry.count : 0;
+}
+
+/*
+ * test_txn_identity_tests_a_saves_drop_takes_its_folded_pairs_out: bugs row
+ * 164, a save's drop takes the identity versions it folded out of the delta
+ * and gives their counts back at their writer's entry, the pairs then
+ * reading from the manifest's tree alone.
+ */
+void
+test_txn_identity_tests_a_saves_drop_takes_its_folded_pairs_out(void)
+{
+	SimcProcess process = simc_process();
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	uint32		repository;
+	uint64		id;
+	HostXid		sub;
+	HostXid		top;
+	HostLsn		point;
+	StdVec		pairs;
+	HostError	error;
+
+	simc_end(false);
+	repository = txn_identity_tests_repository(io, 9479);
+	id = txn_identity_tests_table(io, repository, "t", 16384);
+	txn_identity_tests_ok(host_current_writer(HOST_IO_IO_IO_DOORS(io), &sub, &top, &error), &error, __LINE__);
+	txn_identity_tests_committed(io);
+	point = txn_identity_tests_point(io);
+	pairs = txn_identity_tests_folded(io, repository, point);
+	txn_identity_tests_pairs_drop(&pairs);
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_kept(io, repository, 16384, id) == 2 &&
+				   txn_identity_tests_counted(io, top) == 2, "(kept(io), counted(io)) == (2, 2)");
+	txn_identity_tests_ok(txn_identity_dropped(io, repository, point, &error), &error, __LINE__);
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_kept(io, repository, 16384, id) == 0 &&
+				   txn_identity_tests_counted(io, top) == 0, "(kept(io), counted(io)) == (0, 0)");
+	STD_ASSERT_MSG(__LINE__, 9, txn_identity_tests_pairs_read(io, repository, 16384, id),
+				   "the pairs read from the manifest's tree alone");
+	txn_identity_tests_dropped(io, repository, __LINE__);
+	txn_identity_tests_ok(txn_written_ended(io, &error), &error, __LINE__);
+	simc_TestIo_drop(&test_io);
+	simc_Process_drop(&process);
+}
+
+#endif							/* DOLTGRES_TEST_TXN */

@@ -311,6 +311,45 @@ extern int64 doltgres_database_size(Oid dbOid, int64 size);
 extern int64 doltgres_tablespace_size(Oid tblspcOid, int64 size);
 
 /*
+ * doltgres_visibility_counted counts every block of a fork table all-visible
+ * and all-frozen, in visibilitymap_count, answering whether the fork stores
+ * the table.
+ */
+extern bool doltgres_visibility_counted(Relation rel, BlockNumber *all_visible, BlockNumber *all_frozen);
+
+/*
+ * doltgres_index_scan_io gives a fork table's part of an index scan's costs,
+ * in cost_index, in place of heap's page fetches: its I/O costs at either
+ * correlation and the leaves it reads at random.
+ */
+extern void doltgres_index_scan_io(Oid indexoid, bool indexonly, double tuples_fetched, double selectivity,
+								   double loop_count, double random_page_cost, double seq_page_cost,
+								   double cpu_operator_cost, double *max_io, double *min_io, double *rand_heap_pages);
+
+/*
+ * doltgres_bitmap_page_cost gives a fork table's cost per page fetched of a
+ * bitmap heap scan, in cost_bitmap_heap_scan, in place of heap's.
+ */
+extern void doltgres_bitmap_page_cost(Oid relid, double tuples_fetched, double pages_fetched, BlockNumber pages,
+									  double maxentries, double random_page_cost, double cpu_operator_cost,
+									  double *cost_per_page);
+
+/*
+ * doltgres_heap_only_refused answers whether the fork stores a relation, in
+ * each heap-only contrib module's access method check, which then refuses it
+ * with its own error.
+ */
+extern bool doltgres_heap_only_refused(Relation rel);
+
+/*
+ * doltgres_tablespace_emptied empties the fork's packs out of a tablespace
+ * whose Postgres directories hold no files and removes its directory of
+ * them, in DropTableSpace, waiting, and in tblspc_redo, once before each
+ * removal of the tablespace's directories.
+ */
+extern void doltgres_tablespace_emptied(Oid tablespaceoid, bool redo);
+
+/*
  * doltgres_fold_launch is the fold launcher's background worker: it starts a
  * fold worker for each database with a storage due a fold.
  */

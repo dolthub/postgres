@@ -1116,7 +1116,7 @@ txn_memtable_branch_prepare(HostIoIo *io, HostSharedRecord deltas, const uint8 *
 	TxnMemtableTableReservation unstored;
 
 	return txn_memtable_table_prepared(io, &aim, 1, false, none, inside, inside_captures, inside_drop, &has_unstored,
-									   &unstored, error);
+									   &unstored, NULL, error);
 }
 
 /*
@@ -1135,12 +1135,14 @@ txn_memtable_branch_finish(HostIoIo *io, TxnMemtableTablePreparedBranchDeltas *p
 	TxnMemtableVersionChange change = {.writer = writer, .op = &op, .lock = TXN_MEMTABLE_LOCK_MODE_KEY_SHARE,
 	.shown = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND}, .has_lsn = has_lsn, .lsn = lsn};
 	bool		pushed;
+	TxnStatusRoomed unroomed = {0};
 
 	op.u.put.value = *chunk;
 	std_vec_new(chunk, 1, 1);
 	std_vec_new(&op.u.put.addresses, sizeof(chunks_TupleU32Locator_t), _Alignof(chunks_TupleU32Locator_t));
 	std_vec_new(&op.u.put.values, sizeof(uint32), _Alignof(uint32));
-	pushed = txn_memtable_table_pushed(HOST_IO_IO_TAKES_SHORT(io), prepared, 0, &change, result, error);
+	pushed = txn_memtable_table_pushed(HOST_IO_IO_TAKES_SHORT(io), prepared, 0, &change, false,
+									   unroomed, result, error);
 	*chunk = op.u.put.value;
 	return pushed;
 }
@@ -2548,7 +2550,7 @@ test_txn_memtable_branch_tests_an_abort_leaves_the_chunk_a_committed_transaction
 								 host_Error_Debug_fmt);
 	txn_memtable_branch_tests_chunks(812, 68, io, deltas, 4, txn_memtable_branch_tests_wrote(aborted), false, 0);
 	simc_abort(aborted);
-	if (!txn_written_aborted(io, &error))
+	if (!txn_written_aborted(io, 0, &error))
 		STD_RESULT_EXPECT_FAILED(814, 37, "called `Result::unwrap()` on an `Err` value", &error,
 								 host_Error_Debug_fmt);
 	txn_memtable_branch_tests_got_is(815, 9, 815, 58, io, deltas, 4, "chunk");

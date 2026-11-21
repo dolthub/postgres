@@ -431,5 +431,265 @@ for my $crashed (['doltgres-store-move-finishing', 'farther', 'before'], ['doltg
 }
 $rekeyed->stop;
 
+# Bugs row 99: DROP TABLESPACE of a location a fork table left, moved out by
+# SET TABLESPACE or dropped, empties the fork's packs out of it into the
+# database's own directory and removes the tablespace's directory of them, so
+# the tablespace drops as in Postgres, after the checkpoint that removes a
+# dropped table's files, and the moved table reads every row.
+$node->safe_psql('postgres', 'CREATE EXTENSION IF NOT EXISTS doltgres_test');
+for my $left ('moved', 'dropped')
+{
+	$node->safe_psql('postgres', "CREATE TABLESPACE left_$left LOCATION ''");
+	my $space = $node->safe_psql('postgres',
+		"SELECT oid FROM pg_tablespace WHERE spcname = 'left_$left'");
+	$node->safe_psql('postgres',
+		"CREATE TABLE in_$left (k int4 PRIMARY KEY, v text) TABLESPACE left_$left; INSERT INTO in_$left SELECT g, repeat('v', 40) || g FROM generate_series(1, 500) g"
+	);
+	$node->safe_psql('postgres',
+		"SELECT doltgres_test_fold('in_$left'); CHECKPOINT");
+	my @packs = glob("$pgdata/pg_tblspc/$space/PG_*/pg_versioned/*/*.pack");
+	ok(@packs > 0,
+		"a fold of a table in tablespace left_$left writes its packs there");
+	$node->safe_psql('postgres',
+		$left eq 'moved'
+		? "ALTER TABLE in_$left SET TABLESPACE pg_default"
+		: "DROP TABLE in_$left");
+	my ($ret, $out, $err) =
+	  $node->psql('postgres', "DROP TABLESPACE left_$left");
+	is("$ret|$err", '0|',
+		$left eq 'moved'
+		? 'DROP TABLESPACE of a location a fork table moved out of empties the fork\'s packs out of it'
+		: 'DROP TABLESPACE of a location a fork table left empties the fork\'s packs out of it'
+	);
+	ok(!-e "$pgdata/pg_tblspc/$space",
+		"the dropped tablespace left_$left leaves no directory");
+}
+is( $node->safe_psql(
+		'postgres', 'SELECT count(*) || \' \' || sum(k) FROM in_moved'),
+	'500 125250',
+	"the moved table reads every row after its old tablespace drops");
+
+# Bugs row 99: a base backup keeps every collection from running, so DROP
+# TABLESPACE of a location that holds the fork's packs waits for the backup's
+# end, where Postgres drops it at once: a cancel ends the wait with Postgres'
+# error and keeps the tablespace, and a DROP waiting at pg_backup_stop then
+# drops it.
+$node->safe_psql('postgres',
+	"CREATE TABLESPACE backed LOCATION ''; CREATE TABLE in_backed (k int4) TABLESPACE backed; INSERT INTO in_backed SELECT generate_series(1, 100)"
+);
+$node->safe_psql('postgres',
+	"SELECT doltgres_test_fold('in_backed'); ALTER TABLE in_backed SET TABLESPACE pg_default; CHECKPOINT"
+);
+my $backed = $node->safe_psql('postgres',
+	"SELECT oid FROM pg_tablespace WHERE spcname = 'backed'");
+my $backup = $node->background_psql('postgres');
+$backup->query_safe("SELECT pg_backup_start('row99', true)");
+my $waiting =
+  q{SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE query = 'DROP TABLESPACE backed;' AND wait_event_type = 'Extension')};
+my $dropper = $node->background_psql('postgres', on_error_stop => 0);
+$dropper->query_safe('\\set VERBOSITY verbose');
+$dropper->query_until(qr/start/, "\\echo start\nDROP TABLESPACE backed;\n");
+$node->poll_query_until('postgres', $waiting);
+$node->safe_psql('postgres',
+	"SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE query = 'DROP TABLESPACE backed;'"
+);
+$dropper->query('SELECT 1');
+like(
+	$dropper->{stderr},
+	qr/ERROR:  57014: canceling statement due to user request/,
+	"a cancel ends DROP TABLESPACE's wait for a base backup with Postgres' error"
+);
+is( $node->safe_psql(
+		'postgres',
+		"SELECT count(*) FROM pg_tablespace WHERE spcname = 'backed'"),
+	'1',
+	"a canceled DROP TABLESPACE keeps the tablespace");
+$dropper->{stderr} = '';
+$dropper->query_until(qr/again/, "\\echo again\nDROP TABLESPACE backed;\n");
+$node->poll_query_until('postgres', $waiting);
+$backup->query('SELECT 1 FROM pg_backup_stop()');
+$dropper->query('SELECT 1');
+is( $dropper->{stderr}
+	  . (
+		$node->safe_psql(
+			'postgres',
+			"SELECT count(*) FROM pg_tablespace WHERE spcname = 'backed'")),
+	'0',
+	"DROP TABLESPACE during a base backup drops the tablespace once pg_backup_stop ends the backup"
+);
+ok(!-e "$pgdata/pg_tblspc/$backed",
+	"the tablespace dropped after the backup leaves no directory");
+$_->quit for $backup, $dropper;
+
+# Bugs row 99 on a hot standby: its replay of DROP TABLESPACE empties its own
+# packs out of the tablespace, so the replay removes the tablespace's
+# directories and the moved table reads every row; and when a reader holds
+# the packs through the replay, Postgres' replay logs what it couldn't
+# remove, and the collector's sweep removes the fork's directory of packs
+# once the reader ends, with no restart.
+$node->backup('spaced');
+my $spaced = PostgreSQL::Test::Cluster->new('spaced_standby');
+$spaced->init_from_backup($node, 'spaced', has_streaming => 1);
+$spaced->append_conf('postgresql.conf', 'max_standby_streaming_delay = 1s');
+$spaced->start;
+my $spaced_dir = $spaced->data_dir;
+# standby_space makes a tablespace with a table whose fold the standby
+# replays into packs of its own there, and returns the tablespace's id.
+sub standby_space
+{
+	my ($held) = @_;
+	$node->safe_psql('postgres',
+		"CREATE TABLESPACE standby_$held LOCATION ''; CREATE TABLE on_$held (k int4 PRIMARY KEY, v text) TABLESPACE standby_$held; INSERT INTO on_$held SELECT g, repeat('w', 40) || g FROM generate_series(1, 300) g"
+	);
+	$node->safe_psql('postgres',
+		"SELECT doltgres_test_fold('on_$held'); CHECKPOINT");
+	$node->wait_for_replay_catchup($spaced);
+	my $space = $node->safe_psql('postgres',
+		"SELECT oid FROM pg_tablespace WHERE spcname = 'standby_$held'");
+	my $made = time + $PostgreSQL::Test::Utils::timeout_default;
+	sleep 1
+	  while !(() =
+		glob("$spaced_dir/pg_tblspc/$space/PG_*/pg_versioned/*/*.pack"))
+	  && time < $made;
+	return $space;
+}
+
+# standby_moved moves a tablespace's table out to pg_default and drops the
+# tablespace, each replayed on the standby.
+sub standby_moved
+{
+	my ($held) = @_;
+	$node->safe_psql('postgres',
+		"ALTER TABLE on_$held SET TABLESPACE pg_default; CHECKPOINT");
+	$node->wait_for_replay_catchup($spaced);
+	$node->safe_psql('postgres', "DROP TABLESPACE standby_$held");
+	$node->wait_for_replay_catchup($spaced);
+}
+my $free = standby_space('free');
+standby_moved('free');
+ok( !-e "$spaced_dir/pg_tblspc/$free",
+	"a hot standby's replay of DROP TABLESPACE removes the tablespace's directories with the fork's packs"
+);
+is( $spaced->safe_psql(
+		'postgres', 'SELECT count(*) || \' \' || sum(k) FROM on_free'),
+	'300 45150',
+	"the standby reads every row of the table moved out of the dropped tablespace"
+);
+my $read = standby_space('read');
+$spaced->safe_psql('postgres',
+	"SELECT injection_points_attach('doltgres-shared-reading', 'wait')");
+my $holder = $spaced->background_psql('postgres', on_error_stop => 0);
+$holder->query_until(qr/reading/,
+	"\\echo reading\nSELECT doltgres_test_shared(11, 0, 0);\n");
+$spaced->wait_for_event('client backend', 'doltgres-shared-reading');
+standby_moved('read');
+$spaced->psql('postgres',
+	"SELECT injection_points_wakeup('doltgres-shared-reading')");
+$holder->query('SELECT 1');
+like(
+	$holder->{stderr},
+	qr/ERROR:  canceling statement due to conflict with recovery/,
+	"a standby reader that holds the packs through the replay of DROP TABLESPACE is canceled as Postgres' replay cancels a tablespace's users"
+);
+ok( !-e "$spaced_dir/pg_tblspc/$read",
+	"and the replay's retry after the cancel empties the fork's packs out of the tablespace and removes its directories, with no restart"
+);
+$spaced->safe_psql('postgres',
+	"SELECT injection_points_detach('doltgres-shared-reading')");
+$holder->quit;
+is( $spaced->safe_psql(
+		'postgres', 'SELECT count(*) || \' \' || sum(k) FROM on_read'),
+	'300 45150',
+	"the standby reads every row of the table moved out of that tablespace");
+$spaced->stop;
+
+# Bugs row 99 on a standby without hot standby: no collector worker runs to
+# empty its packs at the replay of DROP TABLESPACE, so Postgres' replay logs
+# what it couldn't remove after leaving the dropped mark, and once the
+# standby starts again with hot standby, after a crash, the collector's
+# sweep empties the fork's packs out of the marked tablespace.
+$node->backup('cold');
+my $cold = PostgreSQL::Test::Cluster->new('cold_standby');
+$cold->init_from_backup($node, 'cold', has_streaming => 1);
+$cold->append_conf('postgresql.conf', 'hot_standby = off');
+$cold->start;
+my $cold_dir = $cold->data_dir;
+# cold_replayed waits until the standby without hot standby has replayed the
+# primary's WAL to its current end, read from the primary's view of it.
+sub cold_replayed
+{
+	my $lsn = $node->lsn('insert');
+	$node->poll_query_until('postgres',
+		"SELECT replay_lsn >= '$lsn' FROM pg_stat_replication WHERE application_name = 'cold_standby'"
+	) or die "the standby without hot standby didn't replay to $lsn";
+}
+$node->safe_psql('postgres',
+	"CREATE TABLESPACE cold_kept LOCATION ''; CREATE TABLE on_cold (k int4 PRIMARY KEY, v text); INSERT INTO on_cold SELECT g, repeat('c', 40) || g FROM generate_series(1, 300) g"
+);
+$node->safe_psql('postgres',
+	"SELECT doltgres_test_fold('on_cold'); ALTER TABLE on_cold SET TABLESPACE cold_kept; CHECKPOINT"
+);
+my $cold_space = $node->safe_psql('postgres',
+	"SELECT oid FROM pg_tablespace WHERE spcname = 'cold_kept'");
+cold_replayed();
+my @cold_packs =
+  glob("$cold_dir/pg_tblspc/$cold_space/PG_*/pg_versioned/*/*.pack");
+ok( @cold_packs > 0,
+	"a standby without hot standby replays a move into a tablespace as packs of its own there"
+);
+$node->safe_psql('postgres',
+	'ALTER TABLE on_cold SET TABLESPACE pg_default; CHECKPOINT');
+$node->safe_psql('postgres', 'DROP TABLESPACE cold_kept');
+cold_replayed();
+my @cold_left = glob("$cold_dir/pg_tblspc/$cold_space/PG_*/pg_versioned");
+ok( @cold_left == 1,
+	"a standby without hot standby keeps the fork's packs through its replay of DROP TABLESPACE"
+);
+ok(-e "$cold_left[0]/dropped",
+	"and its replay leaves the dropped mark on them");
+$cold->stop('immediate');
+$cold->append_conf('postgresql.conf', 'hot_standby = on');
+$cold->start;
+my $cold_swept = time + $PostgreSQL::Test::Utils::timeout_default;
+sleep 1 while -e $cold_left[0] && time < $cold_swept;
+ok( !-e $cold_left[0],
+	"the collector's sweep empties the fork's packs out of a tablespace whose catalog row is gone"
+);
+is( $cold->safe_psql(
+		'postgres', 'SELECT count(*) || \' \' || sum(k) FROM on_cold'),
+	'300 45150',
+	"the swept standby reads every row of the table moved out of the tablespace"
+);
+$cold->stop;
+
+# Bugs row 99: a table another session creates in the tablespace while DROP
+# TABLESPACE waits for a base backup stops the DROP's emptying at its next
+# round, before any of the new table's packs could be moved, so Postgres
+# refuses the DROP as not empty, as it would with no wait.
+$node->safe_psql('postgres',
+	"CREATE TABLESPACE raced LOCATION ''; CREATE TABLE in_raced (k int4) TABLESPACE raced; INSERT INTO in_raced SELECT generate_series(1, 100)"
+);
+$node->safe_psql('postgres',
+	"SELECT doltgres_test_fold('in_raced'); ALTER TABLE in_raced SET TABLESPACE pg_default; CHECKPOINT"
+);
+my $raced_backup = $node->background_psql('postgres');
+$raced_backup->query_safe("SELECT pg_backup_start('raced', true)");
+my $racing = $node->background_psql('postgres', on_error_stop => 0);
+$racing->query_safe('\\set VERBOSITY verbose');
+$racing->query_until(qr/raced/, "\\echo raced\nDROP TABLESPACE raced;\n");
+$node->poll_query_until('postgres',
+	q{SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE query = 'DROP TABLESPACE raced;' AND wait_event_type = 'Extension')}
+);
+$node->safe_psql('postgres',
+	'CREATE TABLE in_raced_late (k int4) TABLESPACE raced');
+$racing->query('SELECT 1');
+like(
+	$racing->{stderr},
+	qr/ERROR:  55000: tablespace "raced" is not empty/,
+	"a table created in the tablespace while DROP TABLESPACE waits stops its emptying, and Postgres refuses the DROP"
+);
+$raced_backup->query('SELECT 1 FROM pg_backup_stop()');
+$_->quit for $racing, $raced_backup;
+
 $node->stop;
 done_testing();

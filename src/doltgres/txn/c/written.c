@@ -366,7 +366,7 @@ typedef struct txn_written_touched_t
 	uint64		bytes;
 } txn_written_touched_t;
 
-/* txn_written_touched_call adds the bytes to the tree's count and records the key unless it was just recorded or the list is full. */
+/* txn_written_touched_call adds the bytes to the tree's count and records the key unless it is a free space map's, was just recorded, or the list is full. */
 static bool
 txn_written_touched_call(void *captures, HostIoIo *io, TxnWrittenWritten *written, uint64 *result, HostError *error)
 {
@@ -404,6 +404,8 @@ txn_written_touched_call(void *captures, HostIoIo *io, TxnWrittenWritten *writte
 		}
 	}
 	*result = count;
+	if (c->of == TXN_WRITTEN_OF_FREE)
+		return true;
 	if (written->touched.len > 0)
 	{
 		const TxnWrittenTouched *last = &STD_VEC_AT(&written->touched, TxnWrittenTouched, written->touched.len - 1);
@@ -435,7 +437,9 @@ txn_written_touched_call(void *captures, HostIoIo *io, TxnWrittenWritten *writte
  * and adds the bytes to the tree's count with the key's, answering it; a key
  * just recorded isn't recorded twice, and a list at its cap is marked
  * overflowed instead. A key of a database's identity tree adds no bytes,
- * since that tree lives in the working state's delta and never spills.
+ * since that tree lives in the working state's delta and never spills, and a
+ * free space map's key adds its bytes and isn't recorded, since its take
+ * isn't taken back.
  */
 bool
 txn_written_touched(HostIoIo *io, uint64 top, const HostStorage *storage, TxnWrittenOf of, const uint8 *key,
@@ -718,46 +722,72 @@ txn_written_ended(HostIoIo *io, HostError *error)
 	return host_owned_TableTxnWrittenWritten_end(&TXN_WRITTEN_WRITTEN, io, handle, error);
 }
 
-/* txn_written_pruned_one prunes one touched key in its tree, under the frame's held state or delta when its home is there. */
+/*
+ * txn_written_homed finds a touched key's home into held: its storage's state
+ * for a storage's tree, its database's working state's delta for its identity
+ * tree, or its repository's for its chunk tree; some is false for a home that
+ * is gone, or for a chunk tree of no repository, holding nothing to prune.
+ */
 static bool
-txn_written_pruned_one(HostIoIo *io, const TxnWrittenTouched *touched, bool has_aborting, uint64 aborting,
-					   HostSharedHeld *held, bool *held_live, HostError *error)
+txn_written_homed(HostIoIo *io, const TxnWrittenTouched *touched, HostSharedHeld *held, bool *some,
+				  HostError *error)
 {
-	const TxnMemtableTableTreeOps *tree;
 	uint32		repository;
-	bool		some;
 
 	if (touched->of == TXN_WRITTEN_OF_ROWS || touched->of == TXN_WRITTEN_OF_VALUES)
+		return txn_state_found(io, &touched->storage, some, held, error);
+	*some = false;
+	if (touched->of == TXN_WRITTEN_OF_IDENTITY)
 	{
-		tree = touched->of == TXN_WRITTEN_OF_ROWS ? &TXN_MEMTABLE_TABLE_ROWS_TREE_OPS :
-			&TXN_MEMTABLE_MAP_VALUES_TREE_OPS;
-		if (!txn_state_found(io, &touched->storage, &some, held, error))
-			return false;
-	}
-	else
-	{
-		tree = touched->of == TXN_WRITTEN_OF_IDENTITY ? &TXN_MEMTABLE_BRANCH_IDENTITY_TREE_OPS :
-			&TXN_MEMTABLE_BRANCH_CHUNKS_TREE_OPS;
-		if (touched->of == TXN_WRITTEN_OF_IDENTITY)
-		{
-			repository = touched->storage.database;
-			if (repository == 0)
-				return true;
-		}
-		else if (!txn_spill_chunks_repository(&touched->storage, &repository))
+		repository = touched->storage.database;
+		if (repository == 0)
 			return true;
-		if (!txn_memtable_branch_find(HOST_SHARED_IO_WITHIN(io), repository, &some, held, error))
-			return false;
 	}
-	if (!some)
+	else if (!txn_spill_chunks_repository(&touched->storage, &repository))
 		return true;
-	*held_live = true;
-	if (!txn_memtable_table_pruned(tree, io, host_shared_Held_record(held), touched->key.ptr, touched->key.len,
-								   has_aborting, aborting, error))
-		return false;
-	*held_live = false;
-	host_shared_Held_drop(held);
-	return true;
+	return txn_memtable_branch_find(HOST_SHARED_IO_WITHIN(io), repository, some, held, error);
+}
+
+/* txn_written_pruned_one prunes one touched key in its tree, under its home's held state or delta. */
+static bool
+txn_written_pruned_one(HostIoIo *io, const TxnWrittenTouched *touched, bool has_aborting, uint64 aborting,
+					   const HostSharedHeld *held, HostError *error)
+{
+	const TxnMemtableTableTreeOps *tree;
+
+	if (touched->of == TXN_WRITTEN_OF_ROWS)
+		tree = &TXN_MEMTABLE_TABLE_ROWS_TREE_OPS;
+	else if (touched->of == TXN_WRITTEN_OF_VALUES)
+		tree = &TXN_MEMTABLE_MAP_VALUES_TREE_OPS;
+	else if (touched->of == TXN_WRITTEN_OF_IDENTITY)
+		tree = &TXN_MEMTABLE_BRANCH_IDENTITY_TREE_OPS;
+	else
+		tree = &TXN_MEMTABLE_BRANCH_CHUNKS_TREE_OPS;
+	return txn_memtable_table_pruned(tree, io, host_shared_Held_record(held), touched->key.ptr, touched->key.len,
+									 has_aborting, aborting, error);
+}
+
+/* txn_written_Homed_t is a touched key's place in the prune's order: its tree, its storage, and its place in the list. */
+typedef struct txn_written_Homed_t
+{
+	TxnWrittenOf of;
+	HostStorage storage;
+	size_t		at;
+} txn_written_Homed_t;
+
+/* txn_written_homed_order orders touched keys by their home, and within one by their place in the list. */
+static int
+txn_written_homed_order(const void *a_, const void *b_)
+{
+	const txn_written_Homed_t *a = a_;
+	const txn_written_Homed_t *b = b_;
+	uint64		left[5] = {(uint64) a->of, a->storage.tablespace, a->storage.database, a->storage.relation, a->at};
+	uint64		right[5] = {(uint64) b->of, b->storage.tablespace, b->storage.database, b->storage.relation, b->at};
+
+	for (int i = 0; i < 5; i++)
+		if (left[i] != right[i])
+			return left[i] < right[i] ? -1 : 1;
+	return 0;
 }
 
 /* txn_written_taken_frame_0_t is the state of aborted and sub_aborted across their pad: the keys and storages taken from the list, and a held home. */
@@ -765,15 +795,19 @@ typedef struct txn_written_taken_frame_0_t
 {
 	HostIoIo   *io;
 	uint32		sub;
+	/* end is an aborted transaction's abort record's end. */
+	uint64		end;
 	HostError  *error;
 	bool		ok;
 	txn_written_Taken_t taken;
 	bool		taken_live;
 	HostSharedHeld held;
 	bool		held_live;
+	StdVec		order;
+	bool		order_live;
 } txn_written_taken_frame_0_t;
 
-/* txn_written_taken_pad_0 is the pad of aborted and sub_aborted: the held home, then what they took from the list, while live. */
+/* txn_written_taken_pad_0 is the pad of aborted and sub_aborted: the held home, the prune's order, then what they took from the list, while live. */
 static void
 txn_written_taken_pad_0(void *frame_)
 {
@@ -783,6 +817,11 @@ txn_written_taken_pad_0(void *frame_)
 	{
 		frame->held_live = false;
 		host_shared_Held_drop(&frame->held);
+	}
+	if (frame->order_live)
+	{
+		frame->order_live = false;
+		std_vec_free_Checked(&frame->order, sizeof(txn_written_Homed_t), _Alignof(txn_written_Homed_t));
 	}
 	if (frame->taken_live)
 	{
@@ -796,15 +835,48 @@ txn_written_taken_pad_0(void *frame_)
  * tree, in its database's identity tree, or in its repository's chunk tree,
  * a storage whose state is gone, or a database whose working state's delta
  * is, holding nothing to prune, an aborting top-level transaction's own
- * versions taken out by its xid.
+ * versions taken out by its xid. It prunes the keys grouped by their home,
+ * each home's in the list's order, and finds each home once, so its finds go
+ * with the homes the list names, not its keys (bugs row 309).
  */
 static bool
 txn_written_pruned(txn_written_taken_frame_0_t *frame, bool has_aborting, uint64 aborting)
 {
+	const TxnWrittenTouched *home = NULL;
+	bool		some = false;
+
+	std_vec_with_capacity_Checked(&frame->order, frame->taken.touched.len, sizeof(txn_written_Homed_t),
+								  _Alignof(txn_written_Homed_t));
+	frame->order_live = true;
 	for (size_t k = 0; k < frame->taken.touched.len; k++)
-		if (!txn_written_pruned_one(frame->io, &STD_VEC_AT(&frame->taken.touched, TxnWrittenTouched, k), has_aborting,
-									aborting, &frame->held, &frame->held_live, frame->error))
+	{
+		const TxnWrittenTouched *touched = &STD_VEC_AT(&frame->taken.touched, TxnWrittenTouched, k);
+		txn_written_Homed_t homed = {touched->of, touched->storage, k};
+
+		std_vec_push_Checked(&frame->order, &homed, sizeof(homed), _Alignof(txn_written_Homed_t));
+	}
+	if (frame->order.len > 1)
+		qsort(frame->order.ptr, frame->order.len, sizeof(txn_written_Homed_t), txn_written_homed_order);
+	for (size_t k = 0; k < frame->order.len; k++)
+	{
+		const TxnWrittenTouched *touched = &STD_VEC_AT(&frame->taken.touched, TxnWrittenTouched,
+													   STD_VEC_AT(&frame->order, txn_written_Homed_t, k).at);
+
+		if (home == NULL || home->of != touched->of || !host_Storage_PartialEq_eq(&home->storage, &touched->storage))
+		{
+			if (frame->held_live)
+			{
+				frame->held_live = false;
+				host_shared_Held_drop(&frame->held);
+			}
+			if (!txn_written_homed(frame->io, touched, &frame->held, &some, frame->error))
+				return false;
+			frame->held_live = some;
+			home = touched;
+		}
+		if (some && !txn_written_pruned_one(frame->io, touched, has_aborting, aborting, &frame->held, frame->error))
 			return false;
+	}
 	return true;
 }
 
@@ -841,7 +913,7 @@ txn_written_aborted_body_0(void *frame_)
 		return;
 	frame->taken_live = true;
 	frame->ok = txn_spill_aborted(frame->io, frame->taken.top, frame->taken.spills.ptr, frame->taken.spills.len,
-								  frame->error) &&
+								  frame->end, frame->error) &&
 		txn_written_pruned(frame, true, frame->taken.top) && txn_spill_unwrote(frame->io, false, 0, frame->error) &&
 		host_owned_TableTxnWrittenWritten_end(&TXN_WRITTEN_WRITTEN, frame->io, handle, frame->error);
 	txn_written_taken_pad_0(frame);
@@ -851,12 +923,13 @@ txn_written_aborted_body_0(void *frame_)
  * txn_written_aborted takes back the versions of the backend's aborted
  * top-level transaction: it takes its spills' entries out of the storages
  * it spilled and clears its pending spill, whose files the next checkpoint
- * unlinks, prunes every key its list holds, then ends the list.
+ * unlinks, but its free space map's, which it marks with its abort record's
+ * end; prunes every key its list holds; then ends the list.
  */
 bool
-txn_written_aborted(HostIoIo *io, HostError *error)
+txn_written_aborted(HostIoIo *io, uint64 end, HostError *error)
 {
-	txn_written_taken_frame_0_t frame = {.io = io, .error = error};
+	txn_written_taken_frame_0_t frame = {.io = io, .end = end, .error = error};
 
 	std_landing(&frame, txn_written_aborted_body_0, txn_written_taken_pad_0);
 	return frame.ok;

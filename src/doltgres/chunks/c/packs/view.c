@@ -496,7 +496,7 @@ chunks_packs_view_runs_entry(StdVec *runs, uint32 space)
 }
 
 /* chunks_packs_view_runs_remove drops a tablespace's runs file as the view read it, if it has one. */
-static void
+void
 chunks_packs_view_runs_remove(StdVec *runs, uint32 space)
 {
 	size_t		at;

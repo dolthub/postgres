@@ -47,9 +47,6 @@
 /* TXN_MEMTABLE_INDEX_LEVELS is LEVELS, the first bit of a node's height in its place word, above its key's length. */
 #define TXN_MEMTABLE_INDEX_LEVELS 56
 
-/* TXN_MEMTABLE_INDEX_WORDS is WORDS, the count of a node's words before its links: its head and its place word. */
-#define TXN_MEMTABLE_INDEX_WORDS UINT64CONST(2)
-
 /* A range's pages are at most the delta's slots, so a page's index fits a node's name above its word. */
 StaticAssertDecl(HOST_DELTA_PAGE_SLOTS <= UINT64CONST(1) << 32, "a page's index fits a node's name");
 
@@ -154,7 +151,7 @@ HostDeltaPageSize
 txn_memtable_index_least(const uint8 *key, size_t key_len)
 {
 	HostDeltaPageSize size = {(uint32) key_len,
-	(uint32) (1 + TXN_MEMTABLE_INDEX_WORDS + TXN_MEMTABLE_INDEX_HEIGHT)};
+	(uint32) TXN_MEMTABLE_INDEX_LEAST_WORDS};
 
 	return size;
 }
@@ -2142,7 +2139,8 @@ test_txn_memtable_index_tests_a_new_keys_version_and_node_go_together_on_a_fresh
 		STD_OPTION_UNWRAP_FAILED(693, 45);
 	std_vec_new(&spare, sizeof(HostDeltaOwned), _Alignof(HostDeltaOwned));
 	std_vec_new(&buffer, 1, 1);
-	if (!txn_memtable_version_push(&open, &hold, c, sizeof(c), &change, &has_fresh, &fresh, &spare, &buffer, &wanted,
+	if (!txn_memtable_version_push(&open, &hold, c, sizeof(c), &change, false, &has_fresh, &fresh, &spare, &buffer,
+								   &wanted,
 								   &error))
 		STD_RESULT_EXPECT_FAILED(710, 21, "called `Result::unwrap()` on an `Err` value", &error,
 								 host_Error_Debug_fmt);

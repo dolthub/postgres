@@ -1040,13 +1040,14 @@ typedef struct txn_status_counted_frame_t
 	HostIoTakesShort io;
 	const HostDeltaHold *hold;
 	TxnStatusRoomed roomed;
+	uint64		amount;
 	HostError  *error;
 	bool		ok;
 	HostSharedGuard guard;
 	bool		guard_live;
 } txn_status_counted_frame_t;
 
-/* txn_status_counted_body adds one to the entry's count under the table's lock shared. */
+/* txn_status_counted_body adds the amount to the entry's count under the table's lock shared. */
 static void
 txn_status_counted_body(void *frame_)
 {
@@ -1063,7 +1064,7 @@ txn_status_counted_body(void *frame_)
 	if (!txn_status_slotted(frame->hold, root, frame->roomed.f0, &page, &at, frame->error) ||
 		!txn_status_word(&page, at + 2, &word, frame->error))
 		return;
-	host_delta_Word_fetch_add(&word, 1);
+	host_delta_Word_fetch_add(&word, frame->amount);
 	frame->ok = true;
 }
 
@@ -1079,15 +1080,16 @@ txn_status_counted_pad(void *frame_)
 }
 
 /*
- * txn_status_counted adds one to the count of the entry a take's slot names,
- * an atomic add under the table's lock shared with no lookup and no check of
- * the slot, for a version's push inside its window under the hold the push
- * holds.
+ * txn_status_counted adds an amount to the count of the entry a take's slot
+ * names, a subtract being the add of its two's complement, an atomic add
+ * under the table's lock shared with no lookup and no check of the slot, for
+ * a version's push inside its window under the hold the push holds.
  */
 bool
-txn_status_counted(HostIoTakesShort io, const HostDeltaHold *hold, TxnStatusRoomed roomed, HostError *error)
+txn_status_counted(HostIoTakesShort io, const HostDeltaHold *hold, TxnStatusRoomed roomed, uint64 amount,
+				   HostError *error)
 {
-	txn_status_counted_frame_t frame = {.io = io, .hold = hold, .roomed = roomed, .error = error};
+	txn_status_counted_frame_t frame = {.io = io, .hold = hold, .roomed = roomed, .amount = amount, .error = error};
 
 	std_landing(&frame, txn_status_counted_body, txn_status_counted_pad);
 	txn_status_counted_pad(&frame);
@@ -1345,6 +1347,23 @@ txn_status_prepared_committing(HostIoIo *io, HostXid xid, HostError *error)
 		txn_status_local_store(&txn_status_ROOMED.local, xid.f0);
 	}
 	return true;
+}
+
+/*
+ * txn_status_kept_roomed returns the slot of the entry a version's writer's
+ * top-level xid has, taking no room for one with none, so a version carried
+ * or read back counts where its writer's other versions do.
+ */
+bool
+txn_status_kept_roomed(HostIoIo *io, const TxnMemtableVersionWriter *writer, bool *has_result,
+					   TxnStatusRoomed *result, HostError *error)
+{
+	HostXid		top = {writer->has_top ? writer->top : writer->xid};
+	TxnStatusEntry entry;
+
+	if (!txn_status_lookup(io, top, has_result, &entry, error))
+		return false;
+	return !*has_result || txn_status_redo_roomed(io, writer, has_result, result, error);
 }
 
 /*
@@ -2006,6 +2025,674 @@ test_txn_status_tests_a_key_whose_slot_isnt_stored_yet_leaves_its_slot_as_it_was
 			   "a key whose slot isn't stored yet answers none and leaves its slot as it was");
 	txn_status_release(&scope);
 	simc_abort(xid);
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * The fork's own: each outcome's word says that outcome again, a zero word is
+ * pending in no process, and the kinds' words don't meet.
+ */
+void
+test_txn_status_tests_an_outcomes_word_says_the_outcome(void)
+{
+	TxnStatusOutcome outcomes[6] = {{.tag = TXN_STATUS_OUTCOME_UNOWNED},
+	{.tag = TXN_STATUS_OUTCOME_COMMITTED, .u.committed = 1},
+	{.tag = TXN_STATUS_OUTCOME_COMMITTED, .u.committed = UINT64CONST(0x16B3F2A40)},
+	{.tag = TXN_STATUS_OUTCOME_COMMITTED, .u.committed = TXN_STATUS_LSNS - 1},
+	{.tag = TXN_STATUS_OUTCOME_PENDING_IN, .u.pending_in = 0},
+	{.tag = TXN_STATUS_OUTCOME_PENDING_IN, .u.pending_in = PG_UINT32_MAX}};
+	TxnStatusOutcome unowned = {.tag = TXN_STATUS_OUTCOME_UNOWNED};
+	TxnStatusOutcome zero = txn_status_Outcome_of(0);
+	uint64		words[6];
+
+	for (size_t k = 0; k < lengthof(outcomes); k++)
+	{
+		TxnStatusOutcome again;
+
+		STD_ASSERT(__LINE__, 0, txn_status_Outcome_word(outcomes[k], &words[k]), "the outcome has a word");
+		again = txn_status_Outcome_of(words[k]);
+		STD_ASSERT_EQ(__LINE__, 0, txn_status_Outcome_PartialEq_eq(&again, &outcomes[k]), &again,
+					  txn_status_Outcome_Debug_fmt, &outcomes[k], txn_status_Outcome_Debug_fmt);
+		for (size_t j = 0; j < k; j++)
+			STD_ASSERT(__LINE__, 0, words[j] != words[k], "!words.contains(&word)");
+	}
+	STD_ASSERT_EQ(__LINE__, 0, txn_status_Outcome_PartialEq_eq(&zero, &unowned), &zero, txn_status_Outcome_Debug_fmt,
+				  &unowned, txn_status_Outcome_Debug_fmt);
+}
+
+/* The fork's own: a commit record's end of zero or past the word's room has no word. */
+void
+test_txn_status_tests_an_outcome_too_large_for_its_word_has_none(void)
+{
+	TxnStatusOutcome at_zero = {.tag = TXN_STATUS_OUTCOME_COMMITTED, .u.committed = 0};
+	TxnStatusOutcome past = {.tag = TXN_STATUS_OUTCOME_COMMITTED, .u.committed = TXN_STATUS_LSNS};
+	uint64		word;
+
+	STD_ASSERT(__LINE__, 0, !txn_status_Outcome_word(at_zero, &word), "Outcome::Committed(0).word() == None");
+	STD_ASSERT(__LINE__, 0, !txn_status_Outcome_word(past, &word), "Outcome::Committed(LSNS).word() == None");
+}
+
+/*
+ * The fork's own: every normal xid but the last has its own xid word, which
+ * is neither a free place's nor a removed one's, and the invalid, bootstrap,
+ * and frozen xids have none.
+ */
+void
+test_txn_status_tests_an_xids_word_is_no_empty_places(void)
+{
+	static const uint64 none[4] = {0, 1, 2, PG_UINT64_MAX};
+	static const uint64 some[4] = {3, 747, PG_UINT32_MAX, PG_UINT64_MAX - 1};
+	uint64		key;
+
+	for (size_t k = 0; k < lengthof(none); k++)
+	{
+		HostXid		xid = {none[k]};
+
+		STD_ASSERT(__LINE__, 0, !txn_status_key(xid, &key), "key(Xid(xid)) == None");
+	}
+	for (size_t k = 0; k < lengthof(some); k++)
+	{
+		HostXid		xid = {some[k]};
+
+		STD_ASSERT(__LINE__, 0, txn_status_key(xid, &key) && key == some[k], "key(Xid(xid)) == Some(xid)");
+	}
+}
+
+/*
+ * The fork's own: a lookup's places are within the table and reach every one
+ * of them, and xids taken in order start at places spread over it.
+ */
+void
+test_txn_status_tests_a_lookup_probes_every_place_and_neighbours_start_apart(void)
+{
+	static const uint64 capacities[4] = {1, 2, 64, 4096};
+	bool		seen[4096];
+	size_t		distinct = 0;
+
+	for (size_t c = 0; c < lengthof(capacities); c++)
+	{
+		uint64		capacity = capacities[c];
+		uint64		start = txn_status_first(747, capacity);
+		uint64		place = start;
+
+		memset(seen, 0, sizeof(seen));
+		for (uint64 k = 0; k < capacity; k++)
+		{
+			STD_ASSERT(__LINE__, 0, place < capacity && !seen[place], "place < capacity && !seen[place]");
+			seen[place] = true;
+			place = txn_status_next(place, capacity);
+		}
+		STD_ASSERT_EQ_U64(__LINE__, 0, place, start);
+	}
+	memset(seen, 0, sizeof(seen));
+	for (uint64 xid = 1000; xid < 2000; xid++)
+	{
+		uint64		start = txn_status_first(xid, 4096);
+
+		distinct += !seen[start];
+		seen[start] = true;
+	}
+	STD_ASSERT(__LINE__, 0, distinct > 850, "more than 850 of 1000 neighbours start at their own place");
+}
+
+/* The fork's own: a table is crowded from three quarters of its places taken. */
+void
+test_txn_status_tests_a_table_is_crowded_at_three_quarters(void)
+{
+	STD_ASSERT(__LINE__, 0,
+			   !txn_status_crowded(0, 4) && !txn_status_crowded(2, 4) && txn_status_crowded(3, 4) &&
+			   txn_status_crowded(4, 4), "crowded at three of four");
+	STD_ASSERT(__LINE__, 0, !txn_status_crowded(3071, 4096) && txn_status_crowded(3072, 4096),
+			   "crowded at 3072 of 4096");
+}
+
+/* txn_status_tests_capacity returns the table's index capacity, read from its root. */
+static uint64
+txn_status_tests_capacity(HostIoIo *io)
+{
+	TxnStatusScope scope = {.io = io};
+	HostError	error;
+	uint64		capacity;
+
+	scope.error = &error;
+	if (!txn_status_hold(&scope) || !txn_status_root(&scope))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	capacity = txn_status_load(scope.root, TXN_STATUS_CAPACITY);
+	txn_status_release(&scope);
+	return capacity;
+}
+
+/* txn_status_tests_took takes an xid's entry with an outcome and returns whether the entry was there already. */
+static bool
+txn_status_tests_took(HostIoIo *io, HostXid xid, TxnStatusOutcome outcome)
+{
+	TxnStatusRoomed roomed;
+	HostError	error;
+	bool		had;
+
+	if (!txn_status_take(io, xid, outcome, &roomed, &had, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	return had;
+}
+
+/* txn_status_tests_added adds an amount to an xid's entry's count and returns whether it has an entry, with the count in a result. */
+static bool
+txn_status_tests_added(HostIoIo *io, HostXid xid, uint64 amount, uint64 *result)
+{
+	HostError	error;
+	bool		some;
+
+	if (!txn_status_add(io, xid, amount, &some, result, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	return some;
+}
+
+/* txn_status_tests_looked_up looks up an xid's entry and returns whether it has one, the entry in a result. */
+static bool
+txn_status_tests_looked_up(HostIoIo *io, HostXid xid, TxnStatusEntry *result)
+{
+	HostError	error;
+	bool		some;
+
+	if (!txn_status_lookup(io, xid, &some, result, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	return some;
+}
+
+/* txn_status_tests_removed removes an xid's entry and returns whether it had one. */
+static bool
+txn_status_tests_removed(HostIoIo *io, HostXid xid)
+{
+	HostError	error;
+	bool		removed;
+
+	if (!txn_status_remove(io, xid, &removed, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	return removed;
+}
+
+/*
+ * The fork's own (design item 7): a take of room makes an entry a lookup
+ * finds, pending, with a count of zero, a second take for its xid leaves it,
+ * its count adds and subtracts, a removal leaves it for no lookup, and the
+ * table grows past its load factor keeping every entry; a growth leaves
+ * behind an entry of zero count whose xid isn't running.
+ */
+void
+test_txn_status_tests_entries_are_taken_found_counted_removed_and_kept_by_a_growth(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	TxnStatusOutcome unowned = {.tag = TXN_STATUS_OUTCOME_UNOWNED};
+	TxnStatusOutcome pending = {.tag = TXN_STATUS_OUTCOME_PENDING_IN, .u.pending_in = 3};
+	TxnStatusEntry wanted = {.outcome = pending};
+	HostXid		seven = {7};
+	HostXid		eight = {8};
+	HostXid		ended;
+	HostXid		aborted;
+	HostXid		running;
+	HostXid		committed[TXN_STATUS_PLACES];
+	TxnStatusEntry entry;
+	uint64		count;
+
+	STD_ASSERT(__LINE__, 0, !txn_status_tests_looked_up(io, seven, &entry), "lookup(io, Xid(7)).unwrap() == None");
+	STD_ASSERT(__LINE__, 0, !txn_status_tests_took(io, seven, pending), "!take(io, Xid(7), PendingIn(3)).1");
+	STD_ASSERT_EQ(__LINE__, 0, txn_status_tests_looked_up(io, seven, &entry) &&
+				  txn_status_Entry_PartialEq_eq(&entry, &wanted), &entry, txn_status_Entry_Debug_fmt, &wanted,
+				  txn_status_Entry_Debug_fmt);
+	STD_ASSERT(__LINE__, 0, txn_status_tests_took(io, seven, unowned), "take(io, Xid(7), Unowned).1");
+	STD_ASSERT(__LINE__, 0, txn_status_tests_added(io, seven, 2, &count) && count == 2,
+			   "add(io, Xid(7), 2) == Some(2)");
+	STD_ASSERT(__LINE__, 0, txn_status_tests_added(io, seven, PG_UINT64_MAX, &count) && count == 1,
+			   "add(io, Xid(7), -1) == Some(1)");
+	STD_ASSERT(__LINE__, 0, !txn_status_tests_added(io, eight, 1, &count), "add(io, Xid(8), 1) == None");
+	STD_ASSERT(__LINE__, 0, txn_status_tests_removed(io, seven) && !txn_status_tests_removed(io, seven),
+			   "remove(io, Xid(7)) && !remove(io, Xid(7))");
+	STD_ASSERT(__LINE__, 0, !txn_status_tests_looked_up(io, seven, &entry), "lookup(io, Xid(7)).unwrap() == None");
+	ended = simc_begin();
+	aborted = simc_begin();
+	running = simc_begin();
+	simc_commit(ended);
+	simc_abort(aborted);
+	txn_status_tests_took(io, ended, unowned);
+	txn_status_tests_took(io, aborted, unowned);
+	txn_status_tests_took(io, running, unowned);
+	txn_status_tests_added(io, aborted, 1, &count);
+	for (uint64 k = 0; k < TXN_STATUS_PLACES; k++)
+		committed[k] = simc_begin();
+	for (uint64 k = 0; k < TXN_STATUS_PLACES; k++)
+	{
+		simc_commit(committed[k]);
+		txn_status_tests_took(io, committed[k], unowned);
+		txn_status_tests_added(io, committed[k], 1, &count);
+	}
+	STD_ASSERT(__LINE__, 0, txn_status_tests_capacity(io) >= 2 * TXN_STATUS_PLACES,
+			   "root.atomic::<Capacity>(Op::Load) >= 2 * PLACES");
+	for (uint64 k = 0; k < TXN_STATUS_PLACES; k++)
+		STD_ASSERT(__LINE__, 0, txn_status_tests_looked_up(io, committed[k], &entry) && entry.count == 1,
+				   "a committed xid's entry keeps its count of 1");
+	STD_ASSERT(__LINE__, 0, !txn_status_tests_looked_up(io, ended, &entry), "lookup(io, ended).unwrap() == None");
+	STD_ASSERT(__LINE__, 0, !txn_status_tests_looked_up(io, aborted, &entry), "lookup(io, aborted).unwrap() == None");
+	STD_ASSERT(__LINE__, 0, txn_status_tests_looked_up(io, running, &entry) && entry.count == 0,
+			   "lookup(io, running).unwrap().map(|e| e.count) == Some(0)");
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * The fork's own (PRevPF 5's F1): a growth is sized from the entries it
+ * keeps, so churn alone keeps one segment: 40,000 transactions, each taking
+ * room, counting, committing, and counting down, every other one removed and
+ * the rest left at a count of zero, grow the table many times and leave it at
+ * its first capacity.
+ */
+void
+test_txn_status_tests_churn_with_no_live_entries_keeps_one_segment(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	TxnStatusOutcome pending = {.tag = TXN_STATUS_OUTCOME_PENDING_IN, .u.pending_in = 1};
+	uint64		count;
+
+	for (uint32 at = 0; at < 40000; at++)
+	{
+		HostXid		xid = simc_begin();
+
+		txn_status_tests_took(io, xid, pending);
+		txn_status_tests_added(io, xid, 1, &count);
+		simc_commit(xid);
+		txn_status_tests_added(io, xid, PG_UINT64_MAX, &count);
+		if (at % 2 == 0)
+			txn_status_tests_removed(io, xid);
+	}
+	STD_ASSERT_EQ_U64(__LINE__, 0, txn_status_tests_capacity(io), TXN_STATUS_PLACES);
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * The fork's own: a growth's index capacity is the fewest whole segments of
+ * places that hold what it keeps under the load factor.
+ */
+void
+test_txn_status_tests_a_growth_holds_what_it_keeps_in_the_least_room(void)
+{
+	STD_ASSERT_EQ_U64(__LINE__, 0, txn_status_sized(0), TXN_STATUS_PLACES);
+	STD_ASSERT_EQ_U64(__LINE__, 0, txn_status_sized(TXN_STATUS_PLACES * 3 / 4 - 1), TXN_STATUS_PLACES);
+	STD_ASSERT_EQ_U64(__LINE__, 0, txn_status_sized(TXN_STATUS_PLACES * 3 / 4), 2 * TXN_STATUS_PLACES);
+	STD_ASSERT_EQ_U64(__LINE__, 0, txn_status_sized(2 * TXN_STATUS_PLACES * 3 / 4 - 1), 2 * TXN_STATUS_PLACES);
+	STD_ASSERT_EQ_U64(__LINE__, 0, txn_status_sized(2 * TXN_STATUS_PLACES * 3 / 4), 3 * TXN_STATUS_PLACES);
+}
+
+/* TXN_STATUS_TESTS_LISTED is LISTED, the commits' slots at their position in the test's table. */
+static const HostSharedListed TXN_STATUS_TESTS_LISTED = {0};
+
+/* txn_status_tests_roomed takes a top-level xid's room as a backend's first write does. */
+static void
+txn_status_tests_roomed(HostIoIo *io, HostXid top)
+{
+	TxnStatusRoomed roomed;
+	HostError	error;
+
+	if (!txn_status_roomed(io, top, &roomed, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+}
+
+/* txn_status_tests_commit returns what the table says of a top-level xid's commit. */
+static TxnStatusCommit
+txn_status_tests_commit(HostIoIo *io, HostXid xid)
+{
+	TxnStatusCommit commit;
+	HostError	error;
+
+	if (!txn_status_committed(io, xid, &commit, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	return commit;
+}
+
+/* txn_status_tests_commit_is asserts at its line that the table says a commit of an xid. */
+static void
+txn_status_tests_commit_is(uint32 line, HostIoIo *io, HostXid xid, TxnStatusCommit wanted)
+{
+	TxnStatusCommit commit = txn_status_tests_commit(io, xid);
+
+	STD_ASSERT_EQ(line, 0, txn_status_Commit_PartialEq_eq(&commit, &wanted), &commit, txn_status_Commit_Debug_fmt,
+				  &wanted, txn_status_Commit_Debug_fmt);
+}
+
+/* txn_status_tests_mine returns this process's slot of the commits' words. */
+static HostSharedMine
+txn_status_tests_mine(HostIoIo *io)
+{
+	HostSharedMine mine;
+	HostError	error;
+
+	if (!host_shared_mine(HOST_IO_IO_TAKES_SHORT(io), &TXN_STATUS_COMMITS_PROC_SLOTS_OPS, &mine, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	return mine;
+}
+
+/* txn_status_tests_moved moves this process's slot's pair into its entry. */
+static void
+txn_status_tests_moved(HostIoIo *io, const HostSharedMine *mine)
+{
+	HostError	error;
+
+	if (!txn_status_moved(io, mine, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+}
+
+/*
+ * PLAN item 7's registration, move, and reader: an entry pending in this
+ * process reads not committed while its transaction runs; once the
+ * transaction commits with its pair registered, a reader takes the end from
+ * the slot; the move stores the end in the entry and clears the slot's xid,
+ * and a second move does nothing; an entry nothing names is dropped by its
+ * move; and an xid with no entry reads missing.
+ */
+void
+test_txn_status_tests_a_commit_registered_in_its_slot_reads_back_and_its_move_settles_the_entry(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedMine mine = txn_status_tests_mine(io);
+	HostXid		named = simc_begin();
+	HostXid		unnamed = simc_begin();
+	HostXid		absent = simc_begin();
+	TxnStatusCommit pending = {.tag = TXN_STATUS_COMMIT_PENDING};
+	TxnStatusCommit at = {.tag = TXN_STATUS_COMMIT_AT, .u.at = 400};
+	TxnStatusCommit missing = {.tag = TXN_STATUS_COMMIT_MISSING};
+	TxnStatusEntry settled = {.outcome = {.tag = TXN_STATUS_OUTCOME_COMMITTED, .u.committed = 400}, .count = 2};
+	TxnStatusEntry entry;
+	uint64		count;
+
+	txn_status_tests_roomed(io, named);
+	txn_status_tests_added(io, named, 2, &count);
+	txn_status_tests_commit_is(__LINE__, io, named, pending);
+	txn_status_registered(&TXN_STATUS_TESTS_LISTED, named, 400);
+	simc_commit(named);
+	txn_status_tests_commit_is(__LINE__, io, named, at);
+	txn_status_tests_moved(io, &mine);
+	STD_ASSERT_EQ_U64(__LINE__, 0, host_shared_Mine_load(&mine, TXN_STATUS_COMMIT_XID_INDEX), 0);
+	STD_ASSERT_EQ(__LINE__, 0, txn_status_tests_looked_up(io, named, &entry) &&
+				  txn_status_Entry_PartialEq_eq(&entry, &settled), &entry, txn_status_Entry_Debug_fmt, &settled,
+				  txn_status_Entry_Debug_fmt);
+	txn_status_tests_moved(io, &mine);
+	txn_status_tests_commit_is(__LINE__, io, named, at);
+	txn_status_tests_roomed(io, unnamed);
+	txn_status_registered(&TXN_STATUS_TESTS_LISTED, unnamed, 500);
+	simc_commit(unnamed);
+	txn_status_tests_moved(io, &mine);
+	STD_ASSERT(__LINE__, 0, !txn_status_tests_looked_up(io, unnamed, &entry), "lookup(io, unnamed).unwrap() == None");
+	txn_status_tests_commit_is(__LINE__, io, absent, missing);
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * The fold text's 3.1 (draft 10): a fold's point lies below the end of a
+ * commit registered at or below the insert position whose transaction is
+ * still in the proc array, and is the position once it left, or when the
+ * commit ends past the position.
+ */
+void
+test_txn_status_tests_a_folds_point_lies_below_a_commit_still_in_the_proc_array(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedMine mine = txn_status_tests_mine(io);
+	HostXid		held = simc_begin();
+	HostError	error;
+	HostLsn		point;
+	uint64		count;
+
+	txn_status_tests_roomed(io, held);
+	txn_status_tests_added(io, held, 1, &count);
+	txn_status_registered(&TXN_STATUS_TESTS_LISTED, held, 400);
+	if (!txn_status_lowered(io, 500, &point, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT_EQ_U64(__LINE__, 0, point, 399);
+	if (!txn_status_lowered(io, 300, &point, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT_EQ_U64(__LINE__, 0, point, 300);
+	simc_commit(held);
+	if (!txn_status_lowered(io, 500, &point, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT_EQ_U64(__LINE__, 0, point, 500);
+	txn_status_tests_moved(io, &mine);
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * PLAN item 7's take of room: a backend's first write in a transaction moves
+ * its slot's pair, here a committed earlier transaction's, and takes its
+ * top-level xid's room pending in this process; a second write takes
+ * nothing.
+ */
+void
+test_txn_status_tests_a_take_of_room_moves_the_slots_pair_first(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	TxnStatusEntry earlier_entry = {.outcome = {.tag = TXN_STATUS_OUTCOME_COMMITTED, .u.committed = 700},
+	.count = 1};
+	TxnStatusEntry later_entry = {.outcome = {.tag = TXN_STATUS_OUTCOME_PENDING_IN,
+	.u.pending_in = host_shared_proc_number()}};
+	HostXid		earlier = simc_begin();
+	HostXid		later = simc_begin();
+	TxnStatusEntry entry;
+	uint64		count;
+
+	txn_status_tests_roomed(io, earlier);
+	txn_status_tests_added(io, earlier, 1, &count);
+	txn_status_registered(&TXN_STATUS_TESTS_LISTED, earlier, 700);
+	simc_commit(earlier);
+	txn_status_tests_roomed(io, later);
+	STD_ASSERT_EQ(__LINE__, 0, txn_status_tests_looked_up(io, earlier, &entry) &&
+				  txn_status_Entry_PartialEq_eq(&entry, &earlier_entry), &entry, txn_status_Entry_Debug_fmt,
+				  &earlier_entry, txn_status_Entry_Debug_fmt);
+	STD_ASSERT_EQ(__LINE__, 0, txn_status_tests_looked_up(io, later, &entry) &&
+				  txn_status_Entry_PartialEq_eq(&entry, &later_entry), &entry, txn_status_Entry_Debug_fmt,
+				  &later_entry, txn_status_Entry_Debug_fmt);
+	txn_status_tests_added(io, later, 1, &count);
+	txn_status_tests_roomed(io, later);
+	STD_ASSERT(__LINE__, 0, txn_status_tests_looked_up(io, later, &entry) && entry.count == 1,
+			   "lookup(io, later).unwrap().map(|e| e.count) == Some(1)");
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * PLAN item 7's redo call site: a replayed commit stores its record's end in
+ * the entry its replayed row change took, pending in no process, and a commit
+ * of a transaction with no entry stores nothing.
+ */
+void
+test_txn_status_tests_a_replayed_commit_stores_its_end_in_the_entry_its_replay_took(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	TxnStatusOutcome at = {.tag = TXN_STATUS_OUTCOME_COMMITTED, .u.committed = 900};
+	HostXid		wrote = simc_begin();
+	HostXid		quiet = simc_begin();
+	HostXid		sub = simc_begin_under(wrote);
+	TxnMemtableVersionWriter writer = {.xid = sub.f0, .has_top = true, .top = wrote.f0};
+	TxnStatusRoomed roomed;
+	TxnStatusEntry entry;
+	HostError	error;
+	bool		some;
+
+	if (!txn_status_redo_roomed(io, &writer, &some, &roomed, &error) ||
+		!txn_status_redo_committed(io, wrote, 900, &error) || !txn_status_redo_committed(io, quiet, 950, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT_EQ(__LINE__, 0, txn_status_tests_looked_up(io, wrote, &entry) &&
+				  txn_status_Outcome_PartialEq_eq(&entry.outcome, &at), &entry.outcome,
+				  txn_status_Outcome_Debug_fmt, &at, txn_status_Outcome_Debug_fmt);
+	STD_ASSERT(__LINE__, 0, !txn_status_tests_looked_up(io, quiet, &entry), "lookup(io, quiet).unwrap() == None");
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * PLAN item 7's prepared transaction: its entry, left pending in its
+ * preparing backend's number, is pointed at the committing process ahead of
+ * the critical section, whose registration then stores its end, which a
+ * reader takes from the committer's slot; a prepared transaction with no
+ * entry registers nothing.
+ */
+void
+test_txn_status_tests_a_prepared_commit_points_its_entry_at_the_committer_and_registers(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	TxnStatusOutcome preparer = {.tag = TXN_STATUS_OUTCOME_PENDING_IN, .u.pending_in = 77};
+	TxnStatusEntry pointed = {.outcome = {.tag = TXN_STATUS_OUTCOME_PENDING_IN,
+	.u.pending_in = host_shared_proc_number()}, .count = 1};
+	TxnStatusCommit at = {.tag = TXN_STATUS_COMMIT_AT, .u.at = 1200};
+	TxnStatusCommit missing = {.tag = TXN_STATUS_COMMIT_MISSING};
+	HostXid		prepared = simc_begin();
+	HostXid		empty = simc_begin();
+	TxnStatusEntry entry;
+	HostError	error;
+	uint64		count;
+
+	txn_status_tests_took(io, prepared, preparer);
+	txn_status_tests_added(io, prepared, 1, &count);
+	if (!txn_status_prepared_committing(io, prepared, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT_EQ(__LINE__, 0, txn_status_tests_looked_up(io, prepared, &entry) &&
+				  txn_status_Entry_PartialEq_eq(&entry, &pointed), &entry, txn_status_Entry_Debug_fmt, &pointed,
+				  txn_status_Entry_Debug_fmt);
+	txn_status_prepared_registered(&TXN_STATUS_TESTS_LISTED, 1200);
+	simc_commit(prepared);
+	txn_status_tests_commit_is(__LINE__, io, prepared, at);
+	if (!txn_status_prepared_committing(io, empty, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	txn_status_prepared_registered(&TXN_STATUS_TESTS_LISTED, 1300);
+	simc_commit(empty);
+	txn_status_tests_commit_is(__LINE__, io, prepared, at);
+	txn_status_tests_commit_is(__LINE__, io, empty, missing);
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * The fold text's 3.11: a growth that rebuilds the index between a take of
+ * room and a count leaves the entry in its slot, so the count lands in the
+ * same entry, and a removed entry's slot is the next take's.
+ */
+void
+test_txn_status_tests_a_slot_stays_its_entrys_across_a_growth_and_a_removed_ones_is_taken_again(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	TxnStatusOutcome unowned = {.tag = TXN_STATUS_OUTCOME_UNOWNED};
+	HostXid		counted_one = simc_begin();
+	HostXid		gone;
+	HostXid		next;
+	TxnStatusRoomed roomed;
+	TxnStatusRoomed freed_slot;
+	TxnStatusRoomed again;
+	TxnStatusEntry entry;
+	HostDeltaHold hold;
+	HostError	error;
+	uint64		capacity;
+	uint64		count;
+	bool		had;
+
+	if (!txn_status_take(io, counted_one, unowned, &roomed, &had, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	capacity = txn_status_tests_capacity(io);
+	while (txn_status_tests_capacity(io) == capacity)
+	{
+		HostXid		xid = simc_begin();
+
+		txn_status_tests_took(io, xid, unowned);
+		txn_status_tests_added(io, xid, 1, &count);
+	}
+	if (!host_delta_hold(io, &hold, &error) ||
+		!txn_status_counted(HOST_IO_IO_TAKES_SHORT(io), &hold, roomed, 1, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	host_delta_Hold_drop(&hold);
+	STD_ASSERT(__LINE__, 0, txn_status_tests_looked_up(io, counted_one, &entry) && entry.count == 1,
+			   "lookup(io, counted_one).unwrap().map(|e| e.count) == Some(1)");
+	gone = simc_begin();
+	next = simc_begin();
+	if (!txn_status_take(io, gone, unowned, &freed_slot, &had, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT(__LINE__, 0, txn_status_tests_removed(io, gone), "remove(io, gone).unwrap()");
+	if (!txn_status_take(io, next, unowned, &again, &had, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT_EQ(__LINE__, 0, txn_status_Roomed_PartialEq_eq(&again, &freed_slot) && !had, &again,
+				  txn_status_Roomed_Debug_fmt, &freed_slot, txn_status_Roomed_Debug_fmt);
+	simc_TestIo_drop(&test_io);
+}
+
+/* txn_status_tests_grown takes committed xids' room, each counted once, until the table grows. */
+static void
+txn_status_tests_grown(HostIoIo *io)
+{
+	TxnStatusOutcome unowned = {.tag = TXN_STATUS_OUTCOME_UNOWNED};
+	uint64		capacity = txn_status_tests_capacity(io);
+	uint64		count;
+
+	while (txn_status_tests_capacity(io) == capacity)
+	{
+		HostXid		xid = simc_begin();
+
+		simc_commit(xid);
+		txn_status_tests_took(io, xid, unowned);
+		txn_status_tests_added(io, xid, 1, &count);
+	}
+}
+
+/*
+ * Bugs row 90: while the proc array doesn't answer for every running and
+ * prepared transaction, as in crash recovery before its end puts the prepared
+ * ones in it, a growth keeps an entry of zero count whose xid isn't in
+ * progress, which a growth with the proc array answering leaves behind; one
+ * with a count whose xid aborted goes either way, since the commit log
+ * answers it.
+ */
+void
+test_txn_status_tests_a_growth_while_the_proc_array_cant_answer_keeps_an_ended_entry(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	TxnStatusOutcome unowned = {.tag = TXN_STATUS_OUTCOME_UNOWNED};
+	TxnStatusEntry kept = {.outcome = unowned};
+	HostXid		ended = simc_begin();
+	HostXid		aborted = simc_begin();
+	TxnStatusEntry entry;
+	uint64		count;
+
+	simc_commit(ended);
+	simc_abort(aborted);
+	txn_status_tests_took(io, ended, unowned);
+	txn_status_tests_took(io, aborted, unowned);
+	txn_status_tests_added(io, aborted, 1, &count);
+	simc_unanswered(true);
+	txn_status_tests_grown(io);
+	simc_unanswered(false);
+	STD_ASSERT_EQ(__LINE__, 0, txn_status_tests_looked_up(io, ended, &entry) &&
+				  txn_status_Entry_PartialEq_eq(&entry, &kept), &entry, txn_status_Entry_Debug_fmt, &kept,
+				  txn_status_Entry_Debug_fmt);
+	STD_ASSERT(__LINE__, 0, !txn_status_tests_looked_up(io, aborted, &entry), "lookup(io, aborted).unwrap() == None");
+	txn_status_tests_grown(io);
+	STD_ASSERT(__LINE__, 0, !txn_status_tests_looked_up(io, ended, &entry), "lookup(io, ended).unwrap() == None");
 	simc_TestIo_drop(&test_io);
 }
 

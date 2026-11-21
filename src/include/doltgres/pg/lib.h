@@ -767,6 +767,7 @@ extern PgIndexFetch *pg_IndexScan_heap_fetch(PgIndexScan *self);
 extern const PgRel *pg_IndexScan_index(const PgIndexScan *self);
 extern const PgSnapshot *pg_IndexScan_snapshot(const PgIndexScan *self);
 extern PgIndexScan *pg_IndexScanDesc_scan(PgIndexScanDesc *self);
+extern bool pg_transaction_snapshot_view(const PgMayRaise *raise, PgSnapshotView *result, PgPgError *error);
 extern bool pg_snapshot_view(const PgMayRaise *raise, const PgSnapshot *snapshot, PgSnapshotView *result,
 							 PgPgError *error);
 extern DgScanKeys pg_ScanKeys_with_count(const PgScanKeys *keys, int32 count);

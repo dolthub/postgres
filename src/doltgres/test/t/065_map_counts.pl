@@ -136,5 +136,78 @@ $node->safe_psql('postgres', 'CHECKPOINT');
 is($node->safe_psql('postgres', "SELECT doltgres_test_status_table(1, $locker, 0)"),
 	'0', 'a row lock rolled back to a savepoint leaves its committed transaction\'s entry counting nothing');
 
+
+# Every free space map version a write pushes counts at its writer's entry,
+# and a fold gives back only what was counted (bugs row 305). An UPDATE of 40
+# rows on full pages flags a block for each row it moves off one, 40 flags;
+# an INSERT of 20 rows into another table by the same transaction pushes 20
+# rows and their 20 takes, 40 versions, as many as the flags. The first
+# table's fold gives back the UPDATE's versions, flags included, and leaves
+# the entry counting the INSERT's 40, so a drop of an ended entry that counts
+# nothing passes it by, and the second table's fold reads the writer's
+# commit. With the fold launcher held and no fold worker it started before
+# its hold left running, no fold but the case's own folds or drops a version
+# while the case counts, and each fold waits until no other process holds an
+# xmin or an xid at or below the writer, such as an autovacuum worker's,
+# which would keep the fold's horizon below it.
+sub horizon_past
+{
+	my ($xid) = @_;
+	$node->poll_query_until('postgres',
+		"SELECT count(*) = 0 FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND (age(backend_xmin) >= age('$xid'::xid) OR age(backend_xid) >= age('$xid'::xid))"
+	) or die "a process holds the horizon at or below $xid";
+	return;
+}
+$node->safe_psql('postgres', 'CREATE EXTENSION injection_points');
+$node->safe_psql('postgres',
+	"SELECT injection_points_attach('doltgres-fold-launch', 'wait')");
+$node->poll_query_until('postgres',
+	"SELECT count(*) = 1 FROM pg_stat_activity WHERE wait_event = 'doltgres-fold-launch'"
+) or die 'the fold launcher is not held';
+$node->poll_query_until('postgres',
+	"SELECT count(*) = 0 FROM pg_stat_activity WHERE backend_type = 'fold worker'"
+) or die 'a fold worker still runs';
+my $filler = (
+	split /\n/,
+	$node->safe_psql(
+		'postgres', q{
+CREATE TABLE flagged (id int4 PRIMARY KEY, v text);
+BEGIN;
+INSERT INTO flagged SELECT g, repeat('x', 900) FROM generate_series(1, 400) g;
+SELECT txid_current();
+COMMIT;
+CREATE TABLE inserted (id int4, v text);
+}))[-1];
+horizon_past($filler);
+$node->safe_psql('postgres', q{SELECT doltgres_test_fold('flagged')});
+my $flagger = (
+	split /\n/,
+	$node->safe_psql(
+		'postgres', q{
+BEGIN;
+UPDATE flagged SET v = repeat('y', 900) WHERE id <= 40;
+INSERT INTO inserted SELECT g, 'b' FROM generate_series(1, 20) g;
+SELECT txid_current();
+COMMIT;
+}))[-1];
+horizon_past($flagger);
+$node->safe_psql('postgres', q{SELECT doltgres_test_fold('flagged')});
+is(dropped_if_uncounted($flagger), '40',
+	'a writer\'s entry counts its other table\'s versions after its first table\'s fold gives back its flags'
+);
+(undef, $folded) =
+  $node->psql('postgres', q{SELECT doltgres_test_fold('inserted')});
+is($folded, 't', 'the other table\'s fold reads its writer\'s commit');
+is( $node->safe_psql(
+		'postgres', "SELECT doltgres_test_status_table(1, $flagger, 0)"),
+	'0',
+	'the writer\'s entry counts nothing once both tables fold');
+is( $node->safe_psql(
+		'postgres',
+		q{SELECT (SELECT count(*) FROM flagged WHERE v LIKE 'y%'), (SELECT count(*) FROM inserted)}
+	),
+	'40|20',
+	'both tables read the transaction\'s rows');
+
 $node->stop;
 done_testing();

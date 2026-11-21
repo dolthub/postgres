@@ -126,4 +126,17 @@ extern bool txn_identity_dropped(HostIoIo *io, uint32 repository, HostLsn point,
 extern bool txn_identity_redo(HostIoIo *io, TxnRecordDatabaseChange *change, uint32 own, uint64 lsn,
 							  HostError *error);
 
+#ifdef DOLTGRES_TEST_TXN
+extern void test_txn_identity_tests_an_objects_id_derives_from_its_kind_parent_and_name(void);
+extern void test_txn_identity_tests_a_columns_id_holds_its_types_category(void);
+extern void test_txn_identity_tests_a_pairs_keys_find_it_from_either_side(void);
+extern void test_txn_identity_tests_a_tables_pairs_read_back_by_its_oid_and_its_id(void);
+extern void test_txn_identity_tests_an_aborted_transactions_pairs_go_at_the_take_back(void);
+extern void test_txn_identity_tests_a_taken_id_moves_on_and_a_removed_pair_frees_it(void);
+extern void test_txn_identity_tests_redone_identity_changes_give_the_same_pairs_once(void);
+extern void test_txn_identity_tests_an_identity_change_reads_back_as_written(void);
+extern void test_txn_identity_tests_a_saves_fold_keeps_its_committed_pairs_and_leaves_running_ones(void);
+extern void test_txn_identity_tests_a_saves_drop_takes_its_folded_pairs_out(void);
+#endif
+
 #endif							/* DOLTGRES_TXN_IDENTITY_H */

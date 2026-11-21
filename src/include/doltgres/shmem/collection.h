@@ -37,8 +37,10 @@ extern bool shmem_collection_backups_running(void);
 extern bool shmem_collection_collection_begin(void);
 extern void shmem_collection_collection_end(void);
 extern void shmem_collection_worker_started(void);
-extern bool shmem_collection_ask(const PgMayRaise *raise, uint32 database, uint64 result[3], PgPgError *error);
-extern bool shmem_collection_asked_for(std_TupleU64U32_t *result);
+extern bool shmem_collection_worker_running(void);
+extern bool shmem_collection_ask(const PgMayRaise *raise, uint32 database, uint32 emptied, uint64 result[3],
+								 PgPgError *error);
+extern bool shmem_collection_asked_for(std_TupleU64U32_t *result, uint32 *emptied);
 extern void shmem_collection_answer(uint64 word, const uint64 counts[3]);
 
 #endif							/* FRONTEND */

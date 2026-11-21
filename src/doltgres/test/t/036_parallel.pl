@@ -149,5 +149,63 @@ is( $held_parallel,
 );
 $before->quit;
 
+# Bugs row 309's parallel units: a parallel query's scan of a table whose rows
+# are all in the delta, run by the leader and two workers, reads the delta's
+# run at most once in each of them, at 2,000 rows and at 5,000, where each
+# unit read and sorted the whole run; it gives every row once; and the scan
+# rescanned on a nested loop's inner side for each of three outer rows gives
+# every row each time.
+my $parallel_on = q{
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 2;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_material = off;
+};
+$node->safe_psql(
+	'postgres', q{
+CREATE EXTENSION injection_points;
+});
+foreach my $rows (2000, 5000)
+{
+	my ($code, $out, $err) = $node->psql(
+		'postgres', qq{
+BEGIN;
+$parallel_on
+CREATE TABLE units_$rows (a int4, b text) USING heap;
+ALTER TABLE units_$rows SET (parallel_workers = 2);
+INSERT INTO units_$rows SELECT n, repeat('u', 34) FROM generate_series(1, $rows) n;
+ANALYZE units_$rows;
+SELECT injection_points_attach('doltgres-scan-run', 'notice');
+SELECT count(*) FROM units_$rows;
+SELECT injection_points_detach('doltgres-scan-run');
+\\echo ONCE
+SELECT count(*), count(DISTINCT a), sum(a) FROM units_$rows;
+\\echo PLAN
+EXPLAIN (COSTS OFF) SELECT count(*) FROM (SELECT n FROM generate_series(1, 3) n WHERE random() >= 0) o, units_$rows u WHERE u.a > 0;
+\\echo RESCANNED
+SELECT count(*) FROM (SELECT n FROM generate_series(1, 3) n WHERE random() >= 0) o, units_$rows u WHERE u.a > 0;
+ROLLBACK;
+});
+	my $runs = () = $err =~ /doltgres-scan-run/g;
+	ok( $runs >= 1 && $runs <= 3,
+		"a parallel scan of $rows delta rows reads the delta's run at most once in each process ($runs)"
+	);
+	is( ($out =~ /ONCE\n(\S+)\n/)[0],
+		"$rows|$rows|" . ($rows * ($rows + 1) / 2),
+		"a parallel scan of $rows delta rows gives every row once");
+	like(
+		($out =~ /PLAN\n(.*)RESCANNED/s)[0],
+		qr/Nested Loop.*Gather.*Parallel Seq Scan on units_$rows/s,
+		"the rescanned plan has the parallel scan of $rows rows on a nested loop's inner side"
+	);
+	is( ($out =~ /RESCANNED\n(\d+)/)[0],
+		3 * $rows,
+		"a parallel scan of $rows delta rows rescanned for each outer row gives every row each time"
+	);
+}
+
 $node->stop;
 done_testing();

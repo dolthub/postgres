@@ -2661,12 +2661,26 @@ doltgres_entries_searches_read_closure_5(void *captures, HostIoIo *io, DoltgresE
 	return true;
 }
 
-/* doltgres_entries_searches_read_closure_3 is read's lent call: the base the scan's snapshot reads, as splits' is. */
+/* doltgres_entries_searches_read_captures_t is read's lent call's captures: the snapshot and the generation it reads. */
+typedef struct doltgres_entries_searches_read_captures_t
+{
+	const HostSnapshot *read;
+	uint64		generation;
+} doltgres_entries_searches_read_captures_t;
+
+/*
+ * doltgres_entries_searches_read_closure_3 is read's lent call: the base the
+ * scan's snapshot reads, as splits' is, with the base generation read
+ * before it.
+ */
 static bool
 doltgres_entries_searches_read_closure_3(void *captures, HostIoIo *io, const RepoRepo *repo, const HostSharedHeld *held, bool *some,
 										 TxnBaseBase *result, HostError *error)
 {
-	return doltgres_entries_searches_Entries_splits_closure_0(captures, io, repo, held, some, result, error);
+	doltgres_entries_searches_read_captures_t *c = captures;
+
+	c->generation = txn_state_generation(host_shared_Held_record(held));
+	return doltgres_entries_searches_Entries_splits_closure_0((void *) c->read, io, repo, held, some, result, error);
 }
 
 /* doltgres_entries_searches_unsnapshotted returns the error of an index scan asked to read with no snapshot. */
@@ -2828,6 +2842,7 @@ doltgres_entries_searches_read_body_0(void *frame_)
 		TreesStoreReader store;
 		TreesKeyOrder order;
 		bool		ok;
+		doltgres_entries_searches_read_captures_t c = {&frame->read};
 
 		if (!host_owned_TableDoltgresEntriesSearchesSearch_withVecU8(&DOLTGRES_ENTRIES_SEARCHES_SEARCHES, &frame->io,
 																	 frame->owned,
@@ -2843,8 +2858,8 @@ doltgres_entries_searches_read_body_0(void *frame_)
 			  doltgres_entries_index_making(&frame->io, index, &found, frame->error)))
 			return;
 		if (!txn_state_held_OptionBase(&frame->io, STD_ARC_VALUE(frame->repo, _Alignof(RepoRepo)), &frame->reading,
-									   found, doltgres_entries_searches_read_closure_3, &frame->read, NULL, &some,
-									   &base, &failed))
+									   found, doltgres_entries_searches_read_closure_3, &c, NULL, &some, &base,
+									   &failed))
 		{
 			*frame->error = pghost_raised(&failed);
 			return;
@@ -2854,7 +2869,8 @@ doltgres_entries_searches_read_body_0(void *frame_)
 		trees_KeyOrder_Clone_clone(&frame->order, &order);
 		frame->keyed_live = false;
 		ok = doltgres_scan_scan_begin(&frame->io, TREES_STORE_READER_NODE_STORE(&store), 0, some ? &base : NULL,
-									  &frame->keyed, pg_calls_index_table(index), &order, &reader, &failed);
+									  c.generation, &frame->keyed, pg_calls_index_table(index), &order, &reader,
+									  &failed);
 		if (some)
 			txn_base_Base_drop(&base);
 		if (!ok ||

@@ -212,16 +212,13 @@ pg_snapshot_view_closure_0(void *captures, const uint32 *xids, size_t count, con
 	}
 }
 
-/* pg_snapshot_view reads a snapshot an entry got into its view, its arrays lent for as long as the snapshot is. */
-bool
-pg_snapshot_view(const PgMayRaise *raise, const PgSnapshot *snapshot, PgSnapshotView *result, PgPgError *error)
+/* pg_snapshot_view_of reads a snapshot's fields into its view, its arrays lent for as long as the snapshot is. */
+static void
+pg_snapshot_view_of(DgSnapshotView fields, PgSnapshotView *result)
 {
-	DgSnapshotView fields;
 	size_t		subxcnt;
 	StdTryFromIntError tried;
 
-	if (!pg_calls_snapshot_fields(raise, snapshot, &fields, error))
-		return false;
 	result->kind = fields.kind;
 	result->xmin = fields.xmin;
 	result->xmax = fields.xmax;
@@ -232,6 +229,33 @@ pg_snapshot_view(const PgMayRaise *raise, const PgSnapshot *snapshot, PgSnapshot
 	if (!std_usize_try_from_i32(fields.subxcnt, &subxcnt, &tried))
 		subxcnt = 0;
 	pg_snapshot_view_closure_0(NULL, fields.subxip, subxcnt, &result->subxip, &result->subxip_len);
+}
+
+/*
+ * pg_transaction_snapshot_view reads the transaction's snapshot, as
+ * GetTransactionSnapshot takes it, into its view, its arrays lent until the
+ * backend's next snapshot.
+ */
+bool
+pg_transaction_snapshot_view(const PgMayRaise *raise, PgSnapshotView *result, PgPgError *error)
+{
+	DgSnapshotView fields;
+
+	if (!pg_calls_transaction_snapshot_fields(raise, &fields, error))
+		return false;
+	pg_snapshot_view_of(fields, result);
+	return true;
+}
+
+/* pg_snapshot_view reads a snapshot an entry got into its view, its arrays lent for as long as the snapshot is. */
+bool
+pg_snapshot_view(const PgMayRaise *raise, const PgSnapshot *snapshot, PgSnapshotView *result, PgPgError *error)
+{
+	DgSnapshotView fields;
+
+	if (!pg_calls_snapshot_fields(raise, snapshot, &fields, error))
+		return false;
+	pg_snapshot_view_of(fields, result);
 	return true;
 }
 

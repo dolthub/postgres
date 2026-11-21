@@ -90,6 +90,8 @@ extern bool chunks_packs_lists_Rewrite_begin(ChunksPacksViewView *view, HostShar
 											 HostSharedFlagIo *io, ChunksPacksListsChange *result,
 											 ChunksErrorError *error);
 extern bool chunks_packs_lists_Rewrite_compact(ChunksPacksListsChange *self, bool all, ChunksErrorError *error);
+extern bool chunks_packs_lists_Rewrite_remove_space(ChunksPacksListsChange *self, uint32 space,
+													ChunksErrorError *error);
 
 #ifdef DOLTGRES_TEST_CHUNKS
 extern HostSharedOwned chunks_packs_lists_tests_repository(HostIoIo *io, const StdPathBuf *dir);
@@ -105,6 +107,7 @@ extern void test_chunks_packs_lists_tests_only_a_list_file_past_its_slack_is_wri
 extern void test_chunks_packs_lists_tests_a_retirements_records_lead_every_view_to_the_copies(void);
 extern void test_chunks_packs_lists_tests_a_refresh_across_a_whole_write_lists_the_packs_before_it_or_after_it(void);
 extern void test_chunks_packs_lists_tests_a_whole_write_that_fails_before_its_renames_leaves_the_count_even(void);
+extern void test_chunks_packs_lists_tests_a_removed_tablespace_reads_a_runs_file_made_again_from_its_start(void);
 #endif
 
 #endif							/* DOLTGRES_CHUNKS_PACKS_LISTS_H */

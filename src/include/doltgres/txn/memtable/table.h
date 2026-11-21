@@ -101,6 +101,14 @@ typedef struct TxnMemtableTableReserve
 	bool		has_seen;
 	TxnMemtableSplitSeen seen;
 	uint64		grown;
+
+	/*
+	 * counting is whether a push by the step within runs counts at its
+	 * writer's entry.
+	 */
+	bool		counting;
+	/* counted is whether the step pushed a version it counted. */
+	bool		counted;
 } TxnMemtableTableReserve;
 
 /* TxnMemtableTableTarget is Target: one push a prepare readied, its tree, where its hand-off found its key, and its reserve. */
@@ -144,6 +152,13 @@ typedef struct TxnMemtableTablePreparedState
 	HostDeltaHold hold;
 	const TxnMemtableTableAim *aims;
 	size_t		aims_len;
+
+	/*
+	 * first is the place among the caller's aims of aims' first: a prepare
+	 * readies the caller's aims in groups an empty budget can give, aims and
+	 * targets being the group's (bugs row 338).
+	 */
+	size_t		first;
 	/* targets is a Vec<Target>. */
 	StdVec		targets;
 	bool		has_tuple;
@@ -166,12 +181,13 @@ typedef struct TxnMemtableTableRemoving
 	size_t		handles_len;
 } TxnMemtableTableRemoving;
 
-/* txn_TupleHandleU64_t is a version's handle with its writer's top-level xid, (Handle, u64), as copied hands them out. */
-typedef struct txn_TupleHandleU64_t
+/* txn_TupleHandleU64Bool_t is a version's handle with its writer's top-level xid and whether it is killed, (Handle, u64, bool), as copied hands them out. */
+typedef struct txn_TupleHandleU64Bool_t
 {
 	TxnMemtableVersionHandle f0;
 	uint64		f1;
-} txn_TupleHandleU64_t;
+	bool		f2;
+} txn_TupleHandleU64Bool_t;
 
 /* TXN_MEMTABLE_TABLE_STATE_OWNER_OPS is State's Owner: a storage's state. */
 extern const TxnMemtableTableOwnerOps TXN_MEMTABLE_TABLE_STATE_OWNER_OPS;
@@ -219,8 +235,6 @@ extern bool txn_memtable_table_finish_row(HostIoTakesShort io, TxnMemtableTableP
 										  const TxnMemtableVersionChange *change, bool has_roomed,
 										  TxnStatusRoomed roomed, TxnMemtableVersionHandle *result,
 										  HostError *error);
-extern bool txn_memtable_table_counted(HostIoTakesShort io, const TxnMemtableTablePreparedState *prepared,
-									   bool has_roomed, TxnStatusRoomed roomed, HostError *error);
 extern bool txn_memtable_table_newest(HostIoTakesShort io, TxnMemtableTablePreparedState *prepared, size_t row,
 									  bool *some, TxnMemtableVersionHandle *result, HostError *error);
 extern bool txn_memtable_table_holds(HostIoIo *io, HostSharedRecord state, const uint8 *key, size_t key_len,
@@ -238,7 +252,6 @@ extern bool txn_memtable_table_removed(const TxnMemtableTableTreeOps *tree, Host
 extern bool txn_memtable_table_pruned(const TxnMemtableTableTreeOps *tree, HostIoIo *io, HostSharedRecord owner,
 									  const uint8 *key, size_t key_len, bool has_aborting, uint64 aborting,
 									  HostError *error);
-extern bool txn_memtable_table_uncounted(HostIoIo *io, const TxnMemtableVersionVersion *version, HostError *error);
 extern bool txn_memtable_table_waited(HostIoIo *io, HostDeltaFull full, bool spilling, HostError *error);
 extern bool txn_memtable_table_versions(HostIoIo *io, const HostDeltaHold *hold, HostSharedRecord state,
 										const uint8 *key, size_t key_len, StdVec *result, HostError *error);
@@ -278,14 +291,36 @@ extern bool txn_memtable_table_Prepared_aimed(const TxnMemtableTablePreparedStat
 extern bool txn_memtable_table_Prepared_tuple(TxnMemtableTablePreparedState *self, const HostDeltaHold **result_0,
 											  HostSharedRecord *result_1, TxnMemtableTableReservation *result_2,
 											  HostError *error);
+
+/*
+ * TXN_MEMTABLE_TABLE_WHOLE is the most aims a prepare readies as one group at
+ * every delta_memory, so a caller of a few aims never meets a group (bugs row
+ * 338).
+ */
+#define TXN_MEMTABLE_TABLE_WHOLE 8
+
+/*
+ * TxnMemtableTableRefusal is a carry's prepare's answer of the delta
+ * budget's refusal: whether the budget refused it, having taken nothing, and
+ * the refusal, which the carry waits on.
+ */
+typedef struct TxnMemtableTableRefusal
+{
+	bool		refused;
+	HostDeltaFull full;
+} TxnMemtableTableRefusal;
+
 extern bool txn_memtable_table_prepared(HostIoIo *io, const TxnMemtableTableAim *aims, size_t aims_len,
 										bool has_tuple, TxnMemtableTableReservation tuple,
 										bool (*inside) (void *captures, HostIoIo *io,
 														TxnMemtableTablePreparedState *prepared, HostError *error),
 										void *inside_captures, void (*inside_drop) (void *captures),
 										bool *has_unstored, TxnMemtableTableReservation *unstored,
-										HostError *error);
+										TxnMemtableTableRefusal *refused, HostError *error);
+extern bool txn_memtable_table_refused(HostIoIo *io, HostDeltaFull full, TxnMemtableTableRefusal *refused,
+									   bool *result, HostError *error);
 extern bool txn_memtable_table_within(HostIoTakesShort io, TxnMemtableTablePreparedState *prepared, size_t index,
+									  bool has_roomed, TxnStatusRoomed roomed,
 									  bool (*step) (void *captures, TxnMemtableIndexKeyedOpen *open,
 													const HostDeltaHold *hold, const uint8 *key, size_t key_len,
 													TxnMemtableTableReserve *reserve, HostError *error),
@@ -293,8 +328,12 @@ extern bool txn_memtable_table_within(HostIoTakesShort io, TxnMemtableTablePrepa
 extern bool txn_memtable_table_settled(const TxnMemtableTableTreeOps *tree, HostIoIo *io, HostSharedRecord owner,
 									   TxnMemtableTableAt at, bool has_seen, const TxnMemtableSplitSeen *seen,
 									   HostError *error);
+#ifdef DOLTGRES_TEST_TXN
+extern void test_txn_memtable_table_tests_a_refused_try_leaves_no_memtable_range_or_page_behind(void);
+extern void test_txn_memtable_table_tests_a_refused_try_of_two_trees_leaves_neither_memtable_behind(void);
 extern bool txn_memtable_table_first(const TxnMemtableTableTreeOps *tree, HostIoIo *io, HostSharedRecord owner,
 									 HostError *error);
+#endif
 extern bool txn_memtable_table_memtable(const TxnMemtableTableTreeOps *tree, HostSharedRecord owner, uint64 *result);
 extern bool txn_memtable_table_names(const TxnMemtableTableTreeOps *tree, HostSharedRecord owner, uint64 location);
 extern bool txn_memtable_table_abandoned(const TxnMemtableTableTreeOps *tree, HostIoIo *io, HostSharedRecord owner,
@@ -307,11 +346,11 @@ extern bool txn_memtable_table_readied(HostIoIo *io, bool has_rows, HostSharedRe
 									   bool tuple, bool (*inside) (void *captures, HostIoIo *io,
 																   TxnMemtableTablePreparedState *prepared,
 																   HostError *error), void *inside_captures,
-									   void (*inside_drop) (void *captures),
+									   void (*inside_drop) (void *captures), TxnMemtableTableRefusal *refused,
 									   HostError *error);
 extern bool txn_memtable_table_pushed(HostIoTakesShort io, TxnMemtableTablePreparedState *prepared, size_t index,
-									  const TxnMemtableVersionChange *change, TxnMemtableVersionHandle *result,
-									  HostError *error);
+									  const TxnMemtableVersionChange *change, bool has_roomed,
+									  TxnStatusRoomed roomed, TxnMemtableVersionHandle *result, HostError *error);
 extern bool txn_memtable_table_finished(HostIoTakesShort io, TxnMemtableTablePreparedState *prepared, size_t index,
 										const TxnMemtableVersionChange *change, bool has_roomed, TxnStatusRoomed roomed,
 										TxnMemtableVersionHandle *result,
@@ -334,7 +373,7 @@ extern bool txn_memtable_table_held(const TxnMemtableTableTreeOps *tree, HostIoI
 									const uint8 *key, size_t key_len, uint64 lsn, bool *result, HostError *error);
 extern bool txn_memtable_table_alone(const TxnMemtableTableTreeOps *tree, HostIoIo *io, HostSharedRecord owner,
 									 const uint8 *key, size_t key_len, const TxnMemtableVersionChange *change,
-									 TxnMemtableVersionHandle *result,
+									 bool has_roomed, TxnStatusRoomed roomed, TxnMemtableVersionHandle *result,
 									 HostError *error);
 extern bool txn_memtable_table_removed_all(const TxnMemtableTableTreeOps *tree, HostIoIo *io, HostSharedRecord owner,
 										   const TxnMemtableTableRemoving *keys, size_t keys_len, StdVec *result,
@@ -346,7 +385,7 @@ extern bool txn_memtable_table_copied(const TxnMemtableTableTreeOps *tree, HostI
 									  bool killed, bool (*each) (void *captures, HostIoIo *io, const uint8 *key,
 																 size_t key_len, const StdVec *records,
 																 size_t records_len,
-																 const txn_TupleHandleU64_t *handles,
+																 const txn_TupleHandleU64Bool_t *handles,
 																 size_t handles_len, HostError *error),
 									  void *captures,
 									  HostError *error);

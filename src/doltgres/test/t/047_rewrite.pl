@@ -1251,7 +1251,8 @@ for my $table ('relocated_held', 'relocated_standby')
 		"a new standby snapshot reads $table as heap's twin");
 	is($node->safe_psql('postgres', $stamp_read),
 		$stamp, "the move keeps the stamps of a row of $table updated to its own value");
-	eval { $standby_older->query('COMMIT'); $standby_older->quit };
+	eval { $standby_older->query('COMMIT') };
+	$standby_older->quit;
 }
 $relocating->stop;
 
@@ -1904,4 +1905,148 @@ for my $case (
 }
 
 $node->stop;
+
+# P2 (bugs row 229): a rewrite's carry never waits on other writers' versions.
+# Session A holds a REPEATABLE READ snapshot from before B, so no fold applies
+# B's commit; B commits about 10 MB of rows past a 4 MB delta_memory, which its
+# own spills relieve; C's VACUUM FULL of the table carries B's versions to spill
+# files under B's xid and completes. A still reads the table as it was, a new
+# snapshot reads B's rows, and a crash keeps them.
+my $budgeted = PostgreSQL::Test::Cluster->new('carry_budget');
+$budgeted->init;
+# A count's parallel workers would read the table through heap, since the fork's
+# routine stands in the leader alone.
+$budgeted->append_conf('postgresql.conf',
+	"delta_memory = 4MB\nfold_threshold = 1GB\nfold_timeout = 3600s\ncollector_naptime = 3600s\nmax_parallel_workers_per_gather = 0"
+);
+$budgeted->start;
+$budgeted->safe_psql('postgres',
+	'CREATE EXTENSION injection_points; CREATE EXTENSION doltgres_test; CREATE TABLE carried (k int4 PRIMARY KEY, v text)'
+);
+my $carried_count = rows('carried', 'SELECT count(*) FROM %');
+my $before_carry = $budgeted->background_psql('postgres');
+$before_carry->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
+$budgeted->safe_psql('postgres',
+	written('carried', "INSERT INTO % SELECT g, repeat(md5(g::text), 31) FROM generate_series(1, 10000) g"));
+$budgeted->safe_psql('postgres', rewritten('carried', undef, 'false'), timeout => 600);
+pass('a VACUUM FULL over another transaction\'s committed rows past delta_memory, held unfolded by a snapshot, completes');
+is($before_carry->query_safe($carried_count), '0', 'the older snapshot still reads none of the committed rows');
+$before_carry->query_safe('COMMIT');
+$before_carry->quit;
+is($budgeted->safe_psql('postgres', $carried_count), '10000', 'a new snapshot reads every row the carry spilled');
+$budgeted->stop('immediate');
+$budgeted->start;
+is($budgeted->safe_psql('postgres', $carried_count), '10000', 'the carried rows survive a crash');
+
+# A carry the server crashes in, after its files are written and before they
+# are listed: after the restart, whose redo replays the carry's records into
+# the new relfilenode its transaction left, the table reads as it was before
+# the rewrite, and a rewrite then carries every row.
+$before_carry = $budgeted->background_psql('postgres');
+$before_carry->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
+$budgeted->safe_psql('postgres',
+	written('carried', "INSERT INTO % SELECT g, repeat(md5(g::text), 31) FROM generate_series(10001, 20000) g"));
+$budgeted->safe_psql('postgres', "SELECT injection_points_attach('doltgres-carry-written', 'wait')");
+my $cut_short = $budgeted->background_psql('postgres', on_error_stop => 0);
+$cut_short->query_until(qr/start/, "\\echo start\n" . rewritten('carried', undef, 'false') . ";\n");
+$budgeted->wait_for_event('client backend', 'doltgres-carry-written');
+$budgeted->stop('immediate');
+eval { $cut_short->quit };
+eval { $before_carry->quit };
+$budgeted->start;
+is($budgeted->safe_psql('postgres', $carried_count), '20000', 'the table reads as it was before the rewrite');
+$budgeted->safe_psql('postgres', rewritten('carried', undef, 'false'), timeout => 600);
+is($budgeted->safe_psql('postgres', $carried_count), '20000', 'a rewrite after the restart carries every row');
+$budgeted->stop;
+
+# Ruling (b)'s case (iii): a moved table's base on a standby is its primary's,
+# root, fold point, and read point alike, its read point no higher than its fold
+# point.
+my $points = PostgreSQL::Test::Cluster->new('moved_points');
+$points->init(allows_streaming => 1);
+$points->append_conf('postgresql.conf',
+	"fold_threshold = 1GB\nfold_timeout = 3600s\ncollector_naptime = 3600s\nallow_in_place_tablespaces = on");
+$points->start;
+$points->safe_psql('postgres',
+	q{CREATE EXTENSION doltgres_test; CREATE TABLESPACE points_moved LOCATION ''; CREATE TABLE pointed (k int4 PRIMARY KEY, v text)});
+$points->safe_psql('postgres', written('pointed', "INSERT INTO % SELECT g, 'r' || g FROM generate_series(1, 2000) g"));
+$points->safe_psql('postgres', "SELECT doltgres_test_fold('pointed')");
+$points->backup('points_backup');
+my $points_standby = PostgreSQL::Test::Cluster->new('moved_points_standby');
+$points_standby->init_from_backup($points, 'points_backup', has_streaming => 1);
+$points_standby->append_conf('postgresql.conf', 'allow_in_place_tablespaces = on');
+$points_standby->start;
+$points->safe_psql('postgres', written('pointed', "INSERT INTO % SELECT g, 'r' || g FROM generate_series(2001, 2100) g"));
+$points->safe_psql('postgres', "SELECT doltgres_test_move('pointed', 'points_moved')");
+$points->wait_for_catchup($points_standby);
+my $primary_points = $points->safe_psql('postgres', "SELECT doltgres_test_base_points('pointed')");
+my ($root, $folded, $read) = split / /, $primary_points;
+ok($root ne '' && $read <= $folded, "a moved base's read point is no higher than its fold point");
+is($points_standby->safe_psql('postgres', "SELECT doltgres_test_base_points('pointed')"),
+	$primary_points, "a standby's base of a moved table has its primary's root, fold point, and read point");
+$points_standby->stop;
+$points->stop;
+
+# RevA's Q2 guard: a committed transaction's free space takes sit above those
+# of a writer begun after it, which commits while a snapshot taken before its
+# commit holds the table's horizon, so the move's fold keeps the takes above the
+# later writer's with its rows' out-of-line values; the move lowers the moved
+# base's read point below its fold point, and a rewrite before any fold carries
+# every row, so the table's rows and values equal heap's twin's, and no tuple id
+# is given twice.
+my $guarded = PostgreSQL::Test::Cluster->new('rewrite_guard');
+$guarded->init;
+$guarded->append_conf('postgresql.conf',
+	"fold_threshold = 1GB\nfold_timeout = 3600s\ncollector_naptime = 3600s\nallow_in_place_tablespaces = on\nmax_parallel_workers_per_gather = 0"
+);
+$guarded->start;
+$guarded->safe_psql(
+	'postgres', q{
+CREATE EXTENSION doltgres_test;
+CREATE TABLESPACE guard_moved LOCATION '';
+CREATE TABLE guarded (k int4 PRIMARY KEY, v text);
+CREATE TABLE heap_guarded (k int4 PRIMARY KEY, v text);
+});
+my $long = "string_agg(md5(g::text || ':' || n::text), '') FROM generate_series(1, 120) n";
+for my $table ('guarded', 'heap_guarded')
+{
+	$guarded->safe_psql('postgres',
+		written($table, "INSERT INTO % SELECT g, 'r' || g FROM generate_series(1, 400) g"));
+}
+$guarded->safe_psql('postgres', "SELECT doltgres_test_fold('guarded')");
+my ($kept, $running) = map { $guarded->background_psql('postgres') } 1 .. 2;
+$kept->query_safe('BEGIN; SELECT pg_current_xact_id()');
+$running->query_safe('BEGIN');
+for my $table ('guarded', 'heap_guarded')
+{
+	$running->query_safe(written($table, "INSERT INTO % SELECT g, 'o' || g FROM generate_series(401, 405) g"));
+}
+for my $table ('guarded', 'heap_guarded')
+{
+	$kept->query_safe(written($table, "INSERT INTO % SELECT g, (SELECT $long) FROM generate_series(406, 430) g"));
+}
+$kept->query_safe('COMMIT');
+$kept->quit;
+my $holder = $guarded->background_psql('postgres');
+$holder->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
+$running->query_safe('COMMIT');
+$running->quit;
+$guarded->safe_psql('postgres', "SELECT doltgres_test_move('guarded', 'guard_moved')");
+$holder->query_safe('COMMIT');
+$holder->quit;
+my ($guard_root, $guard_folded, $guard_read) =
+  split / /, $guarded->safe_psql('postgres', "SELECT doltgres_test_base_points('guarded')");
+cmp_ok($guard_read, '<', $guard_folded,
+	"a move over takes its fold kept above a later writer's lowers the moved base's read point");
+$guarded->safe_psql('postgres', rewritten('guarded', undef, 'false'));
+my $guard_rows = "SELECT count(*) || ' ' || md5(string_agg(k || ':' || v, ',' ORDER BY k)) FROM %";
+my $unindexed = 'SET enable_indexscan = off; SET enable_indexonlyscan = off; SET enable_bitmapscan = off;';
+is($guarded->safe_psql('postgres', "$unindexed " . rows('guarded', $guard_rows)),
+	$guarded->safe_psql('postgres', rows('heap_guarded', $guard_rows)),
+	"a rewrite of the moved table before any fold carries every row and value as heap's twin holds them");
+is( $guarded->safe_psql('postgres',
+		q{SELECT count(*) = count(DISTINCT substring(r from '^(\S+) ')) FROM doltgres_test_scan('guarded', false, -1) r}),
+	't', 'and gives no tuple id twice');
+$guarded->stop;
+
 done_testing();
