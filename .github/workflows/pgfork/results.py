@@ -143,7 +143,8 @@ INT8_TBL = [("123", "456"), ("123", "4567890123456789"), ("4567890123456789", "1
 # takes a column's values as an aggregate without ORDER BY builds them, the same elements in any order (or, given a
 # list, as many different ones of it as Postgres' value holds), as `gathered` checks; and `cursor` takes the fetches
 # from a cursor over rows in no defined order, its rows (each time its DECLARE comes, the rows its query has then, and
-# how many of them it returns) taken in one order, as `Cursors` checks.
+# how many of them it returns) taken in one order, as `Cursors` checks; and `either` takes a column whose value compares
+# results in no defined order, so that any of its listed values is right, every other value equal.
 EXCEPTIONS = [
     ("with", "WITH t AS (\n    UPDATE y SET a = a * 100 RETURNING *\n)\nSELECT * FROM t LIMIT 10;",
      ("some_of", ["1100", "1200", "1300", "1400", "1500", "4200", "0", "-100", "-200", "-300", "-400", "-500", "-600",
@@ -247,6 +248,8 @@ EXCEPTIONS = [
     ("limit", "declare c3 cursor for select * from int8_tbl offset 3;", ("cursor", "c3", [(INT8_TBL, 2)])),
     ("limit", "declare c5 cursor for select * from int8_tbl order by q1 fetch first 2 rows with ties;",
      ("cursor", "c5", [(INT8_TBL[:2], 2)])),
+    ("gin", "  lateral execute_text_query_heap($$select string_agg((i, j)::text, ' ') from t_gin_test_tbl where $$ "
+     "|| query) res_heap;", ("either", "match", ["t", "f"])),
 ]
 
 
@@ -703,6 +706,15 @@ def excepted(test, script, expected, received, order=DEFINED):
         return noticed(check[1], order, expected, received)
     if check and check[0] == "elements":
         return gathered(check, expected, received)
+    if check and check[0] == "either":
+        mine, theirs = table(expected), table(received)
+        if not mine or not theirs or mine[0] != theirs[0] or mine[2] != theirs[2] or len(mine[1]) != len(theirs[1]):
+            return False
+        names = cells(mine[0], [[mine[0][-2]]])[0][1]
+        k = names.index(check[1]) if check[1] in names else None
+        return k is not None and all(
+            a and b and a[:k] + a[k + 1:] == b[:k] + b[k + 1:] and b[k] in check[2]
+            for (_, a), (_, b) in zip(cells(mine[0], mine[1]), cells(theirs[0], theirs[1])))
     mine, theirs = table(expected), table(received)
     if not check or not mine or not theirs:
         return False

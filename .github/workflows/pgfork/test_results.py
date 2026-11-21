@@ -328,6 +328,15 @@ class Exceptions(unittest.TestCase):
             self.assertFalse(same("limit", script, expected, out("BEGIN", [], *wrong, "COMMIT")), wrong)
         self.assertFalse(same("other", script, expected, received))
 
+    def test_an_either_column_takes_any_listed_value(self):
+        query = [results.EXCEPTIONS[[e[2][0] for e in results.EXCEPTIONS].index("either")][1]]
+        expected = aligned([("i", "7.00", "t"), ("j", "6.00", "t")], ("query", "removed", "match"))
+        self.assertTrue(excepted("gin", query, expected, aligned([("i", "7.00", "f"), ("j", "6.00", "t")],
+                                                                 ("query", "removed", "match"))))
+        for wrong in [[("i", "7.00", "x"), ("j", "6.00", "t")], [("i", "6.00", "f"), ("j", "6.00", "t")],
+                      [("i", "7.00", "f")]]:
+            self.assertFalse(excepted("gin", query, expected, aligned(wrong, ("query", "removed", "match"))))
+
 
 class Copies(unittest.TestCase):
     """COPY to psql's output, whose lines come in no defined order when its source has none."""
