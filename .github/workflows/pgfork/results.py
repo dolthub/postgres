@@ -125,6 +125,10 @@ ENCODINGS = ("notices", r"^NOTICE:  (EUC_\w+|LATIN1|UTF8) ")
 ROW_TRIGGERS = ("notices", r"^NOTICE:  (?P<phase>BEFORE|AFTER) (INSERT|UPDATE|DELETE) ROW trigger row: (?P<key>.*)$")
 BLEATS = ("notices", r"^NOTICE:  bleat -?\d+$")
 
+# The rows of test_setup's int8_tbl, which the regression tests read in no defined order.
+INT8_TBL = [("123", "456"), ("123", "4567890123456789"), ("4567890123456789", "123"),
+            ("4567890123456789", "4567890123456789"), ("4567890123456789", "-4567890123456789")]
+
 # The units of tests whose valid outputs are more than Postgres' expected output shows, as Doltgrust's regression
 # runner lists them: by test and statement, how a received table with the expected table's columns and number of rows
 # is checked. `some_of` takes different ones of every row Postgres returns for the statement without its LIMIT,
@@ -134,7 +138,9 @@ BLEATS = ("notices", r"^NOTICE:  bleat -?\d+$")
 # values joined by newlines without ORDER BY shows them; `notices` takes the lines a pattern matches, the NOTICEs a
 # statement raises once per row it reads, in any order within each run of them, as `noticed` checks; and `elements`
 # takes a column's values as an aggregate without ORDER BY builds them, the same elements in any order (or, given a
-# list, as many different ones of it as Postgres' value holds), as `gathered` checks.
+# list, as many different ones of it as Postgres' value holds), as `gathered` checks; and `cursor` takes the fetches
+# from a cursor over rows in no defined order, its rows (each time its DECLARE comes, the rows its query has then, and
+# how many of them it returns) taken in one order, as `Cursors` checks.
 EXCEPTIONS = [
     ("with", "WITH t AS (\n    UPDATE y SET a = a * 100 RETURNING *\n)\nSELECT * FROM t LIMIT 10;",
      ("some_of", ["1100", "1200", "1300", "1400", "1500", "4200", "0", "-100", "-200", "-300", "-400", "-500", "-600",
@@ -233,6 +239,11 @@ EXCEPTIONS = [
      ("elements", "json", "json_build_object", ("turbines",), None)),
     ("xml", "SELECT xmlelement(name employees, xmlagg(xmlelement(name name, name))) FROM emp;",
      ("elements", "xml", "xmlelement", (), None)),
+    ("limit", "declare c1 cursor for select * from int8_tbl limit 10;", ("cursor", "c1", [(INT8_TBL, 5)])),
+    ("limit", "declare c2 cursor for select * from int8_tbl limit 3;", ("cursor", "c2", [(INT8_TBL, 3)])),
+    ("limit", "declare c3 cursor for select * from int8_tbl offset 3;", ("cursor", "c3", [(INT8_TBL, 2)])),
+    ("limit", "declare c5 cursor for select * from int8_tbl order by q1 fetch first 2 rows with ties;",
+     ("cursor", "c5", [(INT8_TBL[:2], 2)])),
 ]
 
 
@@ -597,12 +608,94 @@ def gathered(check, expected, received):
     return True
 
 
+class Cursors:
+    """Follows the cursors a test's `cursor` checks name through its units: where each one stands, and which of its
+    rows each position holds in Postgres' output and in the received one, as Postgres' DoPortalRunFetch moves it."""
+
+    def __init__(self, test):
+        self.checks = [(text, check) for name, text, check in EXCEPTIONS if name == test and check[0] == "cursor"]
+        self.seen, self.open = {}, {}
+
+    def declared(self, stmt, text):
+        """Opens a listed cursor at its DECLARE, before its first row, with the rows of this DECLARE's turn."""
+        for listed, check in self.checks:
+            if stmt.portalname == check[1] and text.strip().rstrip(";") == listed.strip().rstrip(";"):
+                turn = self.seen.get(listed, 0)
+                self.seen[listed] = turn + 1
+                if turn < len(check[2]):
+                    rows, count = check[2][turn]
+                    self.open[stmt.portalname] = {"rows": [tuple(row) for row in rows], "count": count, "at": 0,
+                                                  "mine": {}, "theirs": {}}
+                else:
+                    self.open.pop(stmt.portalname, None)
+
+    def positions(self, cursor, stmt):
+        """Returns the positions a FETCH or MOVE reads, in the order it returns them, and moves the cursor."""
+        at, count, many = cursor["at"], cursor["count"], stmt.howMany
+        if stmt.direction == enums.FetchDirection.FETCH_ABSOLUTE:
+            target = many if many >= 0 else count + 1 + many
+        elif stmt.direction == enums.FetchDirection.FETCH_RELATIVE:
+            target = at + many
+        if stmt.direction in (enums.FetchDirection.FETCH_ABSOLUTE, enums.FetchDirection.FETCH_RELATIVE):
+            cursor["at"] = min(max(target, 0), count + 1)
+            return [target] if 1 <= target <= count else []
+        step = 1 if stmt.direction == enums.FetchDirection.FETCH_FORWARD else -1
+        if many == 0:
+            return [at] if 1 <= at <= count else []
+        read = []
+        while len(read) < many and 1 <= at + step <= count:
+            at += step
+            read.append(at)
+        cursor["at"] = at if len(read) == many else (count + 1 if step > 0 else 0)
+        return read
+
+    def fetched(self, script, expected, received):
+        """Returns None unless a unit's last statement fetches from or moves a listed cursor; otherwise whether both
+        outputs hold the rows its positions hold, each position keeping one row and each row of the cursor's rows taken
+        at most once, with everything but the rows equal."""
+        text = "\n".join("" if line.lstrip().startswith("\\") else line for line in script)
+        try:
+            parts = [(text[part], parse_sql(text[part])) for part in parser.split(text, with_parser=False,
+                                                                                  only_slices=True)]
+        except Exception:
+            return None
+        stmts = [(source, raw.stmt) for source, raws in parts for raw in raws]
+        for source, stmt in stmts:
+            if isinstance(stmt, ast.DeclareCursorStmt):
+                self.declared(stmt, source)
+        if not stmts or not isinstance(stmts[-1][1], ast.FetchStmt) or stmts[-1][1].portalname not in self.open:
+            return None
+        stmt = stmts[-1][1]
+        cursor = self.open[stmt.portalname]
+        read = self.positions(cursor, stmt)
+        if stmt.ismove:
+            return expected == received and expected[:1] == [f"MOVE {len(read)}"]
+        mine, theirs = table(expected), table(received)
+        if not mine or not theirs or mine[2] != theirs[2] or len(mine[1]) != len(read) or len(theirs[1]) != len(read):
+            return False
+        names = lambda head: cells(head, [[head[-2]]])[0][1]
+        if names(mine[0]) != names(theirs[0]):
+            return False
+        for side, found in (("mine", cells(mine[0], mine[1])), ("theirs", cells(theirs[0], theirs[1]))):
+            held = cursor[side]
+            for position, (_, values) in zip(read, found):
+                row = tuple(values)
+                if position in held:
+                    if held[position] != row:
+                        return False
+                elif row not in cursor["rows"] or list(held.values()).count(row) >= cursor["rows"].count(row):
+                    return False
+                held[position] = row
+        return True
+
+
 def excepted(test, script, expected, received, order=DEFINED):
     """Returns whether a unit of a test, whose statement returns rows in an order, is one of `EXCEPTIONS` and passes its
     check: `notices` by `noticed`, and every other check only when the received table has the expected table's columns
     and number of rows."""
     query = "\n".join(script)
-    check = next((valid for name, text, valid in EXCEPTIONS if name == test and query.endswith(text)), None)
+    check = next((valid for name, text, valid in EXCEPTIONS
+                  if name == test and valid[0] != "cursor" and query.endswith(text)), None)
     if check and check[0] == "notices":
         return noticed(check[1], order, expected, received)
     if check and check[0] == "elements":
@@ -661,9 +754,14 @@ def same(test, script, expected, received):
     mine, theirs = units(script, expected), units(script, received)
     if [lines for lines, _ in mine] != [lines for lines, _ in theirs]:
         return False
-    statements = Statements()
+    statements, cursors = Statements(), Cursors(test)
     for (lines, out), (_, other) in zip(mine, theirs):
         order = statements.order(lines)
+        fetched = cursors.fetched(lines, out, other)
+        if fetched is not None:
+            if not fetched:
+                return False
+            continue
         if out == other:
             continue
         if isinstance(order, tuple) and order[0] == "copy":

@@ -304,6 +304,26 @@ class Exceptions(unittest.TestCase):
         self.assertNotEqual(unordered("xml", value, ()), unordered("xml", "<f><n>b</n><n>a</n></f>", ()))
         self.assertIsNone(unordered("xml", "<e>", ()))
 
+    def test_a_cursors_fetches_take_one_order_of_its_rows(self):
+        script = ["begin;", "declare c1 cursor for select * from int8_tbl limit 10;", "fetch 2 in c1;",
+                  "fetch backward 1 in c1;", "fetch all in c1;", "fetch backward all in c1;", "move forward 2 in c1;",
+                  "fetch relative 0 in c1;", "fetch absolute -1 in c1;", "commit;"]
+        rows = results.INT8_TBL
+        out = lambda *fetched: sum(([line] + (aligned([rows[i] for i in batch], ("q1", "q2")) if isinstance(batch, list)
+                                              else [batch]) for line, batch in zip(script, fetched)), [])
+        expected = out("BEGIN", [], [0, 1], [0], [1, 2, 3, 4], [4, 3, 2, 1, 0], "MOVE 2", [1], [4], "COMMIT")
+        self.assertTrue(same("limit", script, expected, expected))
+        received = out("BEGIN", [], [4, 2], [4], [2, 0, 1, 3], [3, 1, 0, 2, 4], "MOVE 2", [2], [3], "COMMIT")
+        self.assertTrue(same("limit", script, expected, received))
+        for wrong in [[4, 2], [3], [2, 0, 1, 3], [3, 1, 0, 2, 4], "MOVE 2", [2], [3]], \
+                [[4, 2], [4], [2, 0, 1, 4], [4, 1, 0, 2, 4], "MOVE 2", [2], [4]], \
+                [[4, 2], [4], [2, 0, 1], [1, 0, 2, 4], "MOVE 2", [2], [1]], \
+                [[4, 2], [4], [2, 0, 1, 3], [3, 1, 0, 2, 4], "MOVE 2", [0], [3]], \
+                [[4, 2], [4], [2, 0, 1, 3], [3, 1, 0, 2, 4], "MOVE 2", [2], [4]], \
+                [[4, 2], [4], [2, 0, 1, 3], [3, 1, 0, 2, 4], "MOVE 3", [2], [3]]:
+            self.assertFalse(same("limit", script, expected, out("BEGIN", [], *wrong, "COMMIT")), wrong)
+        self.assertFalse(same("other", script, expected, received))
+
 
 class Copies(unittest.TestCase):
     """COPY to psql's output, whose lines come in no defined order when its source has none."""
