@@ -25,7 +25,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import results  # noqa: E402
-from results import ANY, DEFINED, Statements, columns, copied, excepted, joined, same, valid  # noqa: E402
+from results import ANY, DEFINED, Statements, columns, copied, excepted, joined, noticed, same, valid  # noqa: E402
 
 
 def sorted_by(keys, cut_start=False, cut_end=False):
@@ -212,6 +212,45 @@ class Exceptions(unittest.TestCase):
         self.assertTrue(excepted("psql_crosstab", query, expected, other))
         self.assertFalse(excepted("psql_crosstab", query, expected, [line.replace("dbl", "dbx") for line in other]))
         self.assertFalse(excepted("psql_crosstab", query, expected, [line.replace(" baz", " bay") for line in other]))
+
+    def test_row_notices_come_in_any_order_within_their_run(self):
+        f_leak = results.F_LEAK[1]
+        rows = ["NOTICE:  f_leak => a", "NOTICE:  f_leak => b", "NOTICE:  f_leak => c"]
+        expected = rows + render([("1", "a"), ("2", "b")])
+        received = [rows[2], rows[0], rows[1]] + render([("2", "b"), ("1", "a")])
+        self.assertTrue(noticed(f_leak, ANY, expected, received))
+        self.assertFalse(noticed(f_leak, DEFINED, expected, received))
+        self.assertFalse(noticed(f_leak, ANY, expected, [rows[2], rows[0], rows[0]] + received[3:]))
+        self.assertFalse(noticed(f_leak, ANY, expected, [rows[2], rows[0]] + received[3:]))
+        self.assertFalse(noticed(f_leak, ANY, expected, received[:3] + render([("2", "b"), ("1", "x")])))
+        self.assertFalse(noticed(f_leak, ANY, expected, received[1:3] + render([("2", "b")])[:2] + [rows[0]]
+                                 + render([("2", "b"), ("1", "a")])[2:]))
+        self.assertTrue(excepted("rowsecurity", ["SELECT * FROM t1 WHERE f_leak(b);"], expected, received, ANY))
+        self.assertFalse(excepted("rowsecurity", ["SELECT * FROM t2 WHERE f_leak(b);"], expected, received, ANY))
+
+    def test_unmatched_notices_keep_their_places(self):
+        f_leak = results.F_LEAK[1]
+        expected = ["NOTICE:  f_leak => a", "NOTICE:  f_leak => b", "NOTICE:  other", "NOTICE:  f_leak => c"]
+        self.assertTrue(noticed(f_leak, DEFINED, expected, [expected[1], expected[0], expected[2], expected[3]]))
+        self.assertFalse(noticed(f_leak, DEFINED, expected, [expected[3], expected[1], expected[2], expected[0]]))
+        self.assertFalse(noticed(f_leak, DEFINED, expected, [expected[2], expected[1], expected[0], expected[3]]))
+        self.assertFalse(noticed(f_leak, DEFINED, expected, [*expected[:2], "NOTICE:  another", expected[3]]))
+
+    def test_row_triggers_keep_their_phases_and_one_row_order(self):
+        triggers = results.ROW_TRIGGERS[1]
+        line = lambda phase, row: f"NOTICE:  {phase} UPDATE ROW trigger row: {row}"
+        statement = "NOTICE:  BEFORE UPDATE STATEMENT trigger"
+        expected = [statement] + [line(p, r) for p in ("BEFORE", "AFTER") for r in ("(1,1)", "(2,2)", "(3,3)")]
+        reordered = [statement] + [line(p, r) for p in ("BEFORE", "AFTER") for r in ("(3,3)", "(1,1)", "(2,2)")]
+        self.assertTrue(noticed(triggers, DEFINED, expected, reordered))
+        mixed = [statement] + [line(p, r) for p, r in [("BEFORE", "(3,3)"), ("BEFORE", "(1,1)"), ("BEFORE", "(2,2)"),
+                                                       ("AFTER", "(1,1)"), ("AFTER", "(3,3)"), ("AFTER", "(2,2)")]]
+        self.assertFalse(noticed(triggers, DEFINED, expected, mixed))
+        crossed = [statement] + [line(p, r) for p, r in [("BEFORE", "(1,1)"), ("BEFORE", "(2,2)"), ("AFTER", "(3,3)"),
+                                                         ("BEFORE", "(3,3)"), ("AFTER", "(1,1)"), ("AFTER", "(2,2)")]]
+        self.assertFalse(noticed(triggers, DEFINED, expected, crossed))
+        self.assertFalse(noticed(triggers, DEFINED, expected, [reordered[1]] + [statement] + reordered[2:]))
+
 
 
 class Copies(unittest.TestCase):

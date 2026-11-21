@@ -113,13 +113,24 @@ COPY_OPTION = r"\b{}\b(?!\s*(?:=\s*)?(?:false|off|0)\b)"
 # index whose expression is the key, as Postgres looks up a bare name in ORDER BY.
 ANY, DEFINED = "any", "defined"
 
+# The NOTICEs that functions of the regression tests raise once per row they read, each in a `notices` check: f_leak's,
+# snoop's, and tattle's, a PL/pgSQL loop's rows, test_encoding's lines, and merge's row triggers, whose rows fire their
+# BEFORE triggers and then their AFTER triggers in one order.
+F_LEAK = ("notices", r"^NOTICE:  f_leak => ")
+SNOOPED = ("notices", r"^NOTICE:  snooped value: ")
+TATTLED = ("notices", r"^NOTICE:  x = \d+, y = \d+$")
+RAISED_ROWS = ("notices", r"^NOTICE:  \d+$")
+ENCODINGS = ("notices", r"^NOTICE:  (EUC_\w+|LATIN1|UTF8) ")
+ROW_TRIGGERS = ("notices", r"^NOTICE:  (?P<phase>BEFORE|AFTER) (INSERT|UPDATE|DELETE) ROW trigger row: (?P<key>.*)$")
+
 # The units of tests whose valid outputs are more than Postgres' expected output shows, as Doltgrust's regression
 # runner lists them: by test and statement, how a received table with the expected table's columns and number of rows
 # is checked. `some_of` takes different ones of every row Postgres returns for the statement without its LIMIT,
 # recorded at the same point of its test, as LIMIT without ORDER BY picks any of them; `joined` takes a `bytea` value
 # that is these values, in hex, in any order with the delimiter between them, as `string_agg` without ORDER BY joins
-# them; and `lines` takes the expected rows but for the order of the lines of each value, as a crosstab of `string_agg`
-# values joined by newlines without ORDER BY shows them.
+# them; `lines` takes the expected rows but for the order of the lines of each value, as a crosstab of `string_agg`
+# values joined by newlines without ORDER BY shows them; and `notices` takes the lines a pattern matches, the NOTICEs a
+# statement raises once per row it reads, in any order within each run of them, as `noticed` checks.
 EXCEPTIONS = [
     ("with", "WITH t AS (\n    UPDATE y SET a = a * 100 RETURNING *\n)\nSELECT * FROM t LIMIT 10;",
      ("some_of", ["1100", "1200", "1300", "1400", "1500", "4200", "0", "-100", "-200", "-300", "-400", "-500", "-600",
@@ -141,6 +152,38 @@ EXCEPTIONS = [
      "FROM ctv_data GROUP BY v, h ORDER BY h,v\n \\crosstabview 2 1 4", ("lines",)),
     ("psql_crosstab", "SELECT v,h, string_agg(i::text, E'\\n') AS i, string_agg(c, E'\\n') AS c\n"
      "FROM ctv_data GROUP BY v, h ORDER BY h,v\n \\crosstabview 1 \"h\" 4", ("lines",)),
+    ('rowsecurity', 'SELECT * FROM t1 WHERE f_leak(b);', F_LEAK),
+    ('rowsecurity', 'SELECT * FROM part_document WHERE f_leak(dtitle) ORDER BY did;', F_LEAK),
+    ('rowsecurity', 'SELECT * FROM part_document_satire WHERE f_leak(dtitle) ORDER BY did;', F_LEAK),
+    ('rowsecurity', 'UPDATE t1 SET b = b WHERE f_leak(b) RETURNING *;', F_LEAK),
+    ('rowsecurity', 'UPDATE t1 SET b = b WHERE f_leak(b) RETURNING tableoid::regclass, *, t1;', F_LEAK),
+    ('rowsecurity', 'DELETE FROM t1 WHERE f_leak(b) RETURNING tableoid::regclass, *, t1;', F_LEAK),
+    ('rowsecurity', 'SELECT * FROM bv1 WHERE f_leak(b);', F_LEAK),
+    ('rowsecurity', 'SELECT * FROM z1 WHERE f_leak(b);', F_LEAK),
+    ('rowsecurity', 'SELECT * FROM rls_view;', F_LEAK),
+    ('rowsecurity', 'SELECT * FROM x1 WHERE f_leak(b) ORDER BY a ASC;', F_LEAK),
+    ('rowsecurity', "UPDATE x1 SET b = b || '_updt' WHERE f_leak(b) RETURNING *;", F_LEAK),
+    ('rowsecurity', 'DELETE FROM x1 WHERE f_leak(b) RETURNING *;', F_LEAK),
+    ('rowsecurity', 'SELECT * FROM y2 WHERE f_leak(b);', F_LEAK),
+    ('rowsecurity', 'SELECT * FROM y2 JOIN test_qual_pushdown ON (b = abc) WHERE f_leak(b);', F_LEAK),
+    ('rowsecurity', 'WITH cte1 AS MATERIALIZED (SELECT * FROM t1 WHERE f_leak(b)) SELECT * FROM cte1;', F_LEAK),
+    ('select_views', 'SELECT * FROM my_credit_card_normal WHERE f_leak(cnum);', F_LEAK),
+    ('merge', 'MERGE INTO target t\nUSING source AS s\nON t.tid = s.sid\nWHEN MATCHED AND t.balance > s.delta THEN\n\tUPDATE SET balance = t.balance - s.delta\nWHEN MATCHED THEN\n\tDELETE\nWHEN NOT MATCHED THEN\n\tINSERT VALUES (s.sid, s.delta);', ROW_TRIGGERS),
+    ('merge', 'MERGE INTO target t\nUSING source AS s\nON t.tid = s.sid\nWHEN MATCHED AND t.balance > s.delta THEN\n    UPDATE SET balance = t.balance - s.delta\nWHEN MATCHED THEN\n\tUPDATE SET balance = 0\nWHEN NOT MATCHED THEN\n    INSERT VALUES (s.sid, s.delta)\nWHEN NOT MATCHED BY SOURCE AND tid = 1 THEN\n\tUPDATE SET balance = 0\nWHEN NOT MATCHED BY SOURCE THEN\n\tDELETE\nRETURNING merge_action(), old, new, t.*;', ROW_TRIGGERS),
+    ('merge', "DO $$\nDECLARE\n  result integer;\nBEGIN\nMERGE INTO target t\nUSING source AS s\nON t.tid = s.sid\nWHEN MATCHED AND s.sid = 3 THEN UPDATE SET balance = t.balance + s.delta\nWHEN MATCHED THEN DELETE\nWHEN NOT MATCHED THEN INSERT VALUES (sid, delta);\nIF FOUND THEN\n  RAISE NOTICE 'Found';\nELSE\n  RAISE NOTICE 'Not found';\nEND IF;\nGET DIAGNOSTICS result := ROW_COUNT;\nRAISE NOTICE 'ROW_COUNT = %', result;\nEND;\n$$;", ROW_TRIGGERS),
+    ('merge', 'MERGE INTO target t1\nUSING target t2\nON t1.tid = t2.tid\nWHEN MATCHED THEN\n\tUPDATE SET balance = t1.balance + t2.balance\nWHEN NOT MATCHED THEN\n\tINSERT VALUES (t2.tid, t2.balance);', ROW_TRIGGERS),
+    ('plancache', 'select cachebug();', RAISED_ROWS),
+    ('encoding', 'SELECT COUNT(test_encoding(encoding, description, input)) > 0\nFROM encoding_tests;', ENCODINGS),
+    ('updatable_views', 'SELECT * FROM rw_view1 WHERE snoop(person);', SNOOPED),
+    ('updatable_views', 'UPDATE rw_view1 SET person=person WHERE snoop(person);', SNOOPED),
+    ('updatable_views', 'DELETE FROM rw_view1 WHERE NOT snoop(person);', SNOOPED),
+    ('updatable_views', "MERGE INTO rw_view1 t\n  USING (VALUES ('Tom'), ('Dick'), ('Harry')) AS v(person) ON t.person = v.person\n  WHEN MATCHED AND snoop(t.person) THEN UPDATE SET person = v.person;", SNOOPED),
+    ('updatable_views', 'SELECT * FROM rw_view2 WHERE snoop(person);', SNOOPED),
+    ('updatable_views', 'UPDATE rw_view2 SET person=person WHERE snoop(person);', SNOOPED),
+    ('updatable_views', 'DELETE FROM rw_view2 WHERE NOT snoop(person);', SNOOPED),
+    ('updatable_views', "MERGE INTO rw_view2 t\n  USING (VALUES ('Tom'), ('Dick'), ('Harry')) AS v(person) ON t.person = v.person\n  WHEN MATCHED AND snoop(t.person) THEN UPDATE SET person = v.person;", SNOOPED),
+    ('updatable_views', 'DELETE FROM v1 WHERE snoop(a) AND leakproof(a); -- should not delete everything, just where a>5', SNOOPED),
+    ('subselect', 'select * from\n  (select tattle(3, ten) as v, count(*) from tenk1 where unique1 < 3 group by 1) ss\n  where ss.v;', TATTLED),
 ]
 
 
@@ -387,11 +430,49 @@ def joined(text, values, delimiter):
     return False
 
 
-def excepted(test, script, expected, received):
-    """Returns whether a unit of a test is one of `EXCEPTIONS` whose received table has the expected table's columns
-    and number of rows and passes its check."""
+def noticed(pattern, order, expected, received):
+    """Returns whether two outputs differ only in the order of the lines a pattern matches within each run of them, the
+    rest equal or in an order the statement allows. The matched lines keep their places, each run (consecutive matched
+    lines of one `phase` group) holds the same lines, and the rows a `key` group names keep one order across runs, as a
+    statement's BEFORE and AFTER row triggers fire for its rows in one order."""
+    match = re.compile(pattern).match
+    mine = [i for i, line in enumerate(expected) if match(line)]
+    if mine != [i for i, line in enumerate(received) if match(line)]:
+        return False
+    rest = lambda lines: [line for i, line in enumerate(lines) if i not in set(mine)]
+    if rest(expected) != rest(received) and not valid(order, rest(expected), rest(received)):
+        return False
+    group = lambda line, name: match(line).groupdict().get(name)
+    runs = []
+    for i in mine:
+        if runs and runs[-1][-1] == i - 1 and group(expected[i], "phase") == group(expected[i - 1], "phase"):
+            runs[-1].append(i)
+        else:
+            runs.append([i])
+    before = set()
+    for run in runs:
+        lines = [received[i] for i in run]
+        if sorted(lines) != sorted(expected[i] for i in run):
+            return False
+        keys = [group(line, "key") for line in lines]
+        if any(group(line, "phase") != group(expected[run[0]], "phase") for line in lines):
+            return False
+        pairs = [(earlier, later) for j, later in enumerate(keys) for earlier in keys[:j]
+                 if None not in (earlier, later) and earlier != later]
+        if any((later, earlier) in before for earlier, later in pairs):
+            return False
+        before.update(pairs)
+    return True
+
+
+def excepted(test, script, expected, received, order=DEFINED):
+    """Returns whether a unit of a test, whose statement returns rows in an order, is one of `EXCEPTIONS` and passes its
+    check: `notices` by `noticed`, and every other check only when the received table has the expected table's columns
+    and number of rows."""
     query = "\n".join(script)
     check = next((valid for name, text, valid in EXCEPTIONS if name == test and query.endswith(text)), None)
+    if check and check[0] == "notices":
+        return noticed(check[1], order, expected, received)
     mine, theirs = table(expected), table(received)
     if not check or not mine or not theirs:
         return False
@@ -454,7 +535,7 @@ def same(test, script, expected, received):
         if isinstance(order, tuple) and order[0] == "copy":
             if not copied(order, out, other):
                 return False
-        elif not (valid(order, out, other) or excepted(test, lines, out, other)):
+        elif not (valid(order, out, other) or excepted(test, lines, out, other, order)):
             return False
     return True
 
