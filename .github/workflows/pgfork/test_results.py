@@ -19,11 +19,15 @@ harness and regression runner (crates/harness/src/order.rs and crates/regress/sr
 rule only this runner has."""
 
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import record  # noqa: E402
 import results  # noqa: E402
 from results import (ANY, DEFINED, Statements, array_elements, columns, copied, excepted,  # noqa: E402
                      gathered, joined, noticed, same, unordered, valid)
@@ -355,6 +359,56 @@ class Copies(unittest.TestCase):
         self.assertTrue(same("t", script, expected, expected[:3] + ["2", "1"]))
         self.assertFalse(same("t", script, expected, expected[:3] + ["2", "3"]))
 
+
+class Recordings(unittest.TestCase):
+    """record.py's reorders, which only put a table's rows in the fork's order; the cases that record need a stock
+    Postgres's bindir and its regression library's dlpath in PGFORK_RECORD_BINDIR and PGFORK_RECORD_DLPATH."""
+
+    def test_a_reorder_is_only_the_template(self):
+        script = "CREATE TABLE t (a int);\nSELECT * FROM t;\nSELECT * FROM t;"
+        lines = record.changed(script, [{"before": "SELECT * FROM t;", "occurrence": 2, "table": "t", "order": "a"}])
+        self.assertEqual(lines.split("\n"), script.split("\n")[:2] + "\n".join(record.reorder("t", "a")).split("\n")
+                         + script.split("\n")[2:])
+        for step in [{"before": "SELECT * FROM t;", "table": "t", "order": "a", "sql": "DELETE FROM u;"},
+                     {"before": "SELECT * FROM t;", "table": "t"}, {"before": "SELECT * FROM u;", "table": "t",
+                                                                    "order": "a"}]:
+            with self.assertRaises(SystemExit):
+                record.changed(script, [step])
+
+    def recorded(self, order):
+        """Records a two-line test whose reorder of t uses an order, returning whether the recording was kept."""
+        bindir, dlpath = os.environ.get("PGFORK_RECORD_BINDIR"), os.environ.get("PGFORK_RECORD_DLPATH")
+        if not bindir:
+            self.skipTest("no stock Postgres to record with")
+        with tempfile.TemporaryDirectory() as work:
+            regress = os.path.join(work, "regress")
+            for part in ("sql", "expected"):
+                os.makedirs(os.path.join(regress, part))
+            sql = ["CREATE TABLE t (a int); CREATE TABLE u (a int); CREATE SEQUENCE s;",
+                   "CREATE FUNCTION f(int) RETURNS int LANGUAGE sql AS 'INSERT INTO u VALUES (1) RETURNING $1';",
+                   "INSERT INTO t VALUES (1), (2), (3);", "SELECT * FROM t;"]
+            with open(os.path.join(regress, "sql", "probe.sql"), "w", encoding="utf-8") as f:
+                f.write("\n".join(sql) + "\n")
+            shutil.copy(os.path.join(regress, "sql", "probe.sql"), os.path.join(regress, "expected", "probe.out"))
+            with open(os.path.join(regress, "parallel_schedule"), "w", encoding="utf-8") as f:
+                f.write("test: probe\n")
+            script = os.path.join(work, "pgfork", "record.py")
+            os.makedirs(os.path.join(work, "pgfork", "alternatives"))
+            shutil.copy(record.__file__, script)
+            with open(os.path.join(work, "pgfork", "alternatives", "probe.json"), "w", encoding="utf-8") as f:
+                f.write(f'[{{"before": "SELECT * FROM t;", "table": "t", "order": "{order}"}}]')
+            done = subprocess.run([sys.executable, script, regress, bindir, dlpath or work, "probe"],
+                                  capture_output=True, text=True, check=False)
+            return done.returncode == 0 and os.path.exists(os.path.join(work, "pgfork", "alternatives", "probe_1.out"))
+
+    def test_a_reorder_that_only_permutes_is_kept(self):
+        self.assertTrue(self.recorded("a DESC"))
+
+    def test_a_reorder_that_changes_another_table_is_refused(self):
+        self.assertFalse(self.recorded("f(a)"))
+
+    def test_a_reorder_that_moves_a_sequence_is_refused(self):
+        self.assertFalse(self.recorded("nextval('s')"))
 
 if __name__ == "__main__":
     unittest.main()
