@@ -116,7 +116,7 @@ typedef struct store_collect_held_t
 } store_collect_held_t;
 
 extern bool store_collect_collected(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading,
-									uint32 database, uint64 limit, uint64 percent, const StdVec *old,
+									uint32 database, uint64 limit, uint64 percent, uint32 emptied, const StdVec *old,
 									bool *has_result, StoreCollectCollected *result, HostError *error);
 extern void store_collect_Collected_drop(StoreCollectCollected *self);
 extern void store_collect_Schedule_Default_default(StoreCollectSchedule *result);
@@ -126,7 +126,8 @@ extern bool store_collect_collect_due(HostIoIo *io, StoreCollectSchedule *schedu
 									  const StoreCollectSettings *settings, HostError *error);
 extern bool store_collect_collect_asked(HostIoIo *io, StoreCollectSchedule *schedule,
 										const StoreCollectDatabase *databases, size_t databases_len, uint32 id,
-										const StoreCollectSettings *settings, uint64 *result, HostError *error);
+										uint32 emptied, const StoreCollectSettings *settings, uint64 *result,
+										HostError *error);
 
 #ifdef DOLTGRES_TEST_STORE
 extern void test_store_collect_tests_a_collection_retires_a_pack_nothing_names_and_keeps_a_named_one(void);

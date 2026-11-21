@@ -19,6 +19,7 @@
 #include "access/relation.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
+#include "doltgres/hooks.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pageinspect.h"
@@ -158,7 +159,8 @@ get_raw_page_internal(text *relname, ForkNumber forknum, BlockNumber blkno)
 	relrv = makeRangeVarFromNameList(textToQualifiedNameList(relname));
 	rel = relation_openrv(relrv, AccessShareLock);
 
-	if (!RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
+	if (!RELKIND_HAS_STORAGE(rel->rd_rel->relkind) ||
+		(forknum == MAIN_FORKNUM && doltgres_heap_only_refused(rel)))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("cannot get raw page from relation \"%s\"",

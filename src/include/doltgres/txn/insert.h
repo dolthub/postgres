@@ -194,6 +194,21 @@ typedef enum TxnInsertRechecked
 } TxnInsertRechecked;
 
 /* TxnInsertBase is Base: what allocation reads of the base, its free space tree, fresh end, and generation. */
+/* TxnInsertCarriedPut is a carry's put of another writer: its tuple id, its heap bytes, and its writer. */
+typedef struct TxnInsertCarriedPut
+{
+	HostRow		tid;
+	uint64		heap_bytes;
+	TxnMemtableVersionWriter writer;
+} TxnInsertCarriedPut;
+
+/* TxnInsertCarriedTake is a carried put's take: its block and the take's version's record. */
+typedef struct TxnInsertCarriedTake
+{
+	uint32		block;
+	StdVec		record;
+} TxnInsertCarriedTake;
+
 typedef struct TxnInsertBase
 {
 	bool		has_tree;
@@ -296,9 +311,13 @@ extern bool txn_insert_Placed_read(HostIoIo *io, TreesStoreNodeStore store, cons
 								   HostError *error);
 extern TxnMemtableMapTake txn_insert_Placed_take(const TxnInsertPlaced *self, HostSharedRecord record);
 extern void txn_insert_Placed_drop(TxnInsertPlaced *self);
+extern void txn_insert_carried_takes_drop(StdVec *takes);
+extern bool txn_insert_carried_takes(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held,
+									 const TxnInsertCarriedPut *puts, size_t puts_len, const TxnInsertPage *page,
+									 StdVec *result, HostError *error);
 extern bool txn_insert_place_taken(HostIoTakesShort io, TxnMemtableTablePreparedState *prepared, size_t take,
-								   HostSharedRecord record, TxnMemtableVersionWriter writer,
-								   const TxnInsertPlaced *placed, HostError *error);
+								   HostSharedRecord record, TxnMemtableVersionWriter writer, bool has_roomed,
+								   TxnStatusRoomed roomed, const TxnInsertPlaced *placed, HostError *error);
 extern bool txn_insert_Room_fits(const TxnInsertRoom *self, uint64 free, uint16 offset);
 extern uint64 txn_insert_Room_need(const TxnInsertRoom *self);
 extern bool txn_insert_insert(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held,
@@ -325,5 +344,42 @@ extern bool txn_insert_redo_spent(HostIoIo *io, TreesStoreNodeStore store, const
 								  const TxnRecordSpent *spent, const TxnInsertPage *page, HostError *error);
 extern bool txn_insert_redo_left(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held,
 								 const TxnRecordPageLeft *left, const TxnInsertPage *page, HostError *error);
+
+#ifdef DOLTGRES_TEST_TXN
+extern bool txn_insert_tests_taken(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held,
+								   TxnInsertInsert *row, const TxnInsertRoom *room, const HostSharedHeld *toast,
+								   const TxnValuesEntry *toast_entries, size_t toast_entries_len, uint64 *result,
+								   HostError *error);
+extern HostStorage txn_insert_tests_stored(uint32 database);
+extern TxnInsertInsert txn_insert_tests_row(HostStorage storage, uint64 n);
+extern void test_txn_insert_tests_inserts_take_heaps_tuple_ids_by_offsets_and_by_bytes(void);
+extern void test_txn_insert_tests_a_row_the_last_page_cant_hold_goes_to_the_lowest_page_left_with_room(void);
+extern void test_txn_insert_tests_redo_leaves_the_free_space_map_and_the_counter_as_the_primarys(void);
+extern void test_txn_insert_tests_a_take_redone_again_changes_nothing(void);
+extern void test_txn_insert_tests_an_insert_maps_its_out_of_line_values_in_its_window(void);
+extern void test_txn_insert_tests_a_gathering_from_an_inserts_prepare_to_its_push_keeps_the_counter(void);
+extern void test_txn_insert_tests_an_insert_that_leaves_the_fresh_page_and_fails_redoes_as_the_primary(void);
+extern void test_txn_insert_tests_a_row_whose_value_references_sit_in_an_overflow_chunk_redoes_its_map_entries(void);
+extern void test_txn_insert_tests_an_insert_that_fails_after_its_chunks_maps_no_value(void);
+extern void test_txn_insert_tests_redo_from_any_point_gives_a_row_with_all_its_map_entries_or_none(void);
+extern void test_txn_insert_tests_a_kept_values_count_add_is_redone_once(void);
+extern void test_txn_insert_tests_a_load_moves_the_counter_past_every_loaded_tid_and_left_page(void);
+extern void test_txn_insert_tests_an_insert_logical_decoding_reads_logs_heaps_record_of_its_command(void);
+extern void test_txn_insert_tests_a_checkpoints_runs_and_every_record_after_redo_as_the_primary(void);
+extern void test_txn_insert_tests_a_window_between_a_sweeps_rows_and_its_cut_leaves_its_take_without_its_row(void);
+extern void test_txn_insert_tests_windows_after_a_sweeps_cut_are_in_its_runs_with_neither_their_rows_nor_their_takes(void);
+extern void test_txn_insert_tests_an_aborted_inserts_value_map_versions_go_at_its_take_back_and_its_free_space_take_stays(void);
+extern void test_txn_insert_tests_an_update_keeps_its_key_or_moves_it_and_redoes_as_the_primary(void);
+extern void test_txn_insert_tests_a_keyless_or_deferrable_update_names_its_rows_by_their_tuple_ids(void);
+extern void test_txn_insert_tests_an_updates_combo_command_shows_on_the_row_it_ends(void);
+extern void test_txn_insert_tests_a_speculative_insert_holds_its_token_until_confirmed(void);
+extern void test_txn_insert_tests_an_aborted_updates_new_row_and_end_go_at_the_take_back(void);
+extern void test_txn_insert_tests_a_resolve_whose_stripe_moves_three_times_holds_its_writers_back(void);
+extern void test_txn_insert_tests_a_checkpoint_between_an_updates_count_adds_and_its_row_leaves_the_counts_once(void);
+extern void test_txn_insert_tests_a_checkpoint_before_or_after_an_update_leaves_its_kept_counts_once(void);
+extern void test_txn_insert_tests_a_crash_after_a_key_change_whose_runs_hold_one_chain_redoes_both(void);
+extern void test_txn_insert_tests_a_resolve_whose_first_target_is_refused_ends_in_bounded_turns(void);
+extern void test_txn_insert_tests_a_frozen_inserts_row_change_replays_with_no_status_room(void);
+#endif
 
 #endif							/* DOLTGRES_TXN_INSERT_H */

@@ -46,6 +46,10 @@
 #include "doltgres/txn/state.h"
 #include "doltgres/txn/status.h"
 
+#ifdef DOLTGRES_TEST_TXN
+#include "doltgres/std/test.h"
+#endif
+
 #define RUST_FILE "txn" STD_SEP "src" STD_SEP "record.rs"
 
 /* A row change's marks of a counted key's added and removed copies, and of a row added, updated, and deleted. */
@@ -510,6 +514,7 @@ txn_record_read_put(const ChunksRecordRecord *r, HostRow tuple, TxnMemtablePut *
 	const uint8 *raw = chunks_record_Record_bytes(r, 8, &raw_len);
 	size_t		value_len;
 	const uint8 *value;
+	TxnMemtablePut put = {.tuple = tuple};
 
 	if (raw == NULL)
 		raw_len = 0;
@@ -524,6 +529,7 @@ txn_record_read_put(const ChunksRecordRecord *r, HostRow tuple, TxnMemtablePut *
 		*error = txn_record_corrupt();
 		return false;
 	}
+	*result = put;
 	std_vec_with_capacity_Checked(&result->addresses, raw_len / TXN_RECORD_ADDRESS, TXN_RECORD_PLACED);
 	for (size_t at = 0; at < raw_len; at += TXN_RECORD_ADDRESS)
 	{
@@ -535,8 +541,6 @@ txn_record_read_put(const ChunksRecordRecord *r, HostRow tuple, TxnMemtablePut *
 	}
 	std_slice_to_vec_Checked(&result->value, value, value_len, 1, 1);
 	std_vec_new(&result->values, TXN_RECORD_ID);
-	result->tuple = tuple;
-	result->heap_bytes = 0;
 	return true;
 }
 
@@ -2550,6 +2554,137 @@ txn_record_StorageEmptied_decode(const uint8 *body, size_t body_len, TxnRecordSt
 	return txn_record_read(&read);
 }
 
+/* txn_record_unlisted_frame_t is an unlist's encode's state across its pad: its field's bytes and the writer, while live. */
+typedef struct txn_record_unlisted_frame_t
+{
+	const TxnRecordCarryUnlisted *self;
+	StdVec	   *result;
+	StdVec		bytes;
+	bool		bytes_live;
+	ChunksRecordRecordWriter writer;
+	bool		writer_live;
+} txn_record_unlisted_frame_t;
+
+/* txn_record_unlisted_body writes an unlist's storage and its ends, the first and then each one's distance from the one before. */
+static void
+txn_record_unlisted_body(void *frame_)
+{
+	txn_record_unlisted_frame_t *frame = frame_;
+	const TxnRecordCarryUnlisted *self = frame->self;
+	uint64		before = 0;
+
+	frame->writer = chunks_record_RecordWriter_new();
+	frame->writer_live = true;
+	chunks_record_RecordWriter_uint(&frame->writer, 1, self->storage.tablespace);
+	chunks_record_RecordWriter_uint(&frame->writer, 2, self->storage.database);
+	chunks_record_RecordWriter_uint(&frame->writer, 3, self->storage.relation);
+	std_vec_new(&frame->bytes, 1, 1);
+	frame->bytes_live = true;
+	for (size_t i = 0; i < self->ends.len; i++)
+	{
+		uint64		end = STD_VEC_AT(&self->ends, uint64, i);
+
+		chunks_varint_put_varint(&frame->bytes, end - before);
+		before = end;
+	}
+	chunks_record_RecordWriter_field(&frame->writer, 4, frame->bytes.ptr, frame->bytes.len);
+	*frame->result = chunks_record_RecordWriter_finish(&frame->writer);
+	frame->writer_live = false;
+	chunks_record_RecordWriter_drop(&frame->writer);
+}
+
+/* txn_record_unlisted_pad frees what an unlist's encode holds live. */
+static void
+txn_record_unlisted_pad(void *frame_)
+{
+	txn_record_unlisted_frame_t *frame = frame_;
+
+	if (frame->bytes_live)
+		std_vec_free_Checked(&frame->bytes, 1, 1);
+	if (frame->writer_live)
+		chunks_record_RecordWriter_drop(&frame->writer);
+	frame->bytes_live = frame->writer_live = false;
+}
+
+/* txn_record_CarryUnlisted_encode returns the record's body: the new storage (fields 1 to 3) and the ends of the carry's records (field 4). */
+void
+txn_record_CarryUnlisted_encode(const TxnRecordCarryUnlisted *self, StdVec *result)
+{
+	txn_record_unlisted_frame_t frame = {.self = self, .result = result};
+
+	std_landing(&frame, txn_record_unlisted_body, txn_record_unlisted_pad);
+	txn_record_unlisted_pad(&frame);
+}
+
+/* txn_record_CarryUnlisted_drop frees an unlist's ends. */
+void
+txn_record_CarryUnlisted_drop(TxnRecordCarryUnlisted *self)
+{
+	std_vec_free_Checked(&self->ends, sizeof(uint64), _Alignof(uint64));
+}
+
+/* txn_record_CarryUnlisted_drop_void is CarryUnlisted's drop of a decode's result. */
+static void
+txn_record_CarryUnlisted_drop_void(void *self)
+{
+	txn_record_CarryUnlisted_drop(self);
+}
+
+/* txn_record_unlisted_read reads an unlist's body. */
+static bool
+txn_record_unlisted_read(TxnRecordRead *read)
+{
+	static const uint32 allowed[] = {1, 2, 3, 4};
+	TxnRecordCarryUnlisted *result = read->result;
+	ChunksRecordRecord *r = &read->record;
+	const uint8 *bytes;
+	size_t		len;
+	size_t		at = 0;
+	uint64		end = 0;
+	ChunksVarintMalformed malformed;
+
+	if (!txn_record_known(read, allowed, lengthof(allowed)) || !txn_record_value(read) ||
+		!txn_record_narrow(r, 1, &result->storage.tablespace, read->error) ||
+		!txn_record_narrow(r, 2, &result->storage.database, read->error) ||
+		!txn_record_narrow(r, 3, &result->storage.relation, read->error))
+		return false;
+	bytes = chunks_record_Record_bytes(r, 4, &len);
+	if (bytes == NULL || len == 0)
+		return txn_record_refuse(read);
+	while (at < len)
+	{
+		uint64		distance;
+
+		if (!chunks_varint_decode(bytes, len, &at, &distance, &malformed) ||
+			(result->ends.len > 0 && distance == 0) || end + distance < end)
+			return txn_record_refuse(read);
+		end += distance;
+		if (!std_vec_try_reserve(&result->ends, 1, sizeof(uint64), _Alignof(uint64)))
+		{
+			*read->error = host_Error_out_of_memory();
+			return false;
+		}
+		std_vec_push_Checked(&result->ends, &end, sizeof(uint64), _Alignof(uint64));
+	}
+	return true;
+}
+
+/*
+ * txn_record_CarryUnlisted_decode reads an unlist's body, refusing any other
+ * form as data corruption: a field it doesn't know or lacks, a storage field
+ * past 32 bits, and ends that are empty, out of order, or cut short.
+ */
+bool
+txn_record_CarryUnlisted_decode(const uint8 *body, size_t body_len, TxnRecordCarryUnlisted *result,
+								HostError *error)
+{
+	TxnRecordRead read = {.body = body, .body_len = body_len, .error = error, .result = result,
+	.drop = txn_record_CarryUnlisted_drop_void, .result_live = true, .read = txn_record_unlisted_read};
+
+	std_vec_new(&result->ends, sizeof(uint64), _Alignof(uint64));
+	return txn_record_read(&read);
+}
+
 /* txn_record_put_runs appends runs of tuple ids as varints: each run's block, first offset, count, and bytes. */
 static void
 txn_record_put_runs(const StdVec *runs, StdVec *out)
@@ -2614,6 +2749,13 @@ txn_record_freed_body(void *frame_)
 		chunks_record_RecordWriter_uint(w, 8, self->values.f0.relation);
 		chunks_record_RecordWriter_field(w, 9, frame->bytes.ptr, frame->bytes.len);
 	}
+	if (self->runs.len != 0 || self->dead.len != 0)
+	{
+		frame->bytes.len = 0;
+		for (size_t i = 0; i < self->enders.len; i++)
+			chunks_varint_put_varint(&frame->bytes, STD_VEC_AT(&self->enders, uint64, i));
+		chunks_record_RecordWriter_field(w, 10, frame->bytes.ptr, frame->bytes.len);
+	}
 	*frame->result = chunks_record_RecordWriter_finish(w);
 }
 
@@ -2650,6 +2792,7 @@ txn_record_TidsFreed_drop(TxnRecordTidsFreed *self)
 {
 	std_vec_free_Checked(&self->runs, TXN_RECORD_RUN);
 	std_vec_free_Checked(&self->dead, TXN_RECORD_RUN);
+	std_vec_free_Checked(&self->enders, sizeof(uint64), _Alignof(uint64));
 	if (self->has_values)
 		std_vec_free_Checked(&self->values.f1, TXN_RECORD_COUNTED);
 }
@@ -2749,7 +2892,7 @@ txn_record_over(TxnRecordRead *read, const TxnRecordTidsFreed *result, uint64 pa
 static bool
 txn_record_freed_read(TxnRecordRead *read, uint16 most, uint64 page)
 {
-	static const uint32 allowed[] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+	static const uint32 allowed[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
 	TxnRecordTidsFreed *result = read->result;
 	ChunksRecordRecord *r = &read->record;
 	size_t		len;
@@ -2808,6 +2951,30 @@ txn_record_freed_read(TxnRecordRead *read, uint16 most, uint64 page)
 	}
 	else
 		return txn_record_refuse(read);
+	bytes = chunks_record_Record_bytes(r, 10, &len);
+	if ((bytes != NULL) != (result->runs.len != 0 || result->dead.len != 0))
+		return txn_record_refuse(read);
+	if (bytes != NULL)
+	{
+		size_t		at = 0;
+		uint64		tids = 0;
+		ChunksVarintMalformed malformed;
+
+		for (size_t i = 0; i < result->runs.len; i++)
+			tids += STD_VEC_AT(&result->runs, std_TupleU32U16U16U64_t, i).f2;
+		for (size_t i = 0; i < result->dead.len; i++)
+			tids += STD_VEC_AT(&result->dead, std_TupleU32U16U16U64_t, i).f2;
+		while (at < len)
+		{
+			uint64		ender;
+
+			if (result->enders.len == tids || !chunks_varint_decode(bytes, len, &at, &ender, &malformed))
+				return txn_record_refuse(read);
+			std_vec_push_Checked(&result->enders, &ender, sizeof(uint64), _Alignof(uint64));
+		}
+		if (result->enders.len != tids)
+			return txn_record_refuse(read);
+	}
 	return txn_record_uint(r, 4, &result->horizon, read->error);
 }
 
@@ -2832,8 +2999,10 @@ txn_record_freed_read_at(TxnRecordRead *read)
  * txn_record_TidsFreed_decode reads a free's body, refusing any other form as
  * data corruption: a field it doesn't know or lacks, a field 6 with no run, a
  * run runs refuses, a block whose runs of both fields give back more bytes
- * than a page holds, fields 7 to 9 not all present or all absent, and values
- * that are empty, out of id order, or of a count of zero.
+ * than a page holds, fields 7 to 9 not all present or all absent, values
+ * that are empty, out of id order, or of a count of zero, and a field 10
+ * present without a run in field 5 or 6, absent with one, or of another
+ * count of enders than their tuple ids.
  */
 bool
 txn_record_TidsFreed_decode(const uint8 *body, size_t body_len, uint16 most, uint64 page, TxnRecordTidsFreed *result,
@@ -2845,6 +3014,7 @@ txn_record_TidsFreed_decode(const uint8 *body, size_t body_len, uint16 most, uin
 
 	std_vec_new(&result->runs, TXN_RECORD_RUN);
 	std_vec_new(&result->dead, TXN_RECORD_RUN);
+	std_vec_new(&result->enders, sizeof(uint64), _Alignof(uint64));
 	result->has_values = false;
 	return txn_record_read(&freed.read);
 }
@@ -3234,6 +3404,13 @@ txn_record_values_Debug_fmt(const void *value, StdFormatter *f)
 	return std_tuple_Debug_fmt(&tuple, f);
 }
 
+/* txn_record_u64_eq reports whether two u64s are equal, an element's PartialEq. */
+static bool
+txn_record_u64_eq(const void *a, const void *b)
+{
+	return *(const uint64 *) a == *(const uint64 *) b;
+}
+
 /* txn_record_TidsFreed_PartialEq_eq reports whether two frees are equal field by field. */
 bool
 txn_record_TidsFreed_PartialEq_eq(const TxnRecordTidsFreed *self, const TxnRecordTidsFreed *other)
@@ -3241,6 +3418,7 @@ txn_record_TidsFreed_PartialEq_eq(const TxnRecordTidsFreed *self, const TxnRecor
 	return host_Storage_PartialEq_eq(&self->storage, &other->storage) && self->horizon == other->horizon &&
 		std_vec_PartialEq_eq(&self->runs, &other->runs, sizeof(std_TupleU32U16U16U64_t), txn_record_run_eq) &&
 		std_vec_PartialEq_eq(&self->dead, &other->dead, sizeof(std_TupleU32U16U16U64_t), txn_record_run_eq) &&
+		std_vec_PartialEq_eq(&self->enders, &other->enders, sizeof(uint64), txn_record_u64_eq) &&
 		self->has_values == other->has_values &&
 		(!self->has_values ||
 		 (host_Storage_PartialEq_eq(&self->values.f0, &other->values.f0) &&
@@ -3254,6 +3432,7 @@ txn_record_TidsFreed_Debug_fmt(const void *value, StdFormatter *f)
 	const TxnRecordTidsFreed *self = value;
 	TxnRecordList runs = {&self->runs, sizeof(std_TupleU32U16U16U64_t), txn_record_run_Debug_fmt};
 	TxnRecordList dead = {&self->dead, sizeof(std_TupleU32U16U16U64_t), txn_record_run_Debug_fmt};
+	TxnRecordList enders = {&self->enders, sizeof(uint64), std_u64_Debug_fmt};
 	StdOptionRef values = {self->has_values, {&self->values, txn_record_values_Debug_fmt}};
 	StdDebugStruct s = std_fmt_debug_struct(f, "TidsFreed", 9);
 
@@ -3261,6 +3440,1662 @@ txn_record_TidsFreed_Debug_fmt(const void *value, StdFormatter *f)
 	std_DebugStruct_field(&s, "horizon", 7, &self->horizon, std_u64_Debug_fmt);
 	std_DebugStruct_field(&s, "runs", 4, &runs, txn_record_List_Debug_fmt);
 	std_DebugStruct_field(&s, "dead", 4, &dead, txn_record_List_Debug_fmt);
+	std_DebugStruct_field(&s, "enders", 6, &enders, txn_record_List_Debug_fmt);
 	std_DebugStruct_field(&s, "values", 6, &values, std_option_Debug_fmt);
 	return std_DebugStruct_finish(&s);
 }
+
+#ifdef DOLTGRES_TEST_TXN
+/* TXN_RECORD_TESTS_UNWRAP is Result::unwrap's panic text. */
+#define TXN_RECORD_TESTS_UNWRAP "called `Result::unwrap()` on an `Err` value"
+
+/* TxnRecordTestsRead is what a decode of a body came to: read, refused as data corruption, or failed otherwise. */
+typedef enum TxnRecordTestsRead
+{
+	TXN_RECORD_TESTS_READ,
+	TXN_RECORD_TESTS_CORRUPT,
+	TXN_RECORD_TESTS_FAILED,
+} TxnRecordTestsRead;
+
+/* TxnRecordTestsField is a field a test writes: its number and its integer, or its bytes when they are set. */
+typedef struct TxnRecordTestsField
+{
+	uint32		number;
+	uint64		value;
+	const void *bytes;
+	size_t		bytes_len;
+} TxnRecordTestsField;
+
+/* TxnRecordTestsU32s is a slice of u32s, as a test's message shows it. */
+typedef struct TxnRecordTestsU32s
+{
+	const uint32 *ptr;
+	size_t		len;
+} TxnRecordTestsU32s;
+
+/* txn_record_tests_u32s_Debug_fmt is a slice of u32s' Debug. */
+static bool
+txn_record_tests_u32s_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const TxnRecordTestsU32s *u32s = value;
+	StdDebugList list = std_fmt_debug_list(f);
+
+	for (size_t i = 0; i < u32s->len; i++)
+		std_DebugList_entry(&list, &u32s->ptr[i], std_u32_Debug_fmt);
+	return std_DebugList_finish(&list);
+}
+
+/* txn_record_tests_vec_Debug_fmt is a Vec<u8>'s Debug. */
+static bool
+txn_record_tests_vec_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const StdVec *vec = value;
+	StdBytes	bytes = {vec->ptr, vec->len};
+
+	return std_bytes_Debug_fmt(&bytes, f);
+}
+
+/* txn_record_tests_piece_Debug_fmt is a piece's Debug, its key and its value. */
+static bool
+txn_record_tests_piece_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const txn_TupleVecU8VecU8_t *piece = value;
+	StdTupleRef tuple = STD_TUPLE(2, STD_ITEM(&piece->f0, txn_record_tests_vec_Debug_fmt),
+								  STD_ITEM(&piece->f1, txn_record_tests_vec_Debug_fmt));
+
+	return std_tuple_Debug_fmt(&tuple, f);
+}
+
+/* txn_record_tests_pieces_Debug_fmt is a Vec of pieces' Debug. */
+static bool
+txn_record_tests_pieces_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const StdVec *pieces = value;
+	StdDebugList list = std_fmt_debug_list(f);
+
+	for (size_t i = 0; i < pieces->len; i++)
+		std_DebugList_entry(&list, &STD_VEC_AT(pieces, txn_TupleVecU8VecU8_t, i), txn_record_tests_piece_Debug_fmt);
+	return std_DebugList_finish(&list);
+}
+
+/* txn_record_tests_bytes_eq returns whether a Vec<u8> holds the bytes given. */
+static bool
+txn_record_tests_bytes_eq(const StdVec *vec, const void *bytes, size_t bytes_len)
+{
+	return vec->len == bytes_len && (bytes_len == 0 || memcmp(vec->ptr, bytes, bytes_len) == 0);
+}
+
+/* txn_record_tests_message_decoded panics at a line unless refused, its message a prefix, an argument, and " decoded". */
+static void
+txn_record_tests_message_decoded(bool refused, const char *prefix, const void *shown, StdFmtFn shown_fmt, uint32 line,
+								 uint32 col)
+{
+	if (!refused)
+	{
+		StdFmtPiece pieces[] = {{prefix, strlen(prefix), 0, {0}}, STD_FMT_ARG(0), STD_FMT_LIT(" decoded")};
+		StdFmtArg	args[] = {{shown, shown_fmt}};
+		StdFmtArguments arguments = {pieces, lengthof(pieces), args};
+
+		std_panic_fmt(RUST_FILE, line, col, &arguments);
+	}
+}
+
+/* txn_record_tests_fields_decoded panics at a line unless a body of the numbered fields was refused, naming them. */
+static void
+txn_record_tests_fields_decoded(bool refused, const uint32 *numbers, size_t numbers_len, uint32 line)
+{
+	TxnRecordTestsU32s shown = {numbers, numbers_len};
+
+	txn_record_tests_message_decoded(refused, "fields ", &shown, txn_record_tests_u32s_Debug_fmt, line, 13);
+}
+
+/* txn_record_tests_write appends fields to a writer, each an integer or, with bytes, a field of them. */
+static void
+txn_record_tests_write(ChunksRecordRecordWriter *w, const TxnRecordTestsField *fields, size_t fields_len)
+{
+	for (size_t i = 0; i < fields_len; i++)
+	{
+		if (fields[i].bytes != NULL)
+			chunks_record_RecordWriter_field(w, fields[i].number, fields[i].bytes, fields[i].bytes_len);
+		else
+			chunks_record_RecordWriter_uint(w, fields[i].number, fields[i].value);
+	}
+}
+
+/* txn_record_tests_body returns a record of fields. */
+static StdVec
+txn_record_tests_body(const TxnRecordTestsField *fields, size_t fields_len)
+{
+	ChunksRecordRecordWriter w = chunks_record_RecordWriter_new();
+
+	txn_record_tests_write(&w, fields, fields_len);
+	return chunks_record_RecordWriter_finish(&w);
+}
+
+/* txn_record_tests_status returns what a decode came to, freeing its error and then the body. */
+static TxnRecordTestsRead
+txn_record_tests_status(bool ok, HostError *error, StdVec *body)
+{
+	TxnRecordTestsRead read = TXN_RECORD_TESTS_READ;
+
+	if (!ok)
+	{
+		read = memcmp(host_Error_sqlstate(error), "XX001", 5) == 0 ? TXN_RECORD_TESTS_CORRUPT : TXN_RECORD_TESTS_FAILED;
+		host_Error_drop(error);
+	}
+	std_vec_free_Checked(body, 1, 1);
+	return read;
+}
+
+/* txn_record_tests_change_read decodes a row change's body less its last cut bytes, freeing the body. */
+static TxnRecordTestsRead
+txn_record_tests_change_read(StdVec body, size_t cut)
+{
+	TxnRecordRowChange read;
+	HostError	error;
+	bool		ok = txn_record_RowChange_decode(body.ptr, body.len - cut, &read, &error);
+
+	if (ok)
+		txn_record_RowChange_drop(&read);
+	return txn_record_tests_status(ok, &error, &body);
+}
+
+/* txn_record_tests_left_read decodes a leave's body less its last cut bytes, freeing the body. */
+static TxnRecordTestsRead
+txn_record_tests_left_read(StdVec body, size_t cut)
+{
+	TxnRecordPageLeft read;
+	HostError	error;
+	bool		ok = txn_record_PageLeft_decode(body.ptr, body.len - cut, &read, &error);
+
+	return txn_record_tests_status(ok, &error, &body);
+}
+
+/* txn_record_tests_chunk_read decodes a chunk's body less its last cut bytes, freeing the body. */
+static TxnRecordTestsRead
+txn_record_tests_chunk_read(StdVec body, size_t cut)
+{
+	TxnRecordChunkWrite read;
+	HostError	error;
+	bool		ok = txn_record_ChunkWrite_decode(body.ptr, body.len - cut, &read, &error);
+
+	if (ok)
+		txn_record_ChunkWrite_drop(&read);
+	return txn_record_tests_status(ok, &error, &body);
+}
+
+/* txn_record_tests_carried_read decodes a carry's body, freeing the body. */
+static TxnRecordTestsRead
+txn_record_tests_carried_read(StdVec body)
+{
+	TxnRecordMapCarried read;
+	HostError	error;
+	bool		ok = txn_record_MapCarried_decode(body.ptr, body.len, &read, &error);
+
+	if (ok)
+		txn_record_MapCarried_drop(&read);
+	return txn_record_tests_status(ok, &error, &body);
+}
+
+/* txn_record_tests_advanced_read decodes a fold's body less its last cut bytes, freeing the body. */
+static TxnRecordTestsRead
+txn_record_tests_advanced_read(StdVec body, size_t cut)
+{
+	TxnRecordBaseAdvanced read;
+	HostError	error;
+	bool		ok = txn_record_BaseAdvanced_decode(body.ptr, body.len - cut, &read, &error);
+
+	if (ok)
+		txn_record_BaseAdvanced_drop(&read);
+	return txn_record_tests_status(ok, &error, &body);
+}
+
+/* txn_record_tests_freed_read decodes a free's body in a page of 291 tuples and 8168 bytes, freeing the body. */
+static TxnRecordTestsRead
+txn_record_tests_freed_read(StdVec body)
+{
+	TxnRecordTidsFreed read;
+	HostError	error;
+	bool		ok = txn_record_TidsFreed_decode(body.ptr, body.len, 291, 8168, &read, &error);
+
+	if (ok)
+		txn_record_TidsFreed_drop(&read);
+	return txn_record_tests_status(ok, &error, &body);
+}
+
+/* txn_record_tests_change_round asserts at a line that a row change reads back as it was written. */
+static void
+txn_record_tests_change_round(const TxnRecordRowChange *written, uint32 line)
+{
+	StdVec		body;
+	TxnRecordRowChange read;
+	HostError	error;
+
+	txn_record_RowChange_encode(written, &body);
+	if (!txn_record_RowChange_decode(body.ptr, body.len, &read, &error))
+		STD_RESULT_EXPECT_FAILED(line, 0, TXN_RECORD_TESTS_UNWRAP, &error, host_Error_Debug_fmt);
+	STD_ASSERT_EQ(line, 0, txn_record_RowChange_PartialEq_eq(&read, written), &read, txn_record_RowChange_Debug_fmt,
+				  written, txn_record_RowChange_Debug_fmt);
+	txn_record_RowChange_drop(&read);
+	std_vec_free_Checked(&body, 1, 1);
+}
+
+/* txn_record_tests_left_round asserts at a line that a leave reads back as it was written. */
+static void
+txn_record_tests_left_round(const TxnRecordPageLeft *written, uint32 line)
+{
+	StdVec		body;
+	TxnRecordPageLeft read;
+	HostError	error;
+
+	txn_record_PageLeft_encode(written, &body);
+	if (!txn_record_PageLeft_decode(body.ptr, body.len, &read, &error))
+		STD_RESULT_EXPECT_FAILED(line, 0, TXN_RECORD_TESTS_UNWRAP, &error, host_Error_Debug_fmt);
+	STD_ASSERT_EQ(line, 0, txn_record_PageLeft_PartialEq_eq(&read, written), &read, txn_record_PageLeft_Debug_fmt,
+				  written, txn_record_PageLeft_Debug_fmt);
+	std_vec_free_Checked(&body, 1, 1);
+}
+
+/* txn_record_tests_chunk_decoded returns a chunk's encoding read back, asserting at a line that it is the chunk. */
+static TxnRecordChunkWrite
+txn_record_tests_chunk_decoded(const TxnRecordChunkWrite *written, uint32 line)
+{
+	StdVec		body;
+	TxnRecordChunkWrite read;
+	HostError	error;
+
+	txn_record_ChunkWrite_encode(written, &body);
+	if (!txn_record_ChunkWrite_decode(body.ptr, body.len, &read, &error))
+		STD_RESULT_EXPECT_FAILED(line, 0, TXN_RECORD_TESTS_UNWRAP, &error, host_Error_Debug_fmt);
+	STD_ASSERT_EQ(line, 0, txn_record_ChunkWrite_PartialEq_eq(&read, written), &read, txn_record_ChunkWrite_Debug_fmt,
+				  written, txn_record_ChunkWrite_Debug_fmt);
+	std_vec_free_Checked(&body, 1, 1);
+	return read;
+}
+
+/* txn_record_tests_carried_round asserts at a line that a carry reads back as it was written. */
+static void
+txn_record_tests_carried_round(const TxnRecordMapCarried *written, uint32 line)
+{
+	StdVec		body;
+	TxnRecordMapCarried read;
+	HostError	error;
+
+	txn_record_MapCarried_encode(written, &body);
+	if (!txn_record_MapCarried_decode(body.ptr, body.len, &read, &error))
+		STD_RESULT_EXPECT_FAILED(line, 0, TXN_RECORD_TESTS_UNWRAP, &error, host_Error_Debug_fmt);
+	STD_ASSERT_EQ(line, 0, txn_record_MapCarried_PartialEq_eq(&read, written), &read, txn_record_MapCarried_Debug_fmt,
+				  written, txn_record_MapCarried_Debug_fmt);
+	txn_record_MapCarried_drop(&read);
+	std_vec_free_Checked(&body, 1, 1);
+}
+
+/* txn_record_tests_advanced_round asserts at a line that a fold's record reads back as it was written. */
+static void
+txn_record_tests_advanced_round(const TxnRecordBaseAdvanced *written, uint32 line)
+{
+	StdVec		body;
+	TxnRecordBaseAdvanced read;
+	HostError	error;
+
+	txn_record_BaseAdvanced_encode(written, &body);
+	if (!txn_record_BaseAdvanced_decode(body.ptr, body.len, &read, &error))
+		STD_RESULT_EXPECT_FAILED(line, 0, TXN_RECORD_TESTS_UNWRAP, &error, host_Error_Debug_fmt);
+	STD_ASSERT_EQ(line, 0, txn_record_BaseAdvanced_PartialEq_eq(&read, written), &read,
+				  txn_record_BaseAdvanced_Debug_fmt, written, txn_record_BaseAdvanced_Debug_fmt);
+	txn_record_BaseAdvanced_drop(&read);
+	std_vec_free_Checked(&body, 1, 1);
+}
+
+/* txn_record_tests_freed_round asserts at a line that a free reads back as it was written in a page of 291 tuples. */
+static void
+txn_record_tests_freed_round(const TxnRecordTidsFreed *written, uint32 line)
+{
+	StdVec		body;
+	TxnRecordTidsFreed read;
+	HostError	error;
+
+	txn_record_TidsFreed_encode(written, &body);
+	if (!txn_record_TidsFreed_decode(body.ptr, body.len, 291, 8168, &read, &error))
+		STD_RESULT_EXPECT_FAILED(line, 0, TXN_RECORD_TESTS_UNWRAP, &error, host_Error_Debug_fmt);
+	STD_ASSERT_EQ(line, 0, txn_record_TidsFreed_PartialEq_eq(&read, written), &read, txn_record_TidsFreed_Debug_fmt,
+				  written, txn_record_TidsFreed_Debug_fmt);
+	txn_record_TidsFreed_drop(&read);
+	std_vec_free_Checked(&body, 1, 1);
+}
+
+/* txn_record_tests_ids sets a put's value ids. */
+static void
+txn_record_tests_ids(TxnMemtablePut *put, const uint32 *ids, size_t ids_len)
+{
+	std_vec_free_Checked(&put->values, sizeof(uint32), _Alignof(uint32));
+	std_slice_to_vec_Checked(&put->values, ids, ids_len, sizeof(uint32), _Alignof(uint32));
+}
+
+/* txn_record_tests_put returns a put of a value with an address and a tuple id. */
+static TxnMemtablePut
+txn_record_tests_put(uint64 tuple)
+{
+	TxnMemtablePut put = {.tuple = {tuple}, .heap_bytes = 36};
+	chunks_TupleU32Locator_t address = {2, chunks_trailer_Locator_at(7, 640, 64)};
+
+	std_slice_to_vec_Checked(&put.value, "row", 3, 1, 1);
+	std_slice_to_vec_Checked(&put.addresses, &address, 1, sizeof(address), _Alignof(chunks_TupleU32Locator_t));
+	std_vec_new(&put.values, sizeof(uint32), _Alignof(uint32));
+	return put;
+}
+
+/* txn_record_tests_op returns the which'th op a row change's round trip writes, in the order its test lists them. */
+static TxnMemtableOp
+txn_record_tests_op(int which)
+{
+	TxnMemtableOp op = {0};
+
+	switch (which)
+	{
+		case 0:
+			op.tag = TXN_MEMTABLE_OP_PUT;
+			op.u.put = txn_record_tests_put(1 << 16 | 1);
+			break;
+		case 1:
+			op.tag = TXN_MEMTABLE_OP_DELETE;
+			break;
+		case 2:
+			op.tag = TXN_MEMTABLE_OP_MOVE;
+			op.u.move.tag = TXN_MEMTABLE_SUCCESSOR_KEY;
+			std_slice_to_vec_Checked(&op.u.move.u.key, "m", 1, 1, 1);
+			break;
+		case 3:
+			op.tag = TXN_MEMTABLE_OP_ADD;
+			op.u.add = txn_record_tests_put(2);
+			break;
+		case 4:
+			op.tag = TXN_MEMTABLE_OP_REMOVE;
+			op.u.remove.f0.f0 = 7;
+			op.u.remove.has_f1 = true;
+			op.u.remove.f1.tag = TXN_MEMTABLE_SUCCESSOR_OTHER_TABLE;
+			break;
+		case 5:
+			op.tag = TXN_MEMTABLE_OP_ADD_ROW;
+			op.u.add_row = txn_record_tests_put(3);
+			break;
+		case 6:
+			op.tag = TXN_MEMTABLE_OP_UPDATE_ROW;
+			op.u.update_row.f0.f0 = 3;
+			op.u.update_row.f1 = txn_record_tests_put(4);
+			break;
+		default:
+			op.tag = TXN_MEMTABLE_OP_DELETE_ROW;
+			op.u.delete_row.f0.f0 = 4;
+			break;
+	}
+	return op;
+}
+
+/* txn_record_tests_change returns a row change of an op by a writer, in a storage of a table, top zero for none. */
+static TxnRecordRowChange
+txn_record_tests_change(TxnMemtableOp op, uint64 top)
+{
+	TxnRecordRowChange change = {
+		.writer = {41, top != 0, top, 3},
+		.storage = {1663, 5, 16384},
+		.table = 16385,
+		.op = op,
+	};
+
+	if (op.tag == TXN_MEMTABLE_OP_PUT || op.tag == TXN_MEMTABLE_OP_ADD || op.tag == TXN_MEMTABLE_OP_ADD_ROW ||
+		op.tag == TXN_MEMTABLE_OP_UPDATE_ROW)
+		change.heap_bytes = 36;
+	std_slice_to_vec_Checked(&change.key, "k", 1, 1, 1);
+	std_vec_new(&change.blobs, sizeof(chunks_TupleAddressU64_t), _Alignof(chunks_TupleAddressU64_t));
+	std_vec_new(&change.kept, sizeof(size_t), _Alignof(size_t));
+	return change;
+}
+
+/* txn_record_tests_put_change returns a row change of a put. */
+static TxnRecordRowChange
+txn_record_tests_put_change(TxnMemtablePut put, uint64 top)
+{
+	TxnMemtableOp op = {.tag = TXN_MEMTABLE_OP_PUT, .u.put = put};
+
+	return txn_record_tests_change(op, top);
+}
+
+/* txn_record_tests_blob appends a stored value's root, the address of its bytes, and its length to a change. */
+static void
+txn_record_tests_blob(TxnRecordRowChange *change, const char *bytes, uint64 length)
+{
+	chunks_TupleAddressU64_t blob = {chunks_address_Address_of((const uint8 *) bytes, strlen(bytes)), length};
+
+	std_vec_push_Checked(&change->blobs, &blob, sizeof(blob), _Alignof(chunks_TupleAddressU64_t));
+}
+
+/* txn_record_tests_kept sets a change's kept places. */
+static void
+txn_record_tests_kept(TxnRecordRowChange *change, const size_t *kept, size_t kept_len)
+{
+	std_vec_free_Checked(&change->kept, sizeof(size_t), _Alignof(size_t));
+	std_slice_to_vec_Checked(&change->kept, kept, kept_len, sizeof(size_t), _Alignof(size_t));
+}
+
+/* txn_record_tests_valued returns a put's body with heap bytes and each numbered field, 24 a stored value and others 9. */
+static StdVec
+txn_record_tests_valued(const uint32 *numbers, size_t numbers_len)
+{
+	static const uint8 stored[34] = {7,[33] = 1};
+	const TxnRecordTestsField fields[] = {{1, 41}, {2, 1}, {3, 5}, {4, 1}, {6, 0, "k", 1}, {7, 0, "row", 3}, {9, 1},
+	{15, 1}, {16, 0}, {22, 36}};
+	ChunksRecordRecordWriter w = chunks_record_RecordWriter_new();
+
+	txn_record_tests_write(&w, fields, lengthof(fields));
+	for (size_t i = 0; i < numbers_len; i++)
+	{
+		if (numbers[i] == 24)
+			chunks_record_RecordWriter_field(&w, 24, stored, sizeof(stored));
+		else
+			chunks_record_RecordWriter_uint(&w, numbers[i], 9);
+	}
+	return chunks_record_RecordWriter_finish(&w);
+}
+
+/*
+ * test_txn_record_tests_a_row_change_reads_back_and_refuses_every_other_form:
+ * Doltgrust's own, ported: each op a row change carries reads back as it was
+ * written, with its writer, the storage and table, the key, a
+ * subtransaction's xid beside its top-level one, the no-key and frozen marks,
+ * and a put's heap bytes and value ids (fields 22 and 24, the fork's own),
+ * and any other form is data corruption, a put without its heap bytes, a
+ * delete with them or with value ids, and an empty list of ids among them.
+ */
+void
+test_txn_record_tests_a_row_change_reads_back_and_refuses_every_other_form(void)
+{
+	static const uint32 marked_ids[] = {16390, 1U << 31};
+	static const uint8 one_id[] = {7};
+	static const uint8 cut_value[] = {7, 0, 0};
+	static const uint32 all[] = {24, 25, 26, 27};
+	static const uint32 first[] = {24};
+	static const uint32 second[] = {24, 25, 26};
+	static const uint32 third[] = {25, 26, 27};
+	static const uint32 fourth[] = {25};
+	static const uint32 fifth[] = {27};
+	static const TxnRecordTestsU32s refused_sets[] = {{first, 1}, {second, 3}, {third, 3}, {fourth, 1}, {fifth, 1}};
+	const TxnRecordTestsField added[] = {{1, 41}, {2, 1}, {3, 5}, {4, 1}, {6, 0, "k", 1}, {11, TXN_RECORD_ADD},
+	{15, 1}, {16, 0}};
+	const TxnRecordTestsField wide[] = {{1, 41}, {2, UINT64CONST(1) << 40}, {3, 5}, {4, 1}, {6, 0, "k", 1}, {15, 1},
+	{16, 0}};
+	const TxnRecordTestsField unweighed[] = {{1, 41}, {2, 1}, {3, 5}, {4, 1}, {6, 0, "k", 1}, {7, 0, "row", 3}, {9, 1},
+	{15, 1}, {16, 0}};
+	const TxnRecordTestsField weighed[] = {{1, 41}, {2, 1}, {3, 5}, {4, 1}, {6, 0, "k", 1}, {15, 1}, {16, 0},
+	{22, 36}};
+	const TxnRecordTestsField delete_valued[] = {{1, 41}, {2, 1}, {3, 5}, {4, 1}, {6, 0, "k", 1}, {15, 1}, {16, 0},
+	{24, 0, one_id, 1}};
+	const TxnRecordTestsField emptied[] = {{1, 41}, {2, 1}, {3, 5}, {4, 1}, {6, 0, "k", 1}, {7, 0, "row", 3}, {9, 1},
+	{15, 1}, {16, 0}, {22, 36}, {24, 0, "", 0}};
+	const TxnRecordTestsField cut[] = {{1, 41}, {2, 1}, {3, 5}, {4, 1}, {6, 0, "k", 1}, {7, 0, "row", 3}, {9, 1},
+	{15, 1}, {16, 0}, {22, 36}, {24, 0, cut_value, sizeof(cut_value)}, {25, 1}, {26, 2}, {27, 3}};
+	TxnMemtablePut put = txn_record_tests_put(5);
+	TxnRecordRowChange marked;
+	TxnRecordRowChange ended;
+	TxnRecordRowChange whole;
+	StdVec		body;
+
+	for (int which = 0; which < 8; which++)
+	{
+		for (uint64 top = 0; top <= 40; top += 40)
+		{
+			TxnRecordRowChange written = txn_record_tests_change(txn_record_tests_op(which), top);
+
+			txn_record_tests_change_round(&written, __LINE__);
+			txn_record_RowChange_drop(&written);
+		}
+	}
+	txn_record_tests_ids(&put, marked_ids, lengthof(marked_ids));
+	marked = txn_record_tests_put_change(put, 0);
+	marked.no_key = true;
+	marked.frozen = true;
+	marked.has_toast = true;
+	marked.toast = (TxnRecordToast)
+	{
+		1663, 16391, 16392
+	};
+	txn_record_tests_blob(&marked, "one", 4000);
+	txn_record_tests_blob(&marked, "two", 300000);
+	marked.has_replaced = true;
+	marked.replaced.f0 = 3 << 16 | 7;
+	txn_record_tests_change_round(&marked, __LINE__);
+	txn_record_RowChange_drop(&marked);
+	ended = txn_record_tests_change(txn_record_tests_op(1), 0);
+	ended.has_replaced = true;
+	ended.replaced.f0 = 7;
+	txn_record_RowChange_encode(&ended, &body);
+	txn_record_RowChange_drop(&ended);
+	STD_ASSERT(__LINE__, 9, txn_record_tests_change_read(body, 0) == TXN_RECORD_TESTS_CORRUPT,
+			   "RowChange::decode(&ended.encode()).unwrap_err().sqlstate() == b\"XX001\"");
+	whole = txn_record_tests_put_change(txn_record_tests_put(1), 0);
+	txn_record_RowChange_encode(&whole, &body);
+	txn_record_RowChange_drop(&whole);
+	STD_ASSERT(__LINE__, 9, txn_record_tests_change_read(body, 1) == TXN_RECORD_TESTS_CORRUPT,
+			   "refused(&body[..body.len() - 1])");
+	STD_ASSERT(__LINE__, 9,
+			   txn_record_tests_change_read(txn_record_tests_body(added, lengthof(added)), 0) ==
+			   TXN_RECORD_TESTS_CORRUPT, "refused(&w.finish())");
+	STD_ASSERT(__LINE__, 9,
+			   txn_record_tests_change_read(txn_record_tests_body(wide, lengthof(wide)), 0) ==
+			   TXN_RECORD_TESTS_CORRUPT, "refused(&w.finish())");
+	STD_ASSERT_MSG(__LINE__, 9,
+				   txn_record_tests_change_read(txn_record_tests_body(unweighed, lengthof(unweighed)), 0) ==
+				   TXN_RECORD_TESTS_CORRUPT, "a put without its heap bytes decoded");
+	STD_ASSERT_MSG(__LINE__, 9,
+				   txn_record_tests_change_read(txn_record_tests_body(weighed, lengthof(weighed)), 0) ==
+				   TXN_RECORD_TESTS_CORRUPT, "a delete with heap bytes decoded");
+	STD_ASSERT_MSG(__LINE__, 9,
+				   txn_record_tests_change_read(txn_record_tests_body(delete_valued, lengthof(delete_valued)), 0) ==
+				   TXN_RECORD_TESTS_CORRUPT, "a delete with value ids decoded");
+	STD_ASSERT_MSG(__LINE__, 9,
+				   txn_record_tests_change_read(txn_record_tests_body(emptied, lengthof(emptied)), 0) ==
+				   TXN_RECORD_TESTS_CORRUPT, "an empty field 24 decoded");
+	STD_ASSERT(__LINE__, 9,
+			   txn_record_tests_change_read(txn_record_tests_valued(all, lengthof(all)), 0) == TXN_RECORD_TESTS_READ,
+			   "RowChange::decode(&valued(&[24, 25, 26, 27])).is_ok()");
+	STD_ASSERT_MSG(__LINE__, 9,
+				   txn_record_tests_change_read(txn_record_tests_body(cut, lengthof(cut)), 0) ==
+				   TXN_RECORD_TESTS_CORRUPT, "a value with a cut address decoded");
+	for (size_t i = 0; i < lengthof(refused_sets); i++)
+		txn_record_tests_fields_decoded(txn_record_tests_change_read(txn_record_tests_valued(refused_sets[i].ptr,
+																							 refused_sets[i].len),
+																	 0) == TXN_RECORD_TESTS_CORRUPT,
+										refused_sets[i].ptr, refused_sets[i].len, __LINE__);
+}
+
+/* txn_record_tests_left returns a leave's body to a counter, with an extra field of 1 unless its number is zero. */
+static StdVec
+txn_record_tests_left(uint64 to, uint32 extra)
+{
+	const TxnRecordTestsField fields[] = {{1, 41}, {2, 1663}, {3, 5}, {4, 16384}, {6, to}};
+	ChunksRecordRecordWriter w = chunks_record_RecordWriter_new();
+
+	txn_record_tests_write(&w, fields, lengthof(fields));
+	if (extra != 0)
+		chunks_record_RecordWriter_uint(&w, extra, 1);
+	chunks_record_RecordWriter_uint(&w, 16, 3);
+	return chunks_record_RecordWriter_finish(&w);
+}
+
+/*
+ * test_txn_record_tests_a_page_leave_reads_back_and_refuses_every_other_form:
+ * the fork's own (CommPF 5's ruling on a fresh page's leave): a leave reads
+ * back as it was written, with its writer and a subtransaction's xid, its
+ * storage, and the counter it moved to, and a field it doesn't know, a
+ * counter that names no page's first tuple id, and a cut body are data
+ * corruption.
+ */
+void
+test_txn_record_tests_a_page_leave_reads_back_and_refuses_every_other_form(void)
+{
+	for (uint64 top = 0; top <= 40; top += 40)
+	{
+		TxnRecordPageLeft left = {.writer = {41, top != 0, top, 3}, .storage = {1663, 5, 16384}, .to = 3 << 16 | 1};
+
+		txn_record_tests_left_round(&left, __LINE__);
+	}
+	STD_ASSERT(__LINE__, 9, txn_record_tests_left_read(txn_record_tests_left(1 << 16 | 1, 0), 0) ==
+			   TXN_RECORD_TESTS_READ, "PageLeft::decode(&left(1 << 16 | 1, None)).is_ok()");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_left_read(txn_record_tests_left(1 << 16 | 2, 0), 0) ==
+				   TXN_RECORD_TESTS_CORRUPT, "a counter past a page's first offset decoded");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_left_read(txn_record_tests_left(1, 0), 0) ==
+				   TXN_RECORD_TESTS_CORRUPT, "a leave to block 0 decoded");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_left_read(txn_record_tests_left(1 << 16 | 1, 9), 0) ==
+				   TXN_RECORD_TESTS_CORRUPT, "an unknown field decoded");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_left_read(txn_record_tests_left(1 << 16 | 1, 0), 1) ==
+				   TXN_RECORD_TESTS_CORRUPT, "a cut leave decoded");
+}
+
+/* txn_record_tests_leaf returns a leaf of the entries a=1 and, of two, b=2, with no addresses. */
+static StdVec
+txn_record_tests_leaf(size_t entries)
+{
+	const StdBytes keys[] = {{(const uint8 *) "a", 1}, {(const uint8 *) "b", 1}};
+	const StdBytes values[] = {{(const uint8 *) "1", 1}, {(const uint8 *) "2", 1}};
+	const StdVec addresses[] = {STD_VEC_NEW, STD_VEC_NEW};
+	StdVec		leaf;
+
+	trees_node_encode_leaf(keys, entries, values, entries, addresses, entries, false, &leaf);
+	return leaf;
+}
+
+/* txn_record_tests_stamps returns the stamps of transaction 7's tuples 1 to count, one an entry. */
+static ChunksTrailerStamps
+txn_record_tests_stamps(uint64 count)
+{
+	StdVec		single;
+
+	std_vec_new(&single, sizeof(ChunksTrailerStamp), _Alignof(ChunksTrailerStamp));
+	for (uint64 tuple = 1; tuple <= count; tuple++)
+	{
+		ChunksTrailerStamp stamp = {7, tuple};
+
+		std_vec_push_Checked(&single, &stamp, sizeof(stamp), _Alignof(ChunksTrailerStamp));
+	}
+	return chunks_trailer_Stamps_FromVecStamp_from(&single);
+}
+
+/* txn_record_tests_node returns a built base's node of a chunk's bytes with stamps stored alone, in a storage at a point. */
+static TxnRecordChunkWrite
+txn_record_tests_node(const StdVec *bytes, const ChunksTrailerStamps *stamps, uint32 relation, uint64 point)
+{
+	TxnRecordChunkWrite chunk = {
+		.repository = 16384,
+		.address = chunks_address_Address_of(bytes->ptr, bytes->len),
+		.has_node = true,
+		.node = {.tablespace = 1663, .relation = relation, .point = point, .writer = UINT64CONST(0x1000002f1)},
+	};
+
+	std_vec_clone(&chunk.bytes, bytes, 1, 1);
+	chunks_trailer_store((const uint8 *) "", 0, NULL, 0, stamps, &chunk.node.stamps);
+	return chunk;
+}
+
+/* txn_record_tests_pieces_drop frees a chunk's pieces. */
+static void
+txn_record_tests_pieces_drop(StdVec *pieces)
+{
+	for (size_t i = 0; i < pieces->len; i++)
+	{
+		std_vec_free_Checked(&STD_VEC_AT(pieces, txn_TupleVecU8VecU8_t, i).f0, 1, 1);
+		std_vec_free_Checked(&STD_VEC_AT(pieces, txn_TupleVecU8VecU8_t, i).f1, 1, 1);
+	}
+	std_vec_free_Checked(pieces, sizeof(txn_TupleVecU8VecU8_t), _Alignof(txn_TupleVecU8VecU8_t));
+}
+
+/* txn_record_tests_be appends an integer's low bytes, most significant first. */
+static void
+txn_record_tests_be(StdVec *out, uint64 value, size_t bytes)
+{
+	for (size_t i = bytes; i > 0; i--)
+	{
+		uint8		byte = (uint8) (value >> (8 * (i - 1)));
+
+		std_vec_push_Checked(out, &byte, 1, 1);
+	}
+}
+
+/*
+ * test_txn_record_tests_a_built_bases_node_reads_back_with_its_stamps: PLAN's
+ * Chunk record row, field 5 (the rewrite text's standby ruling): a built
+ * base's leaf reads back with its stamps, and its stored form in the working
+ * state's delta is one piece under its key: its writer, its length, and its
+ * bytes and their trailer with no locators.
+ */
+void
+test_txn_record_tests_a_built_bases_node_reads_back_with_its_stamps(void)
+{
+	StdVec		leaf = txn_record_tests_leaf(2);
+	ChunksTrailerStamps stamps = txn_record_tests_stamps(2);
+	TxnRecordChunkWrite chunk = txn_record_tests_node(&leaf, &stamps, 16390, UINT64CONST(0x100000028));
+	TxnRecordChunkWrite read = txn_record_tests_chunk_decoded(&chunk, __LINE__);
+	txn_TupleVecU8VecU8_t piece;
+	StdVec		value;
+	StdVec		pieces;
+	StdVec		wanted = {&piece, 1, 1};
+	HostError	error;
+	uint8		node_key[TXN_MEMTABLE_BRANCH_NODE_KEY];
+
+	chunks_trailer_store(leaf.ptr, leaf.len, NULL, 0, &stamps, &value);
+	txn_memtable_branch_node_key(chunk.address.f0, 1663, 16390, UINT64CONST(0x100000028), node_key);
+	std_slice_to_vec_Checked(&piece.f0, node_key, sizeof(node_key), 1, 1);
+	txn_record_tests_be(&piece.f0, 0, 2);
+	std_vec_new(&piece.f1, 1, 1);
+	txn_record_tests_be(&piece.f1, UINT64CONST(0x1000002f1), 8);
+	txn_record_tests_be(&piece.f1, value.len, 4);
+	std_vec_extend_from_slice_Checked(&piece.f1, value.ptr, value.len, 1, 1);
+	if (!txn_record_ChunkWrite_pieces(&read, &pieces, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, TXN_RECORD_TESTS_UNWRAP, &error, host_Error_Debug_fmt);
+	STD_ASSERT_EQ(__LINE__, 9, pieces.len == 1 &&
+				  txn_record_tests_bytes_eq(&STD_VEC_AT(&pieces, txn_TupleVecU8VecU8_t, 0).f0, piece.f0.ptr,
+											piece.f0.len) &&
+				  txn_record_tests_bytes_eq(&STD_VEC_AT(&pieces, txn_TupleVecU8VecU8_t, 0).f1, piece.f1.ptr,
+											piece.f1.len),
+				  &pieces, txn_record_tests_pieces_Debug_fmt, &wanted, txn_record_tests_pieces_Debug_fmt);
+	txn_record_tests_pieces_drop(&pieces);
+	std_vec_free_Checked(&piece.f0, 1, 1);
+	std_vec_free_Checked(&piece.f1, 1, 1);
+	std_vec_free_Checked(&value, 1, 1);
+	txn_record_ChunkWrite_drop(&chunk);
+	chunks_trailer_Stamps_drop(&stamps);
+	std_vec_free_Checked(&leaf, 1, 1);
+}
+
+/* txn_record_tests_stamped_refused returns whether a built node of bytes with stamps is refused as data corruption. */
+static bool
+txn_record_tests_stamped_refused(const StdVec *bytes, const ChunksTrailerStamps *stamps)
+{
+	TxnRecordChunkWrite chunk = txn_record_tests_node(bytes, stamps, 16390, UINT64CONST(0x100000028));
+	StdVec		body;
+
+	txn_record_ChunkWrite_encode(&chunk, &body);
+	txn_record_ChunkWrite_drop(&chunk);
+	return txn_record_tests_chunk_read(body, 0) == TXN_RECORD_TESTS_CORRUPT;
+}
+
+/*
+ * test_txn_record_tests_stamps_on_a_blob_or_of_another_count_are_refused:
+ * PLAN's Chunk record row, field 5: stamps on a chunk that isn't a tree's
+ * node, a blob's leaf, and stamps whose count isn't the node's entries' are
+ * data corruption.
+ */
+void
+test_txn_record_tests_stamps_on_a_blob_or_of_another_count_are_refused(void)
+{
+	static const uint8 raw[] = {CHUNKS_HEADER_BLOB_LEAF, 0, 0, 'r', 'a', 'w'};
+	ChunksTrailerStamps one = txn_record_tests_stamps(1);
+	StdVec		blob;
+	StdVec		leaf = txn_record_tests_leaf(2);
+
+	std_slice_to_vec_Checked(&blob, raw, sizeof(raw), 1, 1);
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_stamped_refused(&blob, &one), "stamps on a blob's leaf decoded");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_stamped_refused(&leaf, &one),
+				   "one stamp on a leaf of two entries decoded");
+	std_vec_free_Checked(&leaf, 1, 1);
+	std_vec_free_Checked(&blob, 1, 1);
+	chunks_trailer_Stamps_drop(&one);
+}
+
+/*
+ * txn_record_tests_take returns a carried version: its writer, its tuple id,
+ * its entry unless value is NULL, its ender, and its values mark unless mark
+ * is NULL.
+ */
+static TxnRecordCarriedTake
+txn_record_tests_take(TxnMemtableVersionWriter writer, uint64 tuple, const uint8 *value, size_t value_len,
+					  uint64 ender, const uint32 *mark, size_t mark_len)
+{
+	TxnRecordCarriedTake take = {.writer = writer, .tuple = {tuple}, .has_value = value != NULL, .ender = ender,
+	.has_mark = mark != NULL};
+
+	if (value != NULL)
+		std_slice_to_vec_Checked(&take.value, value, value_len, 1, 1);
+	if (mark != NULL)
+		std_slice_to_vec_Checked(&take.mark, mark, mark_len, sizeof(uint32), _Alignof(uint32));
+	return take;
+}
+
+/* txn_record_tests_versions returns a Vec of carried versions, taking them. */
+static StdVec
+txn_record_tests_versions(const TxnRecordCarriedTake *versions, size_t versions_len)
+{
+	StdVec		result;
+
+	std_slice_to_vec_Checked(&result, versions, versions_len, sizeof(TxnRecordCarriedTake),
+							 _Alignof(TxnRecordCarriedTake));
+	return result;
+}
+
+/*
+ * txn_record_tests_version returns a carried version's writer: its op, its
+ * tuple id when it has one, an entry of [1] when value is set, its ender
+ * unless it is zero, and its values mark's value ids unless ids is NULL.
+ */
+static ChunksRecordRecordWriter
+txn_record_tests_version(uint64 op, bool has_tuple, uint64 tuple, bool value, uint64 ender, const uint8 *ids,
+						 size_t ids_len)
+{
+	static const uint8 entry[] = {1};
+	ChunksRecordRecordWriter w = chunks_record_RecordWriter_new();
+
+	chunks_record_RecordWriter_uint(&w, 1, 741);
+	chunks_record_RecordWriter_uint(&w, 3, 0);
+	chunks_record_RecordWriter_uint(&w, 4, op);
+	if (has_tuple)
+		chunks_record_RecordWriter_uint(&w, 5, tuple);
+	if (value)
+		chunks_record_RecordWriter_field(&w, 6, entry, sizeof(entry));
+	if (ender != 0)
+		chunks_record_RecordWriter_uint(&w, 7, ender);
+	if (ids != NULL)
+		chunks_record_RecordWriter_field(&w, 8, ids, ids_len);
+	return w;
+}
+
+/* txn_record_tests_item returns a free space version's writer of tuple id 4. */
+static ChunksRecordRecordWriter
+txn_record_tests_item(uint64 op, bool value, uint64 ender)
+{
+	return txn_record_tests_version(op, true, 4, value, ender, NULL, 0);
+}
+
+/* txn_record_tests_mapped returns a carry's body of one version, a map's number unless it is zero, and an extra field. */
+static StdVec
+txn_record_tests_mapped(ChunksRecordRecordWriter item, uint64 map, bool extra)
+{
+	const TxnRecordTestsField fields[] = {{2, 16500}, {3, 5}, {4, 16384}, {5, 3}};
+	ChunksRecordRecordWriter w = chunks_record_RecordWriter_new();
+	StdVec		items;
+
+	txn_record_tests_write(&w, fields, lengthof(fields));
+	std_slice_to_vec_Checked(&items, &item, 1, sizeof(item), _Alignof(ChunksRecordRecordWriter));
+	chunks_record_RecordWriter_list(&w, 6, &items);
+	if (map != 0)
+		chunks_record_RecordWriter_uint(&w, 7, map);
+	if (extra)
+		chunks_record_RecordWriter_uint(&w, 8, 1);
+	return chunks_record_RecordWriter_finish(&w);
+}
+
+/* txn_record_tests_carried_refused returns whether a carry's body is refused as data corruption. */
+static bool
+txn_record_tests_carried_refused(StdVec body)
+{
+	return txn_record_tests_carried_read(body) == TXN_RECORD_TESTS_CORRUPT;
+}
+
+/*
+ * test_txn_record_tests_a_moves_carried_free_space_reads_back_and_refuses_every_other_form:
+ * PLAN's kind 12 (the rewrite text's section 5): a move's carried free space
+ * versions read back as written, a subtransaction's writer, an emptying, an
+ * ended take, and values marks among them, and so do a value map's, and a
+ * field it doesn't know, an unknown map, a key with no versions, an unknown
+ * op, an emptying with an entry or an ender, an ender below the first normal
+ * xid or on a version with no tuple id, a value map version with a tuple id
+ * or an ender, a values mark with an entry, no tuple id, no value ids, a part
+ * of one, or in a value map, and value ids on a take are data corruption.
+ */
+void
+test_txn_record_tests_a_moves_carried_free_space_reads_back_and_refuses_every_other_form(void)
+{
+	static const uint8 taken[] = {9, 8, 7};
+	static const uint8 flagged[] = {6};
+	static const uint8 five[] = {5};
+	static const uint32 mark[] = {16401, 70000};
+	static const uint8 id[] = {0x11, 0x40, 0, 0};
+	const TxnMemtableVersionWriter sub = {741, true, 740, 2};
+	const TxnMemtableVersionWriter emptier = {742, false, 0, 0};
+	const TxnMemtableVersionWriter flagger = {743, false, 0, 0};
+	const TxnMemtableVersionWriter valuer = {743, false, 0, 1};
+	TxnRecordCarriedTake versions[6];
+	TxnRecordCarriedTake valued[2];
+	TxnRecordMapCarried carried = {.storage = {16500, 5, 16384}, .map = TXN_MEMTABLE_MAP_MAP_FREE, .key = 3};
+	TxnRecordMapCarried values = {.storage = {16500, 5, 16384}, .map = TXN_MEMTABLE_MAP_MAP_VALUES, .key = 16400};
+	const TxnRecordTestsField empty[] = {{2, 16500}, {3, 5}, {4, 16384}, {5, 3}};
+	ChunksRecordRecordWriter w = chunks_record_RecordWriter_new();
+	StdVec		none;
+
+	versions[0] = txn_record_tests_take(sub, 3 << 16 | 4, taken, sizeof(taken), 0, NULL, 0);
+	versions[1] = txn_record_tests_take(sub, 3 << 16 | 4, taken, sizeof(taken), 801, NULL, 0);
+	versions[2] = txn_record_tests_take(emptier, 3 << 16 | 4, NULL, 0, 0, NULL, 0);
+	versions[3] = txn_record_tests_take(flagger, 0, flagged, sizeof(flagged), 0, NULL, 0);
+	versions[4] = txn_record_tests_take(sub, 3 << 16 | 5, NULL, 0, 0, mark, lengthof(mark));
+	versions[5] = txn_record_tests_take(sub, 3 << 16 | 5, NULL, 0, 801, mark, lengthof(mark));
+	carried.versions = txn_record_tests_versions(versions, lengthof(versions));
+	valued[0] = txn_record_tests_take(valuer, 0, five, sizeof(five), 0, NULL, 0);
+	valued[1] = txn_record_tests_take(valuer, 0, NULL, 0, 0, NULL, 0);
+	values.versions = txn_record_tests_versions(valued, lengthof(valued));
+
+	txn_record_tests_carried_round(&carried, __LINE__);
+	txn_record_MapCarried_drop(&carried);
+	txn_record_tests_carried_round(&values, __LINE__);
+	txn_record_MapCarried_drop(&values);
+	STD_ASSERT_MSG(__LINE__, 9, !txn_record_tests_carried_refused(txn_record_tests_mapped(txn_record_tests_item(1, true, 0), 0, false)),
+				   "a whole body was refused");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_carried_refused(txn_record_tests_mapped(txn_record_tests_item(1, true, 0), 0, true)),
+				   "an unknown field decoded");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_carried_refused(txn_record_tests_mapped(txn_record_tests_item(4, false, 0), 0, false)),
+				   "an unknown op decoded");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_carried_refused(txn_record_tests_mapped(txn_record_tests_item(2, true, 0), 0, false)),
+				   "an emptying with an entry decoded");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_carried_refused(txn_record_tests_mapped(txn_record_tests_item(2, false, 801), 0, false)),
+				   "an emptying with an ender decoded");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_carried_refused(txn_record_tests_mapped(txn_record_tests_item(1, true, 2), 0, false)),
+				   "an ender below the first normal xid decoded");
+	STD_ASSERT_MSG(__LINE__, 9, !txn_record_tests_carried_refused(txn_record_tests_mapped(txn_record_tests_item(1, true, 0), 1, false)),
+				   "a free space map named by its number was refused");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_carried_refused(txn_record_tests_mapped(txn_record_tests_item(1, true, 0), 3, false)),
+				   "an unknown map decoded");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_carried_refused(txn_record_tests_mapped(txn_record_tests_item(1, true, 0), 2, false)),
+				   "a value map version with a tuple id decoded");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_carried_refused(txn_record_tests_mapped(txn_record_tests_version(1, false, 0, true, 801, NULL, 0), 0, false)),
+				   "an ender on a free space version with no tuple id decoded");
+	STD_ASSERT_MSG(__LINE__, 9, !txn_record_tests_carried_refused(txn_record_tests_mapped(txn_record_tests_version(1, false, 0, true, 0, NULL, 0), 2, false)),
+				   "a value map put was refused");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_carried_refused(txn_record_tests_mapped(txn_record_tests_version(1, false, 0, true, 801, NULL, 0), 2, false)),
+				   "a value map version with an ender decoded");
+	STD_ASSERT_MSG(__LINE__, 9, !txn_record_tests_carried_refused(txn_record_tests_mapped(txn_record_tests_version(3, true, 4, false, 0, id, sizeof(id)), 0, false)),
+				   "a values mark was refused");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_carried_refused(txn_record_tests_mapped(txn_record_tests_version(3, true, 4, true, 0, id, sizeof(id)), 0, false)),
+				   "a values mark with an entry decoded");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_carried_refused(txn_record_tests_mapped(txn_record_tests_version(3, true, 0, false, 0, id, sizeof(id)), 0, false)),
+				   "a values mark with no tuple id decoded");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_carried_refused(txn_record_tests_mapped(txn_record_tests_version(3, true, 4, false, 0, NULL, 0), 0, false)),
+				   "a values mark with no value ids decoded");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_carried_refused(txn_record_tests_mapped(txn_record_tests_version(3, true, 4, false, 0, id, 3), 0, false)),
+				   "a part of a value id decoded");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_carried_refused(txn_record_tests_mapped(txn_record_tests_version(3, true, 4, false, 0, id, sizeof(id)), 2, false)),
+				   "a value map's values mark decoded");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_carried_refused(txn_record_tests_mapped(txn_record_tests_version(1, true, 4, true, 0, id, sizeof(id)), 0, false)),
+				   "value ids on a take decoded");
+	txn_record_tests_write(&w, empty, lengthof(empty));
+	std_vec_new(&none, sizeof(ChunksRecordRecordWriter), _Alignof(ChunksRecordRecordWriter));
+	chunks_record_RecordWriter_list(&w, 6, &none);
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_carried_refused(chunks_record_RecordWriter_finish(&w)),
+				   "a block with no versions decoded");
+}
+
+/* txn_record_tests_blob_chunk returns a blob's chunk of "blob" by writer 743, top zero for none. */
+static TxnRecordChunkWrite
+txn_record_tests_blob_chunk(uint64 top)
+{
+	TxnRecordChunkWrite chunk = {
+		.repository = 16384,
+		.address = chunks_address_Address_of((const uint8 *) "blob", 4),
+		.has_writer = true,
+		.writer = {743, top != 0, top, 0},
+	};
+
+	std_slice_to_vec_Checked(&chunk.bytes, "blob", 4, 1, 1);
+	return chunk;
+}
+
+/* txn_record_tests_blob_body returns a blob's chunk's body of a repository, an address, bytes, and an extra field. */
+static StdVec
+txn_record_tests_blob_body(uint64 repository, const uint8 *address, size_t address_len, const char *bytes,
+						   bool extra)
+{
+	ChunksRecordRecordWriter w = chunks_record_RecordWriter_new();
+
+	chunks_record_RecordWriter_uint(&w, 1, repository);
+	chunks_record_RecordWriter_field(&w, 2, address, address_len);
+	chunks_record_RecordWriter_field(&w, 3, (const uint8 *) bytes, strlen(bytes));
+	if (extra)
+		chunks_record_RecordWriter_uint(&w, 4, 1);
+	chunks_record_RecordWriter_uint(&w, 10, 743);
+	return chunks_record_RecordWriter_finish(&w);
+}
+
+/* txn_record_tests_chunk_refused returns whether a chunk's body less its last cut bytes is refused as data corruption. */
+static bool
+txn_record_tests_chunk_refused(StdVec body, size_t cut)
+{
+	return txn_record_tests_chunk_read(body, cut) == TXN_RECORD_TESTS_CORRUPT;
+}
+
+/*
+ * test_txn_record_tests_a_chunk_reads_back_and_refuses_every_other_form:
+ * PLAN's Chunk record row (the out-of-line values text, revision 3) and chunk
+ * spill row: a chunk reads back as it was written, its fields numbered on
+ * their own with its writer's xids, a subtransaction's top-level one too, and
+ * a field it doesn't know, a zero or too wide repository, an address of
+ * another length, bytes whose hash isn't the address, a blob's chunk with no
+ * writer, a top-level xid with no writer, and a cut body are data corruption.
+ */
+void
+test_txn_record_tests_a_chunk_reads_back_and_refuses_every_other_form(void)
+{
+	TxnRecordChunkWrite chunk = txn_record_tests_blob_chunk(0);
+	TxnRecordChunkWrite sub = txn_record_tests_blob_chunk(742);
+	TxnRecordChunkWrite read = txn_record_tests_chunk_decoded(&chunk, __LINE__);
+	TxnRecordChunkWrite unwritten = txn_record_tests_blob_chunk(0);
+	ChunksAddressAddress address = chunks_address_Address_of((const uint8 *) "blob", 4);
+	const TxnRecordTestsField topped[] = {{1, 16384}, {2, 0, address.f0, sizeof(address.f0)}, {3, 0, "blob", 4},
+	{11, 742}};
+	StdVec		body;
+
+	txn_record_ChunkWrite_drop(&read);
+	read = txn_record_tests_chunk_decoded(&sub, __LINE__);
+	txn_record_ChunkWrite_drop(&read);
+	txn_record_ChunkWrite_drop(&sub);
+	unwritten.has_writer = false;
+	unwritten.writer = (TxnMemtableVersionWriter)
+	{
+		0
+	};
+	txn_record_ChunkWrite_encode(&unwritten, &body);
+	txn_record_ChunkWrite_drop(&unwritten);
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_chunk_refused(body, 0), "a blob's chunk with no writer decoded");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_chunk_refused(txn_record_tests_body(topped, lengthof(topped)), 0),
+				   "a top-level xid with no writer decoded");
+	STD_ASSERT_MSG(__LINE__, 9,
+				   txn_record_tests_chunk_refused(txn_record_tests_blob_body(16384, address.f0, sizeof(address.f0),
+																			 "blob", true), 0),
+				   "an unknown field decoded");
+	STD_ASSERT_MSG(__LINE__, 9,
+				   txn_record_tests_chunk_refused(txn_record_tests_blob_body(0, address.f0, sizeof(address.f0),
+																			 "blob", false), 0),
+				   "a zero repository decoded");
+	STD_ASSERT_MSG(__LINE__, 9,
+				   txn_record_tests_chunk_refused(txn_record_tests_blob_body(UINT64CONST(1) << 32, address.f0,
+																			 sizeof(address.f0), "blob", false), 0),
+				   "a too wide repository decoded");
+	STD_ASSERT_MSG(__LINE__, 9,
+				   txn_record_tests_chunk_refused(txn_record_tests_blob_body(16384, address.f0, 31, "blob", false), 0),
+				   "a short address decoded");
+	STD_ASSERT_MSG(__LINE__, 9,
+				   txn_record_tests_chunk_refused(txn_record_tests_blob_body(16384, address.f0, sizeof(address.f0),
+																			 "blot", false), 0),
+				   "bytes of another address decoded");
+	txn_record_ChunkWrite_encode(&chunk, &body);
+	txn_record_ChunkWrite_drop(&chunk);
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_chunk_refused(body, 1), "a cut chunk decoded");
+}
+
+/* txn_record_tests_kept_body returns an update's body with one stored value and its kept field unless it is empty. */
+static StdVec
+txn_record_tests_kept_body(const uint8 *kept, size_t kept_len)
+{
+	ChunksAddressAddress ten = chunks_address_Address_of((const uint8 *) "ten", 3);
+	uint8		stored[1 + sizeof(ten.f0) + 1] = {10};
+	const TxnRecordTestsField fields[] = {{1, 41}, {2, 1663}, {3, 5}, {4, 16384}, {6, 0, "k", 1}, {7, 0, "row", 3},
+	{9, 2}, {15, 16385}, {16, 3}, {22, 36}, {24, 0, stored, sizeof(stored)}, {25, 1663}, {26, 16390}, {27, 16391}};
+	ChunksRecordRecordWriter w = chunks_record_RecordWriter_new();
+
+	memcpy(stored + 1, ten.f0, sizeof(ten.f0));
+	stored[sizeof(stored) - 1] = 1;
+	txn_record_tests_write(&w, fields, lengthof(fields));
+	if (kept_len != 0)
+		chunks_record_RecordWriter_field(&w, 28, kept, kept_len);
+	return chunks_record_RecordWriter_finish(&w);
+}
+
+/*
+ * test_txn_record_tests_an_updates_kept_values_read_back_in_their_values_order:
+ * field 28 (PLAN's row change record, (4b)): an update that keeps some of its
+ * row's values out of line reads back with its put's value ids in its values'
+ * order, field 24 holding the stored ones with their blobs and field 28 the
+ * kept ones at their places; one that keeps every value has no field 24; and
+ * a kept place out of order or past the put's values, a kept id also in field
+ * 24, and an empty field 28 are data corruption.
+ */
+void
+test_txn_record_tests_an_updates_kept_values_read_back_in_their_values_order(void)
+{
+	static const uint32 updated_ids[] = {10, 11, 12};
+	static const uint32 put_ids[] = {20, 21};
+	static const size_t one[] = {1};
+	static const size_t both[] = {0, 1};
+	static const uint8 kept[] = {1, 11};
+	static const uint8 past[] = {2, 11};
+	static const uint8 stored[] = {1, 10};
+	static const uint8 unordered[] = {0, 11, 0, 12};
+	const TxnRecordToast toast = {1663, 16390, 16391};
+	TxnMemtableOp op = {.tag = TXN_MEMTABLE_OP_UPDATE_ROW, .u.update_row = {{1}, txn_record_tests_put(1 << 16 | 2)}};
+	TxnMemtablePut put = txn_record_tests_put(1 << 16 | 2);
+	TxnRecordRowChange written;
+	TxnRecordRowChange all;
+
+	txn_record_tests_ids(&op.u.update_row.f1, updated_ids, lengthof(updated_ids));
+	written = txn_record_tests_change(op, 0);
+	written.has_toast = true;
+	written.toast = toast;
+	txn_record_tests_blob(&written, "ten", 3000);
+	txn_record_tests_blob(&written, "twelve", 5000);
+	txn_record_tests_kept(&written, one, lengthof(one));
+	txn_record_tests_change_round(&written, __LINE__);
+	txn_record_RowChange_drop(&written);
+	txn_record_tests_ids(&put, put_ids, lengthof(put_ids));
+	all = txn_record_tests_put_change(put, 0);
+	all.has_toast = true;
+	all.toast = toast;
+	txn_record_tests_kept(&all, both, lengthof(both));
+	txn_record_tests_change_round(&all, __LINE__);
+	txn_record_RowChange_drop(&all);
+	STD_ASSERT(__LINE__, 9,
+			   txn_record_tests_change_read(txn_record_tests_kept_body(kept, sizeof(kept)), 0) ==
+			   TXN_RECORD_TESTS_READ, "RowChange::decode(&body(&[1, 11])).is_ok()");
+	STD_ASSERT_MSG(__LINE__, 9,
+				   txn_record_tests_change_read(txn_record_tests_kept_body(past, sizeof(past)), 0) ==
+				   TXN_RECORD_TESTS_CORRUPT, "a kept place past the put's values decoded");
+	STD_ASSERT_MSG(__LINE__, 9,
+				   txn_record_tests_change_read(txn_record_tests_kept_body(stored, sizeof(stored)), 0) ==
+				   TXN_RECORD_TESTS_CORRUPT, "a kept id also stored decoded");
+	STD_ASSERT_MSG(__LINE__, 9,
+				   txn_record_tests_change_read(txn_record_tests_kept_body(unordered, sizeof(unordered)), 0) ==
+				   TXN_RECORD_TESTS_CORRUPT, "kept places out of order decoded");
+}
+
+/* txn_record_tests_pending returns a chain's entry. */
+static TxnBasePending
+txn_record_tests_pending(uint64 xid, uint32 command, uint64 sub, size_t transform_len, bool has_end, uint64 end)
+{
+	TxnBasePending pending = {.xid = xid, .command = command, .sub = sub, .has_end = has_end, .end = end};
+
+	std_vec_u8_from_elem(&pending.transform, 1, transform_len);
+	return pending;
+}
+
+/* txn_record_tests_fold_body returns a fold's body of a relation, a base record unless it is NULL, and an extra field. */
+static StdVec
+txn_record_tests_fold_body(uint64 relation, const StdVec *kept, size_t kept_cut, bool extra)
+{
+	static const uint8 pack[16] = {7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7};
+	const TxnRecordTestsField fields[] = {{2, 1663}, {3, 16384}, {4, relation}, {6, 40}, {7, 742}};
+	ChunksRecordRecordWriter w = chunks_record_RecordWriter_new();
+
+	txn_record_tests_write(&w, fields, lengthof(fields));
+	if (kept != NULL)
+		chunks_record_RecordWriter_field(&w, 8, kept->ptr, kept->len - kept_cut);
+	chunks_record_RecordWriter_field(&w, 9, pack, sizeof(pack));
+	if (extra)
+		chunks_record_RecordWriter_uint(&w, 11, 1);
+	return chunks_record_RecordWriter_finish(&w);
+}
+
+/* txn_record_tests_marked_fold returns a fold's whole body with a pack id of a length and one more field. */
+static StdVec
+txn_record_tests_marked_fold(const StdVec *kept, size_t pack_len, uint32 number, uint64 value)
+{
+	static const uint8 pack[16] = {7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7};
+	const TxnRecordTestsField fields[] = {{2, 1663}, {3, 16384}, {4, 16385}, {6, 40}, {7, 742},
+	{8, 0, kept->ptr, kept->len}, {9, 0, pack, pack_len}};
+	ChunksRecordRecordWriter w = chunks_record_RecordWriter_new();
+
+	txn_record_tests_write(&w, fields, lengthof(fields));
+	if (number != 0)
+		chunks_record_RecordWriter_uint(&w, number, value);
+	return chunks_record_RecordWriter_finish(&w);
+}
+
+/* txn_record_tests_fold_refused returns whether a fold's body less its last cut bytes is refused as data corruption. */
+static bool
+txn_record_tests_fold_refused(StdVec body, size_t cut)
+{
+	return txn_record_tests_advanced_read(body, cut) == TXN_RECORD_TESTS_CORRUPT;
+}
+
+/*
+ * test_txn_record_tests_a_folds_record_reads_back_and_refuses_every_other_form:
+ * the fold text's 3.3 and PLAN's fields 10 to 12: a fold's record reads back
+ * as it was written, its packs' ids, built mark, horizon, and kept mark among
+ * it, and a field it doesn't know, a too wide storage field, a missing or
+ * damaged base record, a pack's id cut short, a built mark other than 1, a
+ * horizon on a fold's record, a kept mark on a fold's record or other than 1,
+ * and a cut body are data corruption.
+ */
+void
+test_txn_record_tests_a_folds_record_reads_back_and_refuses_every_other_form(void)
+{
+	TxnRecordBaseAdvanced advanced = {
+		.storage = {1663, 16384, 16385},
+		.folded = UINT64CONST(0x100000028),
+		.max_folded = 742,
+		.base = txn_base_tests_full(),
+		.built = true,
+		.horizon = 801,
+	};
+	ChunksPackPackId packs[2];
+	TxnBasePending entries[2];
+	TxnBaseBase full = txn_base_tests_full();
+	ChunksRecordRecordWriter w;
+	ChunksRecordRecordWriter nested = chunks_record_RecordWriter_new();
+	StdVec		encoded;
+	StdVec		kept;
+	StdVec		chained_value;
+
+	memset(packs[0].f0, 1, sizeof(packs[0].f0));
+	memset(packs[1].f0, 2, sizeof(packs[1].f0));
+	std_slice_to_vec_Checked(&advanced.packs, packs, lengthof(packs), sizeof(ChunksPackPackId),
+							 _Alignof(ChunksPackPackId));
+	txn_record_BaseAdvanced_encode(&advanced, &encoded);
+	txn_record_tests_advanced_round(&advanced, __LINE__);
+	entries[0] = txn_record_tests_pending(PG_UINT64_MAX, PG_UINT32_MAX, 7, 9, false, 0);
+	entries[1] = txn_record_tests_pending(742, 0, 742, 0, true, 801);
+	advanced.built = false;
+	advanced.horizon = 0;
+	advanced.has_chain = true;
+	std_slice_to_vec_Checked(&advanced.chain, entries, lengthof(entries), sizeof(TxnBasePending),
+							 _Alignof(TxnBasePending));
+	txn_record_tests_advanced_round(&advanced, __LINE__);
+	txn_state_kept(&full, &kept);
+	txn_base_Base_drop(&full);
+	w = chunks_record_RecordWriter_new();
+	{
+		const TxnRecordTestsField fields[] = {{2, 1663}, {3, 16384}, {4, 16385}, {6, 40}, {7, 742},
+		{8, 0, kept.ptr, kept.len}, {9, 0, "\7\7\7\7\7\7\7\7\7\7\7\7\7\7\7\7", 16}, {10, 1}};
+
+		txn_record_tests_write(&w, fields, lengthof(fields));
+	}
+	txn_base_chain_value(&STD_VEC_AT(&advanced.chain, TxnBasePending, 0), &chained_value);
+	chunks_record_RecordWriter_field(&nested, 1, chained_value.ptr, chained_value.len);
+	std_vec_free_Checked(&chained_value, 1, 1);
+	chunks_record_RecordWriter_record(&w, 13, &nested);
+	txn_record_BaseAdvanced_drop(&advanced);
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_advanced_read(chunks_record_RecordWriter_finish(&w), 0) !=
+				   TXN_RECORD_TESTS_READ, "a chain on a built record decoded");
+	STD_ASSERT_MSG(__LINE__, 9, !txn_record_tests_fold_refused(txn_record_tests_fold_body(16385, &kept, 0, false), 0),
+				   "a whole body was refused");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_fold_refused(txn_record_tests_marked_fold(&kept, 16, 10, 2), 0),
+				   "a built mark other than 1 decoded");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_fold_refused(txn_record_tests_marked_fold(&kept, 16, 11, 801), 0),
+				   "a horizon on a fold's record decoded");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_fold_refused(txn_record_tests_fold_body(16385, &kept, 0, true), 0),
+				   "an unknown field decoded");
+	STD_ASSERT_MSG(__LINE__, 9,
+				   txn_record_tests_fold_refused(txn_record_tests_fold_body(UINT64CONST(1) << 32, &kept, 0, false), 0),
+				   "a too wide relation decoded");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_fold_refused(txn_record_tests_fold_body(16385, NULL, 0, false), 0),
+				   "a body with no base decoded");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_fold_refused(txn_record_tests_fold_body(16385, &kept, 1, false), 0),
+				   "a damaged base decoded");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_fold_refused(encoded, 1), "a cut body decoded");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_fold_refused(txn_record_tests_marked_fold(&kept, 15, 0, 0), 0),
+				   "a pack's id cut short decoded");
+	std_vec_free_Checked(&kept, 1, 1);
+}
+
+/* TxnRecordTestsRuns is a list of runs of tuple ids, block, first offset, count, and bytes. */
+typedef struct TxnRecordTestsRuns
+{
+	std_TupleU32U16U16U64_t runs[3];
+	size_t		len;
+} TxnRecordTestsRuns;
+
+/*
+ * txn_record_tests_freed returns a free of runs and dead runs of a storage
+ * with no values, each tuple id's stored ender none (bugs row 320).
+ */
+static TxnRecordTidsFreed
+txn_record_tests_freed(const TxnRecordTestsRuns *runs, const TxnRecordTestsRuns *dead)
+{
+	TxnRecordTidsFreed freed = {.storage = {1663, 5, 16384}};
+	uint64		none = 0;
+
+	std_slice_to_vec_Checked(&freed.runs, runs->runs, runs->len, sizeof(std_TupleU32U16U16U64_t),
+							 _Alignof(std_TupleU32U16U16U64_t));
+	std_slice_to_vec_Checked(&freed.dead, dead->runs, dead->len, sizeof(std_TupleU32U16U16U64_t),
+							 _Alignof(std_TupleU32U16U16U64_t));
+	std_vec_new(&freed.enders, sizeof(uint64), _Alignof(uint64));
+	for (size_t i = 0; i < runs->len; i++)
+		for (uint16 k = 0; k < runs->runs[i].f2; k++)
+			std_vec_push_Checked(&freed.enders, &none, sizeof(uint64), _Alignof(uint64));
+	for (size_t i = 0; i < dead->len; i++)
+		for (uint16 k = 0; k < dead->runs[i].f2; k++)
+			std_vec_push_Checked(&freed.enders, &none, sizeof(uint64), _Alignof(uint64));
+	return freed;
+}
+
+/* txn_record_tests_freed_status returns what a free's encoding decodes to, freeing the free. */
+static TxnRecordTestsRead
+txn_record_tests_freed_status(TxnRecordTidsFreed *freed)
+{
+	StdVec		body;
+
+	txn_record_TidsFreed_encode(freed, &body);
+	txn_record_TidsFreed_drop(freed);
+	return txn_record_tests_freed_read(body);
+}
+
+/* txn_record_tests_freed_extra returns a free's encoding with a record of more fields after it, freeing the free. */
+static StdVec
+txn_record_tests_freed_extra(TxnRecordTidsFreed *freed, const TxnRecordTestsField *fields, size_t fields_len)
+{
+	StdVec		body;
+	StdVec		extra = txn_record_tests_body(fields, fields_len);
+
+	txn_record_TidsFreed_encode(freed, &body);
+	txn_record_TidsFreed_drop(freed);
+	std_vec_extend_from_slice_Checked(&body, extra.ptr, extra.len, 1, 1);
+	std_vec_free_Checked(&extra, 1, 1);
+	return body;
+}
+
+/*
+ * test_txn_record_tests_a_free_reads_back_and_refuses_runs_out_of_bounds_or_order:
+ * a free's record decodes to what it encoded, its dead runs (D5) too, and a
+ * run of either field that is empty, starts at offset zero, both (PRevPF 7's
+ * V1), passes a page's most tuples, isn't past the run before it, or gives
+ * back more bytes than a page holds, a block whose runs give back more than a
+ * page, a field 6 with no run, or a field it doesn't know, is data
+ * corruption.
+ */
+void
+test_txn_record_tests_a_free_reads_back_and_refuses_runs_out_of_bounds_or_order(void)
+{
+	static const TxnRecordTestsRuns none = {{{0}}, 0};
+	static const TxnRecordTestsRuns runs = {{{0, 3, 2, 64}, {0, 291, 1, 28}, {7, 1, 291, 8168}}, 3};
+	static const TxnRecordTestsRuns dead_runs = {{{0, 5, 1, 40}, {3, 2, 2, 80}}, 2};
+	static const TxnRecordTestsRuns bad_runs[] = {
+		{{{0, 3, 0, 0}}, 1},
+		{{{0, 0, 1, 28}}, 1},
+		{{{0, 291, 2, 56}}, 1},
+		{{{1, 3, 1, 28}, {1, 2, 1, 28}}, 2},
+		{{{1, 3, 2, 56}, {1, 4, 1, 28}}, 2},
+		{{{1, 3, 1, 8169}}, 1},
+		{{{0, 0, 0, 0}}, 1},
+		{{{1, 3, 1, 5000}, {1, 5, 1, 5000}}, 2},
+	};
+	const TxnRecordTestsField empty[] = {{1, 1663}, {2, 5}, {3, 16384}, {4, 0}, {5, 0, "", 0}, {6, 0, "", 0}};
+	const TxnRecordTestsField unknown[] = {{9, 1}};
+	TxnRecordTidsFreed freed = txn_record_tests_freed(&runs, &none);
+	TxnRecordTidsFreed dead = txn_record_tests_freed(&none, &dead_runs);
+
+	txn_record_tests_freed_round(&freed, __LINE__);
+	txn_record_TidsFreed_drop(&freed);
+	txn_record_tests_freed_round(&dead, __LINE__);
+	STD_ASSERT(__LINE__, 9, txn_record_tests_freed_read(txn_record_tests_body(empty, lengthof(empty))) ==
+			   TXN_RECORD_TESTS_CORRUPT, "TidsFreed::decode(&empty, 291, 8168).unwrap_err().sqlstate() == b\"XX001\"");
+	for (size_t i = 0; i < lengthof(bad_runs); i++)
+	{
+		TxnRecordTidsFreed bad = txn_record_tests_freed(&bad_runs[i], &none);
+
+		STD_ASSERT(__LINE__, 13, txn_record_tests_freed_status(&bad) == TXN_RECORD_TESTS_CORRUPT,
+				   "TidsFreed::decode(&bad.encode(), 291, 8168).unwrap_err().sqlstate() == b\"XX001\"");
+		bad = txn_record_tests_freed(&none, &bad_runs[i]);
+		STD_ASSERT(__LINE__, 13, txn_record_tests_freed_status(&bad) == TXN_RECORD_TESTS_CORRUPT,
+				   "TidsFreed::decode(&bad.encode(), 291, 8168).unwrap_err().sqlstate() == b\"XX001\"");
+	}
+	STD_ASSERT(__LINE__, 9,
+			   txn_record_tests_freed_read(txn_record_tests_freed_extra(&dead, unknown, lengthof(unknown))) ==
+			   TXN_RECORD_TESTS_CORRUPT, "TidsFreed::decode(&body, 291, 8168).unwrap_err().sqlstate() == b\"XX001\"");
+}
+
+/* txn_record_tests_valued_free returns a free of one run whose values are taken down in a TOAST storage. */
+static TxnRecordTidsFreed
+txn_record_tests_valued_free(const std_TupleU32U64_t *values, size_t values_len)
+{
+	static const TxnRecordTestsRuns none = {{{0}}, 0};
+	static const TxnRecordTestsRuns one = {{{0, 3, 1, 64}}, 1};
+	TxnRecordTidsFreed freed = txn_record_tests_freed(&one, &none);
+
+	freed.has_values = true;
+	freed.values.f0 = (HostStorage)
+	{
+		1663, 5, 16387
+	};
+	std_slice_to_vec_Checked(&freed.values.f1, values, values_len, sizeof(std_TupleU32U64_t),
+							 _Alignof(std_TupleU32U64_t));
+	return freed;
+}
+
+/*
+ * test_txn_record_tests_a_frees_taken_down_values_read_back_and_refuse_every_other_form:
+ * bugs row 146: a free's taken-down values read back with their TOAST storage
+ * in the storage's database, and values that are empty, out of id order, or
+ * of a count of zero, or fields 7 to 9 not all present, are data corruption.
+ */
+void
+test_txn_record_tests_a_frees_taken_down_values_read_back_and_refuse_every_other_form(void)
+{
+	static const std_TupleU32U64_t values[] = {{7, 1}, {PG_UINT32_MAX, 3}};
+	static const std_TupleU32U64_t twice[] = {{7, 1}, {7, 1}};
+	static const std_TupleU32U64_t unordered[] = {{9, 1}, {7, 1}};
+	static const std_TupleU32U64_t uncounted[] = {{7, 0}};
+	static const struct
+	{
+		const std_TupleU32U64_t *values;
+		size_t		len;
+	}			bad_values[] = {{values, 0}, {twice, 2}, {unordered, 2}, {uncounted, 1}};
+	static const TxnRecordTestsRuns none = {{{0}}, 0};
+	static const TxnRecordTestsRuns one = {{{0, 3, 1, 64}}, 1};
+	const TxnRecordTestsField partial[] = {{7, 1663}, {8, 16387}};
+	TxnRecordTidsFreed freed = txn_record_tests_valued_free(values, lengthof(values));
+	TxnRecordTidsFreed plain = txn_record_tests_freed(&one, &none);
+
+	txn_record_tests_freed_round(&freed, __LINE__);
+	txn_record_TidsFreed_drop(&freed);
+	for (size_t i = 0; i < lengthof(bad_values); i++)
+	{
+		TxnRecordTidsFreed bad = txn_record_tests_valued_free(bad_values[i].values, bad_values[i].len);
+
+		STD_ASSERT(__LINE__, 13, txn_record_tests_freed_status(&bad) == TXN_RECORD_TESTS_CORRUPT,
+				   "TidsFreed::decode(&bad.encode(), 291, 8168).unwrap_err().sqlstate() == b\"XX001\"");
+	}
+	STD_ASSERT(__LINE__, 9,
+			   txn_record_tests_freed_read(txn_record_tests_freed_extra(&plain, partial, lengthof(partial))) ==
+			   TXN_RECORD_TESTS_CORRUPT, "TidsFreed::decode(&body, 291, 8168).unwrap_err().sqlstate() == b\"XX001\"");
+}
+
+/* TxnRecordTestsExtra is a field an index entry's body carries beside its own, and its integer. */
+typedef struct TxnRecordTestsExtra
+{
+	uint32		number;
+	uint64		value;
+} TxnRecordTestsExtra;
+
+/* txn_record_tests_entry_op returns the which'th op of an index entry's change, in the order its test lists them. */
+static TxnMemtableOp
+txn_record_tests_entry_op(int which)
+{
+	TxnMemtableOp op = {0};
+	TxnMemtablePut put = txn_record_tests_put(which == 2 ? 3 << 16 | 2 : 0);
+
+	put.heap_bytes = 0;
+	switch (which)
+	{
+		case 0:
+			op.tag = TXN_MEMTABLE_OP_PUT;
+			op.u.put = put;
+			return op;
+		case 1:
+			op.tag = TXN_MEMTABLE_OP_DELETE;
+			break;
+		case 2:
+			op.tag = TXN_MEMTABLE_OP_ADD;
+			op.u.add = put;
+			return op;
+		default:
+			op.tag = TXN_MEMTABLE_OP_REMOVE;
+			op.u.remove.f0.f0 = 3 << 16 | 2;
+			break;
+	}
+	txn_memtable_Put_drop(&put);
+	return op;
+}
+
+/* txn_record_tests_entry returns an index entry's body, a put's or a delete's, with extra fields in number order. */
+static StdVec
+txn_record_tests_entry(bool put, const TxnRecordTestsExtra *extra, size_t extra_len)
+{
+	const TxnRecordTestsField fields[] = {{1, 41}, {2, 1663}, {3, 5}, {4, 16390}, {6, 0, "k", 1}};
+	ChunksRecordRecordWriter w = chunks_record_RecordWriter_new();
+
+	txn_record_tests_write(&w, fields, lengthof(fields));
+	if (put)
+		chunks_record_RecordWriter_field(&w, 7, (const uint8 *) "entry", 5);
+	for (size_t i = 0; i < extra_len; i++)
+		if (extra[i].number < 15)
+			chunks_record_RecordWriter_uint(&w, extra[i].number, extra[i].value);
+	chunks_record_RecordWriter_uint(&w, 15, 16385);
+	chunks_record_RecordWriter_uint(&w, 16, 3);
+	for (size_t i = 0; i < extra_len; i++)
+		if (extra[i].number >= 15 && extra[i].number < 31)
+			chunks_record_RecordWriter_uint(&w, extra[i].number, extra[i].value);
+	chunks_record_RecordWriter_uint(&w, 31, 16390);
+	return chunks_record_RecordWriter_finish(&w);
+}
+
+/* txn_record_tests_entry_refused returns whether an index entry's body is refused as data corruption. */
+static bool
+txn_record_tests_entry_refused(bool put, const TxnRecordTestsExtra *extra, size_t extra_len)
+{
+	return txn_record_tests_change_read(txn_record_tests_entry(put, extra, extra_len), 0) == TXN_RECORD_TESTS_CORRUPT;
+}
+
+/*
+ * test_txn_record_tests_an_index_entrys_change_reads_back_and_refuses_every_field_its_op_doesnt_carry:
+ * PLAN's row change row, field 31: each change of an index's storage (a put
+ * naming no tuple id, a delete, and a counted entry's added and removed copy,
+ * each naming the copy's) reads back as it was written, with a
+ * subtransaction's xid, field 15 its table's object id and field 31 the
+ * index's, and no heap bytes; and any field its op doesn't carry beside field
+ * 31 is data corruption: a put's tuple id, an added copy's removed row,
+ * another mark, and each of 13, 14, 21, 22, 23, and 24 to 30.
+ */
+void
+test_txn_record_tests_an_index_entrys_change_reads_back_and_refuses_every_field_its_op_doesnt_carry(void)
+{
+	static const TxnRecordTestsExtra tupled[] = {{9, 1}};
+	static const TxnRecordTestsExtra added[] = {{9, 1}, {11, TXN_RECORD_ADD}};
+	static const TxnRecordTestsExtra removed[] = {{11, TXN_RECORD_REMOVE}, {12, 1}};
+	static const TxnRecordTestsExtra added_removed[] = {{9, 1}, {11, TXN_RECORD_ADD}, {12, 1}};
+	static const TxnRecordTestsExtra marked[] = {{11, TXN_RECORD_DELETE_ROW}, {12, 1}};
+	static const uint32 numbers[] = {13, 14, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30};
+
+	for (int which = 0; which < 4; which++)
+	{
+		for (uint64 top = 0; top <= 40; top += 40)
+		{
+			TxnRecordRowChange written = txn_record_tests_change(txn_record_tests_entry_op(which), top);
+			StdVec		body;
+			StdVec		fields;
+			ChunksErrorError failed;
+			bool		carried = true;
+
+			written.heap_bytes = 0;
+			written.has_index = true;
+			written.index = 16390;
+			txn_record_RowChange_encode(&written, &body);
+			if (!chunks_record_fields(body.ptr, body.len, &fields, &failed))
+				STD_RESULT_EXPECT_FAILED(__LINE__, 0, TXN_RECORD_TESTS_UNWRAP, &failed, chunks_error_Error_Debug_fmt);
+			for (size_t i = 0; i < fields.len; i++)
+			{
+				uint32		number = STD_VEC_AT(&fields, ChunksRecordField, i).number;
+
+				carried = carried && ((number != 9 && number != 22) ||
+									  (written.op.tag == TXN_MEMTABLE_OP_ADD && number == 9));
+			}
+			std_vec_free_Checked(&fields, sizeof(ChunksRecordField), _Alignof(ChunksRecordField));
+			STD_ASSERT(__LINE__, 17, carried,
+					   "chunks::record::fields(&body).unwrap().iter().all(|field| ![9, 22].contains(&field.number) || matches!(written.op, Op::Add(_)) && field.number == 9)");
+			std_vec_free_Checked(&body, 1, 1);
+			txn_record_tests_change_round(&written, __LINE__);
+			txn_record_RowChange_drop(&written);
+		}
+	}
+	STD_ASSERT(__LINE__, 9, !txn_record_tests_entry_refused(true, NULL, 0) &&
+			   !txn_record_tests_entry_refused(false, NULL, 0),
+			   "!refused(&entry(true, &[])) && !refused(&entry(false, &[]))");
+	STD_ASSERT(__LINE__, 9, !txn_record_tests_entry_refused(true, added, lengthof(added)) &&
+			   !txn_record_tests_entry_refused(false, removed, lengthof(removed)),
+			   "!refused(&entry(true, &[(9, 1), (11, ADD)])) && !refused(&entry(false, &[(11, REMOVE), (12, 1)]))");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_entry_refused(true, tupled, lengthof(tupled)),
+				   "an entry's put with a tuple id decoded");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_entry_refused(true, added_removed, lengthof(added_removed)),
+				   "an added copy naming a removed row decoded");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_entry_refused(false, marked, lengthof(marked)),
+				   "an entry's change of another mark decoded");
+	for (size_t i = 0; i < lengthof(numbers); i++)
+	{
+		TxnRecordTestsExtra extra = {numbers[i], 1};
+
+		txn_record_tests_message_decoded(txn_record_tests_entry_refused(true, &extra, 1),
+										 "an entry's put with field ", &numbers[i], std_u32_Debug_fmt, __LINE__, 13);
+		txn_record_tests_message_decoded(txn_record_tests_entry_refused(false, &extra, 1),
+										 "an entry's delete with field ", &numbers[i], std_u32_Debug_fmt, __LINE__,
+										 13);
+	}
+}
+
+/* txn_record_tests_key returns the key of a chunk's first piece, taking the chunk. */
+static StdVec
+txn_record_tests_key(TxnRecordChunkWrite chunk)
+{
+	StdVec		pieces;
+	StdVec		key;
+	HostError	error;
+
+	if (!txn_record_ChunkWrite_pieces(&chunk, &pieces, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, TXN_RECORD_TESTS_UNWRAP, &error, host_Error_Debug_fmt);
+	std_vec_clone(&key, &STD_VEC_AT(&pieces, txn_TupleVecU8VecU8_t, 0).f0, 1, 1);
+	txn_record_tests_pieces_drop(&pieces);
+	return key;
+}
+
+/* txn_record_tests_keys_ne asserts at a line that two keys differ, freeing the second. */
+static void
+txn_record_tests_keys_ne(const StdVec *left, StdVec right, const char *message, uint32 line)
+{
+	if (txn_record_tests_bytes_eq(left, right.ptr, right.len))
+	{
+		StdFmtPiece pieces[] = {{message, strlen(message), 0, {0}}};
+		StdFmtArguments arguments = {pieces, 1, NULL};
+
+		std_assert_failed(RUST_FILE, line, 9, "!=", left, txn_record_tests_vec_Debug_fmt, &right,
+						  txn_record_tests_vec_Debug_fmt, &arguments);
+	}
+	std_vec_free_Checked(&right, 1, 1);
+}
+
+/* txn_record_tests_node_refused returns whether a node's chunk of the numbered fields beside its own is refused. */
+static bool
+txn_record_tests_node_refused(const StdVec *leaf, const StdVec *stamps, const uint32 *numbers, size_t numbers_len)
+{
+	ChunksAddressAddress address = chunks_address_Address_of(leaf->ptr, leaf->len);
+	ChunksRecordRecordWriter w = chunks_record_RecordWriter_new();
+
+	chunks_record_RecordWriter_uint(&w, 1, 16384);
+	chunks_record_RecordWriter_field(&w, 2, address.f0, sizeof(address.f0));
+	chunks_record_RecordWriter_field(&w, 3, leaf->ptr, leaf->len);
+	for (size_t i = 0; i < numbers_len; i++)
+	{
+		if (numbers[i] == 5)
+			chunks_record_RecordWriter_field(&w, 5, stamps->ptr, stamps->len);
+		else
+			chunks_record_RecordWriter_uint(&w, numbers[i], 1);
+	}
+	return txn_record_tests_chunk_refused(chunks_record_RecordWriter_finish(&w), 0);
+}
+
+/*
+ * test_txn_record_tests_a_built_nodes_key_names_its_base_and_its_fields_come_together:
+ * PLAN's Chunk record row, fields 6 to 9 (CommPF 8's ruling on concurrent
+ * built bases): a built base's node is keyed in the working state's delta by
+ * its address and its base, so two bases' nodes of one address are held
+ * apart and a blob's chunk keeps its address alone; and stamps without a
+ * storage, a fold point, and a writer, or any of those without stamps, are
+ * data corruption.
+ */
+void
+test_txn_record_tests_a_built_nodes_key_names_its_base_and_its_fields_come_together(void)
+{
+	static const uint32 whole[] = {5, 6, 7, 8, 9};
+	static const uint32 written[] = {5, 6, 7, 8, 9, 10};
+	static const uint32 first_set[] = {5};
+	static const uint32 second_set[] = {5, 6, 7};
+	static const uint32 third_set[] = {5, 6, 7, 8};
+	static const uint32 fourth_set[] = {6, 7, 8, 9};
+	static const uint32 fifth_set[] = {9};
+	static const TxnRecordTestsU32s refused_sets[] = {{first_set, 1}, {second_set, 3}, {third_set, 4},
+	{fourth_set, 4}, {fifth_set, 1}};
+	StdVec		leaf = txn_record_tests_leaf(1);
+	ChunksTrailerStamps one = txn_record_tests_stamps(1);
+	ChunksAddressAddress address = chunks_address_Address_of(leaf.ptr, leaf.len);
+	TxnRecordChunkWrite alone = txn_record_tests_node(&leaf, &one, 16390, 0);
+	StdVec		first = txn_record_tests_key(txn_record_tests_node(&leaf, &one, 16390, UINT64CONST(0x100000028)));
+	StdVec		stamps;
+	StdVec		alone_key;
+	StdBytes	head = {first.ptr, Min(first.len, TXN_MEMTABLE_BRANCH_ADDRESS)};
+	StdBytes	addressed = {address.f0, sizeof(address.f0)};
+
+	STD_ASSERT_EQ_U64(__LINE__, 9, first.len, TXN_MEMTABLE_BRANCH_PIECE_KEY);
+	STD_ASSERT_EQ(__LINE__, 9, head.len == addressed.len && memcmp(head.ptr, addressed.ptr, head.len) == 0, &head,
+				  std_bytes_Debug_fmt, &addressed, std_bytes_Debug_fmt);
+	txn_record_tests_keys_ne(&first, txn_record_tests_key(txn_record_tests_node(&leaf, &one, 16391,
+																				UINT64CONST(0x100000028))),
+							 "two storages' nodes share a key", __LINE__);
+	txn_record_tests_keys_ne(&first, txn_record_tests_key(txn_record_tests_node(&leaf, &one, 16390,
+																				UINT64CONST(0x100000030))),
+							 "two fold points' nodes share a key", __LINE__);
+	std_vec_free_Checked(&alone.node.stamps, 1, 1);
+	alone.has_node = false;
+	alone.node = (TxnRecordBuiltNode)
+	{
+		0
+	};
+	alone_key = txn_record_tests_key(alone);
+	STD_ASSERT_EQ(__LINE__, 9, txn_record_tests_bytes_eq(&alone_key, address.f0, sizeof(address.f0)), &alone_key,
+				  txn_record_tests_vec_Debug_fmt, &addressed, std_bytes_Debug_fmt);
+	std_vec_free_Checked(&alone_key, 1, 1);
+	chunks_trailer_store((const uint8 *) "", 0, NULL, 0, &one, &stamps);
+	STD_ASSERT_MSG(__LINE__, 9, !txn_record_tests_node_refused(&leaf, &stamps, whole, lengthof(whole)),
+				   "a built node's whole fields were refused");
+	STD_ASSERT_MSG(__LINE__, 9, txn_record_tests_node_refused(&leaf, &stamps, written, lengthof(written)),
+				   "a built node with a blob's writer decoded");
+	for (size_t i = 0; i < lengthof(refused_sets); i++)
+		txn_record_tests_fields_decoded(txn_record_tests_node_refused(&leaf, &stamps, refused_sets[i].ptr,
+																	  refused_sets[i].len),
+										refused_sets[i].ptr, refused_sets[i].len, __LINE__);
+	std_vec_free_Checked(&stamps, 1, 1);
+	std_vec_free_Checked(&first, 1, 1);
+	chunks_trailer_Stamps_drop(&one);
+	std_vec_free_Checked(&leaf, 1, 1);
+}
+
+#endif							/* DOLTGRES_TEST_TXN */

@@ -97,6 +97,8 @@ extern bool doltgres_entries_testing_doltgres_test_fold(const PgCatalogCaps *cap
 														PgPgError *error);
 extern bool doltgres_entries_testing_doltgres_test_free_space(const PgCatalogCaps *caps, const PgRel *target,
 															  int32 block, PgDatum *result, PgPgError *error);
+extern bool doltgres_entries_testing_doltgres_test_base_points(const PgCatalogCaps *caps, const PgRel *target,
+															   PgDatum *result, PgPgError *error);
 extern bool doltgres_entries_testing_doltgres_test_base_sizes(const PgCatalogCaps *caps, const PgRel *target,
 															  PgDatum *result, PgPgError *error);
 extern bool doltgres_entries_testing_doltgres_test_index_entries(const PgCatalogCaps *caps, const PgRel *target,
@@ -124,6 +126,8 @@ extern bool doltgres_entries_testing_doltgres_test_base_levels(const PgCatalogCa
 															   int32 *result, PgPgError *error);
 extern bool doltgres_entries_testing_doltgres_test_totals(const PgCatalogCaps *caps, const PgRel *target,
 														  PgDatum *result, PgPgError *error);
+extern bool doltgres_entries_testing_doltgres_test_scan_shape(const PgCatalogCaps *caps, const PgRel *target,
+															  PgDatum *result, PgPgError *error);
 extern bool doltgres_entries_testing_doltgres_test_count(const PgCatalogCaps *caps, const PgRel *target,
 														 PgDatum *result, PgPgError *error);
 

@@ -102,9 +102,13 @@ typedef enum ShmemRecordsOpTag
 	SHMEM_RECORDS_OP_LOAD,
 	SHMEM_RECORDS_OP_ADD,
 	SHMEM_RECORDS_OP_EXCHANGE,
+	SHMEM_RECORDS_OP_LOAD_ACQUIRE,
 } ShmemRecordsOpTag;
 
-/* ShmemRecordsOp is an operation on an atomic: a load, an add, or an exchange of the second value for the first. */
+/*
+ * ShmemRecordsOp is an operation on an atomic: a load, an add, an exchange of
+ * the second value for the first, or a load after a read barrier.
+ */
 typedef struct ShmemRecordsOp
 {
 	ShmemRecordsOpTag tag;
@@ -132,6 +136,8 @@ extern bool shmem_records_pool(size_t kind, std_TupleU32U32_t *result);
 extern uint64 shmem_records_word(uint32 at);
 extern bool shmem_records_swap(uint32 at, uint64 loaded, uint64 word);
 extern uint32 shmem_records_hand(size_t kind);
+extern uint64 shmem_records_retired(size_t kind);
+extern bool shmem_records_retired_swap(size_t kind, uint64 loaded, uint64 word);
 extern void shmem_records_clear(size_t kind, uint32 index);
 extern bool shmem_records_lock(const PgMayRaise *raise, size_t kind, uint32 index, size_t lock, bool exclusive,
 							   PgPgError *error);

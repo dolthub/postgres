@@ -27,6 +27,7 @@
 #include "doltgres/host/shared.h"
 #include "doltgres/std/vec.h"
 #include "doltgres/txn/memtable/version.h"
+#include "doltgres/txn/status.h"
 
 /* TXN_MEMTABLE_MAP_KEY is KEY, the length of a map's key, a u32 in big-endian order. */
 #define TXN_MEMTABLE_MAP_KEY 4
@@ -130,19 +131,28 @@ extern const struct TxnMemtableTableTreeOps TXN_MEMTABLE_MAP_VALUES_TREE_OPS;
 
 extern bool txn_memtable_map_Map_Debug_fmt(const void *value, StdFormatter *f);
 extern bool txn_memtable_map_named(HostIoTakesShort io, struct TxnMemtableTablePreparedState *prepared, size_t take,
-								   TxnMemtableVersionWriter writer, bool has_lsn, uint64 lsn, HostRow tuple,
-								   StdVec *values, HostError *error);
+								   TxnMemtableVersionWriter writer, bool has_roomed, TxnStatusRoomed roomed,
+								   bool has_lsn, uint64 lsn, HostRow tuple, StdVec *values, HostError *error);
 extern size_t txn_memtable_map_named_most(size_t count);
 extern bool txn_memtable_map_valued(const TxnMemtableVersionVersion *version, bool *some, StdBytes *result,
 									HostError *error);
 extern bool txn_memtable_map_versions(const struct TxnMemtableTableTreeOps *tree, HostIoIo *io,
 									  const HostDeltaHold *hold, HostSharedRecord state, uint32 key, StdVec *result,
 									  HostError *error);
+extern bool txn_memtable_map_in_memtable(HostIoIo *io, HostSharedRecord state, TxnMemtableMapMap map, uint32 key,
+										 bool *some, TxnMemtableMapEntry *result, HostError *error);
+extern bool txn_memtable_map_spilled_newest(HostIoIo *io, HostSharedRecord state, uint32 key, bool *some,
+											TxnMemtableMapEntry *result, HostError *error);
 extern bool txn_memtable_map_newest(HostIoIo *io, HostSharedRecord state, TxnMemtableMapMap map, uint32 key,
 									bool *some, TxnMemtableMapEntry *result, HostError *error);
+extern bool txn_memtable_map_taker(const TxnMemtableVersionVersion *version,
+								   txn_TupleWriterRowEntryU64TupleVecU32Bool_t *taker, HostError *error);
+extern bool txn_memtable_map_spilled_takes(HostIoIo *io, HostSharedRecord state, uint32 block, StdVec *result,
+										   HostError *error);
 extern bool txn_memtable_map_takers(HostIoIo *io, HostSharedRecord state, TxnMemtableMapMap map, uint32 key,
 									StdVec *result, HostError *error);
-extern bool txn_memtable_map_ended(HostIoIo *io, HostSharedRecord state, HostRow tid, uint32 ender, HostError *error);
+extern bool txn_memtable_map_ended(HostIoIo *io, HostSharedRecord state, HostRow tid, uint64 writer, uint32 ender,
+								   HostError *error);
 extern void txn_memtable_map_takers_drop(StdVec *takers);
 extern HostRow txn_memtable_map_taken(TxnMemtableVersionOpRef op);
 extern bool txn_memtable_map_marked(HostIoIo *io, HostSharedRecord state, uint32 block, uint64 lsn, StdVec *result,
@@ -156,7 +166,8 @@ extern bool txn_memtable_map_raised(HostSharedRecord state, const uint8 *key, si
 extern bool txn_memtable_map_cut(HostIoIo *io, HostSharedRecord state, bool *some, txn_TupleU64VecVecU8_t *result,
 								 HostError *error);
 extern bool txn_memtable_map_took_core(HostIoTakesShort io, struct TxnMemtableTablePreparedState *prepared,
-									   size_t take, TxnMemtableVersionWriter writer, bool has_lsn, uint64 lsn,
+									   size_t take, TxnMemtableVersionWriter writer, bool has_roomed,
+									   TxnStatusRoomed roomed, bool has_lsn, uint64 lsn,
 									   bool has_claim, HostRow claim_tid, uint64 claim_bytes, bool has_base,
 									   const uint8 *base, size_t base_len,
 									   TxnMemtableMapStep (*step) (void *captures, bool has_current,

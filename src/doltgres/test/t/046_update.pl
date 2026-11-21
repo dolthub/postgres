@@ -1073,4 +1073,56 @@ for my $carrying (@carrying)
 		"an update carries its old row's lock to the new row's xmax as heap's does, with columns ($columns)");
 }
 
+
+# A primary key WITHOUT OVERLAPS is an exclusion constraint's, so an insert or
+# an update that writes an existing row's key is refused with the exclusion
+# violation, 23P01, as heap's exclusion check refuses it (bugs row 317), not
+# with a unique index's 23505, the existing row folded into the base. On a
+# node of its own, with the fold launcher held, no fold worker left running,
+# and no other process's xmin or xid holding the horizon, the case's own fold
+# installs that base.
+my $overlap = PostgreSQL::Test::Cluster->new('overlap');
+$overlap->init;
+$overlap->start;
+$overlap->safe_psql('postgres',
+	"CREATE EXTENSION injection_points; CREATE EXTENSION doltgres_test; SELECT injection_points_attach('doltgres-fold-launch', 'wait')"
+);
+$overlap->poll_query_until('postgres',
+	"SELECT count(*) = 1 FROM pg_stat_activity WHERE wait_event = 'doltgres-fold-launch'"
+) or die 'the fold launcher is not held';
+$overlap->safe_psql(
+	'postgres', q{
+CREATE TABLE overlapped (id int4range, valid_at daterange, CONSTRAINT overlapped_pkey PRIMARY KEY (id, valid_at WITHOUT OVERLAPS));
+INSERT INTO overlapped VALUES ('[1,2)', daterange('2000-01-01', '2000-02-15')), ('[1,2)', daterange('2001-01-01', '2002-01-01'));
+});
+$overlap->poll_query_until('postgres',
+	"SELECT count(*) = 0 FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND (backend_type = 'fold worker' OR backend_xmin IS NOT NULL OR backend_xid IS NOT NULL)"
+) or die 'a process holds the fold back';
+is( $overlap->safe_psql(
+		'postgres', "SELECT doltgres_test_fold('overlapped')"),
+	't',
+	'a WITHOUT OVERLAPS primary key\'s table folds its rows into its base');
+my @refused;
+for my $statement (
+	"INSERT INTO overlapped VALUES ('[1,2)', daterange('2000-01-01', '2000-02-15'))",
+	"UPDATE overlapped SET valid_at = daterange('2000-01-01', '2000-04-01') WHERE id = '[1,2)'"
+  )
+{
+	my (undef, undef, $err) =
+	  $overlap->psql('postgres', "\\set VERBOSITY verbose\n$statement");
+	push @refused,
+	  join("\n",
+		grep { /^(?:psql:<stdin>:\d+: )?(?:ERROR|DETAIL):/ } split /\n/,
+		$err);
+}
+is_deeply(
+	\@refused,
+	[
+		qq{psql:<stdin>:2: ERROR:  23P01: conflicting key value violates exclusion constraint "overlapped_pkey"\nDETAIL:  Key (id, valid_at)=([1,2), [2000-01-01,2000-02-15)) conflicts with existing key (id, valid_at)=([1,2), [2000-01-01,2000-02-15)).},
+		qq{psql:<stdin>:2: ERROR:  23P01: conflicting key value violates exclusion constraint "overlapped_pkey"\nDETAIL:  Key (id, valid_at)=([1,2), [2000-01-01,2000-04-01)) conflicts with existing key (id, valid_at)=([1,2), [2000-01-01,2000-04-01)).}
+	],
+	"an insert or an update of a WITHOUT OVERLAPS primary key's existing key is refused as heap's exclusion check refuses it"
+);
+$overlap->stop;
+
 done_testing();

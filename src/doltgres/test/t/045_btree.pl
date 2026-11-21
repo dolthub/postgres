@@ -2481,5 +2481,130 @@ is( $node->safe_psql('postgres',
 	't|t',
 	"an answer of none leaves the caller's handle and datum as they were");
 
+# Bugs row 313: a concurrent build's validation forms no key of a row its
+# build's snapshot saw, which the build indexed, so a REINDEX CONCURRENTLY runs
+# an indexed row's expression once, as heap's validation does: the regress
+# suite's concur_reindex_ddl sequence gives the reference's one NOTICE and its
+# two errors.
+my (undef, undef, $ddl_err) = $node->psql(
+	'postgres', q{
+CREATE TABLE concur_reindex_ddl_tab (i int);
+INSERT INTO concur_reindex_ddl_tab VALUES (1);
+CREATE FUNCTION concur_reindex_ddl_f() RETURNS void LANGUAGE plpgsql AS
+  'begin DROP INDEX IF EXISTS public.concur_reindex_ddl_ind2; end';
+CREATE FUNCTION concur_reindex_ddl_im(int) RETURNS int
+  LANGUAGE plpgsql IMMUTABLE AS
+  'begin perform public.concur_reindex_ddl_f(); return $1; end';
+CREATE INDEX concur_reindex_ddl_ind1 ON
+  concur_reindex_ddl_tab (concur_reindex_ddl_im(i));
+CREATE INDEX concur_reindex_ddl_ind2 ON concur_reindex_ddl_tab (i);
+REINDEX TABLE CONCURRENTLY concur_reindex_ddl_tab;
+REINDEX INDEX CONCURRENTLY concur_reindex_ddl_ind2;
+REINDEX INDEX CONCURRENTLY concur_reindex_ddl_ind1;
+REINDEX INDEX CONCURRENTLY concur_reindex_ddl_ind2;
+},
+	on_error_stop => 0,
+	extra_params => [ '-v', 'VERBOSITY=verbose' ]);
+is( join("\n", $ddl_err =~ /((?:NOTICE|ERROR):  \w{5}: [^\n]*)/g),
+	join("\n",
+		'NOTICE:  00000: index "concur_reindex_ddl_ind2" does not exist, skipping',
+		'ERROR:  55006: cannot DROP INDEX "concur_reindex_ddl_ind2" because it is being used by active queries in this session',
+		'ERROR:  42P01: relation "concur_reindex_ddl_ind2" does not exist'),
+	"a REINDEX CONCURRENTLY computes an indexed row's expression once, as heap's validation does"
+);
+
+# Bugs row 313: CREATE INDEX CONCURRENTLY and REINDEX CONCURRENTLY of a fork
+# btree expression index while another session, which held its lock across the
+# build, inserts while the command waits for writers before its validation:
+# the index is valid and holds every row once. The index's expression waits on
+# an advisory lock at one row, so the writer's lock comes after the build's
+# first wait.
+$node->safe_psql(
+	'postgres', q{
+CREATE FUNCTION validated_at(k int) RETURNS int IMMUTABLE LANGUAGE plpgsql
+	AS $$ BEGIN IF k = 2 THEN PERFORM pg_advisory_xact_lock_shared(45); END IF; RETURN k; END $$;
+CREATE TABLE validated (k int);
+INSERT INTO validated SELECT generate_series(1, 3);
+});
+my $validated_locker = $node->background_psql('postgres');
+my $validated_builder = $node->background_psql('postgres');
+my $validated_writer = $node->background_psql('postgres');
+my $validated_first = 4;
+foreach my $statement (
+	'CREATE INDEX CONCURRENTLY validated_k ON validated ((validated_at(k)))',
+	'REINDEX INDEX CONCURRENTLY validated_k')
+{
+	$validated_locker->query_safe('SELECT pg_advisory_lock(45)');
+	$validated_builder->query_until(qr/start/, "\\echo start\n$statement;\n");
+	$node->poll_query_until('postgres',
+		q{SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event = 'advisory' AND query ~ 'CONCURRENTLY')}
+	);
+	$validated_writer->query_safe(
+		'BEGIN; LOCK TABLE validated IN ROW EXCLUSIVE MODE');
+	$validated_locker->query_safe('SELECT pg_advisory_unlock(45)');
+	$node->poll_query_until('postgres',
+		q{SELECT EXISTS (SELECT 1 FROM pg_stat_progress_create_index WHERE phase = 'waiting for writers before validation')}
+	);
+	my $last = $validated_first + 1;
+	$validated_writer->query_safe(
+		"INSERT INTO validated SELECT generate_series($validated_first, $last); COMMIT"
+	);
+	$validated_builder->query_safe('SELECT 1');
+	is( $node->safe_psql(
+			'postgres',
+			"SET enable_seqscan = off; SET enable_bitmapscan = off; SELECT (SELECT indisvalid FROM pg_index WHERE indexrelid = 'validated_k'::regclass) || ' ' || string_agg(k::text, ',' ORDER BY k) FROM validated WHERE validated_at(k) > 0"
+		),
+		'true ' . join(',', 1 .. $last),
+		"$statement while another session inserts before its validation leaves a valid index holding every row once"
+	);
+	$validated_first = $last + 1;
+}
+$_->quit for $validated_locker, $validated_builder, $validated_writer;
+
 $node->stop;
+
+# P2's index build and index move: a build whose snapshot predates another
+# transaction's committed insert of rows past a 4 MB delta_memory carries their
+# late entries to spill files under the writer's xid and completes; held
+# unfolded by an older snapshot, the index then moves into a tablespace with
+# those entries carried again, never waiting at the budget, and its storage
+# holds an entry for every row after the move and after a crash.
+my $moving_index = PostgreSQL::Test::Cluster->new('index_move');
+$moving_index->init;
+$moving_index->append_conf('postgresql.conf',
+	"delta_memory = 4MB\nfold_threshold = 1GB\nfold_timeout = 3600s\ncollector_naptime = 3600s\nallow_in_place_tablespaces = on"
+);
+$moving_index->start;
+$moving_index->safe_psql(
+	'postgres', q{
+	CREATE EXTENSION doltgres_test;
+	CREATE TABLESPACE index_moved LOCATION '';
+	CREATE TABLE indexed (id int PRIMARY KEY, name text);
+	CREATE INDEX indexed_name ON indexed (name);
+});
+my $entries = sub {
+	scalar(() = $moving_index->safe_psql('postgres', q{SELECT doltgres_test_index_entries('indexed_name')}) =~ /^put$/mg);
+};
+my $index_older = $moving_index->background_psql('postgres');
+$index_older->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
+my $index_builder = $moving_index->background_psql('postgres');
+$index_builder->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
+$moving_index->safe_psql('postgres',
+	q{SELECT doltgres_test_write('indexed', true, 'INSERT INTO indexed SELECT g, repeat(md5(g::text), 31) FROM generate_series(1, 10000) g')},
+	timeout => 600);
+$index_builder->query_safe(q{SELECT doltgres_test_index_build('indexed', 'indexed_name')});
+$index_builder->query_safe('COMMIT');
+$index_builder->quit;
+is($entries->(), 10000, "a build at a 4 MB delta_memory carries every late entry of another transaction's rows");
+$moving_index->safe_psql('postgres',
+	q{SELECT doltgres_test_index_routine('indexed_name'); SELECT doltgres_test_index_move('indexed_name', 'index_moved')},
+	timeout => 600);
+is($entries->(), 10000, "an index move held unfolded carries every entry of another transaction past delta_memory");
+$index_older->query_safe('COMMIT');
+$index_older->quit;
+$moving_index->stop('immediate');
+$moving_index->start;
+is($entries->(), 10000, 'and the moved entries survive a crash');
+$moving_index->stop;
+
 done_testing();

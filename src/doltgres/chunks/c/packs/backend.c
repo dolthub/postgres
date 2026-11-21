@@ -675,13 +675,16 @@ chunks_packs_backend_Packs_changed(const ChunksPacksBackendPacks *self, HostIoTa
 
 /*
  * chunks_packs_backend_Packs_compact_frame_0_t is compact's state across its
- * pad: the view's guard, the list files' flag, and the rewrite under way.
+ * pad, and remove_space's: the view's guard, the list files' flag, and the
+ * rewrite under way.
  */
 typedef struct chunks_packs_backend_Packs_compact_frame_0_t
 {
 	const ChunksPacksBackendPacks *self;
 	HostIoTakesShort io;
 	bool		all;
+	bool		removing;
+	uint32		space;
 	ChunksErrorError *error;
 	bool		ok;
 	HostLockLending view;
@@ -715,7 +718,7 @@ chunks_packs_backend_Packs_compact_pad_0(void *frame_)
 	}
 }
 
-/* chunks_packs_backend_Packs_compact_body_0 is compact's body: the list files due a whole write written whole. */
+/* chunks_packs_backend_Packs_compact_body_0 is compact's body, the list files due a whole write written whole, and remove_space's, its tablespace taken out of them. */
 static void
 chunks_packs_backend_Packs_compact_body_0(void *frame_)
 {
@@ -730,7 +733,7 @@ chunks_packs_backend_Packs_compact_body_0(void *frame_)
 										   frame->io);
 	frame->view_live = true;
 	view = host_lock_Lending_DerefMut_deref_mut(&frame->view);
-	if (!frame->all && !chunks_packs_lists_past_slack(view))
+	if (!frame->removing && !frame->all && !chunks_packs_lists_past_slack(view))
 	{
 		frame->ok = true;
 		goto done;
@@ -746,7 +749,8 @@ chunks_packs_backend_Packs_compact_body_0(void *frame_)
 	if (!chunks_packs_lists_Rewrite_begin(view, record, &flag_io, &frame->rewrite, frame->error))
 		goto done;
 	frame->rewrite_live = true;
-	if (!chunks_packs_lists_Rewrite_compact(&frame->rewrite, frame->all, frame->error))
+	if (frame->removing ? !chunks_packs_lists_Rewrite_remove_space(&frame->rewrite, frame->space, frame->error) :
+		!chunks_packs_lists_Rewrite_compact(&frame->rewrite, frame->all, frame->error))
 		goto done;
 	frame->rewrite_live = false;
 	frame->ok = chunks_packs_lists_Change_install(&frame->rewrite, frame->error);
@@ -764,6 +768,23 @@ chunks_packs_backend_Packs_compact(const ChunksPacksBackendPacks *self, HostIoTa
 								   const HostSharedReader *reading, bool all, ChunksErrorError *error)
 {
 	chunks_packs_backend_Packs_compact_frame_0_t frame = {.self = self, .io = io, .all = all, .error = error};
+
+	(void) reading;
+	std_landing(&frame, chunks_packs_backend_Packs_compact_body_0, chunks_packs_backend_Packs_compact_pad_0);
+	return frame.ok;
+}
+
+/*
+ * chunks_packs_backend_Packs_remove_space takes a tablespace out of the
+ * repository's list files under their flag once none of its packs is listed,
+ * refusing while one is (bugs row 99).
+ */
+bool
+chunks_packs_backend_Packs_remove_space(const ChunksPacksBackendPacks *self, HostIoTakesShort io,
+										const HostSharedReader *reading, uint32 space, ChunksErrorError *error)
+{
+	chunks_packs_backend_Packs_compact_frame_0_t frame = {.self = self, .io = io, .removing = true, .space = space,
+	.error = error};
 
 	(void) reading;
 	std_landing(&frame, chunks_packs_backend_Packs_compact_body_0, chunks_packs_backend_Packs_compact_pad_0);

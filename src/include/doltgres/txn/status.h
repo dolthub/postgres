@@ -137,7 +137,7 @@ extern bool txn_status_lookup(HostIoIo *io, HostXid xid, bool *has_result, TxnSt
 extern bool txn_status_take(HostIoIo *io, HostXid xid, TxnStatusOutcome outcome, TxnStatusRoomed *result_0,
 							bool *result_1, HostError *error);
 extern bool txn_status_counted(HostIoTakesShort io, const HostDeltaHold *hold, TxnStatusRoomed roomed,
-							   HostError *error);
+							   uint64 amount, HostError *error);
 extern bool txn_status_settled(HostIoIo *io, HostXid xid, TxnStatusOutcome from, TxnStatusOutcome to, bool *result,
 							   HostError *error);
 extern bool txn_status_remove(HostIoIo *io, HostXid xid, bool *result, HostError *error);
@@ -147,6 +147,8 @@ extern void txn_status_registered(const HostSharedListed *listed, HostXid xid, H
 extern void txn_status_prepared_registered(const HostSharedListed *listed, HostLsn end);
 extern bool txn_status_roomed(HostIoIo *io, HostXid top, TxnStatusRoomed *result, HostError *error);
 extern bool txn_status_prepared_committing(HostIoIo *io, HostXid xid, HostError *error);
+extern bool txn_status_kept_roomed(HostIoIo *io, const TxnMemtableVersionWriter *writer, bool *has_result,
+								   TxnStatusRoomed *result, HostError *error);
 extern bool txn_status_redo_roomed(HostIoIo *io, const TxnMemtableVersionWriter *writer, bool *has_result,
 								   TxnStatusRoomed *result, HostError *error);
 extern bool txn_status_redo_committed(HostIoIo *io, HostXid xid, HostLsn end, HostError *error);
@@ -156,6 +158,21 @@ extern bool txn_status_Commit_Debug_fmt(const void *value, StdFormatter *f);
 extern bool txn_status_committed(HostIoIo *io, HostXid xid, TxnStatusCommit *result, HostError *error);
 
 #ifdef DOLTGRES_TEST_TXN
+extern void test_txn_status_tests_a_prepared_commit_points_its_entry_at_the_committer_and_registers(void);
+extern void test_txn_status_tests_a_slot_stays_its_entrys_across_a_growth_and_a_removed_ones_is_taken_again(void);
+extern void test_txn_status_tests_a_growth_while_the_proc_array_cant_answer_keeps_an_ended_entry(void);
+extern void test_txn_status_tests_a_commit_registered_in_its_slot_reads_back_and_its_move_settles_the_entry(void);
+extern void test_txn_status_tests_a_folds_point_lies_below_a_commit_still_in_the_proc_array(void);
+extern void test_txn_status_tests_a_take_of_room_moves_the_slots_pair_first(void);
+extern void test_txn_status_tests_a_replayed_commit_stores_its_end_in_the_entry_its_replay_took(void);
+extern void test_txn_status_tests_churn_with_no_live_entries_keeps_one_segment(void);
+extern void test_txn_status_tests_a_growth_holds_what_it_keeps_in_the_least_room(void);
+extern void test_txn_status_tests_entries_are_taken_found_counted_removed_and_kept_by_a_growth(void);
+extern void test_txn_status_tests_an_outcomes_word_says_the_outcome(void);
+extern void test_txn_status_tests_an_outcome_too_large_for_its_word_has_none(void);
+extern void test_txn_status_tests_an_xids_word_is_no_empty_places(void);
+extern void test_txn_status_tests_a_lookup_probes_every_place_and_neighbours_start_apart(void);
+extern void test_txn_status_tests_a_table_is_crowded_at_three_quarters(void);
 extern void test_txn_status_tests_a_key_whose_slot_isnt_stored_yet_leaves_its_slot_as_it_was(void);
 #endif
 

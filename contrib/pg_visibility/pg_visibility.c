@@ -16,6 +16,7 @@
 #include "access/xloginsert.h"
 #include "catalog/pg_type.h"
 #include "catalog/storage_xlog.h"
+#include "doltgres/hooks.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
@@ -924,7 +925,7 @@ tuple_all_visible(HeapTuple tup, TransactionId OldestXmin, Buffer buffer)
 static void
 check_relation_relkind(Relation rel)
 {
-	if (!RELKIND_HAS_TABLE_AM(rel->rd_rel->relkind))
+	if (!RELKIND_HAS_TABLE_AM(rel->rd_rel->relkind) || doltgres_heap_only_refused(rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("relation \"%s\" is of wrong relation kind",

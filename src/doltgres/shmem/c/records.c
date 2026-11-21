@@ -78,11 +78,16 @@ typedef struct ShmemRecordsSpot
 	ShmemRecordsForm form;
 } ShmemRecordsSpot;
 
-/* ShmemRecordsPlaced is a kind in the region: its spot, and the hand its makes sweep from. */
+/*
+ * ShmemRecordsPlaced is a kind in the region: its spot, the hand its makes
+ * sweep from, and for an aged kind the head of its retired list, its first
+ * record plus one, 0 for none (bugs row 309).
+ */
 typedef struct ShmemRecordsPlaced
 {
 	ShmemRecordsSpot spot;
 	pg_atomic_uint64 hand;
+	pg_atomic_uint64 retired;
 } ShmemRecordsPlaced;
 
 /*
@@ -541,6 +546,7 @@ shmem_records_initialize_body_0(void *frame_)
 		placed = shmem_records_part(SHMEM_RECORDS_PLACED, kind, sizeof(ShmemRecordsPlaced));
 		placed->spot = *spot;
 		pg_calls_atomic_init_u64(&placed->hand, 0);
+		pg_calls_atomic_init_u64(&placed->retired, 0);
 		for (size_t index = 0, index_end = (size_t) spot->count; index < index_end;
 			 index = std_forward_unchecked_usize_Checked(index, 1))
 		{
@@ -767,6 +773,26 @@ shmem_records_hand(size_t kind)
 	uint64		hand = pg_calls_atomic_add_u64(&placed->hand, 1);
 
 	return (uint32) STD_REM(u64, hand, (uint64) spot.count, 406, 6);
+}
+
+/* shmem_records_retired loads an aged kind's retired list's head: its first record plus one, 0 for none. */
+uint64
+shmem_records_retired(size_t kind)
+{
+	ShmemRecordsPlaced *placed = shmem_records_part(SHMEM_RECORDS_PLACED, kind, sizeof(ShmemRecordsPlaced));
+
+	return pg_calls_atomic_read_u64(&placed->retired);
+}
+
+/* shmem_records_retired_swap stores an aged kind's retired list's head over the one loaded, reporting whether it was still there. */
+bool
+shmem_records_retired_swap(size_t kind, uint64 loaded, uint64 word)
+{
+	ShmemRecordsPlaced *placed = shmem_records_part(SHMEM_RECORDS_PLACED, kind, sizeof(ShmemRecordsPlaced));
+	uint64		seen = loaded;
+
+	pg_calls_atomic_exchange_u64(&placed->retired, &seen, word);
+	return seen == loaded;
 }
 
 static ShmemRecordsMapped
@@ -1065,6 +1091,9 @@ shmem_records_atomic(size_t kind, uint32 index, size_t atomic, ShmemRecordsOp op
 				pg_calls_atomic_exchange_u64(at, &seen, op.u.exchange.f1);
 				return seen;
 			}
+		case SHMEM_RECORDS_OP_LOAD_ACQUIRE:
+			pg_calls_read_barrier();
+			return pg_calls_atomic_read_u64(at);
 	}
 	pg_unreachable();
 }

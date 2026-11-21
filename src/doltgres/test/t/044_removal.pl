@@ -83,5 +83,31 @@ is($node->safe_psql('postgres', $INSERTED),
 	"a backend terminated inside its transaction takes its rows back at its exit's abort"
 );
 
+# Bugs row 309: an abort's take-back of twenty rows of one table finds the
+# table's state once, not once for each row it wrote.
+SKIP:
+{
+	skip 'injection points are not enabled', 1
+	  if $ENV{enable_injection_points} ne 'yes'
+	  || !$node->check_extension('injection_points');
+	$node->safe_psql(
+		'postgres', q{
+CREATE EXTENSION injection_points;
+CREATE TABLE source_twenty AS SELECT generate_series(1, 20) AS a;
+CREATE TABLE found_twenty (a int4);
+});
+	my ($code, $out, $err) = $node->psql(
+		'postgres', q{
+SELECT injection_points_set_local();
+SELECT injection_points_attach('doltgres-state-found', 'notice');
+BEGIN;
+SELECT doltgres_test_insert('found_twenty', 'source_twenty', false, 0);
+ROLLBACK;
+});
+	my $found = () = $err =~ /doltgres-state-found/g;
+	is($found, 1,
+		"an abort's take-back of twenty rows finds their table's state once");
+}
+
 $node->stop;
 done_testing();

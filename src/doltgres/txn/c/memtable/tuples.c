@@ -52,6 +52,8 @@
 #define TXN_MEMTABLE_TUPLES_USED 1
 #define TXN_MEMTABLE_TUPLES_RESERVED 2
 #define TXN_MEMTABLE_TUPLES_COUNT 3
+/* TXN_MEMTABLE_TUPLES_DEAD_COUNT counts a table's slots whose tids a spill dropped, until a growth or a compaction leaves them behind. */
+#define TXN_MEMTABLE_TUPLES_DEAD_COUNT 4
 
 /* TXN_MEMTABLE_TUPLES_PER is PER, the slots a slot page holds, two words each. */
 #define TXN_MEMTABLE_TUPLES_PER UINT64CONST(512)
@@ -75,6 +77,13 @@
 /* TXN_MEMTABLE_TUPLES_DEAD is DEAD, the tuple id word a dropped slot holds, which a search passes over. */
 #define TXN_MEMTABLE_TUPLES_DEAD PG_UINT64_MAX
 
+/*
+ * TXN_MEMTABLE_TUPLES_DROPPED is the entry, in a table's list of byte pages,
+ * of a byte page a compaction retired, which keeps every other page's index,
+ * so no key's place moves; no page's name is zero.
+ */
+#define TXN_MEMTABLE_TUPLES_DROPPED 0
+
 StaticAssertDecl(HOST_DELTA_PAGE_LARGEST <= UINT64CONST(1) << TXN_MEMTABLE_TUPLES_OFFSET &&
 				 HOST_DELTA_PAGE_LARGEST <= UINT64CONST(1) << TXN_MEMTABLE_TUPLES_LENGTH &&
 				 HOST_DELTA_PAGE_SLOTS <= UINT64CONST(1) << (64 - TXN_MEMTABLE_TUPLES_OFFSET - TXN_MEMTABLE_TUPLES_LENGTH),
@@ -87,9 +96,9 @@ txn_memtable_tuples_Tuples_Aged_count(const HostSharedLimits *limits)
 	return limits->relation_locks;
 }
 
-/* TXN_MEMTABLE_TUPLES_TUPLES_AGED_OPS is Tuples' Shape and Aged: a storage's tuple id table, its lock, four atomics, and its slot and byte pages. */
+/* TXN_MEMTABLE_TUPLES_TUPLES_AGED_OPS is Tuples' Shape and Aged: a storage's tuple id table, its lock, five atomics, and its slot and byte pages. */
 const HostSharedAgedOps TXN_MEMTABLE_TUPLES_TUPLES_AGED_OPS = {
-	.shape = {.id = UINT64CONST(0x74786e000013), .locks = 1, .atomics = 4, .lists = 2},
+	.shape = {.id = UINT64CONST(0x74786e000013), .locks = 1, .atomics = 5, .lists = 2},
 	.name = {"tuple id table", 14},
 	.count = txn_memtable_tuples_Tuples_Aged_count,
 };
@@ -337,7 +346,8 @@ txn_memtable_tuples_Retiring_retire(const TxnMemtableTuplesRetiring *self, HostI
  * txn_memtable_tuples_closed closes an open table under its exclusive lock,
  * both lists and then its mark, and gathers its retirement into a live
  * Retiring: the record, its slot pages, its lists' own pages, and, for a
- * table that leaves no next one, its byte pages.
+ * table that leaves no next one, its byte pages but those a compaction
+ * retired.
  */
 static bool
 txn_memtable_tuples_closed(HostSharedGuard *guard, const HostDeltaHold *hold, uint64 location, bool bytes,
@@ -394,7 +404,8 @@ txn_memtable_tuples_closed(HostSharedGuard *guard, const HostDeltaHold *hold, ui
 
 		if (!host_delta_list_ListView_get(&byte_pages, hold, index, &name, error))
 			return false;
-		std_vec_push_Checked(&result->names, &name, sizeof(name), _Alignof(uint64));
+		if (name != TXN_MEMTABLE_TUPLES_DROPPED)
+			std_vec_push_Checked(&result->names, &name, sizeof(name), _Alignof(uint64));
 	}
 	if (!txn_memtable_table_closed_names(&result->names, &slots, hold, error) ||
 		!txn_memtable_table_closed_names(&result->names, &keys, hold, error))
@@ -1004,6 +1015,12 @@ typedef struct txn_memtable_tuples_reserve_frame_0_t
 	const uint8 *key;
 	size_t		key_len;
 	TxnMemtableTableReservation *result;
+
+	/*
+	 * refused, for a carry's reserve, answers whether the delta's budget
+	 * refused it, with its refusal.
+	 */
+	TxnMemtableTableRefusal *refused;
 	HostError  *error;
 	bool		ok;
 	bool		has_want;
@@ -1019,9 +1036,12 @@ typedef struct txn_memtable_tuples_reserve_frame_0_t
 	bool		guard_live;
 	TxnMemtableTuplesRetiring leaving;
 	bool		leaving_live;
+	/* retired is a Vec<u64> of the byte pages a compaction retired. */
+	StdVec		retired;
+	bool		retired_live;
 } txn_memtable_tuples_reserve_frame_0_t;
 
-/* txn_memtable_tuples_reserve_pad_0 is reserve's pad: the guard, the retirement, the hold, the try, and its sizes, while live. */
+/* txn_memtable_tuples_reserve_pad_0 is reserve's pad: the guard, the retirement, the retired byte pages, the hold, the try, and its sizes, while live. */
 static void
 txn_memtable_tuples_reserve_pad_0(void *frame_)
 {
@@ -1036,6 +1056,11 @@ txn_memtable_tuples_reserve_pad_0(void *frame_)
 	{
 		frame->leaving_live = false;
 		std_vec_free_Checked(&frame->leaving.names, sizeof(uint64), _Alignof(uint64));
+	}
+	if (frame->retired_live)
+	{
+		frame->retired_live = false;
+		std_vec_free_Checked(&frame->retired, sizeof(uint64), _Alignof(uint64));
 	}
 	if (frame->hold_live)
 	{
@@ -1092,6 +1117,293 @@ txn_memtable_tuples_taken(txn_memtable_tuples_reserve_frame_0_t *frame, bool *ok
 }
 
 /*
+ * TxnMemtableTuplesLive is a live slot a compaction stores again: its tid,
+ * its place, its slot's place word, and the words of the slot it moves to.
+ */
+typedef struct TxnMemtableTuplesLive
+{
+	uint64		tid;
+	uint64		place;
+	HostDeltaWord place_word;
+	HostDeltaWord to_tid;
+	HostDeltaWord to_place;
+} TxnMemtableTuplesLive;
+
+/* txn_memtable_tuples_place_cmp orders live slots by their places, which are distinct. */
+static int
+txn_memtable_tuples_place_cmp(const void *a, const void *b)
+{
+	uint64		x = ((const TxnMemtableTuplesLive *) a)->place;
+	uint64		y = ((const TxnMemtableTuplesLive *) b)->place;
+
+	return x < y ? -1 : x > y;
+}
+
+/*
+ * txn_memtable_tuples_moved moves the live keys of a byte page but the open
+ * one to the open page when they fit its room, storing each slot's new place
+ * as soon as its key is appended, marks the page DROPPED in the list of
+ * byte pages, and adds it to the retired pages, which have room for it; live
+ * holds the page's slots, from its first to the one before end. A failure
+ * part way leaves every slot naming a place that holds its key.
+ */
+static bool
+txn_memtable_tuples_moved(HostSharedGuard *guard, const HostDeltaHold *hold, uint64 index, uint64 newest,
+						  const HostDeltaPageRef *open, TxnMemtableTuplesLive *live, size_t len, StdVec *retired,
+						  HostError *error)
+{
+	uint64		mask = (UINT64CONST(1) << TXN_MEMTABLE_TUPLES_LENGTH) - 1;
+	uint64		bytes = 0;
+	uint64		name;
+	HostDeltaPageRef page;
+	HostDeltaListListMut keys;
+
+	keys = host_delta_list_GuardExclusive_list_mut(guard, &TXN_MEMTABLE_TUPLES_TUPLES_AGED_OPS.shape,
+												   TXN_MEMTABLE_TUPLES_LOCK, TXN_MEMTABLE_TUPLES_KEYS);
+	{
+		HostDeltaListListView view = host_delta_list_ListMut_view(&keys);
+
+		if (!host_delta_list_ListView_get(&view, hold, index, &name, error))
+			return false;
+	}
+	for (size_t k = 0; k < len; k++)
+		bytes += live[k].place & mask;
+	if (name == TXN_MEMTABLE_TUPLES_DROPPED || bytes > host_delta_PageRef_room(open))
+		return true;
+	if (!host_delta_Hold_page(hold, host_delta_page_Page_named(name), &page, error))
+		return false;
+	for (size_t k = 0; k < len; k++)
+	{
+		uint64		length = live[k].place & mask;
+		uint64		offset = live[k].place >> TXN_MEMTABLE_TUPLES_LENGTH & ((UINT64CONST(1) << TXN_MEMTABLE_TUPLES_OFFSET) - 1);
+		HostDeltaLent key;
+		StdBytes	held;
+		uint32		at;
+		bool		ok;
+
+		if (!host_delta_PageRef_bytes(&page, offset, length, &key, error))
+			return false;
+		held = host_delta_Lent_Deref_deref(&key);
+		ok = host_delta_PageRef_append(open, &TXN_MEMTABLE_TUPLES_TUPLES_AGED_OPS.shape, TXN_MEMTABLE_TUPLES_LOCK, guard,
+									   held.ptr, held.len, &at, error);
+		host_delta_Lent_drop(&key);
+		if (!ok)
+			return false;
+		live[k].place = txn_memtable_tuples_placed(newest, at, (size_t) length);
+		host_delta_Word_store(&live[k].place_word, live[k].place);
+	}
+	if (!host_delta_list_ListMut_set(&keys, hold, index, TXN_MEMTABLE_TUPLES_DROPPED, error))
+		return false;
+	std_vec_push_Checked(retired, &name, sizeof(name), _Alignof(uint64));
+	return true;
+}
+
+/*
+ * txn_memtable_tuples_compacted_frame_t is compacted's state across its pad:
+ * the slot pages, the live slots, and the tid words of every used slot, each
+ * while live.
+ */
+typedef struct txn_memtable_tuples_compacted_frame_t
+{
+	HostSharedGuard *guard;
+	const HostDeltaHold *hold;
+	StdVec	   *retired;
+	HostError  *error;
+	bool		ok;
+	StdVec		pages;
+	bool		pages_live;
+	StdVec		live;
+	bool		live_live;
+	StdVec		cleared;
+	bool		cleared_live;
+	StdVec		taken;
+	bool		taken_live;
+} txn_memtable_tuples_compacted_frame_t;
+
+/* txn_memtable_tuples_compacted_reserved reserves room for more elements in one of compacted's vectors, answering false on running out of memory. */
+static bool
+txn_memtable_tuples_compacted_reserved(txn_memtable_tuples_compacted_frame_t *frame, StdVec *vec, size_t more,
+									   size_t size, size_t align)
+{
+	if (std_vec_try_reserve(vec, more, size, align))
+		return true;
+	*frame->error = host_Error_out_of_memory();
+	return false;
+}
+
+/*
+ * txn_memtable_tuples_compacted_body reads every slot page and gathers the
+ * live slots and every used slot's tid word, moves the byte pages' keys,
+ * plans each live slot's new slot and takes its words, and only then zeroes
+ * the used slots and stores the live ones again, so every step that can
+ * fail runs before the first slot is zeroed.
+ */
+static void
+txn_memtable_tuples_compacted_body(void *frame_)
+{
+	txn_memtable_tuples_compacted_frame_t *frame = frame_;
+	HostSharedGuard *guard = frame->guard;
+	const HostDeltaHold *hold = frame->hold;
+	HostSharedRecord record = host_shared_Guard_record(guard);
+	HostSharedOp load = {.tag = HOST_SHARED_OP_LOAD};
+	uint64		count = host_shared_Record_atomic(record, TXN_MEMTABLE_TUPLES_COUNT, load);
+	uint64		held = host_shared_Record_atomic(record, TXN_MEMTABLE_TUPLES_USED, load) -
+		host_shared_Record_atomic(record, TXN_MEMTABLE_TUPLES_DEAD_COUNT, load);
+	uint64		reserved = host_shared_Record_atomic(record, TXN_MEMTABLE_TUPLES_RESERVED, load);
+	HostDeltaListListView slots = txn_memtable_tuples_view(guard, TXN_MEMTABLE_TUPLES_SLOTS);
+	uint64		len = host_delta_list_ListView_len(&slots);
+	HostSharedOp exchange = {.tag = HOST_SHARED_OP_EXCHANGE};
+	TxnMemtableTuplesLive *live;
+
+	std_vec_new(&frame->pages, sizeof(HostDeltaPageRef), _Alignof(HostDeltaPageRef));
+	frame->pages_live = true;
+	std_vec_new(&frame->live, sizeof(TxnMemtableTuplesLive), _Alignof(TxnMemtableTuplesLive));
+	frame->live_live = true;
+	std_vec_new(&frame->cleared, sizeof(HostDeltaWord), _Alignof(HostDeltaWord));
+	frame->cleared_live = true;
+	if (!txn_memtable_tuples_compacted_reserved(frame, &frame->pages, (size_t) len, sizeof(HostDeltaPageRef),
+												_Alignof(HostDeltaPageRef)) ||
+		!txn_memtable_tuples_compacted_reserved(frame, &frame->live, (size_t) held, sizeof(TxnMemtableTuplesLive),
+												_Alignof(TxnMemtableTuplesLive)))
+		return;
+	for (uint64 index = 0; index < len; index++)
+	{
+		uint64		name;
+		HostDeltaPageRef page;
+
+		if (!host_delta_list_ListView_get(&slots, hold, index, &name, frame->error) ||
+			!host_delta_Hold_page(hold, host_delta_page_Page_named(name), &page, frame->error))
+			return;
+		std_vec_push_Checked(&frame->pages, &page, sizeof(page), _Alignof(HostDeltaPageRef));
+		for (uint64 at = 0; at < Min(count, TXN_MEMTABLE_TUPLES_PER); at++)
+		{
+			HostDeltaWord word;
+			TxnMemtableTuplesLive slot = {0};
+
+			if (!host_delta_PageRef_word(&page, 2 * at, &word, frame->error))
+				return;
+			slot.tid = host_delta_Word_load(&word);
+			if (slot.tid == 0)
+				continue;
+			if (!txn_memtable_tuples_compacted_reserved(frame, &frame->cleared, 1, sizeof(HostDeltaWord),
+														_Alignof(HostDeltaWord)))
+				return;
+			std_vec_push_Checked(&frame->cleared, &word, sizeof(word), _Alignof(HostDeltaWord));
+			if (slot.tid == TXN_MEMTABLE_TUPLES_DEAD)
+				continue;
+			if (!host_delta_PageRef_word(&page, 2 * at + 1, &slot.place_word, frame->error) ||
+				!txn_memtable_tuples_compacted_reserved(frame, &frame->live, 1, sizeof(TxnMemtableTuplesLive),
+														_Alignof(TxnMemtableTuplesLive)))
+				return;
+			slot.place = host_delta_Word_load(&slot.place_word);
+			std_vec_push_Checked(&frame->live, &slot, sizeof(slot), _Alignof(TxnMemtableTuplesLive));
+		}
+	}
+	live = frame->live.ptr;
+	if (reserved == 0 && frame->live.len > 0)
+	{
+		HostDeltaListListView keys = txn_memtable_tuples_view(guard, TXN_MEMTABLE_TUPLES_KEYS);
+		uint64		newest = host_delta_list_ListView_len(&keys) - 1;
+		size_t		at = 0;
+		uint64		name;
+		HostDeltaPageRef open;
+
+		qsort(live, frame->live.len, sizeof(TxnMemtableTuplesLive), txn_memtable_tuples_place_cmp);
+		if (!host_delta_list_ListView_get(&keys, hold, newest, &name, frame->error) ||
+			!host_delta_Hold_page(hold, host_delta_page_Page_named(name), &open, frame->error) ||
+			!txn_memtable_tuples_compacted_reserved(frame, frame->retired, (size_t) newest, sizeof(uint64),
+													_Alignof(uint64)))
+			return;
+		for (uint64 index = 0; index < newest; index++)
+		{
+			size_t		from = at;
+
+			while (at < frame->live.len &&
+				   live[at].place >> (TXN_MEMTABLE_TUPLES_OFFSET + TXN_MEMTABLE_TUPLES_LENGTH) == index)
+				at++;
+			if (!txn_memtable_tuples_moved(guard, hold, index, newest, &open, &live[from], at - from, frame->retired,
+										   frame->error))
+				return;
+		}
+	}
+	std_vec_new(&frame->taken, sizeof(bool), _Alignof(bool));
+	frame->taken_live = true;
+	if (!txn_memtable_tuples_compacted_reserved(frame, &frame->taken, (size_t) count, sizeof(bool), _Alignof(bool)))
+		return;
+	memset(frame->taken.ptr, 0, (size_t) count);
+	frame->taken.len = (size_t) count;
+	for (size_t k = 0; k < frame->live.len; k++)
+	{
+		uint64		to = txn_memtable_tuples_slot(live[k].tid - 1, count);
+		bool	   *taken = frame->taken.ptr;
+		const HostDeltaPageRef *page;
+
+		while (taken[to])
+			to = (to + 1) % count;
+		taken[to] = true;
+		page = &STD_VEC_AT(&frame->pages, HostDeltaPageRef, (size_t) (to / TXN_MEMTABLE_TUPLES_PER));
+		if (!txn_memtable_tuples_word(page, to, false, 0, 0, &live[k].to_tid, frame->error) ||
+			!txn_memtable_tuples_word(page, to, true, 0, 0, &live[k].to_place, frame->error))
+			return;
+	}
+	for (size_t k = 0; k < frame->cleared.len; k++)
+		host_delta_Word_store(&STD_VEC_AT(&frame->cleared, HostDeltaWord, k), 0);
+	for (size_t k = 0; k < frame->live.len; k++)
+	{
+		host_delta_Word_store(&live[k].to_place, live[k].place);
+		host_delta_Word_store(&live[k].to_tid, live[k].tid);
+	}
+	exchange.u.exchange.f0 = host_shared_Record_atomic(record, TXN_MEMTABLE_TUPLES_USED, load);
+	exchange.u.exchange.f1 = frame->live.len;
+	host_shared_Record_atomic(record, TXN_MEMTABLE_TUPLES_USED, exchange);
+	exchange.u.exchange.f0 = host_shared_Record_atomic(record, TXN_MEMTABLE_TUPLES_DEAD_COUNT, load);
+	exchange.u.exchange.f1 = 0;
+	host_shared_Record_atomic(record, TXN_MEMTABLE_TUPLES_DEAD_COUNT, exchange);
+	frame->ok = host_pause(HOST_SHARED_GUARD_PAUSES(guard), "doltgres-tuples-compacting", frame->error);
+}
+
+/* txn_memtable_tuples_compacted_pad frees what compacted holds live. */
+static void
+txn_memtable_tuples_compacted_pad(void *frame_)
+{
+	txn_memtable_tuples_compacted_frame_t *frame = frame_;
+
+	if (frame->taken_live)
+		std_vec_free_Checked(&frame->taken, sizeof(bool), _Alignof(bool));
+	if (frame->cleared_live)
+		std_vec_free_Checked(&frame->cleared, sizeof(HostDeltaWord), _Alignof(HostDeltaWord));
+	if (frame->live_live)
+		std_vec_free_Checked(&frame->live, sizeof(TxnMemtableTuplesLive), _Alignof(TxnMemtableTuplesLive));
+	if (frame->pages_live)
+		std_vec_free_Checked(&frame->pages, sizeof(HostDeltaPageRef), _Alignof(HostDeltaPageRef));
+	frame->taken_live = frame->cleared_live = frame->live_live = frame->pages_live = false;
+}
+
+/*
+ * txn_memtable_tuples_compacted compacts an open table in place under its
+ * exclusive lock, once its dropped slots leave its live ones at most half
+ * its load factor, allocating nothing from the delta: its live slots,
+ * gathered with fallible allocation, are stored again in its own slot pages,
+ * the dropped ones left behind and its dropped count reset; and, while no
+ * reservation holds a place on a byte page, each byte page but the open one
+ * whose live keys fit the open page's room, none included, has them moved
+ * there with their places and is retired, its entry in the list of byte
+ * pages marked DROPPED, so no other page's index moves. It adds the retired
+ * pages to retired, to retire once the lock is released. Every step that can
+ * fail runs before the first slot is zeroed, and each key's move stores its
+ * new place at once, so an error or a panic leaves every tid found.
+ */
+static bool
+txn_memtable_tuples_compacted(HostSharedGuard *guard, const HostDeltaHold *hold, StdVec *retired, HostError *error)
+{
+	txn_memtable_tuples_compacted_frame_t frame = {.guard = guard, .hold = hold, .retired = retired, .error = error};
+
+	std_landing(&frame, txn_memtable_tuples_compacted_body, txn_memtable_tuples_compacted_pad);
+	txn_memtable_tuples_compacted_pad(&frame);
+	return frame.ok;
+}
+
+/*
  * txn_memtable_tuples_reserve_open is a try under an open table's exclusive
  * lock: it appends the key to the newest byte page when it fits and the table
  * isn't full, answering done, and otherwise grows the table or pushes a byte
@@ -1113,6 +1425,9 @@ txn_memtable_tuples_reserve_open(txn_memtable_tuples_reserve_frame_0_t *frame, T
 	HostDeltaPageRef page;
 	HostDeltaPageSize byte;
 	TxnMemtableTuplesWant wanted = {0};
+	uint64		used;
+	uint64		reserved;
+	uint64		dead;
 
 	*done = false;
 	if (!host_delta_list_ListView_get(&keys, &frame->hold, newest, &name, frame->error) ||
@@ -1121,8 +1436,17 @@ txn_memtable_tuples_reserve_open(txn_memtable_tuples_reserve_frame_0_t *frame, T
 	byte = txn_memtable_tuples_bytes(frame->key_len, true,
 									 STD_ADD(u64, host_delta_PageRef_filled(&page), host_delta_PageRef_room(&page),
 											 280, 40));
-	if (txn_memtable_tuples_full(host_shared_Record_atomic(record, TXN_MEMTABLE_TUPLES_USED, load),
-								 host_shared_Record_atomic(record, TXN_MEMTABLE_TUPLES_RESERVED, load), count))
+	used = host_shared_Record_atomic(record, TXN_MEMTABLE_TUPLES_USED, load);
+	reserved = host_shared_Record_atomic(record, TXN_MEMTABLE_TUPLES_RESERVED, load);
+	dead = host_shared_Record_atomic(record, TXN_MEMTABLE_TUPLES_DEAD_COUNT, load);
+	if (txn_memtable_tuples_full(used, reserved, count) && dead > 0 &&
+		2 * (used - dead + reserved + 1) <= count / 4 * 3)
+	{
+		std_vec_new(&frame->retired, sizeof(uint64), _Alignof(uint64));
+		frame->retired_live = true;
+		return txn_memtable_tuples_compacted(&frame->guard, &frame->hold, &frame->retired, frame->error);
+	}
+	if (txn_memtable_tuples_full(used, reserved, count))
 	{
 		wanted.tag = TXN_MEMTABLE_TUPLES_WANT_GROW;
 		wanted.count = STD_MUL(u64, 2, count, 282, 37);
@@ -1191,8 +1515,16 @@ txn_memtable_tuples_reserve_body_0(void *frame_)
 			}
 			if (!ok)
 			{
-				if (!txn_memtable_table_waited(frame->io, full, false, frame->error))
+				bool		answered;
+
+				if (!txn_memtable_table_refused(frame->io, full, frame->refused, &answered, frame->error))
 				{
+					txn_memtable_tuples_reserve_pad_0(frame);
+					return;
+				}
+				if (answered)
+				{
+					frame->ok = true;
 					txn_memtable_tuples_reserve_pad_0(frame);
 					return;
 				}
@@ -1256,6 +1588,17 @@ txn_memtable_tuples_reserve_body_0(void *frame_)
 			txn_memtable_tuples_reserve_pad_0(frame);
 			return;
 		}
+		if (frame->retired_live)
+		{
+			TxnMemtableTableRetiring names = {frame->retired.ptr, frame->retired.len, 0};
+			StdIterator pages = {&TXN_MEMTABLE_TABLE_RETIRING_ITERATOR_OPS, &names};
+
+			if (!host_delta_retire(frame->io, NULL, 0, pages, frame->error))
+			{
+				txn_memtable_tuples_reserve_pad_0(frame);
+				return;
+			}
+		}
 		txn_memtable_tuples_reserve_pad_0(frame);
 	}
 }
@@ -1266,17 +1609,21 @@ txn_memtable_tuples_reserve_body_0(void *frame_)
  * page, so that the finish only stores the slot. Each try takes what the
  * last one wanted before its hold, then, under the table's exclusive lock:
  * makes the storage's first table as its first maker when there is none,
- * grows the table first when one more slot would pass its load factor, puts
- * a fresh byte page on the table's list when the key doesn't fit the newest,
- * and counts the slot reserved.
+ * compacts the table in place when one more slot would pass its load factor
+ * while its dropped slots leave its live ones at most half of it, else grows
+ * it first, puts a fresh byte page on the table's list when the key doesn't
+ * fit the newest, and counts the slot reserved. A take the delta refuses is
+ * met as refused says (table's refused).
  */
 bool
 txn_memtable_tuples_reserve(HostIoIo *io, HostSharedRecord state, const uint8 *key, size_t key_len,
-							TxnMemtableTableReservation *result, HostError *error)
+							TxnMemtableTableReservation *result, TxnMemtableTableRefusal *refused, HostError *error)
 {
 	txn_memtable_tuples_reserve_frame_0_t frame = {.io = io, .state = state, .key = key, .key_len = key_len,
-	.result = result, .error = error};
+	.result = result, .refused = refused, .error = error};
 
+	if (refused != NULL)
+		refused->refused = false;
 	std_landing(&frame, txn_memtable_tuples_reserve_body_0, txn_memtable_tuples_reserve_pad_0);
 	return frame.ok;
 }
@@ -1384,7 +1731,10 @@ txn_memtable_tuples_dropped_one(txn_memtable_tuples_held_frame_0_t *frame, const
 			return true;
 		if (held == STD_ADD(u64, tid, 1, 441, 37))
 		{
+			HostSharedOp add = {.tag = HOST_SHARED_OP_ADD, .u.add = 1};
+
 			host_delta_Word_store(&word, TXN_MEMTABLE_TUPLES_DEAD);
+			host_shared_Record_atomic(host_shared_Guard_record(&frame->guard), TXN_MEMTABLE_TUPLES_DEAD_COUNT, add);
 			return true;
 		}
 		at = STD_REM(u64, STD_ADD(u64, at, 1, 445, 32), count, 445, 31);
@@ -1989,6 +2339,14 @@ typedef struct txn_memtable_tuples_tests_counts_t
 	uint64		used;
 	uint64		reserved;
 	uint64		pages;
+
+	/*
+	 * slot_page is the name of the table's last slot page, byte_page of its
+	 * first byte page left, and open_page of its newest.
+	 */
+	uint64		slot_page;
+	uint64		byte_page;
+	uint64		open_page;
 } txn_memtable_tuples_tests_counts_t;
 
 /* txn_memtable_tuples_tests_counts_frame_0_t is counts' state across its pad: the hold and the guard, while live. */
@@ -2056,12 +2414,36 @@ txn_memtable_tuples_tests_counts_body_0(void *frame_)
 	frame->result->used = host_shared_Record_atomic(record, TXN_MEMTABLE_TUPLES_USED, load);
 	frame->result->reserved = host_shared_Record_atomic(record, TXN_MEMTABLE_TUPLES_RESERVED, load);
 	keys = txn_memtable_tuples_view(&frame->guard, TXN_MEMTABLE_TUPLES_KEYS);
-	frame->result->pages = host_delta_list_ListView_len(&keys);
+	frame->result->pages = 0;
+	frame->result->byte_page = 0;
+	{
+		HostDeltaListListView slots = txn_memtable_tuples_view(&frame->guard, TXN_MEMTABLE_TUPLES_SLOTS);
+
+		if (!host_delta_list_ListView_get(&slots, &frame->hold, host_delta_list_ListView_len(&slots) - 1,
+										  &frame->result->slot_page, frame->error))
+		{
+			txn_memtable_tuples_tests_counts_pad_0(frame);
+			return;
+		}
+	}
+	for (uint64 index = 0, len = host_delta_list_ListView_len(&keys); index < len; index++)
+	{
+		uint64		name;
+
+		if (!host_delta_list_ListView_get(&keys, &frame->hold, index, &name, frame->error))
+		{
+			txn_memtable_tuples_tests_counts_pad_0(frame);
+			return;
+		}
+		if (name != TXN_MEMTABLE_TUPLES_DROPPED && frame->result->pages++ == 0)
+			frame->result->byte_page = name;
+		frame->result->open_page = name;
+	}
 	frame->ok = true;
 	txn_memtable_tuples_tests_counts_pad_0(frame);
 }
 
-/* txn_memtable_tuples_tests_counts returns a storage's table's count of slots, its counts of used and reserved slots, and its count of byte pages. */
+/* txn_memtable_tuples_tests_counts returns a storage's table's count of slots, its counts of used and reserved slots, and its count of byte pages but those a compaction retired. */
 static bool
 txn_memtable_tuples_tests_counts(HostIoIo *io, HostSharedRecord state, txn_memtable_tuples_tests_counts_t *result,
 								 HostError *error)
@@ -2589,6 +2971,317 @@ test_txn_memtable_tuples_tests_a_tables_first_pages_are_the_smallest_that_hold_t
 		host_shared_Held_drop(&held);
 	}
 	simc_TestIo_drop(&test_io);
+}
+
+/* txn_memtable_tuples_tests_sized returns the bytes of a storage's table's slot pages and byte pages, as sized does with its unwraps. */
+static uint64
+txn_memtable_tuples_tests_sized(HostIoIo *io, HostSharedRecord state)
+{
+	HostSharedPast word = txn_memtable_tuples_word_of(state);
+	HostDeltaHold hold;
+	HostSharedRecord record;
+	HostSharedGuard guard;
+	HostDeltaListListView lists[2];
+	HostError	error;
+	uint64		location;
+	uint64		bytes = 0;
+
+	if (!host_delta_hold(io, &hold, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 1, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	if (!host_shared_Past_load(&word, &location))
+		STD_OPTION_UNWRAP_FAILED(__LINE__, 1);
+	if (!host_delta_Hold_record(&hold, &TXN_MEMTABLE_TUPLES_TUPLES_AGED_OPS, location, &record, &error) ||
+		!host_shared_Record_lock_shared(record, HOST_IO_IO_TAKES_SHORT(io), TXN_MEMTABLE_TUPLES_LOCK, &guard,
+										&error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 1, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	lists[0] = txn_memtable_tuples_view(&guard, TXN_MEMTABLE_TUPLES_SLOTS);
+	lists[1] = txn_memtable_tuples_view(&guard, TXN_MEMTABLE_TUPLES_KEYS);
+	for (size_t list = 0; list < lengthof(lists); list++)
+	{
+		for (uint64 index = 0, len = host_delta_list_ListView_len(&lists[list]); index < len; index++)
+		{
+			uint64		name;
+			HostDeltaPageRef page;
+
+			if (!host_delta_list_ListView_get(&lists[list], &hold, index, &name, &error))
+				STD_RESULT_EXPECT_FAILED(__LINE__, 1, "called `Result::unwrap()` on an `Err` value", &error,
+										 host_Error_Debug_fmt);
+			if (list == 1 && name == TXN_MEMTABLE_TUPLES_DROPPED)
+				continue;
+			if (!host_delta_Hold_page(&hold, host_delta_page_Page_named(name), &page, &error))
+				STD_RESULT_EXPECT_FAILED(__LINE__, 1, "called `Result::unwrap()` on an `Err` value", &error,
+										 host_Error_Debug_fmt);
+			bytes += list == 0 ? 8 * host_delta_PageRef_words(&page) :
+				host_delta_PageRef_filled(&page) + host_delta_PageRef_room(&page);
+		}
+	}
+	host_shared_Guard_drop(&guard);
+	host_delta_Hold_drop(&hold);
+	return bytes;
+}
+
+/*
+ * txn_memtable_tuples_tests_filled inserts the rows of tids 1 to inserted_to,
+ * drops the slots of tids 1 to dropped_to as a spill drops them, and inserts
+ * the rows of the tids after inserted_to to last one at a time, the last of
+ * them past the table's load factor.
+ */
+static void
+txn_memtable_tuples_tests_filled(HostIoIo *io, HostSharedRecord state, uint64 inserted_to, uint64 dropped_to,
+								 uint64 last)
+{
+	uint64		tids[TXN_MEMTABLE_TUPLES_PER];
+	HostError	error;
+
+	for (uint64 tid = 1; tid <= inserted_to; tid++)
+		txn_memtable_tuples_tests_inserts(__LINE__, 1, io, state, tid);
+	for (uint64 tid = 1; tid <= dropped_to; tid++)
+		tids[tid - 1] = tid;
+	if (!txn_memtable_tuples_dropped(io, state, tids, (size_t) dropped_to, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 1, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	for (uint64 tid = inserted_to + 1; tid <= last; tid++)
+		txn_memtable_tuples_tests_inserts(__LINE__, 1, io, state, tid);
+}
+
+/*
+ * The compaction's case: a table whose most slots a spill dropped, past its
+ * load factor at its next insert, is compacted in place: its live slots
+ * stored again in its own slot pages, the dropped ones left behind, and
+ * every byte page but the open one retired, the live keys moved into the
+ * open page's room, so every live tid is found, every dropped one isn't, and
+ * the table holds fewer bytes than it held.
+ */
+void
+test_txn_memtable_tuples_tests_a_table_of_mostly_dropped_tids_is_compacted_at_its_load_factor(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedHeld held = txn_memtable_testing_created(io, 9361);
+	HostSharedRecord state = host_shared_Held_record(&held);
+	uint64		before;
+	uint64		after;
+
+	txn_memtable_tuples_tests_filled(io, state, 300, 290, TXN_MEMTABLE_TUPLES_PER / 4 * 3);
+	before = txn_memtable_tuples_tests_sized(io, state);
+	txn_memtable_tuples_tests_counts_are(__LINE__, 1, __LINE__, 1, io, state, TXN_MEMTABLE_TUPLES_PER,
+										 TXN_MEMTABLE_TUPLES_PER / 4 * 3, 0, 6);
+	txn_memtable_tuples_tests_inserts(__LINE__, 1, io, state, 1000);
+	txn_memtable_tuples_tests_counts_are(__LINE__, 1, __LINE__, 1, io, state, TXN_MEMTABLE_TUPLES_PER,
+										 TXN_MEMTABLE_TUPLES_PER / 4 * 3 - 290 + 1, 0, 1);
+	after = txn_memtable_tuples_tests_sized(io, state);
+	STD_ASSERT(__LINE__, 1, after < before, "the compaction retired the byte pages of the dropped keys");
+	for (uint64 tid = 291; tid <= TXN_MEMTABLE_TUPLES_PER / 4 * 3; tid++)
+		txn_memtable_tuples_tests_got_key(__LINE__, 1, __LINE__, 1, io, state, tid);
+	txn_memtable_tuples_tests_got_key(__LINE__, 1, __LINE__, 1, io, state, 1000);
+	for (uint64 tid = 1; tid <= 290; tid++)
+		txn_memtable_tuples_tests_got_is(__LINE__, 1, __LINE__, 1, io, state, tid, NULL, false);
+	host_shared_Held_drop(&held);
+	simc_TestIo_drop(&test_io);
+}
+
+/* txn_memtable_tuples_tests_compactions is the compaction cases' writers: each inserts the row of the tid its captures hold, after its database. */
+static bool
+txn_memtable_tuples_tests_compactions(void *captures, HostIoIo *io, HostError *error)
+{
+	const uint64 *given = captures;
+
+	return txn_memtable_tuples_tests_inserter((uint32) given[0], given[1], io, error);
+}
+
+/*
+ * The compaction's reservation case: a compaction while another prepare's
+ * reservation holds a place on a byte page moves no byte page: it stores the
+ * slots again alone, leaving the dropped ones behind and every byte page
+ * where it was, so the outstanding reservation's finish stores its key's
+ * place as it was.
+ */
+void
+test_txn_memtable_tuples_tests_a_compaction_with_a_reservation_outstanding_moves_no_byte_page(void)
+{
+	static const char *const names[2] = {"reserving", "compacting"};
+	static const uint64 given[2][2] = {{9362, 2000}, {9362, 1000}};
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedHeld held = txn_memtable_testing_created(io, 9362);
+	HostSharedRecord state = host_shared_Held_record(&held);
+	SimcRun		run;
+	SimcStep	steps[2] = {{"compacting", 10, PG_UINT64_MAX}, {"reserving", 9, PG_UINT64_MAX}};
+	SimcReport	report;
+
+	txn_memtable_tuples_tests_filled(io, state, 300, 290, TXN_MEMTABLE_TUPLES_PER / 4 * 3 - 1);
+	run = simc_Run_new(171);
+	for (size_t k = 0; k < lengthof(names); k++)
+	{
+		SimcActor	actor = {txn_memtable_tuples_tests_compactions, (void *) given[k]};
+
+		simc_Run_actor(&run, names[k], strlen(names[k]), actor);
+	}
+	simc_Run_until(&run, "reserving", 9, "doltgres-memtable-prepared");
+	simc_Run_script(&run, steps, lengthof(steps));
+	report = simc_Run_finish(run);
+	txn_memtable_tuples_tests_endings_are(__LINE__, 1, __LINE__, 1, &report);
+	txn_memtable_tuples_tests_counts_are(__LINE__, 1, __LINE__, 1, io, state, TXN_MEMTABLE_TUPLES_PER,
+										 TXN_MEMTABLE_TUPLES_PER / 4 * 3 - 290 + 1, 0, 6);
+	for (uint64 tid = 291; tid < TXN_MEMTABLE_TUPLES_PER / 4 * 3; tid++)
+		txn_memtable_tuples_tests_got_key(__LINE__, 1, __LINE__, 1, io, state, tid);
+	txn_memtable_tuples_tests_got_key(__LINE__, 1, __LINE__, 1, io, state, 1000);
+	txn_memtable_tuples_tests_got_key(__LINE__, 1, __LINE__, 1, io, state, 2000);
+	simc_Report_drop(&report);
+	host_shared_Held_drop(&held);
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * The compaction's lock case: a writer that reaches the table while a
+ * compaction, paused before it releases the table's exclusive lock, holds it
+ * waits on the lock and reserves in the compacted table once it ends, so
+ * both writers' tids and every live tid before them are found.
+ */
+void
+test_txn_memtable_tuples_tests_a_writer_waits_on_a_compactions_exclusive_lock(void)
+{
+	static const char *const names[2] = {"compacting", "writer"};
+	static const uint64 given[2][2] = {{9363, 1000}, {9363, 2000}};
+	static const uint64 found[3] = {1000, 2000, 291};
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedHeld held = txn_memtable_testing_created(io, 9363);
+	HostSharedRecord state = host_shared_Held_record(&held);
+	SimcRun		run;
+	SimcStep	steps[2] = {{"writer", 6, PG_UINT64_MAX}, {"compacting", 10, PG_UINT64_MAX}};
+	SimcReport	report;
+	txn_memtable_tuples_tests_counts_t counts;
+	uint64		used = TXN_MEMTABLE_TUPLES_PER / 4 * 3 - 290 + 2;
+
+	txn_memtable_tuples_tests_filled(io, state, 300, 290, TXN_MEMTABLE_TUPLES_PER / 4 * 3);
+	run = simc_Run_new(173);
+	for (size_t k = 0; k < lengthof(names); k++)
+	{
+		SimcActor	actor = {txn_memtable_tuples_tests_compactions, (void *) given[k]};
+
+		simc_Run_actor(&run, names[k], strlen(names[k]), actor);
+	}
+	simc_Run_until(&run, "compacting", 10, "doltgres-tuples-compacting");
+	simc_Run_script(&run, steps, lengthof(steps));
+	report = simc_Run_finish(run);
+	txn_memtable_tuples_tests_endings_are(__LINE__, 1, __LINE__, 1, &report);
+	for (size_t k = 0; k < lengthof(found); k++)
+		txn_memtable_tuples_tests_got_key(__LINE__, 1, __LINE__, 1, io, state, found[k]);
+	counts = txn_memtable_tuples_tests_counted(__LINE__, 1, io, state);
+	STD_ASSERT_EQ(__LINE__, 1, counts.used == used, &counts.used, std_u64_Debug_fmt, &used, std_u64_Debug_fmt);
+	simc_Report_drop(&report);
+	host_shared_Held_drop(&held);
+	simc_TestIo_drop(&test_io);
+}
+
+
+/* TxnMemtableTuplesTestsRefusal is a compaction case's refusal: an allocation, the last slot page's open, the first byte page's, or the open byte page's. */
+typedef enum TxnMemtableTuplesTestsRefusal
+{
+	TXN_MEMTABLE_TUPLES_TESTS_ALLOCATION,
+	TXN_MEMTABLE_TUPLES_TESTS_SLOT_PAGE,
+	TXN_MEMTABLE_TUPLES_TESTS_BYTE_PAGE,
+	TXN_MEMTABLE_TUPLES_TESTS_OPEN_PAGE,
+} TxnMemtableTuplesTestsRefusal;
+
+/* txn_memtable_tuples_tests_insert_t is a refused compaction's insert's captures: the io, the state, and whether it finished. */
+typedef struct txn_memtable_tuples_tests_insert_t
+{
+	HostIoIo   *io;
+	HostSharedRecord state;
+	bool		inserted;
+} txn_memtable_tuples_tests_insert_t;
+
+/* txn_memtable_tuples_tests_insert_body inserts tid 1000's row, an error answering it unfinished. */
+static void
+txn_memtable_tuples_tests_insert_body(void *captures)
+{
+	txn_memtable_tuples_tests_insert_t *insert = captures;
+	HostError	error;
+
+	insert->inserted = txn_memtable_tuples_tests_inserted(insert->io, insert->state, 1000, &error);
+	if (!insert->inserted)
+		host_Error_drop(&error);
+}
+
+/*
+ * txn_memtable_tuples_tests_refused fills a table to its compaction, makes
+ * the compacting insert's step of a refusal fail after a count of them, an
+ * allocation's failure where it can't be refused panicking, and checks that
+ * every live tid's key is still found, the insert's tid's too when it
+ * finished; it answers whether the insert failed or panicked.
+ */
+static bool
+txn_memtable_tuples_tests_refused(uint32 database, TxnMemtableTuplesTestsRefusal refusal, uint64 after)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedHeld held = txn_memtable_testing_created(io, database);
+	HostSharedRecord state = host_shared_Held_record(&held);
+	txn_memtable_tuples_tests_counts_t counts;
+	txn_memtable_tuples_tests_insert_t insert = {.io = io, .state = state};
+	StdCaught	caught;
+
+	txn_memtable_tuples_tests_filled(io, state, 300, 290, TXN_MEMTABLE_TUPLES_PER / 4 * 3);
+	counts = txn_memtable_tuples_tests_counted(__LINE__, 1, io, state);
+	switch (refusal)
+	{
+		case TXN_MEMTABLE_TUPLES_TESTS_ALLOCATION:
+			simc_fail_allocation(after + 1);
+			break;
+
+		case TXN_MEMTABLE_TUPLES_TESTS_SLOT_PAGE:
+			simc_refuse_open(host_delta_page_Page_named(counts.slot_page), after);
+			break;
+		case TXN_MEMTABLE_TUPLES_TESTS_BYTE_PAGE:
+			simc_refuse_open(host_delta_page_Page_named(counts.byte_page), after);
+			break;
+		case TXN_MEMTABLE_TUPLES_TESTS_OPEN_PAGE:
+			simc_refuse_open(host_delta_page_Page_named(counts.open_page), after);
+			break;
+	}
+	if (!std_catch_unwind(txn_memtable_tuples_tests_insert_body, &insert, &caught))
+		std_Caught_drop_Checked(&caught);
+	simc_fail_allocation(0);
+	simc_refuse_nothing();
+	for (uint64 tid = 291; tid <= TXN_MEMTABLE_TUPLES_PER / 4 * 3; tid++)
+		txn_memtable_tuples_tests_got_key(__LINE__, 1, __LINE__, 1, io, state, tid);
+	if (insert.inserted)
+		txn_memtable_tuples_tests_got_key(__LINE__, 1, __LINE__, 1, io, state, 1000);
+	host_shared_Held_drop(&held);
+	simc_TestIo_drop(&test_io);
+	return !insert.inserted;
+}
+
+/* txn_memtable_tuples_tests_refusals runs a refusal's case after each count of its steps up to a bound, and asserts that one of them failed the insert. */
+static void
+txn_memtable_tuples_tests_refusals(uint32 database, TxnMemtableTuplesTestsRefusal refusal, uint64 bound)
+{
+	uint64		failed = 0;
+
+	for (uint64 after = 0; after < bound; after++)
+		failed += txn_memtable_tuples_tests_refused(database, refusal, after) ? 1 : 0;
+	STD_ASSERT_EQ_U64(__LINE__, 1, failed > 0 ? refusal + 1 : 0, refusal + 1);
+}
+
+/*
+ * The compaction's failure case (bugs row 291's review C1): a compacting
+ * insert whose allocation or page open fails, or panics, at any of its steps
+ * (the gather's slot pages, the moves' byte pages and the open page, the
+ * reinsert's plan) leaves every live tid's key found, since every step that
+ * can fail runs before the compaction zeroes its first slot and each moved
+ * key's new place is stored at once.
+ */
+void
+test_txn_memtable_tuples_tests_a_compaction_failed_at_any_step_leaves_every_tid_found(void)
+{
+	txn_memtable_tuples_tests_refusals(9397, TXN_MEMTABLE_TUPLES_TESTS_ALLOCATION, 200);
+	txn_memtable_tuples_tests_refusals(9398, TXN_MEMTABLE_TUPLES_TESTS_SLOT_PAGE, 4);
+	txn_memtable_tuples_tests_refusals(9399, TXN_MEMTABLE_TUPLES_TESTS_BYTE_PAGE, 4);
+	txn_memtable_tuples_tests_refusals(9388, TXN_MEMTABLE_TUPLES_TESTS_OPEN_PAGE, 4);
 }
 
 #endif							/* DOLTGRES_TEST_TXN */

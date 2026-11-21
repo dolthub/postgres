@@ -45,9 +45,9 @@
 #define RUST_FILE "txn" STD_SEP "src" STD_SEP "base.rs"
 
 /*
- * The record's field numbers, in the format's order, TABLE, MAX_ENDED, and
- * CHAIN always present, CHAIN the highest-numbered and last, so a record cut
- * short anywhere is refused.
+ * The record's field numbers, in the format's order, TABLE, MAX_ENDED, CHAIN,
+ * and READ always present, READ the highest-numbered and last, so a record
+ * cut short anywhere is refused.
  */
 #define TXN_BASE_ROOT 1
 #define TXN_BASE_FOLDED 2
@@ -64,6 +64,7 @@
 #define TXN_BASE_PENDING 13
 #define TXN_BASE_MAX_ENDED 14
 #define TXN_BASE_CHAIN 16
+#define TXN_BASE_READ 18
 
 /* TXN_BASE_ATTNUM_MAX is Postgres' MaxHeapAttributeNumber, the largest attribute number a key's column has. */
 #define TXN_BASE_ATTNUM_MAX UINT64CONST(1600)
@@ -316,7 +317,7 @@ txn_base_Base_PartialEq_eq(const TxnBaseBase *self, const TxnBaseBase *other)
 		txn_base_Key_PartialEq_eq(&self->key, &other->key) &&
 		txn_base_tree_eq(self->has_pending, &self->pending, other->has_pending, &other->pending) &&
 		self->max_ended == other->max_ended &&
-		txn_base_tree_eq(self->has_chain, &self->chain, other->has_chain, &other->chain);
+		txn_base_tree_eq(self->has_chain, &self->chain, other->has_chain, &other->chain) && self->read == other->read;
 }
 
 /* txn_base_Base_Debug_fmt is Base's derived Debug. */
@@ -347,6 +348,7 @@ txn_base_Base_Debug_fmt(const void *value, StdFormatter *f)
 	std_DebugStruct_field(&s, "pending", 7, &pending, std_option_Debug_fmt);
 	std_DebugStruct_field(&s, "max_ended", 9, &self->max_ended, std_u64_Debug_fmt);
 	std_DebugStruct_field(&s, "chain", 5, &chain, std_option_Debug_fmt);
+	std_DebugStruct_field(&s, "read", 4, &self->read, std_u64_Debug_fmt);
 	return std_DebugStruct_finish(&s);
 }
 
@@ -905,7 +907,9 @@ txn_base_pair_value(const uint8 *key, size_t key_len, uint32 heap_bytes, StdVec 
 /*
  * txn_base_pending_value returns a pending tuple id's entry's value in the
  * base's pending tree: its row's ender's full xid, 0 when the ender aborted,
- * then its heap bytes, then the value ids its row names, each little-endian.
+ * with TXN_BASE_OWN set when the ender is the row's own writer, then its heap
+ * bytes, 0 when a prune already gave them back, then the value ids its row
+ * names, each little-endian.
  */
 void
 txn_base_pending_value(uint64 ender, uint32 heap_bytes, const uint32 *ids, size_t ids_len, StdVec *result)
@@ -924,7 +928,7 @@ txn_base_pending_value(uint64 ender, uint32 heap_bytes, const uint32 *ids, size_
 /*
  * txn_base_pending_read reads a pending tuple id's entry's value as
  * pending_value writes it, refusing a length that isn't 12 bytes and a whole
- * number of value ids, and heap bytes of 0, as data corruption.
+ * number of value ids as data corruption.
  */
 bool
 txn_base_pending_read(const uint8 *value, size_t value_len, uint64 *result_0, uint32 *result_1, StdVec *result_2,
@@ -932,7 +936,7 @@ txn_base_pending_read(const uint8 *value, size_t value_len, uint64 *result_0, ui
 {
 	size_t		ids;
 
-	if (value_len < 12 || (value_len - 12) % 4 != 0 || std_u32_from_le_bytes(value + 8) == 0)
+	if (value_len < 12 || (value_len - 12) % 4 != 0)
 	{
 		*error = TXN_BASE_FORK("XX001", "a pending tuple id's entry is corrupt");
 		return false;
@@ -1148,6 +1152,7 @@ txn_base_encode_body(void *frame_)
 		txn_base_address(&frame->writer, TXN_BASE_CHAIN, true, &self->chain);
 	else
 		chunks_record_RecordWriter_field(&frame->writer, TXN_BASE_CHAIN, TXN_BASE_NO_BYTES, 0);
+	chunks_record_RecordWriter_uint(&frame->writer, TXN_BASE_READ, self->read);
 	frame->writer_live = false;
 	chunks_record_RecordWriter_finish_value(&frame->writer, frame->result_0, frame->result_1);
 }
@@ -1230,13 +1235,13 @@ txn_base_decode_fields_free(txn_base_decode_frame_t *frame)
  * outside a range and isn't another number.
  */
 static bool
-txn_base_decode_outside(const txn_base_decode_frame_t *frame, uint32 least, uint32 most, uint32 other)
+txn_base_decode_outside(const txn_base_decode_frame_t *frame, uint32 least, uint32 most, uint32 other, uint32 last)
 {
 	for (size_t i = 0; i < frame->fields.len; i++)
 	{
 		uint32		number = STD_VEC_AT(&frame->fields, ChunksRecordField, i).number;
 
-		if ((number < least || number > most) && number != other)
+		if ((number < least || number > most) && number != other && number != last)
 			return true;
 	}
 	return false;
@@ -1416,7 +1421,7 @@ txn_base_decode_body(void *frame_)
 	frame->record_live = true;
 	if (!txn_base_decode_fields(frame, frame->bytes, frame->bytes_len))
 		return;
-	if (txn_base_decode_outside(frame, TXN_BASE_ROOT, TXN_BASE_MAX_ENDED, TXN_BASE_CHAIN))
+	if (txn_base_decode_outside(frame, TXN_BASE_ROOT, TXN_BASE_MAX_ENDED, TXN_BASE_CHAIN, TXN_BASE_READ))
 	{
 		*frame->error = txn_base_corrupt();
 		return;
@@ -1431,7 +1436,7 @@ txn_base_decode_body(void *frame_)
 	if (!txn_base_decode_nested(frame, &frame->record, sizes, &frame->held, &frame->held_live) ||
 		!txn_base_decode_fields(frame, sizes->bytes, sizes->bytes_len))
 		return;
-	if (txn_base_decode_outside(frame, 1, 5, 1))
+	if (txn_base_decode_outside(frame, 1, 5, 1, 1))
 	{
 		*frame->error = txn_base_corrupt();
 		return;
@@ -1482,6 +1487,8 @@ txn_base_decode_body(void *frame_)
 		return;
 	}
 	if (chain->bytes_len != 0 && !txn_base_decode_tree(frame, TXN_BASE_CHAIN, &base.has_chain, &base.chain))
+		return;
+	if (!txn_base_record_uint(&frame->record, TXN_BASE_READ, 0, base.folded, &base.read, frame->error))
 		return;
 	frame->columns_live = false;
 	*frame->result = base;
@@ -1572,6 +1579,7 @@ txn_base_tests_full(void)
 		.has_pending = true, .pending = txn_base_tests_tree(4),
 		.max_ended = PG_UINT64_MAX,
 		.has_chain = true, .chain = txn_base_tests_tree(5),
+		.read = PG_UINT64_MAX,
 	};
 
 	return base;
@@ -1672,8 +1680,8 @@ txn_base_tests_round_trips(uint32 line, const TxnBaseBase *base)
 void
 test_txn_base_tests_a_base_record_round_trips_at_its_limits(void)
 {
-	TxnBaseBase bases[4] = {txn_base_tests_full(), txn_base_tests_empty(), txn_base_tests_full(),
-	txn_base_tests_empty()};
+	TxnBaseBase bases[5] = {txn_base_tests_full(), txn_base_tests_empty(), txn_base_tests_full(),
+	txn_base_tests_empty(), txn_base_tests_empty()};
 
 	bases[2].has_index = false;
 	bases[2].index = 0;
@@ -1681,7 +1689,9 @@ test_txn_base_tests_a_base_record_round_trips_at_its_limits(void)
 	bases[3].index = 0;
 	bases[3].has_root = true;
 	bases[3].root = txn_base_tests_tree(9);
-	for (int i = 0; i < 4; i++)
+	bases[4].folded = 200;
+	bases[4].read = 149;
+	for (int i = 0; i < lengthof(bases); i++)
 		txn_base_tests_round_trips(605, &bases[i]);
 }
 
@@ -1765,6 +1775,7 @@ txn_base_tests_write_plain(ChunksRecordRecordWriter *writer, uint32 number)
 		case TXN_BASE_INDEX:
 		case TXN_BASE_KEY:
 		case 15:
+		case 17:
 			break;
 		case TXN_BASE_CHAIN:
 			chunks_record_RecordWriter_field(writer, TXN_BASE_CHAIN, TXN_BASE_NO_BYTES, 0);
@@ -1800,13 +1811,13 @@ txn_base_tests_write_changed(ChunksRecordRecordWriter *writer, const TxnBaseTest
 		txn_base_tests_write_plain(writer, number);
 }
 
-/* txn_base_tests_write_form writes every field from ROOT to CHAIN in a form, but a skipped one, as a value. */
+/* txn_base_tests_write_form writes every field from ROOT to READ in a form, but a skipped one, as a value. */
 static void
 txn_base_tests_write_form(uint32 skip, const TxnBaseTestsForm *form, StdVec *bytes, StdVec *addresses)
 {
 	ChunksRecordRecordWriter writer = chunks_record_RecordWriter_new();
 
-	for (uint32 number = TXN_BASE_ROOT; number <= TXN_BASE_CHAIN; number++)
+	for (uint32 number = TXN_BASE_ROOT; number <= TXN_BASE_READ; number++)
 		if (number != skip)
 			txn_base_tests_write_changed(&writer, form, number);
 	chunks_record_RecordWriter_finish_value(&writer, bytes, addresses);
@@ -1822,9 +1833,9 @@ txn_base_tests_write_form(uint32 skip, const TxnBaseTestsForm *form, StdVec *byt
 void
 test_txn_base_tests_every_other_form_of_a_base_record_is_corrupt(void)
 {
-	static const uint32 required[] = {TXN_BASE_FOLDED, TXN_BASE_MAX_FOLDED, TXN_BASE_EPOCH, TXN_BASE_COUNTER, TXN_BASE_FRESH_END, TXN_BASE_SIZES, TXN_BASE_TABLE, TXN_BASE_MAX_ENDED, TXN_BASE_CHAIN};
+	static const uint32 required[] = {TXN_BASE_FOLDED, TXN_BASE_MAX_FOLDED, TXN_BASE_EPOCH, TXN_BASE_COUNTER, TXN_BASE_FRESH_END, TXN_BASE_SIZES, TXN_BASE_TABLE, TXN_BASE_MAX_ENDED, TXN_BASE_CHAIN, TXN_BASE_READ};
 	static const TxnBaseTestsForm past[] = {{TXN_BASE_TESTS_FORM_PAST, TXN_BASE_EPOCH, TXN_BASE_U32_MAX}, {TXN_BASE_TESTS_FORM_PAST, TXN_BASE_COUNTER, TXN_BASE_TUPLE_ID_MAX},
-	{TXN_BASE_TESTS_FORM_PAST, TXN_BASE_FRESH_END, TXN_BASE_TUPLE_ID_MAX}, {TXN_BASE_TESTS_FORM_PAST, TXN_BASE_TABLE, TXN_BASE_U32_MAX}, {TXN_BASE_TESTS_FORM_PAST, TXN_BASE_INDEX, TXN_BASE_U32_MAX}};
+	{TXN_BASE_TESTS_FORM_PAST, TXN_BASE_FRESH_END, TXN_BASE_TUPLE_ID_MAX}, {TXN_BASE_TESTS_FORM_PAST, TXN_BASE_TABLE, TXN_BASE_U32_MAX}, {TXN_BASE_TESTS_FORM_PAST, TXN_BASE_INDEX, TXN_BASE_U32_MAX}, {TXN_BASE_TESTS_FORM_PAST, TXN_BASE_READ, 0}};
 	static const TxnBaseTestsForm plain = {TXN_BASE_TESTS_FORM_PLAIN};
 	StdVec		bytes;
 	StdVec		addresses;
@@ -1925,6 +1936,7 @@ txn_base_tests_keyed(const TxnBaseTestsKeyedCase *keyed_case, StdVec *bytes, Std
 	chunks_record_RecordWriter_uint(&writer, TXN_BASE_TABLE, 0);
 	chunks_record_RecordWriter_uint(&writer, TXN_BASE_MAX_ENDED, 0);
 	chunks_record_RecordWriter_field(&writer, TXN_BASE_CHAIN, TXN_BASE_NO_BYTES, 0);
+	chunks_record_RecordWriter_uint(&writer, TXN_BASE_READ, 0);
 	chunks_record_RecordWriter_finish_value(&writer, bytes, addresses);
 }
 

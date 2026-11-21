@@ -354,7 +354,7 @@ doltgres_rewrite_read_body(void *frame_)
 	std_vec_new(&read->olds, DOLTGRES_REWRITE_OLD);
 	frame->rest_live = true;
 	read->left_out = read->base.max_ended >= frame->horizon ? read->base.max_ended : 0;
-	if (!txn_rewrite_keys(frame->io, frame->held, read->based.ptr, read->based.len, read->base.folded,
+	if (!txn_rewrite_keys(frame->io, frame->held, read->based.ptr, read->based.len, read->base.read,
 						  doltgres_rewrite_read_closure_0, &captures, NULL, frame->error))
 		return;
 	*frame->result = *read;
@@ -1646,7 +1646,7 @@ doltgres_rewrite_Reformer_reformed(DoltgresRewriteReformer *self, const PgCatalo
 /* More element layouts of the rewrite's vectors. */
 #define DOLTGRES_REWRITE_COPIED sizeof(TxnRewriteCopied), _Alignof(TxnRewriteCopied)
 #define DOLTGRES_REWRITE_COPY sizeof(txn_TupleU64U64U32_t), _Alignof(txn_TupleU64U64U32_t)
-#define DOLTGRES_REWRITE_CARRY sizeof(DoltgresRewriteCarry), _Alignof(DoltgresRewriteCarry)
+#define DOLTGRES_REWRITE_CARRY sizeof(TxnRewriteCarry), _Alignof(TxnRewriteCarry)
 #define DOLTGRES_REWRITE_KEPT_ROW sizeof(doltgres_rewrite_kept_t), _Alignof(doltgres_rewrite_kept_t)
 #define DOLTGRES_REWRITE_ROW_ENDS sizeof(doltgres_rewrite_row_ends_t), _Alignof(doltgres_rewrite_row_ends_t)
 #define DOLTGRES_REWRITE_ROWS sizeof(StdVec), _Alignof(StdVec)
@@ -1756,7 +1756,7 @@ doltgres_rewrite_copied(const DoltgresRewriteRead *read, DoltgresRewriteRewritte
 static void
 doltgres_rewrite_Carry_drop(void *carry)
 {
-	txn_record_RowChange_drop(&((DoltgresRewriteCarry *) carry)->f0);
+	txn_record_RowChange_drop(&((TxnRewriteCarry *) carry)->f0);
 }
 
 /*
@@ -2134,7 +2134,7 @@ doltgres_rewrite_carrying_body(void *frame_)
 			TxnMemtableVersionOpRef ref;
 			TxnMemtableLockMode lock;
 			const StdVec *values = NULL;
-			DoltgresRewriteCarry carry = {0};
+			TxnRewriteCarry carry = {0};
 			HostRow		row = {0};
 			StdBytes	rekeyed;
 			bool		has_row = true;
@@ -2331,7 +2331,7 @@ doltgres_rewrite_moving_closure_0(void *captures, HostIoIo *io, const uint8 *key
 		TxnMemtableVersionVersion *version = &STD_VEC_AT(versions, TxnMemtableVersionVersion, i);
 		TxnMemtableVersionRecord record;
 		TxnMemtableVersionOpRef ref;
-		DoltgresRewriteCarry carry = {0};
+		TxnRewriteCarry carry = {0};
 		HostStatus	outcome;
 
 		if (!txn_outcome_outcome(io, version, &outcome, error))

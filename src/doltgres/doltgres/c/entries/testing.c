@@ -32,10 +32,12 @@
 #include "doltgres/chunks/error.h"
 #include "doltgres/chunks/file.h"
 #include "doltgres/chunks/pack.h"
+#include "doltgres/chunks/packs.h"
 #include "doltgres/chunks/packs/roots.h"
 #include "doltgres/chunks/packs/shared.h"
 #include "doltgres/chunks/trailer.h"
 #include "doltgres/doltgres/entries.h"
+#include "doltgres/doltgres/entries_tail.h"
 #include "doltgres/doltgres/entries/testing.h"
 #include "doltgres/doltgres/index.h"
 #include "doltgres/doltgres/kinds.h"
@@ -7112,7 +7114,7 @@ doltgres_entries_testing_doltgres_test_collect(const PgCatalogCaps *caps, PgDatu
 	HostError	failed;
 
 	if (!host_session_database(&database, &tablespace, &failed) ||
-		!host_collection_ask(&io, database, counts, &failed))
+		!host_collection_ask(&io, database, CHUNKS_PACKS_DEFAULT_SPACE, counts, &failed))
 	{
 		*error = pghost_raised(&failed);
 		return false;
@@ -7812,6 +7814,71 @@ doltgres_entries_testing_doltgres_test_base_sizes(const PgCatalogCaps *caps, con
 	return doltgres_entries_testing_held_run(&frame, doltgres_entries_testing_base_sizes_body_0);
 }
 
+static void doltgres_entries_testing_hex(StdBytes bytes, StdString *result);
+
+/* doltgres_entries_testing_base_points_body_0 reads the newest base's root, fold point, and read point as their text. */
+static void
+doltgres_entries_testing_base_points_body_0(void *frame_)
+{
+	doltgres_entries_testing_held_frame_0_t *frame = frame_;
+	const PgMayRaise *raise = pg_CatalogCaps_may_raise(frame->caps);
+	HostError	failed;
+	bool		some;
+	StdString	shown;
+
+	if (!doltgres_entries_testing_opened(frame))
+		return;
+	if (!txn_state_held_OptionBase(&frame->io, doltgres_entries_testing_held_repo(frame), &frame->reading,
+								   frame->found, doltgres_entries_testing_doltgres_test_base_sizes_closure_0, NULL, NULL, &some,
+								   &frame->base, &failed))
+	{
+		*frame->error = pghost_raised(&failed);
+		return;
+	}
+	frame->base_live = some;
+	if (some)
+	{
+		StdString	root;
+		StdFmtPiece pieces[] = {STD_FMT_ARG(0), STD_FMT_LIT(" "), STD_FMT_ARG(1), STD_FMT_LIT(" "), STD_FMT_ARG(2)};
+		StdFmtArg	args[] = {{&root, std_String_Display_fmt}, {&frame->base.folded, std_u64_Display_fmt},
+		{&frame->base.read, std_u64_Display_fmt}};
+		StdFmtArguments arguments = {pieces, lengthof(pieces), args};
+
+		if (frame->base.has_root)
+		{
+			StdBytes	address = {frame->base.root.address.f0, sizeof(frame->base.root.address.f0)};
+
+			doltgres_entries_testing_hex(address, &root);
+		}
+		else
+			std_vec_new(&root, 1, 1);
+		std_fmt_format_Checked(&shown, &arguments);
+		std_String_drop(&root);
+		frame->base_live = false;
+		txn_base_Base_drop(&frame->base);
+	}
+	else
+		std_string_from_Checked(&shown, "none", 4);
+	frame->ok = doltgres_entries_testing_text_datum(raise, &shown, "a base's points' text holds no NUL", 2899, 47,
+													frame->datum, frame->error);
+}
+
+/*
+ * doltgres_entries_testing_doltgres_test_base_points returns a table's
+ * storage's newest base's root as its address in hex, with its fold point and
+ * its read point, or "none" for a storage with no base, so a standby's base
+ * is compared with its primary's.
+ */
+bool
+doltgres_entries_testing_doltgres_test_base_points(const PgCatalogCaps *caps, const PgRel *target, PgDatum *result,
+												   PgPgError *error)
+{
+	doltgres_entries_testing_held_frame_0_t frame = {.caps = caps, .target = target, .datum = result,
+	.error = error};
+
+	return doltgres_entries_testing_held_run(&frame, doltgres_entries_testing_base_points_body_0);
+}
+
 /* doltgres_entries_testing_doltgres_test_held_closure_0 is doltgres_test_held's lent call: whether a version holds the tuple id. */
 static bool
 doltgres_entries_testing_doltgres_test_held_closure_0(void *captures, HostIoIo *io, const RepoRepo *repo, const HostSharedHeld *held,
@@ -7957,6 +8024,33 @@ doltgres_entries_testing_doltgres_test_totals(const PgCatalogCaps *caps, const P
 	.error = error};
 
 	return doltgres_entries_testing_held_run(&frame, doltgres_entries_testing_totals_body_0);
+}
+
+/*
+ * doltgres_entries_testing_doltgres_test_scan_shape returns a fork table's
+ * shape as its scans' costs read it: its tree's leaves and levels above
+ * them, then its tuple id tree's.
+ */
+bool
+doltgres_entries_testing_doltgres_test_scan_shape(const PgCatalogCaps *caps, const PgRel *target, PgDatum *result,
+												  PgPgError *error)
+{
+	DoltgresEntriesScanned shape;
+	uint64		heights[2];
+	StdString	shown;
+	StdFmtPiece pieces[] = {STD_FMT_ARG(0), STD_FMT_LIT(" "), STD_FMT_ARG(1), STD_FMT_LIT(" "), STD_FMT_ARG(2),
+	STD_FMT_LIT(" "), STD_FMT_ARG(3)};
+	StdFmtArg	args[] = {{&shape.rows.leaves, std_u64_Display_fmt}, {&heights[0], std_u64_Display_fmt},
+	{&shape.tuple_ids.leaves, std_u64_Display_fmt}, {&heights[1], std_u64_Display_fmt}};
+	StdFmtArguments arguments = {pieces, lengthof(pieces), args};
+
+	if (!doltgres_entries_scanned(caps, 0, pg_calls_rel_id(target), &shape, error))
+		return false;
+	heights[0] = shape.rows.height;
+	heights[1] = shape.tuple_ids.height;
+	std_fmt_format_Checked(&shown, &arguments);
+	return doltgres_entries_testing_text_datum(pg_CatalogCaps_may_raise(caps), &shown,
+											   "a scan shape's text holds no NUL", __LINE__, 0, result, error);
 }
 
 /* doltgres_entries_testing_op_name returns the name doltgres_test_changes gives a version's op. */

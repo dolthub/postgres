@@ -135,6 +135,11 @@ tests += {
     ] : []) + [
       't/123_cport_fe_pg.pl',
       't/120_cport_access.pl',
+      't/071_spill_reads.pl',
+      't/131_scan_costs.pl',
+      't/132_heap_only_contrib.pl',
+      't/072_standby_spills.pl',
+      't/124_carry_unlisted.pl',
     ],
     'deps': [doltgres_cport_test_fe_pg],
     # The injection points are cluster-wide, so disable installcheck

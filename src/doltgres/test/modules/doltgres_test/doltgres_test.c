@@ -44,11 +44,13 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_type_d.h"
+#include "catalog/storage.h"
 #include "commands/progress.h"
 #include "commands/repack.h"
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
 #include "commands/vacuum.h"
+#include "doltgres/hooks.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "executor/tuptable.h"
@@ -124,7 +126,9 @@ extern void doltgres_test_index_fetch_key(struct IndexFetchTableData *fetch, Rel
 extern bool doltgres_test_fold(Relation target);
 extern Datum doltgres_test_base_sizes(Relation target);
 extern Datum doltgres_test_totals(Relation target);
+extern Datum doltgres_test_scan_shape(Relation target);
 extern Datum doltgres_test_count(Relation target);
+extern Datum doltgres_test_base_points(Relation target);
 extern Datum doltgres_test_index_entries(Relation target);
 extern bool doltgres_test_held(Relation target, uint64 tid);
 extern Datum doltgres_test_index_base(Relation target);
@@ -252,6 +256,9 @@ PG_FUNCTION_INFO_V1(dg_totals);
 PG_FUNCTION_INFO_V1(dg_count);
 PG_FUNCTION_INFO_V1(dg_drop_constraint);
 PG_FUNCTION_INFO_V1(dg_unchain);
+PG_FUNCTION_INFO_V1(dg_scan_shape);
+PG_FUNCTION_INFO_V1(dg_index_move);
+PG_FUNCTION_INFO_V1(dg_base_points);
 
 /* dg_store writes the shared area's root record under the fork's lock. */
 Datum
@@ -2708,4 +2715,57 @@ dg_unchain(PG_FUNCTION_ARGS)
 {
 	ProcessUtility_hook = unchained_utility;
 	PG_RETURN_VOID();
+}
+
+/* dg_scan_shape returns a fork table's shape as its scans' costs read it, as doltgres_test_scan_shape reads it. */
+Datum
+dg_scan_shape(PG_FUNCTION_ARGS)
+{
+	Relation	rel = table_open(PG_GETARG_OID(0), AccessShareLock);
+	Datum		shape = doltgres_test_scan_shape(rel);
+
+	table_close(rel, AccessShareLock);
+	PG_RETURN_DATUM(shape);
+}
+
+/*
+ * dg_index_move moves an index into a tablespace as ALTER INDEX SET TABLESPACE's index_copy_data does: a new
+ * relfilenode with its main fork's pages copied, the fork's move of its storage, the old file dropped at commit, and
+ * its pg_class row.
+ */
+Datum
+dg_index_move(PG_FUNCTION_ARGS)
+{
+	Relation	rel = index_open(PG_GETARG_OID(0), AccessExclusiveLock);
+	Oid			space = get_tablespace_oid(text_to_cstring(PG_GETARG_TEXT_PP(1)), false);
+	RelFileNumber number = GetNewRelFileNumber(space, NULL, rel->rd_rel->relpersistence);
+	RelFileLocator locator = rel->rd_locator;
+	SMgrRelation dstrel;
+
+	locator.relNumber = number;
+	locator.spcOid = space;
+	dstrel = RelationCreateStorage(locator, rel->rd_rel->relpersistence, true);
+	RelationCopyStorage(RelationGetSmgr(rel), dstrel, MAIN_FORKNUM, rel->rd_rel->relpersistence);
+	doltgres_index_copy_data(rel, &locator);
+	RelationDropStorage(rel);
+	smgrclose(dstrel);
+	SetRelationTableSpace(rel, space, number);
+	RelationAssumeNewRelfilelocator(rel);
+	index_close(rel, NoLock);
+	CommandCounterIncrement();
+	PG_RETURN_VOID();
+}
+
+/*
+ * dg_base_points returns a fork table's newest base's root, fold point, and read point, as doltgres_test_base_points
+ * reads them.
+ */
+Datum
+dg_base_points(PG_FUNCTION_ARGS)
+{
+	Relation	rel = table_open(PG_GETARG_OID(0), AccessShareLock);
+	Datum		points = doltgres_test_base_points(rel);
+
+	table_close(rel, AccessShareLock);
+	PG_RETURN_DATUM(points);
 }

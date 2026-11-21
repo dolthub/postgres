@@ -330,6 +330,13 @@ extern bool txn_memtable_version_Pushed_Debug_fmt(const void *value, StdFormatte
 extern bool txn_memtable_version_Handle_named(uint64 value, TxnMemtableVersionHandle *result);
 extern TxnMemtableVersionHandle txn_memtable_version_Handle_spilled(uint64 xid, uint32 number, uint32 place);
 #ifdef DOLTGRES_TEST_TXN
+extern void test_txn_memtable_version_tests_every_ops_record_reads_back_as_written(void);
+extern void test_txn_memtable_version_tests_a_stored_record_is_refused_unless_encode_writes_it(void);
+extern void test_txn_memtable_version_tests_a_link_holds_its_offset_and_older_handle_at_their_limits(void);
+extern void test_txn_memtable_version_tests_a_keys_versions_read_newest_first_with_their_deleters(void);
+extern void test_txn_memtable_version_tests_a_version_on_a_fresh_page_is_named_by_its_index_in_the_list(void);
+extern void test_txn_memtable_version_tests_a_hint_and_a_token_clear_racing_both_survive(void);
+extern void test_txn_memtable_version_tests_a_shown_combo_is_the_rows_raw_command_and_no_token(void);
 extern uint64 txn_memtable_version_Handle_page(TxnMemtableVersionHandle self);
 #endif
 extern size_t txn_memtable_version_encoded(const TxnMemtableVersionWriter *writer, const TxnMemtableOp *op,
@@ -367,6 +374,7 @@ extern uint32 txn_memtable_version_Version_raw(const TxnMemtableVersionVersion *
 extern bool txn_memtable_version_Version_ender(const TxnMemtableVersionVersion *self, uint32 *result);
 extern void txn_memtable_version_Version_end(TxnMemtableVersionVersion *self, uint32 ender);
 extern void txn_memtable_version_Version_set_hint(TxnMemtableVersionVersion *self, TxnMemtableVersionHint hint);
+extern bool txn_memtable_version_Version_counted(const TxnMemtableVersionVersion *self);
 extern bool txn_memtable_version_Version_killed(const TxnMemtableVersionVersion *self);
 extern TxnMemtableOp txn_memtable_version_OpRef_owned(const TxnMemtableVersionOpRef *self);
 extern void txn_memtable_version_Version_stored(const TxnMemtableVersionVersion *self, StdVec *result);
@@ -387,12 +395,14 @@ extern bool txn_memtable_version_chain(const TxnMemtableIndexKeyedOps *keyed,
 extern bool txn_memtable_version_Chain_Iterator_next(TxnMemtableVersionChain *self, bool *has_result,
 													 TxnMemtableVersionVersion *result, HostError *error);
 extern bool txn_memtable_version_push(TxnMemtableIndexKeyedOpen *open, const HostDeltaHold *hold, const uint8 *key,
-									  size_t key_len, const TxnMemtableVersionChange *change, bool *has_fresh,
+									  size_t key_len, const TxnMemtableVersionChange *change, bool counted,
+									  bool *has_fresh,
 									  HostDeltaOwned *fresh, StdVec *spare, StdVec *buffer,
 									  TxnMemtableVersionPushed *result, HostError *error);
 extern bool txn_memtable_version_removed(const TxnMemtableIndexKeyedOpen *open, const HostDeltaHold *hold,
 										 TxnMemtableIndexNode node, const TxnMemtableVersionHandle *handles,
-										 size_t handles_len, bool *taken, size_t taken_len, bool *result_0,
+										 size_t handles_len, bool *taken, size_t taken_len, StdVec *counted,
+										 bool *result_0,
 										 StdVec *result_1, uint64 *result_2, HostError *error);
 
 extern TxnMemtableVersionAddresses txn_memtable_version_PutRef_addresses(const TxnMemtableVersionPutRef *self);
@@ -406,5 +416,6 @@ extern void txn_memtable_version_Version_confirm(TxnMemtableVersionVersion *self
 extern void txn_memtable_version_Version_kill(TxnMemtableVersionVersion *self);
 extern void txn_memtable_version_Version_drop(TxnMemtableVersionVersion *self);
 extern void txn_memtable_version_versions_drop(StdVec *versions, size_t from);
+extern void txn_memtable_version_ended(StdVec *record, uint32 ender);
 
 #endif							/* DOLTGRES_TXN_MEMTABLE_VERSION_H */

@@ -150,14 +150,20 @@ repo_runs_pad_0(void *frame_)
 	}
 }
 
-/* repo_runs_file reads one file of a manifest's runs from its item, refusing what runs refuses. */
+/*
+ * repo_runs_file reads one file of a manifest's runs from its item, refusing
+ * what runs refuses: a spill's xid without its number, its number without its
+ * xid, or its passing point or residual's point without either.
+ */
 static bool
 repo_runs_file(const ChunksRecordRecord *item, RepoRunFile *file, ChunksErrorError *error)
 {
-	static const uint32 numbers[] = {1, 2, 3, 4, 5, 6, 7};
+	static const uint32 numbers[] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
 	uint64		kind;
 	bool		has_xid;
 	bool		has_number;
+	bool		has_passed;
+	bool		has_from;
 
 	if (!repo_known(item, numbers, lengthof(numbers)))
 		return repo_corrupt(error);
@@ -168,12 +174,22 @@ repo_runs_file(const ChunksRecordRecord *item, RepoRunFile *file, ChunksErrorErr
 	file->kind = (uint8) kind;
 	has_xid = chunks_record_Record_field(item, 6) != NULL;
 	has_number = chunks_record_Record_field(item, 7) != NULL;
-	if (has_xid != has_number)
+	has_passed = chunks_record_Record_field(item, 8) != NULL;
+	has_from = chunks_record_Record_field(item, 9) != NULL;
+	if (has_xid != has_number || (!has_xid && (has_passed || has_from)))
 		return repo_corrupt(error);
 	file->has_spilled = has_xid;
 	if (has_xid && (!chunks_record_Record_uint(item, 6, &file->spilled.xid, error) ||
 					!repo_narrow(item, 7, &file->spilled.number, error)))
 		return false;
+	if (has_xid)
+	{
+		file->spilled.has_passed = has_passed;
+		file->spilled.has_from = has_from;
+		if ((has_passed && !chunks_record_Record_uint(item, 8, &file->spilled.passed, error)) ||
+			(has_from && !chunks_record_Record_uint(item, 9, &file->spilled.from, error)))
+			return false;
+	}
 	return repo_narrow(item, 2, &file->tablespace, error) && repo_narrow(item, 3, &file->relation, error) &&
 		chunks_record_Record_uint(item, 4, &file->len, error) && chunks_record_Record_uint(item, 5, &file->hash, error);
 }
@@ -346,6 +362,10 @@ repo_Manifest_encode_body_0(void *frame_)
 			{
 				chunks_record_RecordWriter_uint(&frame->item, 6, file->spilled.xid);
 				chunks_record_RecordWriter_uint(&frame->item, 7, file->spilled.number);
+				if (file->spilled.has_passed)
+					chunks_record_RecordWriter_uint(&frame->item, 8, file->spilled.passed);
+				if (file->spilled.has_from)
+					chunks_record_RecordWriter_uint(&frame->item, 9, file->spilled.from);
 			}
 			std_vec_push_Checked(&frame->files, &frame->item, sizeof(frame->item), _Alignof(ChunksRecordRecordWriter));
 			frame->item_live = false;
@@ -612,10 +632,14 @@ bool
 repo_Spilled_Debug_fmt(const void *value, StdFormatter *f)
 {
 	const RepoSpilled *self = value;
+	StdOptionRef passed = {self->has_passed, {&self->passed, std_u64_Debug_fmt}};
+	StdOptionRef from = {self->has_from, {&self->from, std_u64_Debug_fmt}};
 	StdDebugStruct s = std_fmt_debug_struct(f, "Spilled", strlen("Spilled"));
 
 	std_DebugStruct_field(&s, "xid", strlen("xid"), &self->xid, std_u64_Debug_fmt);
 	std_DebugStruct_field(&s, "number", strlen("number"), &self->number, std_u32_Debug_fmt);
+	std_DebugStruct_field(&s, "passed", strlen("passed"), &passed, std_option_Debug_fmt);
+	std_DebugStruct_field(&s, "from", strlen("from"), &from, std_option_Debug_fmt);
 	return std_DebugStruct_finish(&s);
 }
 
@@ -623,7 +647,9 @@ repo_Spilled_Debug_fmt(const void *value, StdFormatter *f)
 bool
 repo_Spilled_PartialEq_eq(const RepoSpilled *self, const RepoSpilled *other)
 {
-	return self->xid == other->xid && self->number == other->number;
+	return self->xid == other->xid && self->number == other->number && self->has_passed == other->has_passed &&
+		(!self->has_passed || self->passed == other->passed) && self->has_from == other->has_from &&
+		(!self->has_from || self->from == other->from);
 }
 
 /* repo_RunFile_Debug_fmt is RunFile's derived Debug. */
@@ -2966,7 +2992,7 @@ repo_tests_runs(HostLsn redo, RepoRuns *result)
 		{.kind = 0, .tablespace = HOST_PG_DEFAULT, .relation = 16384, .len = 4096, .hash = 0xfeed},
 		{.kind = 3, .tablespace = 0, .relation = 0, .len = 128, .hash = PG_UINT64_MAX},
 		{.kind = 5, .tablespace = HOST_PG_DEFAULT, .relation = 16384, .len = 512, .hash = 7, .has_spilled = true,
-		.spilled = {((uint64) 1 << 40) | 742, 3}},
+		.spilled = {((uint64) 1 << 40) | 742, 3, true, ((uint64) 1 << 33) | 5, true, ((uint64) 1 << 33) | 9}},
 	};
 
 	result->redo = redo;
@@ -3045,7 +3071,7 @@ repo_tests_runs_body_0(void *frame_)
 	{
 		uint32		number;
 		uint64		value;
-	}			listings[] = {{1, 256}, {2, (uint64) 1 << 32}, {3, (uint64) 1 << 32}, {6, 1}, {7, 1}, {8, 1}};
+	}			listings[] = {{1, 256}, {2, (uint64) 1 << 32}, {3, (uint64) 1 << 32}, {6, 1}, {7, 1}, {8, 1}, {9, 1}};
 
 	for (size_t k = 0, k_len = 3; k < k_len; k++)
 	{

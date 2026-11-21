@@ -140,7 +140,7 @@ TXN_MEMTABLE_TABLE_NAME(txn_memtable_table_prepare) (HostIoIo *io, HostSharedRec
 
 	return txn_memtable_table_readied(io, true, state, rows, rows_len, takes, takes_len, tuple,
 									  TXN_MEMTABLE_TABLE_NAME(txn_memtable_table_inside), &captures,
-									  TXN_MEMTABLE_TABLE_NAME(txn_memtable_table_dropped),
+									  TXN_MEMTABLE_TABLE_NAME(txn_memtable_table_dropped), NULL,
 									  TXN_MEMTABLE_TABLE_RESULT_ERROR);
 }
 
@@ -172,7 +172,7 @@ TXN_MEMTABLE_TABLE_NAME(txn_memtable_table_prepare_striped) (HostIoIo *io, HostI
 
 	return txn_memtable_table_readied(io, true, state, rows, rows_len, takes, takes_len, tuple,
 									  TXN_MEMTABLE_TABLE_NAME(txn_memtable_table_inside), &captures,
-									  TXN_MEMTABLE_TABLE_NAME(txn_memtable_table_dropped),
+									  TXN_MEMTABLE_TABLE_NAME(txn_memtable_table_dropped), NULL,
 									  TXN_MEMTABLE_TABLE_RESULT_ERROR);
 }
 #endif

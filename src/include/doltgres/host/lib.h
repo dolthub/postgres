@@ -299,6 +299,7 @@ typedef enum HostWalKind
 	HOST_WAL_KIND_TIDS_FREED,
 	HOST_WAL_KIND_MAP_CARRIED,
 	HOST_WAL_KIND_DATABASE_CHANGE,
+	HOST_WAL_KIND_CARRY_UNLISTED,
 } HostWalKind;
 
 /*
@@ -604,6 +605,8 @@ typedef struct HostHostOps
 	bool		(*delay_checkpoints) (void *self, const HostMayRaise *raise,
 									  const char *const *pauses, size_t pauses_len,
 									  HostError *error);
+	bool		(*load_pauses) (void *self, const HostMayRaise *raise, const char *const *pauses,
+								size_t pauses_len, HostError *error);
 	void		(*resume_checkpoints) (void *self, bool finished);
 	bool		(*xid_status) (void *self, const HostMayRaise *raise, HostXid xid,
 							   HostStatus *result, HostError *error);
@@ -772,11 +775,12 @@ typedef struct HostHostOps
 	bool		(*backups_running) (void *self);
 	bool		(*collection_begin) (void *self);
 	void		(*collection_end) (void *self);
-	bool		(*collection_ask) (void *self, const HostMayRaise *raise, uint32 database, uint64 *result,
-								   HostError *error);
-	bool		(*collection_asked) (void *self, uint64 *result_0, uint32 *result_1);
+	bool		(*collection_ask) (void *self, const HostMayRaise *raise, uint32 database, uint32 emptied,
+								   uint64 *result, HostError *error);
+	bool		(*collection_asked) (void *self, uint64 *result_0, uint32 *result_1, uint32 *result_2);
 	void		(*collection_answer) (void *self, uint64 word, const uint64 *counts);
 	void		(*collector_started) (void *self);
+	bool		(*collector_running) (void *self);
 	bool		(*database_locked) (void *self, const HostMayRaise *raise, uint32 database, bool *result,
 									HostError *error);
 	void		(*database_unlocked) (void *self, uint32 database);
@@ -876,6 +880,7 @@ extern bool host_Storage_PartialEq_eq(const HostStorage *self, const HostStorage
 extern bool host_Storage_Debug_fmt(const void *value, StdFormatter *f);
 extern bool host_Xid_PartialEq_eq(const HostXid *self, const HostXid *other);
 extern bool host_Xid_Debug_fmt(const void *value, StdFormatter *f);
+extern bool host_Command_Debug_fmt(const void *value, StdFormatter *f);
 extern bool host_Row_PartialEq_eq(const HostRow *self, const HostRow *other);
 extern bool host_Row_Debug_fmt(const void *value, StdFormatter *f);
 extern bool host_Refused_Debug_fmt(const void *value, StdFormatter *f);
@@ -947,6 +952,7 @@ extern bool host_tree_bytes(HostIoIoDoors io, const char *path, size_t path_len,
 extern bool host_nap(HostIoIoDoors io, StdDuration duration, HostError *error);
 extern bool host_wal_insert(HostIoIoDoors io, HostWalKind kind, const uint8 *body,
 							size_t body_len, HostLsn *result, HostError *error);
+extern bool host_NewCid_Debug_fmt(const void *value, StdFormatter *f);
 extern bool host_wal_new_cid(HostIoIoDoors io, const HostStorage *storage, HostRow tid,
 							 HostNewCid cid, HostLsn *result, HostError *error);
 extern bool host_wal_flush(HostIoIoDoors io, HostLsn lsn, HostError *error);
@@ -1001,6 +1007,7 @@ extern bool host_warn(HostIoIoDoors io, HostError *error_, const char *context,
 					  HostError *error);
 extern bool host_log(HostIoIoDoors io, const char *message, HostError *error);
 extern void host_refuse_recovery(HostIoIoDoors io, const char *detail, size_t detail_len);
+extern bool host_load_pauses(HostIoIoDoors io, const char *const *pauses, size_t pauses_len, HostError *error);
 extern bool host_delay_checkpoint(HostIoIoDoors io, const char *const *pauses,
 								  size_t pauses_len, HostDelayCheckpoint *result,
 								  HostError *error);
@@ -1022,10 +1029,11 @@ extern void host_backup_end(void);
 extern bool host_backups_running(void);
 extern bool host_collection_begin(void);
 extern void host_collection_end(void);
-extern bool host_collection_ask(HostIoIo *io, uint32 database, uint64 *result, HostError *error);
-extern bool host_collection_asked(uint64 *result_0, uint32 *result_1);
+extern bool host_collection_ask(HostIoIo *io, uint32 database, uint32 emptied, uint64 *result, HostError *error);
+extern bool host_collection_asked(uint64 *result_0, uint32 *result_1, uint32 *result_2);
 extern void host_collection_answer(uint64 word, const uint64 *counts);
 extern void host_collector_started(void);
+extern bool host_collector_running(void);
 extern bool host_database_locked(HostIoIo *io, uint32 database, bool *result, HostError *error);
 extern void host_database_unlocked(uint32 database);
 extern bool host_database_lock_waited(HostIoIo *io, uint32 database, bool *result, HostError *error);

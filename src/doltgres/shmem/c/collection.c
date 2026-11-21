@@ -49,6 +49,9 @@ static const char SHMEM_COLLECTION_ASKING[] = "versioned collection ask";
 /* SHMEM_COLLECTION_DONE is the bit of the ask's word the worker sets once it has written its answer. */
 #define SHMEM_COLLECTION_DONE ((uint64) 1 << 32)
 
+/* SHMEM_COLLECTION_HELD is the bit of the ask's word its asker holds while it writes the tablespace the ask empties. */
+#define SHMEM_COLLECTION_HELD ((uint64) 1 << 63)
+
 /*
  * SHMEM_COLLECTION_PG_WAIT_LWLOCK is Postgres' wait event class of a
  * lightweight lock's tranche, which the backup's sleep names with the
@@ -61,8 +64,9 @@ static const char SHMEM_COLLECTION_ASKING[] = "versioned collection ask";
  * backups, the collection's word (one while a collection runs), the condition
  * variable a backup's start sleeps on, and the tranche its sleep names; then
  * the ask's word (0, or the asker's process number plus one above DONE, DONE
- * once answered, and the database asked for below it), the collector
- * worker's process number plus one (0 before it starts), the answer's
+ * once answered, and the database asked for below it), the tablespace the
+ * ask empties, the collector worker's process number plus one (0 before it
+ * starts), the answer's
  * counts, the condition variable askers sleep on, and the tranche their
  * sleep names.
  */
@@ -73,6 +77,7 @@ typedef struct ShmemCollectionMeeting
 	ConditionVariable wake;
 	uint32		tranche;
 	pg_atomic_uint64 asked;
+	pg_atomic_uint64 emptied;
 	pg_atomic_uint64 worker;
 	pg_atomic_uint64 answer[3];
 	ConditionVariable answered;
@@ -116,6 +121,8 @@ shmem_collection_initialize(const PgMayRaise *raise, PgPgError *error)
 	region->tranche = (uint32) tranche;
 	region = shmem_collection_region();
 	pg_calls_atomic_init_u64(&region->asked, 0);
+	region = shmem_collection_region();
+	pg_calls_atomic_init_u64(&region->emptied, 0);
 	region = shmem_collection_region();
 	pg_calls_atomic_init_u64(&region->worker, 0);
 	for (size_t at = 0, at_end = 3; at < at_end; at = std_forward_unchecked_usize_Checked(at, 1))
@@ -278,6 +285,13 @@ shmem_collection_worker_started(void)
 	pg_calls_atomic_write_u64(&shmem_collection_region()->worker, number);
 }
 
+/* shmem_collection_worker_running reports whether a collector worker has started, which an ask needs to be answered. */
+bool
+shmem_collection_worker_running(void)
+{
+	return shmem_collection_read(&shmem_collection_region()->worker) != 0;
+}
+
 /* shmem_collection_ask_closure_0 is map's closure: an answer's count at a place. */
 static uint64
 shmem_collection_ask_closure_0(void *captures, size_t at)
@@ -339,14 +353,15 @@ shmem_collection_ask_pad_0(void *frame_)
 
 /*
  * shmem_collection_ask asks the collector worker for a full collection of a
- * database's repository and sleeps until it answers with the packs it
+ * database's repository, emptying a tablespace unless that is
+ * CHUNKS_PACKS_DEFAULT_SPACE, and sleeps until it answers with the packs it
  * retired, those it copied out, and its live bytes, each
  * SHMEM_COLLECTION_FAILED when it failed; one ask is out at a time, and a
  * later asker sleeps until it may write its own. A cancel ends the sleep,
  * taking back an ask not yet answered, and the collection goes on.
  */
 bool
-shmem_collection_ask(const PgMayRaise *raise, uint32 database, uint64 result[3], PgPgError *error)
+shmem_collection_ask(const PgMayRaise *raise, uint32 database, uint32 emptied, uint64 result[3], PgPgError *error)
 {
 	uint64		tmp_1 = (uint64) (uint32) pg_calls_my_proc_number();
 	uint64		tmp_2 = STD_ADD(u64, tmp_1, 1, 218, 18);
@@ -358,11 +373,13 @@ shmem_collection_ask(const PgMayRaise *raise, uint32 database, uint64 result[3],
 	STD_CHECK_ALIGNED(region, _Alignof(ShmemCollectionMeeting), 222, 42);
 	STD_CHECK_NULL_DEREF(region, 222, 42);
 	wait = SHMEM_COLLECTION_PG_WAIT_LWLOCK | region->asking;
-	while (!shmem_collection_swapped(shmem_collection_asked(), 0, mine))
+	while (!shmem_collection_swapped(shmem_collection_asked(), 0, mine | SHMEM_COLLECTION_HELD))
 	{
 		if (!shmem_collection_slept(raise, wait, false, 0, error))
 			return false;
 	}
+	pg_calls_atomic_write_u64(&shmem_collection_region()->emptied, emptied);
+	(void) shmem_collection_swapped(shmem_collection_asked(), mine | SHMEM_COLLECTION_HELD, mine);
 	worker = shmem_collection_read(&shmem_collection_region()->worker);
 	if (worker != 0)
 	{
@@ -409,9 +426,9 @@ shmem_collection_slept(const PgMayRaise *raise, uint32 wait, bool has_mine, uint
 	return false;
 }
 
-/* shmem_collection_asked_for returns the unanswered ask's word and the database it asks for, the collector worker's read. */
+/* shmem_collection_asked_for returns the unanswered ask's word, the database it asks for, and the tablespace it empties, the collector worker's read. */
 bool
-shmem_collection_asked_for(std_TupleU64U32_t *result)
+shmem_collection_asked_for(std_TupleU64U32_t *result, uint32 *emptied)
 {
 	uint64		word = shmem_collection_read(shmem_collection_asked());
 	uint32		database;
@@ -421,10 +438,12 @@ shmem_collection_asked_for(std_TupleU64U32_t *result)
 		std_result_unwrap_failed("the word's low half fits a database id",
 								 sizeof("the word's low half fits a database id") - 1, &tried,
 								 std_TryFromIntError_Debug_fmt, RUST_FILE, 273, 62);
-	if (word != 0 && (word & SHMEM_COLLECTION_DONE) == 0)
+	if (word != 0 && (word & (SHMEM_COLLECTION_DONE | SHMEM_COLLECTION_HELD)) == 0)
 	{
+		pg_calls_read_barrier();
 		result->f0 = word;
 		result->f1 = database;
+		*emptied = (uint32) shmem_collection_read(&shmem_collection_region()->emptied);
 		return true;
 	}
 	return false;

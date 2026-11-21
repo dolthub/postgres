@@ -56,8 +56,10 @@ typedef struct TxnSpillFilter
 /*
  * TxnSpillFile is File: what names a spill's file, its spilling transaction's
  * top-level xid, its kind, its number among that transaction's files of its
- * storage and tree, its length, its trailer's xxh3, and the count of its
- * filter's bits.
+ * storage and tree, its length, its trailer's xxh3, the count of its filter's
+ * bits, for a free space map's spill its transaction's abort kept, the end of
+ * that abort, or for a carry's file of frozen versions its passing point, and,
+ * for a fold's residual of a map's spills, the fold's point.
  */
 typedef struct TxnSpillFile
 {
@@ -67,6 +69,20 @@ typedef struct TxnSpillFile
 	uint64		len;
 	uint64		hash;
 	uint64		bits;
+
+	/*
+	 * passed is the end of the abort that kept a free space map's spill, or
+	 * the newest end of a carry's frozen versions' records, 1 for versions
+	 * with none, the point a fold passes it at, or 0 for none.
+	 */
+	uint64		passed;
+
+	/*
+	 * from is the point of the fold whose residual the file is, from which
+	 * readers read it in its sources' place, or 0 for a file that is no
+	 * residual.
+	 */
+	uint64		from;
 } TxnSpillFile;
 
 /* txn_TupleVecFileU64_t is listed's (Vec<File>, u64): a storage's spill files, newest first, and the generation they were read at. */
@@ -90,6 +106,31 @@ typedef struct txn_TupleU64KindU32OptionU32_t
 	uint32		f3;
 } txn_TupleU64KindU32OptionU32_t;
 
+/*
+ * TxnSpillKept is Kept: a spilled version of a storage's map that a fold at
+ * a point leaves unapplied above an older running writer's (bugs row 228):
+ * its kind, its key, and its record's bytes.
+ */
+typedef struct TxnSpillKept
+{
+	TxnRunsKind kind;
+	StdVec		key;
+	StdVec		bytes;
+} TxnSpillKept;
+
+/*
+ * TxnSpillChain is Chain: a key of a tree a carry writes to spill files: the
+ * tree, the key, and its versions oldest first, each its writer's top-level
+ * xid and its record.
+ */
+typedef struct TxnSpillChain
+{
+	TxnWrittenOf of;
+	StdVec		key;
+	/* versions is a Vec<(u64, Vec<u8>)>. */
+	StdVec		versions;
+} TxnSpillChain;
+
 /* TXN_SPILL_PENDING_PROC_SLOTS_OPS is Pending's ProcSlots: each process's slot naming its one spill no manifest lists yet. */
 extern const HostSharedProcSlotsOps TXN_SPILL_PENDING_PROC_SLOTS_OPS;
 
@@ -103,6 +144,19 @@ extern bool txn_spill_replayed(HostIoIo *io, const HostStorage *storage, TxnWrit
 extern bool txn_spill_spilled(HostIoIo *io, const HostStorage *storage, TxnWrittenOf of, uint64 xid, bool *result,
 							  HostError *error);
 extern bool txn_spill_folded(HostIoIo *io, HostSharedRecord state, HostLsn point, HostError *error);
+extern bool txn_spill_residual(HostIoIo *io, HostSharedRecord state, HostLsn point, const TxnSpillKept *kept,
+							   size_t kept_len, StdVec *result, HostError *error);
+extern bool txn_spill_unlisted(HostIoIo *io, HostSharedRecord state, const StdVec *residuals, HostError *error);
+extern void txn_spill_Chain_drop(TxnSpillChain *self);
+
+struct TxnRecordCarryUnlisted;
+
+extern bool txn_spill_redo_unlisted(HostIoIo *io, const HostSharedHeld *held,
+									const struct TxnRecordCarryUnlisted *unlisted, HostError *error);
+extern bool txn_spill_carried(HostIoIo *io, const HostSharedHeld *held, const uint64 *writers, size_t writers_len,
+							  bool (*logged) (void *captures, HostSharedLongIo *io, StdVec *chains,
+											  HostError *error),
+							  void *captures, HostError *error);
 extern bool txn_spill_versions(const TxnSpillHomeOps *home, HostIoIo *io, const HostDeltaHold *hold,
 							   HostSharedRecord state, TxnRunsKind kind, const uint8 *key, size_t key_len,
 							   StdVec *result, HostError *error);
@@ -119,7 +173,9 @@ extern bool txn_spill_settle_pending(HostIoIo *io, HostError *error);
 extern bool txn_spill_wrote(HostIoIo *io, uint64 top, uint64 bytes, HostError *error);
 extern bool txn_spill_unwrote(HostIoIo *io, bool has_bytes, uint64 bytes, HostError *error);
 extern bool txn_spill_aborted(HostIoIo *io, uint64 xid, const HostStorage *storages, size_t storages_len,
-							  HostError *error);
+							  HostLsn end, HostError *error);
+extern bool txn_spill_spilled_free(HostIoIo *io, uint64 xid, HostError *error);
+extern bool txn_spill_redo_aborted(HostIoIo *io, uint64 xid, HostLsn end, HostError *error);
 extern bool txn_spill_chunks_repository(const HostStorage *storage, uint32 *result);
 extern bool txn_spill_Filter_of(size_t count, const StdBytes *keys, size_t keys_len, TxnSpillFilter *result,
 								HostError *error);
@@ -129,6 +185,9 @@ extern bool txn_spill_chunk_versions(HostIoIo *io, const HostDeltaHold *hold, Ho
 									 size_t key_len, StdVec *result, HostError *error);
 extern bool txn_spill_chunk(HostIoIo *io, HostSharedRecord deltas, const uint8 *key, size_t key_len, bool *some,
 							StdVec *result, HostError *error);
+extern bool txn_spill_removed(const TxnSpillHomeOps *home, HostIoIo *io, HostSharedRecord record,
+							  const HostStorage *storage, bool (*picked) (void *captures, const TxnSpillFile *file),
+							  void *picked_captures, StdVec *result, HostError *error);
 extern bool txn_spill_linked(const TxnSpillHomeOps *home, HostIoIo *io, HostSharedRecord record,
 							 const HostStorage *storage, const TxnSpillFile *linking, size_t linking_len,
 							 bool has_replacing, txn_TupleU64KindU32OptionU32_t replacing, HostError *error);
@@ -137,7 +196,7 @@ extern bool txn_spill_twinned(HostIoIo *io, HostSharedRecord state, TxnRunsKind 
 extern uint64 txn_spill_counted(const TxnRunsDecoded *decoded);
 extern bool txn_spill_chunks_ended(HostIoIo *io, HostSharedRecord deltas, HostError *error);
 extern bool txn_spill_named(const TxnSpillHomeOps *home, HostIoIo *io, HostSharedRecord state,
-							const HostStorage *storage, StdVec *result, HostError *error);
+							const HostStorage *storage, HostLsn redo, StdVec *result, HostError *error);
 extern bool txn_spill_tuple_key(HostIoIo *io, const HostDeltaHold *hold, HostSharedRecord state, HostRow tid,
 								bool *some, StdVec *result, HostError *error);
 
@@ -145,6 +204,13 @@ extern bool txn_spill_tuple_key(HostIoIo *io, const HostDeltaHold *hold, HostSha
 extern void test_txn_spill_tests_a_merges_rewrite_and_another_transactions_listing_lose_nothing(void);
 extern void test_txn_spill_tests_a_reader_paused_in_a_manifest_read_finds_each_version_once(void);
 extern void test_txn_spill_tests_a_lookup_reads_an_evicted_filter_page_again(void);
+extern void test_txn_spill_tests_a_spilled_free_space_maps_entries_are_read_below_the_memtable(void);
+extern void test_txn_spill_tests_an_aborted_free_space_map_spill_stays_listed_until_a_fold(void);
+extern void test_txn_spill_tests_the_committed_arm_spills_a_keys_oldest_committed_versions_above_its_spills(void);
+extern void test_txn_spill_tests_the_committed_arms_spill_reads_back_in_order_after_a_restart(void);
+extern void test_txn_spill_tests_a_free_space_spill_a_crash_ended_is_marked_with_the_next_checkpoints_redo_point(void);
+extern void test_txn_spill_tests_a_prepared_transactions_spills_are_never_taken_out(void);
+extern void test_txn_spill_tests_a_free_space_spills_merge_leaves_the_rows_tuple_ids_alone(void);
 extern void test_txn_spill_tests_a_transaction_spilling_more_storages_than_the_budget_holds_pages_completes(void);
 extern void test_txn_spill_tests_two_transactions_spilling_the_same_storages_crosswise_complete(void);
 extern void test_txn_spill_tests_more_transactions_than_any_fixed_count_spill_one_storage_at_a_full_budget(void);
@@ -169,6 +235,9 @@ extern void test_txn_spill_tests_a_storages_spills_list_hit_and_remove(void);
 extern void test_txn_spill_tests_a_pending_spill_is_found_by_its_storages_readers_until_it_settles(void);
 extern void test_txn_spill_tests_a_filter_hits_its_keys_and_few_others(void);
 extern void test_txn_spill_tests_a_large_filter_takes_several_pages(void);
+extern void test_txn_spill_tests_a_residual_whose_listing_fails_lists_nothing_and_gives_its_count_back(void);
+extern void test_txn_spill_tests_a_drop_counts_a_crashed_transactions_files_in_either_order(void);
+extern void test_txn_spill_tests_a_carry_that_fails_at_any_step_lists_nothing_and_leaves_every_count(void);
 #endif
 
 #endif							/* DOLTGRES_TXN_SPILL_H */

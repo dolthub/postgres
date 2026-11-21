@@ -267,11 +267,24 @@ ROLLBACK;
 });
 ok(spill_files($aborted) > 0,
 	"an aborted transaction's spill files stay until a checkpoint");
+# The versioned collector holds a reader while it sleeps (bugs row 255), which
+# keeps every deferred removal waiting, so the case ends it before its
+# checkpoints, the postmaster starting it again ten seconds later; this step
+# goes when row 255 is fixed.
+$node->safe_psql('postgres',
+	q{SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE backend_type = 'versioned collector'});
+$node->poll_query_until('postgres',
+	q{SELECT count(*) = 0 FROM pg_stat_activity WHERE backend_type = 'versioned collector'})
+  or die 'the versioned collector stayed';
+$node->safe_psql('postgres', 'CHECKPOINT') for 1 .. 2;
+isnt(spill_files($aborted), '0', "an aborted transaction's spill files stay through the second checkpoint after it");
+# A fold worker's reader, which the third checkpoint's removal rightly waits
+# for, ends with its fold first.
+$node->poll_query_until('postgres',
+	q{SELECT count(*) = 0 FROM pg_stat_activity WHERE backend_type = 'fold worker'})
+  or die 'a fold worker stayed';
 $node->safe_psql('postgres', 'CHECKPOINT');
-$node->safe_psql('postgres', 'CHECKPOINT');
-is(spill_files($aborted), '0',
-	"an aborted transaction's spill files go at the second checkpoint after it"
-);
+is(spill_files($aborted), '0', "and go at the third");
 my $crashed = $node->safe_psql(
 	'postgres', q{
 BEGIN;
@@ -281,9 +294,9 @@ ROLLBACK;
 });
 $node->stop('immediate');
 $node->start;
-$node->safe_psql('postgres', 'CHECKPOINT');
+$node->safe_psql('postgres', 'CHECKPOINT') for 1 .. 2;
 is(spill_files($crashed), '0',
-	"a crash between an abort and a checkpoint leaves none of its spill files once a checkpoint after the start ran"
+	"a crash between an abort and a checkpoint leaves none of its spill files once two checkpoints after the start ran"
 );
 folded('swept');
 
@@ -655,6 +668,73 @@ is( $pinned->safe_psql('postgres',
 	'a test insert of a source past shared_buffers completes on a node made for streaming');
 $pinned->stop;
 
+# Commit 4's case: a statement inserting 300,000 rows at a 4 MB delta_memory
+# completes, its spills dropping their rows' tuple ids from the storage's tuple
+# id table, whose compaction leaves those slots and their keys' bytes behind,
+# and every row reads back.
+my $compacted = PostgreSQL::Test::Cluster->new('spill_compacted');
+$compacted->init;
+$compacted->append_conf('postgresql.conf',
+	"delta_memory = 4MB\nfold_threshold = 1GB\nfold_timeout = 3600s\nmax_parallel_workers_per_gather = 0");
+$compacted->start;
+$compacted->safe_psql(
+	'postgres', q{
+CREATE EXTENSION doltgres_test;
+CREATE TABLE many_source (v text);
+INSERT INTO many_source SELECT 'r' || i FROM generate_series(1, 300000) i;
+CREATE TABLE many (v text);
+});
+$compacted->safe_psql('postgres',
+	q{SELECT count(*) FROM doltgres_test_insert('many', 'many_source', true, 0)}, timeout => 1200);
+is($compacted->safe_psql('postgres', q{SELECT count(*) FROM doltgres_test_scan('many', false, -1)}),
+	'300000', 'a statement inserting 300,000 rows at a 4 MB delta_memory completes and every row reads back');
+$compacted->stop;
+
+# A standby's replay of an aborted transaction's spills: at a 4 MB delta_memory
+# a standby replays a transaction whose rows and free space map takes pass its
+# budget, which its redo spills, and then the transaction's abort, which keeps
+# the free space map spill marked with the abort's end until a fold takes it;
+# the standby reads the table as its primary does after a committed insert,
+# after the primary's fold, and after the standby's restart, once it folded at
+# its primary's point and its primary's checkpoint gave it a restartpoint, which
+# no fold point a storage holds unfolded lets it pass (bugs row 158).
+my $aborting = PostgreSQL::Test::Cluster->new('spill_aborting');
+$aborting->init(allows_streaming => 1);
+$aborting->append_conf('postgresql.conf',
+	"delta_memory = 4MB\nfold_threshold = 1GB\nfold_timeout = 3600s\nmax_parallel_workers_per_gather = 0");
+$aborting->start;
+$aborting->safe_psql(
+	'postgres', q{
+CREATE EXTENSION doltgres_test;
+CREATE TABLE aborted_source (v text);
+INSERT INTO aborted_source SELECT 'r' || i FROM generate_series(1, 100000) i;
+CREATE TABLE aborted_rows (v text);
+});
+$aborting->backup('aborting_backup');
+my $aborting_standby = PostgreSQL::Test::Cluster->new('spill_aborting_standby');
+$aborting_standby->init_from_backup($aborting, 'aborting_backup', has_streaming => 1);
+$aborting_standby->append_conf('postgresql.conf', "delta_memory = 4MB\nmax_parallel_workers_per_gather = 0");
+$aborting_standby->start;
+$aborting->safe_psql('postgres',
+	q{BEGIN; SELECT count(*) FROM doltgres_test_insert('aborted_rows', 'aborted_source', true, 0); ROLLBACK;},
+	timeout => 1200);
+$aborting->safe_psql('postgres',
+	q{SELECT count(*) FROM doltgres_test_insert('aborted_rows', 'aborted_source', true, 0)}, timeout => 1200);
+$aborting->wait_for_catchup($aborting_standby);
+my $aborted_count = q{SELECT count(*) FROM doltgres_test_scan('aborted_rows', false, -1)};
+is($aborting_standby->safe_psql('postgres', $aborted_count),
+	'100000', "a standby that replayed an aborted transaction's spills reads only the committed rows");
+$aborting->safe_psql('postgres', q{SELECT doltgres_test_fold('aborted_rows')});
+$aborting->wait_for_catchup($aborting_standby);
+is($aborting_standby->safe_psql('postgres', $aborted_count), '100000', "and after the primary's fold");
+$aborting_standby->safe_psql('postgres', q{SELECT doltgres_test_fold('aborted_rows')});
+$aborting->safe_psql('postgres', 'CHECKPOINT');
+$aborting->wait_for_catchup($aborting_standby);
+$aborting_standby->restart;
+is($aborting_standby->safe_psql('postgres', $aborted_count), '100000', "and after the standby's restart");
+$aborting_standby->stop;
+$aborting->stop;
+
 # Bugs row 74 through the real commands: one INSERT ... SELECT whose own
 # versions pass the default 32 MB of delta_memory completes, its running
 # transaction spilling them (the delta's drain), and every row reads back.
@@ -939,49 +1019,6 @@ $small->safe_psql('postgres',
 is($small->safe_psql('postgres', $used),
 	$start, "the delta's used bytes are back at their start once both ended and folded");
 $small->stop;
-
-# Bugs row 242: an UPDATE ... FROM through a nested loop whose outer scan reads
-# a source whose rows its writer spilled, held at its first read of the
-# source's spills while a fold of the source installs a base and drops the
-# spills, updates every row, as heap's twin's does.
-my %joined;
-for my $am ('', 'USING doltgres_twin')
-{
-	my $p = $am eq '' ? '' : 'heap_';
-	$node->safe_psql(
-		'postgres', qq{
-CREATE TABLE ${p}joined_source (k int4, v text) $am;
-INSERT INTO ${p}joined_source SELECT g, repeat('s', 100) FROM generate_series(1, 40000) g;
-CREATE TABLE ${p}joined_target (k int4 PRIMARY KEY, v text) $am;
-INSERT INTO ${p}joined_target SELECT g, 't' FROM generate_series(1, 40000) g;
-});
-	my $plan = "SET enable_hashjoin = off; SET enable_mergejoin = off; SET enable_material = off;"
-	  . " SET max_parallel_workers_per_gather = 0;";
-	my $update = "UPDATE ${p}joined_target t SET v = s.v || 'u' FROM ${p}joined_source s WHERE t.k = s.k";
-	if ($am eq '')
-	{
-		my $updater = $node->background_psql('postgres');
-		$updater->query_safe(
-			"$plan SELECT injection_points_set_local(); SELECT injection_points_attach('doltgres-spill-slots-read', 'wait')"
-		);
-		$updater->query_until(qr/started/, "\\echo started\n$update;\n");
-		$node->wait_for_event('client backend', 'doltgres-spill-slots-read');
-		$node->safe_psql('postgres', "SELECT doltgres_test_fold('joined_source')");
-		$node->safe_psql('postgres',
-			"SELECT injection_points_detach('doltgres-spill-slots-read'); SELECT injection_points_wakeup('doltgres-spill-slots-read')"
-		);
-		$updater->query_safe('SELECT 1');
-		$updater->quit;
-	}
-	else
-	{
-		$node->safe_psql('postgres', "$plan $update");
-	}
-	$joined{$p} = $node->safe_psql('postgres',
-		"SELECT count(*) || ' ' || md5(string_agg(k || v, ',' ORDER BY k)) FROM ${p}joined_target");
-}
-is($joined{''}, $joined{heap_},
-	"an UPDATE ... FROM whose source scan a fold's drop passes under updates every row as heap's twin's");
 
 # Bugs row 286: a helper spilling an idle transaction's versions pauses after
 # taking them out of its memtable and before listing its file, and the

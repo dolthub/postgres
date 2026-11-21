@@ -28,6 +28,15 @@
 #include "doltgres/txn/outcome.h"
 #include "doltgres/txn/status.h"
 
+#ifdef DOLTGRES_TEST_TXN
+#include "doltgres/simc/simc.h"
+#include "doltgres/std/test.h"
+#include "doltgres/txn/memtable/table.h"
+#include "doltgres/txn/memtable/testing.h"
+#endif
+
+#define RUST_FILE "txn" STD_SEP "src" STD_SEP "outcome.rs"
+
 /*
  * txn_outcome_stamped returns whether the transaction of a row stamp's xid is
  * in progress, committed, or aborted, as outcome answers a version's writer
@@ -90,3 +99,91 @@ txn_outcome_outcome(HostIoIo *io, TxnMemtableVersionVersion *version, HostStatus
 		txn_memtable_version_Version_set_hint(version, TXN_MEMTABLE_VERSION_HINT_ABORTED);
 	return true;
 }
+
+#ifdef DOLTGRES_TEST_TXN
+
+/* txn_outcome_tests_written pushes a version of a key into a storage's rows, written by a writer. */
+static void
+txn_outcome_tests_written(HostIoIo *io, HostSharedRecord state, const char *key, uint64 xid)
+{
+	TxnMemtableOp op = txn_memtable_testing_put((const uint8 *) "row", 3);
+	TxnMemtableVersionChange change = {.writer = txn_memtable_testing_writer(xid), .op = &op,
+	.lock = TXN_MEMTABLE_LOCK_MODE_UPDATE, .shown = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND}};
+	TxnMemtableVersionHandle handle;
+	HostError	error;
+
+	op.u.put.tuple.f0 = 1;
+	op.u.put.heap_bytes = 32;
+	if (!txn_memtable_table_push(io, state, (const uint8 *) key, strlen(key), &change, &handle, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	txn_memtable_Op_drop(&op);
+}
+
+/* txn_outcome_tests_outcome returns a version's outcome. */
+static HostStatus
+txn_outcome_tests_outcome(HostIoIo *io, TxnMemtableVersionVersion *version)
+{
+	HostStatus	status;
+	HostError	error;
+
+	if (!txn_outcome_outcome(io, version, &status, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	return status;
+}
+
+/*
+ * test_txn_outcome_tests_a_writers_outcome_answers_frozen_with_no_door_and_caches_an_ended_writers:
+ * a version FrozenTransactionId wrote reads committed with no door asked, so
+ * its hint stays unset; a running writer's version reads in progress and
+ * caches nothing; once the writer commits it reads committed and caches it,
+ * and reads committed from the cache after the commit log keeps no such xid.
+ */
+void
+test_txn_outcome_tests_a_writers_outcome_answers_frozen_with_no_door_and_caches_an_ended_writers(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedHeld held = txn_memtable_testing_created(io, 9330);
+	HostSharedRecord record = host_shared_Held_record(&held);
+	HostXid		running = simc_begin();
+	HostXid		later;
+	HostDeltaHold hold;
+	StdVec		frozen;
+	StdVec		ran;
+	TxnMemtableVersionVersion *version;
+	HostError	error;
+
+	txn_outcome_tests_written(io, record, "f", 2);
+	txn_outcome_tests_written(io, record, "r", running.f0);
+	if (!host_delta_hold(io, &hold, &error) ||
+		!txn_memtable_table_versions(io, &hold, record, (const uint8 *) "f", 1, &frozen, &error) ||
+		!txn_memtable_table_versions(io, &hold, record, (const uint8 *) "r", 1, &ran, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	version = &STD_VEC_AT(&frozen, TxnMemtableVersionVersion, 0);
+	STD_ASSERT(__LINE__, 9, txn_outcome_tests_outcome(io, version) == HOST_STATUS_COMMITTED &&
+			   txn_memtable_version_Version_hint(version) == TXN_MEMTABLE_VERSION_HINT_UNKNOWN,
+			   "a frozen writer's version reads committed and caches nothing");
+	version = &STD_VEC_AT(&ran, TxnMemtableVersionVersion, 0);
+	STD_ASSERT(__LINE__, 9, txn_outcome_tests_outcome(io, version) == HOST_STATUS_IN_PROGRESS &&
+			   txn_memtable_version_Version_hint(version) == TXN_MEMTABLE_VERSION_HINT_UNKNOWN,
+			   "a running writer's version reads in progress and caches nothing");
+	simc_commit(running);
+	STD_ASSERT(__LINE__, 9, txn_outcome_tests_outcome(io, version) == HOST_STATUS_COMMITTED &&
+			   txn_memtable_version_Version_hint(version) == TXN_MEMTABLE_VERSION_HINT_COMMITTED,
+			   "a committed writer's version reads committed and caches it");
+	later = simc_begin();
+	simc_truncate_commit_log(later);
+	STD_ASSERT(__LINE__, 9, txn_outcome_tests_outcome(io, version) == HOST_STATUS_COMMITTED,
+			   "a cached commit reads committed after the commit log keeps no such xid");
+	simc_commit(later);
+	txn_memtable_version_versions_drop(&ran, 0);
+	txn_memtable_version_versions_drop(&frozen, 0);
+	host_delta_Hold_drop(&hold);
+	host_shared_Held_drop(&held);
+	simc_TestIo_drop(&test_io);
+}
+
+#endif							/* DOLTGRES_TEST_TXN */

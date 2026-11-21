@@ -79,4 +79,12 @@ extern TxnMemtableMapStep txn_values_taken_down(bool has_current, const uint8 *c
 extern bool txn_values_based(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *toast, uint32 id,
 							 bool *has_value, StdVec *value, std_TupleU64U64_t *mark, HostError *error);
 
+#ifdef DOLTGRES_TEST_TXN
+extern void test_txn_values_tests_a_value_map_entry_reads_back_and_refuses_every_other_form(void);
+extern void test_txn_values_tests_a_value_id_the_map_holds_is_skipped(void);
+extern void test_txn_values_tests_a_value_ids_entry_reads_back(void);
+extern void test_txn_values_tests_a_value_counts_heaps_toast_chunks(void);
+extern void test_txn_values_tests_a_take_down_takes_one_from_a_count_and_removes_the_last(void);
+#endif
+
 #endif							/* DOLTGRES_TXN_VALUES_H */

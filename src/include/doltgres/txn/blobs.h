@@ -81,4 +81,12 @@ extern bool txn_blobs_written(HostIoIo *io, const HostSharedHeld *deltas, uint32
 extern bool txn_blobs_redo(HostIoIo *io, const HostSharedHeld *deltas, TxnRecordChunkWrite chunk, uint64 lsn,
 						   HostError *error);
 
+#ifdef DOLTGRES_TEST_TXN
+extern void test_txn_blobs_tests_a_logged_write_logs_a_chunk_an_unlogged_one_left_and_redo_makes_it_durable(void);
+extern void test_txn_blobs_tests_a_blob_in_the_delta_reads_back_through_blobs(void);
+extern void test_txn_blobs_tests_a_transactions_chunks_spill_read_back_and_leave_at_its_abort(void);
+extern void test_txn_blobs_tests_a_chunk_another_running_transaction_holds_stays_after_that_ones_abort(void);
+extern void test_txn_blobs_tests_a_rolled_back_chunk_takes_nothing_from_its_tops_count(void);
+#endif
+
 #endif							/* DOLTGRES_TXN_BLOBS_H */

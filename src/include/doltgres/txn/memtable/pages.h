@@ -42,6 +42,9 @@
 /* TXN_MEMTABLE_PAGES_FIRST is FIRST, the first word a range page hands out, past its four counts. */
 #define TXN_MEMTABLE_PAGES_FIRST UINT64CONST(4)
 
+/* TXN_MEMTABLE_PAGES_SMALLEST is SMALLEST, the body of a range's first page, before what it must hold makes it larger. */
+#define TXN_MEMTABLE_PAGES_SMALLEST (UINT64CONST(1) << 10)
+
 /* TXN_MEMTABLE_PAGES_DROPPED is DROPPED, what a range's list stores over the index of a page the remover dropped. */
 #define TXN_MEMTABLE_PAGES_DROPPED PG_UINT64_MAX
 

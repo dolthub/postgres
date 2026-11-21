@@ -39,6 +39,18 @@
 #include "doltgres/txn/visible.h"
 #include "doltgres/txn/written.h"
 
+#ifdef DOLTGRES_TEST_TXN
+#include "doltgres/repo/lib.h"
+#include "doltgres/simc/simc.h"
+#include "doltgres/std/test.h"
+#include "doltgres/txn/change.h"
+#include "doltgres/txn/record.h"
+#include "doltgres/txn/runs.h"
+
+/* RUST_FILE is the file the tests' asserts name, entry.rs. */
+#define RUST_FILE "txn" STD_SEP "src" STD_SEP "entry.rs"
+#endif
+
 /* The prepare whose closure pushes an entry's changes. */
 #define TXN_MEMTABLE_TABLE_RS Unit
 #define TXN_MEMTABLE_TABLE_RETURNS bool
@@ -1237,3 +1249,673 @@ txn_entry_unique(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *
 	txn_entry_unique_pad(&frame);
 	return frame.ok;
 }
+
+#ifdef DOLTGRES_TEST_TXN
+/* TXN_ENTRY_TESTS_UNWRAP is Result::unwrap's panic text. */
+#define TXN_ENTRY_TESTS_UNWRAP "called `Result::unwrap()` on an `Err` value"
+
+/* txn_entry_tests_ok unwraps a host result at a line. */
+static void
+txn_entry_tests_ok(bool ok, HostError *error, uint32 line)
+{
+	if (!ok)
+		STD_RESULT_EXPECT_FAILED(line, 0, TXN_ENTRY_TESTS_UNWRAP, error, host_Error_Debug_fmt);
+}
+
+/* txn_entry_tests_made_t is made's (Storage, Repo, Held<State>), with the reader the state was made under. */
+typedef struct txn_entry_tests_made_t
+{
+	HostStorage storage;
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+} txn_entry_tests_made_t;
+
+/* txn_entry_tests_made returns a new database's index storage in pg_default, its state made as a backend's make of an index's storage makes it. */
+static txn_entry_tests_made_t
+txn_entry_tests_made(HostIoIo *io, uint32 database)
+{
+	txn_entry_tests_made_t made = {.storage = {HOST_PG_DEFAULT, database, 16390}};
+	TxnStateMade state = {.key = {.tag = TXN_BASE_KEY_NONE}, .table = 16385, .has_index = true, .index = 16390};
+	ChunksErrorError failed;
+	HostError	error;
+
+	if (!repo_Repo_create(io, database, HOST_PG_DEFAULT, &made.repo, &failed))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, TXN_ENTRY_TESTS_UNWRAP, &failed, chunks_error_Error_Debug_fmt);
+	txn_entry_tests_ok(host_shared_read(io, &made.reading, &error) &&
+					   txn_state_state(io, &made.repo, &made.reading, &made.storage, TXN_STATE_PERSISTENCE_PERMANENT,
+									   true, &state, &made.held, &error), &error, __LINE__);
+	return made;
+}
+
+/* txn_entry_tests_made_drop frees what made returned. */
+static void
+txn_entry_tests_made_drop(txn_entry_tests_made_t *made)
+{
+	host_shared_Held_drop(&made->held);
+	host_shared_Reader_drop(&made->reading);
+	repo_Repo_drop(&made->repo);
+}
+
+/* txn_entry_tests_shown_t is shown's (&str, u64, u32, Option<u64>): what a version does, its tuple id, its command, and its LSN. */
+typedef struct txn_entry_tests_shown_t
+{
+	const char *does;
+	uint64		tuple;
+	uint32		raw;
+	bool		has_lsn;
+	uint64		lsn;
+} txn_entry_tests_shown_t;
+
+/* txn_entry_tests_shown returns a key's versions newest first, each as what it does, its tuple id, its command, and its LSN. */
+static StdVec
+txn_entry_tests_shown(HostIoIo *io, const HostSharedHeld *held, const uint8 *key, size_t key_len)
+{
+	HostDeltaHold hold;
+	StdVec		versions;
+	StdVec		shown;
+	HostError	error;
+
+	txn_entry_tests_ok(host_delta_hold(io, &hold, &error) &&
+					   txn_memtable_table_versions(io, &hold, host_shared_Held_record(held), key, key_len, &versions,
+												   &error), &error, __LINE__);
+	std_vec_new(&shown, sizeof(txn_entry_tests_shown_t), _Alignof(txn_entry_tests_shown_t));
+	for (size_t k = 0; k < versions.len; k++)
+	{
+		TxnMemtableVersionRecord record = txn_memtable_version_Version_record(&STD_VEC_AT(&versions,
+																						  TxnMemtableVersionVersion,
+																						  k));
+		TxnMemtableVersionOpRef op = txn_memtable_version_Record_op(&record);
+		txn_entry_tests_shown_t one = {.does = "other", .raw = txn_memtable_version_Record_raw(&record)};
+
+		if (op.tag == TXN_MEMTABLE_VERSION_OP_REF_PUT)
+		{
+			one.does = "put";
+			one.tuple = op.u.put.tuple.f0;
+		}
+		else if (op.tag == TXN_MEMTABLE_VERSION_OP_REF_DELETE)
+			one.does = "delete";
+		else if (op.tag == TXN_MEMTABLE_VERSION_OP_REF_ADD)
+		{
+			one.does = "add";
+			one.tuple = op.u.add.tuple.f0;
+		}
+		else if (op.tag == TXN_MEMTABLE_VERSION_OP_REF_REMOVE)
+		{
+			one.does = "remove";
+			one.tuple = op.u.remove.f0.f0;
+		}
+		one.has_lsn = txn_memtable_version_Record_lsn(&record, &one.lsn);
+		std_vec_push_Checked(&shown, &one, sizeof(one), _Alignof(txn_entry_tests_shown_t));
+	}
+	for (size_t k = 0; k < versions.len; k++)
+		txn_memtable_version_Version_drop(&STD_VEC_AT(&versions, TxnMemtableVersionVersion, k));
+	std_vec_free_Checked(&versions, sizeof(TxnMemtableVersionVersion), _Alignof(TxnMemtableVersionVersion));
+	host_delta_Hold_drop(&hold);
+	return shown;
+}
+
+/* txn_entry_tests_shown_Debug_fmt is a shown version's Debug. */
+static bool
+txn_entry_tests_shown_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const txn_entry_tests_shown_t *one = value;
+	StdStr		does = {one->does, strlen(one->does)};
+	StdOptionRef lsn = {one->has_lsn, STD_ITEM(&one->lsn, std_u64_Debug_fmt)};
+	StdTupleRef tuple = STD_TUPLE(4, STD_ITEM(&does, std_str_Debug_fmt), STD_ITEM(&one->tuple, std_u64_Debug_fmt),
+								  STD_ITEM(&one->raw, std_u32_Debug_fmt), STD_ITEM(&lsn, std_option_Debug_fmt));
+
+	return std_tuple_Debug_fmt(&tuple, f);
+}
+
+/* txn_entry_tests_shown_list_Debug_fmt is a Vec of shown versions' Debug. */
+static bool
+txn_entry_tests_shown_list_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const StdVec *shown = value;
+	StdDebugList list = std_fmt_debug_list(f);
+
+	for (size_t k = 0; k < shown->len; k++)
+		std_DebugList_entry(&list, &STD_VEC_AT(shown, txn_entry_tests_shown_t, k), txn_entry_tests_shown_Debug_fmt);
+	return std_DebugList_finish(&list);
+}
+
+/* txn_entry_tests_shown_is asserts a key's shown versions are the wanted ones, freeing them. */
+static void
+txn_entry_tests_shown_is(uint32 line, StdVec *got, const txn_entry_tests_shown_t *want, size_t want_len)
+{
+	StdVec		wanted = {(void *) want, want_len, want_len};
+	bool		eq = got->len == want_len;
+
+	for (size_t k = 0; k < want_len && eq; k++)
+	{
+		const txn_entry_tests_shown_t *a = &STD_VEC_AT(got, txn_entry_tests_shown_t, k);
+
+		eq = strcmp(a->does, want[k].does) == 0 && a->tuple == want[k].tuple && a->raw == want[k].raw &&
+			a->has_lsn == want[k].has_lsn && (!a->has_lsn || a->lsn == want[k].lsn);
+	}
+	STD_ASSERT_EQ(line, 9, eq, got, txn_entry_tests_shown_list_Debug_fmt, &wanted,
+				  txn_entry_tests_shown_list_Debug_fmt);
+	std_vec_free_Checked(got, sizeof(txn_entry_tests_shown_t), _Alignof(txn_entry_tests_shown_t));
+}
+
+/* txn_entry_tests_does_is asserts what a key's versions do, newest first, freeing them. */
+static void
+txn_entry_tests_does_is(uint32 line, StdVec *got, const char *const *want, size_t want_len)
+{
+	bool		eq = got->len == want_len;
+
+	for (size_t k = 0; k < want_len && eq; k++)
+		eq = strcmp(STD_VEC_AT(got, txn_entry_tests_shown_t, k).does, want[k]) == 0;
+	STD_ASSERT_MSG(line, 9, eq, "a key's versions do what the test wants");
+	std_vec_free_Checked(got, sizeof(txn_entry_tests_shown_t), _Alignof(txn_entry_tests_shown_t));
+}
+
+/* txn_entry_tests_put returns an op that puts a value under a tuple id. */
+static TxnMemtableOp
+txn_entry_tests_put(const char *value, uint64 tuple)
+{
+	TxnMemtableOp op = {.tag = TXN_MEMTABLE_OP_PUT};
+
+	std_slice_to_vec_Checked(&op.u.put.value, value, strlen(value), 1, 1);
+	std_vec_new(&op.u.put.addresses, sizeof(chunks_TupleU32Locator_t), _Alignof(chunks_TupleU32Locator_t));
+	std_vec_new(&op.u.put.values, sizeof(uint32), _Alignof(uint32));
+	op.u.put.tuple.f0 = tuple;
+	return op;
+}
+
+/* txn_entry_tests_entry returns an entry of a storage's index under a writer, its key's change, logged. */
+static TxnEntryEntry
+txn_entry_tests_entry(HostIoIo *io, const HostStorage *storage, TxnMemtableVersionWriter writer, uint32 index,
+					  const char *key, TxnMemtableOp op)
+{
+	TxnEntryEntry entry = {.writer = writer, .storage = *storage, .table = 16385, .index = index, .op = op,
+	.logged = true};
+	bool		has;
+	HostError	error;
+
+	txn_entry_tests_ok(txn_status_redo_roomed(io, &writer, &has, &entry.roomed, &error), &error, __LINE__);
+	STD_ASSERT_MSG(__LINE__, 0, has, "a roomed entry");
+	std_slice_to_vec_Checked(&entry.key, key, strlen(key), 1, 1);
+	return entry;
+}
+
+/* txn_entry_tests_changed changes an entry, which unwraps at a line. */
+static void
+txn_entry_tests_changed(HostIoIo *io, const HostSharedHeld *held, TxnEntryEntry entry, uint32 line)
+{
+	HostError	error;
+
+	txn_entry_tests_ok(txn_entry_change(io, held, &entry, false, NULL, &error), &error, line);
+}
+
+/* txn_entry_tests_writer returns a writer of a transaction the simulation begins. */
+static TxnMemtableVersionWriter
+txn_entry_tests_writer(HostXid *xid)
+{
+	TxnMemtableVersionWriter writer = {0};
+
+	*xid = simc_begin();
+	writer.xid = xid->f0;
+	return writer;
+}
+
+/* txn_entry_tests_logged_t is one of the logged row changes with its record's end. */
+typedef struct txn_entry_tests_logged_t
+{
+	TxnRecordRowChange change;
+	uint64		end;
+} txn_entry_tests_logged_t;
+
+/* txn_entry_tests_changes returns a database's logged row changes, each with its record's end. */
+static StdVec
+txn_entry_tests_changes(uint32 database)
+{
+	StdVec		logged = simc_logged();
+	StdVec		changes;
+
+	std_vec_new(&changes, sizeof(txn_entry_tests_logged_t), _Alignof(txn_entry_tests_logged_t));
+	for (size_t k = 0; k < logged.len; k++)
+	{
+		simc_TupleU8VecU8Lsn_t *one = &STD_VEC_AT(&logged, simc_TupleU8VecU8Lsn_t, k);
+		txn_entry_tests_logged_t row = {.end = one->f2};
+		HostWalKind kind;
+		HostError	error;
+
+		if (host_WalKind_of(one->f0, &kind) && kind == HOST_WAL_KIND_ROW_CHANGE)
+		{
+			if (!txn_record_RowChange_decode(one->f1.ptr, one->f1.len, &row.change, &error))
+				host_Error_drop(&error);
+			else if (row.change.storage.database != database)
+				txn_record_RowChange_drop(&row.change);
+			else
+				std_vec_push_Checked(&changes, &row, sizeof(row), _Alignof(txn_entry_tests_logged_t));
+		}
+		std_vec_free_Checked(&one->f1, 1, 1);
+	}
+	std_vec_free_Checked(&logged, sizeof(simc_TupleU8VecU8Lsn_t), _Alignof(simc_TupleU8VecU8Lsn_t));
+	return changes;
+}
+
+/*
+ * test_txn_entry_tests_an_index_entrys_changes_are_logged_pushed_and_redone_once:
+ * the btree text's section 5 and PLAN's row change row, field 31, an index's
+ * entry put and delete, and a counted entry's added and removed copy, each
+ * append a row change of the index's storage naming its table and its index
+ * and push their versions with its LSN, showing their writer's command; redo
+ * of each on another database's storage, first seen by it, makes its first
+ * base record with that table and index and pushes each version once,
+ * showing command 0, however often it is replayed.
+ */
+void
+test_txn_entry_tests_an_index_entrys_changes_are_logged_pushed_and_redone_once(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	txn_entry_tests_made_t made = txn_entry_tests_made(io, 9371);
+	TxnMemtableVersionWriter writer = {.xid = 51, .command = 2};
+	uint64		copy = (UINT64CONST(1) << 16) | 1;
+	TxnMemtableOp added = txn_entry_tests_put("entry", copy);
+	TxnMemtableOp removed = {.tag = TXN_MEMTABLE_OP_REMOVE};
+	TxnMemtableOp deleted = {.tag = TXN_MEMTABLE_OP_DELETE};
+	StdVec		logged;
+	uint64		lsns[4];
+	HostStorage replica_storage = {HOST_PG_DEFAULT, 9372, 16390};
+	RepoRepo	replica_repo;
+	HostSharedReader reading;
+	HostSharedHeld replica;
+	TxnBaseBase base;
+	bool		some = false;
+	ChunksErrorError failed;
+	HostError	error;
+
+	added.tag = TXN_MEMTABLE_OP_ADD;
+	removed.u.remove.f0.f0 = copy;
+	txn_entry_tests_changed(io, &made.held, txn_entry_tests_entry(io, &made.storage, writer, 16390, "p",
+																  txn_entry_tests_put("entry", 0)), __LINE__);
+	txn_entry_tests_changed(io, &made.held, txn_entry_tests_entry(io, &made.storage, writer, 16390, "p", deleted),
+							__LINE__);
+	txn_entry_tests_changed(io, &made.held, txn_entry_tests_entry(io, &made.storage, writer, 16390, "c", added),
+							__LINE__);
+	txn_entry_tests_changed(io, &made.held, txn_entry_tests_entry(io, &made.storage, writer, 16390, "c", removed),
+							__LINE__);
+	logged = txn_entry_tests_changes(9371);
+	STD_ASSERT_MSG(__LINE__, 9, logged.len == 4, "logged.len() == 4");
+	for (size_t k = 0; k < logged.len; k++)
+	{
+		const txn_entry_tests_logged_t *one = &STD_VEC_AT(&logged, txn_entry_tests_logged_t, k);
+
+		STD_ASSERT_MSG(__LINE__, 9, one->change.has_index && one->change.index == 16390 && one->change.table == 16385,
+					   "every change names the index and its table");
+		lsns[k] = one->end;
+	}
+	{
+		txn_entry_tests_shown_t p[] = {{"delete", 0, 2, true, lsns[1]}, {"put", 0, 2, true, lsns[0]}};
+		txn_entry_tests_shown_t c[] = {{"remove", copy, 2, true, lsns[3]}, {"add", copy, 2, true, lsns[2]}};
+		StdVec		got = txn_entry_tests_shown(io, &made.held, (const uint8 *) "p", 1);
+
+		txn_entry_tests_shown_is(__LINE__, &got, p, lengthof(p));
+		got = txn_entry_tests_shown(io, &made.held, (const uint8 *) "c", 1);
+		txn_entry_tests_shown_is(__LINE__, &got, c, lengthof(c));
+	}
+	if (!repo_Repo_create(io, 9372, HOST_PG_DEFAULT, &replica_repo, &failed))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, TXN_ENTRY_TESTS_UNWRAP, &failed, chunks_error_Error_Debug_fmt);
+	txn_entry_tests_ok(host_shared_read(io, &reading, &error), &error, __LINE__);
+	for (int pass = 0; pass < 2; pass++)
+		for (size_t k = 0; k < logged.len; k++)
+		{
+			const txn_entry_tests_logged_t *one = &STD_VEC_AT(&logged, txn_entry_tests_logged_t, k);
+			TxnStateMade state = {.key = {.tag = TXN_BASE_KEY_NONE}, .table = one->change.table,
+			.has_index = one->change.has_index, .index = one->change.index};
+
+			txn_entry_tests_ok(txn_state_state(io, &replica_repo, &reading, &replica_storage,
+											   TXN_STATE_PERSISTENCE_PERMANENT, true, &state, &replica, &error) &&
+							   txn_change_redo(io, &replica, &one->change, one->end, &error), &error, __LINE__);
+			host_shared_Held_drop(&replica);
+		}
+	txn_entry_tests_ok(txn_state_state(io, &replica_repo, &reading, &replica_storage,
+									   TXN_STATE_PERSISTENCE_PERMANENT, false, NULL, &replica, &error) &&
+					   txn_state_base_record(io, &replica, &some, &base, &error), &error, __LINE__);
+	STD_ASSERT_MSG(__LINE__, 9, some && base.table == 16385 && base.has_index && base.index == 16390 &&
+				   base.key.tag == TXN_BASE_KEY_NONE, "(base.table, base.index, base.key) == (16385, Some(16390), None)");
+	txn_base_Base_drop(&base);
+	{
+		txn_entry_tests_shown_t p[] = {{"delete", 0, 0, true, lsns[1]}, {"put", 0, 0, true, lsns[0]}};
+		txn_entry_tests_shown_t c[] = {{"remove", copy, 0, true, lsns[3]}, {"add", copy, 0, true, lsns[2]}};
+		StdVec		got = txn_entry_tests_shown(io, &replica, (const uint8 *) "p", 1);
+
+		txn_entry_tests_shown_is(__LINE__, &got, p, lengthof(p));
+		got = txn_entry_tests_shown(io, &replica, (const uint8 *) "c", 1);
+		txn_entry_tests_shown_is(__LINE__, &got, c, lengthof(c));
+	}
+	txn_entry_tests_ok(txn_written_ended(io, &error), &error, __LINE__);
+	for (size_t k = 0; k < logged.len; k++)
+		txn_record_RowChange_drop(&STD_VEC_AT(&logged, txn_entry_tests_logged_t, k).change);
+	std_vec_free_Checked(&logged, sizeof(txn_entry_tests_logged_t), _Alignof(txn_entry_tests_logged_t));
+	host_shared_Held_drop(&replica);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&replica_repo);
+	txn_entry_tests_made_drop(&made);
+	simc_TestIo_drop(&test_io);
+}
+
+/* txn_entry_tests_refused reports whether a base entry's read is refused with XX001. */
+static bool
+txn_entry_tests_refused(const uint8 *value, size_t value_len, const ChunksTrailerStamp *stamps, size_t stamps_len,
+						bool keyless)
+{
+	StdBytes	read;
+	HostError	error;
+	bool		refused;
+
+	if (txn_entry_based(value, value_len, stamps, stamps_len, keyless, &read, &error))
+		return false;
+	refused = memcmp(host_Error_sqlstate(&error), "XX001", 5) == 0;
+	host_Error_drop(&error);
+	return refused;
+}
+
+/*
+ * test_txn_entry_tests_an_index_base_entry_reads_back_and_refuses_a_keyed_stamp_and_an_uneven_count:
+ * PLAN's format row for an index storage's base leaf entry, a keyed table's
+ * entry reads back its tuple with no stamp and a keyless one its tuple under
+ * a count equal to its stamps, and each other form is data corruption: a
+ * stamp on a keyed table's entry, and a count that differs from a keyless
+ * one's stamps, above or below.
+ */
+void
+test_txn_entry_tests_an_index_base_entry_reads_back_and_refuses_a_keyed_stamp_and_an_uneven_count(void)
+{
+	ChunksTrailerStamp stamps[3] = {{7, 1}, {7, 2}, {7, 3}};
+	StdVec		counted;
+	StdBytes	read;
+	HostError	error;
+
+	txn_entry_tests_ok(txn_entry_based((const uint8 *) "tuple", 5, NULL, 0, false, &read, &error), &error, __LINE__);
+	STD_ASSERT(__LINE__, 9, read.len == 5 && memcmp(read.ptr, "tuple", 5) == 0,
+			   "based(b\"tuple\", &[], false).unwrap() == b\"tuple\"");
+	txn_counted_keyless_value(2, (const uint8 *) "tuple", 5, &counted);
+	txn_entry_tests_ok(txn_entry_based(counted.ptr, counted.len, stamps, 2, true, &read, &error), &error, __LINE__);
+	STD_ASSERT(__LINE__, 9, read.len == 5 && memcmp(read.ptr, "tuple", 5) == 0,
+			   "based(&counted, &[stamp(1), stamp(2)], true).unwrap() == b\"tuple\"");
+	STD_ASSERT_MSG(__LINE__, 9, txn_entry_tests_refused((const uint8 *) "tuple", 5, stamps, 1, false),
+				   "a keyed table's entry with a stamp read back");
+	STD_ASSERT_MSG(__LINE__, 9, txn_entry_tests_refused(counted.ptr, counted.len, stamps, 1, true),
+				   "a count above its stamps read back");
+	STD_ASSERT_MSG(__LINE__, 9, txn_entry_tests_refused(counted.ptr, counted.len, stamps, 3, true),
+				   "a count below its stamps read back");
+	std_vec_free_Checked(&counted, 1, 1);
+}
+
+/*
+ * test_txn_entry_tests_an_index_storages_large_keys_spill_at_the_threshold:
+ * bugs row 153, an index's 6,000 entries of 1 KB keys, whose versions alone
+ * are a few dozen bytes each, spill by the spill's threshold alone as an
+ * entries spill, since a write's counted bytes take its key's too.
+ */
+void
+test_txn_entry_tests_an_index_storages_large_keys_spill_at_the_threshold(void)
+{
+	SimcProcess process = simc_process();
+	SimcTestIo	test_io;
+	HostIoIo   *io;
+	txn_entry_tests_made_t made;
+	HostXid		xid;
+	TxnMemtableVersionWriter writer;
+	txn_TupleVecFileU64_t listed;
+	bool		spilled = false;
+	HostError	error;
+
+	simc_size_delta(UINT64CONST(32) << 20);
+	test_io = simc_io();
+	io = &test_io.io;
+	made = txn_entry_tests_made(io, 9373);
+	writer = txn_entry_tests_writer(&xid);
+	for (uint32 number = 0; number < 6000; number++)
+	{
+		TxnEntryEntry entry = txn_entry_tests_entry(io, &made.storage, writer, 16390, "",
+													txn_entry_tests_put("entry", 0));
+
+		entry.logged = false;
+		std_vec_free_Checked(&entry.key, 1, 1);
+		std_vec_from_elem_zeroed(&entry.key, 1 << 10, 1, 1);
+		for (int b = 0; b < 4; b++)
+			((uint8 *) entry.key.ptr)[b] = (uint8) (number >> (8 * (3 - b)));
+		txn_entry_tests_changed(io, &made.held, entry, __LINE__);
+	}
+	txn_entry_tests_ok(txn_spill_listed(&TXN_SPILL_STATE_HOME_OPS, io, host_shared_Held_record(&made.held),
+										&made.storage, &listed, &error), &error, __LINE__);
+	for (size_t k = 0; k < listed.f0.len; k++)
+		spilled |= STD_VEC_AT(&listed.f0, TxnSpillFile, k).kind == TXN_RUNS_KIND_SPILLED_ENTRIES;
+	STD_ASSERT_MSG(__LINE__, 9, spilled, "the index's entries spilled as an entries spill");
+	std_vec_free_Checked(&listed.f0, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	txn_entry_tests_ok(txn_written_ended(io, &error), &error, __LINE__);
+	txn_entry_tests_made_drop(&made);
+	simc_TestIo_drop(&test_io);
+	simc_Process_drop(&process);
+}
+
+/* txn_entry_tests_unique_t is a unique test's captures: what its entries' unique checks read. */
+typedef struct txn_entry_tests_unique_t
+{
+	HostIoIo   *io;
+	txn_entry_tests_made_t *made;
+	TreesStoreReader store;
+	TxnInsertUniqueness uniqueness;
+	HostIoWaits waits;
+} txn_entry_tests_unique_t;
+
+/* txn_entry_tests_checked runs a unique index's check of an entry in a transaction it commits, answering what it did. */
+static TxnEntryChanged
+txn_entry_tests_checked(txn_entry_tests_unique_t *u, const char *key, TxnMemtableOp op, uint64 tuple, bool partial,
+						bool commit, HostXid xid)
+{
+	TxnMemtableVersionWriter writer = {.xid = xid.f0};
+	TxnEntryEntry entry = txn_entry_tests_entry(u->io, &u->made->storage, writer, u->uniqueness.index, key, op);
+	TxnEntryChanged changed;
+	HostRow		row = {tuple};
+	HostError	error;
+
+	txn_entry_tests_ok(txn_entry_unique(u->io, TREES_STORE_READER_NODE_STORE(&u->store), &u->made->held, &entry, false,
+										NULL, &u->uniqueness, &u->waits, row, partial, &changed, &error), &error,
+					   __LINE__);
+	if (commit)
+	{
+		simc_commit(xid);
+		txn_entry_tests_ok(txn_written_ended(u->io, &error), &error, __LINE__);
+	}
+	return changed;
+}
+
+/* txn_entry_tests_unique begins a unique test's captures over a made index storage, for an index. */
+static txn_entry_tests_unique_t
+txn_entry_tests_unique(HostIoIo *io, txn_entry_tests_made_t *made, const TreesKeyOrder *order, uint32 index)
+{
+	txn_entry_tests_unique_t u = {.io = io, .made = made, .uniqueness = {.order = order, .index = index},
+	.waits = host_io_Waits_testing()};
+
+	u.store = repo_Repo_reader(&made->repo, HOST_CACHE_PLACEMENT_SERVER, &made->reading);
+	return u;
+}
+
+/* txn_entry_tests_exists_is reports whether a unique check answered an existing entry of a value, freeing it. */
+static bool
+txn_entry_tests_exists_is(TxnEntryChanged changed, const char *value)
+{
+	bool		is = changed.tag == TXN_ENTRY_CHANGED_EXISTS && changed.u.exists.len == strlen(value) &&
+		memcmp(changed.u.exists.ptr, value, changed.u.exists.len) == 0;
+
+	if (changed.tag == TXN_ENTRY_CHANGED_EXISTS)
+		std_vec_free_Checked(&changed.u.exists, 1, 1);
+	return is;
+}
+
+/*
+ * test_txn_entry_tests_a_unique_entry_takes_a_free_key_and_answers_an_existing_entrys_value:
+ * the btree's part 2, slice 5, a unique index's entry resolves its key as an
+ * immediate key's insert does: a free key takes the put, a key holding a
+ * committed entry answers that entry's value and writes nothing, and once a
+ * committed delete ended the entry, the key takes the put again.
+ */
+void
+test_txn_entry_tests_a_unique_entry_takes_a_free_key_and_answers_an_existing_entrys_value(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	txn_entry_tests_made_t made = txn_entry_tests_made(io, 9373);
+	TreesKeyOrder order = {.tag = TREES_KEY_ORDER_BYTES};
+	txn_entry_tests_unique_t u = txn_entry_tests_unique(io, &made, &order, 16390);
+	static const char *const ops[] = {"put", "delete", "put"};
+	HostXid		xid;
+	StdVec		shown;
+	HostError	error;
+
+	STD_ASSERT_MSG(__LINE__, 9, txn_entry_tests_checked(&u, "k", txn_entry_tests_put("a", 0), 1, false, true,
+														simc_begin()).tag == TXN_ENTRY_CHANGED_DONE,
+				   "a free key takes the put");
+	STD_ASSERT_MSG(__LINE__, 9, txn_entry_tests_exists_is(txn_entry_tests_checked(&u, "k", txn_entry_tests_put("b", 0),
+																				  1, false, true, simc_begin()), "a"),
+				   "a key holding a committed entry answers its value");
+	{
+		TxnMemtableOp deleted = {.tag = TXN_MEMTABLE_OP_DELETE};
+		TxnMemtableVersionWriter writer = txn_entry_tests_writer(&xid);
+
+		txn_entry_tests_changed(io, &made.held, txn_entry_tests_entry(io, &made.storage, writer, 16390, "k", deleted),
+								__LINE__);
+		simc_commit(xid);
+		txn_entry_tests_ok(txn_written_ended(io, &error), &error, __LINE__);
+	}
+	STD_ASSERT_MSG(__LINE__, 9, txn_entry_tests_checked(&u, "k", txn_entry_tests_put("d", 0), 1, false, true,
+														simc_begin()).tag == TXN_ENTRY_CHANGED_DONE,
+				   "a key whose entry a committed delete ended takes the put again");
+	shown = txn_entry_tests_shown(io, &made.held, (const uint8 *) "k", 1);
+	txn_entry_tests_does_is(__LINE__, &shown, ops, lengthof(ops));
+	txn_entry_tests_made_drop(&made);
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * test_txn_entry_tests_a_counted_unique_entry_writes_nothing_for_its_own_copy_and_answers_another:
+ * the btree's part 2, slice 5 (orev-14's R2 and R4), a keyless table's
+ * unique entry counts copies, so a copy under a tuple id the key holds live
+ * is counted already and writes nothing, and a copy under another tuple id
+ * answers the live copy's value.
+ */
+void
+test_txn_entry_tests_a_counted_unique_entry_writes_nothing_for_its_own_copy_and_answers_another(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	txn_entry_tests_made_t made = txn_entry_tests_made(io, 9374);
+	TreesKeyOrder order = {.tag = TREES_KEY_ORDER_BYTES};
+	txn_entry_tests_unique_t u = txn_entry_tests_unique(io, &made, &order, 16391);
+	static const char *const ops[] = {"add"};
+	StdVec		shown;
+
+	for (int k = 0; k < 2; k++)
+	{
+		TxnMemtableOp add = txn_entry_tests_put("v", 1);
+
+		add.tag = TXN_MEMTABLE_OP_ADD;
+		STD_ASSERT_MSG(__LINE__, 9, txn_entry_tests_checked(&u, "k", add, 1, false, true, simc_begin()).tag ==
+					   TXN_ENTRY_CHANGED_DONE, "a copy under a tuple id the key holds live writes nothing");
+	}
+	{
+		TxnMemtableOp add = txn_entry_tests_put("v", 2);
+
+		add.tag = TXN_MEMTABLE_OP_ADD;
+		STD_ASSERT_MSG(__LINE__, 9, txn_entry_tests_exists_is(txn_entry_tests_checked(&u, "k", add, 2, false, true,
+																					  simc_begin()), "v"),
+					   "a copy under another tuple id answers the live copy's value");
+	}
+	shown = txn_entry_tests_shown(io, &made.held, (const uint8 *) "k", 1);
+	txn_entry_tests_does_is(__LINE__, &shown, ops, lengthof(ops));
+	txn_entry_tests_made_drop(&made);
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * test_txn_entry_tests_a_partial_unique_check_answers_a_running_write_without_waiting:
+ * a speculative insert's partial check (CommPF 10,
+ * insert-conflict-specconflict) answers another transaction's running write
+ * of its key as running, writing nothing and waiting for none, as
+ * _bt_check_unique answers UNIQUE_CHECK_PARTIAL.
+ */
+void
+test_txn_entry_tests_a_partial_unique_check_answers_a_running_write_without_waiting(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	txn_entry_tests_made_t made = txn_entry_tests_made(io, 9375);
+	TreesKeyOrder order = {.tag = TREES_KEY_ORDER_BYTES};
+	txn_entry_tests_unique_t u = txn_entry_tests_unique(io, &made, &order, 16392);
+	static const char *const ops[] = {"put"};
+	HostXid		first = simc_begin();
+	HostXid		second = simc_begin();
+	StdVec		shown;
+	HostError	error;
+
+	STD_ASSERT_MSG(__LINE__, 9, txn_entry_tests_checked(&u, "k", txn_entry_tests_put("a", 0), 1, false, false,
+														first).tag == TXN_ENTRY_CHANGED_DONE,
+				   "the first write takes the free key");
+	STD_ASSERT_MSG(__LINE__, 9, txn_entry_tests_checked(&u, "k", txn_entry_tests_put("b", 0), 1, true, false,
+														second).tag == TXN_ENTRY_CHANGED_RUNNING,
+				   "a partial check answers the running write as running");
+	simc_commit(first);
+	simc_commit(second);
+	txn_entry_tests_ok(txn_written_ended(io, &error), &error, __LINE__);
+	shown = txn_entry_tests_shown(io, &made.held, (const uint8 *) "k", 1);
+	txn_entry_tests_does_is(__LINE__, &shown, ops, lengthof(ops));
+	txn_entry_tests_made_drop(&made);
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * test_txn_entry_tests_an_entry_and_its_record_change_together: an index
+ * that keeps records (CommPF 10's no-user-code removal) changes an entry and
+ * its record in one change: both pushed under the entry's writer, after
+ * every entry in the storage's order, and both removed together.
+ */
+void
+test_txn_entry_tests_an_entry_and_its_record_change_together(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	txn_entry_tests_made_t made = txn_entry_tests_made(io, 9376);
+	static const char *const ops[] = {"delete", "put"};
+	StdVec		record;
+	StdVec		shown;
+	HostError	error;
+
+	txn_entry_record((const uint8 *) "row", 3, &record);
+	for (int k = 0; k < 2; k++)
+	{
+		HostXid		xid;
+		TxnMemtableVersionWriter writer = txn_entry_tests_writer(&xid);
+		TxnMemtableOp entry_op = {.tag = TXN_MEMTABLE_OP_DELETE};
+		txn_TupleVecU8Op_t recorded = {.f1 = {.tag = TXN_MEMTABLE_OP_DELETE}};
+		TxnEntryEntry entry;
+
+		if (k == 0)
+		{
+			entry_op = txn_entry_tests_put("v", 0);
+			recorded.f1 = txn_entry_tests_put("k", 0);
+		}
+		entry = txn_entry_tests_entry(io, &made.storage, writer, 16393, "k", entry_op);
+		std_slice_to_vec_Checked(&recorded.f0, record.ptr, record.len, 1, 1);
+		txn_entry_tests_ok(txn_entry_change(io, &made.held, &entry, true, &recorded, &error), &error, __LINE__);
+		simc_commit(xid);
+		txn_entry_tests_ok(txn_written_ended(io, &error), &error, __LINE__);
+	}
+	shown = txn_entry_tests_shown(io, &made.held, (const uint8 *) "k", 1);
+	txn_entry_tests_does_is(__LINE__, &shown, ops, lengthof(ops));
+	shown = txn_entry_tests_shown(io, &made.held, record.ptr, record.len);
+	txn_entry_tests_does_is(__LINE__, &shown, ops, lengthof(ops));
+	STD_ASSERT_MSG(__LINE__, 9, record.len > 0 && ((const uint8 *) record.ptr)[0] == TXN_ENTRY_RECORD &&
+				   memcmp(record.ptr, "k", 1) > 0, "record.as_slice() > b\"k\" && record[0] == RECORD");
+	std_vec_free_Checked(&record, 1, 1);
+	txn_entry_tests_made_drop(&made);
+	simc_TestIo_drop(&test_io);
+}
+
+#endif							/* DOLTGRES_TEST_TXN */

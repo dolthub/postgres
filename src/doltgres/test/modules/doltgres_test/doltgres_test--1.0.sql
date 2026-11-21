@@ -332,3 +332,12 @@ AS 'MODULE_PATHNAME', 'dg_listed_unwritten' LANGUAGE C STRICT;
 
 CREATE FUNCTION doltgres_test_step_unwritten() RETURNS bool
 AS 'MODULE_PATHNAME', 'dg_step_unwritten' LANGUAGE C STRICT;
+
+CREATE FUNCTION doltgres_test_scan_shape(target regclass) RETURNS text
+AS 'MODULE_PATHNAME', 'dg_scan_shape' LANGUAGE C STRICT;
+
+CREATE FUNCTION doltgres_test_index_move(index regclass, tablespace text) RETURNS void
+AS 'MODULE_PATHNAME', 'dg_index_move' LANGUAGE C STRICT;
+
+CREATE FUNCTION doltgres_test_base_points(target regclass) RETURNS text
+AS 'MODULE_PATHNAME', 'dg_base_points' LANGUAGE C STRICT;

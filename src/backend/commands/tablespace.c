@@ -67,6 +67,7 @@
 #include "commands/seclabel.h"
 #include "commands/tablespace.h"
 #include "common/file_perm.h"
+#include "doltgres/hooks.h"
 #include "miscadmin.h"
 #include "postmaster/bgwriter.h"
 #include "storage/fd.h"
@@ -492,6 +493,8 @@ DropTableSpace(DropTableSpaceStmt *stmt)
 	 * Remove dependency on owner.
 	 */
 	deleteSharedDependencyRecordsFor(TableSpaceRelationId, tablespaceoid, 0);
+
+	doltgres_tablespace_emptied(tablespaceoid, false);
 
 	/*
 	 * Acquire TablespaceCreateLock to ensure that no TablespaceCreateDbspace
@@ -1555,6 +1558,8 @@ tblspc_redo(XLogReaderState *record)
 		/* Close all smgr fds in all backends. */
 		WaitForProcSignalBarrier(EmitProcSignalBarrier(PROCSIGNAL_BARRIER_SMGRRELEASE));
 
+		doltgres_tablespace_emptied(xlrec->ts_id, true);
+
 		/*
 		 * If we issued a WAL record for a drop tablespace it implies that
 		 * there were no files in it at all when the DROP was done. That means
@@ -1573,6 +1578,8 @@ tblspc_redo(XLogReaderState *record)
 		if (!destroy_tablespace_directories(xlrec->ts_id, true))
 		{
 			ResolveRecoveryConflictWithTablespace(xlrec->ts_id);
+
+			doltgres_tablespace_emptied(xlrec->ts_id, true);
 
 			/*
 			 * If we did recovery processing then hopefully the backends who

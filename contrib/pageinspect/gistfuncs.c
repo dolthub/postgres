@@ -15,6 +15,7 @@
 #include "access/htup_details.h"
 #include "access/relation.h"
 #include "catalog/pg_am_d.h"
+#include "doltgres/hooks.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pageinspect.h"
@@ -218,7 +219,7 @@ gist_page_items(PG_FUNCTION_ARGS)
 	/* Open the relation */
 	indexRel = index_open(indexRelid, AccessShareLock);
 
-	if (!IS_GIST(indexRel))
+	if (!IS_GIST(indexRel) || doltgres_heap_only_refused(indexRel))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not a %s index",

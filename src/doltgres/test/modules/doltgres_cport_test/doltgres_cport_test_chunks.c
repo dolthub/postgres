@@ -227,6 +227,8 @@ static const CportTest CPORT_TESTS[] = {
 	test_chunks_packs_lists_tests_a_pack_added_is_listed_by_every_view},
 	{"packs::lists::tests::a_refresh_across_a_whole_write_lists_the_packs_before_it_or_after_it",
 	test_chunks_packs_lists_tests_a_refresh_across_a_whole_write_lists_the_packs_before_it_or_after_it},
+	{"packs::lists::tests::a_removed_tablespace_reads_a_runs_file_made_again_from_its_start",
+	test_chunks_packs_lists_tests_a_removed_tablespace_reads_a_runs_file_made_again_from_its_start},
 	{"packs::lists::tests::a_retirements_records_lead_every_view_to_the_copies",
 	test_chunks_packs_lists_tests_a_retirements_records_lead_every_view_to_the_copies},
 	{"packs::lists::tests::a_whole_write_that_fails_before_its_renames_leaves_the_count_even",

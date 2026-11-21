@@ -38,9 +38,6 @@
 
 #define RUST_FILE "txn" STD_SEP "src" STD_SEP "memtable" STD_SEP "pages.rs"
 
-/* TXN_MEMTABLE_PAGES_SMALLEST is SMALLEST, the body of a range's first page, before what it must hold makes it larger. */
-#define TXN_MEMTABLE_PAGES_SMALLEST (UINT64CONST(1) << 10)
-
 /* TXN_MEMTABLE_PAGES_LARGER is LARGER, the body a range's pages double to, past which a page holds one record of its own. */
 #define TXN_MEMTABLE_PAGES_LARGER (UINT64CONST(64) << 10)
 

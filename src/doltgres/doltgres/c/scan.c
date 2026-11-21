@@ -51,6 +51,7 @@
 #include "doltgres/txn/change.h"
 #include "doltgres/txn/counted.h"
 #include "doltgres/txn/insert.h"
+#include "doltgres/txn/spill.h"
 #include "doltgres/txn/state.h"
 #include "doltgres/txn/written.h"
 #endif
@@ -162,12 +163,16 @@ typedef enum DoltgresScanTurnTag
 	DOLTGRES_SCAN_TURN_END,
 	DOLTGRES_SCAN_TURN_RUN,
 	DOLTGRES_SCAN_TURN_COMPARE,
+	DOLTGRES_SCAN_TURN_MOVED,
 } DoltgresScanTurnTag;
 
 /*
  * DoltgresScanTurn is Turn: what a turn of a read in the scan's record
  * leaves it, a row, another turn, the end, a compared table's run to make
- * by its order, or two candidates to compare by it.
+ * by its order, two candidates to compare by it, or an install's move of the
+ * storage's base during the turn's read of the delta, which changed nothing
+ * in the record: the scan moves to the newest base (reseated) and takes the
+ * turn again.
  */
 typedef struct DoltgresScanTurn
 {
@@ -271,8 +276,12 @@ typedef struct DoltgresScanUnit
 /*
  * DoltgresScanParallel is Parallel: a parallel scan's part of its record,
  * the base's count of entries, the count of units, the unit being read, a
- * tid range unit's first and last tuple ids, and the delta's split keys (a
- * Vec<Vec<u8>>).
+ * tid range unit's first and last tuple ids, the delta's split keys (a
+ * Vec<Vec<u8>>), the table tree of the base the leader shared, whose
+ * entries' ordinals every worker's units split whatever newer base a worker
+ * moved to (rebased), and the unit's low and high keys (bounds), which a
+ * worker on a newer base than the shared one finds its unit's place and stop
+ * in.
  */
 typedef struct DoltgresScanParallel
 {
@@ -284,6 +293,19 @@ typedef struct DoltgresScanParallel
 	uint64		ranged_first;
 	uint64		ranged_last;
 	StdVec		splits;
+	bool		has_shared;
+	TreesStoreTree shared;
+	doltgres_OptionVecU8_t low;
+	doltgres_OptionVecU8_t high;
+
+	/*
+	 * kept is the delta's run in the table's order (a Vec<Vec<u8>>), read at
+	 * the scan's generation kept_at, which each unit takes its keys from
+	 * (bugs row 309).
+	 */
+	bool		has_kept;
+	StdVec		kept;
+	uint64		kept_at;
 } DoltgresScanParallel;
 
 /*
@@ -321,6 +343,8 @@ struct DoltgresScanScan
 	TreesStoreTree tree;
 	uint64		folded;
 	DoltgresScanEpochs epochs;
+	/* generation is the base generation the scan's base was read at. */
+	uint64		generation;
 	uint64		blocks;
 	StdVec		keyed;
 	uint32		table;
@@ -416,6 +440,47 @@ doltgres_scan_Epochs_of(HostIoIo *io, TreesStoreNodeStore store, uint32 epoch, b
 	if (!txn_visible_live(io, &pending, &result->chain, error))
 		return false;
 	std_vec_new(&result->composed, DOLTGRES_SCAN_COMPOSED);
+	return true;
+}
+
+/* doltgres_scan_internal returns an internal error of the fork's with a literal message. */
+static HostError
+doltgres_scan_internal(const char *message)
+{
+	StdString text;
+
+	std_string_from_Checked(&text, message, strlen(message));
+	return host_Error_fork((const uint8 *) "XX000", &text);
+}
+
+/*
+ * doltgres_scan_Epochs_moved takes the epochs of a newer base a read moved to
+ * (rebased, Trees_newer), which it takes, keeping the reader's epoch and its
+ * layout's check; a newer base whose epoch or chain doesn't reach the
+ * reader's epoch is an internal error, as a row past it is.
+ */
+static bool
+doltgres_scan_Epochs_moved(DoltgresScanEpochs *self, DoltgresScanEpochs *newer, HostError *error)
+{
+	size_t		end = 0;
+
+	if (self->has_end)
+	{
+		size_t		reached = (size_t) self->base + self->end;
+
+		if (reached < newer->base || reached - newer->base > newer->chain.len)
+		{
+			doltgres_scan_Epochs_drop(newer);
+			*error = doltgres_scan_internal("a newer base is past its reader's epoch");
+			return false;
+		}
+		end = reached - newer->base;
+	}
+	newer->has_end = self->has_end;
+	newer->end = end;
+	newer->checked = self->checked;
+	doltgres_scan_Epochs_drop(self);
+	*self = *newer;
 	return true;
 }
 
@@ -711,6 +776,7 @@ doltgres_scan_Turn_drop(DoltgresScanTurn *self)
 			break;
 		case DOLTGRES_SCAN_TURN_AGAIN:
 		case DOLTGRES_SCAN_TURN_END:
+		case DOLTGRES_SCAN_TURN_MOVED:
 			break;
 	}
 }
@@ -808,7 +874,13 @@ doltgres_scan_Scan_drop(void *record)
 	doltgres_scan_option_drop(&scan->bound);
 	doltgres_scan_option_drop(&scan->seek);
 	if (scan->has_parallel)
+	{
 		doltgres_scan_vecs_drop(&scan->parallel.splits);
+		doltgres_scan_option_drop(&scan->parallel.low);
+		doltgres_scan_option_drop(&scan->parallel.high);
+		if (scan->parallel.has_kept)
+			doltgres_scan_vecs_drop(&scan->parallel.kept);
+	}
 	doltgres_scan_Page_drop(&scan->page);
 	if (scan->has_sample)
 		doltgres_scan_rows_drop(&scan->sample.rows);
@@ -1331,6 +1403,8 @@ static bool doltgres_scan_split(HostIoIo *io, const StdVec *keys, const uint8 *f
 static bool doltgres_scan_pick(HostIoIo *io, StdVec *base_key, DoltgresScanCopies *base_copies, StdVec *delta_key,
 							   size_t delta_at, const TreesKeyOrder *order, DoltgresScanDirection way,
 							   DoltgresScanPicked *result, HostError *error);
+static bool doltgres_scan_reseated(HostIoIo *io, const DoltgresScanStores *stores, const DoltgresScanUnder *under,
+								   HostOwnedHandle handle, DoltgresScanDirection way, HostError *error);
 
 /* doltgres_scan_Repo_Stores_with is the repository's Stores::with: the call lent the repository's reader of nodes. */
 static void
@@ -1426,6 +1500,7 @@ typedef struct doltgres_scan_begin_frame_t
 	TreesStoreNodeStore store;
 	uint64		blocks;
 	const TxnBaseBase *base;
+	uint64		generation;
 	StdVec		keyed;
 	bool		keyed_live;
 	uint32		table;
@@ -1483,8 +1558,9 @@ doltgres_scan_begin_body(void *frame_)
 	scan.has_tree = base != NULL && base->has_root;
 	if (scan.has_tree)
 		scan.tree = base->root;
-	scan.folded = base == NULL ? 0 : base->folded;
+	scan.folded = base == NULL ? 0 : base->read;
 	scan.epochs = frame->epochs;
+	scan.generation = frame->generation;
 	scan.blocks = frame->blocks;
 	scan.keyed = frame->keyed;
 	scan.table = frame->table;
@@ -1501,16 +1577,18 @@ doltgres_scan_begin_body(void *frame_)
 
 /*
  * doltgres_scan_scan_begin makes a scan of a storage of a count of blocks,
- * whose base, or no base (NULL), is in a table of a keyed layout, an object
- * id, and a tree's order, which it takes, and answers its handle; its first
- * read gives the storage's first row its snapshot sees.
+ * whose base, or no base (NULL), read at a base generation or after it, is in
+ * a table of a keyed layout, an object id, and a tree's order, which it
+ * takes, and answers its handle; its first read gives the storage's first
+ * row its snapshot sees.
  */
 bool
 doltgres_scan_scan_begin(HostIoIo *io, TreesStoreNodeStore store, uint64 blocks, const TxnBaseBase *base,
-						 StdVec *keyed, uint32 table, TreesKeyOrder *order, HostOwnedHandle *result,
-						 HostError *error)
+						 uint64 generation, StdVec *keyed, uint32 table, TreesKeyOrder *order,
+						 HostOwnedHandle *result, HostError *error)
 {
-	doltgres_scan_begin_frame_t frame = {.io = io, .store = store, .blocks = blocks, .base = base, .keyed = *keyed,
+	doltgres_scan_begin_frame_t frame = {.io = io, .store = store, .blocks = blocks, .base = base,
+		.generation = generation, .keyed = *keyed,
 	.keyed_live = true, .table = table, .order = *order, .order_live = true, .result = result, .error = error};
 
 	std_landing(&frame, doltgres_scan_begin_body, doltgres_scan_begin_pad);
@@ -1629,8 +1707,8 @@ doltgres_scan_gather_closure_2(void *captures, HostIoIo *io, TreesStoreNodeStore
 
 /*
  * doltgres_scan_advance_frame_t is advance's state across its pad: the
- * group's key it moves from, the base's entry, the delta's hold, the key a
- * seek left, and the delta's key and versions, each while live.
+ * base's entry, the delta's hold, and the delta's key and versions, each
+ * while live.
  */
 typedef struct doltgres_scan_advance_frame_t
 {
@@ -1639,11 +1717,9 @@ typedef struct doltgres_scan_advance_frame_t
 	const DoltgresScanUnder *under;
 	DoltgresScanScan *scan;
 	DoltgresScanDirection way;
-	doltgres_OptionVecU8_t from;
 	doltgres_scan_base_read_t entry;
 	HostDeltaHold hold;
 	bool		hold_live;
-	doltgres_OptionVecU8_t at;
 	bool		has_delta;
 	txn_TupleVecU8VecVersion_t delta;
 	DoltgresScanTurn *result;
@@ -1682,12 +1758,10 @@ doltgres_scan_advance_pad(void *frame_)
 	doltgres_scan_advance_frame_t *frame = frame_;
 
 	doltgres_scan_delta_drop(&frame->has_delta, &frame->delta);
-	doltgres_scan_option_drop(&frame->at);
 	if (frame->hold_live)
 		host_delta_Hold_drop(&frame->hold);
 	frame->hold_live = false;
 	doltgres_scan_entry_drop(&frame->entry);
-	doltgres_scan_option_drop(&frame->from);
 }
 
 /* doltgres_scan_advance_body finds the nearer of the base's next entry and the delta's next key and makes its group. */
@@ -1698,6 +1772,9 @@ doltgres_scan_advance_body(void *frame_)
 	DoltgresScanScan *scan = frame->scan;
 	DoltgresScanDirection way = frame->way;
 	bool		entries = scan->index && !scan->records;
+	uint8		record = TXN_ENTRY_RECORD;
+	const uint8 *from = NULL;
+	size_t		from_len = 0;
 	StdVec		key;
 	bool		has_copies = false;
 	DoltgresScanCopies copies;
@@ -1705,14 +1782,54 @@ doltgres_scan_advance_body(void *frame_)
 
 	if (scan->has_group)
 	{
-		frame->from.has = true;
-		frame->from.v = scan->group.key;
-		std_vec_free_Checked(&scan->group.base, DOLTGRES_SCAN_BYTES);
-		std_ptr_drop_in_place_slice(scan->group.rows.ptr, scan->group.rows.len, sizeof(DoltgresScanFound),
-									doltgres_scan_Found_drop);
-		std_vec_free_Checked(&scan->group.rows, DOLTGRES_SCAN_FOUND);
-		scan->has_group = false;
+		from = scan->group.key.ptr;
+		from_len = scan->group.key.len;
 	}
+	else if (entries && way == DOLTGRES_SCAN_DIRECTION_BACKWARD)
+	{
+		from = &record;
+		from_len = 1;
+	}
+	if (!host_delta_hold(frame->io, &frame->hold, frame->error))
+		return;
+	frame->hold_live = true;
+	if (scan->seek.has)
+	{
+		if (!txn_visible_versions(frame->io, &frame->hold, frame->under->state, scan->seek.v.ptr, scan->seek.v.len,
+								  scan->folded, &versions, frame->error))
+			return;
+		if (versions.len == 0)
+		{
+			txn_memtable_version_versions_drop(&versions, 0);
+			if (!txn_visible_next(frame->io, &frame->hold, frame->under->state, true, scan->seek.v.ptr,
+								  scan->seek.v.len, doltgres_scan_toward(way), scan->folded, &frame->has_delta,
+								  &frame->delta, frame->error))
+				return;
+		}
+		else
+		{
+			std_vec_clone(&frame->delta.f0, &scan->seek.v, DOLTGRES_SCAN_BYTES);
+			frame->delta.f1 = versions;
+			frame->has_delta = true;
+		}
+	}
+	else if (!txn_visible_next(frame->io, &frame->hold, frame->under->state, from != NULL, from, from_len,
+							   doltgres_scan_toward(way), scan->folded, &frame->has_delta, &frame->delta,
+							   frame->error))
+		return;
+	if (frame->has_delta && entries && frame->delta.f0.len > 0 &&
+		((const uint8 *) frame->delta.f0.ptr)[0] == TXN_ENTRY_RECORD)
+		doltgres_scan_delta_drop(&frame->has_delta, &frame->delta);
+	if (txn_state_moved_past(frame->under->state, scan->generation))
+	{
+		frame->result->tag = DOLTGRES_SCAN_TURN_MOVED;
+		frame->ok = true;
+		return;
+	}
+	if (scan->has_group)
+		doltgres_scan_Group_drop(&scan->group);
+	scan->has_group = false;
+	doltgres_scan_option_drop(&scan->seek);
 	frame->entry.scan = scan;
 	frame->entry.keyless = scan->keyed.len == 0;
 	frame->entry.entries = entries ? &scan->order : NULL;
@@ -1722,47 +1839,6 @@ doltgres_scan_advance_body(void *frame_)
 							 &frame->entry);
 	if (!frame->entry.ok)
 		return;
-	if (!frame->from.has && entries && way == DOLTGRES_SCAN_DIRECTION_BACKWARD)
-	{
-		uint8		record = TXN_ENTRY_RECORD;
-
-		std_slice_to_vec_Checked(&frame->from.v, &record, 1, DOLTGRES_SCAN_BYTES);
-		frame->from.has = true;
-	}
-	if (!host_delta_hold(frame->io, &frame->hold, frame->error))
-		return;
-	frame->hold_live = true;
-	if (scan->seek.has)
-	{
-		frame->at = scan->seek;
-		scan->seek.has = false;
-		if (!txn_visible_versions(frame->io, &frame->hold, frame->under->state, frame->at.v.ptr, frame->at.v.len,
-								  scan->folded, &versions, frame->error))
-			return;
-		if (versions.len == 0)
-		{
-			txn_memtable_version_versions_drop(&versions, 0);
-			if (!txn_visible_next(frame->io, &frame->hold, frame->under->state, true, frame->at.v.ptr,
-								  frame->at.v.len, doltgres_scan_toward(way), scan->folded, &frame->has_delta,
-								  &frame->delta, frame->error))
-				return;
-			doltgres_scan_option_drop(&frame->at);
-		}
-		else
-		{
-			frame->delta.f0 = frame->at.v;
-			frame->delta.f1 = versions;
-			frame->at.has = false;
-			frame->has_delta = true;
-		}
-	}
-	else if (!txn_visible_next(frame->io, &frame->hold, frame->under->state, frame->from.has, frame->from.v.ptr,
-							   frame->from.has ? frame->from.v.len : 0, doltgres_scan_toward(way), scan->folded,
-							   &frame->has_delta, &frame->delta, frame->error))
-		return;
-	if (frame->has_delta && entries && frame->delta.f0.len > 0 &&
-		((const uint8 *) frame->delta.f0.ptr)[0] == TXN_ENTRY_RECORD)
-		doltgres_scan_delta_drop(&frame->has_delta, &frame->delta);
 	if (!frame->entry.has_entry && !frame->has_delta)
 	{
 		DoltgresScanPlace start = {.tag = DOLTGRES_SCAN_PLACE_START};
@@ -1817,7 +1893,10 @@ doltgres_scan_advance_body(void *frame_)
  * the way a read goes and makes that key's group: the nearer of the base's
  * next entry and the delta's next key with a version past the group's key,
  * by their bytes, one group when they are the same key. With neither, the
- * scan starts over.
+ * scan starts over. It reads the delta first and, when an install moved the
+ * storage's base since the scan took its own (txn_state_moved_past),
+ * changes nothing and answers Moved; so the delta it pairs with its base is
+ * the delta before any newer base's drop.
  */
 static bool
 doltgres_scan_advance(HostIoIo *io, const DoltgresScanStores *stores, const DoltgresScanUnder *under,
@@ -1832,8 +1911,9 @@ doltgres_scan_advance(HostIoIo *io, const DoltgresScanStores *stores, const Dolt
 }
 
 /*
- * doltgres_scan_chosen_frame_t is chosen's state across its pad: the choice,
- * the delta's hold, and the key's versions, while live.
+ * doltgres_scan_chosen_frame_t is chosen's state across its pad: the
+ * choice, with where the run's split goes, the delta's hold, and the key's
+ * versions, while live, and whether an install moved the base.
  */
 typedef struct doltgres_scan_chosen_frame_t
 {
@@ -1841,6 +1921,8 @@ typedef struct doltgres_scan_chosen_frame_t
 	const DoltgresScanUnder *under;
 	DoltgresScanScan *scan;
 	DoltgresScanDirection way;
+	bool		has_at;
+	size_t		at;
 	bool		delta_key;
 	StdVec		key;
 	bool		key_live;
@@ -1848,6 +1930,7 @@ typedef struct doltgres_scan_chosen_frame_t
 	DoltgresScanCopies copies;
 	HostDeltaHold hold;
 	bool		hold_live;
+	bool	   *moved;
 	HostError  *error;
 	bool		ok;
 } doltgres_scan_chosen_frame_t;
@@ -1871,13 +1954,15 @@ doltgres_scan_chosen_pad(void *frame_)
 
 /*
  * doltgres_scan_chosen_body reads the delta's versions of the key, when the
- * group takes the delta's key, and makes the group.
+ * group takes the delta's key, and, unless an install moved the base, moves
+ * the run's split and makes the group.
  */
 static void
 doltgres_scan_chosen_body(void *frame_)
 {
 	doltgres_scan_chosen_frame_t *frame = frame_;
 	DoltgresScanScan *scan = frame->scan;
+	DoltgresScanDirection way = frame->way;
 	StdVec		versions;
 
 	if (!host_delta_hold(frame->io, &frame->hold, frame->error))
@@ -1891,6 +1976,26 @@ doltgres_scan_chosen_body(void *frame_)
 	}
 	else
 		std_vec_new(&versions, sizeof(TxnMemtableVersionVersion), _Alignof(TxnMemtableVersionVersion));
+	*frame->moved = txn_state_moved_past(frame->under->state, scan->generation);
+	if (*frame->moved)
+	{
+		txn_memtable_version_versions_drop(&versions, 0);
+		frame->ok = true;
+		return;
+	}
+	doltgres_scan_option_drop(&scan->seek);
+	if (scan->has_run)
+	{
+		if (frame->has_at && (frame->delta_key || way == DOLTGRES_SCAN_DIRECTION_BACKWARD))
+			scan->run.split = frame->at + 1;
+		else if (frame->has_at)
+			scan->run.split = frame->at;
+		else if (way == DOLTGRES_SCAN_DIRECTION_FORWARD)
+			scan->run.split = scan->run.keys.len;
+		else
+			scan->run.split = 0;
+	}
+	doltgres_scan_took(&scan->place, frame->has_copies);
 	frame->key_live = false;
 	if (!doltgres_scan_grouped(frame->io, frame->under, &scan->epochs, &frame->key, frame->has_copies,
 							   &frame->copies, &versions, &scan->group, frame->error))
@@ -1907,17 +2012,17 @@ doltgres_scan_chosen_body(void *frame_)
  * doltgres_scan_chosen makes a compared table's next group from its
  * candidates as chosen, which it takes, the delta's key's versions read
  * again by the key, and moves the run's split past the keys at or before the
- * group's.
+ * group's. It reads the delta key's versions first and, when an install
+ * moved the storage's base since the scan took its own
+ * (txn_state_moved_past), changes nothing and answers moved, as advance
+ * answers Moved.
  */
 static bool
 doltgres_scan_chosen(HostIoIo *io, const DoltgresScanUnder *under, DoltgresScanScan *scan,
-					 DoltgresScanPicked *picked, DoltgresScanDirection way, HostError *error)
+					 DoltgresScanPicked *picked, DoltgresScanDirection way, bool *moved, HostError *error)
 {
 	doltgres_scan_chosen_frame_t frame = {.io = io, .under = under, .scan = scan, .way = way, .key_live = true,
-	.error = error};
-	bool		has_at;
-	size_t		at = 0;
-	bool		delta_key;
+	.moved = moved, .error = error};
 
 	switch (picked->tag)
 	{
@@ -1925,15 +2030,14 @@ doltgres_scan_chosen(HostIoIo *io, const DoltgresScanUnder *under, DoltgresScanS
 			frame.key = picked->base_key;
 			frame.copies = picked->base_copies;
 			frame.has_copies = true;
-			has_at = picked->has_before;
-			at = picked->before;
-			delta_key = false;
+			frame.has_at = picked->has_before;
+			frame.at = picked->before;
 			break;
 		case DOLTGRES_SCAN_PICKED_DELTA:
 			frame.key = picked->delta_key;
-			has_at = true;
-			at = picked->delta_at;
-			delta_key = true;
+			frame.has_at = true;
+			frame.at = picked->delta_at;
+			frame.delta_key = true;
 			break;
 		case DOLTGRES_SCAN_PICKED_BOTH:
 		default:
@@ -1941,24 +2045,11 @@ doltgres_scan_chosen(HostIoIo *io, const DoltgresScanUnder *under, DoltgresScanS
 			frame.key = picked->delta_key;
 			frame.copies = picked->base_copies;
 			frame.has_copies = true;
-			has_at = true;
-			at = picked->delta_at;
-			delta_key = true;
+			frame.has_at = true;
+			frame.at = picked->delta_at;
+			frame.delta_key = true;
 			break;
 	}
-	if (scan->has_run)
-	{
-		if (has_at && (delta_key || way == DOLTGRES_SCAN_DIRECTION_BACKWARD))
-			scan->run.split = at + 1;
-		else if (has_at)
-			scan->run.split = at;
-		else if (way == DOLTGRES_SCAN_DIRECTION_FORWARD)
-			scan->run.split = scan->run.keys.len;
-		else
-			scan->run.split = 0;
-	}
-	doltgres_scan_took(&scan->place, frame.has_copies);
-	frame.delta_key = delta_key;
 	std_landing(&frame, doltgres_scan_chosen_body, doltgres_scan_chosen_pad);
 	doltgres_scan_chosen_pad(&frame);
 	return frame.ok;
@@ -2011,9 +2102,8 @@ doltgres_scan_gather_body(void *frame_)
 	bool		has_at;
 	size_t		at = 0;
 	DoltgresScanPicked picked = {0};
+	bool		moved;
 
-	if (seeked)
-		doltgres_scan_option_drop(&scan->seek);
 	if (!scan->has_group && seeked && way == DOLTGRES_SCAN_DIRECTION_FORWARD)
 	{
 		has_at = run->split < run->keys.len;
@@ -2075,6 +2165,7 @@ doltgres_scan_gather_body(void *frame_)
 			doltgres_scan_Group_drop(&scan->group);
 		scan->has_group = false;
 		doltgres_scan_Place_set(&scan->place, start);
+		doltgres_scan_option_drop(&scan->seek);
 		frame->result->tag = DOLTGRES_SCAN_TURN_END;
 		frame->ok = true;
 		return;
@@ -2104,9 +2195,9 @@ doltgres_scan_gather_body(void *frame_)
 		picked.delta_at = frame->delta_at;
 	}
 	frame->entry.has_entry = frame->has_delta = false;
-	if (!doltgres_scan_chosen(frame->io, frame->under, scan, &picked, way, frame->error))
+	if (!doltgres_scan_chosen(frame->io, frame->under, scan, &picked, way, &moved, frame->error))
 		return;
-	frame->result->tag = DOLTGRES_SCAN_TURN_AGAIN;
+	frame->result->tag = moved ? DOLTGRES_SCAN_TURN_MOVED : DOLTGRES_SCAN_TURN_AGAIN;
 	frame->ok = true;
 }
 
@@ -2181,6 +2272,15 @@ typedef struct doltgres_scan_TupleOptionVecU8VecVecU8_t
 #define HOST_OWNED_WITH_T doltgres_scan_TupleOptionVecU8VecVecU8_t
 #define HOST_OWNED_WITH_T_DROP(place) DOLTGRES_SCAN_SEEK_KEYS_DROP(place)
 #include "doltgres/host/owned_template.h"
+
+/* doltgres_scan_generation_closure_0 is a read's look in the record: the base generation the scan took its base at. */
+static bool
+doltgres_scan_generation_closure_0(void *captures, HostIoIo *io, DoltgresScanScan *scan, uint64 *result,
+								   HostError *error)
+{
+	*result = scan->generation;
+	return true;
+}
 
 /* doltgres_scan_turn_t is a read's turn's captures: the store's source, what the read is under, and its way. */
 typedef struct doltgres_scan_turn_t
@@ -2259,13 +2359,15 @@ doltgres_scan_next_closure_2(void *captures, HostIoIo *io, DoltgresScanScan *sca
 
 /*
  * doltgres_scan_chose_t is the captures of a call that makes the chosen group
- * in the record: the choice, the read's state, and its way.
+ * in the record: the choice, the read's state, its way, and whether an
+ * install moved the base.
  */
 typedef struct doltgres_scan_chose_t
 {
 	DoltgresScanPicked picked;
 	const DoltgresScanUnder *under;
 	DoltgresScanDirection way;
+	bool		moved;
 } doltgres_scan_chose_t;
 
 /* doltgres_scan_chose_drop frees the choice of a call that never ran. */
@@ -2281,7 +2383,7 @@ doltgres_scan_next_closure_3(void *captures, HostIoIo *io, DoltgresScanScan *sca
 {
 	doltgres_scan_chose_t *chose = captures;
 
-	return doltgres_scan_chosen(io, chose->under, scan, &chose->picked, chose->way, error);
+	return doltgres_scan_chosen(io, chose->under, scan, &chose->picked, chose->way, &chose->moved, error);
 }
 
 /*
@@ -2347,15 +2449,35 @@ doltgres_scan_next_body(void *frame_)
 			frame->ok = true;
 			return;
 		}
-		if (step.tag == DOLTGRES_SCAN_TURN_RUN)
+		if (step.tag == DOLTGRES_SCAN_TURN_MOVED)
+		{
+			if (!doltgres_scan_reseated(frame->io, frame->stores, frame->under, frame->handle, frame->way,
+										frame->error))
+				return;
+		}
+		else if (step.tag == DOLTGRES_SCAN_TURN_RUN)
 		{
 			doltgres_scan_TupleOptionVecU8VecVecU8_t looked;
 			doltgres_scan_run_set_t set = {0};
+			uint64		generation;
 
 			frame->order = step.u.run;
 			frame->order_live = true;
 			if (!doltgres_scan_run(frame->io, frame->under, &frame->order, &frame->keys, frame->error))
 				return;
+			frame->keys_live = true;
+			if (!host_owned_TableDoltgresScanScan_withU64(&DOLTGRES_SCAN_SCANS, frame->io, frame->handle,
+														  doltgres_scan_generation_closure_0, NULL, NULL, &generation,
+														  frame->error))
+				return;
+			if (txn_state_moved_past(frame->under->state, generation))
+			{
+				doltgres_scan_next_pad(frame);
+				if (!doltgres_scan_reseated(frame->io, frame->stores, frame->under, frame->handle, frame->way,
+											frame->error))
+					return;
+				continue;
+			}
 			frame->keys_live = false;
 			if (!host_owned_TableDoltgresScanScan_withTupleOptionVecU8VecVecU8(&DOLTGRES_SCAN_SCANS, frame->io,
 																			   frame->handle,
@@ -2393,6 +2515,10 @@ doltgres_scan_next_body(void *frame_)
 														   doltgres_scan_chose_drop, frame->error))
 				return;
 			doltgres_scan_next_pad(frame);
+			if (chose.moved &&
+				!doltgres_scan_reseated(frame->io, frame->stores, frame->under, frame->handle, frame->way,
+										frame->error))
+				return;
 		}
 	}
 }
@@ -2544,7 +2670,7 @@ doltgres_scan_run_body(void *frame_)
  * version, in byte order, and sorts them by the table's order with ties
  * broken by their bytes, so that keys its comparator finds equal make
  * adjacent groups; it runs with no record lent, since the comparator is user
- * code.
+ * code. It pauses at doltgres-scan-run first, so a case counts its reads.
  */
 static bool
 doltgres_scan_run(HostIoIo *io, const DoltgresScanUnder *under, const TreesKeyOrder *order, StdVec *result,
@@ -2552,6 +2678,8 @@ doltgres_scan_run(HostIoIo *io, const DoltgresScanUnder *under, const TreesKeyOr
 {
 	doltgres_scan_run_frame_t frame = {.io = io, .under = under, .order = order, .result = result, .error = error};
 
+	if (!host_pause(HOST_SHARED_IO_PAUSES(io), "doltgres-scan-run", error))
+		return false;
 	std_landing(&frame, doltgres_scan_run_body, doltgres_scan_run_pad);
 	doltgres_scan_run_pad(&frame);
 	return frame.ok;
@@ -3146,7 +3274,7 @@ doltgres_scan_grouped(HostIoIo *io, const DoltgresScanUnder *under, DoltgresScan
 
 /*
  * doltgres_scan_rescan_closure_0 is rescan's call: the scan's place, group,
- * run, seek, page, sample, and unit cleared.
+ * run, seek, page, sample, unit, and kept run cleared.
  */
 static bool
 doltgres_scan_rescan_closure_0(void *captures, HostIoIo *io, DoltgresScanScan *scan, HostError *error)
@@ -3172,7 +3300,12 @@ doltgres_scan_rescan_closure_0(void *captures, HostIoIo *io, DoltgresScanScan *s
 	scan->has_written = false;
 	scan->records = false;
 	if (scan->has_parallel)
+	{
 		scan->parallel.has_unit = scan->parallel.has_ranged = false;
+		if (scan->parallel.has_kept)
+			doltgres_scan_vecs_drop(&scan->parallel.kept);
+		scan->parallel.has_kept = false;
+	}
 	return true;
 }
 
@@ -3188,7 +3321,11 @@ doltgres_scan_scan_rescan(HostIoIo *io, HostOwnedHandle handle, HostError *error
 													 NULL, NULL, error);
 }
 
-/* doltgres_scan_placed_captures_t is placed's arguments in a pin scope: the tree, the key, the way, and the order. */
+/*
+ * doltgres_scan_placed_captures_t is placed's arguments in a pin scope: the
+ * tree, the key, the way, the order, and whether the key is a group's, which
+ * a newer base's place takes when the tree holds it (reseated).
+ */
 typedef struct doltgres_scan_placed_captures_t
 {
 	TreesStoreTree tree;
@@ -3196,6 +3333,7 @@ typedef struct doltgres_scan_placed_captures_t
 	size_t		from_len;
 	DoltgresScanDirection way;
 	const TreesKeyOrder *order;
+	bool		grouped;
 } doltgres_scan_placed_captures_t;
 
 /* doltgres_scan_placed_frame_t is placed's state across its pad: its cursor, while live. */
@@ -3273,11 +3411,15 @@ doltgres_scan_placed_body(void *frame_)
 	}
 	if (trees_cursor_Cursor_is_valid(&frame->cursor))
 	{
+		StdBytes	key = trees_cursor_Cursor_key(&frame->cursor);
+		bool		taken = captures->grouped &&
+			std_bytes_Ord_cmp(key.ptr, key.len, captures->from, captures->from_len) == STD_ORDERING_EQUAL;
+
 		frame->result->tag = DOLTGRES_SCAN_PLACE_AT;
 		frame->cursor_live = false;
 		trees_cursor_Cursor_keep(&frame->cursor, &frame->result->u.at.cursor);
 		frame->result->u.at.way = captures->way;
-		frame->result->u.at.taken = false;
+		frame->result->u.at.taken = taken;
 	}
 	else
 		*frame->result = doltgres_scan_off(captures->way);
@@ -3287,7 +3429,9 @@ doltgres_scan_placed_body(void *frame_)
 /*
  * doltgres_scan_placed answers a base's place at a key in its tree's order:
  * its first entry not below the key going forward, or its last not above it
- * going backward, or off its end that way.
+ * going backward, or off its end that way; at a group's key the tree holds,
+ * the place is taken, so the next advance steps past it whichever way it
+ * goes, as an advance leaves a nearer entry its group didn't take untaken.
  */
 static bool
 doltgres_scan_placed(void *captures, HostIoIo *io, TreesPinPin *pin, DoltgresScanPlace *result, HostError *error)
@@ -3323,6 +3467,401 @@ doltgres_scan_place_read(void *captures, HostIoIo *io, TreesStoreNodeStore store
 
 	read->ok = trees_pin_pin_ResultPlace(io, store, doltgres_scan_placed, &read->placed, NULL, &read->place,
 										 read->error);
+}
+
+/* doltgres_scan_Trees_of returns the trees of a base, or of none (NULL), read at a base generation or after it. */
+DoltgresScanTrees
+doltgres_scan_Trees_of(const TxnBaseBase *base, uint64 generation)
+{
+	DoltgresScanTrees trees = {.generation = generation};
+
+	if (base == NULL)
+		return trees;
+	trees.has_root = base->has_root;
+	if (trees.has_root)
+		trees.root = base->root;
+	trees.has_tuple_ids = base->has_tuple_ids;
+	if (trees.has_tuple_ids)
+		trees.tuple_ids = base->tuple_ids;
+	trees.folded = base->read;
+	return trees;
+}
+
+/*
+ * DoltgresScanNewest is what a read whose base an install moved reads of its
+ * storage's newest base: whether the generation moved, the base, none for a
+ * storage with no base, the generation it read it at, and its epochs, each
+ * while live.
+ */
+typedef struct DoltgresScanNewest
+{
+	bool		moved;
+	bool		some;
+	TxnBaseBase base;
+	uint64		now;
+	DoltgresScanEpochs epochs;
+	bool		epochs_live;
+} DoltgresScanNewest;
+
+/* doltgres_scan_Newest_drop frees a newest base's read, its epochs and its base. */
+static void
+doltgres_scan_Newest_drop(DoltgresScanNewest *self)
+{
+	if (self->epochs_live)
+		doltgres_scan_Epochs_drop(&self->epochs);
+	self->epochs_live = false;
+	if (self->some)
+		txn_base_Base_drop(&self->base);
+	self->some = false;
+}
+
+/*
+ * doltgres_scan_newest reads a storage's newest base for a snapshot to read,
+ * as readable gives it, with the generation it read it at and its epochs,
+ * its chain read through a store, once an install moved the generation past
+ * one a read took its base at, and nothing while it hasn't, which costs one
+ * load of the generation.
+ */
+static bool
+doltgres_scan_newest(HostIoIo *io, TreesStoreNodeStore store, const DoltgresScanUnder *under, uint64 generation,
+					 DoltgresScanNewest *result, HostError *error)
+{
+	uint32		epoch;
+	bool		has_chain;
+	TreesStoreTree chain;
+
+	if (!txn_state_readable_since(io, under->state, under->snapshot, generation, &result->moved, &result->some,
+								  &result->base, &result->now, error))
+		return false;
+	if (!result->moved)
+		return true;
+	doltgres_scan_Epochs_based(result->some ? &result->base : NULL, &epoch, &has_chain, &chain);
+	if (!doltgres_scan_Epochs_of(io, store, epoch, has_chain, chain, &result->epochs, error))
+		return false;
+	result->epochs_live = true;
+	return true;
+}
+
+/* doltgres_scan_Trees_newer_frame_t is Trees_newer's state across its pad: the newest base's read. */
+typedef struct doltgres_scan_Trees_newer_frame_t
+{
+	DoltgresScanTrees *self;
+	HostIoIo   *io;
+	TreesStoreNodeStore store;
+	const DoltgresScanUnder *under;
+	DoltgresScanEpochs *epochs;
+	DoltgresScanNewest newest;
+	HostError  *error;
+	bool		ok;
+} doltgres_scan_Trees_newer_frame_t;
+
+/* doltgres_scan_Trees_newer_pad frees the newest base's read. */
+static void
+doltgres_scan_Trees_newer_pad(void *frame_)
+{
+	doltgres_scan_Newest_drop(&((doltgres_scan_Trees_newer_frame_t *) frame_)->newest);
+}
+
+/* doltgres_scan_Trees_newer_body reads the newest base and moves the read's trees and epochs to it. */
+static void
+doltgres_scan_Trees_newer_body(void *frame_)
+{
+	doltgres_scan_Trees_newer_frame_t *frame = frame_;
+	DoltgresScanNewest *newest = &frame->newest;
+
+	if (!doltgres_scan_newest(frame->io, frame->store, frame->under, frame->self->generation, newest, frame->error))
+		return;
+	if (newest->moved)
+	{
+		newest->epochs_live = false;
+		if (!doltgres_scan_Epochs_moved(frame->epochs, &newest->epochs, frame->error))
+			return;
+		*frame->self = doltgres_scan_Trees_of(newest->some ? &newest->base : NULL, newest->now);
+	}
+	frame->ok = true;
+}
+
+/*
+ * doltgres_scan_Trees_newer moves the trees of a read whose base an install
+ * moved to its storage's newest base, as readable gives it for the read's
+ * snapshot, with the generation it read it at, and the read's epochs to
+ * that base's (Epochs_moved), leaving them as they are while the base
+ * hasn't moved.
+ */
+static bool
+doltgres_scan_Trees_newer(DoltgresScanTrees *self, HostIoIo *io, TreesStoreNodeStore store,
+						  const DoltgresScanUnder *under, DoltgresScanEpochs *epochs, HostError *error)
+{
+	doltgres_scan_Trees_newer_frame_t frame = {.self = self, .io = io, .store = store, .under = under,
+	.epochs = epochs, .error = error};
+
+	std_landing(&frame, doltgres_scan_Trees_newer_body, doltgres_scan_Trees_newer_pad);
+	doltgres_scan_Trees_newer_pad(&frame);
+	return frame.ok;
+}
+
+/*
+ * DoltgresScanRebased is Rebased: what a move of a scan to its storage's
+ * newest base leaves its place to go on from: whether it moved, the new
+ * base's tree, the key a read goes on from, with whether it is its group's
+ * key, gone past, or a seek's, gone to, none for a scan not begun, and the
+ * table's order, cloned for the comparisons outside the record, while live.
+ */
+typedef struct DoltgresScanRebased
+{
+	bool		moved;
+	bool		has_tree;
+	TreesStoreTree tree;
+	doltgres_OptionVecU8_t from;
+	bool		grouped;
+	TreesKeyOrder order;
+	bool		order_live;
+} DoltgresScanRebased;
+
+/* doltgres_scan_Rebased_drop frees a move's key and order, each while live. */
+static void
+doltgres_scan_Rebased_drop(DoltgresScanRebased *self)
+{
+	doltgres_scan_option_drop(&self->from);
+	if (self->order_live)
+		trees_KeyOrder_drop(&self->order);
+	self->order_live = self->moved = false;
+}
+
+/* doltgres_scan_rebased_put_t is the captures of rebased's put in the record: the newest base's read and the move. */
+typedef struct doltgres_scan_rebased_put_t
+{
+	DoltgresScanNewest *newest;
+	DoltgresScanRebased *result;
+} doltgres_scan_rebased_put_t;
+
+/*
+ * doltgres_scan_rebased_closure_0 is rebased's put in the record: the newest
+ * base's trees, read point, epochs, and generation, the tid range read's
+ * delta tuple ids cleared, and the key the scan goes on from.
+ */
+static bool
+doltgres_scan_rebased_closure_0(void *captures, HostIoIo *io, DoltgresScanScan *scan, HostError *error)
+{
+	doltgres_scan_rebased_put_t *put = captures;
+	DoltgresScanNewest *newest = put->newest;
+	DoltgresScanRebased *result = put->result;
+	DoltgresScanTrees trees = doltgres_scan_Trees_of(newest->some ? &newest->base : NULL, newest->now);
+
+	newest->epochs_live = false;
+	if (!doltgres_scan_Epochs_moved(&scan->epochs, &newest->epochs, error))
+		return false;
+	scan->has_tree = trees.has_root;
+	scan->tree = trees.root;
+	scan->has_tuple_ids = trees.has_tuple_ids;
+	scan->tuple_ids = trees.tuple_ids;
+	scan->folded = trees.folded;
+	scan->generation = trees.generation;
+	if (scan->has_written)
+		std_vec_free_Checked(&scan->written, DOLTGRES_SCAN_U64);
+	scan->has_written = false;
+	result->moved = true;
+	result->has_tree = scan->has_tree;
+	result->tree = scan->tree;
+	result->grouped = scan->has_group;
+	if (scan->has_group)
+		std_vec_clone(&result->from.v, &scan->group.key, DOLTGRES_SCAN_BYTES);
+	else if (scan->seek.has)
+		std_vec_clone(&result->from.v, &scan->seek.v, DOLTGRES_SCAN_BYTES);
+	result->from.has = scan->has_group || scan->seek.has;
+	trees_KeyOrder_Clone_clone(&scan->order, &result->order);
+	result->order_live = true;
+	return true;
+}
+
+/* doltgres_scan_rebased_frame_t is rebased's state across its pad: the newest base's read. */
+typedef struct doltgres_scan_rebased_frame_t
+{
+	HostIoIo   *io;
+	TreesStoreNodeStore store;
+	const DoltgresScanUnder *under;
+	HostOwnedHandle handle;
+	DoltgresScanNewest newest;
+	DoltgresScanRebased *result;
+	HostError  *error;
+	bool		ok;
+} doltgres_scan_rebased_frame_t;
+
+/* doltgres_scan_rebased_pad frees the newest base's read. */
+static void
+doltgres_scan_rebased_pad(void *frame_)
+{
+	doltgres_scan_Newest_drop(&((doltgres_scan_rebased_frame_t *) frame_)->newest);
+}
+
+/* doltgres_scan_rebased_body reads the newest base once the generation moved and puts it in the record. */
+static void
+doltgres_scan_rebased_body(void *frame_)
+{
+	doltgres_scan_rebased_frame_t *frame = frame_;
+	doltgres_scan_rebased_put_t put = {&frame->newest, frame->result};
+	uint64		generation;
+
+	*frame->result = (DoltgresScanRebased)
+	{
+		.moved = false
+	};
+	if (!host_owned_TableDoltgresScanScan_withU64(&DOLTGRES_SCAN_SCANS, frame->io, frame->handle,
+												  doltgres_scan_generation_closure_0, NULL, NULL, &generation,
+												  frame->error) ||
+		!doltgres_scan_newest(frame->io, frame->store, frame->under, generation, &frame->newest, frame->error))
+		return;
+	frame->ok = !frame->newest.moved ||
+		host_owned_TableDoltgresScanScan_withUnit(&DOLTGRES_SCAN_SCANS, frame->io, frame->handle,
+												  doltgres_scan_rebased_closure_0, &put, NULL, frame->error);
+}
+
+/*
+ * doltgres_scan_rebased moves a scan to its storage's newest base when an
+ * install moved the base since the scan took its own (bugs rows 240 and
+ * 241), at a read's start and never inside one: the record takes the new
+ * base's trees, read point, epochs (Epochs_moved), and generation, the
+ * epochs' chain read through a store, and a tid range read's delta tuple ids
+ * are collected again at that point by its next read. Every live snapshot
+ * may read the newest base (txn_state_readable), and its read point passes
+ * over the delta's versions it holds, so a read going on from its group's
+ * key reads nothing twice and misses nothing. It answers what the caller's
+ * place goes on from, or that the base hasn't moved, which costs one load of
+ * the generation.
+ */
+static bool
+doltgres_scan_rebased(HostIoIo *io, TreesStoreNodeStore store, const DoltgresScanUnder *under,
+					  HostOwnedHandle handle, DoltgresScanRebased *result, HostError *error)
+{
+	doltgres_scan_rebased_frame_t frame = {.io = io, .store = store, .under = under, .handle = handle,
+	.result = result, .error = error};
+
+	std_landing(&frame, doltgres_scan_rebased_body, doltgres_scan_rebased_pad);
+	doltgres_scan_rebased_pad(&frame);
+	return frame.ok;
+}
+
+/*
+ * doltgres_scan_rebase_read_t is a move to the newest base under a reader, a
+ * Stores::with call's captures: rebased's arguments and its answer.
+ */
+typedef struct doltgres_scan_rebase_read_t
+{
+	const DoltgresScanUnder *under;
+	HostOwnedHandle handle;
+	DoltgresScanRebased *result;
+	HostError  *error;
+	bool		ok;
+} doltgres_scan_rebase_read_t;
+
+/* doltgres_scan_rebase_read moves the scan to the newest base, reseated's and next_parallel's store calls' body. */
+static void
+doltgres_scan_rebase_read(void *captures, HostIoIo *io, TreesStoreNodeStore store)
+{
+	doltgres_scan_rebase_read_t *read = captures;
+
+	read->ok = doltgres_scan_rebased(io, store, read->under, read->handle, read->result, read->error);
+}
+
+/* doltgres_scan_reseated_closure_0 is reseated's put of the place in the record. */
+static bool
+doltgres_scan_reseated_closure_0(void *captures, HostIoIo *io, DoltgresScanScan *scan, HostError *error)
+{
+	doltgres_scan_Place_set(&scan->place, *(DoltgresScanPlace *) captures);
+	return true;
+}
+
+/* doltgres_scan_place_put_drop drops the place of a put that never ran. */
+static void
+doltgres_scan_place_put_drop(void *captures)
+{
+	doltgres_scan_Place_drop(captures);
+}
+
+/* doltgres_scan_reseated_frame_t is reseated's state across its pad: its reader and the move, while live. */
+typedef struct doltgres_scan_reseated_frame_t
+{
+	HostIoIo   *io;
+	const DoltgresScanStores *stores;
+	const DoltgresScanUnder *under;
+	HostOwnedHandle handle;
+	DoltgresScanDirection way;
+	HostSharedReader reading;
+	bool		reading_live;
+	DoltgresScanRebased rebasing;
+	DoltgresScanPlace place;
+	HostError  *error;
+	bool		ok;
+} doltgres_scan_reseated_frame_t;
+
+/* doltgres_scan_reseated_pad drops what reseated holds. */
+static void
+doltgres_scan_reseated_pad(void *frame_)
+{
+	doltgres_scan_reseated_frame_t *frame = frame_;
+
+	doltgres_scan_Rebased_drop(&frame->rebasing);
+	if (frame->reading_live)
+		host_shared_Reader_drop(&frame->reading);
+	frame->reading_live = false;
+}
+
+/* doltgres_scan_reseated_body moves the scan to the newest base and puts its place in the new base's tree. */
+static void
+doltgres_scan_reseated_body(void *frame_)
+{
+	doltgres_scan_reseated_frame_t *frame = frame_;
+	DoltgresScanRebased *rebasing = &frame->rebasing;
+	doltgres_scan_rebase_read_t rebase = {frame->under, frame->handle, rebasing, frame->error};
+
+	if (!host_shared_read(frame->io, &frame->reading, frame->error))
+		return;
+	frame->reading_live = true;
+	frame->stores->ops->with(frame->stores->self, frame->io, &frame->reading, doltgres_scan_rebase_read, &rebase);
+	if (!rebase.ok)
+		return;
+	if (!rebasing->moved)
+	{
+		frame->ok = true;
+		return;
+	}
+	if (!rebasing->from.has)
+		frame->place.tag = DOLTGRES_SCAN_PLACE_START;
+	else if (rebasing->has_tree)
+	{
+		doltgres_scan_place_read_t read = {{rebasing->tree, rebasing->from.v.ptr, rebasing->from.v.len, frame->way,
+		&rebasing->order, rebasing->grouped}, .error = frame->error};
+
+		frame->stores->ops->with(frame->stores->self, frame->io, &frame->reading, doltgres_scan_place_read, &read);
+		if (!read.ok)
+			return;
+		frame->place = read.place;
+	}
+	else
+		frame->place = doltgres_scan_off(frame->way);
+	frame->ok = host_owned_TableDoltgresScanScan_withUnit(&DOLTGRES_SCAN_SCANS, frame->io, frame->handle,
+														  doltgres_scan_reseated_closure_0, &frame->place,
+														  doltgres_scan_place_put_drop, frame->error);
+}
+
+/*
+ * doltgres_scan_reseated moves a scan whose read found an install moved its
+ * storage's base (txn_state_moved_past) to the newest base (rebased) and
+ * puts its place in the new base's tree, outside the record, since a
+ * compared tree's order runs user code: past its group's key (placed's
+ * grouped place), at a seek's key, or, for a scan not begun, whose read may
+ * have stepped its place in the old tree, at the new tree's start.
+ */
+static bool
+doltgres_scan_reseated(HostIoIo *io, const DoltgresScanStores *stores, const DoltgresScanUnder *under,
+					   HostOwnedHandle handle, DoltgresScanDirection way, HostError *error)
+{
+	doltgres_scan_reseated_frame_t frame = {.io = io, .stores = stores, .under = under, .handle = handle,
+	.way = way, .error = error};
+
+	std_landing(&frame, doltgres_scan_reseated_body, doltgres_scan_reseated_pad);
+	doltgres_scan_reseated_pad(&frame);
+	return frame.ok;
 }
 
 /* doltgres_scan_seek_closure_1_0 is seek's store call, the base's place at the key found under the scan's reader. */
@@ -4279,29 +4818,46 @@ doltgres_scan_fetch_body(void *frame_)
 	DoltgresScanPaired paired;
 
 	*frame->has_result = false;
-	if (!txn_memtable_tuples_get(frame->io, under->state, tuple, &frame->written.has, &frame->written.v,
-								 frame->error))
+	if (!host_delta_hold(frame->io, &frame->hold, frame->error))
 		return;
-	if (!frame->written.has && frame->trees.has_tuple_ids &&
-		!doltgres_scan_pair(frame->io, frame->store, frame->trees.tuple_ids, frame->tuple_id, &frame->paired,
-							frame->error))
-		return;
-	key = frame->written.has ? &frame->written.v : frame->paired.has ? &frame->paired.v : NULL;
+	frame->hold_live = true;
+	for (;;)
+	{
+		if (!txn_memtable_tuples_get(frame->io, under->state, tuple, &frame->written.has, &frame->written.v,
+									 frame->error))
+			return;
+		if (!frame->written.has && frame->trees.has_tuple_ids &&
+			!doltgres_scan_pair(frame->io, frame->store, frame->trees.tuple_ids, frame->tuple_id, &frame->paired,
+								frame->error))
+			return;
+		key = frame->written.has ? &frame->written.v : frame->paired.has ? &frame->paired.v : NULL;
+		if (!host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-fetch-keyed", frame->error))
+			return;
+		if (key != NULL)
+		{
+			if (!txn_memtable_slice_row_versions(frame->io, &frame->hold, under->state, key->ptr, key->len, tuple,
+												 frame->trees.folded, &slice, frame->error))
+				return;
+			frame->versions = slice.versions;
+			frame->versions_live = true;
+			std_vec_new(&slice.versions, sizeof(TxnMemtableVersionVersion), _Alignof(TxnMemtableVersionVersion));
+			txn_memtable_slice_Slice_drop(&slice);
+		}
+		if (!txn_state_moved_past(under->state, frame->trees.generation))
+			break;
+		if (frame->versions_live)
+			txn_memtable_version_versions_drop(&frame->versions, 0);
+		frame->versions_live = false;
+		doltgres_scan_option_drop(&frame->paired);
+		doltgres_scan_option_drop(&frame->written);
+		if (!doltgres_scan_Trees_newer(&frame->trees, frame->io, frame->store, under, frame->epochs, frame->error))
+			return;
+	}
 	if (key == NULL)
 	{
 		frame->ok = true;
 		return;
 	}
-	if (!host_delta_hold(frame->io, &frame->hold, frame->error))
-		return;
-	frame->hold_live = true;
-	if (!txn_memtable_slice_row_versions(frame->io, &frame->hold, under->state, key->ptr, key->len, tuple,
-										 frame->trees.folded, &slice, frame->error))
-		return;
-	frame->versions = slice.versions;
-	frame->versions_live = true;
-	std_vec_new(&slice.versions, sizeof(TxnMemtableVersionVersion), _Alignof(TxnMemtableVersionVersion));
-	txn_memtable_slice_Slice_drop(&slice);
 	if (!txn_visible_seen(frame->io, rule, frame->versions.ptr, frame->versions.len,
 						  under->has_serial ? &under->serial.read : NULL, &frame->seen, frame->error))
 		return;
@@ -4388,7 +4944,11 @@ doltgres_scan_fetch_body(void *frame_)
  * or the base's tuple id tree pairs with the id, then the key's row version
  * with the id among those the snapshot sees in the delta, or else the base's
  * copy with the id, unless its ender in the delta ended it for the snapshot.
- * It takes the layout.
+ * Once it read the delta, a read whose base an install moved
+ * (txn_state_moved_past) reads again from the newest base, so it never pairs
+ * a base with the delta a newer base's drop changed; a case holds it inside
+ * its delta read, between its tuple id's lookup and its versions' read
+ * (doltgres-fetch-keyed). It takes the layout.
  */
 bool
 doltgres_scan_fetch(HostIoIo *io, TreesStoreNodeStore store, const DoltgresScanUnder *under,
@@ -4532,21 +5092,33 @@ doltgres_scan_fetch_key_body(void *frame_)
 	StdVec		key;
 	bool		has_copies;
 
-	if (frame->trees.has_root)
-	{
-		doltgres_scan_fetch_key_captures_t captures = {frame->trees.root, frame->key, frame->key_len,
-		&frame->layout.order, frame->layout.keyed.len == 0};
-
-		if (!trees_pin_pin_ResultOptionCopies(frame->io, frame->store, doltgres_scan_fetch_key_closure_0, &captures,
-											  NULL, &frame->copied, frame->error))
-			return;
-	}
 	if (!host_delta_hold(frame->io, &frame->hold, frame->error))
 		return;
 	frame->hold_live = true;
-	if (!txn_visible_versions(frame->io, &frame->hold, frame->under->state, frame->key, frame->key_len,
-							  frame->trees.folded, &versions, frame->error))
-		return;
+	for (;;)
+	{
+		if (frame->trees.has_root)
+		{
+			doltgres_scan_fetch_key_captures_t captures = {frame->trees.root, frame->key, frame->key_len,
+			&frame->layout.order, frame->layout.keyed.len == 0};
+
+			if (!trees_pin_pin_ResultOptionCopies(frame->io, frame->store, doltgres_scan_fetch_key_closure_0,
+												  &captures, NULL, &frame->copied, frame->error))
+				return;
+		}
+		if (!txn_visible_versions(frame->io, &frame->hold, frame->under->state, frame->key, frame->key_len,
+								  frame->trees.folded, &versions, frame->error))
+			return;
+		if (!txn_state_moved_past(frame->under->state, frame->trees.generation))
+			break;
+		txn_memtable_version_versions_drop(&versions, 0);
+		if (frame->copied.has)
+			doltgres_scan_Copies_drop(&frame->copied.v);
+		frame->copied.has = false;
+		if (!doltgres_scan_Trees_newer(&frame->trees, frame->io, frame->store, frame->under, frame->epochs,
+									   frame->error))
+			return;
+	}
 	std_slice_to_vec_Checked(&key, frame->key, frame->key_len, DOLTGRES_SCAN_BYTES);
 	has_copies = frame->copied.has;
 	frame->copied.has = false;
@@ -4572,8 +5144,9 @@ doltgres_scan_fetch_key_body(void *frame_)
  * doltgres_scan_fetch_key answers the rows a snapshot sees of a row key in a
  * storage, read through a store, in the order a scan's group gives them: the
  * copies of the base's entry of the key that the key's versions in the delta
- * leave seen, then the delta's rows it sees, oldest first. It takes the
- * layout.
+ * leave seen, then the delta's rows it sees, oldest first. Once it read the
+ * delta, a read whose base an install moved reads again from the newest
+ * base, as fetch does. It takes the layout.
  */
 bool
 doltgres_scan_fetch_key(HostIoIo *io, TreesStoreNodeStore store, const DoltgresScanUnder *under,
@@ -4594,9 +5167,7 @@ typedef struct doltgres_scan_keyed_frame_t
 {
 	HostIoIo   *io;
 	TreesStoreNodeStore store;
-	HostSharedRecord state;
-	bool		has_tuple_ids;
-	TreesStoreTree tuple_ids;
+	const HostSharedHeld *held;
 	uint64		tuple_id;
 	doltgres_OptionVecU8_t written;
 	bool	   *has_result;
@@ -4613,19 +5184,30 @@ doltgres_scan_keyed_pad(void *frame_)
 	doltgres_scan_option_drop(&((doltgres_scan_keyed_frame_t *) frame_)->written);
 }
 
-/* doltgres_scan_keyed_body reads the delta's and the base's keys of the tuple id. */
+/* doltgres_scan_keyed_body reads the delta's key of the tuple id, then the newest base's. */
 static void
 doltgres_scan_keyed_body(void *frame_)
 {
 	doltgres_scan_keyed_frame_t *frame = frame_;
 	HostRow		tuple = {frame->tuple_id};
 	doltgres_OptionVecU8_t paired = {0};
+	bool		some;
+	TxnBaseBase base;
+	bool		has_tuple_ids;
+	TreesStoreTree tuple_ids;
 
-	if (!txn_memtable_tuples_get(frame->io, frame->state, tuple, &frame->written.has, &frame->written.v,
-								 frame->error))
+	if (!host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-tuple-keyed", frame->error) ||
+		!txn_memtable_tuples_get(frame->io, host_shared_Held_record(frame->held), tuple, &frame->written.has,
+								 &frame->written.v, frame->error) ||
+		!txn_state_newest(frame->io, frame->held, &some, &base, frame->error))
 		return;
-	if (frame->has_tuple_ids &&
-		!doltgres_scan_pair(frame->io, frame->store, frame->tuple_ids, frame->tuple_id, &paired, frame->error))
+	has_tuple_ids = some && base.has_tuple_ids;
+	if (has_tuple_ids)
+		tuple_ids = base.tuple_ids;
+	if (some)
+		txn_base_Base_drop(&base);
+	if (has_tuple_ids &&
+		!doltgres_scan_pair(frame->io, frame->store, tuple_ids, frame->tuple_id, &paired, frame->error))
 		return;
 	*frame->result_1 = paired.has;
 	*frame->has_result = frame->written.has || paired.has;
@@ -4641,18 +5223,20 @@ doltgres_scan_keyed_body(void *frame_)
 }
 
 /*
- * doltgres_scan_keyed answers the row key a tuple id names in a storage,
- * the delta's tuple id table's, else the base's tuple id tree's, read
- * through a store, with whether the base holds the row, or none for a tuple
- * id no layer holds.
+ * doltgres_scan_keyed answers the row key a tuple id names in a held
+ * storage, the delta's tuple id table's, else the newest base's tuple id
+ * tree's, read through a store, with whether that base holds the row, or
+ * none for a tuple id no layer holds. It reads the base after the delta, so
+ * a row a fold's drop takes out of the delta after the delta's read is in
+ * the base it reads (bugs rows 240 and 315); it first pauses at
+ * doltgres-tuple-keyed.
  */
 bool
-doltgres_scan_keyed(HostIoIo *io, TreesStoreNodeStore store, HostSharedRecord state, bool has_tuple_ids,
-					TreesStoreTree tuple_ids, uint64 tuple_id, bool *has_result, StdVec *result_0, bool *result_1,
-					HostError *error)
+doltgres_scan_keyed(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held, uint64 tuple_id,
+					bool *has_result, StdVec *result_0, bool *result_1, HostError *error)
 {
-	doltgres_scan_keyed_frame_t frame = {io, store, state, has_tuple_ids, tuple_ids, tuple_id, {0}, has_result,
-	result_0, result_1, error, false};
+	doltgres_scan_keyed_frame_t frame = {io, store, held, tuple_id, {0}, has_result, result_0, result_1, error,
+	false};
 
 	std_landing(&frame, doltgres_scan_keyed_body, doltgres_scan_keyed_pad);
 	doltgres_scan_keyed_pad(&frame);
@@ -5140,11 +5724,17 @@ doltgres_scan_delta_tid(const uint64 *written, size_t written_len, bool has_give
 /*
  * doltgres_scan_OptionChosen_t is next_in_range's choice in the record: a
  * tuple id, the trees and layout its fetch reads, and the epochs moved out
- * of the record, or none.
+ * of the record, or none, with whether an install moved the base while it
+ * collected the delta's tuple ids, which the read moves to (rebased) before
+ * it chooses again. The tuple ids it chooses from are the base's and the
+ * delta's from before any newer base's drop, so none is missed; each fetch
+ * reads its row from the newest base (fetch), and a read whose fetch found a
+ * newer base moves to it once, so its later fetches start there.
  */
 typedef struct doltgres_scan_OptionChosen_t
 {
 	bool		has;
+	bool		moved;
 	uint64		tuple_id;
 	DoltgresScanTrees trees;
 	DoltgresScanLayout layout;
@@ -5200,13 +5790,19 @@ doltgres_scan_next_in_range_closure_0(void *captures, HostIoIo *io, DoltgresScan
 	bool		has_delta;
 	uint64		delta = 0;
 
-	result->has = false;
+	result->has = result->moved = false;
 	if (!has_range)
 		return true;
 	if (!scan->has_written)
 	{
 		if (!doltgres_scan_written(io, read->under, scan->folded, &scan->written, error))
 			return false;
+		if (txn_state_moved_past(read->under->state, scan->generation))
+		{
+			std_vec_free_Checked(&scan->written, DOLTGRES_SCAN_U64);
+			result->moved = true;
+			return true;
+		}
 		scan->has_written = true;
 	}
 	if (scan->has_tuple_ids &&
@@ -5227,7 +5823,7 @@ doltgres_scan_next_in_range_closure_0(void *captures, HostIoIo *io, DoltgresScan
 	trees_KeyOrder_Clone_clone(&scan->order, &result->layout.order);
 	result->trees = (DoltgresScanTrees)
 	{
-		scan->has_tree, scan->tree, scan->has_tuple_ids, scan->tuple_ids, scan->folded
+		scan->has_tree, scan->tree, scan->has_tuple_ids, scan->tuple_ids, scan->folded, scan->generation
 	};
 	result->tuple_id = scan->given;
 	result->epochs = scan->epochs;
@@ -5297,11 +5893,19 @@ doltgres_scan_next_in_range_body(void *frame_)
 	for (;;)
 	{
 		doltgres_scan_OptionChosen_t chosen;
+		DoltgresScanRebased rebasing;
 
 		if (!host_owned_TableDoltgresScanScan_withOptionChosen(&DOLTGRES_SCAN_SCANS, frame->io, frame->handle,
 															   doltgres_scan_next_in_range_closure_0, &read, NULL,
 															   &chosen, frame->error))
 			return;
+		if (chosen.moved)
+		{
+			if (!doltgres_scan_rebased(frame->io, frame->store, frame->under, frame->handle, &rebasing, frame->error))
+				return;
+			doltgres_scan_Rebased_drop(&rebasing);
+			continue;
+		}
 		if (!chosen.has)
 		{
 			*frame->has_result = false;
@@ -5318,6 +5922,12 @@ doltgres_scan_next_in_range_body(void *frame_)
 													   doltgres_scan_next_in_range_closure_1, &frame->epochs,
 													   doltgres_scan_epochs_put_drop, frame->error))
 			return;
+		if (txn_state_moved_past(frame->under->state, chosen.trees.generation))
+		{
+			if (!doltgres_scan_rebased(frame->io, frame->store, frame->under, frame->handle, &rebasing, frame->error))
+				return;
+			doltgres_scan_Rebased_drop(&rebasing);
+		}
 		if (frame->has_row)
 		{
 			*frame->has_result = true;
@@ -5415,16 +6025,6 @@ doltgres_scan_splits(const StdVec *starts, size_t starts_len, StdVec *result)
 	std_landing(&frame, doltgres_scan_splits_body, doltgres_scan_splits_pad);
 }
 
-/* doltgres_scan_internal returns an internal error of the fork's with a literal message. */
-static HostError
-doltgres_scan_internal(const char *message)
-{
-	StdString text;
-
-	std_string_from_Checked(&text, message, strlen(message));
-	return host_Error_fork((const uint8 *) "XX000", &text);
-}
-
 /* doltgres_scan_split_keys_frame_t is split_keys' state across its pad: the keys read so far, and the bytes left. */
 typedef struct doltgres_scan_split_keys_frame_t
 {
@@ -5496,6 +6096,7 @@ typedef struct doltgres_scan_begin_parallel_frame_t
 	HostIoIo   *io;
 	DoltgresScanShared shared;
 	bool		shared_live;
+	uint64		generation;
 	StdVec		keyed;
 	bool		keyed_live;
 	uint32		table;
@@ -5545,6 +6146,7 @@ doltgres_scan_begin_parallel_body(void *frame_)
 	scan.tree = shared->tree;
 	scan.folded = shared->folded;
 	scan.epochs = shared->epochs;
+	scan.generation = frame->generation;
 	scan.blocks = shared->has_tree ? (shared->fresh_end >> 16) + 1 : 0;
 	scan.keyed = frame->keyed;
 	scan.table = frame->table;
@@ -5555,6 +6157,8 @@ doltgres_scan_begin_parallel_body(void *frame_)
 	scan.parallel.entries = shared->entries;
 	scan.parallel.units = shared->units;
 	scan.parallel.splits = shared->splits;
+	scan.parallel.has_shared = shared->has_tree;
+	scan.parallel.shared = shared->tree;
 	scan.page = doltgres_scan_ended();
 	frame->reader_live = frame->shared_live = frame->keyed_live = frame->order_live = false;
 	frame->ok = host_owned_TableDoltgresScanScan_make(&DOLTGRES_SCAN_SCANS, frame->io, scan, frame->result,
@@ -5563,15 +6167,16 @@ doltgres_scan_begin_parallel_body(void *frame_)
 
 /*
  * doltgres_scan_begin_parallel makes a parallel scan of the base the leader
- * shared, in a table of a keyed layout, an object id, and a tree's order,
- * each of which it takes, and answers its handle; its first read asks for
- * its first unit.
+ * shared, the storage's newest at a base generation or none newer, in a
+ * table of a keyed layout, an object id, and a tree's order, each of which
+ * it takes, and answers its handle; its first read asks for its first unit.
  */
 bool
-doltgres_scan_begin_parallel(HostIoIo *io, DoltgresScanShared *shared, StdVec *keyed, uint32 table,
-							 TreesKeyOrder *order, HostOwnedHandle *result, HostError *error)
+doltgres_scan_begin_parallel(HostIoIo *io, DoltgresScanShared *shared, uint64 generation, StdVec *keyed,
+							 uint32 table, TreesKeyOrder *order, HostOwnedHandle *result, HostError *error)
 {
-	doltgres_scan_begin_parallel_frame_t frame = {.io = io, .shared = *shared, .shared_live = true, .keyed = *keyed,
+	doltgres_scan_begin_parallel_frame_t frame = {.io = io, .shared = *shared, .shared_live = true,
+		.generation = generation, .keyed = *keyed,
 		.keyed_live = true, .table = table, .order = *order, .order_live = true, .result = result,
 	.error = error};
 
@@ -5784,6 +6389,20 @@ doltgres_scan_bounds_closure_1(const StdVec *splits, uint64 segment, uint64 segm
 	return key;
 }
 
+/* doltgres_scan_edges keeps a unit's bounds as its edges in the scan's parallel part, cloned. */
+static void
+doltgres_scan_edges(DoltgresScanParallel *parallel, const DoltgresScanBounds *bounds)
+{
+	doltgres_scan_option_drop(&parallel->low);
+	doltgres_scan_option_drop(&parallel->high);
+	parallel->low.has = bounds->low.has;
+	if (bounds->low.has)
+		std_vec_clone(&parallel->low.v, &bounds->low.v, DOLTGRES_SCAN_BYTES);
+	parallel->high.has = bounds->high.has;
+	if (bounds->high.has)
+		std_vec_clone(&parallel->high.v, &bounds->high.v, DOLTGRES_SCAN_BYTES);
+}
+
 /*
  * doltgres_scan_bounds_frame_t is bounds' state across its pad: the scan, the
  * unit, the store's source, and the bounds being made.
@@ -5821,7 +6440,7 @@ doltgres_scan_bounds_body(void *frame_)
 	doltgres_scan_bounds_frame_t *frame = frame_;
 	DoltgresScanScan *scan = frame->scan;
 	DoltgresScanBounds *result = frame->result;
-	doltgres_scan_bounds_captures_t captures = {.scan = scan, .tree = scan->tree, .unit = frame->unit,
+	doltgres_scan_bounds_captures_t captures = {.scan = scan, .tree = scan->parallel.shared, .unit = frame->unit,
 	.error = frame->error};
 
 	*result = (DoltgresScanBounds)
@@ -5836,7 +6455,7 @@ doltgres_scan_bounds_body(void *frame_)
 		return;
 	}
 	captures.entries = scan->parallel.entries;
-	if (!scan->has_tree || captures.entries == 0)
+	if (!scan->parallel.has_shared || captures.entries == 0)
 	{
 		const StdVec *splits = &scan->parallel.splits;
 		uint64		segments = (uint64) splits->len + 1;
@@ -5856,6 +6475,7 @@ doltgres_scan_bounds_body(void *frame_)
 			std_vec_new(&result->high.v, DOLTGRES_SCAN_BYTES);
 		}
 		result->alone = !result->low.has && !result->high.has;
+		doltgres_scan_edges(&scan->parallel, result);
 		frame->live = false;
 		frame->ok = true;
 		return;
@@ -5870,6 +6490,7 @@ doltgres_scan_bounds_body(void *frame_)
 	if (result->high.has)
 		std_vec_clone(&scan->bound.v, &result->high.v, DOLTGRES_SCAN_BYTES);
 	scan->bound.has = result->high.has;
+	doltgres_scan_edges(&scan->parallel, result);
 	frame->live = false;
 	frame->ok = true;
 }
@@ -5894,24 +6515,76 @@ doltgres_scan_bounds(HostIoIo *io, const DoltgresScanStores *stores, DoltgresSca
 }
 
 /*
+ * doltgres_scan_Kept_t is a parallel worker's kept run outside its record:
+ * whether it has one, its keys (a Vec<Vec<u8>>), and the scan's generation
+ * it was read at, which a take sets to the record's generation when it finds
+ * none to give.
+ */
+typedef struct doltgres_scan_Kept_t
+{
+	bool		has;
+	StdVec		keys;
+	uint64		at;
+} doltgres_scan_Kept_t;
+
+/*
+ * doltgres_scan_kept_take_closure_0 is kept_take's call: the record's kept run
+ * moved out when it was read at the scan's generation, and dropped when it
+ * wasn't, since a rebase or a rescan left it behind.
+ */
+static bool
+doltgres_scan_kept_take_closure_0(void *captures, HostIoIo *io, DoltgresScanScan *scan, HostError *error)
+{
+	doltgres_scan_Kept_t *kept = captures;
+
+	kept->has = false;
+	kept->at = scan->generation;
+	if (!scan->has_parallel || !scan->parallel.has_kept)
+		return true;
+	scan->parallel.has_kept = false;
+	if (scan->parallel.kept_at != scan->generation)
+	{
+		doltgres_scan_vecs_drop(&scan->parallel.kept);
+		return true;
+	}
+	kept->has = true;
+	kept->keys = scan->parallel.kept;
+	return true;
+}
+
+/* doltgres_scan_kept_put_closure_0 is kept_put's call: the kept run moved back into the record. */
+static bool
+doltgres_scan_kept_put_closure_0(void *captures, HostIoIo *io, DoltgresScanScan *scan, HostError *error)
+{
+	doltgres_scan_Kept_t *kept = captures;
+
+	if (!scan->has_parallel)
+		return true;
+	scan->parallel.kept = kept->keys;
+	scan->parallel.kept_at = kept->at;
+	scan->parallel.has_kept = true;
+	kept->has = false;
+	return true;
+}
+
+/*
  * doltgres_scan_unit_keys_frame_t is unit_keys' state across its pad: the
- * run's keys not yet looked at and the ones kept, while live.
+ * kept run while it is out of the record, and the keys kept, while live.
  */
 typedef struct doltgres_scan_unit_keys_frame_t
 {
 	HostIoIo   *io;
 	const DoltgresScanUnder *under;
+	HostOwnedHandle handle;
 	const DoltgresScanBounds *bounds;
-	StdVec		keys;
-	size_t		next;
-	bool		keys_live;
+	doltgres_scan_Kept_t kept;
 	StdVec	   *result;
 	bool		result_live;
 	HostError  *error;
 	bool		ok;
 } doltgres_scan_unit_keys_frame_t;
 
-/* doltgres_scan_unit_keys_pad drops the keys not yet looked at and the ones kept. */
+/* doltgres_scan_unit_keys_pad drops the kept run while it is out of the record, and the keys kept. */
 static void
 doltgres_scan_unit_keys_pad(void *frame_)
 {
@@ -5920,21 +6593,51 @@ doltgres_scan_unit_keys_pad(void *frame_)
 	if (frame->result_live)
 		doltgres_scan_vecs_drop(frame->result);
 	frame->result_live = false;
-	if (frame->keys_live)
-	{
-		for (size_t i = frame->next; i < frame->keys.len; i++)
-			std_vec_free_Checked(&STD_VEC_AT(&frame->keys, StdVec, i), DOLTGRES_SCAN_BYTES);
-		std_vec_free_Checked(&frame->keys, DOLTGRES_SCAN_VEC);
-	}
-	frame->keys_live = false;
+	if (frame->kept.has)
+		doltgres_scan_vecs_drop(&frame->kept.keys);
+	frame->kept.has = false;
 }
 
-/* doltgres_scan_unit_keys_body reads the run and keeps its keys within the unit's bounds. */
+/*
+ * doltgres_scan_unit_keys_at returns the place in the kept run of its first
+ * key at or past a bound in the table's order, by a binary search, since the
+ * run is in that order.
+ */
+static bool
+doltgres_scan_unit_keys_at(doltgres_scan_unit_keys_frame_t *frame, const StdVec *bound, size_t *result)
+{
+	size_t		low = 0;
+	size_t		high = frame->kept.keys.len;
+
+	while (low < high)
+	{
+		size_t		middle = low + (high - low) / 2;
+		StdOrdering ordering;
+
+		if (!doltgres_scan_total(frame->io, &frame->bounds->order, &STD_VEC_AT(&frame->kept.keys, StdVec, middle),
+								 bound, &ordering, frame->error))
+			return false;
+		if (ordering == STD_ORDERING_LESS)
+			low = middle + 1;
+		else
+			high = middle;
+	}
+	*result = low;
+	return true;
+}
+
+/*
+ * doltgres_scan_unit_keys_body takes the kept run out of the record, reading
+ * the run when the record keeps none at the scan's generation, copies out its
+ * keys within the unit's bounds, and puts the run back.
+ */
 static void
 doltgres_scan_unit_keys_body(void *frame_)
 {
 	doltgres_scan_unit_keys_frame_t *frame = frame_;
 	const DoltgresScanBounds *bounds = frame->bounds;
+	size_t		first = 0;
+	size_t		end;
 
 	std_vec_new(frame->result, DOLTGRES_SCAN_VEC);
 	if (!bounds->low.has && !bounds->high.has && !bounds->alone)
@@ -5943,39 +6646,30 @@ doltgres_scan_unit_keys_body(void *frame_)
 		return;
 	}
 	frame->result_live = true;
-	if (!doltgres_scan_run(frame->io, frame->under, &bounds->order, &frame->keys, frame->error))
+	if (!host_owned_TableDoltgresScanScan_withUnit(&DOLTGRES_SCAN_SCANS, frame->io, frame->handle,
+												   doltgres_scan_kept_take_closure_0, &frame->kept, NULL, frame->error))
 		return;
-	frame->keys_live = true;
-	while (frame->next < frame->keys.len)
+	if (!frame->kept.has)
 	{
-		StdVec		key = STD_VEC_AT(&frame->keys, StdVec, frame->next);
-		StdOrdering ordering;
-		bool		at_or_past = true;
-		bool		before = true;
-
-		if (bounds->low.has)
-		{
-			if (!doltgres_scan_total(frame->io, &bounds->order, &key, &bounds->low.v, &ordering, frame->error))
-				return;
-			at_or_past = ordering != STD_ORDERING_LESS;
-		}
-		if (bounds->high.has)
-		{
-			if (!doltgres_scan_total(frame->io, &bounds->order, &key, &bounds->high.v, &ordering, frame->error))
-				return;
-			before = ordering == STD_ORDERING_LESS;
-		}
-		if (at_or_past && before)
-		{
-			std_vec_push_Checked(frame->result, &key, DOLTGRES_SCAN_VEC);
-			frame->next++;
-		}
-		else
-		{
-			frame->next++;
-			std_vec_free_Checked(&key, DOLTGRES_SCAN_BYTES);
-		}
+		if (!doltgres_scan_run(frame->io, frame->under, &bounds->order, &frame->kept.keys, frame->error))
+			return;
+		frame->kept.has = true;
 	}
+	end = frame->kept.keys.len;
+	if ((bounds->low.has && !doltgres_scan_unit_keys_at(frame, &bounds->low.v, &first)) ||
+		(bounds->high.has && !doltgres_scan_unit_keys_at(frame, &bounds->high.v, &end)))
+		return;
+	for (size_t i = first; i < end; i++)
+	{
+		const StdVec *key = &STD_VEC_AT(&frame->kept.keys, StdVec, i);
+		StdVec		copy;
+
+		std_slice_to_vec_Checked(&copy, key->ptr, key->len, DOLTGRES_SCAN_BYTES);
+		std_vec_push_Checked(frame->result, &copy, DOLTGRES_SCAN_VEC);
+	}
+	if (!host_owned_TableDoltgresScanScan_withUnit(&DOLTGRES_SCAN_SCANS, frame->io, frame->handle,
+												   doltgres_scan_kept_put_closure_0, &frame->kept, NULL, frame->error))
+		return;
 	frame->result_live = false;
 	frame->ok = true;
 }
@@ -5984,14 +6678,16 @@ doltgres_scan_unit_keys_body(void *frame_)
  * doltgres_scan_unit_keys answers a parallel unit's delta keys in the
  * table's order: every key at or past its low bound and before its high
  * one, with ties broken by the keys' bytes, or every key when its bounds say
- * the unit reads them all alone.
+ * the unit reads them all alone. It takes them from the run the worker keeps,
+ * read once for each generation the scan reads at, so a scan's units read the
+ * delta's run once and not once each (bugs row 309).
  */
 static bool
-doltgres_scan_unit_keys(HostIoIo *io, const DoltgresScanUnder *under, const DoltgresScanBounds *bounds,
-						StdVec *result, HostError *error)
+doltgres_scan_unit_keys(HostIoIo *io, const DoltgresScanUnder *under, HostOwnedHandle handle,
+						const DoltgresScanBounds *bounds, StdVec *result, HostError *error)
 {
-	doltgres_scan_unit_keys_frame_t frame = {.io = io, .under = under, .bounds = bounds, .result = result,
-	.error = error};
+	doltgres_scan_unit_keys_frame_t frame = {.io = io, .under = under, .handle = handle, .bounds = bounds,
+	.result = result, .error = error};
 
 	std_landing(&frame, doltgres_scan_unit_keys_body, doltgres_scan_unit_keys_pad);
 	doltgres_scan_unit_keys_pad(&frame);
@@ -6108,8 +6804,299 @@ doltgres_scan_next_parallel_closure_5(void *captures, HostIoIo *io, DoltgresScan
 {
 	doltgres_scan_chose_t *chose = captures;
 
-	return doltgres_scan_chosen(io, chose->under, scan, &chose->picked, DOLTGRES_SCAN_DIRECTION_FORWARD, error);
+	return doltgres_scan_chosen(io, chose->under, scan, &chose->picked, DOLTGRES_SCAN_DIRECTION_FORWARD,
+								&chose->moved, error);
 }
+
+/* doltgres_scan_sought_captures_t is sought's pin scope's captures: the tree, the key, and its order. */
+typedef struct doltgres_scan_sought_captures_t
+{
+	TreesStoreTree tree;
+	const uint8 *key;
+	size_t		key_len;
+	const TreesKeyOrder *order;
+} doltgres_scan_sought_captures_t;
+
+/* doltgres_scan_sought_closure_0_body seeks the key and copies out the key of the first entry at or past it. */
+static void
+doltgres_scan_sought_closure_0_body(void *frame_)
+{
+	doltgres_scan_cursor_frame_t *frame = frame_;
+	doltgres_scan_sought_captures_t *captures = frame->captures;
+	doltgres_OptionVecU8_t *result = frame->result;
+	ChunksErrorError failed;
+	StdBytes	key;
+
+	if (!trees_cursor_Cursor_seek(frame->io, frame->pin, TREES_STORE_TREE_NAMED(&captures->tree), captures->key,
+								  captures->key_len, captures->order, &frame->cursor, &failed))
+	{
+		doltgres_scan_storage_failed(&failed, frame->error);
+		return;
+	}
+	frame->cursor_live = true;
+	result->has = trees_cursor_Cursor_is_valid(&frame->cursor);
+	if (result->has)
+	{
+		key = trees_cursor_Cursor_key(&frame->cursor);
+		std_slice_to_vec_Checked(&result->v, key.ptr, key.len, DOLTGRES_SCAN_BYTES);
+	}
+	frame->ok = true;
+}
+
+/* doltgres_scan_sought_closure_0 is sought's pin scope. */
+static bool
+doltgres_scan_sought_closure_0(void *captures, HostIoIo *io, TreesPinPin *pin, doltgres_OptionVecU8_t *result,
+							   HostError *error)
+{
+	return doltgres_scan_cursor_scope(captures, io, pin, result, error, doltgres_scan_sought_closure_0_body);
+}
+
+/* doltgres_scan_sought_read_t is a stop's read under a reader, a Stores::with call's captures. */
+typedef struct doltgres_scan_sought_read_t
+{
+	doltgres_scan_sought_captures_t sought;
+	doltgres_OptionVecU8_t *result;
+	HostError  *error;
+	bool		ok;
+} doltgres_scan_sought_read_t;
+
+/* doltgres_scan_sought_read reads the key of a tree's first entry at or past a key going forward, in a pin scope. */
+static void
+doltgres_scan_sought_read(void *captures, HostIoIo *io, TreesStoreNodeStore store)
+{
+	doltgres_scan_sought_read_t *read = captures;
+
+	read->ok = trees_pin_pin_ResultOptionVecU8(io, store, doltgres_scan_sought_closure_0, &read->sought, NULL,
+											   read->result, read->error);
+}
+
+/*
+ * DoltgresScanUnitPlacing is what unit_placed takes out of a parallel scan's
+ * record: whether the worker's tree is a newer base's than the shared one,
+ * that tree, its group's key, its unit's edges, and the table's order, each
+ * cloned and each while live, and the place and stop it puts back.
+ */
+typedef struct DoltgresScanUnitPlacing
+{
+	bool		moved;
+	bool		has_tree;
+	TreesStoreTree tree;
+	doltgres_OptionVecU8_t group;
+	doltgres_OptionVecU8_t low;
+	doltgres_OptionVecU8_t high;
+	TreesKeyOrder order;
+	bool		order_live;
+	DoltgresScanPlace place;
+	doltgres_OptionVecU8_t bound;
+} DoltgresScanUnitPlacing;
+
+/* doltgres_scan_unit_placed_closure_0 is unit_placed's look in the record: a moved worker's tree, group, and edges. */
+static bool
+doltgres_scan_unit_placed_closure_0(void *captures, HostIoIo *io, DoltgresScanScan *scan, HostError *error)
+{
+	DoltgresScanUnitPlacing *placing = captures;
+	const DoltgresScanParallel *parallel = &scan->parallel;
+
+	if (!scan->has_parallel || !parallel->has_unit ||
+		(scan->has_tree == parallel->has_shared &&
+		 (!scan->has_tree || trees_store_Tree_PartialEq_eq(&scan->tree, &parallel->shared))))
+		return true;
+	placing->moved = true;
+	placing->has_tree = scan->has_tree;
+	placing->tree = scan->tree;
+	if (scan->has_group)
+		std_vec_clone(&placing->group.v, &scan->group.key, DOLTGRES_SCAN_BYTES);
+	placing->group.has = scan->has_group;
+	if (parallel->low.has)
+		std_vec_clone(&placing->low.v, &parallel->low.v, DOLTGRES_SCAN_BYTES);
+	placing->low.has = parallel->low.has;
+	if (parallel->high.has)
+		std_vec_clone(&placing->high.v, &parallel->high.v, DOLTGRES_SCAN_BYTES);
+	placing->high.has = parallel->high.has;
+	trees_KeyOrder_Clone_clone(&scan->order, &placing->order);
+	placing->order_live = true;
+	return true;
+}
+
+/* doltgres_scan_unit_placed_closure_1 is unit_placed's put of the place and the stop in the record. */
+static bool
+doltgres_scan_unit_placed_closure_1(void *captures, HostIoIo *io, DoltgresScanScan *scan, HostError *error)
+{
+	DoltgresScanUnitPlacing *placing = captures;
+
+	doltgres_scan_Place_set(&scan->place, placing->place);
+	doltgres_scan_option_drop(&scan->bound);
+	scan->bound = placing->bound;
+	placing->place.tag = DOLTGRES_SCAN_PLACE_START;
+	placing->bound.has = false;
+	return true;
+}
+
+/* doltgres_scan_unit_placed_frame_t is unit_placed's state across its pad: its reader and what it took, while live. */
+typedef struct doltgres_scan_unit_placed_frame_t
+{
+	HostIoIo   *io;
+	const DoltgresScanStores *stores;
+	HostOwnedHandle handle;
+	HostSharedReader reading;
+	bool		reading_live;
+	DoltgresScanUnitPlacing placing;
+	HostError  *error;
+	bool		ok;
+} doltgres_scan_unit_placed_frame_t;
+
+/* doltgres_scan_unit_placed_pad drops what unit_placed holds. */
+static void
+doltgres_scan_unit_placed_pad(void *frame_)
+{
+	doltgres_scan_unit_placed_frame_t *frame = frame_;
+	DoltgresScanUnitPlacing *placing = &frame->placing;
+
+	doltgres_scan_option_drop(&placing->bound);
+	doltgres_scan_Place_drop(&placing->place);
+	placing->place.tag = DOLTGRES_SCAN_PLACE_START;
+	if (placing->order_live)
+		trees_KeyOrder_drop(&placing->order);
+	doltgres_scan_option_drop(&placing->high);
+	doltgres_scan_option_drop(&placing->low);
+	doltgres_scan_option_drop(&placing->group);
+	placing->order_live = placing->moved = false;
+	if (frame->reading_live)
+		host_shared_Reader_drop(&frame->reading);
+	frame->reading_live = false;
+}
+
+/* doltgres_scan_unit_placed_body finds a moved worker's place and stop in its unit in the newer base's tree. */
+static void
+doltgres_scan_unit_placed_body(void *frame_)
+{
+	doltgres_scan_unit_placed_frame_t *frame = frame_;
+	DoltgresScanUnitPlacing *placing = &frame->placing;
+	const doltgres_OptionVecU8_t *from;
+
+	placing->place.tag = DOLTGRES_SCAN_PLACE_START;
+	if (!host_owned_TableDoltgresScanScan_withUnit(&DOLTGRES_SCAN_SCANS, frame->io, frame->handle,
+												   doltgres_scan_unit_placed_closure_0, placing, NULL, frame->error))
+		return;
+	if (!placing->moved)
+	{
+		frame->ok = true;
+		return;
+	}
+	from = placing->group.has ? &placing->group : &placing->low;
+	if (!placing->has_tree)
+		placing->place = doltgres_scan_off(DOLTGRES_SCAN_DIRECTION_FORWARD);
+	else
+	{
+		if (!host_shared_read(frame->io, &frame->reading, frame->error))
+			return;
+		frame->reading_live = true;
+		if (from->has)
+		{
+			doltgres_scan_place_read_t read = {{placing->tree, from->v.ptr, from->v.len,
+			DOLTGRES_SCAN_DIRECTION_FORWARD, &placing->order, placing->group.has}, .error = frame->error};
+
+			frame->stores->ops->with(frame->stores->self, frame->io, &frame->reading, doltgres_scan_place_read,
+									 &read);
+			if (!read.ok)
+				return;
+			placing->place = read.place;
+		}
+		if (placing->high.has)
+		{
+			doltgres_scan_sought_read_t read = {{placing->tree, placing->high.v.ptr, placing->high.v.len,
+			&placing->order}, &placing->bound, frame->error};
+
+			frame->stores->ops->with(frame->stores->self, frame->io, &frame->reading, doltgres_scan_sought_read,
+									 &read);
+			if (!read.ok)
+				return;
+		}
+	}
+	frame->ok = host_owned_TableDoltgresScanScan_withUnit(&DOLTGRES_SCAN_SCANS, frame->io, frame->handle,
+														  doltgres_scan_unit_placed_closure_1, placing, NULL,
+														  frame->error);
+}
+
+/*
+ * doltgres_scan_unit_placed puts a parallel scan's worker that moved to a
+ * newer base than the shared one (rebased) at its place in its unit in the
+ * newer base's tree, outside the record, since a compared tree's order runs
+ * user code: past its group's key once it has one, as a serial read goes on,
+ * or else at the unit's low key, or the tree's start for unit 0; and stops it
+ * at the first entry at or past the unit's high key, which the newer tree
+ * need not hold, so each key is read by the unit whose edges hold it. A
+ * worker on the shared base, or with no unit, is left as it is.
+ */
+static bool
+doltgres_scan_unit_placed(HostIoIo *io, const DoltgresScanStores *stores, HostOwnedHandle handle, HostError *error)
+{
+	doltgres_scan_unit_placed_frame_t frame = {.io = io, .stores = stores, .handle = handle, .error = error};
+
+	std_landing(&frame, doltgres_scan_unit_placed_body, doltgres_scan_unit_placed_pad);
+	doltgres_scan_unit_placed_pad(&frame);
+	return frame.ok;
+}
+
+/* doltgres_scan_rebasing_frame_t is rebasing's state across its pad: its reader and the move, while live. */
+typedef struct doltgres_scan_rebasing_frame_t
+{
+	HostIoIo   *io;
+	const DoltgresScanStores *stores;
+	const DoltgresScanUnder *under;
+	HostOwnedHandle handle;
+	HostSharedReader reading;
+	bool		reading_live;
+	DoltgresScanRebased rebasing;
+	bool	   *moved;
+	HostError  *error;
+	bool		ok;
+} doltgres_scan_rebasing_frame_t;
+
+/* doltgres_scan_rebasing_pad drops what rebasing holds. */
+static void
+doltgres_scan_rebasing_pad(void *frame_)
+{
+	doltgres_scan_rebasing_frame_t *frame = frame_;
+
+	doltgres_scan_Rebased_drop(&frame->rebasing);
+	if (frame->reading_live)
+		host_shared_Reader_drop(&frame->reading);
+	frame->reading_live = false;
+}
+
+/* doltgres_scan_rebasing_body moves the worker to the newest base under its reader. */
+static void
+doltgres_scan_rebasing_body(void *frame_)
+{
+	doltgres_scan_rebasing_frame_t *frame = frame_;
+	doltgres_scan_rebase_read_t rebase = {frame->under, frame->handle, &frame->rebasing, frame->error};
+
+	if (!host_shared_read(frame->io, &frame->reading, frame->error))
+		return;
+	frame->reading_live = true;
+	frame->stores->ops->with(frame->stores->self, frame->io, &frame->reading, doltgres_scan_rebase_read, &rebase);
+	*frame->moved = rebase.ok && frame->rebasing.moved;
+	frame->ok = rebase.ok;
+}
+
+/*
+ * doltgres_scan_rebasing moves a parallel scan's worker to its storage's
+ * newest base under a reader of its own (rebased) and answers whether it
+ * moved.
+ */
+static bool
+doltgres_scan_rebasing(HostIoIo *io, const DoltgresScanStores *stores, const DoltgresScanUnder *under,
+					   HostOwnedHandle handle, bool *moved, HostError *error)
+{
+	doltgres_scan_rebasing_frame_t frame = {.io = io, .stores = stores, .under = under, .handle = handle,
+	.moved = moved, .error = error};
+
+	std_landing(&frame, doltgres_scan_rebasing_body, doltgres_scan_rebasing_pad);
+	doltgres_scan_rebasing_pad(&frame);
+	return frame.ok;
+}
+
 
 /*
  * doltgres_scan_next_parallel_frame_t is next_parallel's state across its pad:
@@ -6125,6 +7112,7 @@ typedef struct doltgres_scan_next_parallel_frame_t
 	TreesKeyOrder order;
 	bool		order_live;
 	StdVec		keys;
+	bool		keys_live;
 	DoltgresScanStep *result;
 	HostError  *error;
 	bool		ok;
@@ -6136,6 +7124,9 @@ doltgres_scan_next_parallel_pad(void *frame_)
 {
 	doltgres_scan_next_parallel_frame_t *frame = frame_;
 
+	if (frame->keys_live)
+		doltgres_scan_vecs_drop(&frame->keys);
+	frame->keys_live = false;
 	if (frame->order_live)
 		trees_KeyOrder_drop(&frame->order);
 	frame->order_live = false;
@@ -6149,20 +7140,43 @@ doltgres_scan_next_parallel_body(void *frame_)
 {
 	doltgres_scan_next_parallel_frame_t *frame = frame_;
 	doltgres_scan_turn_t turn = {frame->stores, frame->under, DOLTGRES_SCAN_DIRECTION_FORWARD};
+	bool		moved = false;
 
 	for (;;)
 	{
 		DoltgresScanTurn step;
+		uint64		generation;
 
 		if (!host_owned_TableDoltgresScanScan_withOptionBounds(&DOLTGRES_SCAN_SCANS, frame->io, frame->handle,
 															   doltgres_scan_next_parallel_closure_0,
 															   (void *) &frame->stores, NULL, &frame->begun,
 															   frame->error))
 			return;
+		if (moved || frame->begun.has)
+		{
+			if (!doltgres_scan_unit_placed(frame->io, frame->stores, frame->handle, frame->error))
+				return;
+			moved = false;
+		}
 		if (frame->begun.has)
 		{
-			if (!doltgres_scan_unit_keys(frame->io, frame->under, &frame->begun.v, &frame->keys, frame->error))
+			if (!doltgres_scan_unit_keys(frame->io, frame->under, frame->handle, &frame->begun.v, &frame->keys,
+										 frame->error))
 				return;
+			frame->keys_live = true;
+			if (!host_owned_TableDoltgresScanScan_withU64(&DOLTGRES_SCAN_SCANS, frame->io, frame->handle,
+														  doltgres_scan_generation_closure_0, NULL, NULL, &generation,
+														  frame->error))
+				return;
+			if (txn_state_moved_past(frame->under->state, generation))
+			{
+				doltgres_scan_next_parallel_pad(frame);
+				if (!doltgres_scan_rebasing(frame->io, frame->stores, frame->under, frame->handle, &moved,
+											frame->error))
+					return;
+				continue;
+			}
+			frame->keys_live = false;
 			if (!host_owned_TableDoltgresScanScan_withUnit(&DOLTGRES_SCAN_SCANS, frame->io, frame->handle,
 														   doltgres_scan_next_parallel_closure_1, &frame->keys,
 														   doltgres_scan_keys_drop, frame->error))
@@ -6190,12 +7204,31 @@ doltgres_scan_next_parallel_body(void *frame_)
 			frame->ok = true;
 			return;
 		}
-		if (step.tag == DOLTGRES_SCAN_TURN_RUN)
+		if (step.tag == DOLTGRES_SCAN_TURN_MOVED)
+		{
+			if (!doltgres_scan_rebasing(frame->io, frame->stores, frame->under, frame->handle, &moved, frame->error))
+				return;
+		}
+		else if (step.tag == DOLTGRES_SCAN_TURN_RUN)
 		{
 			frame->order = step.u.run;
 			frame->order_live = true;
 			if (!doltgres_scan_run(frame->io, frame->under, &frame->order, &frame->keys, frame->error))
 				return;
+			frame->keys_live = true;
+			if (!host_owned_TableDoltgresScanScan_withU64(&DOLTGRES_SCAN_SCANS, frame->io, frame->handle,
+														  doltgres_scan_generation_closure_0, NULL, NULL, &generation,
+														  frame->error))
+				return;
+			if (txn_state_moved_past(frame->under->state, generation))
+			{
+				doltgres_scan_next_parallel_pad(frame);
+				if (!doltgres_scan_rebasing(frame->io, frame->stores, frame->under, frame->handle, &moved,
+											frame->error))
+					return;
+				continue;
+			}
+			frame->keys_live = false;
 			if (!host_owned_TableDoltgresScanScan_withUnit(&DOLTGRES_SCAN_SCANS, frame->io, frame->handle,
 														   doltgres_scan_next_parallel_closure_4, &frame->keys,
 														   doltgres_scan_keys_drop, frame->error))
@@ -6217,6 +7250,9 @@ doltgres_scan_next_parallel_body(void *frame_)
 														   doltgres_scan_chose_drop, frame->error))
 				return;
 			doltgres_scan_next_parallel_pad(frame);
+			if (chose.moved &&
+				!doltgres_scan_rebasing(frame->io, frame->stores, frame->under, frame->handle, &moved, frame->error))
+				return;
 		}
 	}
 }
@@ -6382,9 +7418,7 @@ doltgres_scan_tests_storage(void)
 static DoltgresScanTrees
 doltgres_scan_tests_trees(const TxnBaseBase *base)
 {
-	DoltgresScanTrees trees = {base->has_root, base->root, base->has_tuple_ids, base->tuple_ids, base->folded};
-
-	return trees;
+	return doltgres_scan_Trees_of(base, 0);
 }
 
 /*
@@ -6514,18 +7548,20 @@ doltgres_scan_tests_le4(uint32 n)
 }
 
 /*
- * doltgres_scan_tests_base builds a tree of rows rows in a store, each keyed
- * by its number big-endian with its number's square as its value and
- * stamped by its number plus one as its tuple id, and returns its root's name
- * as a base's record would decode it.
+ * doltgres_scan_tests_built builds a tree of the rows numbered from one
+ * number up to another in a store, each keyed by its number big-endian with
+ * its number's square as its value and stamped by its number plus one as
+ * its tuple id, and returns its root's name as a base's record would decode
+ * it; its adds and its finish unwrap at a line and column each.
  */
 static TreesStoreTree
-doltgres_scan_tests_base(HostIoIo *io, TreesStoreMemoryStore *store, uint32 rows)
+doltgres_scan_tests_built(HostIoIo *io, TreesStoreMemoryStore *store, uint32 from, uint32 to, uint32 add_line,
+						  uint32 add_col, uint32 finished_line, uint32 finished_col)
 {
 	TreesBuildBuilder builder;
 
 	trees_build_Builder_new(TREES_STORE_MEMORY_STORE_NODE_STORE(store), 256, &builder);
-	for (uint32 n = 0; n < rows; n++)
+	for (uint32 n = from; n < to; n++)
 	{
 		StdVec		key = doltgres_scan_tests_be4(n);
 		StdVec		value = doltgres_scan_tests_le4(n * n);
@@ -6534,9 +7570,19 @@ doltgres_scan_tests_base(HostIoIo *io, TreesStoreMemoryStore *store, uint32 rows
 
 		trees_build_Entry_new_VecU8VecU8(&key, &value, &entry);
 		std_vec_push_Checked(&entry.stamps, &stamp, sizeof(ChunksTrailerStamp), _Alignof(ChunksTrailerStamp));
-		doltgres_scan_tests_add(&builder, io, &entry, 1837, 105);
+		doltgres_scan_tests_add(&builder, io, &entry, add_line, add_col);
 	}
-	return doltgres_scan_tests_finished(&builder, io, 1839, 53);
+	return doltgres_scan_tests_finished(&builder, io, finished_line, finished_col);
+}
+
+/*
+ * doltgres_scan_tests_base builds a tree of rows rows in a store, as built
+ * builds the rows from 0, and returns its root's name.
+ */
+static TreesStoreTree
+doltgres_scan_tests_base(HostIoIo *io, TreesStoreMemoryStore *store, uint32 rows)
+{
+	return doltgres_scan_tests_built(io, store, 0, rows, 1837, 105, 1839, 53);
 }
 
 /* doltgres_scan_tests_next reads a scan's next row, which unwraps at a line and column. */
@@ -6638,8 +7684,8 @@ doltgres_scan_tests_begin(HostIoIo *io, TreesStoreMemoryStore *store, uint64 blo
 	HostError	failed;
 
 	std_slice_to_vec_Checked(&layout, keyed, keyed_len, DOLTGRES_SCAN_BYTES);
-	if (!doltgres_scan_scan_begin(io, TREES_STORE_MEMORY_STORE_NODE_STORE(store), blocks, base, &layout, table, &order,
-								  &handle, &failed))
+	if (!doltgres_scan_scan_begin(io, TREES_STORE_MEMORY_STORE_NODE_STORE(store), blocks, base, 0, &layout, table,
+								  &order, &handle, &failed))
 		STD_RESULT_EXPECT_FAILED(line, col, DOLTGRES_SCAN_TESTS_UNWRAP, &failed, host_Error_Debug_fmt);
 	return handle;
 }
@@ -7652,7 +8698,7 @@ doltgres_scan_tests_begin_parallel(HostIoIo *io, DoltgresScanShared *shared, con
 	HostError	failed;
 
 	std_slice_to_vec_Checked(&layout, keyed, keyed_len, DOLTGRES_SCAN_BYTES);
-	if (!doltgres_scan_begin_parallel(io, shared, &layout, 0, &order, &handle, &failed))
+	if (!doltgres_scan_begin_parallel(io, shared, 0, &layout, 0, &order, &handle, &failed))
 		STD_RESULT_EXPECT_FAILED(line, col, DOLTGRES_SCAN_TESTS_UNWRAP, &failed, host_Error_Debug_fmt);
 	return handle;
 }
@@ -8808,7 +9854,7 @@ test_doltgres_scan_tests_a_compared_scan_merges_the_deltas_keys_in_the_tables_or
 	under.has_serial = false;
 	based = doltgres_scan_tests_based(tree, NULL, 1);
 	std_slice_to_vec_Checked(&layout, keyed, 1, DOLTGRES_SCAN_BYTES);
-	if (!doltgres_scan_scan_begin(io, TREES_STORE_MEMORY_STORE_NODE_STORE(&store), 1, &based, &layout, 0, &order,
+	if (!doltgres_scan_scan_begin(io, TREES_STORE_MEMORY_STORE_NODE_STORE(&store), 1, &based, 0, &layout, 0, &order,
 								  &handle, &failed))
 		STD_RESULT_EXPECT_FAILED(2697, 95, DOLTGRES_SCAN_TESTS_UNWRAP, &failed, host_Error_Debug_fmt);
 	w = writer.f0;
@@ -9422,6 +10468,333 @@ void
 test_doltgres_scan_tests_a_scan_with_no_sample_or_range_leaves_its_answers_as_they_were(void)
 {
 	doltgres_scan_tests_run(test_doltgres_scan_tests_a_scan_with_no_sample_or_range_leaves_its_answers_as_they_were_closure_0);
+}
+
+/*
+ * test_doltgres_scan_tests_a_scan_moves_to_a_newer_base_at_its_next_read_and_gives_every_row_once_closure_0
+ * is the case's actor.
+ */
+static void
+test_doltgres_scan_tests_a_scan_moves_to_a_newer_base_at_its_next_read_and_gives_every_row_once_closure_0(void *captures)
+{
+	HostIoIo   *io = ((doltgres_scan_tests_case_t *) captures)->io;
+	static const uint8 keyed[] = {1};
+	TreesStoreMemoryStore store = trees_store_MemoryStore_new();
+	HostSharedHeld held = doltgres_scan_tests_made(io);
+	HostSharedRecord state = host_shared_Held_record(&held);
+	TreesStoreTree older = doltgres_scan_tests_base(io, &store, 4);
+	TreesStoreTree newer = doltgres_scan_tests_base(io, &store, 8);
+	HostXid		writer = simc_begin();
+	TxnStatusOutcome committed = {.tag = TXN_STATUS_OUTCOME_COMMITTED, .u.committed = 100};
+	TxnStatusRoomed roomed;
+	bool		took;
+	SimcTaken	after_taken;
+	HostSnapshot after;
+	TxnBaseBase based;
+	TxnBaseBase installed;
+	uint64		generation;
+	HostOwnedHandle handle;
+	DoltgresScanUnder under;
+	StdVec		rows;
+	StdVec		rest;
+	HostError	error;
+
+	for (uint32 n = 4; n < 8; n++)
+	{
+		StdVec		key = doltgres_scan_tests_be4(n);
+		StdVec		tuple = doltgres_scan_tests_le4(n * n);
+		TxnMemtableOp op = {.tag = TXN_MEMTABLE_OP_PUT};
+
+		op.u.put = doltgres_scan_tests_put(tuple.ptr, tuple.len, (uint64) n + 1);
+		doltgres_scan_tests_pushed(io, &held, key.ptr, key.len, writer, 0, &op);
+		std_vec_free_Checked(&tuple, DOLTGRES_SCAN_BYTES);
+		std_vec_free_Checked(&key, DOLTGRES_SCAN_BYTES);
+	}
+	if (!txn_status_take(io, writer, committed, &roomed, &took, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, DOLTGRES_SCAN_TESTS_UNWRAP, &error, host_Error_Debug_fmt);
+	simc_commit(writer);
+	after_taken = simc_snapshot(HOST_SNAPSHOT_KIND_MVCC, false);
+	after = simc_Taken_lent(&after_taken);
+	generation = txn_state_generation(state);
+	based = doltgres_scan_tests_based(older, NULL, 1);
+	handle = doltgres_scan_tests_begin(io, &store, 1, &based, keyed, 1, 0, __LINE__, 0);
+	under.state = state;
+	under.snapshot = &after;
+	under.has_serial = false;
+	std_vec_new(&rows, sizeof(DoltgresScanRow), _Alignof(DoltgresScanRow));
+	for (int i = 0; i < 6; i++)
+	{
+		DoltgresScanRow row;
+
+		STD_ASSERT(__LINE__, 0,
+				   doltgres_scan_tests_next(io, &store, &under, handle, DOLTGRES_SCAN_DIRECTION_FORWARD, &row,
+											__LINE__, 0),
+				   "next(io, &store, &under, handle, Direction::Forward).unwrap().is_some()");
+		std_vec_push_Checked(&rows, &row, sizeof(DoltgresScanRow), _Alignof(DoltgresScanRow));
+	}
+	installed = doltgres_scan_tests_based(newer, NULL, 1);
+	installed.folded = 200;
+	if (!txn_state_installed(HOST_IO_IO_TAKES_SHORT(io), &held, generation, &installed, &took, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, DOLTGRES_SCAN_TESTS_UNWRAP, &error, host_Error_Debug_fmt);
+	STD_ASSERT(__LINE__, 0, took, "state::installed(io, &held, generation, &installed).unwrap()");
+	for (uint32 n = 4; n < 8; n++)
+	{
+		StdVec		key = doltgres_scan_tests_be4(n);
+		StdVec		versions;
+		StdVec		handles;
+		StdVec		removed;
+		HostDeltaHold hold;
+
+		if (!host_delta_hold(io, &hold, &error) ||
+			!txn_memtable_table_versions(io, &hold, state, key.ptr, key.len, &versions, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 0, DOLTGRES_SCAN_TESTS_UNWRAP, &error, host_Error_Debug_fmt);
+		std_vec_new(&handles, sizeof(TxnMemtableVersionHandle), _Alignof(TxnMemtableVersionHandle));
+		for (size_t v = 0; v < versions.len; v++)
+			std_vec_push_Checked(&handles, &STD_VEC_AT(&versions, TxnMemtableVersionVersion, v).handle,
+								 sizeof(TxnMemtableVersionHandle), _Alignof(TxnMemtableVersionHandle));
+		txn_memtable_version_versions_drop(&versions, 0);
+		host_delta_Hold_drop(&hold);
+		if (!txn_memtable_table_removed(&TXN_MEMTABLE_TABLE_ROWS_TREE_OPS, io, state, key.ptr, key.len, handles.ptr,
+										handles.len, &removed, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 0, DOLTGRES_SCAN_TESTS_UNWRAP, &error, host_Error_Debug_fmt);
+		std_vec_free_Checked(&removed, sizeof(bool), _Alignof(bool));
+		std_vec_free_Checked(&handles, sizeof(TxnMemtableVersionHandle), _Alignof(TxnMemtableVersionHandle));
+		std_vec_free_Checked(&key, DOLTGRES_SCAN_BYTES);
+	}
+	rest = doltgres_scan_tests_read(io, &store, &under, handle, DOLTGRES_SCAN_DIRECTION_FORWARD);
+	for (size_t i = 0; i < rest.len; i++)
+		std_vec_push_Checked(&rows, &STD_VEC_AT(&rest, DoltgresScanRow, i), sizeof(DoltgresScanRow),
+							 _Alignof(DoltgresScanRow));
+	std_vec_free_Checked(&rest, sizeof(DoltgresScanRow), _Alignof(DoltgresScanRow));
+	STD_ASSERT(__LINE__, 0, doltgres_scan_tests_expected(&rows, 0, 8, false), "every row once across the install");
+	doltgres_scan_tests_rows_drop(&rows);
+	rows = doltgres_scan_tests_read(io, &store, &under, handle, DOLTGRES_SCAN_DIRECTION_BACKWARD);
+	STD_ASSERT(__LINE__, 0, doltgres_scan_tests_expected(&rows, 0, 8, true),
+			   "read(io, &store, &under, handle, Direction::Backward) == reversed(&expected(8))");
+	doltgres_scan_tests_rows_drop(&rows);
+	doltgres_scan_tests_end(io, handle, __LINE__, 0);
+	simc_Taken_drop(&after_taken);
+	host_shared_Held_drop(&held);
+	trees_store_MemoryStore_drop(&store);
+}
+
+/*
+ * Bugs rows 240 and 241: a scan that has read part of its base and of the
+ * delta when an install gives the storage a newer base holding the delta's
+ * committed rows, and a drop takes them out of the delta, moves to the newer
+ * base at its next read and goes on past its group's key, so it gives every
+ * row once, and its read back after gives them all once the other way. A
+ * C-only case.
+ */
+void
+test_doltgres_scan_tests_a_scan_moves_to_a_newer_base_at_its_next_read_and_gives_every_row_once(void)
+{
+	doltgres_scan_tests_run(test_doltgres_scan_tests_a_scan_moves_to_a_newer_base_at_its_next_read_and_gives_every_row_once_closure_0);
+}
+
+/* DOLTGRES_SCAN_TESTS_HELD_DATABASE is the held reader case's database. */
+#define DOLTGRES_SCAN_TESTS_HELD_DATABASE 9631
+
+/*
+ * doltgres_scan_tests_held_t is the held reader case's actors' captures: the
+ * store, the older and newer bases' trees, the base generation the reader
+ * takes its base at, and the rows the reader read.
+ */
+typedef struct doltgres_scan_tests_held_t
+{
+	TreesStoreMemoryStore *store;
+	TreesStoreTree older;
+	TreesStoreTree newer;
+	uint64		generation;
+	StdVec	   *rows;
+} doltgres_scan_tests_held_t;
+
+/* doltgres_scan_tests_held_storage returns the held reader case's storage. */
+static HostStorage
+doltgres_scan_tests_held_storage(void)
+{
+	HostStorage storage = {HOST_PG_DEFAULT, DOLTGRES_SCAN_TESTS_HELD_DATABASE, 16384};
+
+	return storage;
+}
+
+/* doltgres_scan_tests_held_state opens the held reader case's repository and its storage's state. */
+static bool
+doltgres_scan_tests_held_state(HostIoIo *io, HostSharedHeld *result, HostError *error)
+{
+	HostStorage storage = doltgres_scan_tests_held_storage();
+	RepoRepo	repo;
+	HostSharedReader reading;
+	ChunksErrorError failed;
+	bool		ok;
+
+	if (!repo_Repo_open(io, DOLTGRES_SCAN_TESTS_HELD_DATABASE, HOST_PG_DEFAULT, &repo, &failed))
+	{
+		*error = txn_base_storage(&failed);
+		return false;
+	}
+	ok = host_shared_read(io, &reading, error);
+	if (ok)
+	{
+		ok = txn_state_state(io, &repo, &reading, &storage, TXN_STATE_PERSISTENCE_PERMANENT, false, NULL, result,
+							 error);
+		host_shared_Reader_drop(&reading);
+	}
+	repo_Repo_drop(&repo);
+	return ok;
+}
+
+/* doltgres_scan_tests_held_reader is the held reader case's reader: it reads the scan of the older base to its end. */
+static bool
+doltgres_scan_tests_held_reader(void *captures, HostIoIo *io, HostError *error)
+{
+	const doltgres_scan_tests_held_t *c = captures;
+	static const uint8 keyed[] = {1};
+	TxnBaseBase based = doltgres_scan_tests_based(c->older, NULL, 1);
+	DoltgresScanStores stores = doltgres_scan_tests_stores(c->store);
+	DoltgresScanLayout layout = doltgres_scan_tests_layout(keyed, 1, 0);
+	HostSharedHeld held;
+	SimcTaken	taken;
+	HostSnapshot snapshot;
+	DoltgresScanUnder under = {.has_serial = false};
+	HostOwnedHandle handle;
+	bool		ok;
+
+	if (!doltgres_scan_tests_held_state(io, &held, error))
+	{
+		doltgres_scan_Layout_drop(&layout);
+		return false;
+	}
+	taken = simc_snapshot(HOST_SNAPSHOT_KIND_MVCC, false);
+	snapshot = simc_Taken_lent(&taken);
+	under.state = host_shared_Held_record(&held);
+	under.snapshot = &snapshot;
+	ok = doltgres_scan_scan_begin(io, TREES_STORE_MEMORY_STORE_NODE_STORE(c->store), 1, &based, c->generation,
+								  &layout.keyed, 0, &layout.order, &handle, error);
+	for (;;)
+	{
+		DoltgresScanRow row;
+		bool		has;
+
+		if (!ok)
+			break;
+		ok = doltgres_scan_next(io, &stores, &under, handle, DOLTGRES_SCAN_DIRECTION_FORWARD, &has, &row, error);
+		if (!ok || !has)
+			break;
+		std_vec_push_Checked(c->rows, &row, sizeof(DoltgresScanRow), _Alignof(DoltgresScanRow));
+	}
+	ok = ok && doltgres_scan_scan_end(io, handle, error);
+	simc_Taken_drop(&taken);
+	host_shared_Held_drop(&held);
+	return ok;
+}
+
+/* doltgres_scan_tests_held_folder is the held reader case's folder: it installs the newer base and drops the spills. */
+static bool
+doltgres_scan_tests_held_folder(void *captures, HostIoIo *io, HostError *error)
+{
+	const doltgres_scan_tests_held_t *c = captures;
+	TxnBaseBase installed = doltgres_scan_tests_based(c->newer, NULL, 1);
+	HostSharedHeld held;
+	bool		took = false;
+	bool		ok;
+
+	installed.folded = 200;
+	if (!doltgres_scan_tests_held_state(io, &held, error))
+		return false;
+	ok = txn_state_installed(HOST_IO_IO_TAKES_SHORT(io), &held, c->generation, &installed, &took, error);
+	STD_ASSERT(__LINE__, 0, !ok || took, "state::installed(io, &held, generation, &installed)?");
+	ok = ok && txn_spill_folded(io, host_shared_Held_record(&held), 200, error);
+	host_shared_Held_drop(&held);
+	return ok;
+}
+
+/*
+ * Bugs rows 240 and 241's check after the delta read: a scan's first read,
+ * held inside its read of the delta before it reads the spill files that
+ * hold the delta's committed rows, all below its base's first entry, while
+ * an install gives the storage a newer base holding them and a drop takes
+ * their files out, finds once it read the delta that the base moved, moves
+ * to the newer base, and gives every row once; with the check before the
+ * delta read it pairs its base with the dropped delta and misses them. A
+ * C-only case.
+ */
+void
+test_doltgres_scan_tests_a_scan_held_inside_its_delta_read_across_an_install_and_drop_gives_every_row_once(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostStorage storage = doltgres_scan_tests_held_storage();
+	TreesStoreMemoryStore store = trees_store_MemoryStore_new();
+	StdVec		rows;
+	doltgres_scan_tests_held_t captures = {.store = &store, .rows = &rows};
+	SimcActor	reader = {doltgres_scan_tests_held_reader, &captures};
+	SimcActor	folder = {doltgres_scan_tests_held_folder, &captures};
+	SimcStep	steps[2] = {{"folder", 6, PG_UINT64_MAX}, {"reader", 6, PG_UINT64_MAX}};
+	SimcEnding	returned = {.tag = SIMC_ENDING_RETURNED};
+	TxnStatusOutcome committed = {.tag = TXN_STATUS_OUTCOME_COMMITTED, .u.committed = 100};
+	TxnStatusRoomed roomed;
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+	HostXid		writer;
+	ChunksErrorError created;
+	HostError	error;
+	SimcRun		run;
+	SimcReport	report;
+	bool		spilled;
+	bool		took;
+	bool		has_count;
+	uint64		count;
+
+	captures.older = doltgres_scan_tests_built(io, &store, 8, 12, __LINE__, 0, __LINE__, 0);
+	captures.newer = doltgres_scan_tests_built(io, &store, 0, 12, __LINE__, 0, __LINE__, 0);
+	if (!repo_Repo_create(io, DOLTGRES_SCAN_TESTS_HELD_DATABASE, HOST_PG_DEFAULT, &repo, &created))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, DOLTGRES_SCAN_TESTS_UNWRAP, &created, chunks_error_Error_Debug_fmt);
+	if (!host_shared_read(io, &reading, &error) ||
+		!txn_state_state(io, &repo, &reading, &storage, TXN_STATE_PERSISTENCE_PERMANENT, false, NULL, &held, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, DOLTGRES_SCAN_TESTS_UNWRAP, &error, host_Error_Debug_fmt);
+	writer = simc_begin();
+	for (uint32 n = 0; n < 8; n++)
+	{
+		StdVec		key = doltgres_scan_tests_be4(n);
+		StdVec		tuple = doltgres_scan_tests_le4(n * n);
+		TxnMemtableOp op = {.tag = TXN_MEMTABLE_OP_PUT};
+
+		op.u.put = doltgres_scan_tests_put(tuple.ptr, tuple.len, (uint64) n + 1);
+		doltgres_scan_tests_pushed(io, &held, key.ptr, key.len, writer, 0, &op);
+		std_vec_free_Checked(&tuple, DOLTGRES_SCAN_BYTES);
+		std_vec_free_Checked(&key, DOLTGRES_SCAN_BYTES);
+	}
+	if (!txn_spill_spilled(io, &storage, TXN_WRITTEN_OF_ROWS, writer.f0, &spilled, &error) ||
+		!txn_status_take(io, writer, committed, &roomed, &took, &error) ||
+		!txn_status_add(io, writer, 8, &has_count, &count, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, DOLTGRES_SCAN_TESTS_UNWRAP, &error, host_Error_Debug_fmt);
+	STD_ASSERT(__LINE__, 0, spilled, "spill::spilled(io, &storage, Of::Rows, writer.0).unwrap()");
+	simc_commit(writer);
+	captures.generation = txn_state_generation(host_shared_Held_record(&held));
+	host_shared_Held_drop(&held);
+	host_shared_Reader_drop(&reading);
+	repo_Repo_drop(&repo);
+	std_vec_new(&rows, sizeof(DoltgresScanRow), _Alignof(DoltgresScanRow));
+	run = simc_Run_new(5);
+	simc_Run_actor(&run, "reader", 6, reader);
+	simc_Run_actor(&run, "folder", 6, folder);
+	simc_Run_until(&run, "reader", 6, "doltgres-spill-slots-read");
+	simc_Run_script(&run, steps, lengthof(steps));
+	report = simc_Run_finish(run);
+	STD_ASSERT(__LINE__, 0, report.outcome.tag == SIMC_OUTCOME_ENDED, "the run ended");
+	for (size_t k = 0; k < report.outcome.u.ended.len; k++)
+		STD_ASSERT(__LINE__, 0,
+				   simc_Ending_PartialEq_eq(&STD_VEC_AT(&report.outcome.u.ended, simc_TupleStringEnding_t, k).f1,
+											&returned),
+				   "every actor returned Ok(())");
+	STD_ASSERT(__LINE__, 0, doltgres_scan_tests_expected(&rows, 0, 12, false),
+			   "every row once across the install and drop");
+	doltgres_scan_tests_rows_drop(&rows);
+	simc_Report_drop(&report);
+	trees_store_MemoryStore_drop(&store);
+	simc_TestIo_drop(&test_io);
 }
 
 #endif							/* DOLTGRES_TEST_DOLTGRES */

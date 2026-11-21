@@ -121,4 +121,11 @@ extern bool txn_change_end(HostIoIo *io, const HostSharedHeld *held, TxnChangeEn
 extern bool txn_change_redo(HostIoIo *io, const HostSharedHeld *held, const TxnRecordRowChange *change, uint64 lsn,
 							HostError *error);
 
+#ifdef DOLTGRES_TEST_TXN
+extern void test_txn_change_tests_a_keys_stripe_is_its_storage_and_bytes_or_its_storage_alone(void);
+extern void test_txn_change_tests_a_delete_is_logged_pushed_and_redone_once_and_a_lock_is_never_logged(void);
+extern void test_txn_change_tests_an_aborted_delete_and_lock_go_at_the_take_back(void);
+extern void test_txn_change_tests_a_change_of_a_spilled_row_reads_its_spilled_version(void);
+#endif
+
 #endif							/* DOLTGRES_TXN_CHANGE_H */

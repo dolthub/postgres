@@ -194,6 +194,7 @@ extern const ChunksIndexAddressIndexLocator *chunks_packs_view_View_forwards(con
 extern const ChunksPacksTable *chunks_packs_view_View_table(const ChunksPacksViewView *self);
 extern ChunksPacksViewReadRuns *chunks_packs_view_runs_get(const StdVec *runs, uint32 space);
 extern ChunksPacksViewReadRuns *chunks_packs_view_runs_entry(StdVec *runs, uint32 space);
+extern void chunks_packs_view_runs_remove(StdVec *runs, uint32 space);
 extern bool chunks_packs_view_missing_contains(const StdVec *missing, uint32 space);
 
 /* reads.c's reads through a view. */

@@ -55,9 +55,12 @@ is( $node->safe_psql(
 );
 is( $node->safe_psql(
 		'postgres', q{
-SELECT pg_relation_size('sized', 'fsm'), pg_relation_size('sized', 'vm'), pg_relation_size('sized', 'init')}),
-	'0|0|0',
-	'a fork table\'s other forks have no size');
+SELECT pg_relation_size('sized', 'fsm')
+		= coalesce((pg_stat_file(pg_relation_filepath('sized') || '_fsm', true)).size, 0),
+	pg_relation_size('sized', 'vm'), pg_relation_size('sized', 'init')}),
+	't|0|0',
+	'a fork table\'s free space map fork is its real pages, and its other forks have no size'
+);
 is( $node->safe_psql(
 		'postgres', q{
 SELECT pg_relation_size('sized_k') % 8192 = 0 AND pg_relation_size('sized_k') >= 16384,
@@ -419,6 +422,224 @@ is(sized($standby, 'stood'), $primary_sizes, 'a hot standby\'s sizes equal its p
 $standby->promote;
 is(sized($standby, 'stood'), $primary_sizes, 'a promoted standby\'s sizes equal its primary\'s');
 $standby->stop;
+
+# Bugs rows 240 and 316: a commit's totals, held where the commit reads its
+# storage's base before a fold installs a base holding another transaction's
+# rows and drops their versions from the delta, move by what the commit's
+# rows change, so a DELETE of those rows leaves a keyless table's totals, and
+# an UPDATE that keeps their values leaves a TOAST relation's, equal to a fresh
+# count; and a reader's count of totals a rewrite left unknown, held where
+# the count reads the base before such a fold, counts them again to a fresh
+# count.
+sub launcher_held
+{
+	$node->safe_psql('postgres',
+		"SELECT injection_points_attach('doltgres-fold-launch', 'wait')");
+	$node->poll_query_until('postgres',
+		q{SELECT count(*) = 1 FROM pg_stat_activity WHERE wait_event = 'doltgres-fold-launch'}
+	) or die 'the fold launcher never waited';
+	$node->poll_query_until('postgres',
+		q{SELECT count(*) = 0 FROM pg_stat_activity WHERE backend_type = 'fold worker'}
+	) or die 'a fold worker kept running';
+}
+
+sub launcher_freed
+{
+	$node->safe_psql('postgres',
+		"SELECT injection_points_detach('doltgres-fold-launch'); SELECT injection_points_wakeup('doltgres-fold-launch')"
+	);
+}
+
+sub held_fold
+{
+	my ($table, $point, $before, $held) = @_;
+	launcher_held();
+	$node->safe_psql('postgres', $before);
+	my $session = $node->background_psql('postgres', on_error_stop => 0);
+	$session->query_safe(
+		"SELECT injection_points_set_local(); SELECT injection_points_attach('$point', 'wait')"
+	);
+	$session->query_until(qr/held/, "\\echo held\n$held;\n");
+	$node->wait_for_event('client backend', $point);
+	is($node->safe_psql('postgres', "SELECT doltgres_test_fold('$table')"),
+		't', "a fold under a backend held at $point installs a base");
+	launcher_freed();
+	$node->safe_psql('postgres',
+		"SELECT injection_points_detach('$point'); SELECT injection_points_wakeup('$point')"
+	);
+	$session->query('SELECT 1');
+	$session->quit;
+}
+held_fold(
+	'moved_rows',
+	'doltgres-commit-based',
+	q{CREATE TABLE moved_rows (k int4, v text);
+INSERT INTO moved_rows SELECT g, 'v' || g FROM generate_series(1, 100) g},
+	'BEGIN; DELETE FROM moved_rows WHERE k <= 50; COMMIT');
+is(totals('moved_rows'), count('moved_rows'),
+	'a commit held across a fold that applied the rows it deletes moves a keyless table\'s totals to a fresh count'
+);
+$node->safe_psql(
+	'postgres', q{
+CREATE TABLE moved_values (k int4, v text);
+ALTER TABLE moved_values ALTER COLUMN v SET STORAGE EXTERNAL;
+});
+my $moved_toast = $node->safe_psql('postgres',
+	q{SELECT reltoastrelid::regclass FROM pg_class WHERE relname = 'moved_values'}
+);
+held_fold(
+	$moved_toast,
+	'doltgres-commit-valued',
+	q{INSERT INTO moved_values SELECT g, repeat(chr(64 + g), 3000) FROM generate_series(1, 20) g},
+	'BEGIN; UPDATE moved_values SET k = k + 100 WHERE k <= 10; COMMIT');
+is(totals($moved_toast), count($moved_toast),
+	'a commit held across a fold that applied the values its update keeps moves a TOAST relation\'s totals to a fresh count'
+);
+held_fold(
+	'recounted',
+	'doltgres-recount-based',
+	q{CREATE TABLE recounted (k int4);
+INSERT INTO recounted SELECT g FROM generate_series(1, 10) g;
+ALTER TABLE recounted ALTER COLUMN k TYPE int8;
+INSERT INTO recounted SELECT g FROM generate_series(11, 20) g},
+	q{SELECT pg_relation_size('recounted')});
+is(totals('recounted'), count('recounted'),
+	'a count held across a fold counts the totals again to a fresh count');
+
+# Bugs row 316: a DELETE after a count that a fold's install met, as merge's
+# DELETE and ANALYZE met one, takes its rows from totals the count left right:
+# after a crash's restart leaves a folded table's totals unknown, a reader's
+# count held across a fold of rows inserted since is followed by a DELETE of
+# more rows than the older base holds, and the table's size still reads and
+# its totals equal a fresh count, where totals counted over the older base
+# wrapped past zero.
+$node->safe_psql(
+	'postgres', q{
+CREATE TABLE restarted_count (k int4);
+INSERT INTO restarted_count SELECT g FROM generate_series(1, 10) g;
+SELECT doltgres_test_fold('restarted_count');
+});
+$node->stop('immediate');
+$node->start;
+held_fold(
+	'restarted_count',
+	'doltgres-recount-based',
+	q{INSERT INTO restarted_count SELECT g FROM generate_series(11, 20) g},
+	q{SELECT pg_relation_size('restarted_count')});
+$node->safe_psql('postgres', 'DELETE FROM restarted_count WHERE k <= 15');
+$node->psql(
+	'postgres', q{SELECT pg_relation_size('restarted_count')},
+	stdout => \my $restarted_size,
+	stderr => \my $restarted_error);
+is($restarted_error, '',
+	'a DELETE after a count held across a fold leaves the table\'s size readable'
+);
+is(totals('restarted_count'), count('restarted_count'),
+	'a DELETE after a count held across a fold moves the totals to a fresh count'
+);
+
+# Bugs row 316's carriers: a rewrite that carries versions into a new storage,
+# which an older snapshot makes it do by holding the fold horizon below their
+# rows, leaves that storage's totals unknown, since its base's sizes count
+# only the rows folded into it, so after a DELETE and a VACUUM the relation's
+# size reads and equals a twin's that no snapshot held, and a table's totals
+# equal a fresh count, where totals of the base alone wrapped past zero:
+# merge's primary key added to a keyless table, an index's build, and a
+# table's move to another tablespace.
+my $spaced = $node->basedir . '/carried_space';
+mkdir $spaced or die "mkdir $spaced: $!";
+$node->safe_psql('postgres',
+	"CREATE TABLESPACE carried_space LOCATION '$spaced'");
+my %carriers = (
+	rekeyed => [ '%T', 'ALTER TABLE %T ADD PRIMARY KEY (tid)' ],
+	indexed => [ '%T_tid', 'CREATE INDEX %T_tid ON %T (tid)' ],
+	moved => [ '%T', 'ALTER TABLE %T SET TABLESPACE carried_space' ],);
+my %carrier_named = (
+	rekeyed => 'a key change',
+	indexed => 'an index build',
+	moved => 'a move to another tablespace');
+for my $carrier ('rekeyed', 'indexed', 'moved')
+{
+	my $named = $carrier_named{$carrier};
+	my %size;
+	for my $table ($carrier, "${carrier}_twin")
+	{
+		my ($sized, $carry) = @{ $carriers{$carrier} };
+		s/%T/$table/g for ($sized, $carry);
+		my $horizon = $node->background_psql('postgres');
+		$horizon->query_safe(
+			'BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1')
+		  if $table eq $carrier;
+		$node->safe_psql('postgres',
+			"CREATE TABLE $table (tid int4, balance int4); INSERT INTO $table SELECT g, 0 FROM generate_series(1, 20) g; $carry"
+		);
+		$horizon->query_safe('COMMIT') if $table eq $carrier;
+		$horizon->quit;
+		$node->safe_psql('postgres', "DELETE FROM $table WHERE tid > 5");
+		$node->safe_psql('postgres', "VACUUM $table");
+		$node->psql(
+			'postgres', "SELECT pg_relation_size('$sized')",
+			stdout => \$size{$table},
+			stderr => \my $carried_error);
+		is($carried_error, '',
+			"a DELETE and VACUUM after $named leave the size readable")
+		  if $table eq $carrier;
+		is(totals($sized), count($sized),
+			"a DELETE and VACUUM after $named that carried its rows move the totals to a fresh count"
+		) if $table eq $carrier && $carrier ne 'indexed';
+	}
+	is($size{$carrier}, $size{"${carrier}_twin"},
+		"after $named that carried its rows, the size is a twin's that no snapshot held"
+	);
+}
+
+# Bugs row 323: a commit's moves count only the versions its storage's base
+# didn't apply. After a fold's install is made durable and a crash's restart
+# replays the versions that fold applied, a reader's count makes the totals
+# known, and an UPDATE's commit moves a keyless table's totals to a fresh
+# count, where counting the replayed versions again added the folded rows
+# twice.
+$node->safe_psql(
+	'postgres', q{
+CREATE TABLE replayed (k int4, v text);
+INSERT INTO replayed SELECT g % 3, 'v' FROM generate_series(1, 10) g;
+SELECT doltgres_test_fold('replayed');
+CREATE TABLE replayed_flushed (k int4);
+});
+$node->stop('immediate');
+$node->start;
+launcher_held();
+$node->safe_psql('postgres', q{SELECT pg_relation_size('replayed')});
+$node->safe_psql('postgres',
+	q{BEGIN; UPDATE replayed SET v = 's' WHERE k = 0; COMMIT});
+launcher_freed();
+is(totals('replayed'), count('replayed'),
+	'a commit after a restart replayed what a fold applied moves a keyless table\'s totals to a fresh count'
+);
+
+# Bugs row 312: every block of a fork table is all-visible and all-frozen
+# (Differences row 10), so CREATE INDEX, ANALYZE, and REINDEX, which recount
+# through visibilitymap_count, write relallvisible and relallfrozen equal to
+# relpages, as the fork's VACUUM does, on a table no VACUUM has touched.
+my $all_visible = q{
+SELECT relpages > 0, relallvisible = relpages, relallfrozen = relpages FROM pg_class WHERE relname = '%T'};
+$node->safe_psql('postgres',
+	'CREATE TABLE counted_indexed (id int4); INSERT INTO counted_indexed SELECT g FROM generate_series(1, 3000) g; CREATE INDEX ON counted_indexed (id)'
+);
+is($node->safe_psql('postgres', $all_visible =~ s/%T/counted_indexed/r),
+	't|t|t', 'CREATE INDEX counts a fork table\'s every block all-visible');
+$node->safe_psql('postgres',
+	'CREATE TABLE counted_analyzed (id int4); INSERT INTO counted_analyzed SELECT g FROM generate_series(1, 3000) g; ANALYZE counted_analyzed'
+);
+is($node->safe_psql('postgres', $all_visible =~ s/%T/counted_analyzed/r),
+	't|t|t', 'ANALYZE counts a fork table\'s every block all-visible');
+$node->safe_psql('postgres',
+	'INSERT INTO counted_indexed SELECT g FROM generate_series(3001, 9000) g; REINDEX TABLE counted_indexed'
+);
+is( $node->safe_psql('postgres', $all_visible =~ s/%T/counted_indexed/r),
+	't|t|t',
+	'REINDEX counts a fork table\'s every block all-visible after more writes'
+);
 
 $node->stop;
 done_testing();
