@@ -1,0 +1,17 @@
+[
+ {
+  "before": "INSERT INTO INSERT_TBL(y) select yd from tmp;",
+  "table": "tmp",
+  "order": "array_position(ARRAY[$o$(5,\"!check failed\",)$o$, $o$(,\"try again\",)$o$, $o$(,Y,)$o$]::text[], record_rows::text)"
+ },
+ {
+  "before": "UPDATE INSERT_TBL SET x = -z, z = -x;",
+  "table": "INSERT_TBL",
+  "order": "array_position(ARRAY[$o$(6,Y,-6)$o$, $o$(4,\"!check failed\",-4)$o$, $o$(,\"try again\",)$o$, $o$(7,\"try again\",-7)$o$, $o$(,\"try again\",-5)$o$]::text[], record_rows::text)"
+ },
+ {
+  "before": "UPDATE INSERT_TBL SET x = z, z = x;",
+  "table": "INSERT_TBL",
+  "order": "array_position(ARRAY[$o$(6,Y,-6)$o$, $o$(4,\"!check failed\",-4)$o$, $o$(,\"try again\",)$o$, $o$(5,\"try again\",)$o$, $o$(7,\"try again\",-7)$o$]::text[], record_rows::text)"
+ }
+]

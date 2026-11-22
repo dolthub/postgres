@@ -1,0 +1,23 @@
+[
+ {
+  "before": "UPDATE part_c_100_200 set c = c - 20, d = c WHERE c = 105;",
+  "table": "part_c_100_200",
+  "order": "array_position(ARRAY[$o$(19,105,,b,17)$o$, $o$(16,105,,b,15)$o$]::text[], record_rows::text)"
+ },
+ {
+  "before": "UPDATE part_b_10_b_20 set b = b - 6 WHERE c > 116 returning *;",
+  "table": "part_b_10_b_20",
+  "order": "array_position(ARRAY[$o$(9,125,b,17,9)$o$, $o$(1,116,b,12,1)$o$, $o$(6,125,b,15,6)$o$, $o$(2,117,b,13,2)$o$]::text[], record_rows::text)"
+ },
+ {
+  "before": "UPDATE range_parted set c = (case when c = 96 then 110 else c + 1 end ) WHERE a = 'b' and b > 10 and c >= 96;",
+  "table": "range_parted",
+  "order": "array_position(ARRAY[$o$(a,1,1,1,)$o$, $o$(a,10,200,1,)$o$, $o$(b,12,96,1,)$o$, $o$(b,13,97,2,)$o$, $o$(b,17,105,19,)$o$, $o$(b,15,105,16,)$o$]::text[], record_rows::text)"
+ },
+ {
+  "before": "UPDATE range_parted set c = c + 50 WHERE a = 'b' and b > 10 and c >= 96;",
+  "occurrence": 1,
+  "table": "range_parted",
+  "order": "array_position(ARRAY[$o$(a,1,1,1,)$o$, $o$(a,10,200,1,)$o$, $o$(b,12,96,1,)$o$, $o$(b,13,97,2,)$o$, $o$(b,17,105,19,)$o$, $o$(b,15,105,16,)$o$]::text[], record_rows::text)"
+ }
+]

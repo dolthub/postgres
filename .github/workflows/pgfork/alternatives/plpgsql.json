@@ -1,0 +1,20 @@
+[
+ {
+  "before": "select * from sc_test();",
+  "occurrence": 1,
+  "table": "int4_tbl",
+  "order": "array_position(ARRAY[$o$(2147483647)$o$, $o$(123456)$o$, $o$(-123456)$o$, $o$(0)$o$, $o$(-2147483647)$o$]::text[], record_rows::text)"
+ },
+ {
+  "before": "select forc01();",
+  "occurrence": 2,
+  "table": "forc_test",
+  "order": "array_position(ARRAY[$o$(10,10)$o$, $o$(6,6)$o$, $o$(4,4)$o$, $o$(5,5)$o$, $o$(3,3)$o$, $o$(9,9)$o$, $o$(7,7)$o$, $o$(2,2)$o$, $o$(8,8)$o$, $o$(1,1)$o$]::text[], record_rows::text)"
+ },
+ {
+  "before": "select forc01();",
+  "occurrence": 3,
+  "table": "forc_test",
+  "order": "array_position(ARRAY[$o$(200,4)$o$, $o$(100,2)$o$, $o$(800,16)$o$, $o$(700,14)$o$, $o$(300,6)$o$, $o$(600,12)$o$, $o$(400,8)$o$, $o$(900,18)$o$, $o$(1000,20)$o$, $o$(500,10)$o$]::text[], record_rows::text)"
+ }
+]

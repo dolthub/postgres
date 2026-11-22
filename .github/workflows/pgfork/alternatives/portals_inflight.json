@@ -1,0 +1,7 @@
+[
+ {
+  "before": "-- SPI, executor startup.",
+  "table": "cl_p",
+  "order": "array_position(ARRAY[$o$(5)$o$, $o$(3)$o$, $o$(1)$o$, $o$(4)$o$, $o$(9)$o$, $o$(7)$o$, $o$(6)$o$, $o$(0)$o$, $o$(8)$o$, $o$(2)$o$, $o$(14)$o$, $o$(10)$o$, $o$(18)$o$, $o$(16)$o$, $o$(13)$o$, $o$(15)$o$, $o$(17)$o$, $o$(19)$o$, $o$(12)$o$, $o$(11)$o$]::text[], record_rows::text)"
+ }
+]
