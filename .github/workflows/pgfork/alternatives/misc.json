@@ -1,0 +1,7 @@
+[
+ {
+  "before": "SELECT hobbies_by_name('basketball');",
+  "table": "hobbies_r",
+  "order": "array_position(ARRAY[$o$(posthacking,jeff)$o$, $o$(basketball,sally)$o$, $o$(skywalking,)$o$, $o$(basketball,joe)$o$, $o$(posthacking,mike)$o$]::text[], record_rows::text)"
+ }
+]

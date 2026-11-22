@@ -1,0 +1,7 @@
+[
+ {
+  "before": "WITH t1 AS ( DELETE FROM bug6051_3 RETURNING * )",
+  "table": "bug6051_2",
+  "order": "array_position(ARRAY[$o$(3)$o$, $o$(1)$o$, $o$(2)$o$]::text[], record_rows::text)"
+ }
+]

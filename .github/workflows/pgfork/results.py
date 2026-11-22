@@ -250,6 +250,7 @@ EXCEPTIONS = [
      ("cursor", "c5", [(INT8_TBL[:2], 2)])),
     ("gin", "  lateral execute_text_query_heap($$select string_agg((i, j)::text, ' ') from t_gin_test_tbl where $$ "
      "|| query) res_heap;", ("either", "match", ["t", "f"])),
+    ("transactions", "DECLARE ok CURSOR FOR SELECT * FROM int8_tbl;", ("cursor", "ok", [(INT8_TBL, 5)])),
 ]
 
 

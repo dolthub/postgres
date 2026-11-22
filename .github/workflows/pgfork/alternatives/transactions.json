@@ -1,0 +1,26 @@
+[
+ {
+  "before": "update xacttest set a = max_xacttest() + 10 where a > 0;",
+  "occurrence": 2,
+  "table": "xacttest",
+  "order": "array_position(ARRAY[$o$(56,7.8)$o$, $o$(100,99.097)$o$, $o$(0,0.09561)$o$, $o$(777,777.777)$o$, $o$(42,324.78)$o$]::text[], record_rows::text)"
+ },
+ {
+  "before": "update xacttest set a = max_xacttest() + 10 where a > 0;",
+  "occurrence": 4,
+  "table": "xacttest",
+  "order": "array_position(ARRAY[$o$(56,7.8)$o$, $o$(100,99.097)$o$, $o$(0,0.09561)$o$, $o$(777,777.777)$o$, $o$(42,324.78)$o$]::text[], record_rows::text)"
+ },
+ {
+  "before": "declare foo cursor for select * from trans_abc;",
+  "occurrence": 1,
+  "table": "trans_abc",
+  "order": "array_position(ARRAY[$o$(10)$o$, $o$(5)$o$]::text[], record_rows::text)"
+ },
+ {
+  "before": "declare foo cursor for select * from trans_abc;",
+  "occurrence": 2,
+  "table": "trans_abc",
+  "order": "array_position(ARRAY[$o$(10)$o$, $o$(5)$o$, $o$(15)$o$]::text[], record_rows::text)"
+ }
+]

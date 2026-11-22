@@ -1,0 +1,7 @@
+[
+ {
+  "before": "SELECT table_to_xml('testxmlschema.test1', false, false, '');",
+  "table": "testxmlschema.test1",
+  "order": "array_position(ARRAY[$o$(1,one)$o$, $o$(-1,)$o$, $o$(2,two)$o$]::text[], record_rows::text)"
+ }
+]

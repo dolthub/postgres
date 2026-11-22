@@ -1,0 +1,17 @@
+[
+ {
+  "before": "update rules_src set f2 = f2 + 1;",
+  "table": "rules_src",
+  "order": "array_position(ARRAY[$o$(1,2)$o$, $o$(11,12)$o$]::text[], record_rows::text)"
+ },
+ {
+  "before": "update rules_src set f2 = f2 * 10;",
+  "table": "rules_src",
+  "order": "array_position(ARRAY[$o$(11,13)$o$, $o$(1,3)$o$]::text[], record_rows::text)"
+ },
+ {
+  "before": "update rules_src set f2 = f2 / 10;",
+  "table": "rules_src",
+  "order": "array_position(ARRAY[$o$(11,130)$o$, $o$(1,30)$o$]::text[], record_rows::text)"
+ }
+]
