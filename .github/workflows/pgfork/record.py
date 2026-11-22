@@ -58,15 +58,22 @@ END $record$;"""
 def reorder(table, order):
     """Returns the lines of the one step that puts a table's rows in an order: with no user trigger, rule, or foreign
     key firing (session_replication_role replica), it copies the rows, deletes them, and inserts the copy in the
-    order, then checks that every table's rows and every sequence's state are what they were."""
+    order, then checks that the order gave every distinct row a place of its own, so that none falls back to the heap's
+    order, and that every table's rows and every sequence's state are what they were."""
     return [HIDDEN, "\\o /dev/null", DIGEST, "SELECT pg_temp.record_digest() AS record_before \\gset",
             "SET session_replication_role = replica;",
             f"CREATE TEMP TABLE record_rows AS SELECT * FROM {table};",
+            "SELECT coalesce(bool_and(record_count = 1), true) AS record_total FROM (SELECT count(DISTINCT "
+            "record_row::text) AS record_count FROM (SELECT record_rows AS record_row, rank() OVER "
+            f"(ORDER BY {order}) AS record_rank FROM record_rows) record_ranked GROUP BY record_rank) record_ranks"
+            " \\gset",
             f"DELETE FROM {table};",
             f"INSERT INTO {table} OVERRIDING SYSTEM VALUE SELECT * FROM record_rows ORDER BY {order};",
             "DROP TABLE record_rows;", "RESET session_replication_role;",
             "SELECT pg_temp.record_digest() = :'record_before' AS record_same \\gset",
-            "DROP FUNCTION pg_temp.record_digest();", "\\o", f"\\if :record_same\n\\else\n\\warn '{REFUSED}'\n\\endif",
+            "DROP FUNCTION pg_temp.record_digest();", "\\o",
+            f"\\if :record_same\n\\if :record_total\n\\else\n\\warn '{REFUSED}'\n\\endif\n"
+            f"\\else\n\\warn '{REFUSED}'\n\\endif",
             "\\set ECHO all"]
 
 

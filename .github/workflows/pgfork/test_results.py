@@ -435,5 +435,10 @@ class Recordings(unittest.TestCase):
     def test_a_reorder_that_moves_a_sequence_is_refused(self):
         self.assertFalse(self.recorded("nextval('s')"))
 
+    def test_a_reorder_that_leaves_rows_tied_is_refused(self):
+        self.assertTrue(self.recorded("array_position(ARRAY['(3)', '(1)'], record_rows::text)"))
+        self.assertFalse(self.recorded("array_position(ARRAY['(3)'], record_rows::text)"))
+        self.assertFalse(self.recorded("a / 10"))
+
 if __name__ == "__main__":
     unittest.main()
