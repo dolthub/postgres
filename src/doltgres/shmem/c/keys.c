@@ -25,15 +25,13 @@
 #include "postgres.h"
 
 #include "doltgres/shmem/keys.h"
+#include "doltgres/shmem/lib.h"
 #include "doltgres/std/num.h"
 #include "doltgres/std/ptr.h"
 #include "doltgres/std/vec.h"
 #include "pg_calls.h"
 
 #define RUST_FILE "shmem" STD_SEP "src" STD_SEP "keys.rs"
-
-/* SHMEM_KEYS_TRANCHE is the name of the stripes' tranche, which wait events show. */
-static const char SHMEM_KEYS_TRANCHE[] = "versioned key";
 
 /*
  * ShmemKeysStripes is the region's layout: its locks; beside each its push
@@ -80,8 +78,7 @@ shmem_keys_initialize(const PgMayRaise *raise, PgPgError *error)
 	int32		tranche;
 	ShmemKeysStripes *stripes;
 
-	if (!pg_calls_new_tranche(raise, SHMEM_KEYS_TRANCHE, &tranche, error))
-		return false;
+	tranche = shmem_tranche(DOLTGRES_TRANCHE_KEYS);
 	stripes = (ShmemKeysStripes *) pg_calls_keys_base();
 	STD_CHECK_ALIGNED(stripes, _Alignof(ShmemKeysStripes), 58, 14);
 	STD_CHECK_NULL_DEREF(stripes, 58, 14);

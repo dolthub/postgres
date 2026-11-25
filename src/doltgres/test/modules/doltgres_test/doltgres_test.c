@@ -27,6 +27,7 @@
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
+#include "access/nbtree.h"
 #include "access/relscan.h"
 #include "access/skey.h"
 #include "access/relation.h"
@@ -44,11 +45,13 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_type_d.h"
+#include "catalog/storage.h"
 #include "commands/progress.h"
 #include "commands/repack.h"
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
 #include "commands/vacuum.h"
+#include "doltgres/hooks.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "executor/tuptable.h"
@@ -75,6 +78,7 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 #include "utils/sampling.h"
+#include "utils/skipsupport.h"
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
 #include "utils/tuplestore.h"
@@ -118,13 +122,28 @@ extern int64 doltgres_test_states(int64 repository, int64 count);
 extern int64 doltgres_test_relation_locks(void);
 extern void doltgres_test_base_row(Relation target, TupleTableSlot *source);
 extern int64 doltgres_test_base_save(Relation target, int32 extra);
-extern Datum doltgres_test_free_space(Relation target, int32 block);
+extern Datum doltgres_test_free_space(Relation target, int32 block, int64 point);
 extern void doltgres_test_index_fetch_key(struct IndexFetchTableData *fetch, Relation target, TupleTableSlot *source,
 										  uint64 copy);
 extern bool doltgres_test_fold(Relation target);
 extern Datum doltgres_test_base_sizes(Relation target);
 extern Datum doltgres_test_totals(Relation target);
+extern Datum doltgres_test_scan_shape(Relation target);
 extern Datum doltgres_test_count(Relation target);
+extern Datum doltgres_test_base_points(Relation target);
+extern Datum doltgres_test_identity_versions(int32 kind, Oid number);
+extern Datum doltgres_test_save(void);
+extern int64 doltgres_test_chunks(int64 xid);
+extern int	doltgres_test_unplaced(Relation target);
+extern int	doltgres_test_unrooted(Relation target);
+extern int	doltgres_test_tuples_record(Relation target);
+extern int	doltgres_test_tuples_moved(Relation target);
+extern int64 doltgres_test_delta_held(void);
+extern bool doltgres_test_listed_unwritten(Relation target);
+extern bool doltgres_test_step_unwritten(IndexScanDesc scan);
+extern int64 doltgres_test_stamps_decoded(void);
+extern int64 doltgres_test_bases_decoded(void);
+extern int64 doltgres_test_spill_reads(int32 which);
 extern Datum doltgres_test_index_entries(Relation target);
 extern bool doltgres_test_held(Relation target, uint64 tid);
 extern Datum doltgres_test_index_base(Relation target);
@@ -136,6 +155,7 @@ extern bool doltgres_test_database_lock(Oid database, bool hold);
 extern Datum doltgres_test_changes(Relation target);
 extern Datum doltgres_test_built_nodes(void);
 extern bool doltgres_test_mapped(Relation target);
+extern bool doltgres_test_rolling(Relation target);
 extern Datum doltgres_test_identity(int32 kind, Oid number, int32 attnum);
 extern Datum doltgres_test_epochs(void);
 
@@ -252,6 +272,23 @@ PG_FUNCTION_INFO_V1(dg_totals);
 PG_FUNCTION_INFO_V1(dg_count);
 PG_FUNCTION_INFO_V1(dg_drop_constraint);
 PG_FUNCTION_INFO_V1(dg_unchain);
+PG_FUNCTION_INFO_V1(dg_scan_shape);
+PG_FUNCTION_INFO_V1(dg_index_move);
+PG_FUNCTION_INFO_V1(dg_base_points);
+PG_FUNCTION_INFO_V1(dg_identity_versions);
+PG_FUNCTION_INFO_V1(dg_save);
+PG_FUNCTION_INFO_V1(dg_chunks);
+PG_FUNCTION_INFO_V1(dg_unplaced);
+PG_FUNCTION_INFO_V1(dg_unrooted);
+PG_FUNCTION_INFO_V1(dg_tuples_record);
+PG_FUNCTION_INFO_V1(dg_tuples_moved);
+PG_FUNCTION_INFO_V1(dg_delta_held);
+PG_FUNCTION_INFO_V1(dg_listed_unwritten);
+PG_FUNCTION_INFO_V1(dg_step_unwritten);
+PG_FUNCTION_INFO_V1(dg_stamps_decoded);
+PG_FUNCTION_INFO_V1(dg_bases_decoded);
+PG_FUNCTION_INFO_V1(dg_spill_reads);
+PG_FUNCTION_INFO_V1(dg_rolling);
 
 /* dg_store writes the shared area's root record under the fork's lock. */
 Datum
@@ -1954,14 +1991,14 @@ dg_vacuum(PG_FUNCTION_ARGS)
 }
 
 /*
- * dg_free_space returns a block's newest free space entry in a fork table's delta, as doltgres_test_free_space reads
- * it.
+ * dg_free_space returns a block's free space entry in a fork table's delta as of a point, as doltgres_test_free_space
+ * reads it.
  */
 Datum
 dg_free_space(PG_FUNCTION_ARGS)
 {
 	Relation	rel = table_open(PG_GETARG_OID(0), AccessShareLock);
-	Datum		entry = doltgres_test_free_space(rel, PG_GETARG_INT32(1));
+	Datum		entry = doltgres_test_free_space(rel, PG_GETARG_INT32(1), (int64) PG_GETARG_LSN(2));
 
 	table_close(rel, AccessShareLock);
 	PG_RETURN_DATUM(entry);
@@ -2370,6 +2407,20 @@ dg_mapped(PG_FUNCTION_ARGS)
 }
 
 /*
+ * dg_rolling says whether a fork table's storage's state counts a fold reading rolled-back rows or a rows spill's
+ * walk, as doltgres_test_rolling reads it.
+ */
+Datum
+dg_rolling(PG_FUNCTION_ARGS)
+{
+	Relation	rel = table_open(PG_GETARG_OID(0), AccessShareLock);
+	bool		rolling = doltgres_test_rolling(rel);
+
+	table_close(rel, AccessShareLock);
+	PG_RETURN_BOOL(rolling);
+}
+
+/*
  * dg_identity returns the id the database's identity tree pairs with an object's number, as doltgres_test_identity
  * reads it.
  */
@@ -2708,4 +2759,188 @@ dg_unchain(PG_FUNCTION_ARGS)
 {
 	ProcessUtility_hook = unchained_utility;
 	PG_RETURN_VOID();
+}
+
+/* dg_scan_shape returns a fork table's shape as its scans' costs read it, as doltgres_test_scan_shape reads it. */
+Datum
+dg_scan_shape(PG_FUNCTION_ARGS)
+{
+	Relation	rel = table_open(PG_GETARG_OID(0), AccessShareLock);
+	Datum		shape = doltgres_test_scan_shape(rel);
+
+	table_close(rel, AccessShareLock);
+	PG_RETURN_DATUM(shape);
+}
+
+/*
+ * dg_index_move moves an index into a tablespace as ALTER INDEX SET TABLESPACE's index_copy_data does: a new
+ * relfilenode with its main fork's pages copied, the fork's move of its storage, the old file dropped at commit, and
+ * its pg_class row.
+ */
+Datum
+dg_index_move(PG_FUNCTION_ARGS)
+{
+	Relation	rel = index_open(PG_GETARG_OID(0), AccessExclusiveLock);
+	Oid			space = get_tablespace_oid(text_to_cstring(PG_GETARG_TEXT_PP(1)), false);
+	RelFileNumber number = GetNewRelFileNumber(space, NULL, rel->rd_rel->relpersistence);
+	RelFileLocator locator = rel->rd_locator;
+	SMgrRelation dstrel;
+
+	locator.relNumber = number;
+	locator.spcOid = space;
+	dstrel = RelationCreateStorage(locator, rel->rd_rel->relpersistence, true);
+	RelationCopyStorage(RelationGetSmgr(rel), dstrel, MAIN_FORKNUM, rel->rd_rel->relpersistence);
+	doltgres_index_copy_data(rel, &locator);
+	RelationDropStorage(rel);
+	smgrclose(dstrel);
+	SetRelationTableSpace(rel, space, number);
+	RelationAssumeNewRelfilelocator(rel);
+	index_close(rel, NoLock);
+	CommandCounterIncrement();
+	PG_RETURN_VOID();
+}
+
+/*
+ * dg_base_points returns a fork table's newest base's root, fold point, and read point, as doltgres_test_base_points
+ * reads them.
+ */
+Datum
+dg_base_points(PG_FUNCTION_ARGS)
+{
+	Relation	rel = table_open(PG_GETARG_OID(0), AccessShareLock);
+	Datum		points = doltgres_test_base_points(rel);
+
+	table_close(rel, AccessShareLock);
+	PG_RETURN_DATUM(points);
+}
+
+/*
+ * dg_identity_versions returns how many versions the delta and its identity
+ * spills hold of an object's identity key by its number, as
+ * doltgres_test_identity_versions counts them.
+ */
+Datum
+dg_identity_versions(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_DATUM(doltgres_test_identity_versions(PG_GETARG_INT32(0), PG_GETARG_OID(1)));
+}
+
+/*
+ * dg_save saves the database's repository outside a checkpoint, as
+ * doltgres_test_save does.
+ */
+Datum
+dg_save(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_DATUM(doltgres_test_save());
+}
+
+/* dg_chunks counts the blobs' chunks the delta holds a version of by a transaction, as doltgres_test_chunks does. */
+Datum
+dg_chunks(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(doltgres_test_chunks(PG_GETARG_INT64(0)));
+}
+
+/* dg_unplaced counts the chunk addresses a relation's newest base names at an unknown locator, as doltgres_test_unplaced does. */
+Datum
+dg_unplaced(PG_FUNCTION_ARGS)
+{
+	Relation	rel = relation_open(PG_GETARG_OID(0), AccessShareLock);
+	int			unplaced = doltgres_test_unplaced(rel);
+
+	relation_close(rel, AccessShareLock);
+	PG_RETURN_INT64(unplaced);
+}
+
+/* dg_unrooted counts the chunk addresses a relation's spilled versions name that a collection's capture leaves out, as doltgres_test_unrooted does. */
+Datum
+dg_unrooted(PG_FUNCTION_ARGS)
+{
+	Relation	rel = relation_open(PG_GETARG_OID(0), AccessShareLock);
+	int			unrooted = doltgres_test_unrooted(rel);
+
+	relation_close(rel, AccessShareLock);
+	PG_RETURN_INT64(unrooted);
+}
+
+/* dg_tuples_record returns one more than the record index of a relation's storage's tuple id table, as doltgres_test_tuples_record does. */
+Datum
+dg_tuples_record(PG_FUNCTION_ARGS)
+{
+	Relation	rel = relation_open(PG_GETARG_OID(0), AccessShareLock);
+	int			record = doltgres_test_tuples_record(rel);
+
+	relation_close(rel, AccessShareLock);
+	PG_RETURN_INT64(record);
+}
+
+/* dg_tuples_moved moves a relation's storage's tuple id table as a packing does, as doltgres_test_tuples_moved does. */
+Datum
+dg_tuples_moved(PG_FUNCTION_ARGS)
+{
+	Relation	rel = relation_open(PG_GETARG_OID(0), AccessShareLock);
+	int			moved = doltgres_test_tuples_moved(rel);
+
+	relation_close(rel, AccessShareLock);
+	PG_RETURN_INT64(moved);
+}
+
+/* dg_delta_held counts this backend's handles of working states' deltas, as doltgres_test_delta_held does. */
+Datum
+dg_delta_held(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(doltgres_test_delta_held());
+}
+
+/* dg_listed_unwritten answers whether a table's lookup of a removal of old entries it doesn't hold answers none untouched, as doltgres_test_listed_unwritten does. */
+Datum
+dg_listed_unwritten(PG_FUNCTION_ARGS)
+{
+	Relation	rel = relation_open(PG_GETARG_OID(0), AccessShareLock);
+	bool		unwritten = doltgres_test_listed_unwritten(rel);
+
+	relation_close(rel, AccessShareLock);
+	PG_RETURN_BOOL(unwritten);
+}
+
+/* step_past_the_end is dg_step_unwritten's skip support: every value is its type's last. */
+static Datum
+step_past_the_end(Relation rel, Datum existing, bool *overflow)
+{
+	*overflow = true;
+	return (Datum) 0;
+}
+
+/* dg_step_unwritten answers whether a skip array's step past its type's last value answers none untouched, as doltgres_test_step_unwritten does, over a scan whose first array steps past the end. */
+Datum
+dg_step_unwritten(PG_FUNCTION_ARGS)
+{
+	SkipSupportData support = {.decrement = step_past_the_end, .increment = step_past_the_end};
+	BTArrayKeyInfo array = {.sksup = &support};
+	BTScanOpaqueData opaque = {.arrayKeys = &array, .arrayContext = CurrentMemoryContext};
+	IndexScanDescData scan = {.opaque = &opaque};
+
+	PG_RETURN_BOOL(doltgres_test_step_unwritten(&scan));
+}
+
+/* dg_stamps_decoded returns how many trailers' stamps the backend has decoded, as doltgres_test_stamps_decoded does. */
+Datum
+dg_stamps_decoded(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(doltgres_test_stamps_decoded());
+}
+
+/* dg_bases_decoded returns how many base records the backend has decoded, as doltgres_test_bases_decoded does. */
+Datum
+dg_bases_decoded(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(doltgres_test_bases_decoded());
+}
+
+/* dg_spill_reads returns one of the backend's counts of its spill reads, as doltgres_test_spill_reads does. */
+Datum
+dg_spill_reads(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(doltgres_test_spill_reads(PG_GETARG_INT32(0)));
 }

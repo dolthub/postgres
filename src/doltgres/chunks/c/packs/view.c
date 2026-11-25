@@ -496,7 +496,7 @@ chunks_packs_view_runs_entry(StdVec *runs, uint32 space)
 }
 
 /* chunks_packs_view_runs_remove drops a tablespace's runs file as the view read it, if it has one. */
-static void
+void
 chunks_packs_view_runs_remove(StdVec *runs, uint32 space)
 {
 	size_t		at;
@@ -799,7 +799,7 @@ chunks_packs_view_View_read_lists(ChunksPacksViewView *self, HostIoIoDoors io, c
 typedef struct chunks_packs_view_View_refresh_frame_0_t
 {
 	ChunksPacksViewView *self;
-	HostIoIo   *io;
+	HostIoTakesShort io;
 	HostSharedRecord record;
 	ChunksErrorError *error;
 	bool		ok;
@@ -863,7 +863,7 @@ chunks_packs_view_View_refresh_body_0(void *frame_)
 {
 	chunks_packs_view_View_refresh_frame_0_t *frame = frame_;
 	ChunksPacksViewView *self = frame->self;
-	HostIoIoDoors io = HOST_IO_IO_IO_DOORS(frame->io);
+	HostIoIoDoors io = HOST_IO_TAKES_SHORT_IO_DOORS(frame->io);
 	uint64		rotations;
 	uint64		generation;
 	bool		read;
@@ -882,7 +882,7 @@ chunks_packs_view_View_refresh_body_0(void *frame_)
 	}
 	self->has_current = false;
 	rotations = chunks_packs_shared_load(frame->record, CHUNKS_PACKS_SHARED_ROTATIONS_INDEX);
-	if (!host_shared_Record_lock_shared(frame->record, HOST_IO_IO_TAKES_SHORT(frame->io),
+	if (!host_shared_Record_lock_shared(frame->record, frame->io,
 										CHUNKS_PACKS_SHARED_STATE_LOCK_INDEX, &frame->state, &host))
 	{
 		*frame->error = chunks_error_Error_FromError_from(&host);
@@ -918,7 +918,7 @@ chunks_packs_view_View_refresh_body_0(void *frame_)
 #ifdef DOLTGRES_TEST_CHUNKS
 		chunks_packs_view_count_reread();
 #endif
-		if (!host_shared_Record_flag(frame->record, HOST_IO_IO_TAKES_SHORT(frame->io),
+		if (!host_shared_Record_flag(frame->record, frame->io,
 									 CHUNKS_PACKS_SHARED_REWRITING_INDEX, &frame->rewriting, &host))
 		{
 			*frame->error = chunks_error_Error_FromError_from(&host);
@@ -946,7 +946,7 @@ chunks_packs_view_View_refresh_body_0(void *frame_)
 		frame->rewriting_live = false;
 		host_shared_FlagGuard_drop(&frame->rewriting);
 	}
-	if (!chunks_packs_view_View_open(self, HOST_IO_IO_READ_DOORS(frame->io), frame->snapshot.deferred.ptr,
+	if (!chunks_packs_view_View_open(self, HOST_IO_IO_DOORS_READ_DOORS(io), frame->snapshot.deferred.ptr,
 									 frame->snapshot.deferred.len, frame->error))
 		goto done;
 	std_vec_free_Checked(&self->deferred, sizeof(ChunksPacksTableEntry), _Alignof(ChunksPacksTableEntry));
@@ -966,7 +966,7 @@ done:
  * a read found a list file missing or not as its tail says.
  */
 bool
-chunks_packs_view_View_refresh(ChunksPacksViewView *self, HostIoIo *io, HostSharedRecord record,
+chunks_packs_view_View_refresh(ChunksPacksViewView *self, HostIoTakesShort io, HostSharedRecord record,
 							   ChunksErrorError *error)
 {
 	chunks_packs_view_View_refresh_frame_0_t frame = {.self = self, .io = io, .record = record, .error = error};

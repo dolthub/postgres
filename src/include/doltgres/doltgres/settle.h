@@ -56,4 +56,9 @@ extern bool doltgres_settle_pin(HostIoIo *io, uint32 table, StdVec *columns, Hos
 extern bool doltgres_settle_held(HostIoIo *io, uint32 table, StdVec *result);
 extern bool doltgres_settle_pinned(HostIoIo *io, uint32 table, StdVec *result);
 
+#ifdef DOLTGRES_TEST_DOLTGRES
+extern void test_doltgres_settle_tests_a_failed_allocation_in_a_close_keeps_the_outer_level(void);
+extern void test_doltgres_settle_tests_a_failed_allocation_in_a_copy_of_old_key_columns_keeps_them(void);
+#endif
+
 #endif							/* DOLTGRES_DOLTGRES_SETTLE_H */

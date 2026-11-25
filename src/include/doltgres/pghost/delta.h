@@ -67,6 +67,7 @@ extern bool pghost_delta_seal(const HostDeltaDirectoryOpened *opened, HostDeltaD
 							  HostError *error);
 extern void pghost_delta_retire(const HostDeltaLeaving *records, size_t records_len,
 								const HostDeltaPagePage *names, size_t names_len);
+extern bool pghost_delta_packing(const uint64 *shapes, size_t shapes_len, StdVec *result);
 extern void pghost_delta_pass(void);
 extern uint64 pghost_delta_used(void);
 extern void pghost_delta_recovery_fold(PghostDeltaRecoveryFold fold);

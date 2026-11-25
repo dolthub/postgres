@@ -16,9 +16,10 @@
 
 /*
  * The read of the WAL kept for a manifest's fallback (design item 6), which a
- * checkpoint and the startup's open of repositories make, and a standby's read
- * of the fork's records past a storage's reached fold point (PLAN item 8's
- * "Standbys' roots").
+ * checkpoint and the startup's open of repositories make, a standby's read of
+ * the fork's records past a storage's reached fold point (PLAN item 8's
+ * "Standbys' roots"), and recovery's read of transactions' outcomes ahead of
+ * replay.
  */
 #ifndef DOLTGRES_KEPT_WAL_H
 #define DOLTGRES_KEPT_WAL_H
@@ -33,10 +34,20 @@
 extern void doltgres_warn_kept_wal(XLogRecPtr from, XLogRecPtr to, TimeLineID timeline, XLogRecPtr upto);
 
 /*
- * doltgres_next_fork_record reads the first record of a resource manager whose
- * kind is in a mask past a record's end, writing it into a buffer, and returns
- * the bytes it needs, or 0 for none.
+ * doltgres_next_fork_record reads the first record of the fork's two resource
+ * managers whose kind, 15 more under the second, is in a mask past a record's
+ * end, in recovery up to the received WAL
+ * when asked, writing it into a buffer, and returns the bytes it needs, or 0
+ * for none.
  */
-extern uint64 doltgres_next_fork_record(XLogRecPtr from, RmgrId rmid, uint32 kinds, char *data, size_t len);
+extern uint64 doltgres_next_fork_record(XLogRecPtr from, RmgrId rmid, RmgrId second, uint32 kinds, bool received,
+										char *data, size_t len);
+
+/*
+ * doltgres_wal_outcomes reads, in recovery and ahead of replay, the outcomes
+ * of the transactions whose records start between two positions into a buffer
+ * of pairs, and returns how many there are.
+ */
+extern size_t doltgres_wal_outcomes(XLogRecPtr from, XLogRecPtr to, uint64 *pairs, size_t cap);
 
 #endif							/* DOLTGRES_KEPT_WAL_H */

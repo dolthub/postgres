@@ -17,9 +17,7 @@
 /*
  * Counted values: the values of keys that hold copies, a keyless table's rows
  * and its indexes' entries, whose value is how many copies the key holds as a
- * varint, then what each copy holds. Verus proves the Rust's value, parts,
- * and address functions against their specification; the C's guarantee is
- * tested equivalence.
+ * varint, then what each copy holds.
  */
 #ifndef FRONTEND
 #include "postgres.h"

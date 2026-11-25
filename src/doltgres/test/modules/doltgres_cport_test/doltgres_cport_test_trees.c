@@ -55,6 +55,8 @@ static const CportTest CPORT_TESTS[] = {
 	test_trees_store_tests_a_writers_read_by_address_alone_of_a_chunk_it_wrote_with_other_stamps_is_refused_and_of_equal_copies_answers},
 	{"store::tests::copies_in_packs_with_wide_numbers_have_their_own_keys",
 	test_trees_store_tests_copies_in_packs_with_wide_numbers_have_their_own_keys},
+	{"cport::trees::node::tests::a_flat_nodes_stamps_read_in_place_as_its_trailer_decodes",
+	test_trees_node_tests_a_flat_nodes_stamps_read_in_place_as_its_trailer_decodes},
 };
 
 PG_FUNCTION_INFO_V1(doltgres_cport_test_trees);

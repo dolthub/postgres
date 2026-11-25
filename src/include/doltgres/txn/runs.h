@@ -57,10 +57,28 @@ typedef enum TxnRunsKind
 	TXN_RUNS_KIND_IDENTITY = 10,
 
 	/*
+	 * A storage's free space map's own versions a transaction spilled, read
+	 * back as a free space run's.
+	 */
+	TXN_RUNS_KIND_SPILLED_FREE = 11,
+
+	/*
 	 * The chunks of a transaction's blobs it spilled from its repository's
 	 * working state's delta.
 	 */
 	TXN_RUNS_KIND_SPILLED_CHUNKS = 12,
+
+	/*
+	 * A database's identity tree's own versions a transaction spilled, read
+	 * back as an identity run's (bugs row 291).
+	 */
+	TXN_RUNS_KIND_SPILLED_IDENTITY = 13,
+
+	/*
+	 * A repository's cuts at a checkpoint: the tuple id counter there of each
+	 * storage whose cut no free space run holds (bugs row 408).
+	 */
+	TXN_RUNS_KIND_CUTS = 14,
 } TxnRunsKind;
 
 /* TXN_RUNS_FILTER_WORDS is FILTER_WORDS, the most words of a page of a spill's filter: the node cache's smallest frame. */
@@ -111,6 +129,19 @@ typedef struct TxnRunsDecoded
 	StdVec		keys;
 } TxnRunsDecoded;
 
+/*
+ * TxnRunsSpan is a key's frames in a spill's chunk read raw: where its key
+ * starts and how long it is, and where its first frame starts and its last
+ * ends, in the chunk's bytes (bugs row 479).
+ */
+typedef struct TxnRunsSpan
+{
+	size_t		key_at;
+	size_t		key_len;
+	size_t		from;
+	size_t		to;
+} TxnRunsSpan;
+
 /* txn_TupleVecU8U64_t is an Index entry, (Vec<u8>, u64): a key and the place of the key frame it names. */
 typedef struct txn_TupleVecU8U64_t
 {
@@ -147,6 +178,19 @@ typedef struct txn_TupleU64OutcomeU64_t
 	uint64		f2;
 } txn_TupleU64OutcomeU64_t;
 
+/*
+ * TxnRunsSeek is the stride of a spill's file a seek down its index finds:
+ * the first, the last, or the last whose first key is at or below a key, or
+ * below it (bugs row 487).
+ */
+typedef enum TxnRunsSeek
+{
+	TXN_RUNS_SEEK_FIRST,
+	TXN_RUNS_SEEK_LAST,
+	TXN_RUNS_SEEK_AT_OR_BELOW,
+	TXN_RUNS_SEEK_BELOW,
+} TxnRunsSeek;
+
 /* TxnRunsWriting is Writing: a run's file while it is written; its definition is runs.c's. */
 typedef struct TxnRunsWriting TxnRunsWriting;
 
@@ -166,11 +210,26 @@ extern bool txn_runs_spill_tail_hash(HostIoIo *io, const HostFile *file, uint64 
 									 HostError *error);
 extern bool txn_runs_spill_tail_count(HostIoIo *io, const HostFile *file, uint64 len, uint64 *result,
 									  HostError *error);
-extern bool txn_runs_spill_index(HostIoIo *io, const HostFile *file, uint64 len, uint64 *index_at, StdVec *result,
-								 HostError *error);
-extern bool txn_runs_spill_chunk(HostIoIo *io, const HostFile *file, const TxnRunsNames *names, uint64 start,
-								 uint64 end, StdVec *result, HostError *error);
-extern bool txn_runs_index(const uint8 *record_ptr, size_t record_len, StdVec *result, HostError *error);
+extern bool txn_runs_spill_places(HostIoIo *io, const HostFile *file, uint64 len, uint64 *index_at,
+								  uint64 *filter_at, HostError *error);
+extern bool txn_runs_spill_index(HostIoIo *io, const HostFile *file, uint64 index_at, uint64 filter_at,
+								 StdVec *result, HostError *error);
+extern bool txn_runs_spill_seek(HostIoIo *io, const HostFile *file, uint64 index_at, uint64 filter_at,
+								TxnRunsSeek seek, const uint8 *key, size_t key_len, bool *some, uint64 *start,
+								uint64 *end, HostError *error);
+#ifdef USE_INJECTION_POINTS
+extern uint64 txn_runs_versions_checked;
+extern uint64 txn_runs_names_built;
+extern uint64 txn_runs_strides_walked;
+extern uint64 txn_runs_indexes_read;
+extern uint64 txn_runs_index_pages_read;
+#endif
+extern bool txn_runs_spill_spans(HostIoIo *io, const HostFile *file, const TxnRunsNames *names, uint64 start,
+								 uint64 end, StdVec *raw, StdVec *spans, HostError *error);
+extern bool txn_runs_spill_key_at(HostIoIo *io, const HostFile *file, const TxnRunsNames *names, uint64 at,
+								  uint64 end, StdVec *raw, TxnRunsSpan *span, uint64 *next, HostError *error);
+extern bool txn_runs_spill_spanned(const TxnRunsNames *names, const uint8 *bytes, TxnRunsSpan span, StdVec *result,
+								   HostError *error);
 extern bool txn_runs_decode_tuples(const uint8 *bytes, size_t bytes_len, const TxnRunsNames *names, uint64 hash,
 								   StdVec *result, HostError *error);
 extern bool txn_runs_decode_status(const uint8 *bytes, size_t bytes_len, const TxnRunsNames *names, uint64 hash,
@@ -180,20 +239,40 @@ extern void txn_runs_spill_name(const TxnRunsNames *names, uint32 number, StdStr
 extern TxnRunsWriting *txn_runs_Writing_spill(const char *dir, size_t dir_len, const TxnRunsNames *names,
 											  TxnRunsTail tail, uint32 number);
 extern StdBytes txn_runs_Writing_path(const TxnRunsWriting *self);
-extern bool txn_runs_Writing_key(TxnRunsWriting *self, HostIoIo *io, const uint8 *key, size_t key_len,
+extern bool txn_runs_Writing_key(TxnRunsWriting *self, HostIoIoDoors io, const uint8 *key, size_t key_len,
 								 const StdBytes *records, size_t records_len, HostError *error);
-extern bool txn_runs_Writing_end(TxnRunsWriting *self, HostIoIo *io, const uint64 *filter, size_t filter_len,
+extern bool txn_runs_Writing_end(TxnRunsWriting *self, HostIoIoDoors io, const uint64 *filter, size_t filter_len,
 								 bool *some, RepoRunFile *result, HostError *error);
 extern void txn_runs_Writing_drop(TxnRunsWriting *self);
 extern void txn_runs_spill_directory(uint32 repository, uint32 own, StdPathBuf *result);
+extern uint32 txn_runs_named_space(uint32 tablespace, uint32 own);
 extern bool txn_runs_cleaned(HostIoIo *io, HostError *error);
 extern bool txn_runs_checkpoint(HostIoIo *io, HostLsn redo, HostError *error);
+extern bool txn_runs_save(HostIoIo *io, uint32 repository, uint32 own, bool *took, bool *cleaned,
+						  HostError *error);
+extern bool txn_runs_saved_at(HostIoIo *io, uint32 repository, uint32 own, HostLsn position, bool *took,
+							  bool *cleaned, HostError *error);
 extern bool txn_runs_loaded(HostIoIo *io, const TxnInsertPage *page, HostError *error);
+extern bool txn_runs_loaded_one(HostIoIo *io, const TxnInsertPage *page, uint32 repository, uint32 own,
+								HostError *error);
+extern bool txn_runs_copied(HostIoIo *io, uint32 template, uint32 from, uint32 database, uint32 own, HostLsn redo,
+							HostLsn point, RepoRepo *repo, const HostSharedReader *reading, RepoRuns *result,
+							HostError *error);
 extern bool txn_runs_dropped(HostIoIo *io, uint32 repository, HostError *error);
 
 #ifdef DOLTGRES_TEST_TXN
+extern void test_txn_runs_tests_a_starts_loaded_identity_pairs_count_at_their_writers_entry(void);
+extern void test_txn_runs_tests_a_pair_the_save_folds_is_left_out_of_the_identity_run(void);
+extern void test_txn_runs_tests_a_checkpoints_identity_run_loads_its_pairs_back(void);
+extern void test_txn_runs_tests_an_identity_run_reads_its_pairs_and_refuses_heap_bytes_tuple_ids_and_other_ops(void);
+extern void test_txn_runs_tests_a_helpers_part_linked_after_its_transactions_abort_leaves_with_its_files(void);
+extern void test_txn_runs_tests_a_reader_that_listed_a_merges_source_reads_it_across_two_checkpoints(void);
+extern void test_txn_runs_tests_an_index_storages_entries_spill_and_load_back_as_entries(void);
 extern void test_txn_runs_tests_a_checkpoint_names_a_running_spill_and_a_start_links_it_back(void);
+extern void test_txn_runs_tests_a_deferred_spill_named_again_waits_for_two_new_sightings(void);
 extern void test_txn_runs_tests_a_spills_decoder_refuses_another_writer_and_a_wrong_index(void);
+extern void test_txn_runs_tests_a_spill_key_read_keeps_its_key_and_checks_every_keys_lengths(void);
+extern void test_txn_runs_tests_an_identity_spill_reads_its_pairs_and_refuses_another_writer_tuple_ids_and_heap_bytes(void);
 extern void test_txn_runs_tests_a_spills_file_reads_back_with_its_index(void);
 extern void test_txn_runs_tests_an_entries_runs_header_holds_its_table_and_index(void);
 extern void test_txn_runs_tests_an_index_storages_loaded_entries_stay_an_entries_run_through_a_second_checkpoint(void);
@@ -219,6 +298,7 @@ extern void test_txn_runs_tests_a_checkpoints_runs_hold_each_trees_versions(void
 extern void test_txn_runs_tests_a_checkpoint_saves_its_runs_and_removes_the_unnamed(void);
 extern void test_txn_runs_tests_a_runs_file_reads_back_as_written(void);
 extern void test_txn_runs_tests_a_runs_decoder_refuses_what_isnt_its_run(void);
+extern void test_txn_runs_tests_a_spills_paged_index_reads_whole_and_seeks_a_page_a_level(void);
 #endif
 
 #endif							/* DOLTGRES_TXN_RUNS_H */

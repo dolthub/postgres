@@ -212,16 +212,13 @@ pg_snapshot_view_closure_0(void *captures, const uint32 *xids, size_t count, con
 	}
 }
 
-/* pg_snapshot_view reads a snapshot an entry got into its view, its arrays lent for as long as the snapshot is. */
-bool
-pg_snapshot_view(const PgMayRaise *raise, const PgSnapshot *snapshot, PgSnapshotView *result, PgPgError *error)
+/* pg_snapshot_view_of reads a snapshot's fields into its view, its arrays lent for as long as the snapshot is. */
+static void
+pg_snapshot_view_of(DgSnapshotView fields, PgSnapshotView *result)
 {
-	DgSnapshotView fields;
 	size_t		subxcnt;
 	StdTryFromIntError tried;
 
-	if (!pg_calls_snapshot_fields(raise, snapshot, &fields, error))
-		return false;
 	result->kind = fields.kind;
 	result->xmin = fields.xmin;
 	result->xmax = fields.xmax;
@@ -232,6 +229,33 @@ pg_snapshot_view(const PgMayRaise *raise, const PgSnapshot *snapshot, PgSnapshot
 	if (!std_usize_try_from_i32(fields.subxcnt, &subxcnt, &tried))
 		subxcnt = 0;
 	pg_snapshot_view_closure_0(NULL, fields.subxip, subxcnt, &result->subxip, &result->subxip_len);
+}
+
+/*
+ * pg_transaction_snapshot_view reads the transaction's snapshot, as
+ * GetTransactionSnapshot takes it, into its view, its arrays lent until the
+ * backend's next snapshot.
+ */
+bool
+pg_transaction_snapshot_view(const PgMayRaise *raise, PgSnapshotView *result, PgPgError *error)
+{
+	DgSnapshotView fields;
+
+	if (!pg_calls_transaction_snapshot_fields(raise, &fields, error))
+		return false;
+	pg_snapshot_view_of(fields, result);
+	return true;
+}
+
+/* pg_snapshot_view reads a snapshot an entry got into its view, its arrays lent for as long as the snapshot is. */
+bool
+pg_snapshot_view(const PgMayRaise *raise, const PgSnapshot *snapshot, PgSnapshotView *result, PgPgError *error)
+{
+	DgSnapshotView fields;
+
+	if (!pg_calls_snapshot_fields(raise, snapshot, &fields, error))
+		return false;
+	pg_snapshot_view_of(fields, result);
 	return true;
 }
 
@@ -902,7 +926,11 @@ static pg_atomic_uint64 PG_RESERVE = {0};
 pg_atomic_uint64 PG_FAILED_SIZE = {0};
 
 #if defined(USE_INJECTION_POINTS) || defined(DOLTGRES_PG_OUTSIDE_POSTGRES)
-/* PG_FAILING is whether the allocator fails every request, which the fork's tests set in a process of one thread. */
+/*
+ * PG_FAILING is how many requests come before the one the allocator fails,
+ * plus one, or PG_UINT32_MAX while it fails every request, or 0 for none,
+ * which the fork's tests set in a process of one thread.
+ */
 static pg_atomic_uint32 PG_FAILING = {0};
 
 /*
@@ -913,7 +941,31 @@ static pg_atomic_uint32 PG_FAILING = {0};
 void
 pg_fail_allocations(bool fail)
 {
-	pg_atomic_write_membarrier_u32(&PG_FAILING, (uint32) fail);
+	pg_atomic_write_membarrier_u32(&PG_FAILING, fail ? PG_UINT32_MAX : 0);
+}
+
+/*
+ * pg_fail_nth_allocation makes the nth of the next allocations fail, counting
+ * from 1, as one the system refuses does, so a test fails one allocation and
+ * the unwinding its failure starts can allocate.
+ */
+void
+pg_fail_nth_allocation(uint32 nth)
+{
+	pg_atomic_write_membarrier_u32(&PG_FAILING, nth);
+}
+
+/* PG_REFUSED_SIZE is the size of the request pg_fail_nth_allocation's count refused last. */
+static pg_atomic_uint64 PG_REFUSED_SIZE = {0};
+
+/*
+ * pg_refused_size returns the size of the request pg_fail_nth_allocation's
+ * count refused last, so a test checks it failed the allocation it means.
+ */
+uint64
+pg_refused_size(void)
+{
+	return pg_atomic_read_membarrier_u64(&PG_REFUSED_SIZE);
 }
 #endif
 
@@ -942,12 +994,18 @@ pg_count(void *block, size_t given, size_t back)
 
 static void pg_release_reserve(void);
 
-/* pg_refused reports whether the fork's tests fail this request, after freeing the reserve as a refused request does. */
+/* pg_refused reports whether the fork's tests fail a request of a size, after freeing the reserve as a refused request does. */
 static bool
-pg_refused(void)
+pg_refused(size_t size)
 {
 #if defined(USE_INJECTION_POINTS) || defined(DOLTGRES_PG_OUTSIDE_POSTGRES)
-	if (pg_atomic_read_membarrier_u32(&PG_FAILING) != 0)
+	uint32		failing = pg_atomic_read_membarrier_u32(&PG_FAILING);
+
+	if (failing != 0 && failing != PG_UINT32_MAX)
+		pg_atomic_write_membarrier_u32(&PG_FAILING, failing - 1);
+	if (failing == 1)
+		pg_atomic_write_membarrier_u64(&PG_REFUSED_SIZE, size);
+	if (failing == 1 || failing == PG_UINT32_MAX)
 	{
 		pg_release_reserve();
 		return true;
@@ -1016,7 +1074,7 @@ pg_Reserving_GlobalAlloc_alloc(const PgReserving *self, size_t size, size_t alig
 	void	   *block;
 
 	(void) self;
-	if (pg_refused())
+	if (pg_refused(size))
 		return NULL;
 	block = std_System_GlobalAlloc_alloc(size, align);
 	if (block == NULL)
@@ -1034,7 +1092,7 @@ pg_Reserving_GlobalAlloc_alloc_zeroed(const PgReserving *self, size_t size, size
 	void	   *block;
 
 	(void) self;
-	if (pg_refused())
+	if (pg_refused(size))
 		return NULL;
 	block = std_System_GlobalAlloc_alloc_zeroed(size, align);
 	if (block == NULL)
@@ -1052,7 +1110,7 @@ pg_Reserving_GlobalAlloc_realloc(const PgReserving *self, void *block, size_t ol
 	void	   *moved;
 
 	(void) self;
-	if (pg_refused())
+	if (pg_refused(size))
 		return NULL;
 	moved = std_System_GlobalAlloc_realloc(block, old_size, align, size);
 	if (moved == NULL)

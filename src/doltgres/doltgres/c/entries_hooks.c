@@ -33,6 +33,7 @@
 #include "doltgres/pg/lib.h"
 #include "doltgres/pghost/lib.h"
 #include "doltgres/std/unwind.h"
+#include "doltgres/store/databases.h"
 #include "doltgres/txn/state.h"
 #include "pg_calls.h"
 
@@ -41,7 +42,8 @@
  * Postgres unlinks, at commit, at abort, and in redo (PLAN item 5's
  * relfilenodes and their files), so the delta versions of a dropped,
  * truncated, or rewritten storage, which no fold of a gone relation takes,
- * leave the budget. The transaction's outcome is decided, so a failure is
+ * leave the budget; a replayed one names the storage as redo's records do
+ * (bugs row 443). The transaction's outcome is decided, so a failure is
  * reported at WARNING, as smgr_unlink reports its own, and nothing raises.
  */
 bool
@@ -54,6 +56,9 @@ doltgres_entries_doltgres_storage_unlinked(const PgCaps *caps, const PgFileLocat
 	HostIoIo	io = pghost_io(raise);
 	HostError	failed;
 	PgPgError	raised;
+	uint32		timeline;
+
+	store_databases_replayed_storage(&storage, pg_calls_replay_read(&timeline));
 
 	if (txn_state_unlinked(&io, &storage, &failed))
 		return true;

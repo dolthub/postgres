@@ -577,4 +577,87 @@ is( $raced->safe_psql(
 	'the base and a read hold the eleven rows, the loaded ten not applied twice'
 );
 $raced->stop;
+
+# Bugs row 295: a temporary table's fold and index build are bounded by the
+# backend's own snapshots as well as by Postgres' temp horizon, which counts
+# no other session's transaction, so with an older transaction open elsewhere
+# no base of the table is folded past the snapshot that reads it: a read
+# through a new index returns the table's rows, and a fold across an open
+# cursor's snapshot leaves the rows the cursor's transaction began after.
+my $temped = PostgreSQL::Test::Cluster->new('temped');
+$temped->init;
+$temped->start;
+$temped->safe_psql('postgres', 'CREATE EXTENSION doltgres_test');
+my $older = $temped->background_psql('postgres');
+$older->query_safe('BEGIN; SELECT pg_current_xact_id()');
+my ($indexed_code, $indexed, $indexed_error) = $temped->psql(
+	'postgres', q{
+CREATE TEMP TABLE temp_indexed (a int4);
+INSERT INTO temp_indexed VALUES (3), (1), (2);
+CREATE INDEX ON temp_indexed (a);
+SET enable_seqscan = off;
+SET enable_sort = off;
+SELECT a FROM temp_indexed ORDER BY a;
+});
+is($indexed . $indexed_error, "1\n2\n3",
+	"a read through a temporary table's new index returns its rows while an older transaction runs elsewhere");
+my ($cursored_code, $cursored, $cursored_error) = $temped->psql(
+	'postgres', q{
+CREATE TEMP TABLE temp_cursored (a int4);
+INSERT INTO temp_cursored VALUES (3), (1), (2);
+CREATE INDEX ON temp_cursored (a);
+SET enable_seqscan = off;
+SET enable_sort = off;
+BEGIN;
+DECLARE c CURSOR FOR SELECT a FROM temp_cursored ORDER BY a;
+FETCH 1 FROM c;
+SELECT doltgres_test_fold('temp_cursored');
+FETCH ALL FROM c;
+COMMIT;
+SELECT a FROM temp_cursored ORDER BY a;
+});
+is($cursored . $cursored_error, "1\nf\n2\n3\n1\n2\n3",
+	"a fold across an open cursor on a temporary table leaves the rows its snapshot may not read as folded");
+$older->query_safe('COMMIT');
+$older->quit;
+
+# Bugs row 328: a fold of a keyless table whose ALTER TABLE ... SET STORAGE
+# EXTERNAL is pending applies its chain, keeping each entry's copies, those
+# of equal rows written before the ALTER and so re-keyed at its commit and
+# those written after it, and the table reads every copy back, where the
+# re-form refused an entry of more than one copy; the base's sizes count
+# every copy's row and heap bytes, as a fold with no chain to apply counts
+# the same rows written after the same ALTER.
+$temped->safe_psql(
+	'postgres', q{
+CREATE TABLE stored_copies (k int4, v text);
+INSERT INTO stored_copies SELECT g % 3, repeat(chr(65 + g % 3), 3000) FROM generate_series(1, 6) g;
+ALTER TABLE stored_copies ALTER COLUMN v SET STORAGE EXTERNAL;
+INSERT INTO stored_copies SELECT g % 3, repeat(chr(65 + g % 3), 3000) FROM generate_series(7, 12) g;
+CREATE TABLE stored_after (k int4, v text);
+ALTER TABLE stored_after ALTER COLUMN v SET STORAGE EXTERNAL;
+SELECT doltgres_test_fold('stored_after');
+INSERT INTO stored_after SELECT g % 3, repeat(chr(65 + g % 3), 3000) FROM generate_series(1, 12) g;
+SELECT doltgres_test_fold('stored_after');
+});
+is( $temped->safe_psql(
+		'postgres', q{SELECT doltgres_test_fold('stored_copies')}),
+	't',
+	'a fold of a keyless table with a pending SET STORAGE and equal rows installs a base'
+);
+is( $temped->safe_psql(
+		'postgres',
+		q{SELECT k, count(*), min(length(v)), max(length(v)) FROM stored_copies GROUP BY k ORDER BY k}
+	),
+	"0|4|3000|3000\n1|4|3000|3000\n2|4|3000|3000",
+	'and the table reads every copy of its equal rows back');
+my $base_counts = sub {
+	return $temped->safe_psql('postgres',
+		"SELECT doltgres_test_base_sizes('$_[0]')") =~
+	  s/^(\S+ \S+ \S+).*/$1/r;
+};
+is($base_counts->('stored_copies'), $base_counts->('stored_after'),
+	"and the base's heap bytes, rows, and entries count every copy, as a fold with no chain to apply counts them"
+);
+$temped->stop;
 done_testing();

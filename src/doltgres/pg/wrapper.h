@@ -15,17 +15,7 @@
  */
 
 /*
- * The Postgres and libzstd headers bindgen reads for the binding's types and
- * constants (design item 17), and the declarations of the generated wrappers.
+ * The libzstd headers bindgen reads for the simulation's zstd.
  */
-#include "postgres.h"
-
-#include "catalog/pg_collation_d.h"
-#include "catalog/pg_namespace_d.h"
-#include "catalog/pg_type_d.h"
-#include "fmgr.h"
-
 #include <zdict.h>
 #include <zstd.h>
-
-#include "calls.h"

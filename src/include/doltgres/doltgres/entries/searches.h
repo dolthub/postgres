@@ -28,6 +28,9 @@
 /* The backend's index scans, an owned kind whose records the resource owners' release ends. */
 extern HostOwnedTable DOLTGRES_ENTRIES_SEARCHES_SEARCHES;
 
+/* doltgres_entries_searches_Search_OWNED_OPS is Search's Owned: its kind, its table, and its release. */
+extern const HostOwnedOwnedOps doltgres_entries_searches_Search_OWNED_OPS;
+
 extern bool doltgres_entries_searches_begin(const PgCatalogCaps *caps, const PgRel *index, int32 nkeys,
 											int32 norderbys, PgIndexScanDesc *result, PgPgError *error);
 extern bool doltgres_entries_searches_rescan(const PgCaps *caps, PgIndexScan *scan, const PgScanKeys *keys,
@@ -42,7 +45,7 @@ extern bool doltgres_entries_searches_bitmap(const PgCatalogCaps *caps, PgIndexS
 extern bool doltgres_entries_searches_mark(const PgCaps *caps, PgIndexScan *scan, PgPgError *error);
 extern bool doltgres_entries_searches_restore(const PgCatalogCaps *caps, PgIndexScan *scan, PgPgError *error);
 
-/* DOLTGRES_ENTRIES_SEARCHES_SCAN_CALLS_OPS is a scan's search calls; the doltgres_test extension's tests reach its step through it. */
+/* DOLTGRES_ENTRIES_SEARCHES_SCAN_CALLS_OPS is a scan's search calls; the test entry doltgres_test_step_unwritten reaches its step through it. */
 extern const AccessNbtsearchSearchCallsOps DOLTGRES_ENTRIES_SEARCHES_SCAN_CALLS_OPS;
 
 #endif							/* DOLTGRES_DOLTGRES_ENTRIES_SEARCHES_H */

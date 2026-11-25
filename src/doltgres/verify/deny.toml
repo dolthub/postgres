@@ -11,11 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# cargo-deny's configuration for the gates (out/VERIFICATION_PLAN.md's "Linked crates"): every crate in the workspace's
-# graph, for every target, is refused if an advisory names it (a vulnerability, unmaintained, or unsound) or it is
-# yanked, if its license isn't one listed here, if it comes from anywhere but crates.io, if it is required by a
-# wildcard, or if two of its versions are in the graph, unless a skip below names the version with why both run only
-# at build time. Only the coordinator's refs change this file, with PRevPF's YES.
+# cargo-deny's configuration for the gates: every crate in the workspace's graph, for every target, is refused if an
+# advisory names it (a vulnerability, unmaintained, or unsound) or it is yanked, if its license isn't one listed here,
+# if it comes from anywhere but crates.io, if it is required by a wildcard, or if two of its versions are in the graph.
+# Only the coordinator's refs change this file.
 
 [advisories]
 version = 2
@@ -33,9 +32,6 @@ unused-allowed-license = "allow"
 multiple-versions = "deny"
 wildcards = "deny"
 allow-wildcard-paths = true
-skip = [
-    { crate = "syn@2.0.119", reason = "Verus' procedural macros (verus_builtin_macros and synstructure) build on syn 2 while bindgen is on syn 3; both run only at build time" },
-]
 
 [sources]
 unknown-registry = "deny"

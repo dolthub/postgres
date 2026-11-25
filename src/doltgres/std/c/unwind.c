@@ -45,6 +45,7 @@
 #include <pthread.h>
 #endif
 
+#include "doltgres/std/alloc.h"
 #include "doltgres/std/fmt.h"
 #include "doltgres/std/io.h"
 #include "doltgres/std/num.h"
@@ -858,16 +859,27 @@ std_resume_unwind(StdPayload payload, void *box)
 	std_unwind_begin(payload, box);
 }
 
+/* std_unwind_push_catching pushes the frame of a pad that catches the unwind, keeping the port heap it was pushed under. */
+void
+std_unwind_push_catching(StdUnwind *unwind)
+{
+	STD_UNWIND_PUSH(unwind);
+	unwind->catches = true;
+	unwind->heap = std_heap_current();
+}
+
 /*
  * std_unwind_end ends an unwind at the frame that catches it, an entry's or
- * catch_unwind's: it frees the exception record, lowers the panic count,
- * and returns the payload, which the catcher drops.
+ * catch_unwind's: it puts back the port heap the frame was pushed under,
+ * frees the exception record, lowers the panic count, and returns the
+ * payload, which the catcher drops.
  */
 StdCaught
 std_unwind_end(StdUnwind *unwind)
 {
 	StdCaught	caught;
 
+	std_heap_left(unwind->heap);
 	std_unwind_top = unwind->prev;
 #ifndef WIN32
 	std_free(std_exception, STD_EXCEPTION_SIZE, MAXIMUM_ALIGNOF);

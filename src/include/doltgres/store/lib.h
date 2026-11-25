@@ -33,6 +33,13 @@
  */
 #define STORE_KEPT_REDO_INDEX 0
 
+/*
+ * STORE_CAPTURE_REDO_INDEX is CaptureRedo's atomic: the redo point a
+ * collection's capture reads the WAL from, kept while it reads, or zero
+ * while no capture reads (bugs row 406).
+ */
+#define STORE_CAPTURE_REDO_INDEX 1
+
 extern const HostSharedSingleOps STORE_STORE_STATE_SINGLE_OPS;
 
 extern bool store_checkpoint(HostIoIo *io, HostLsn redo, HostError *error);

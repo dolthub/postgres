@@ -29,7 +29,9 @@
 #include "doltgres/chunks/file.h"
 #include "doltgres/chunks/packs.h"
 #include "doltgres/chunks/packs/dropped.h"
+#include "doltgres/chunks/packs/open.h"
 #include "doltgres/chunks/packs/removal.h"
+#include "doltgres/chunks/packs/shared.h"
 #include "doltgres/chunks/packs/single.h"
 #include "doltgres/chunks/trace.h"
 #include "doltgres/host/lib.h"
@@ -396,8 +398,8 @@ chunks_packs_removal_queue(HostIoIo *io, ChunksPacksRemovalReservation *reservat
 	return frame.ok;
 }
 
-/* chunks_packs_removal_queued_packs_frame_0_t is queued_packs' state across its pad: the queue's guard and the ids. */
-typedef struct chunks_packs_removal_queued_packs_frame_0_t
+/* chunks_packs_removal_queued_frame_0_t is queued's state across its pad: the queue's guard and the entries. */
+typedef struct chunks_packs_removal_queued_frame_0_t
 {
 	HostIoIo   *io;
 	uint32		repository;
@@ -406,26 +408,71 @@ typedef struct chunks_packs_removal_queued_packs_frame_0_t
 	bool		ok;
 	HostSharedGuard removing;
 	bool		removing_live;
-	StdVec		ids;
-	bool		ids_live;
-} chunks_packs_removal_queued_packs_frame_0_t;
+	StdVec		entries;
+	bool		entries_live;
+} chunks_packs_removal_queued_frame_0_t;
 
-/* chunks_packs_removal_queued_packs_pad_0 is queued_packs' pad: the ids, then the queue's guard. */
+/* chunks_packs_removal_queued_pad_0 is queued's pad: the entries, then the queue's guard. */
 static void
-chunks_packs_removal_queued_packs_pad_0(void *frame_)
+chunks_packs_removal_queued_pad_0(void *frame_)
 {
-	chunks_packs_removal_queued_packs_frame_0_t *frame = frame_;
+	chunks_packs_removal_queued_frame_0_t *frame = frame_;
 
-	if (frame->ids_live)
+	if (frame->entries_live)
 	{
-		frame->ids_live = false;
-		std_vec_free_Checked(&frame->ids, sizeof(ChunksPackPackId), _Alignof(ChunksPackPackId));
+		frame->entries_live = false;
+		std_vec_free_Checked(&frame->entries, sizeof(ChunksPacksSingleRemoval), _Alignof(ChunksPacksSingleRemoval));
 	}
 	if (frame->removing_live)
 	{
 		frame->removing_live = false;
 		host_shared_Guard_drop(&frame->removing);
 	}
+}
+
+/* chunks_packs_removal_queued_body_0 is queued's body: each of the repository's entries, under the queue's lock. */
+static void
+chunks_packs_removal_queued_body_0(void *frame_)
+{
+	chunks_packs_removal_queued_frame_0_t *frame = frame_;
+
+	frame->ok = false;
+	if (!chunks_packs_removal_removing(frame->io, &frame->removing, frame->error))
+		return;
+	frame->removing_live = true;
+	std_vec_new(&frame->entries, sizeof(ChunksPacksSingleRemoval), _Alignof(ChunksPacksSingleRemoval));
+	frame->entries_live = true;
+	for (size_t index = 0; index < CHUNKS_PACKS_SINGLE_QUEUED; index++)
+	{
+		ChunksPacksSingleRemoval entry;
+		bool		some;
+
+		if (!chunks_packs_removal_entry(&frame->removing, index, &some, &entry, frame->error))
+		{
+			chunks_packs_removal_queued_pad_0(frame);
+			return;
+		}
+		if (some && entry.repository == frame->repository)
+			std_vec_push_Checked(&frame->entries, &entry, sizeof(entry), _Alignof(ChunksPacksSingleRemoval));
+	}
+	*frame->result = frame->entries;
+	frame->entries_live = false;
+	frame->ok = true;
+	chunks_packs_removal_queued_pad_0(frame);
+}
+
+/*
+ * chunks_packs_removal_queued returns the removal queue's entries for a
+ * repository's files, read under the queue's lock, in the queue's order.
+ */
+bool
+chunks_packs_removal_queued(HostIoIo *io, uint32 repository, StdVec *result, ChunksErrorError *error)
+{
+	chunks_packs_removal_queued_frame_0_t frame = {.io = io, .repository = repository, .result = result,
+	.error = error};
+
+	std_landing(&frame, chunks_packs_removal_queued_body_0, chunks_packs_removal_queued_pad_0);
+	return frame.ok;
 }
 
 /* chunks_packs_removal_insert inserts an id into a set of ids, a vector in the ids' order with each once, as BTreeSet::insert. */
@@ -450,37 +497,6 @@ chunks_packs_removal_insert(StdVec *ids, const ChunksPackPackId *id)
 	std_vec_insert(ids, low, id, sizeof(ChunksPackPackId), _Alignof(ChunksPackPackId), RUST_FILE, 140, 17);
 }
 
-/* chunks_packs_removal_queued_packs_body_0 is queued_packs' body: each entry of the repository's packs, under the queue's lock. */
-static void
-chunks_packs_removal_queued_packs_body_0(void *frame_)
-{
-	chunks_packs_removal_queued_packs_frame_0_t *frame = frame_;
-
-	frame->ok = false;
-	if (!chunks_packs_removal_removing(frame->io, &frame->removing, frame->error))
-		return;
-	frame->removing_live = true;
-	std_vec_new(&frame->ids, sizeof(ChunksPackPackId), _Alignof(ChunksPackPackId));
-	frame->ids_live = true;
-	for (size_t index = 0; index < CHUNKS_PACKS_SINGLE_QUEUED; index++)
-	{
-		ChunksPacksSingleRemoval entry;
-		bool		some;
-
-		if (!chunks_packs_removal_entry(&frame->removing, index, &some, &entry, frame->error))
-		{
-			chunks_packs_removal_queued_packs_pad_0(frame);
-			return;
-		}
-		if (some && entry.repository == frame->repository && entry.kind.tag == CHUNKS_PACKS_SINGLE_QUEUED_PACK)
-			chunks_packs_removal_insert(&frame->ids, &entry.id);
-	}
-	*frame->result = frame->ids;
-	frame->ids_live = false;
-	frame->ok = true;
-	chunks_packs_removal_queued_packs_pad_0(frame);
-}
-
 /*
  * chunks_packs_removal_queued_packs returns the ids of a repository's pack
  * files the removal queue holds, a BTreeSet<PackId> as a vector in the ids'
@@ -490,11 +506,46 @@ chunks_packs_removal_queued_packs_body_0(void *frame_)
 bool
 chunks_packs_removal_queued_packs(HostIoIo *io, uint32 repository, StdVec *result, ChunksErrorError *error)
 {
-	chunks_packs_removal_queued_packs_frame_0_t frame = {.io = io, .repository = repository, .result = result,
-	.error = error};
+	StdVec		entries;
 
-	std_landing(&frame, chunks_packs_removal_queued_packs_body_0, chunks_packs_removal_queued_packs_pad_0);
-	return frame.ok;
+	if (!chunks_packs_removal_queued(io, repository, &entries, error))
+		return false;
+	std_vec_new(result, sizeof(ChunksPackPackId), _Alignof(ChunksPackPackId));
+	for (size_t k = 0, k_len = entries.len; k < k_len; k++)
+	{
+		const ChunksPacksSingleRemoval *entry = &STD_VEC_AT(&entries, ChunksPacksSingleRemoval, k);
+
+		if (entry->kind.tag == CHUNKS_PACKS_SINGLE_QUEUED_PACK)
+			chunks_packs_removal_insert(result, &entry->id);
+	}
+	std_vec_free_Checked(&entries, sizeof(ChunksPacksSingleRemoval), _Alignof(ChunksPacksSingleRemoval));
+	return true;
+}
+
+/*
+ * chunks_packs_removal_file_name returns the name of a queued entry's file,
+ * which lies in its repository's directory in the entry's space: a pack, its
+ * address-index run, or a generation of its dead vector beside it.
+ */
+StdString
+chunks_packs_removal_file_name(const ChunksPacksSingleRemoval *entry)
+{
+	StdString	pack;
+	StdPathBuf	vector;
+
+	switch (entry->kind.tag)
+	{
+		case CHUNKS_PACKS_SINGLE_QUEUED_PACK:
+			break;
+		case CHUNKS_PACKS_SINGLE_QUEUED_RUN:
+			return chunks_pack_PackId_file_name(&entry->id, "idx", 3);
+		case CHUNKS_PACKS_SINGLE_QUEUED_VECTOR:
+			pack = chunks_pack_PackId_file_name(&entry->id, "pack", 4);
+			vector = chunks_dead_Dead_path((const char *) pack.ptr, pack.len, entry->kind.u.vector);
+			std_vec_free_Checked(&pack, 1, 1);
+			return vector.bytes;
+	}
+	return chunks_pack_PackId_file_name(&entry->id, "pack", 4);
 }
 
 /* chunks_packs_removal_Due is a due file's entry: its index in the queue and its removal. */
@@ -523,7 +574,11 @@ chunks_packs_removal_removed(void *captures, ChunksTraceEvent *result)
 	}
 }
 
-/* chunks_packs_removal_remove_due_frame_0_t is remove_due's state across its pad: the due entries, the paths, and the queue's guard. */
+/*
+ * chunks_packs_removal_remove_due_frame_0_t is remove_due's state across its
+ * pad: the due entries, the paths, the queue's guard, and the repository it
+ * is at, with its open pack record and its files' flag while held.
+ */
 typedef struct chunks_packs_removal_remove_due_frame_0_t
 {
 	HostIoIo   *io;
@@ -535,11 +590,68 @@ typedef struct chunks_packs_removal_remove_due_frame_0_t
 	bool		removing_live;
 	StdPathBuf	dir;
 	bool		dir_live;
-	StdPathBuf	pack;
-	bool		pack_live;
 	StdPathBuf	path;
 	bool		path_live;
+	uint32		at;
+	bool		at_live;
+	bool		skipped;
+	HostSharedHeld held;
+	bool		held_live;
+	HostSharedFlagGuard rewriting;
+	bool		rewriting_live;
 } chunks_packs_removal_remove_due_frame_0_t;
+
+/* chunks_packs_removal_remove_due_left releases the repository remove_due is at: its files' flag, then its pack record. */
+static void
+chunks_packs_removal_remove_due_left(chunks_packs_removal_remove_due_frame_0_t *frame)
+{
+	frame->at_live = false;
+	if (frame->rewriting_live)
+	{
+		frame->rewriting_live = false;
+		host_shared_FlagGuard_drop(&frame->rewriting);
+	}
+	if (frame->held_live)
+	{
+		frame->held_live = false;
+		host_shared_Held_drop(&frame->held);
+	}
+}
+
+/*
+ * chunks_packs_removal_remove_due_at moves remove_due to a repository: when a
+ * process has its pack record published, it tries the record's files' flag,
+ * and skips the repository's files until a later pass when a whole copy of
+ * its directory holds the flag (bugs row 451), never waiting on it.
+ */
+static bool
+chunks_packs_removal_remove_due_at(chunks_packs_removal_remove_due_frame_0_t *frame, uint32 repository)
+{
+	HostError	host;
+	uint64		location;
+	bool		has;
+	bool		taken;
+
+	chunks_packs_removal_remove_due_left(frame);
+	frame->at = repository;
+	frame->at_live = true;
+	frame->skipped = false;
+	if (!chunks_packs_open_found(HOST_SHARED_IO_WITHIN(frame->io), repository, &has, &frame->held, &location,
+								 frame->error))
+		return false;
+	if (!has)
+		return true;
+	frame->held_live = true;
+	if (!host_shared_Record_try_flag(host_shared_Held_record(&frame->held), HOST_IO_IO_TAKES_SHORT(frame->io),
+									 CHUNKS_PACKS_SHARED_REWRITING_INDEX, &taken, &frame->rewriting, &host))
+	{
+		*frame->error = chunks_error_Error_FromError_from(&host);
+		return false;
+	}
+	frame->rewriting_live = taken;
+	frame->skipped = !taken;
+	return true;
+}
 
 /* chunks_packs_removal_remove_due_paths frees the paths of the due file remove_due is at. */
 static void
@@ -550,11 +662,6 @@ chunks_packs_removal_remove_due_paths(chunks_packs_removal_remove_due_frame_0_t 
 		frame->path_live = false;
 		std_vec_free_Checked(&frame->path.bytes, 1, 1);
 	}
-	if (frame->pack_live)
-	{
-		frame->pack_live = false;
-		std_vec_free_Checked(&frame->pack.bytes, 1, 1);
-	}
 	if (frame->dir_live)
 	{
 		frame->dir_live = false;
@@ -562,7 +669,7 @@ chunks_packs_removal_remove_due_paths(chunks_packs_removal_remove_due_frame_0_t 
 	}
 }
 
-/* chunks_packs_removal_remove_due_pad_0 is remove_due's pad: the queue's guard, the paths, then the due entries. */
+/* chunks_packs_removal_remove_due_pad_0 is remove_due's pad: the queue's guard, the paths, the repository it is at, then the due entries. */
 static void
 chunks_packs_removal_remove_due_pad_0(void *frame_)
 {
@@ -574,6 +681,7 @@ chunks_packs_removal_remove_due_pad_0(void *frame_)
 		host_shared_Guard_drop(&frame->removing);
 	}
 	chunks_packs_removal_remove_due_paths(frame);
+	chunks_packs_removal_remove_due_left(frame);
 	if (frame->due_live)
 	{
 		frame->due_live = false;
@@ -593,8 +701,9 @@ chunks_packs_removal_joined(const StdPathBuf *dir, StdString *name, StdPathBuf *
 /*
  * chunks_packs_removal_remove_due_body_0 is remove_due's body: the due
  * entries read under the queue's lock, each due file removed with no lock
- * held and its entry freed under the lock while it is the one read, then the
- * dropped repositories' pass.
+ * held, under its repository's files' flag when a process has the
+ * repository open, and its entry freed under the lock while it is the one
+ * read, then the dropped repositories' pass.
  */
 static void
 chunks_packs_removal_remove_due_body_0(void *frame_)
@@ -641,29 +750,24 @@ chunks_packs_removal_remove_due_body_0(void *frame_)
 		uint8		bytes[CHUNKS_PACKS_SINGLE_REMOVAL];
 		bool		removed;
 		bool		same;
+		bool		there;
 
+		if ((!frame->at_live || frame->at != entry->repository) &&
+			!chunks_packs_removal_remove_due_at(frame, entry->repository))
+			goto done;
+		if (frame->skipped)
+			continue;
 		frame->dir = host_tablespace_dir(entry->repository, entry->space);
 		frame->dir_live = true;
-		name = chunks_pack_PackId_file_name(&entry->id, "pack", 4);
-		chunks_packs_removal_joined(&frame->dir, &name, &frame->pack, &frame->pack_live);
-		switch (entry->kind.tag)
-		{
-			case CHUNKS_PACKS_SINGLE_QUEUED_PACK:
-				frame->path = frame->pack;
-				frame->path_live = true;
-				frame->pack_live = false;
-				break;
-			case CHUNKS_PACKS_SINGLE_QUEUED_RUN:
-				name = chunks_pack_PackId_file_name(&entry->id, "idx", 3);
-				chunks_packs_removal_joined(&frame->dir, &name, &frame->path, &frame->path_live);
-				break;
-			case CHUNKS_PACKS_SINGLE_QUEUED_VECTOR:
-				frame->path = chunks_dead_Dead_path(frame->pack.bytes.ptr, frame->pack.bytes.len,
-													entry->kind.u.vector);
-				frame->path_live = true;
-				break;
-		}
-		if (!chunks_file_remove_if_there(HOST_IO_IO_IO_DOORS(frame->io), frame->path.bytes.ptr, frame->path.bytes.len,
+		name = chunks_packs_removal_file_name(entry);
+		chunks_packs_removal_joined(&frame->dir, &name, &frame->path, &frame->path_live);
+		if (!chunks_file_dir_there(HOST_IO_IO_DOORS_READ_DOORS(HOST_IO_IO_IO_DOORS(frame->io)), frame->dir.bytes.ptr,
+								   frame->dir.bytes.len, &there, frame->error))
+			goto done;
+		if (there && !host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-removal-checked", &host))
+			goto failed;
+		if (there &&
+			!chunks_file_remove_if_there(HOST_IO_IO_IO_DOORS(frame->io), frame->path.bytes.ptr, frame->path.bytes.len,
 										 &removed, frame->error))
 			goto done;
 		chunks_trace_emit(entry->repository, chunks_packs_removal_removed, (void *) entry, NULL);
@@ -687,6 +791,7 @@ chunks_packs_removal_remove_due_body_0(void *frame_)
 		host_shared_Guard_drop(&frame->removing);
 		chunks_packs_removal_remove_due_paths(frame);
 	}
+	chunks_packs_removal_remove_due_left(frame);
 	frame->ok = chunks_packs_dropped_remove_dropped(frame->io, &freed, frame->error);
 	goto done;
 
@@ -702,11 +807,16 @@ done:
  * each checkpoint do: it compares the readers' epochs under the epoch lock,
  * removes each due file with no lock held, finding its directory through the
  * file door's tablespace-directory seam, and frees each file's entry once
- * the file is removed. A file already gone counts as removed. A removal that
+ * the file is removed. A file already gone counts as removed, and so does
+ * one whose directory is gone, with no directory to sync, as a moved
+ * database's old space leaves its entries (bugs row 451), which Doltgrust's
+ * delete_waiting passes over as gone the same way. A removal that
  * fails is returned, with its entry and those after it left queued. It then
  * removes the directories of the dropped repositories whose pack records no
  * process holds any more. While a base backup runs it removes nothing, since
- * the backup copies the list files and the packs at different moments.
+ * the backup copies the list files and the packs at different moments, and
+ * it leaves queued the files of a repository whose files' flag a whole copy
+ * of its directory holds (bugs row 451).
  */
 bool
 chunks_packs_removal_remove_due(HostIoIo *io, ChunksErrorError *error)

@@ -29,6 +29,7 @@
 
 #include "doltgres/chunks/file.h"
 #include "doltgres/chunks/packs/backend.h"
+#include "doltgres/chunks/packs/dropped.h"
 #include "doltgres/chunks/packs/open.h"
 #include "doltgres/chunks/packs/shared.h"
 #include "doltgres/chunks/record.h"
@@ -41,7 +42,10 @@
 #include "doltgres/std/unwind.h"
 #include "doltgres/std/vec.h"
 #include "doltgres/store/databases.h"
+#include "doltgres/txn/fold.h"
 #include "doltgres/txn/identity.h"
+#include "doltgres/txn/insert.h"
+#include "doltgres/txn/memtable/branch.h"
 #include "doltgres/txn/runs.h"
 #include "doltgres/txn/state.h"
 
@@ -66,8 +70,18 @@
 /* STORE_DATABASES_TEMPLATE is a creation's field of the template's id. */
 #define STORE_DATABASES_TEMPLATE 3
 
-/* STORE_DATABASES_ROOT is a creation's field of the template's base tree's root, absent for a template with no base. */
-#define STORE_DATABASES_ROOT 4
+/* STORE_DATABASES_DIGEST is a creation's field of its template's digest, which a standby's copy must match. */
+#define STORE_DATABASES_DIGEST 4
+
+/*
+ * STORE_DATABASES_KINDS is a creation's field of the storages its template's
+ * digest folded, in order, each its tablespace and relation, four bytes
+ * big-endian each, and its kind, one byte.
+ */
+#define STORE_DATABASES_KINDS 5
+
+/* STORE_DATABASES_KIND is the length of one storage's entry in a creation's kinds. */
+#define STORE_DATABASES_KIND 9
 
 /* STORE_DATABASES_FROM is a move's field of the tablespace it moves from. */
 #define STORE_DATABASES_FROM 2
@@ -77,6 +91,9 @@
 
 /* STORE_DATABASES_MOVING is the suffix of a repository's copy in the tablespace it moves to, which no open reads as a repository. */
 #define STORE_DATABASES_MOVING ".moving"
+
+/* STORE_DATABASES_COPYING is the suffix of a copy while it is written, renamed to the copy's own name only whole (bugs row 449). */
+#define STORE_DATABASES_COPYING ".copying"
 
 /* STORE_DATABASES_TEMPLATE1 is the id of template1, the database whose repository the start after bootstrap makes. */
 #define STORE_DATABASES_TEMPLATE1 1
@@ -90,8 +107,13 @@ typedef struct StoreDatabasesCreated
 	uint32		database;
 	uint32		tablespace;
 	uint32		template;
-	bool		has_root;
-	uint8		root[32];
+
+	/*
+	 * digest is the template's digest, and kinds a Vec<Digested> of the
+	 * storages it folded (bugs row 404).
+	 */
+	uint8		digest[TXN_FOLD_DIGEST_LEN];
+	StdVec		kinds;
 } StoreDatabasesCreated;
 
 /* StoreDatabasesDropped is the fork's record of a repository's drop. */
@@ -267,40 +289,95 @@ static StdVec
 store_databases_Created_encode(const StoreDatabasesCreated *self)
 {
 	ChunksRecordRecordWriter w = chunks_record_RecordWriter_new();
+	StdVec		kinds;
 
-	chunks_record_RecordWriter_uint(chunks_record_RecordWriter_uint(&w, STORE_DATABASES_DATABASE, self->database), STORE_DATABASES_TABLESPACE, self->tablespace);
+	chunks_record_RecordWriter_uint(&w, STORE_DATABASES_DATABASE, self->database);
+	chunks_record_RecordWriter_uint(&w, STORE_DATABASES_TABLESPACE, self->tablespace);
 	chunks_record_RecordWriter_uint(&w, STORE_DATABASES_TEMPLATE, self->template);
-	if (self->has_root)
-		chunks_record_RecordWriter_field(&w, STORE_DATABASES_ROOT, self->root, sizeof(self->root));
+	chunks_record_RecordWriter_field(&w, STORE_DATABASES_DIGEST, self->digest, sizeof(self->digest));
+	std_vec_with_capacity_Checked(&kinds, self->kinds.len * STORE_DATABASES_KIND, 1, 1);
+	for (size_t k = 0; k < self->kinds.len; k++)
+	{
+		const TxnFoldDigested *kind = &STD_VEC_AT(&self->kinds, TxnFoldDigested, k);
+		uint8		entry[STORE_DATABASES_KIND];
+
+		std_u32_to_be_bytes(kind->tablespace, entry);
+		std_u32_to_be_bytes(kind->relation, entry + 4);
+		entry[8] = kind->kind;
+		std_vec_extend_from_slice_Checked(&kinds, entry, sizeof(entry), 1, 1);
+	}
+	chunks_record_RecordWriter_field(&w, STORE_DATABASES_KINDS, kinds.ptr, kinds.len);
+	std_vec_free_Checked(&kinds, 1, 1);
 	return chunks_record_RecordWriter_finish(&w);
 }
 
-/* store_databases_Created_decode reads a creation's body, refusing a field it doesn't know, a missing one it requires, a root of another length, and a body cut short as data corruption. */
+/*
+ * store_databases_Created_kinds reads a creation's kinds, refusing a field of
+ * another length, a kind past unknown, and storages out of order or repeated
+ * as data corruption.
+ */
+static bool
+store_databases_Created_kinds(const ChunksRecordField *field, StdVec *result, HostError *error)
+{
+	if (field->bytes_len % STORE_DATABASES_KIND != 0)
+	{
+		*error = store_databases_corrupt_text("its kinds aren't whole");
+		return false;
+	}
+	std_vec_with_capacity_Checked(result, field->bytes_len / STORE_DATABASES_KIND, sizeof(TxnFoldDigested),
+								  _Alignof(TxnFoldDigested));
+	for (size_t at = 0; at < field->bytes_len; at += STORE_DATABASES_KIND)
+	{
+		const uint8 *entry = field->bytes + at;
+		TxnFoldDigested kind = {std_u32_from_be_bytes(entry), std_u32_from_be_bytes(entry + 4), entry[8]};
+		const TxnFoldDigested *last = result->len > 0 ?
+			&STD_VEC_AT(result, TxnFoldDigested, result->len - 1) : NULL;
+
+		if (kind.kind > TXN_FOLD_DIGEST_UNKNOWN ||
+			(last != NULL && (last->tablespace > kind.tablespace ||
+							  (last->tablespace == kind.tablespace && last->relation >= kind.relation))))
+		{
+			std_vec_free_Checked(result, sizeof(TxnFoldDigested), _Alignof(TxnFoldDigested));
+			*error = store_databases_corrupt_text("its kinds aren't storages in order with a kind each");
+			return false;
+		}
+		std_vec_push_Checked(result, &kind, sizeof(kind), _Alignof(TxnFoldDigested));
+	}
+	return true;
+}
+
+/* store_databases_Created_decode reads a creation's body, refusing a field it doesn't know, a missing one it requires, a digest of another length, kinds that don't read, and a body cut short as data corruption. */
 static bool
 store_databases_Created_decode(const uint8 *body, size_t body_len, StoreDatabasesCreated *result, HostError *error)
 {
 	static const uint32 known[] = {STORE_DATABASES_DATABASE, STORE_DATABASES_TABLESPACE, STORE_DATABASES_TEMPLATE,
-	STORE_DATABASES_ROOT};
+	STORE_DATABASES_DIGEST, STORE_DATABASES_KINDS};
 	StdVec		fields;
-	const ChunksRecordField *root;
+	const ChunksRecordField *digest;
+	const ChunksRecordField *kinds;
 	bool		ok = false;
 
 	if (!store_databases_Read_of(body, body_len, known, lengthof(known), &fields, error))
 		return false;
-	root = store_databases_Read_field(&fields, STORE_DATABASES_ROOT);
-	result->has_root = root != NULL;
-	if (root != NULL)
+	digest = store_databases_Read_field(&fields, STORE_DATABASES_DIGEST);
+	kinds = store_databases_Read_field(&fields, STORE_DATABASES_KINDS);
+	if (digest == NULL || kinds == NULL)
 	{
-		if (root->bytes_len != sizeof(result->root))
-		{
-			*error = store_databases_corrupt_text("its root isn't 32 bytes");
-			goto done;
-		}
-		memcpy(result->root, root->bytes, sizeof(result->root));
+		*error = store_databases_corrupt_field("it lacks field ", digest == NULL ? STORE_DATABASES_DIGEST :
+											   STORE_DATABASES_KINDS, "");
+		goto done;
 	}
-	ok = store_databases_Read_database(&fields, &result->database, error) &&
-		store_databases_Read_oid(&fields, STORE_DATABASES_TABLESPACE, &result->tablespace, error) &&
-		store_databases_Read_oid(&fields, STORE_DATABASES_TEMPLATE, &result->template, error);
+	if (digest->bytes_len != sizeof(result->digest))
+	{
+		*error = store_databases_corrupt_text("its digest isn't 32 bytes");
+		goto done;
+	}
+	memcpy(result->digest, digest->bytes, sizeof(result->digest));
+	if (!store_databases_Read_database(&fields, &result->database, error) ||
+		!store_databases_Read_oid(&fields, STORE_DATABASES_TABLESPACE, &result->tablespace, error) ||
+		!store_databases_Read_oid(&fields, STORE_DATABASES_TEMPLATE, &result->template, error))
+		goto done;
+	ok = store_databases_Created_kinds(kinds, &result->kinds, error);
 done:
 	std_vec_free_Checked(&fields, sizeof(ChunksRecordField), _Alignof(ChunksRecordField));
 	return ok;
@@ -389,14 +466,14 @@ store_databases_spaces(HostIoReadDoors io, StdVec *result, HostError *error)
 	return true;
 }
 
-/* store_databases_moving returns the directory of a repository's copy in the tablespace it moves to. */
+/* store_databases_beside returns a directory named by a repository and a suffix in a tablespace's directory of repositories. */
 static StdPathBuf
-store_databases_moving(uint32 database, uint32 to)
+store_databases_beside(uint32 database, uint32 to, const char *suffix)
 {
 	StdPathBuf	dir = host_versioned_dir(to);
 	StdPathBuf	result;
 	StdString	name;
-	StdFmtPiece pieces[] = {STD_FMT_ARG(0), STD_FMT_LIT(STORE_DATABASES_MOVING)};
+	StdFmtPiece pieces[] = {STD_FMT_ARG(0), STD_FMT_LIT(suffix)};
 	StdFmtArg	args[] = {{&database, std_u32_Display_fmt}};
 	StdFmtArguments arguments = {pieces, lengthof(pieces), args};
 
@@ -405,6 +482,13 @@ store_databases_moving(uint32 database, uint32 to)
 	std_String_drop(&name);
 	std_vec_free_Checked(&dir.bytes, 1, 1);
 	return result;
+}
+
+/* store_databases_moving returns the directory of a repository's copy in the tablespace it moves to. */
+static StdPathBuf
+store_databases_moving(uint32 database, uint32 to)
+{
+	return store_databases_beside(database, to, STORE_DATABASES_MOVING);
 }
 
 /* store_databases_made_gather is made's gathering: the initial schemas' pairs, cloned, since a refused write gathers again. */
@@ -542,12 +626,16 @@ store_databases_made(HostIoIo *io, uint32 repository, uint32 tablespace, HostErr
 	return frame.ok;
 }
 
-/* store_databases_inserted appends a fork's record of a kind, taking its body. */
+/*
+ * store_databases_inserted appends a fork's record of a kind, taking its
+ * body, and when asked flushes the WAL through it, so the record is durable
+ * before the files it orders change; it returns the record's end.
+ */
 static bool
-store_databases_inserted(HostIoIo *io, HostWalKind kind, StdVec *body, HostError *error)
+store_databases_inserted(HostIoIo *io, HostWalKind kind, StdVec *body, bool flushed, HostLsn *end, HostError *error)
 {
-	HostLsn		lsn;
-	bool		ok = host_wal_insert(HOST_IO_IO_IO_DOORS(io), kind, body->ptr, body->len, &lsn, error);
+	bool		ok = host_wal_insert(HOST_IO_IO_IO_DOORS(io), kind, body->ptr, body->len, end, error) &&
+		(!flushed || host_wal_flush(HOST_IO_IO_IO_DOORS(io), *end, error));
 
 	std_vec_free_Checked(body, 1, 1);
 	return ok;
@@ -561,41 +649,620 @@ store_databases_warned(HostIoIo *io, HostError *failure, const char *context, ui
 	return host_warn(HOST_IO_IO_IO_DOORS(io), failure, context, error);
 }
 
+static bool store_databases_found(const StdVec *found, uint32 repository, uint32 *tablespace);
+
 /*
- * store_databases_created makes a new database's repository in its default
- * tablespace and appends the fork's record of it, in createdb's cleanup
- * block after Postgres' copy. A making that fails part way is removed, so the
- * failure callback finds nothing of the fork's: the failure is reported at
- * WARNING first, so no error is held through the removal, and the error
- * raised after it carries the failure's SQLSTATE.
+ * store_databases_pending_t is a creation the startup process found marked
+ * or replayed whose transaction it hasn't seen commit: the new repository,
+ * its tablespace, and the creating transaction's xid.
+ */
+typedef struct store_databases_pending_t
+{
+	uint32		database;
+	uint32		tablespace;
+	uint64		xid;
+} store_databases_pending_t;
+
+/*
+ * store_databases_pending is the startup process's creations its replay of
+ * their transactions' commits or aborts settles, or the end of redo settles
+ * as aborted (bugs row 404).
+ */
+static StdVec store_databases_pending = {.ptr = NULL};
+
+/* store_databases_pending_kept makes the startup process's list of kept creations once. */
+static void
+store_databases_pending_kept(void)
+{
+	if (store_databases_pending.ptr == NULL)
+		std_vec_new(&store_databases_pending, sizeof(store_databases_pending_t),
+					_Alignof(store_databases_pending_t));
+}
+
+/*
+ * store_databases_created_from makes a new database's repository from its
+ * template's, as a backend's creation or, at a replayed record's end, as its
+ * replay by the creating transaction's xid (bugs row 404).
+ */
+static bool store_databases_created_from(HostIoIo *io, uint32 template, uint32 database, uint32 tablespace,
+										 HostLsn position, uint64 xid, const StoreDatabasesCreated *expected,
+										 HostError *error);
+
+/*
+ * store_databases_creation is the repository the backend's transaction is
+ * creating from a template, which the transaction's end settles (bugs row
+ * 404).
+ */
+static struct
+{
+	bool		live;
+	uint32		database;
+	uint32		tablespace;
+}			store_databases_creation;
+
+/* store_databases_created_gather is created's save's gathering, which gathers nothing: the copy's identity tree is the template's. */
+static bool
+store_databases_created_gather(void *captures, HostIoIo *io, const RepoRead *read, StdVec *result,
+							   ChunksErrorError *error)
+{
+	(void) captures;
+	(void) io;
+	(void) read;
+	(void) error;
+	std_vec_new(result, sizeof(RepoGathered), _Alignof(RepoGathered));
+	return true;
+}
+
+/*
+ * store_databases_created_frame_0_t is created's state across its pad: the
+ * repositories found, the template's packs, the new repository, its newest
+ * manifest, and the reader, while live, and the runs its save takes.
+ */
+typedef struct store_databases_created_frame_0_t
+{
+	HostIoIo   *io;
+	uint32		template;
+	uint32		database;
+	uint32		tablespace;
+
+	/*
+	 * position is a replayed creation's record's end, or 0 for a creation a
+	 * backend runs, and xid its creating transaction's, which a backend's
+	 * creation reads as its own.
+	 */
+	HostLsn		position;
+	uint64		xid;
+
+	/*
+	 * expected is a replayed creation's record, whose digest and kinds the
+	 * replay's copy must match, or NULL; digest and kinds are the template's.
+	 */
+	const StoreDatabasesCreated *expected;
+	uint8		digest[TXN_FOLD_DIGEST_LEN];
+	StdVec		kinds;
+	HostError  *error;
+	bool		ok;
+	StdVec		found;
+	bool		found_live;
+	RepoRepo	template_repo;
+	bool		template_live;
+	ChunksPacksBackendPacks packs;
+	bool		packs_live;
+	RepoRepo	repo;
+	bool		repo_live;
+	StdArcInner *manifest;
+	bool		manifest_live;
+	RepoRuns	runs;
+	HostSharedReader reading;
+	bool		reading_live;
+	StdPathBuf	dir;
+} store_databases_created_frame_0_t;
+
+/* store_databases_created_pad_0 is created's pad: the reader, the manifest, the repository, the packs, then the repositories found and the directory. */
+static void
+store_databases_created_pad_0(void *frame_)
+{
+	store_databases_created_frame_0_t *frame = frame_;
+
+	if (frame->reading_live)
+	{
+		frame->reading_live = false;
+		host_shared_Reader_drop(&frame->reading);
+	}
+	if (frame->manifest_live)
+	{
+		frame->manifest_live = false;
+		repo_ArcManifest_drop(frame->manifest);
+	}
+	if (frame->repo_live)
+	{
+		frame->repo_live = false;
+		repo_Repo_drop(&frame->repo);
+	}
+	if (frame->packs_live)
+	{
+		frame->packs_live = false;
+		chunks_packs_backend_Packs_drop(&frame->packs);
+	}
+	if (frame->template_live)
+	{
+		frame->template_live = false;
+		repo_Repo_drop(&frame->template_repo);
+	}
+	if (frame->found_live)
+	{
+		frame->found_live = false;
+		std_vec_free_Checked(&frame->found, sizeof(std_TupleU32U32_t), _Alignof(std_TupleU32U32_t));
+	}
+	std_vec_free_Checked(&frame->kinds, sizeof(TxnFoldDigested), _Alignof(TxnFoldDigested));
+	std_vec_new(&frame->kinds, sizeof(TxnFoldDigested), _Alignof(TxnFoldDigested));
+	std_vec_free_Checked(&frame->dir.bytes, 1, 1);
+	std_PathBuf_new(&frame->dir);
+}
+
+/* store_databases_kind_name returns a digested storage's kind's name for a refusal's detail. */
+static const char *
+store_databases_kind_name(uint8 kind)
+{
+	return kind == TXN_FOLD_DIGEST_KEYED ? "keyed" : kind == TXN_FOLD_DIGEST_KEYLESS ? "keyless" : "unknown";
+}
+
+/* store_databases_hex writes a digest's bytes as hexadecimal digits and a terminator. */
+static void
+store_databases_hex(const uint8 *digest, char *result)
+{
+	for (int k = 0; k < TXN_FOLD_DIGEST_LEN; k++)
+		snprintf(result + 2 * k, 3, "%02x", digest[k]);
+}
+
+/*
+ * store_databases_refused refuses a standby's recovery whose replay of a
+ * creation differs from its primary's (bugs row 404): a storage whose known
+ * key contradicts the kind the primary folded it as, or a digest of its own
+ * template other than the primary's, naming both.
+ */
+static void
+store_databases_refused(store_databases_created_frame_0_t *frame, bool disagreed, const TxnFoldDigested *at)
+{
+	char		detail[320];
+	char		ours[2 * TXN_FOLD_DIGEST_LEN + 1];
+	char		theirs[2 * TXN_FOLD_DIGEST_LEN + 1];
+
+	if (disagreed)
+	{
+		uint8		primary = TXN_FOLD_DIGEST_UNKNOWN;
+
+		for (size_t k = 0; k < frame->expected->kinds.len; k++)
+			if (STD_VEC_AT(&frame->expected->kinds, TxnFoldDigested, k).tablespace == at->tablespace &&
+				STD_VEC_AT(&frame->expected->kinds, TxnFoldDigested, k).relation == at->relation)
+				primary = STD_VEC_AT(&frame->expected->kinds, TxnFoldDigested, k).kind;
+		snprintf(detail, sizeof(detail),
+				 "Storage %u/%u of template database %u is %s here and was %s on the primary.",
+				 at->tablespace, at->relation, frame->template, store_databases_kind_name(at->kind),
+				 store_databases_kind_name(primary));
+	}
+	else
+	{
+		store_databases_hex(frame->digest, ours);
+		store_databases_hex(frame->expected->digest, theirs);
+		snprintf(detail, sizeof(detail),
+				 "Template database %u of database %u digests %s here and digested %s on the primary.",
+				 frame->template, frame->database, ours, theirs);
+	}
+	host_refuse_recovery(HOST_IO_IO_IO_DOORS(frame->io), detail, strlen(detail));
+}
+
+/*
+ * store_databases_created_body_0 is created's body: the template saved, the
+ * new repository's directory made with the creation's mark, the template's
+ * directories copied into it, the template's delta written as its runs, and
+ * its manifest saved naming them; a backend's creation then appends the
+ * record, and a replayed one is kept for its transaction's outcome.
+ */
+static void
+store_databases_created_body_0(void *frame_)
+{
+	store_databases_created_frame_0_t *frame = frame_;
+	HostIoIo   *io = frame->io;
+	StoreDatabasesCreated record = {.database = frame->database, .tablespace = frame->tablespace,
+	.template = frame->template};
+	ChunksErrorError failed;
+	uint32		own;
+	bool		took;
+	bool		cleaned;
+	HostXid		writer;
+	HostXid		top;
+	HostLsn		redo;
+	HostLsn		point;
+	HostLsn		end;
+	StdVec		body;
+	bool		disagreed;
+	bool		diverged = false;
+	TxnFoldDigested at;
+
+	frame->ok = false;
+	if (!chunks_packs_open_repositories(HOST_IO_IO_READ_DOORS(io), &frame->found, &failed))
+		goto raised;
+	frame->found_live = true;
+	if (!store_databases_found(&frame->found, frame->template, &own))
+	{
+		*frame->error = store_databases_failed((const uint8 *) "XX000", "found no repository of template database ",
+											   frame->template);
+		goto done;
+	}
+	if (frame->position != 0)
+	{
+		if (!txn_runs_saved_at(io, frame->template, own, frame->position, &took, &cleaned, frame->error))
+			goto done;
+	}
+	else
+	{
+		if (!txn_runs_save(io, frame->template, own, &took, &cleaned, frame->error) ||
+			!host_current_writer(HOST_IO_IO_IO_DOORS(io), &writer, &top, frame->error))
+			goto done;
+		frame->xid = top.f0;
+	}
+	if (!host_shared_read(io, &frame->reading, frame->error))
+		goto done;
+	frame->reading_live = true;
+	if (!repo_Repo_open(io, frame->template, own, &frame->template_repo, &failed))
+		goto raised;
+	frame->template_live = true;
+	if (!txn_fold_digest(io, &frame->template_repo, &frame->reading, frame->template,
+						 frame->expected != NULL ? &frame->expected->kinds : NULL, &frame->kinds, frame->digest,
+						 &disagreed, &at, frame->error))
+		goto done;
+	frame->template_live = false;
+	if (!repo_Repo_close(&frame->template_repo, io, &frame->reading, &failed))
+		goto raised;
+	if (frame->expected != NULL &&
+		!host_injected(HOST_IO_IO_IO_DOORS(io), "doltgres-store-creation-diverged", &diverged, frame->error))
+		goto done;
+	if (diverged)
+		frame->digest[0] ^= 1;
+	if (frame->expected != NULL &&
+		(disagreed || memcmp(frame->digest, frame->expected->digest, TXN_FOLD_DIGEST_LEN) != 0))
+	{
+		store_databases_refused(frame, disagreed, &at);
+		frame->ok = true;
+		goto done;
+	}
+	frame->dir = host_tablespace_dir(frame->database, frame->tablespace);
+	if (!chunks_packs_open_made_dir(io, frame->dir.bytes.ptr, frame->dir.bytes.len, &failed) ||
+		!chunks_packs_dropped_creation_mark(HOST_IO_IO_IO_DOORS(io), frame->database, frame->tablespace, frame->xid,
+											&failed))
+		goto raised;
+	if (frame->position == 0)
+	{
+		store_databases_creation.live = true;
+		store_databases_creation.database = frame->database;
+		store_databases_creation.tablespace = frame->tablespace;
+	}
+	if (!chunks_packs_open_Packs_open(io, frame->template, own, &frame->packs, &failed))
+		goto raised;
+	frame->packs_live = true;
+	if (!chunks_packs_backend_Packs_created(&frame->packs, io, &frame->reading, frame->database, frame->tablespace,
+											&failed))
+		goto raised;
+	frame->packs_live = false;
+	if (!chunks_packs_backend_Packs_close(&frame->packs, io, &frame->reading, &failed) ||
+		!repo_Repo_open(io, frame->database, frame->tablespace, &frame->repo, &failed))
+		goto raised;
+	frame->repo_live = true;
+	if (!repo_Repo_manifest(&frame->repo, io, &frame->manifest, &failed))
+		goto raised;
+	frame->manifest_live = true;
+	point = repo_Repo_newest(frame->manifest)->folded;
+	frame->manifest_live = false;
+	repo_ArcManifest_drop(frame->manifest);
+	if (!host_last_redo(HOST_IO_IO_IO_DOORS(io), &redo, frame->error) ||
+		!txn_runs_copied(io, frame->template, own, frame->database, frame->tablespace, redo, point, &frame->repo,
+						 &frame->reading, &frame->runs, frame->error))
+		goto done;
+	if (!repo_Repo_save(&frame->repo, io, &frame->reading, true, &frame->runs, store_databases_created_gather, NULL,
+						store_databases_saved, NULL, &failed) ||
+		(own != frame->tablespace &&
+		 !repo_Repo_rekeyed(&frame->repo, io, &frame->reading, own, frame->tablespace, &failed)))
+		goto raised;
+	frame->repo_live = false;
+	if (!repo_Repo_close(&frame->repo, io, &frame->reading, &failed))
+		goto raised;
+	if (frame->position != 0)
+	{
+		store_databases_pending_t pending = {.database = frame->database, .tablespace = frame->tablespace,
+		.xid = frame->xid};
+
+		store_databases_pending_kept();
+		std_vec_push_Checked(&store_databases_pending, &pending, sizeof(pending),
+							 _Alignof(store_databases_pending_t));
+		frame->ok = true;
+		goto done;
+	}
+	memcpy(record.digest, frame->digest, sizeof(record.digest));
+	record.kinds = frame->kinds;
+	body = store_databases_Created_encode(&record);
+	frame->ok = store_databases_inserted(io, HOST_WAL_KIND_REPOSITORY_CREATED, &body, false, &end, frame->error) &&
+		host_pause(HOST_SHARED_IO_PAUSES(io), "doltgres-store-creation-copied", frame->error);
+	goto done;
+raised:
+	*frame->error = store_databases_raised(&failed);
+done:
+	store_databases_created_pad_0(frame);
+}
+
+/*
+ * store_databases_created makes a new database's repository from its
+ * template's, in its default tablespace, and appends the fork's record of
+ * it, in createdb's cleanup block after Postgres' copy (bugs row 404): it
+ * saves the template, makes the new repository's own directory holding the
+ * creation's mark, copies the template's directories into the new
+ * repository's, writes the template's committed delta into it as its runs,
+ * and saves its manifest naming them, its storages of the template's own
+ * tablespace put under the new one's; the record carries the template's
+ * digest and the kinds its storages were folded as. The template has no
+ * session while createdb runs, since Postgres refuses one, and the copy holds
+ * the files' flag that every whole write of the template's kept files holds.
+ * A failure leaves the marked repository to the transaction's abort, which
+ * removes it.
  */
 bool
 store_databases_created(HostIoIo *io, uint32 template, uint32 database, uint32 tablespace, HostError *error)
 {
-	StoreDatabasesCreated record = {.database = database, .tablespace = tablespace, .template = template};
-	HostError	failure;
-	ChunksErrorError failed;
-	StdVec		body;
-	uint8		code[5];
-	bool		removed;
+	return store_databases_id(database, error) &&
+		store_databases_created_from(io, template, database, tablespace, 0, 0, NULL, error);
+}
 
-	if (!store_databases_id(database, error))
-		return false;
-	if (store_databases_made(io, database, tablespace, &failure))
+/* store_databases_created_from makes a new database's repository from its template's, by created's body. */
+static bool
+store_databases_created_from(HostIoIo *io, uint32 template, uint32 database, uint32 tablespace, HostLsn position,
+							 uint64 xid, const StoreDatabasesCreated *expected, HostError *error)
+{
+	store_databases_created_frame_0_t frame = {.io = io, .template = template, .database = database,
+	.tablespace = tablespace, .position = position, .xid = xid, .expected = expected, .error = error};
+
+	std_PathBuf_new(&frame.dir);
+	std_vec_new(&frame.kinds, sizeof(TxnFoldDigested), _Alignof(TxnFoldDigested));
+	std_landing(&frame, store_databases_created_body_0, store_databases_created_pad_0);
+	return frame.ok;
+}
+
+/*
+ * store_databases_settled settles a repository's creation by its creating
+ * transaction's outcome (bugs row 404): a committed one's mark is taken away,
+ * and an aborted one's states are freed and the repository is marked dropped,
+ * its creation's mark is taken away, and its directories are removed, or
+ * left to the next settle while a process holds it.
+ */
+bool
+store_databases_settled(HostIoIo *io, uint32 database, uint32 tablespace, bool committed, HostError *error)
+{
+	ChunksErrorError failed;
+	StdPathBuf	dir;
+	bool		removed;
+	bool		ok;
+
+	if (committed)
+		ok = chunks_packs_dropped_created(HOST_IO_IO_IO_DOORS(io), database, tablespace, &failed);
+	else
 	{
-		body = store_databases_Created_encode(&record);
-		if (store_databases_inserted(io, HOST_WAL_KIND_REPOSITORY_CREATED, &body, &failure))
-			return true;
+		if (!txn_runs_dropped(io, database, error))
+			return false;
+		dir = host_tablespace_dir(database, tablespace);
+		ok = chunks_packs_dropped_mark(HOST_IO_IO_IO_DOORS(io), dir.bytes.ptr, dir.bytes.len, &failed);
+		std_vec_free_Checked(&dir.bytes, 1, 1);
+		ok = ok && chunks_packs_dropped_created(HOST_IO_IO_IO_DOORS(io), database, tablespace, &failed) &&
+			chunks_packs_open_Packs_dropped(io, database, tablespace, &removed, &failed);
 	}
-	if (!store_databases_warned(io, &failure, "CREATE DATABASE", code, error))
-		return false;
-	if (!chunks_packs_open_Packs_dropped(io, database, tablespace, &removed, &failed))
-	{
+	if (!ok)
 		*error = store_databases_raised(&failed);
-		return false;
+	return ok;
+}
+
+/*
+ * store_databases_creation_ended settles the repository the backend's
+ * transaction created, at its commit or its abort, which can't raise: a
+ * failure is reported at WARNING, and the next checkpoint settles the
+ * creation by its outcome (bugs row 404); settled says whether there was
+ * one.
+ */
+bool
+store_databases_creation_ended(HostIoIo *io, bool committed, bool *settled, HostError *error)
+{
+	HostError	failure;
+	uint8		code[5];
+
+	*settled = store_databases_creation.live;
+	if (!store_databases_creation.live)
+		return true;
+	store_databases_creation.live = false;
+	if (committed && !host_pause(HOST_SHARED_IO_PAUSES(io), "doltgres-store-creation-ending", &failure))
+		return store_databases_warned(io, &failure, "CREATE DATABASE", code, error);
+	if (store_databases_settled(io, store_databases_creation.database, store_databases_creation.tablespace,
+								committed, &failure))
+		return true;
+	return store_databases_warned(io, &failure, "CREATE DATABASE", code, error);
+}
+
+/*
+ * store_databases_loaded loads the runs a committed creation's copy wrote
+ * into the delta and then settles it, so no listing of repositories names it
+ * before its runs' versions are in the delta, where the collector counts
+ * them as roots.
+ */
+static bool
+store_databases_loaded(HostIoIo *io, const TxnInsertPage *page, uint32 database, uint32 tablespace,
+					   HostError *error)
+{
+	return txn_runs_loaded_one(io, page, database, tablespace, error) &&
+		store_databases_settled(io, database, tablespace, true, error);
+}
+
+/*
+ * store_databases_started_frame_0_t is started's state across its pad: the
+ * marked repositories found.
+ */
+typedef struct store_databases_started_frame_0_t
+{
+	HostIoIo   *io;
+
+	/*
+	 * page is what the startup process loads a committed creation's runs
+	 * with, or none at a checkpoint, which only settles each ended creation.
+	 */
+	const TxnInsertPage *page;
+
+	/*
+	 * loaded says whether the startup process loaded a committed creation's
+	 * runs.
+	 */
+	bool	   *loaded;
+	HostError  *error;
+	bool		ok;
+	StdVec		found;
+} store_databases_started_frame_0_t;
+
+/* store_databases_started_pad_0 is started's pad: the marked repositories found. */
+static void
+store_databases_started_pad_0(void *frame_)
+{
+	store_databases_started_frame_0_t *frame = frame_;
+
+	std_vec_free_Checked(&frame->found, sizeof(std_TupleU32U32_t), _Alignof(std_TupleU32U32_t));
+	std_vec_new(&frame->found, sizeof(std_TupleU32U32_t), _Alignof(std_TupleU32U32_t));
+}
+
+/* store_databases_started_body_0 is started's body. */
+static void
+store_databases_started_body_0(void *frame_)
+{
+	store_databases_started_frame_0_t *frame = frame_;
+	HostIoIo   *io = frame->io;
+	ChunksErrorError failed;
+
+	if (!chunks_packs_open_creations(HOST_IO_IO_READ_DOORS(io), &frame->found, &failed))
+	{
+		*frame->error = store_databases_raised(&failed);
+		goto done;
 	}
-	*error = store_databases_failed(code, "could not make the repository of database ", database);
-	return false;
+	for (size_t k = 0, k_len = frame->found.len; k < k_len; k++)
+	{
+		std_TupleU32U32_t found = STD_VEC_AT(&frame->found, std_TupleU32U32_t, k);
+		store_databases_pending_t pending = {.database = found.f0, .tablespace = found.f1};
+		bool		marked;
+		HostXid		xid;
+		HostStatus	status;
+
+		if (!chunks_packs_dropped_creating(HOST_IO_IO_READ_DOORS(io), found.f0, found.f1, &marked, &pending.xid,
+										   &failed))
+		{
+			*frame->error = store_databases_raised(&failed);
+			goto done;
+		}
+		xid.f0 = pending.xid;
+		if (!host_status(HOST_IO_IO_IO_DOORS(io), xid, &status, frame->error))
+			goto done;
+		if (status == HOST_STATUS_COMMITTED && frame->page != NULL)
+		{
+			if (!store_databases_loaded(io, frame->page, found.f0, found.f1, frame->error))
+				goto done;
+			*frame->loaded = true;
+		}
+		else if (frame->page != NULL)
+			std_vec_push_Checked(&store_databases_pending, &pending, sizeof(pending),
+								 _Alignof(store_databases_pending_t));
+		else if (status != HOST_STATUS_IN_PROGRESS &&
+				 !store_databases_settled(io, found.f0, found.f1, status == HOST_STATUS_COMMITTED, frame->error))
+			goto done;
+	}
+	frame->ok = true;
+done:
+	store_databases_started_pad_0(frame);
+}
+
+/*
+ * store_databases_started settles, in the startup process before redo, each
+ * creation whose mark stands by its transaction's outcome in the commit log,
+ * which the checkpoint at the redo point made durable for every commit before
+ * it (bugs row 404): a committed one's mark is taken away and its runs are
+ * loaded, ahead of the replay of any write to it, and any other is kept for
+ * the replay of its transaction's commit or abort, or for the end of redo,
+ * since a commit log that shows a transaction neither running nor committed
+ * may only not have replayed its commit yet; loaded says whether it loaded
+ * one.
+ */
+bool
+store_databases_started(HostIoIo *io, const TxnInsertPage *page, bool *loaded, HostError *error)
+{
+	store_databases_started_frame_0_t frame = {.io = io, .page = page, .loaded = loaded, .error = error};
+
+	*loaded = false;
+	store_databases_pending_kept();
+	std_vec_new(&frame.found, sizeof(std_TupleU32U32_t), _Alignof(std_TupleU32U32_t));
+	std_landing(&frame, store_databases_started_body_0, store_databases_started_pad_0);
+	return frame.ok;
+}
+
+/*
+ * store_databases_checkpointed settles, at a checkpoint outside recovery,
+ * each creation whose mark stands and whose transaction has ended, as its
+ * transaction's end does, for an end that couldn't (bugs row 404); recovery
+ * settles its own.
+ */
+bool
+store_databases_checkpointed(HostIoIo *io, HostError *error)
+{
+	store_databases_started_frame_0_t frame = {.io = io, .error = error};
+
+	if (host_wal_stand(HOST_IO_IO_IO_DOORS(io)).recovering)
+		return true;
+	std_vec_new(&frame.found, sizeof(std_TupleU32U32_t), _Alignof(std_TupleU32U32_t));
+	std_landing(&frame, store_databases_started_body_0, store_databases_started_pad_0);
+	return frame.ok;
+}
+
+/*
+ * store_databases_redo_settled settles a kept creation whose transaction's
+ * commit or abort the startup process replays, and loads a committed one's
+ * runs, answering through loaded whether it did (bugs row 404).
+ */
+bool
+store_databases_redo_settled(HostIoIo *io, const TxnInsertPage *page, uint64 xid, bool committed, bool *loaded,
+							 HostError *error)
+{
+	*loaded = false;
+	for (size_t k = 0; store_databases_pending.ptr != NULL && k < store_databases_pending.len; k++)
+	{
+		store_databases_pending_t pending = STD_VEC_AT(&store_databases_pending, store_databases_pending_t, k);
+
+		if (pending.xid != xid)
+			continue;
+		STD_VEC_AT(&store_databases_pending, store_databases_pending_t, k) =
+			STD_VEC_AT(&store_databases_pending, store_databases_pending_t, store_databases_pending.len - 1);
+		store_databases_pending.len--;
+		*loaded = committed;
+		return committed ? store_databases_loaded(io, page, pending.database, pending.tablespace, error) :
+			store_databases_settled(io, pending.database, pending.tablespace, false, error);
+	}
+	return true;
+}
+
+/*
+ * store_databases_redo_ended settles each creation still kept at the end of
+ * redo as aborted, since its transaction never committed (bugs row 404).
+ */
+bool
+store_databases_redo_ended(HostIoIo *io, HostError *error)
+{
+	while (store_databases_pending.ptr != NULL && store_databases_pending.len > 0)
+	{
+		store_databases_pending_t pending = STD_VEC_AT(&store_databases_pending, store_databases_pending_t,
+													   store_databases_pending.len - 1);
+
+		store_databases_pending.len--;
+		if (!store_databases_settled(io, pending.database, pending.tablespace, false, error))
+			return false;
+	}
+	return true;
 }
 
 /* store_databases_held_t is what a function holds across its calls: the tablespaces, and two paths. */
@@ -676,6 +1343,16 @@ typedef struct store_databases_frame_t
 	bool	   *result;
 	/* record is the record a replay reads, while it runs. */
 	const void *record;
+
+	/*
+	 * position is a replayed creation's record's end, and xid its creating
+	 * transaction's.
+	 */
+	HostLsn		position;
+	uint64		xid;
+	/* kinds is a replayed creation's Vec<Digested>, while kinds_live. */
+	StdVec		kinds;
+	bool		kinds_live;
 	uint32	   *space;
 	HostError  *error;
 	bool		ok;
@@ -694,6 +1371,11 @@ store_databases_pad(void *frame_)
 {
 	store_databases_frame_t *frame = frame_;
 
+	if (frame->kinds_live)
+	{
+		frame->kinds_live = false;
+		std_vec_free_Checked(&frame->kinds, sizeof(TxnFoldDigested), _Alignof(TxnFoldDigested));
+	}
 	if (frame->names_live)
 	{
 		frame->names_live = false;
@@ -720,7 +1402,7 @@ store_databases_found(const StdVec *found, uint32 repository, uint32 *tablespace
 	return false;
 }
 
-/* store_databases_stale removes every copy of a database's repository a move left in any tablespace. */
+/* store_databases_stale removes every copy of a database's repository a move left in any tablespace, and every copy's temporary. */
 static bool
 store_databases_stale(HostIoIo *io, store_databases_held_t *held, uint32 database, HostError *error)
 {
@@ -732,12 +1414,18 @@ store_databases_stale(HostIoIo *io, store_databases_held_t *held, uint32 databas
 		bool		removed;
 		bool		ok;
 
-		store_databases_held_first(held, store_databases_moving(database, STD_VEC_AT(&held->spaces, uint32, k)));
-		ok = host_remove_tree(HOST_IO_IO_IO_DOORS(io), held->first.bytes.ptr, held->first.bytes.len, &removed, error);
-		held->first_live = false;
-		std_vec_free_Checked(&held->first.bytes, 1, 1);
-		if (!ok)
-			return false;
+		for (size_t s = 0; s < 2; s++)
+		{
+			store_databases_held_first(held, store_databases_beside(database, STD_VEC_AT(&held->spaces, uint32, k),
+																	s == 0 ? STORE_DATABASES_MOVING :
+																	STORE_DATABASES_COPYING));
+			ok = host_remove_tree(HOST_IO_IO_IO_DOORS(io), held->first.bytes.ptr, held->first.bytes.len, &removed,
+								  error);
+			held->first_live = false;
+			std_vec_free_Checked(&held->first.bytes, 1, 1);
+			if (!ok)
+				return false;
+		}
 	}
 	held->spaces_live = false;
 	std_vec_free_Checked(&held->spaces, sizeof(uint32), _Alignof(uint32));
@@ -753,6 +1441,7 @@ store_databases_dropped_body_0(void *frame_)
 	ChunksErrorError failed;
 	StoreDatabasesDropped record = {.database = frame->database};
 	StdVec		body;
+	HostLsn		end;
 	bool		removed;
 
 	frame->ok = false;
@@ -770,7 +1459,7 @@ store_databases_dropped_body_0(void *frame_)
 		goto done;
 	}
 	body = store_databases_Dropped_encode(&record);
-	if (!store_databases_inserted(io, HOST_WAL_KIND_REPOSITORY_DROPPED, &body, frame->error))
+	if (!store_databases_inserted(io, HOST_WAL_KIND_REPOSITORY_DROPPED, &body, false, &end, frame->error))
 		goto done;
 	if (!chunks_packs_open_Packs_dropped(io, frame->database, record.tablespace, &removed, &failed) ||
 		!chunks_packs_open_emptied(io, &failed))
@@ -911,8 +1600,11 @@ store_databases_redo_created_body_0(void *frame_)
 	bool		there;
 
 	frame->ok = false;
-	if (!store_databases_Created_decode(frame->body, frame->body_len, &record, frame->error) ||
-		!store_databases_standing(frame->io, record.database, &stands, frame->error))
+	if (!store_databases_Created_decode(frame->body, frame->body_len, &record, frame->error))
+		goto done;
+	frame->kinds = record.kinds;
+	frame->kinds_live = true;
+	if (!store_databases_standing(frame->io, record.database, &stands, frame->error))
 		goto done;
 	if (stands)
 	{
@@ -930,20 +1622,8 @@ store_databases_redo_created_body_0(void *frame_)
 		frame->ok = true;
 		goto done;
 	}
-	if (record.has_root)
-	{
-		StdString	message;
-		static const char refused[] = "a repository's creation from a template's base can't be replayed yet";
-
-		/*
-		 * TODO: a template's base is copied with the fold's half of createdb,
-		 * which no build has yet.
-		 */
-		std_string_from_Checked(&message, refused, sizeof(refused) - 1);
-		*frame->error = host_Error_fork((const uint8 *) "XX000", &message);
-		goto done;
-	}
-	frame->ok = store_databases_made(frame->io, record.database, record.tablespace, frame->error);
+	frame->ok = store_databases_created_from(frame->io, record.template, record.database, record.tablespace,
+											 frame->position, frame->xid, &record, frame->error);
 done:
 	store_databases_pad(frame);
 }
@@ -953,12 +1633,17 @@ done:
  * a drop's marked leftovers of the id in any tablespace, makes nothing when
  * another directory of the id stands in any, and makes nothing either when
  * the tablespace's version directory is gone, since a later record drops it;
- * otherwise it makes the repository there.
+ * otherwise it makes the repository there from the template's as this
+ * server's replay holds it, kept for its transaction's outcome, once the
+ * template's digest matches the record's, and refuses recovery when it
+ * doesn't (bugs row 404).
  */
 bool
-store_databases_redo_created(HostIoIo *io, const uint8 *body, size_t body_len, HostError *error)
+store_databases_redo_created(HostIoIo *io, const uint8 *body, size_t body_len, uint64 xid, HostLsn end,
+							 HostError *error)
 {
-	store_databases_frame_t frame = {.io = io, .body = body, .body_len = body_len, .error = error};
+	store_databases_frame_t frame = {.io = io, .body = body, .body_len = body_len, .position = end, .xid = xid,
+	.error = error};
 
 	std_landing(&frame, store_databases_redo_created_body_0, store_databases_pad);
 	return frame.ok;
@@ -1037,16 +1722,20 @@ typedef struct store_databases_copy_frame_0_t
 	HostIoIo   *io;
 	uint32		repository;
 	uint32		from;
-	const StdPathBuf *into;
+	uint32		to;
 	HostError  *error;
 	bool		ok;
+	StdPathBuf	copying;
+	bool		copying_live;
+	StdPathBuf	into;
+	bool		into_live;
 	ChunksPacksBackendPacks packs;
 	bool		packs_live;
 	HostSharedReader reading;
 	bool		reading_live;
 } store_databases_copy_frame_0_t;
 
-/* store_databases_copy_pad_0 is copy's pad: the reader, then the packs. */
+/* store_databases_copy_pad_0 is copy's pad: the reader, then the packs, then the paths. */
 static void
 store_databases_copy_pad_0(void *frame_)
 {
@@ -1062,9 +1751,36 @@ store_databases_copy_pad_0(void *frame_)
 		frame->packs_live = false;
 		chunks_packs_backend_Packs_drop(&frame->packs);
 	}
+	if (frame->into_live)
+	{
+		frame->into_live = false;
+		std_vec_free_Checked(&frame->into.bytes, 1, 1);
+	}
+	if (frame->copying_live)
+	{
+		frame->copying_live = false;
+		std_vec_free_Checked(&frame->copying.bytes, 1, 1);
+	}
 }
 
-/* store_databases_copy_body_0 is copy's body: the packs opened, copied into the directory, and closed, a failure warned of before the close. */
+/* store_databases_copy_renamed renames a whole copy's temporary to the copy's own name, synced with its parent. */
+static bool
+store_databases_copy_renamed(store_databases_copy_frame_0_t *frame)
+{
+	HostIoIoDoors doors = HOST_IO_IO_IO_DOORS(frame->io);
+	StdStr		parent = host_directory_of(frame->into.bytes.ptr, frame->into.bytes.len);
+
+	return host_rename(doors, frame->copying.bytes.ptr, frame->copying.bytes.len, frame->into.bytes.ptr,
+					   frame->into.bytes.len, frame->error) &&
+		host_sync_path(doors, frame->into.bytes.ptr, frame->into.bytes.len, true, frame->error) &&
+		host_sync_path(doors, parent.ptr, parent.len, true, frame->error);
+}
+
+/*
+ * store_databases_copy_body_0 is copy's body: a leftover temporary removed,
+ * the packs opened, copied into the temporary, and closed, a failure warned
+ * of before the close, and the whole copy renamed to its own name.
+ */
 static void
 store_databases_copy_body_0(void *frame_)
 {
@@ -1072,8 +1788,16 @@ store_databases_copy_body_0(void *frame_)
 	ChunksErrorError failed;
 	HostError	failure;
 	uint8		code[5];
+	bool		removed;
 
 	frame->ok = false;
+	frame->copying = store_databases_beside(frame->repository, frame->to, STORE_DATABASES_COPYING);
+	frame->copying_live = true;
+	frame->into = store_databases_moving(frame->repository, frame->to);
+	frame->into_live = true;
+	if (!host_remove_tree(HOST_IO_IO_IO_DOORS(frame->io), frame->copying.bytes.ptr, frame->copying.bytes.len,
+						  &removed, frame->error))
+		goto done;
 	if (!chunks_packs_open_Packs_open(frame->io, frame->repository, frame->from, &frame->packs, &failed))
 	{
 		*frame->error = store_databases_raised(&failed);
@@ -1083,13 +1807,16 @@ store_databases_copy_body_0(void *frame_)
 	if (!host_shared_read(frame->io, &frame->reading, frame->error))
 		goto done;
 	frame->reading_live = true;
-	if (chunks_packs_backend_Packs_copied(&frame->packs, frame->io, &frame->reading, frame->into->bytes.ptr,
-										  frame->into->bytes.len, &failed))
+	if (chunks_packs_backend_Packs_copied(&frame->packs, frame->io, &frame->reading, frame->copying.bytes.ptr,
+										  frame->copying.bytes.len, &failed))
 	{
 		frame->packs_live = false;
-		frame->ok = chunks_packs_backend_Packs_close(&frame->packs, frame->io, &frame->reading, &failed);
-		if (!frame->ok)
+		if (!chunks_packs_backend_Packs_close(&frame->packs, frame->io, &frame->reading, &failed))
+		{
 			*frame->error = store_databases_raised(&failed);
+			goto done;
+		}
+		frame->ok = store_databases_copy_renamed(frame);
 		goto done;
 	}
 	failure = store_databases_raised(&failed);
@@ -1101,6 +1828,9 @@ store_databases_copy_body_0(void *frame_)
 		*frame->error = store_databases_raised(&failed);
 		goto done;
 	}
+	if (!host_remove_tree(HOST_IO_IO_IO_DOORS(frame->io), frame->copying.bytes.ptr, frame->copying.bytes.len,
+						  &removed, frame->error))
+		goto done;
 	*frame->error = store_databases_failed(code, "could not copy the repository of database ", frame->repository);
 done:
 	store_databases_copy_pad_0(frame);
@@ -1108,60 +1838,42 @@ done:
 
 /*
  * store_databases_copy copies a repository's own directory, the files its
- * pack record owes written first, into a directory. A failed copy is
- * reported at WARNING before the hold is closed, so no error is held through
- * the close.
+ * pack record owes written first, into its copy's name in the tablespace it
+ * moves to: under a temporary name, synced, then renamed, so a copy that
+ * stands is whole (bugs row 449). A failed copy is reported at WARNING
+ * before the hold is closed, so no error is held through the close, and its
+ * temporary is removed.
  */
 static bool
-store_databases_copy(HostIoIo *io, uint32 repository, uint32 from, const StdPathBuf *into, HostError *error)
+store_databases_copy(HostIoIo *io, uint32 repository, uint32 from, uint32 to, HostError *error)
 {
-	store_databases_copy_frame_0_t frame = {.io = io, .repository = repository, .from = from, .into = into,
+	store_databases_copy_frame_0_t frame = {.io = io, .repository = repository, .from = from, .to = to,
 	.error = error};
 
 	std_landing(&frame, store_databases_copy_body_0, store_databases_copy_pad_0);
 	return frame.ok;
 }
 
-/* store_databases_moved_copy_body_0 is moved_copy's body: the stale copies removed, the copy made and recorded, or removed again on its failure. */
+/* store_databases_moved_copy_body_0 is moved_copy's body: the stale copies removed, then the copy made. */
 static void
 store_databases_moved_copy_body_0(void *frame_)
 {
 	store_databases_frame_t *frame = frame_;
 	HostIoIo   *io = frame->io;
-	StoreDatabasesMoved record = {frame->database, frame->from, frame->to};
-	HostError	failure;
-	StdVec		body;
-	uint8		code[5];
-	bool		removed;
 
-	frame->ok = false;
-	store_databases_held_second(&frame->held, store_databases_moving(frame->database, frame->to));
-	if (!store_databases_stale(io, &frame->held, frame->database, frame->error))
-		goto done;
-	if (store_databases_copy(io, frame->database, frame->from, &frame->held.second, &failure))
-	{
-		body = store_databases_Moved_encode(&record);
-		if (store_databases_inserted(io, HOST_WAL_KIND_REPOSITORY_COPIED, &body, &failure))
-		{
-			frame->ok = host_pause(HOST_SHARED_IO_PAUSES(io), "doltgres-store-move-copied", frame->error);
-			goto done;
-		}
-	}
-	if (!store_databases_warned(io, &failure, "ALTER DATABASE SET TABLESPACE", code, frame->error) ||
-		!host_remove_tree(HOST_IO_IO_IO_DOORS(io), frame->held.second.bytes.ptr, frame->held.second.bytes.len,
-						  &removed, frame->error))
-		goto done;
-	*frame->error = store_databases_failed(code, "could not copy the repository of database ", frame->database);
-done:
+	frame->ok = store_databases_stale(io, &frame->held, frame->database, frame->error) &&
+		store_databases_copy(io, frame->database, frame->from, frame->to, frame->error) &&
+		host_pause(HOST_SHARED_IO_PAUSES(io), "doltgres-store-move-copied", frame->error);
 	store_databases_pad(frame);
 }
 
 /*
  * store_databases_moved_copy copies a moving database's repository into the
  * tablespace it moves to, under a name no open reads, in movedb's cleanup
- * block after Postgres' copy, and appends the fork's record of it: a
- * leftover copy of an earlier try is removed first, and a copy that fails is
- * removed before its error is returned.
+ * block after Postgres' copy, so a copy that fails fails the move before its
+ * commit: a leftover copy of an earlier try is removed first. No record
+ * repeats it: the move's finish makes the copy itself where none stands
+ * (bugs row 449).
  */
 bool
 store_databases_moved_copy(HostIoIo *io, uint32 database, uint32 from, uint32 to, HostError *error)
@@ -1174,6 +1886,266 @@ store_databases_moved_copy(HostIoIo *io, uint32 database, uint32 from, uint32 to
 	return frame.ok;
 }
 
+/* STORE_DATABASES_MOVES is the name of a repository's move log in its own directory (bugs row 443). */
+#define STORE_DATABASES_MOVES "moves"
+
+/* STORE_DATABASES_MOVES_VERSION is the version byte that begins a move log. */
+#define STORE_DATABASES_MOVES_VERSION 1
+
+/* STORE_DATABASES_MOVE is the length of a move log's entry: the tablespace moved from, then its record's end. */
+#define STORE_DATABASES_MOVE 12
+
+/* StoreDatabasesMove is a move log's entry: the tablespace a repository moved from and the end of its move's record. */
+typedef struct StoreDatabasesMove
+{
+	uint32		from;
+	HostLsn		moved;
+} StoreDatabasesMove;
+
+/* StoreDatabasesMoves is a repository's move log the startup process loaded, with the tablespace it stands in. */
+typedef struct StoreDatabasesMoves
+{
+	uint32		repository;
+	uint32		own;
+
+	/*
+	 * moves is the log's entries in the order of their moves, a
+	 * Vec<StoreDatabasesMove>.
+	 */
+	StdVec		moves;
+} StoreDatabasesMoves;
+
+/*
+ * store_databases_moves_loaded is the startup process's move logs, which
+ * recovery loads before redo and frees when redo ends: a
+ * Vec<StoreDatabasesMoves>, one for each repository that has a log.
+ */
+static struct
+{
+	bool		live;
+	StdVec		repositories;
+}			store_databases_moves_loaded;
+
+/*
+ * store_databases_moves_read returns the entries of the move log in a
+ * repository's directory, a Vec<StoreDatabasesMove>, empty when it has none;
+ * a log whose newest generation doesn't read is corrupt, since its previous
+ * one lacks the newest move.
+ */
+static bool
+store_databases_moves_read(HostIoReadDoors io, uint32 repository, const StdPathBuf *dir, StdVec *result,
+						   HostError *error)
+{
+	StdPathBuf	path;
+	StdVec		bytes;
+	bool		has;
+	bool		fell_back;
+	ChunksFileFallback why;
+	ChunksErrorError failed;
+	bool		ok;
+
+	std_path_join(dir->bytes.ptr, dir->bytes.len, STORE_DATABASES_MOVES, strlen(STORE_DATABASES_MOVES), &path);
+	ok = chunks_file_read_kept(io, path.bytes.ptr, path.bytes.len, &has, &bytes, &fell_back, &why, &failed);
+	std_vec_free_Checked(&path.bytes, 1, 1);
+	if (!ok)
+	{
+		*error = store_databases_raised(&failed);
+		return false;
+	}
+	std_vec_new(result, sizeof(StoreDatabasesMove), _Alignof(StoreDatabasesMove));
+	if (!has)
+		return true;
+	if (fell_back || bytes.len == 0 || ((const uint8 *) bytes.ptr)[0] != STORE_DATABASES_MOVES_VERSION ||
+		(bytes.len - 1) % STORE_DATABASES_MOVE != 0)
+	{
+		std_vec_free_Checked(&bytes, 1, 1);
+		*error = store_databases_failed((const uint8 *) "XX001", "the move log is corrupt in the repository of database ",
+										repository);
+		return false;
+	}
+	for (size_t at = 1; at < bytes.len; at += STORE_DATABASES_MOVE)
+	{
+		const uint8 *entry = STD_PTR_AT(bytes.ptr, at, 1);
+		StoreDatabasesMove move = {std_u32_from_le_bytes(entry), std_u64_from_le_bytes(entry + 4)};
+
+		std_vec_push_Checked(result, &move, sizeof(move), _Alignof(StoreDatabasesMove));
+	}
+	std_vec_free_Checked(&bytes, 1, 1);
+	return true;
+}
+
+/*
+ * store_databases_moves_written writes a move's log into its copy, durably:
+ * the log of the directory it moves from, without the moves whose records end
+ * at or before the redo point of the last checkpoint or restartpoint
+ * completed, from which every replay starts, unless a base backup runs, whose
+ * start may precede them, and then the move's entry, so the copy's rename
+ * makes the repository's new tablespace and the entry that tells redo where it
+ * stood before the move durable at once (bugs row 443). A kept file's write
+ * replaces it whole by a rename, so a crash inside it leaves the copy's log
+ * as it was before.
+ */
+static bool
+store_databases_moves_written(HostIoIo *io, uint32 repository, const StdPathBuf *old, const StdPathBuf *copy,
+							  uint32 from, HostLsn moved, HostError *error)
+{
+	StdVec		moves;
+	StdVec		bytes;
+	StdPathBuf	path;
+	ChunksErrorError failed;
+	StoreDatabasesMove move = {from, moved};
+	HostLsn		durable = 0;
+	uint8		version = STORE_DATABASES_MOVES_VERSION;
+	uint8		le[8];
+	bool		same;
+	bool		ok;
+
+	if ((!host_backups_running() && !host_last_redo(HOST_IO_IO_IO_DOORS(io), &durable, error)) ||
+		!store_databases_moves_read(HOST_IO_IO_READ_DOORS(io), repository, old, &moves, error))
+		return false;
+	std_vec_push_Checked(&moves, &move, sizeof(move), _Alignof(StoreDatabasesMove));
+	std_vec_with_capacity_Checked(&bytes, 1 + moves.len * STORE_DATABASES_MOVE, 1, 1);
+	std_vec_push_Checked(&bytes, &version, 1, 1);
+	for (size_t k = 0; k < moves.len; k++)
+	{
+		const StoreDatabasesMove *kept = &STD_VEC_AT(&moves, StoreDatabasesMove, k);
+
+		if (kept->moved <= durable)
+			continue;
+		std_u32_to_le_bytes(kept->from, le);
+		std_vec_extend_from_slice_Checked(&bytes, le, 4, 1, 1);
+		std_u64_to_le_bytes(kept->moved, le);
+		std_vec_extend_from_slice_Checked(&bytes, le, 8, 1, 1);
+	}
+	std_vec_free_Checked(&moves, sizeof(StoreDatabasesMove), _Alignof(StoreDatabasesMove));
+	std_path_join(copy->bytes.ptr, copy->bytes.len, STORE_DATABASES_MOVES, strlen(STORE_DATABASES_MOVES), &path);
+	ok = chunks_file_write_kept(HOST_IO_IO_IO_DOORS(io), path.bytes.ptr, path.bytes.len, bytes.ptr, bytes.len, &same,
+								&failed);
+	std_vec_free_Checked(&path.bytes, 1, 1);
+	std_vec_free_Checked(&bytes, 1, 1);
+	if (!ok)
+		*error = store_databases_raised(&failed);
+	return ok;
+}
+
+/*
+ * store_databases_moves_load loads, in the startup process before redo, the
+ * move log of each repository that has one, which redo's storages are
+ * translated by (bugs row 443).
+ */
+bool
+store_databases_moves_load(HostIoReadDoors io, HostError *error)
+{
+	ChunksErrorError failed;
+	StdVec		found;
+
+	if (!chunks_packs_open_repositories(io, &found, &failed))
+	{
+		*error = store_databases_raised(&failed);
+		return false;
+	}
+	std_vec_new(&store_databases_moves_loaded.repositories, sizeof(StoreDatabasesMoves),
+				_Alignof(StoreDatabasesMoves));
+	store_databases_moves_loaded.live = true;
+	for (size_t k = 0; k < found.len; k++)
+	{
+		const std_TupleU32U32_t *listed = &STD_VEC_AT(&found, std_TupleU32U32_t, k);
+		StoreDatabasesMoves loaded = {listed->f0, listed->f1};
+		StdPathBuf	dir = host_tablespace_dir(listed->f0, listed->f1);
+		bool		ok = store_databases_moves_read(io, listed->f0, &dir, &loaded.moves, error);
+
+		std_vec_free_Checked(&dir.bytes, 1, 1);
+		if (!ok)
+		{
+			std_vec_free_Checked(&found, sizeof(std_TupleU32U32_t), _Alignof(std_TupleU32U32_t));
+			return false;
+		}
+		if (loaded.moves.len == 0)
+			std_vec_free_Checked(&loaded.moves, sizeof(StoreDatabasesMove), _Alignof(StoreDatabasesMove));
+		else
+			std_vec_push_Checked(&store_databases_moves_loaded.repositories, &loaded, sizeof(loaded),
+								 _Alignof(StoreDatabasesMoves));
+	}
+	std_vec_free_Checked(&found, sizeof(std_TupleU32U32_t), _Alignof(std_TupleU32U32_t));
+	return true;
+}
+
+/* store_databases_moves_freed frees the startup process's move logs once redo ends. */
+void
+store_databases_moves_freed(void)
+{
+	if (!store_databases_moves_loaded.live)
+		return;
+	for (size_t k = 0; k < store_databases_moves_loaded.repositories.len; k++)
+		std_vec_free_Checked(&STD_VEC_AT(&store_databases_moves_loaded.repositories, StoreDatabasesMoves, k).moves,
+							 sizeof(StoreDatabasesMove), _Alignof(StoreDatabasesMove));
+	std_vec_free_Checked(&store_databases_moves_loaded.repositories, sizeof(StoreDatabasesMoves),
+						 _Alignof(StoreDatabasesMoves));
+	store_databases_moves_loaded.live = false;
+}
+
+/*
+ * store_databases_moves_hold reports whether the startup process's loaded
+ * log of a repository holds a move's entry: the tablespace it moved from and
+ * the end of its record.
+ */
+static bool
+store_databases_moves_hold(uint32 repository, uint32 from, HostLsn moved)
+{
+	for (size_t k = 0; store_databases_moves_loaded.live && k < store_databases_moves_loaded.repositories.len; k++)
+	{
+		const StoreDatabasesMoves *loaded = &STD_VEC_AT(&store_databases_moves_loaded.repositories,
+														StoreDatabasesMoves, k);
+
+		for (size_t m = 0; loaded->repository == repository && m < loaded->moves.len; m++)
+		{
+			const StoreDatabasesMove *move = &STD_VEC_AT(&loaded->moves, StoreDatabasesMove, m);
+
+			if (move->from == from && move->moved == moved)
+				return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * store_databases_replayed_storage gives a storage of a record the startup
+ * process replays the tablespace its repository stands in now when its
+ * tablespace was the repository's own at that record, which a kept move from
+ * it after the record says (bugs row 443): a crash after a finished move
+ * replays the records before it over the moved repository. Postgres' movedb
+ * refuses a tablespace that holds any of the database's relations, so a
+ * tablespace a later move left names the repository's own up to that move
+ * and never a relation placed in it after, and moves from F to A to B or to F
+ * each translate right.
+ */
+void
+store_databases_replayed_storage(HostStorage *storage, HostLsn replayed)
+{
+	if (!store_databases_moves_loaded.live)
+		return;
+	for (size_t k = 0; k < store_databases_moves_loaded.repositories.len; k++)
+	{
+		const StoreDatabasesMoves *loaded = &STD_VEC_AT(&store_databases_moves_loaded.repositories,
+														StoreDatabasesMoves, k);
+
+		if (loaded->repository != storage->database)
+			continue;
+		for (size_t m = 0; m < loaded->moves.len; m++)
+		{
+			const StoreDatabasesMove *move = &STD_VEC_AT(&loaded->moves, StoreDatabasesMove, m);
+
+			if (move->moved > replayed)
+			{
+				if (storage->tablespace == move->from)
+					storage->tablespace = loaded->own;
+				return;
+			}
+		}
+		return;
+	}
+}
+
 /* store_databases_finish_frame_0_t is finish's state across its pad: the old directory, the copy, the new directory, the repository, and the reader. */
 typedef struct store_databases_finish_frame_0_t
 {
@@ -1181,6 +2153,7 @@ typedef struct store_databases_finish_frame_0_t
 	uint32		repository;
 	uint32		from;
 	uint32		to;
+	HostLsn		moved;
 	HostError  *error;
 	bool		ok;
 	StdPathBuf	old;
@@ -1228,6 +2201,69 @@ store_databases_finish_pad_0(void *frame_)
 	}
 }
 
+/* store_databases_marked reports whether the directory a move leaves holds the mark of its finish. */
+static bool
+store_databases_marked(store_databases_finish_frame_0_t *frame, bool *result)
+{
+	ChunksErrorError failed;
+	StdPathBuf	mark;
+	bool		ok;
+
+	std_path_join(frame->old.bytes.ptr, frame->old.bytes.len, CHUNKS_PACKS_OPEN_MOVED_FROM,
+				  strlen(CHUNKS_PACKS_OPEN_MOVED_FROM), &mark);
+	ok = chunks_file_exists(HOST_IO_IO_READ_DOORS(frame->io), mark.bytes.ptr, mark.bytes.len, result, &failed);
+	std_vec_free_Checked(&mark.bytes, 1, 1);
+	if (!ok)
+		*frame->error = store_databases_raised(&failed);
+	return ok;
+}
+
+/*
+ * store_databases_finished reports whether a move's finish the startup
+ * process replays ran to its end before: the repository's loaded log holds
+ * the move's own entry, which only the rename of the move's copy makes the
+ * repository's, and the directory it moved from holds no mark, which only the
+ * finish's last step removes, with that directory (bugs row 454). An entry a
+ * later finish pruned ends at or before the durable redo point, so no replay
+ * meets its record; outside the startup process no log is loaded, and every
+ * finish runs its steps.
+ */
+static bool
+store_databases_finished(store_databases_finish_frame_0_t *frame, bool *result)
+{
+	bool		marked;
+
+	*result = false;
+	if (!store_databases_moves_hold(frame->repository, frame->from, frame->moved))
+		return true;
+	if (!store_databases_marked(frame, &marked))
+		return false;
+	*result = !marked;
+	return true;
+}
+
+/*
+ * store_databases_logged writes the move's log into its copy while the copy
+ * stands and the directory it moves from has no mark, so the log is written
+ * before the mark; a finish that finds the mark finds the log written (bugs
+ * row 443).
+ */
+static bool
+store_databases_logged(store_databases_finish_frame_0_t *frame)
+{
+	bool		copied;
+	bool		marked;
+
+	if (!store_databases_there(HOST_IO_IO_READ_DOORS(frame->io), &frame->copy, &copied, frame->error))
+		return false;
+	if (!copied)
+		return true;
+	if (!store_databases_marked(frame, &marked))
+		return false;
+	return marked || store_databases_moves_written(frame->io, frame->repository, &frame->old, &frame->copy,
+												   frame->from, frame->moved, frame->error);
+}
+
 /* store_databases_finish_body_0 is finish's body: each step of a move's finish that isn't done. */
 static void
 store_databases_finish_body_0(void *frame_)
@@ -1237,24 +2273,44 @@ store_databases_finish_body_0(void *frame_)
 	ChunksErrorError failed;
 	HostError	failure;
 	uint8		code[5];
+	bool		there;
+	bool		finished;
 
 	frame->ok = false;
 	frame->old = host_tablespace_dir(frame->repository, frame->from);
 	frame->old_live = true;
+	frame->copy = store_databases_moving(frame->repository, frame->to);
+	frame->copy_live = true;
+	frame->new = host_tablespace_dir(frame->repository, frame->to);
+	frame->new_live = true;
+	if (!store_databases_finished(frame, &finished))
+		goto done;
+	if (finished)
+	{
+		if (!chunks_packs_open_emptied(io, &failed))
+			goto raised;
+		frame->ok = true;
+		goto done;
+	}
+	if (!store_databases_there(HOST_IO_IO_READ_DOORS(io), &frame->new, &there, frame->error) ||
+		(!there && !store_databases_there(HOST_IO_IO_READ_DOORS(io), &frame->copy, &there, frame->error)) ||
+		(!there && !store_databases_copy(io, frame->repository, frame->from, frame->to, frame->error)))
+		goto done;
+	if (!store_databases_logged(frame) ||
+		!host_pause(HOST_SHARED_IO_PAUSES(io), "doltgres-store-move-logged", frame->error))
+		goto done;
 	if (!chunks_packs_open_moving_from(io, frame->old.bytes.ptr, frame->old.bytes.len, &failed))
 		goto raised;
 	if (!host_pause(HOST_SHARED_IO_PAUSES(io), "doltgres-store-move-marked", frame->error))
 		goto done;
 	if (!chunks_packs_open_forgot(io, frame->repository, frame->from, &failed))
 		goto raised;
-	frame->copy = store_databases_moving(frame->repository, frame->to);
-	frame->copy_live = true;
-	frame->new = host_tablespace_dir(frame->repository, frame->to);
-	frame->new_live = true;
 	if (!chunks_packs_open_moved_in(io, frame->copy.bytes.ptr, frame->copy.bytes.len, frame->new.bytes.ptr,
 									frame->new.bytes.len, &failed))
 		goto raised;
-	if (!txn_state_rehomed(io, frame->repository, frame->from, frame->to, frame->error))
+	if (!host_pause(HOST_SHARED_IO_PAUSES(io), "doltgres-store-move-renamed", frame->error) ||
+		!txn_state_rehomed(io, frame->repository, frame->from, frame->to, frame->error) ||
+		!txn_memtable_branch_rehomed(io, frame->repository, frame->from, frame->to, frame->error))
 		goto done;
 	if (!repo_Repo_open(io, frame->repository, frame->to, &frame->repo, &failed))
 		goto raised;
@@ -1279,6 +2335,8 @@ store_databases_finish_body_0(void *frame_)
 		*frame->error = store_databases_failed(code, "could not move the repository of database ", frame->repository);
 		goto done;
 	}
+	if (!host_pause(HOST_SHARED_IO_PAUSES(io), "doltgres-store-move-rekeyed", frame->error))
+		goto done;
 	if (!chunks_packs_open_moved_from(io, frame->old.bytes.ptr, frame->old.bytes.len, &failed) ||
 		!chunks_packs_open_emptied(io, &failed))
 		goto raised;
@@ -1292,17 +2350,26 @@ done:
 
 /*
  * store_databases_finish does whichever step of a move's finish isn't done,
- * each answering one another process did meanwhile: the mark in the old
+ * each answering one another process did meanwhile: the copy made from the
+ * old directory where neither the repository nor its copy stands, as a
+ * standby's replay finds it, under the quiet's hold of the database's lock,
+ * whose conflict ended every session of it and keeps a fold worker from
+ * connecting until the finish ends, so nothing writes the old directory
+ * after the copy (bugs row 449), the move's log in the copy with the end of
+ * its record, moved, then the mark in the old
  * directory, the pack record of the old directory freed, the copy renamed to
  * the repository's own name in its new tablespace, the database's states made
- * to name it there, its manifest's storages of the old tablespace put under
- * the new one, and the old directory removed, the mark last.
+ * to name it there with its working state, its manifest's storages of the old
+ * tablespace put under the new one, and the old directory removed, the mark
+ * last; a finish that ran to its end before, which a replay of its record
+ * after a crash meets, only removes each tablespace's directory of
+ * repositories that holds none, so never a later table's files.
  */
 static bool
-store_databases_finish(HostIoIo *io, uint32 repository, uint32 from, uint32 to, HostError *error)
+store_databases_finish(HostIoIo *io, uint32 repository, uint32 from, uint32 to, HostLsn moved, HostError *error)
 {
 	store_databases_finish_frame_0_t frame = {.io = io, .repository = repository, .from = from, .to = to,
-	.error = error};
+	.moved = moved, .error = error};
 
 	std_landing(&frame, store_databases_finish_body_0, store_databases_finish_pad_0);
 	return frame.ok;
@@ -1312,25 +2379,29 @@ store_databases_finish(HostIoIo *io, uint32 repository, uint32 from, uint32 to, 
  * store_databases_moved_finish makes a moved database's copy its repository
  * in movedb after Postgres' drop record of the old directory and before the
  * database's lock is released: it rekeys the database's states first, then
- * appends the record, finishes the move, and checkpoints.
+ * appends the record and flushes it, so a crash after the finish's rename
+ * leaves it for a standby to replay (bugs row 448), finishes the move, and
+ * checkpoints.
  */
 bool
 store_databases_moved_finish(HostIoIo *io, uint32 database, uint32 from, uint32 to, HostError *error)
 {
 	StoreDatabasesMoved record = {database, from, to};
 	StdVec		body;
+	HostLsn		end;
 
 	if (!store_databases_id(database, error) ||
 		!host_pause(HOST_SHARED_IO_PAUSES(io), "doltgres-store-move-finishing", error) ||
 		!txn_state_rekeyed(io, database, from, to, error))
 		return false;
 	body = store_databases_Moved_encode(&record);
-	return store_databases_inserted(io, HOST_WAL_KIND_REPOSITORY_MOVED, &body, error) &&
-		store_databases_finish(io, database, from, to, error) &&
+	return store_databases_inserted(io, HOST_WAL_KIND_REPOSITORY_MOVED, &body, true, &end, error) &&
+		store_databases_finish(io, database, from, to, end, error) &&
+		host_pause(HOST_SHARED_IO_PAUSES(io), "doltgres-store-move-finished", error) &&
 		host_checkpoint_now(HOST_IO_IO_IO_DOORS(io), error);
 }
 
-/* store_databases_unfinished_body_0 is unfinished's body: the move's copy standing and the repository's own directory not. */
+/* store_databases_unfinished_body_0 is unfinished's body: the repository's own directory not standing. */
 static void
 store_databases_unfinished_body_0(void *frame_)
 {
@@ -1338,25 +2409,20 @@ store_databases_unfinished_body_0(void *frame_)
 	bool		own;
 
 	frame->ok = false;
-	store_databases_held_first(&frame->held, store_databases_moving(frame->database, frame->to));
 	store_databases_held_second(&frame->held, host_tablespace_dir(frame->database, frame->to));
-	if (!store_databases_there(frame->read, &frame->held.first, frame->result, frame->error))
+	if (!store_databases_there(frame->read, &frame->held.second, &own, frame->error))
 		goto done;
-	if (*frame->result)
-	{
-		if (!store_databases_there(frame->read, &frame->held.second, &own, frame->error))
-			goto done;
-		*frame->result = !own;
-	}
+	*frame->result = !own;
 	frame->ok = true;
 done:
 	store_databases_pad(frame);
 }
 
 /*
- * store_databases_unfinished reports whether a repository stands in the
- * tablespace its database's row names only as a move's copy, the move
- * committed and its finish never run.
+ * store_databases_unfinished reports whether a repository's own directory
+ * doesn't stand in the tablespace its database's row names, as when a move
+ * committed and its finish never ran, whether or not its copy stands there
+ * (bugs row 449).
  */
 bool
 store_databases_unfinished(HostIoReadDoors io, uint32 repository, uint32 tablespace, bool *result, HostError *error)
@@ -1378,6 +2444,7 @@ store_databases_committed_body_0(void *frame_)
 	ChunksErrorError failed;
 	StoreDatabasesMoved record = {.database = frame->database, .to = frame->to};
 	StdVec		body;
+	HostLsn		end;
 
 	frame->ok = false;
 	*result = frame->to;
@@ -1399,8 +2466,8 @@ store_databases_committed_body_0(void *frame_)
 		goto done;
 	}
 	body = store_databases_Moved_encode(&record);
-	frame->ok = store_databases_inserted(io, HOST_WAL_KIND_REPOSITORY_MOVED, &body, frame->error) &&
-		store_databases_finish(io, frame->database, record.from, frame->to, frame->error);
+	frame->ok = store_databases_inserted(io, HOST_WAL_KIND_REPOSITORY_MOVED, &body, true, &end, frame->error) &&
+		store_databases_finish(io, frame->database, record.from, frame->to, end, frame->error);
 done:
 	store_databases_pad(frame);
 }
@@ -1408,9 +2475,9 @@ done:
 /*
  * store_databases_committed returns the tablespace a session opens its
  * database's repository in: the one its row names, after finishing a move
- * that committed and whose finish never ran, when the repository stands
- * there only as its copy; on a hot standby, which can't log, the
- * repository's old directory.
+ * that committed and whose finish never ran, when the repository doesn't
+ * stand there, the finish making its copy where none stands; on a hot
+ * standby, which can't log, the repository's old directory.
  */
 bool
 store_databases_committed(HostIoIo *io, uint32 repository, uint32 tablespace, uint32 *result, HostError *error)
@@ -1430,86 +2497,40 @@ store_databases_committed(HostIoIo *io, uint32 repository, uint32 tablespace, ui
 	return frame.ok;
 }
 
-/* store_databases_redo_copied_closure_0 is redo_copied's replay: nothing when the move's copy or its repository stands, or its source doesn't; otherwise the copy. */
-static bool
-store_databases_redo_copied_closure_0(void *captures, HostIoIo *io, HostError *error)
+/* store_databases_redo_moved_t is redo_moved's replay's captures: the record and its end. */
+typedef struct store_databases_redo_moved_t
 {
-	store_databases_frame_t *frame = captures;
-	const StoreDatabasesMoved *record = frame->record;
-	HostIoReadDoors read = HOST_IO_IO_READ_DOORS(io);
-	bool		there;
-
-	store_databases_held_first(&frame->held, host_tablespace_dir(record->database, record->to));
-	store_databases_held_second(&frame->held, store_databases_moving(record->database, record->to));
-	if (!store_databases_there(read, &frame->held.first, &there, error) ||
-		(!there && !store_databases_there(read, &frame->held.second, &there, error)))
-		return false;
-	if (!there)
-	{
-		std_vec_free_Checked(&frame->held.first.bytes, 1, 1);
-		frame->held.first = host_tablespace_dir(record->database, record->from);
-		if (!store_databases_there(read, &frame->held.first, &there, error))
-			return false;
-		if (there)
-			return store_databases_copy(io, record->database, record->from, &frame->held.second, error);
-	}
-	return true;
-}
-
-/* store_databases_redo_copied_body_0 is redo_copied's body: the record read, then its replay under the database's lock. */
-static void
-store_databases_redo_copied_body_0(void *frame_)
-{
-	store_databases_frame_t *frame = frame_;
 	StoreDatabasesMoved record;
-
-	frame->ok = store_databases_Moved_decode(frame->body, frame->body_len, &record, frame->error);
-	if (frame->ok)
-	{
-		frame->record = &record;
-		frame->ok = store_databases_quieted(frame->io, record.database, store_databases_redo_copied_closure_0, frame,
-											frame->error);
-		frame->record = NULL;
-	}
-	store_databases_pad(frame);
-}
-
-/*
- * store_databases_redo_copied replays a move's copy under the database's
- * lock: it makes nothing when the repository already stands, or its copy
- * does, in the tablespace it moves to, or when the tablespace it moves from
- * has no directory of it; otherwise it makes the same copy from the
- * standby's own files.
- */
-bool
-store_databases_redo_copied(HostIoIo *io, const uint8 *body, size_t body_len, HostError *error)
-{
-	store_databases_frame_t frame = {.io = io, .body = body, .body_len = body_len, .error = error};
-
-	std_landing(&frame, store_databases_redo_copied_body_0, store_databases_pad);
-	return frame.ok;
-}
+	HostLsn		end;
+} store_databases_redo_moved_t;
 
 /* store_databases_redo_moved_closure_0 is redo_moved's replay: the move's finish. */
 static bool
 store_databases_redo_moved_closure_0(void *captures, HostIoIo *io, HostError *error)
 {
-	const StoreDatabasesMoved *record = captures;
+	const store_databases_redo_moved_t *moved = captures;
 
-	return store_databases_finish(io, record->database, record->from, record->to, error);
+	return store_databases_finish(io, moved->record.database, moved->record.from, moved->record.to, moved->end,
+								  error);
 }
 
 /*
  * store_databases_redo_moved replays a move's finish under the database's
- * lock, doing whichever of its steps isn't done.
+ * lock, doing whichever of its steps isn't done. It first flushes the WAL
+ * through the record, which in recovery moves the minimum recovery point past
+ * it, so a standby restarted after the finish changed the old directory takes
+ * no connections before it replays the record again (bugs row 443): movedb's
+ * update of pg_database commits before the record, and the quiet ends the
+ * database's sessions before the finish's mark.
  */
 bool
-store_databases_redo_moved(HostIoIo *io, const uint8 *body, size_t body_len, HostError *error)
+store_databases_redo_moved(HostIoIo *io, const uint8 *body, size_t body_len, HostLsn end, HostError *error)
 {
-	StoreDatabasesMoved record;
+	store_databases_redo_moved_t moved = {.end = end};
 
-	return store_databases_Moved_decode(body, body_len, &record, error) &&
-		store_databases_quieted(io, record.database, store_databases_redo_moved_closure_0, &record, error);
+	return store_databases_Moved_decode(body, body_len, &moved.record, error) &&
+		host_wal_flush(HOST_IO_IO_IO_DOORS(io), end, error) &&
+		store_databases_quieted(io, moved.record.database, store_databases_redo_moved_closure_0, &moved, error);
 }
 
 /* store_databases_describe_moved returns a move's copy's or finish's description for pg_walinspect, raising a record that doesn't read. */
@@ -1534,17 +2555,15 @@ bool
 store_databases_describe_created(const uint8 *body, size_t body_len, StdString *result, HostError *error)
 {
 	StoreDatabasesCreated record;
-	StdStr		from;
 	StdFmtPiece pieces[] = {STD_FMT_LIT("database "), STD_FMT_ARG(0), STD_FMT_LIT(" in tablespace "),
-	STD_FMT_ARG(1), STD_FMT_LIT(" from template "), STD_FMT_ARG(2), STD_FMT_ARG(3)};
+	STD_FMT_ARG(1), STD_FMT_LIT(" from template "), STD_FMT_ARG(2)};
 	StdFmtArg	args[] = {{&record.database, std_u32_Display_fmt}, {&record.tablespace, std_u32_Display_fmt},
-	{&record.template, std_u32_Display_fmt}, {&from, std_str_Display_fmt}};
+	{&record.template, std_u32_Display_fmt}};
 	StdFmtArguments arguments = {pieces, lengthof(pieces), args};
 
 	if (!store_databases_Created_decode(body, body_len, &record, error))
 		return false;
-	from.ptr = record.has_root ? " and its base" : "";
-	from.len = strlen(from.ptr);
+	std_vec_free_Checked(&record.kinds, sizeof(TxnFoldDigested), _Alignof(TxnFoldDigested));
 	std_fmt_format_Checked(result, &arguments);
 	return true;
 }
@@ -1736,7 +2755,7 @@ store_databases_marked_moved(store_databases_frame_t *frame, uint32 repository, 
 	if (!store_databases_moved_to(frame, repository, from, &found, &to))
 		return false;
 	if (found)
-		return store_databases_finish(io, repository, from, to, frame->error);
+		return store_databases_finish(io, repository, from, to, 0, frame->error);
 	{
 		HostError	nowhere;
 		StdString	message;
@@ -1960,8 +2979,9 @@ store_databases_tests_dropping(HostIoIo *io, uint32 database, uint32 tablespace,
 /*
  * test_store_databases_tests_a_creation_makes_an_empty_repository_and_leaves_its_template:
  * a creation makes a repository that opens, in its tablespace's directory of
- * repositories, which it makes when absent, and leaves the template's
- * repository byte for byte; its id then conflicts with a new database's.
+ * repositories, which it makes when absent, and leaves the template's pack
+ * table as it was but for the records its pack record owed, which the copy
+ * writes first; its id then conflicts with a new database's.
  */
 void
 test_store_databases_tests_a_creation_makes_an_empty_repository_and_leaves_its_template(void)
@@ -1973,13 +2993,16 @@ test_store_databases_tests_a_creation_makes_an_empty_repository_and_leaves_its_t
 	StdVec		after;
 	uint32		tablespace;
 
-	store_databases_tests_ok(store_databases_created(io, 0, 931, HOST_PG_DEFAULT, &error), &error, 588, 47);
+	store_databases_tests_ok(store_databases_made(io, 931, HOST_PG_DEFAULT, &error), &error, 588, 47);
 	template = store_databases_tests_table(931, HOST_PG_DEFAULT, 589, 103);
 	tablespace = store_databases_tests_space(70001);
 	store_databases_tests_ok(store_databases_created(io, 931, 932, tablespace, &error), &error, 591, 43);
 	STD_ASSERT(592, 9, store_databases_tests_opens(io, 932, tablespace), "opens(io, 932, tablespace)");
 	after = store_databases_tests_table(931, HOST_PG_DEFAULT, 593, 99);
-	store_databases_tests_bytes_eq(&after, &template, 593);
+	STD_ASSERT(__LINE__, 0, after.len >= template.len && memcmp(after.ptr, template.ptr, template.len) == 0,
+			   "table(931, host::PG_DEFAULT).starts_with(&template)");
+	std_vec_free_Checked(&after, 1, 1);
+	std_vec_free_Checked(&template, 1, 1);
 	STD_ASSERT(594, 9, store_databases_tests_conflicts(io, 932, 594, 36) && !store_databases_tests_conflicts(io, 933, 594, 68),
 			   "conflicts(io, 932).unwrap() && !conflicts(io, 933).unwrap()");
 	simc_TestIo_drop(&test_io);
@@ -1987,33 +3010,33 @@ test_store_databases_tests_a_creation_makes_an_empty_repository_and_leaves_its_t
 
 /*
  * test_store_databases_tests_a_failed_creation_removes_what_it_made: a
- * creation that fails part way removes what it made, and a removal that
- * can't finish leaves the directory marked, which the id's conflict sees.
+ * creation leaves its directory marked until its transaction ends, which no
+ * listing of repositories names and the id's conflict sees, and its
+ * transaction's abort removes it (bugs row 404).
  */
 void
 test_store_databases_tests_a_failed_creation_removes_what_it_made(void)
 {
 	SimcTestIo	test_io = simc_io();
 	HostIoIo   *io = &test_io.io;
-	StdPathBuf	dir = host_tablespace_dir(934, HOST_PG_DEFAULT);
-	StdPathBuf	table;
-	StdIoError	io_error;
+	StdVec		found;
+	ChunksErrorError failed;
 	HostError	error;
-	bool		failed;
+	uint32		own;
+	bool		settled;
 
-	std_path_join(dir.bytes.ptr, dir.bytes.len, CHUNKS_PACKS_TABLE, strlen(CHUNKS_PACKS_TABLE), &table);
-	if (!std_fs_create_dir_all(table.bytes.ptr, table.bytes.len, &io_error))
-		store_databases_tests_io_unwrapped(&io_error, 603, 98);
-	failed = !store_databases_created(io, 0, 934, HOST_PG_DEFAULT, &error);
-	if (failed)
-		host_Error_drop(&error);
-	STD_ASSERT(604, 9, failed, "created(io, 0, 934, host::PG_DEFAULT).is_err()");
-	STD_ASSERT(605, 9, store_databases_tests_dropping(io, 934, HOST_PG_DEFAULT, 605, 61),
-			   "chunks::dropping(io, 934, host::PG_DEFAULT).unwrap()");
-	STD_ASSERT(606, 9, store_databases_tests_conflicts(io, 934, 606, 36), "conflicts(io, 934).unwrap()");
-	STD_ASSERT(607, 9, !store_databases_tests_opens(io, 934, HOST_PG_DEFAULT), "!opens(io, 934, host::PG_DEFAULT)");
-	std_vec_free_Checked(&table.bytes, 1, 1);
-	std_vec_free_Checked(&dir.bytes, 1, 1);
+	store_databases_tests_ok(store_databases_made(io, 933, HOST_PG_DEFAULT, &error), &error, __LINE__, 0);
+	store_databases_tests_ok(store_databases_created(io, 933, 934, HOST_PG_DEFAULT, &error), &error, __LINE__, 0);
+	if (!chunks_packs_open_repositories(HOST_IO_IO_READ_DOORS(io), &found, &failed))
+		store_databases_tests_chunks_unwrapped(&failed, __LINE__, 0);
+	STD_ASSERT(__LINE__, 0, !store_databases_found(&found, 934, &own) &&
+			   store_databases_tests_conflicts(io, 934, __LINE__, 0),
+			   "!chunks::repositories(io).unwrap().contains(934) && conflicts(io, 934).unwrap()");
+	std_vec_free_Checked(&found, sizeof(std_TupleU32U32_t), _Alignof(std_TupleU32U32_t));
+	store_databases_tests_ok(store_databases_creation_ended(io, false, &settled, &error), &error, __LINE__, 0);
+	STD_ASSERT(__LINE__, 0, settled && !store_databases_tests_there(934, HOST_PG_DEFAULT) &&
+			   !store_databases_tests_conflicts(io, 934, __LINE__, 0),
+			   "!there(934, host::PG_DEFAULT) && !conflicts(io, 934).unwrap()");
 	simc_TestIo_drop(&test_io);
 }
 
@@ -2052,7 +3075,7 @@ test_store_databases_tests_a_drop_removes_the_repository_and_checkpoints_after_i
 	uint64		left;
 	uint64		right;
 
-	store_databases_tests_ok(store_databases_created(io, 0, 935, tablespace, &error), &error, 618, 41);
+	store_databases_tests_ok(store_databases_made(io, 935, tablespace, &error), &error, 618, 41);
 	before = store_databases_tests_probe(io, 619, 80);
 	store_databases_tests_ok(store_databases_dropped(io, 935, &error), &error, 620, 26);
 	STD_ASSERT(621, 9, !store_databases_tests_there(935, tablespace) &&
@@ -2081,14 +3104,39 @@ store_databases_tests_creation(uint32 database, uint32 tablespace)
 	return store_databases_Created_encode(&record);
 }
 
-/* store_databases_tests_redo_created replays a creation of a database in a tablespace, which unwraps at a line and column. */
+/*
+ * store_databases_tests_redo_created replays a creation of a database in a
+ * tablespace from template1, which it makes first if it has no repository,
+ * with template1's digest as its primary logs it, and unwraps at a line and
+ * column.
+ */
 static void
 store_databases_tests_redo_created(HostIoIo *io, uint32 database, uint32 tablespace, uint32 line, uint32 col)
 {
-	StdVec		body = store_databases_tests_creation(database, tablespace);
+	StoreDatabasesCreated record = {.database = database, .tablespace = tablespace, .template = 1};
+	StdVec		body;
 	HostError	error;
+	RepoRepo	repo;
+	HostSharedReader reading;
+	ChunksErrorError failed;
+	bool		disagreed;
+	TxnFoldDigested at;
 
-	store_databases_tests_ok(store_databases_redo_created(io, body.ptr, body.len, &error), &error, line, col);
+	if (!store_databases_tests_there(STORE_DATABASES_TEMPLATE1, HOST_PG_DEFAULT))
+		store_databases_tests_ok(store_databases_made(io, STORE_DATABASES_TEMPLATE1, HOST_PG_DEFAULT, &error), &error,
+								 line, col);
+	if (!repo_Repo_open(io, STORE_DATABASES_TEMPLATE1, HOST_PG_DEFAULT, &repo, &failed))
+		store_databases_tests_chunks_unwrapped(&failed, line, col);
+	store_databases_tests_ok(host_shared_read(io, &reading, &error), &error, line, col);
+	std_vec_new(&record.kinds, sizeof(TxnFoldDigested), _Alignof(TxnFoldDigested));
+	store_databases_tests_ok(txn_fold_digest(io, &repo, &reading, STORE_DATABASES_TEMPLATE1, NULL, &record.kinds,
+											 record.digest, &disagreed, &at, &error), &error, line, col);
+	if (!repo_Repo_close(&repo, io, &reading, &failed))
+		store_databases_tests_chunks_unwrapped(&failed, line, col);
+	host_shared_Reader_drop(&reading);
+	body = store_databases_Created_encode(&record);
+	std_vec_free_Checked(&record.kinds, sizeof(TxnFoldDigested), _Alignof(TxnFoldDigested));
+	store_databases_tests_ok(store_databases_redo_created(io, body.ptr, body.len, 1, 1, &error), &error, line, col);
 	std_vec_free_Checked(&body, 1, 1);
 }
 
@@ -2172,7 +3220,7 @@ test_store_databases_tests_a_creation_replays_over_a_marked_leftover_and_not_ove
 			   "!host::tablespace_dir(937, host::PG_DEFAULT).join(\"leftover\").exists()");
 	STD_ASSERT(669, 9, store_databases_tests_opens(io, 937, HOST_PG_DEFAULT), "opens(io, 937, host::PG_DEFAULT)");
 	moved = store_databases_tests_space(70004);
-	store_databases_tests_ok(store_databases_created(io, 0, 938, moved, &error), &error, 671, 36);
+	store_databases_tests_ok(store_databases_made(io, 938, moved, &error), &error, 671, 36);
 	store_databases_tests_redo_created(io, 938, HOST_PG_DEFAULT, 672, 60);
 	STD_ASSERT(673, 9, !store_databases_tests_there(938, HOST_PG_DEFAULT) && store_databases_tests_there(938, moved),
 			   "!there(938, host::PG_DEFAULT) && there(938, moved)");
@@ -2223,14 +3271,14 @@ store_databases_tests_corrupt_eq(bool ok, HostError *error, uint32 line, uint32 
 
 /*
  * test_store_databases_tests_a_record_that_doesnt_read_is_corrupt: a record
- * with a field no repository record has, one missing a field it requires, a
- * root of another length, and a body cut short are data corruption.
+ * with a field no repository record has, one missing a field it requires,
+ * and a body cut short are data corruption.
  */
 void
 test_store_databases_tests_a_record_that_doesnt_read_is_corrupt(void)
 {
 	ChunksRecordRecordWriter w;
-	StdVec		bodies[4];
+	StdVec		bodies[3];
 	StdVec		creation = store_databases_tests_creation(940, 1663);
 	StoreDatabasesCreated created;
 	StoreDatabasesDropped dropped = {940, 1663};
@@ -2246,11 +3294,7 @@ test_store_databases_tests_a_record_that_doesnt_read_is_corrupt(void)
 	w = chunks_record_RecordWriter_new();
 	chunks_record_RecordWriter_uint(&w, STORE_DATABASES_DATABASE, 940);
 	bodies[1] = chunks_record_RecordWriter_finish(&w);
-	w = chunks_record_RecordWriter_new();
-	chunks_record_RecordWriter_uint(chunks_record_RecordWriter_uint(chunks_record_RecordWriter_uint(&w, 1, 940), 2, 1663), 3, 1);
-	chunks_record_RecordWriter_field(&w, STORE_DATABASES_ROOT, (const uint8 *) "short", 5);
-	bodies[2] = chunks_record_RecordWriter_finish(&w);
-	std_slice_to_vec_Checked(&bodies[3], creation.ptr, 3, 1, 1);
+	std_slice_to_vec_Checked(&bodies[2], creation.ptr, 3, 1, 1);
 	for (size_t k = 0; k < lengthof(bodies); k++)
 	{
 		ok = store_databases_Created_decode(bodies[k].ptr, bodies[k].len, &created, &error);
@@ -2401,7 +3445,7 @@ test_store_databases_tests_a_move_puts_the_repository_in_its_new_tablespace(void
 	HostLsn		before;
 	HostLsn		redo;
 
-	store_databases_tests_ok(store_databases_created(io, 0, 951, from, &error), &error, 745, 35);
+	store_databases_tests_ok(store_databases_made(io, 951, from, &error), &error, 745, 35);
 	table = store_databases_tests_table(951, from, 746, 88);
 	store_databases_tests_ok(store_databases_moved_copy(io, 951, from, to, &error), &error, 747, 39);
 	STD_ASSERT(748, 9, store_databases_tests_moving_there(951, to) && store_databases_tests_there(951, from) &&
@@ -2423,28 +3467,25 @@ test_store_databases_tests_a_move_puts_the_repository_in_its_new_tablespace(void
 	simc_TestIo_drop(&test_io);
 }
 
-/* store_databases_tests_redo_moving replays a move's copy or finish, which unwraps at a line and column. */
+/* store_databases_tests_redo_moving replays a move's finish, which unwraps at a line and column. */
 static void
-store_databases_tests_redo_moving(HostIoIo *io, bool copied, uint32 database, uint32 from, uint32 to, uint32 line,
-								  uint32 col)
+store_databases_tests_redo_moving(HostIoIo *io, uint32 database, uint32 from, uint32 to, uint32 line, uint32 col)
 {
 	StoreDatabasesMoved record = {database, from, to};
 	StdVec		body = store_databases_Moved_encode(&record);
 	HostError	error;
-	bool		ok = copied ? store_databases_redo_copied(io, body.ptr, body.len, &error) :
-		store_databases_redo_moved(io, body.ptr, body.len, &error);
 
-	store_databases_tests_ok(ok, &error, line, col);
+	store_databases_tests_ok(store_databases_redo_moved(io, body.ptr, body.len, 0, &error), &error, line, col);
 	std_vec_free_Checked(&body, 1, 1);
 }
 
 /*
  * test_store_databases_tests_a_moves_records_replay_twice_as_once_and_after_it_finished:
- * a move's copy and finish each replayed twice leave what one run leaves;
- * replayed after the move finished and its old tablespace's directory went,
- * they make nothing and fail nothing; and a copy replayed after the finish
- * renamed the copy, its old directory still standing marked, makes no second
- * copy.
+ * a move's finish replayed twice makes its copy and leaves what one run
+ * leaves; replayed after the move finished and its old tablespace's
+ * directory went, it makes nothing and fails nothing; and a finish replayed
+ * after a finish renamed the copy, its old directory still standing marked,
+ * makes no second copy.
  */
 void
 test_store_databases_tests_a_moves_records_replay_twice_as_once_and_after_it_finished(void)
@@ -2459,30 +3500,26 @@ test_store_databases_tests_a_moves_records_replay_twice_as_once_and_after_it_fin
 	StdPathBuf	own;
 	StdIoError	io_error;
 
-	store_databases_tests_ok(store_databases_created(io, 0, 952, from, &error), &error, 766, 35);
-	store_databases_tests_redo_moving(io, true, 952, from, to, 768, 34);
-	store_databases_tests_redo_moving(io, true, 952, from, to, 769, 34);
-	STD_ASSERT(770, 9, store_databases_tests_moving_there(952, to) && store_databases_tests_there(952, from),
-			   "moving(952, to).exists() && there(952, from)");
-	store_databases_tests_redo_moving(io, false, 952, from, to, 771, 33);
-	store_databases_tests_redo_moving(io, false, 952, from, to, 772, 33);
-	STD_ASSERT(773, 9, !store_databases_tests_moving_there(952, to) && !store_databases_tests_there(952, from) &&
+	store_databases_tests_ok(store_databases_made(io, 952, from, &error), &error, __LINE__, 35);
+	store_databases_tests_redo_moving(io, 952, from, to, __LINE__, 33);
+	store_databases_tests_redo_moving(io, 952, from, to, __LINE__, 33);
+	STD_ASSERT(__LINE__, 9, !store_databases_tests_moving_there(952, to) && !store_databases_tests_there(952, from) &&
 			   store_databases_tests_opens(io, 952, to),
 			   "!moving(952, to).exists() && !there(952, from) && opens(io, 952, to)");
-	store_databases_tests_redo_moving(io, true, 952, from, to, 774, 34);
-	store_databases_tests_redo_moving(io, false, 952, from, to, 775, 33);
-	STD_ASSERT(776, 9, !store_databases_tests_moving_there(952, to) && store_databases_tests_opens(io, 952, to),
+	store_databases_tests_redo_moving(io, 952, from, to, __LINE__, 33);
+	STD_ASSERT(__LINE__, 9, !store_databases_tests_moving_there(952, to) && store_databases_tests_opens(io, 952, to),
 			   "!moving(952, to).exists() && opens(io, 952, to)");
-	store_databases_tests_ok(store_databases_created(io, 0, 956, from, &error), &error, 777, 35);
-	store_databases_tests_ok(store_databases_moved_copy(io, 956, from, to, &error), &error, 778, 39);
+	store_databases_tests_ok(store_databases_made(io, 956, from, &error), &error, __LINE__, 35);
+	store_databases_tests_ok(store_databases_moved_copy(io, 956, from, to, &error), &error, __LINE__, 39);
 	old = host_tablespace_dir(956, from);
-	store_databases_tests_written(&old, CHUNKS_PACKS_OPEN_MOVED_FROM, "", 779, 87);
+	store_databases_tests_written(&old, CHUNKS_PACKS_OPEN_MOVED_FROM, "", __LINE__, 87);
 	copy = store_databases_moving(956, to);
 	own = host_tablespace_dir(956, to);
 	if (!std_fs_rename(copy.bytes.ptr, copy.bytes.len, own.bytes.ptr, own.bytes.len, &io_error))
-		store_databases_tests_io_unwrapped(&io_error, 780, 73);
-	store_databases_tests_redo_moving(io, true, 956, from, to, 781, 82);
-	STD_ASSERT(782, 9, !store_databases_tests_moving_there(956, to), "!moving(956, to).exists()");
+		store_databases_tests_io_unwrapped(&io_error, __LINE__, 73);
+	store_databases_tests_redo_moving(io, 956, from, to, __LINE__, 82);
+	STD_ASSERT(__LINE__, 9, !store_databases_tests_moving_there(956, to) && store_databases_tests_opens(io, 956, to),
+			   "!moving(956, to).exists() && opens(io, 956, to)");
 	std_vec_free_Checked(&own.bytes, 1, 1);
 	std_vec_free_Checked(&copy.bytes, 1, 1);
 	std_vec_free_Checked(&old.bytes, 1, 1);
@@ -2514,7 +3551,7 @@ test_store_databases_tests_a_start_finishes_a_marked_move_and_leaves_an_unmarked
 	uint32		to = store_databases_tests_space(70016);
 	StdPathBuf	old;
 
-	store_databases_tests_ok(store_databases_created(io, 0, 953, from, &error), &error, 792, 35);
+	store_databases_tests_ok(store_databases_made(io, 953, from, &error), &error, 792, 35);
 	store_databases_tests_ok(store_databases_moved_copy(io, 953, from, to, &error), &error, 793, 39);
 	store_databases_tests_started(io, 794);
 	STD_ASSERT(795, 9, store_databases_tests_moving_there(953, to) && store_databases_tests_there(953, from),
@@ -2555,7 +3592,7 @@ test_store_databases_tests_an_open_finishes_a_committed_move(void)
 	uint32		from = store_databases_tests_space(70017);
 	uint32		to = store_databases_tests_space(70018);
 
-	store_databases_tests_ok(store_databases_created(io, 0, 954, from, &error), &error, 808, 35);
+	store_databases_tests_ok(store_databases_made(io, 954, from, &error), &error, 808, 35);
 	store_databases_tests_ok(store_databases_moved_copy(io, 954, from, to, &error), &error, 809, 39);
 	store_databases_tests_committed_eq(io, 954, to, 810);
 	STD_ASSERT(811, 9, !store_databases_tests_moving_there(954, to) && !store_databases_tests_there(954, from) &&
@@ -2581,7 +3618,7 @@ test_store_databases_tests_a_drop_and_a_move_remove_a_stale_copy(void)
 	uint32		to = store_databases_tests_space(70020);
 	uint32		other = store_databases_tests_space(70021);
 
-	store_databases_tests_ok(store_databases_created(io, 0, 955, from, &error), &error, 822, 35);
+	store_databases_tests_ok(store_databases_made(io, 955, from, &error), &error, 822, 35);
 	store_databases_tests_ok(store_databases_moved_copy(io, 955, from, other, &error), &error, 823, 42);
 	store_databases_tests_moved(io, 955, from, to);
 	STD_ASSERT(825, 9, !store_databases_tests_moving_there(955, other) && store_databases_tests_opens(io, 955, to),
@@ -2611,7 +3648,7 @@ store_databases_tests_finished(HostIoIo *io, uint32 database, uint32 from, uint3
 {
 	HostError	error;
 
-	store_databases_tests_ok(store_databases_finish(io, database, from, to, &error), &error, line, 47);
+	store_databases_tests_ok(store_databases_finish(io, database, from, to, 0, &error), &error, line, 47);
 }
 
 /*
@@ -2636,7 +3673,7 @@ test_store_databases_tests_two_finishes_of_one_move_leave_one_pack_record(void)
 	uint64		a;
 	uint64		b;
 
-	store_databases_tests_ok(store_databases_created(io, 0, 957, from, &error), &error, 838, 35);
+	store_databases_tests_ok(store_databases_made(io, 957, from, &error), &error, 838, 35);
 	store_databases_tests_ok(store_databases_moved_copy(io, 957, from, to, &error), &error, 839, 39);
 	store_databases_tests_committed_eq(io, 957, to, 840);
 	store_databases_tests_repo(io, 957, to, &first, 841, 57);
@@ -2668,7 +3705,7 @@ test_store_databases_tests_a_finish_after_another_removed_the_old_directory_ends
 	uint32		from = store_databases_tests_space(70024);
 	uint32		to = store_databases_tests_space(70025);
 
-	store_databases_tests_ok(store_databases_created(io, 0, 958, from, &error), &error, 857, 35);
+	store_databases_tests_ok(store_databases_made(io, 958, from, &error), &error, 857, 35);
 	store_databases_tests_ok(store_databases_moved_copy(io, 958, from, to, &error), &error, 858, 39);
 	store_databases_tests_finished(io, 958, from, to, 859);
 	STD_ASSERT(860, 9, !store_databases_tests_there(958, from), "!there(958, from)");
@@ -2771,7 +3808,7 @@ test_store_databases_tests_a_record_made_before_a_moves_finish_is_no_record_of_t
 	SimcRun		run;
 	SimcReport	report;
 
-	store_databases_tests_ok(store_databases_created(io, 0, 963, spaces.from, &error), &error, 887, 35);
+	store_databases_tests_ok(store_databases_made(io, 963, spaces.from, &error), &error, 887, 35);
 	store_databases_tests_ok(store_databases_moved_copy(io, 963, spaces.from, spaces.to, &error), &error, 888, 39);
 	if (!chunks_packs_open_forgot(io, 963, spaces.from, &failed))
 		store_databases_tests_chunks_unwrapped(&failed, 889, 51);

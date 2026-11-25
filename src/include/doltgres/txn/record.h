@@ -189,7 +189,8 @@ typedef struct TxnRecordDatabaseChange
  * TxnRecordBaseAdvanced is BaseAdvanced: the base a fold installed in a
  * storage's state, its fold point, the largest top-level xid it applied, the
  * base record, the packs it wrote, whether a backend built it whole, a built
- * base's horizon, and a DDL's transform's chain entries.
+ * base's horizon, a DDL's transform's chain entries, and how many statuses
+ * records the fold logged before it.
  */
 typedef struct TxnRecordBaseAdvanced
 {
@@ -204,6 +205,12 @@ typedef struct TxnRecordBaseAdvanced
 	/* chain is a Vec<Pending>, or none for every record but a chain's. */
 	bool		has_chain;
 	StdVec		chain;
+
+	/*
+	 * statuses is how many FoldStatuses records the fold logged before this
+	 * one, 0 for a built or a chain's record (bugs row 432).
+	 */
+	uint64		statuses;
 } TxnRecordBaseAdvanced;
 
 /*
@@ -242,6 +249,35 @@ typedef struct TxnRecordMapCarried
 	StdVec		versions;
 } TxnRecordMapCarried;
 
+/*
+ * TxnRecordCarryUnlisted is CarryUnlisted: a carry whose spill files its
+ * primary took back out of its new storage's manifest after a count's add
+ * failed, named by the ends of the carry's records, ascending.
+ */
+typedef struct TxnRecordCarryUnlisted
+{
+	HostStorage storage;
+	/* ends is a Vec<u64>. */
+	StdVec		ends;
+} TxnRecordCarryUnlisted;
+
+/*
+ * TxnRecordFoldStatuses is FoldStatuses: one of a fold's records, logged
+ * before its BaseAdvanced, of the writers the fold answered aborted and the
+ * committed writers whose killed versions it answered aborted, at its point
+ * in a storage, with its index among the fold's records of them (bugs row
+ * 432).
+ */
+typedef struct TxnRecordFoldStatuses
+{
+	HostStorage storage;
+	uint64		folded;
+	uint64		index;
+	/* aborted and killed are Vec<u64>s, ascending. */
+	StdVec		aborted;
+	StdVec		killed;
+} TxnRecordFoldStatuses;
+
 /* TxnRecordStorageEmptied is StorageEmptied: a storage emptied in place by a truncate. */
 typedef struct TxnRecordStorageEmptied
 {
@@ -261,9 +297,23 @@ typedef struct TxnRecordTidsFreed
 	StdVec		runs;
 	/* dead is a Vec<(u32, u16, u16, u64)>, as runs. */
 	StdVec		dead;
+
+	/*
+	 * enders is a Vec<u64>: each of runs' tuple ids' stored ender, then each
+	 * of dead's, in tuple id order, which a replayed free's take-out matches
+	 * (bugs row 320).
+	 */
+	StdVec		enders;
 	/* values is the TOAST storage and each value id's count, or none. */
 	bool		has_values;
 	host_TupleStorageVecTupleU32U64_t values;
+
+	/*
+	 * cleared is the block whose full flag a prune that found nothing to free
+	 * cleared, or none (bugs row 370).
+	 */
+	bool		has_cleared;
+	uint32		cleared;
 } TxnRecordTidsFreed;
 
 /*
@@ -355,6 +405,14 @@ extern void txn_record_ChunkWrite_encode(const TxnRecordChunkWrite *self, StdVec
 extern bool txn_record_ChunkWrite_pieces(TxnRecordChunkWrite *self, StdVec *result, HostError *error);
 extern void txn_record_BaseAdvanced_encode(const TxnRecordBaseAdvanced *self, StdVec *result);
 extern void txn_record_StorageEmptied_encode(const TxnRecordStorageEmptied *self, StdVec *result);
+extern void txn_record_CarryUnlisted_encode(const TxnRecordCarryUnlisted *self, StdVec *result);
+extern bool txn_record_CarryUnlisted_decode(const uint8 *body, size_t body_len, TxnRecordCarryUnlisted *result,
+											HostError *error);
+extern void txn_record_CarryUnlisted_drop(TxnRecordCarryUnlisted *self);
+extern void txn_record_FoldStatuses_encode(const TxnRecordFoldStatuses *self, StdVec *result);
+extern bool txn_record_FoldStatuses_decode(const uint8 *body, size_t body_len, TxnRecordFoldStatuses *result,
+										   HostError *error);
+extern void txn_record_FoldStatuses_drop(TxnRecordFoldStatuses *self);
 
 extern void txn_record_PageLeft_encode(const TxnRecordPageLeft *self, StdVec *result);
 extern void txn_record_PageLeft_encode_with(const TxnRecordPageLeft *self, ChunksRecordRecordWriter *w, StdVec *result);
@@ -363,5 +421,21 @@ extern void txn_record_DatabaseChange_encode(const TxnRecordDatabaseChange *self
 
 extern void txn_record_MapCarried_encode(const TxnRecordMapCarried *self, StdVec *result);
 extern void txn_record_TidsFreed_encode(const TxnRecordTidsFreed *self, StdVec *result);
+
+#ifdef DOLTGRES_TEST_TXN
+extern void test_txn_record_tests_a_row_change_reads_back_and_refuses_every_other_form(void);
+extern void test_txn_record_tests_a_page_leave_reads_back_and_refuses_every_other_form(void);
+extern void test_txn_record_tests_a_built_bases_node_reads_back_with_its_stamps(void);
+extern void test_txn_record_tests_stamps_on_a_blob_or_of_another_count_are_refused(void);
+extern void test_txn_record_tests_a_moves_carried_free_space_reads_back_and_refuses_every_other_form(void);
+extern void test_txn_record_tests_a_chunk_reads_back_and_refuses_every_other_form(void);
+extern void test_txn_record_tests_an_updates_kept_values_read_back_in_their_values_order(void);
+extern void test_txn_record_tests_a_folds_record_reads_back_and_refuses_every_other_form(void);
+extern void test_txn_record_tests_a_free_reads_back_and_refuses_runs_out_of_bounds_or_order(void);
+extern void test_txn_record_tests_a_frees_taken_down_values_read_back_and_refuse_every_other_form(void);
+extern void test_txn_record_tests_an_index_entrys_change_reads_back_and_refuses_every_field_its_op_doesnt_carry(void);
+extern void test_txn_record_tests_a_built_nodes_key_names_its_base_and_its_fields_come_together(void);
+extern void test_txn_record_tests_a_frees_cleared_block_reads_back_and_refuses_every_other_form(void);
+#endif
 
 #endif							/* DOLTGRES_TXN_RECORD_H */

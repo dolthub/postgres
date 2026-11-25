@@ -191,6 +191,10 @@ typedef struct chunks_packs_fixtures_dead_t
 	bool		set;
 } chunks_packs_fixtures_dead_t;
 
+static bool chunks_packs_fixtures_dead_closure_0(void *captures, ChunksPacksRetireMarking *marking, StdVec *entries,
+												 StdVec *result, ChunksErrorError *error)
+			STD_REQUIRES(CHUNKS_PACKS_BARRIER_HOLDING);
+
 /* chunks_packs_fixtures_dead_closure_0 is dead's keep: the pack's vector set, and no pack kept. */
 static bool
 chunks_packs_fixtures_dead_closure_0(void *captures, ChunksPacksRetireMarking *marking, StdVec *entries,
@@ -613,7 +617,7 @@ chunks_packs_tests_refreshed(const char *file, ChunksPacksViewView *view, HostIo
 {
 	ChunksErrorError error;
 
-	if (!chunks_packs_view_View_refresh(view, io, record, &error))
+	if (!chunks_packs_view_View_refresh(view, HOST_IO_IO_TAKES_SHORT(io), record, &error))
 		chunks_packs_tests_unwrapped(file, &error, line, col);
 }
 

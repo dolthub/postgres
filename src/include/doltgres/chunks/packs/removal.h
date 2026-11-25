@@ -49,8 +49,10 @@ extern size_t chunks_packs_removal_Reservation_entries(const ChunksPacksRemovalR
 extern void chunks_packs_removal_Reservation_drop(ChunksPacksRemovalReservation *self);
 extern bool chunks_packs_removal_queue(HostIoIo *io, ChunksPacksRemovalReservation *reservation, uint32 repository,
 									   const ChunksPacksRemovalFile *files, size_t files_len, ChunksErrorError *error);
+extern bool chunks_packs_removal_queued(HostIoIo *io, uint32 repository, StdVec *result, ChunksErrorError *error);
 extern bool chunks_packs_removal_queued_packs(HostIoIo *io, uint32 repository, StdVec *result,
 											  ChunksErrorError *error);
+extern StdString chunks_packs_removal_file_name(const ChunksPacksSingleRemoval *entry);
 extern bool chunks_packs_removal_remove_due(HostIoIo *io, ChunksErrorError *error);
 
 #ifdef DOLTGRES_TEST_CHUNKS

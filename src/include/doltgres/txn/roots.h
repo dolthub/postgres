@@ -44,6 +44,7 @@ typedef struct TxnRootsCaptured
 } TxnRootsCaptured;
 
 extern void txn_roots_Captured_drop(TxnRootsCaptured *self);
-extern bool txn_roots_roots(HostIoIo *io, uint32 database, TxnRootsCaptured *result, HostError *error);
+extern bool txn_roots_roots(HostIoIo *io, uint32 database, HostLsn redo, TxnRootsCaptured *result,
+							HostError *error);
 
 #endif							/* DOLTGRES_TXN_ROOTS_H */

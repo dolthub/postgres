@@ -738,6 +738,21 @@ chunks_packs_shared_marked(HostIoIo *io, bool *result, ChunksErrorError *error)
 	return true;
 }
 
+/* CHUNKS_PACKS_BARRIER_HOLDING is this process's exclusive hold of a repository's barrier, a capability with no value. */
+ChunksPacksBarrierHolding CHUNKS_PACKS_BARRIER_HOLDING;
+
+/* chunks_packs_barrier_held marks the barrier the caller holds exclusively as held, for the analysis alone. */
+void
+chunks_packs_barrier_held(void)
+{
+}
+
+/* chunks_packs_barrier_left marks the barrier the caller is about to give back as no longer held. */
+void
+chunks_packs_barrier_left(void)
+{
+}
+
 #ifdef DOLTGRES_TEST_CHUNKS
 
 /* chunks_packs_shared_tests_entry returns the table's entry of a pack numbered `number`. */

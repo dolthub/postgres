@@ -21,6 +21,7 @@
 #include "access/xact.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_class.h"
+#include "doltgres/hooks.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
@@ -344,8 +345,8 @@ verify_heapam(PG_FUNCTION_ARGS)
 	 * Sequences always use heap AM, but they don't show that in the catalogs.
 	 * Other relkinds might be using a different AM, so check.
 	 */
-	if (ctx.rel->rd_rel->relkind != RELKIND_SEQUENCE &&
-		ctx.rel->rd_rel->relam != HEAP_TABLE_AM_OID)
+	if ((ctx.rel->rd_rel->relkind != RELKIND_SEQUENCE &&
+		 ctx.rel->rd_rel->relam != HEAP_TABLE_AM_OID) || doltgres_heap_only_refused(ctx.rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("only heap AM is supported")));

@@ -34,6 +34,7 @@
 #include "doltgres/std/test.h"
 #include "doltgres/std/unwind.h"
 #include "doltgres/std/vec.h"
+#include "port/pg_bitutils.h"
 
 #define RUST_FILE "host" STD_SEP "src" STD_SEP "delta" STD_SEP "blocks.rs"
 
@@ -299,6 +300,95 @@ host_delta_blocks_give(HostDeltaDirectoryDirectory directory, uint64 body)
 	directory.ops->unlock_region(directory.self);
 }
 
+/*
+ * host_delta_blocks_packing orders each class's list of partly used blocks
+ * fullest first, so every take fills the fullest, and returns the blocks
+ * whose pages the blocks ahead of them have room for, the sparsest first,
+ * each with how many of its pages to move: all of each but the last, which
+ * moves only what the room left holds, so once they move each class keeps at
+ * most one partly used block besides those pinned (bugs row 143). A block
+ * pinned, one holding a page no packing moves, is never drained, though it
+ * may take others' pages. It answers false when it can't reserve its lists,
+ * before it takes the region's lock.
+ */
+bool
+host_delta_blocks_packing(HostDeltaDirectoryDirectory directory, const uint8 *pinned, StdVec *result)
+{
+	uint32		blocks = directory.ops->blocks(directory.self);
+	StdVec		listed;
+
+	std_vec_new(result, sizeof(HostDeltaBlocksDrain), _Alignof(HostDeltaBlocksDrain));
+	std_vec_new(&listed, sizeof(HostDeltaBlocksDrain), _Alignof(HostDeltaBlocksDrain));
+	if (!std_vec_try_reserve(result, blocks, sizeof(HostDeltaBlocksDrain), _Alignof(HostDeltaBlocksDrain)) ||
+		!std_vec_try_reserve(&listed, blocks, sizeof(HostDeltaBlocksDrain), _Alignof(HostDeltaBlocksDrain)))
+	{
+		std_vec_free_Checked(result, sizeof(HostDeltaBlocksDrain), _Alignof(HostDeltaBlocksDrain));
+		std_vec_free_Checked(&listed, sizeof(HostDeltaBlocksDrain), _Alignof(HostDeltaBlocksDrain));
+		return false;
+	}
+	directory.ops->lock_region(directory.self);
+	for (uint32 class = 0; class < HOST_DELTA_BLOCKS_CLASSES; class++)
+	{
+		HostDeltaBlocksRegion partial = {HOST_DELTA_BLOCKS_REGION_PARTIAL, {class}};
+		uint64		full = host_delta_blocks_full(class);
+		uint32		slots = (uint32) pg_popcount64(full);
+		uint64		room = 0;
+
+		if (full == 1)
+			continue;
+		listed.len = 0;
+		for (uint64 at = directory.ops->region(directory.self, partial); at != 0;
+			 at = directory.ops->block(directory.self, (uint32) (at - 1), HOST_DELTA_BLOCKS_BLOCK_LINKS) &
+			 (uint64) PG_UINT32_MAX)
+		{
+			HostDeltaBlocksDrain block = {(uint32) (at - 1),
+				(uint32) pg_popcount64(directory.ops->block(directory.self, (uint32) (at - 1),
+															HOST_DELTA_BLOCKS_BLOCK_MAP))};
+
+			std_vec_push_Checked(&listed, &block, sizeof(block), _Alignof(HostDeltaBlocksDrain));
+		}
+		if (listed.len < 2)
+			continue;
+		for (size_t k = 1; k < listed.len; k++)
+		{
+			HostDeltaBlocksDrain block = STD_VEC_AT(&listed, HostDeltaBlocksDrain, k);
+			size_t		at = k;
+
+			for (; at > 0 && STD_VEC_AT(&listed, HostDeltaBlocksDrain, at - 1).pages < block.pages; at--)
+				STD_VEC_AT(&listed, HostDeltaBlocksDrain, at) = STD_VEC_AT(&listed, HostDeltaBlocksDrain, at - 1);
+			STD_VEC_AT(&listed, HostDeltaBlocksDrain, at) = block;
+		}
+		for (size_t k = 0; k < listed.len; k++)
+			host_delta_blocks_unlinked(directory, partial, STD_VEC_AT(&listed, HostDeltaBlocksDrain, k).block);
+		for (size_t k = listed.len; k > 0; k--)
+			host_delta_blocks_pushed(directory, partial, STD_VEC_AT(&listed, HostDeltaBlocksDrain, k - 1).block);
+		room = slots - STD_VEC_AT(&listed, HostDeltaBlocksDrain, 0).pages;
+		for (size_t front = 0, k = listed.len - 1; k > front; k--)
+		{
+			HostDeltaBlocksDrain block = STD_VEC_AT(&listed, HostDeltaBlocksDrain, k);
+			uint32		moving = 0;
+
+			if (pinned[block.block])
+				continue;
+			while (moving < block.pages && front < k)
+			{
+				uint32		put = (uint32) Min(room, (uint64) (block.pages - moving));
+
+				moving += put;
+				room -= put;
+				if (room == 0 && ++front < k)
+					room = slots - STD_VEC_AT(&listed, HostDeltaBlocksDrain, front).pages;
+			}
+			block.pages = moving;
+			if (moving > 0)
+				std_vec_push_Checked(result, &block, sizeof(block), _Alignof(HostDeltaBlocksDrain));
+		}
+	}
+	directory.ops->unlock_region(directory.self);
+	std_vec_free_Checked(&listed, sizeof(HostDeltaBlocksDrain), _Alignof(HostDeltaBlocksDrain));
+	return true;
+}
+
 /* host_delta_blocks_popped takes a block off the free stack, or else the region's next fresh block. */
 static bool
 host_delta_blocks_popped(HostDeltaDirectoryDirectory directory, uint32 *result)
@@ -462,6 +552,146 @@ test_host_delta_blocks_tests_a_body_takes_the_smallest_class_that_holds_it(void)
 			std_vec_free_Checked(&classes, sizeof(uint32), _Alignof(uint32));
 		std_unwind_resume(&unwind);
 	}
+}
+
+/* HOST_DELTA_BLOCKS_TESTS_BLOCKS is the count of blocks the packing case's region holds. */
+#define HOST_DELTA_BLOCKS_TESTS_BLOCKS 12
+
+/* host_delta_blocks_tests_Region_t is the packing case's region: its words and each block's three words. */
+typedef struct host_delta_blocks_tests_Region_t
+{
+	uint64		words[HOST_DELTA_BLOCKS_WORDS];
+	uint64		blocks[HOST_DELTA_BLOCKS_TESTS_BLOCKS][3];
+} host_delta_blocks_tests_Region_t;
+
+/* host_delta_blocks_tests_count is the packing case's region's count of blocks. */
+static uint32
+host_delta_blocks_tests_count(void *self)
+{
+	return HOST_DELTA_BLOCKS_TESTS_BLOCKS;
+}
+
+/* host_delta_blocks_tests_region loads one of the packing case's region's words. */
+static uint64
+host_delta_blocks_tests_region(void *self, HostDeltaBlocksRegion word)
+{
+	return ((host_delta_blocks_tests_Region_t *) self)->words[host_delta_blocks_Region_index(word)];
+}
+
+/* host_delta_blocks_tests_set_region stores one of the packing case's region's words. */
+static void
+host_delta_blocks_tests_set_region(void *self, HostDeltaBlocksRegion word, uint64 value)
+{
+	((host_delta_blocks_tests_Region_t *) self)->words[host_delta_blocks_Region_index(word)] = value;
+}
+
+/* host_delta_blocks_tests_block loads one of a block's words in the packing case's region. */
+static uint64
+host_delta_blocks_tests_block(void *self, uint32 block, HostDeltaBlocksBlock word)
+{
+	return ((host_delta_blocks_tests_Region_t *) self)->blocks[block][word];
+}
+
+/* host_delta_blocks_tests_set_block stores one of a block's words in the packing case's region. */
+static void
+host_delta_blocks_tests_set_block(void *self, uint32 block, HostDeltaBlocksBlock word, uint64 value)
+{
+	((host_delta_blocks_tests_Region_t *) self)->blocks[block][word] = value;
+}
+
+/* host_delta_blocks_tests_nothing is the packing case's region's lock, which one process needs none of. */
+static void
+host_delta_blocks_tests_nothing(void *self)
+{
+}
+
+/* HOST_DELTA_BLOCKS_TESTS_REGION_OPS is the packing case's region's directory ops: the ones a packing reaches. */
+static const HostDeltaDirectoryDirectoryOps HOST_DELTA_BLOCKS_TESTS_REGION_OPS = {
+	.blocks = host_delta_blocks_tests_count,
+	.region = host_delta_blocks_tests_region,
+	.set_region = host_delta_blocks_tests_set_region,
+	.block = host_delta_blocks_tests_block,
+	.set_block = host_delta_blocks_tests_set_block,
+	.lock_region = host_delta_blocks_tests_nothing,
+	.unlock_region = host_delta_blocks_tests_nothing,
+};
+
+/*
+ * test_host_delta_blocks_tests_a_packing_drains_only_what_the_blocks_ahead_hold:
+ * a packing of partly used blocks of assorted counts drains, in each class,
+ * no more pages than the blocks ahead of the drained ones have room for,
+ * drains nothing of a class with one partly used block, never drains a
+ * pinned block, and once its drains are applied leaves each class at most one
+ * partly used block besides a pinned one (bugs row 143). Its blocks' classes
+ * and counts of taken slots are listed by block, -1 for a free block, and
+ * block 11 is pinned.
+ */
+void
+test_host_delta_blocks_tests_a_packing_drains_only_what_the_blocks_ahead_hold(void)
+{
+	static const int classes[HOST_DELTA_BLOCKS_TESTS_BLOCKS] = {0, 0, 0, 0, 0, 1, 2, 2, 2, -1, 0, 2};
+	static const uint32 taken[HOST_DELTA_BLOCKS_TESTS_BLOCKS] = {40, 40, 10, 5, 63, 20, 3, 15, 2, 0, 33, 1};
+	static host_delta_blocks_tests_Region_t region;
+	uint8		pinned[HOST_DELTA_BLOCKS_TESTS_BLOCKS] = {0};
+	uint32		counts[HOST_DELTA_BLOCKS_TESTS_BLOCKS];
+	bool		drained[HOST_DELTA_BLOCKS_TESTS_BLOCKS] = {0};
+	HostDeltaDirectoryDirectory directory = {&HOST_DELTA_BLOCKS_TESTS_REGION_OPS, &region};
+	StdVec		drains;
+
+	memset(&region, 0, sizeof(region));
+	pinned[11] = 1;
+	for (uint32 block = 0; block < HOST_DELTA_BLOCKS_TESTS_BLOCKS; block++)
+	{
+		HostDeltaBlocksRegion partial = {HOST_DELTA_BLOCKS_REGION_PARTIAL, {(uint32) Max(classes[block], 0)}};
+
+		counts[block] = taken[block];
+		if (classes[block] < 0)
+			continue;
+		region.blocks[block][HOST_DELTA_BLOCKS_BLOCK_SLOTS] = (uint64) classes[block];
+		region.blocks[block][HOST_DELTA_BLOCKS_BLOCK_MAP] = taken[block] == 64 ? PG_UINT64_MAX :
+			(UINT64CONST(1) << taken[block]) - 1;
+		host_delta_blocks_pushed(directory, partial, block);
+	}
+	STD_ASSERT(__LINE__, 9, host_delta_blocks_packing(directory, pinned, &drains), "a packing reserves its lists");
+	for (size_t k = 0; k < drains.len; k++)
+	{
+		const HostDeltaBlocksDrain *drain = &STD_VEC_AT(&drains, HostDeltaBlocksDrain, k);
+
+		STD_ASSERT(__LINE__, 9, !pinned[drain->block], "a packing never drains a pinned block");
+		STD_ASSERT(__LINE__, 9, classes[drain->block] != 1, "a class of one partly used block drains nothing");
+		STD_ASSERT(__LINE__, 9, drain->pages <= counts[drain->block], "a drain moves only pages its block holds");
+		counts[drain->block] -= drain->pages;
+		drained[drain->block] = true;
+	}
+	for (uint32 class = 0; class < 3; class++)
+	{
+		HostDeltaBlocksRegion partial = {HOST_DELTA_BLOCKS_REGION_PARTIAL, {class}};
+		uint32		slots = (uint32) pg_popcount64(host_delta_blocks_full(class));
+		uint64		moving = 0;
+		uint32		partly = 0;
+
+		for (size_t k = 0; k < drains.len; k++)
+			if ((uint32) classes[STD_VEC_AT(&drains, HostDeltaBlocksDrain, k).block] == class)
+				moving += STD_VEC_AT(&drains, HostDeltaBlocksDrain, k).pages;
+		for (uint64 at = region.words[host_delta_blocks_Region_index(partial)]; at != 0;
+			 at = region.blocks[at - 1][HOST_DELTA_BLOCKS_BLOCK_LINKS] & PG_UINT32_MAX)
+		{
+			uint32		block = (uint32) (at - 1);
+			uint32		put;
+
+			if (drained[block])
+				break;
+			put = (uint32) Min((uint64) (slots - counts[block]), moving);
+			counts[block] += put;
+			moving -= put;
+		}
+		STD_ASSERT(__LINE__, 9, moving == 0, "the blocks ahead of the drained ones hold every page drained");
+		for (uint32 block = 0; block < HOST_DELTA_BLOCKS_TESTS_BLOCKS; block++)
+			if (classes[block] == (int) class && !pinned[block] && counts[block] > 0 && counts[block] < slots)
+				partly++;
+		STD_ASSERT(__LINE__, 9, partly <= 1, "a packing leaves a class at most one partly used block");
+	}
+	std_vec_free_Checked(&drains, sizeof(HostDeltaBlocksDrain), _Alignof(HostDeltaBlocksDrain));
 }
 
 #endif							/* DOLTGRES_TEST_HOST */

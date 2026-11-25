@@ -210,6 +210,8 @@ extern HostIoInDrop host_io_InDrop_new(void);
 extern HostIoIo host_io_Io_new_for_pghost(StdAny raise);
 #endif
 extern bool host_io_Io_check(HostIoIo *self, struct HostError *error);
+extern void host_io_Io_hold(HostIoIo *self);
+extern void host_io_Io_resume(HostIoIo *self);
 #ifdef DOLTGRES_HOST_TESTING
 extern HostIoIo host_io_Io_testing(void);
 #endif

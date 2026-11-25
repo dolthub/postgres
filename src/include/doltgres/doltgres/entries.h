@@ -37,6 +37,14 @@
 #include "doltgres/txn/status.h"
 #include "doltgres/txn/values.h"
 
+/*
+ * DOLTGRES_DROPPED_MARK is the file tblspc_redo leaves in a dropped
+ * tablespace's directory of repositories when its replay couldn't empty it,
+ * the collector's sweep's one sign to, since the worker connects to no
+ * database and pg_tablespace isn't nailed (bugs row 99).
+ */
+#define DOLTGRES_DROPPED_MARK "dropped"
+
 /* doltgres_TupleUsizeAddressU64_t is a (usize, Address, u64): a value's field, its blob's root, and its length. */
 typedef struct doltgres_TupleUsizeAddressU64_t
 {
@@ -57,6 +65,8 @@ extern bool doltgres_entries_doltgres_rmgr_desc(const PgCaps *caps, PgDesc *buf,
 												PgPgError *error);
 extern bool doltgres_entries_doltgres_rmgr_identify(const PgCaps *caps, uint8 info, const char **result,
 													PgPgError *error);
+extern bool doltgres_entries_doltgres_rmgr2_identify(const PgCaps *caps, uint8 info, const char **result,
+													 PgPgError *error);
 extern bool doltgres_entries_doltgres_shared_exit(const PgCaps *caps, int32 code, PgDatum arg, PgPgError *error);
 extern bool doltgres_entries_doltgres_cache_release(const PgCleanup *caps, uint64 res, PgPgError *error);
 extern bool doltgres_entries_doltgres_owned_release(const PgCleanup *caps, uint64 res, PgPgError *error);
@@ -292,10 +302,29 @@ extern bool doltgres_entries_doltgres_index_blocks(const PgCatalogCaps *caps, co
 												   uint32 *blocks, bool *result, PgPgError *error);
 extern bool doltgres_entries_doltgres_relation_size_added(const PgCatalogCaps *caps, const PgRel *rel,
 														  const PgText *forkName, int64 size, int64 *result, PgPgError *error);
+extern bool doltgres_entries_doltgres_visibility_counted(const PgCatalogCaps *caps, const PgRel *rel, uint32 *all_visible,
+														 uint32 *all_frozen, bool *result, PgPgError *error);
+extern bool doltgres_entries_doltgres_heap_only_refused(const PgCatalogCaps *caps, const PgRel *rel, bool *result,
+														PgPgError *error);
+extern bool doltgres_entries_doltgres_visibility_kept(const PgCatalogCaps *caps, const PgRel *rel, bool *result,
+													  PgPgError *error);
+extern bool doltgres_entries_doltgres_visibility_bits(const PgCatalogCaps *caps, const PgRel *rel, uint32 blkno,
+													  int32 mapbits, int32 *result, PgPgError *error);
+extern bool doltgres_entries_doltgres_index_scan_io(const PgCatalogCaps *caps, uint32 indexoid, bool indexonly,
+													float8 tuples_fetched, float8 selectivity, float8 loop_count,
+													float8 random_page_cost, float8 seq_page_cost,
+													float8 cpu_operator_cost, float8 *max_io, float8 *min_io,
+													float8 *rand_heap_pages, PgPgError *error);
+extern bool doltgres_entries_doltgres_bitmap_page_cost(const PgCatalogCaps *caps, uint32 relid, float8 tuples_fetched,
+													   float8 pages_fetched, uint32 pages, float8 maxentries,
+													   float8 random_page_cost, float8 cpu_operator_cost,
+													   float8 *cost_per_page, PgPgError *error);
 extern bool doltgres_entries_doltgres_database_size(const PgCaps *caps, uint32 dbOid, int64 size, int64 *result,
 													PgPgError *error);
 extern bool doltgres_entries_doltgres_tablespace_size(const PgCaps *caps, uint32 tblspcOid, int64 size, int64 *result,
 													  PgPgError *error);
+extern bool doltgres_entries_doltgres_tablespace_emptied(const PgCaps *caps, uint32 tablespaceoid, bool redo,
+														 PgPgError *error);
 extern bool doltgres_entries_doltgres_altering(const PgCatalogCaps *caps, const PgRel *relation, const PgAlterCmd *cmd,
 											   int32 rewrite, PgPgError *error);
 extern bool doltgres_entries_doltgres_column_dropped(const PgCatalogCaps *caps, uint32 relid, int32 attnum,
@@ -414,10 +443,19 @@ extern bool doltgres_entries_keeping(const PgCatalogCaps *caps, HostIoIo *io, co
 									 const PgSlot *new_, const size_t *key_columns, size_t key_columns_len,
 									 bool *has_result, DoltgresEntriesKeeping *result, PgPgError *error);
 extern TreesStoreTree doltgres_entries_chunk_tree(const uint8 address[32]);
+extern bool doltgres_entries_cut(HostIoIo *io, TreesStoreNodeStore store, AccessHeaptuplePlacing *placing, StdVec *result,
+								 PgPgError *error);
 extern bool doltgres_entries_placed(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading, const PgRel *rel,
 									AccessHeaptuplePlacing *placing, StdVec *result, PgPgError *error);
 extern bool doltgres_entries_rows(const PgCatalogCaps *caps, const PgRel *relation, const PgSnapshot *snapshot,
 								  const HostSnapshot *read, DoltgresEntriesBy by, StdVec *result, PgPgError *error);
+extern bool doltgres_entries_kept_rows(const PgCatalogCaps *caps, const PgRel *relation, const PgSnapshot *snapshot,
+									   const HostSnapshot *read, DoltgresEntriesBy by, DgOwned *kept, StdVec *result,
+									   PgPgError *error);
+extern bool doltgres_entries_kept_end(const PgCaps *caps, DgOwned kept, PgPgError *error);
+extern bool doltgres_entries_rows_kept(const PgCatalogCaps *caps, const PgRel *relation, const PgSnapshot *snapshot,
+									   const HostSnapshot *read, DoltgresEntriesBy by, DoltgresScanKept *kept,
+									   StdVec *result, PgPgError *error);
 extern TxnStatePersistence doltgres_entries_persistence(const PgRel *relation);
 extern bool doltgres_entries_counted(const PgCatalogCaps *caps, HostIoIo *io, const RepoRepo *repo,
 									 const HostSharedReader *reading, const PgRel *rel, const PgRel *table, bool index,
@@ -437,15 +475,16 @@ extern bool doltgres_entries_serial(const PgCatalogCaps *caps, HostIoIo *io, con
 extern void doltgres_entries_found_running(const PgSnapshot *snapshot, const HostSnapshot *read,
 										   const DoltgresScanRow *row);
 extern bool doltgres_entries_fetched(const PgCatalogCaps *caps, const PgRel *relation, uint64 tuple_id,
-									 const PgSnapshot *snapshot, bool *has_result, DoltgresScanRow *result,
+									 const PgSnapshot *snapshot,
+									 DgOwned *kept, bool *has_result, DoltgresScanRow *result,
 									 PgPgError *error);
 extern bool doltgres_entries_relocked(const PgCatalogCaps *caps, const PgRel *relation, const PgSnapshot *snapshot,
 									  uint64 tuple_id, PgPgError *error);
 extern void doltgres_entries_Repo_drop(void *repo);
 extern void doltgres_entries_Row_drop(void *row);
 extern PgPgError doltgres_entries_unsnapshotted(void);
-extern bool doltgres_entries_folded_now(const PgCatalogCaps *caps, const PgRel *target, const PgRel *heap, bool *result,
-										PgPgError *error);
+extern bool doltgres_entries_folded_now(const PgCatalogCaps *caps, const PgRel *target, const PgRel *heap,
+										bool rolled_back, bool *result, PgPgError *error);
 #endif
 
 #ifdef USE_INJECTION_POINTS

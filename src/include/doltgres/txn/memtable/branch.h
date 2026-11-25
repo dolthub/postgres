@@ -71,10 +71,24 @@ typedef TxnMemtableTablePreparedState TxnMemtableTablePreparedBranchDeltas;
 #define TXN_MEMTABLE_BRANCH_DELTAS_LOCK_INDEX 0
 #define TXN_MEMTABLE_BRANCH_CHUNK_SPILLS_WRITING_INDEX 1
 
+/* The delta's long lock IdentitySpillsWriting, the writers' lock of its identity spills' manifest (bugs row 291). */
+#define TXN_MEMTABLE_BRANCH_IDENTITY_SPILLS_WRITING_INDEX 2
+
 /* The delta's atomics of its chunk spills' manifest: ChunkSpills, ChunkSpillsPending, and ChunkSpillsChanged. */
 #define TXN_MEMTABLE_BRANCH_CHUNK_SPILLS_INDEX 3
 #define TXN_MEMTABLE_BRANCH_CHUNK_SPILLS_PENDING_INDEX 4
 #define TXN_MEMTABLE_BRANCH_CHUNK_SPILLS_CHANGED_INDEX 5
+
+/* TXN_MEMTABLE_BRANCH_CHUNK_SPILLS_TAKEN_INDEX is ChunkSpillsTaken's atomic: the take generation of the delta's chunk spills. */
+#define TXN_MEMTABLE_BRANCH_CHUNK_SPILLS_TAKEN_INDEX 7
+
+/* The delta's atomics of its identity spills' manifest: IdentitySpills, IdentitySpillsPending, and IdentitySpillsChanged. */
+#define TXN_MEMTABLE_BRANCH_IDENTITY_SPILLS_INDEX 8
+#define TXN_MEMTABLE_BRANCH_IDENTITY_SPILLS_PENDING_INDEX 9
+#define TXN_MEMTABLE_BRANCH_IDENTITY_SPILLS_CHANGED_INDEX 10
+
+/* TXN_MEMTABLE_BRANCH_IDENTITY_SPILLS_TAKEN_INDEX is IdentitySpillsTaken's atomic: the take generation of the delta's identity spills. */
+#define TXN_MEMTABLE_BRANCH_IDENTITY_SPILLS_TAKEN_INDEX 11
 
 /* TXN_MEMTABLE_BRANCH_IDENTITY_TREE_OPS is Identity's Tree: the memtable of a working state's identity tree. */
 extern const TxnMemtableTableTreeOps TXN_MEMTABLE_BRANCH_IDENTITY_TREE_OPS;
@@ -87,6 +101,9 @@ extern const TxnMemtableTableTreeOps TXN_MEMTABLE_BRANCH_CHUNKS_TREE_OPS;
 
 /* TXN_MEMTABLE_BRANCH_CHUNK_WORD_INDEX is ChunkWord's atomic: the word naming a working state's chunks' memtable. */
 #define TXN_MEMTABLE_BRANCH_CHUNK_WORD_INDEX 1
+
+/* TXN_MEMTABLE_BRANCH_IDENTITY_WORD is IdentityWord's atomic: the word naming a working state's identity memtable. */
+#define TXN_MEMTABLE_BRANCH_IDENTITY_WORD 2
 
 extern void txn_memtable_branch_node_key(const uint8 *address, uint32 tablespace, uint32 relation, uint64 point,
 										 uint8 *result);
@@ -125,6 +142,8 @@ extern bool txn_memtable_branch_identity_versions(HostIoIo *io, const HostDeltaH
 												  const uint8 *key, size_t key_len, StdVec *result, HostError *error);
 extern bool txn_memtable_branch_first_piece(const uint8 *key, size_t key_len, uint8 *result);
 extern uint32 txn_memtable_branch_own(HostSharedRecord record);
+extern bool txn_memtable_branch_rehomed(HostIoIo *io, uint32 repository, uint32 from, uint32 to,
+										HostError *error);
 extern bool txn_memtable_branch_repository(HostSharedRecord record, uint32 *result);
 extern bool txn_memtable_branch_filled(HostIoIo *io, StdVec *result, HostError *error);
 extern bool txn_memtable_branch_prepare(HostIoIo *io, HostSharedRecord deltas, const uint8 *key, size_t key_len,

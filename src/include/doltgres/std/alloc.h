@@ -45,7 +45,11 @@ typedef struct StdAllocErrorHook
 
 #ifndef FRONTEND
 extern void std_heap_make(void);
+extern uint64 std_heap_reads_bytes(void);
 #endif
+extern void *std_heap_current(void);
+extern void *std_heap_reads_entered(void);
+extern void std_heap_left(void *previous);
 extern void *std_System_GlobalAlloc_alloc(size_t size, size_t align);
 extern void *std_System_GlobalAlloc_alloc_zeroed(size_t size, size_t align);
 extern void *std_System_GlobalAlloc_realloc(void *ptr, size_t old_size, size_t align, size_t new_size);

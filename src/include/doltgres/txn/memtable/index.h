@@ -42,6 +42,12 @@
 /* TXN_MEMTABLE_INDEX_NODE is NODE, the most words a node takes: its head, its place word, and a link at each level. */
 #define TXN_MEMTABLE_INDEX_NODE (2 + TXN_MEMTABLE_INDEX_HEIGHT)
 
+/* TXN_MEMTABLE_INDEX_WORDS is WORDS, the count of a node's words before its links: its head and its place word. */
+#define TXN_MEMTABLE_INDEX_WORDS UINT64CONST(2)
+
+/* TXN_MEMTABLE_INDEX_LEAST_WORDS is the words of txn_memtable_index_least's page, which holds a full-height node alone. */
+#define TXN_MEMTABLE_INDEX_LEAST_WORDS (1 + TXN_MEMTABLE_INDEX_WORDS + TXN_MEMTABLE_INDEX_HEIGHT)
+
 /*
  * TxnMemtableIndexClosesOps is the Closes trait: a shape whose records close,
  * the lock of its first list, which opens a record for changes, and its
@@ -217,6 +223,7 @@ extern void test_txn_memtable_index_tests_every_level_links_the_nodes_that_reach
 extern void test_txn_memtable_index_tests_a_page_counts_the_words_its_versions_and_nodes_take(void);
 extern void test_txn_memtable_index_tests_a_closed_record_takes_no_change(void);
 extern void test_txn_memtable_index_tests_a_seek_past_the_last_key_leaves_its_node_as_it_was(void);
+extern void test_txn_memtable_index_tests_a_walks_cursor_reads_each_leaf_it_moves_to(void);
 #endif
 
 #endif							/* DOLTGRES_TXN_MEMTABLE_INDEX_H */

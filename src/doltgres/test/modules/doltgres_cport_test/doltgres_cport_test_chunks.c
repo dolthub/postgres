@@ -33,6 +33,7 @@
 #include "doltgres/chunks/pack.h"
 #include "doltgres/chunks/packs.h"
 #include "doltgres/chunks/packs/backend.h"
+#include "doltgres/chunks/packs/writers.h"
 #include "doltgres/chunks/packs/check.h"
 #include "doltgres/chunks/packs/dropped.h"
 #include "doltgres/chunks/packs/generation.h"
@@ -70,6 +71,10 @@ static const CportTest CPORT_TESTS[] = {
 	{"cport::chunks::hash::tests::a_failed_into_iter_drops_every_member", test_chunks_hash_tests_a_failed_into_iter_drops_every_member},
 	{"cport::chunks::pack::tests::a_record_with_no_dictionary_leaves_its_slot_as_it_was",
 	test_chunks_pack_tests_a_record_with_no_dictionary_leaves_its_slot_as_it_was},
+	{"cport::chunks::packs::backend::tests::a_failed_allocation_in_a_packs_over_keeps_the_process_list",
+	test_chunks_packs_backend_tests_a_failed_allocation_in_a_packs_over_keeps_the_process_list},
+	{"cport::chunks::packs::writers::tests::a_failed_allocation_in_a_writers_number_keeps_the_open_numbers",
+	test_chunks_packs_writers_tests_a_failed_allocation_in_a_writers_number_keeps_the_open_numbers},
 	{"dead::tests::a_damaged_vector_is_refused", test_chunks_dead_tests_a_damaged_vector_is_refused},
 	{"dead::tests::a_missing_vector_fails_its_read", test_chunks_dead_tests_a_missing_vector_fails_its_read},
 	{"dead::tests::a_vector_read_back_holds_the_offsets_written",
@@ -227,6 +232,8 @@ static const CportTest CPORT_TESTS[] = {
 	test_chunks_packs_lists_tests_a_pack_added_is_listed_by_every_view},
 	{"packs::lists::tests::a_refresh_across_a_whole_write_lists_the_packs_before_it_or_after_it",
 	test_chunks_packs_lists_tests_a_refresh_across_a_whole_write_lists_the_packs_before_it_or_after_it},
+	{"packs::lists::tests::a_removed_tablespace_reads_a_runs_file_made_again_from_its_start",
+	test_chunks_packs_lists_tests_a_removed_tablespace_reads_a_runs_file_made_again_from_its_start},
 	{"packs::lists::tests::a_retirements_records_lead_every_view_to_the_copies",
 	test_chunks_packs_lists_tests_a_retirements_records_lead_every_view_to_the_copies},
 	{"packs::lists::tests::a_whole_write_that_fails_before_its_renames_leaves_the_count_even",
@@ -408,6 +415,8 @@ static const CportTest CPORT_TESTS[] = {
 	{"trailer::tests::internal_nodes_store_their_subtrees_highest_tuple_ids",
 	test_chunks_trailer_tests_internal_nodes_store_their_subtrees_highest_tuple_ids},
 	{"trailer::tests::round_trips", test_chunks_trailer_tests_round_trips},
+	{"trailer::tests::stamp_of_finds_each_copys_stamp_among_its_runs",
+	test_chunks_trailer_tests_stamp_of_finds_each_copys_stamp_among_its_runs},
 	{"trailer::tests::the_same_stamps_store_the_same_bytes_however_they_were_pushed",
 	test_chunks_trailer_tests_the_same_stamps_store_the_same_bytes_however_they_were_pushed},
 	{"trailer::tests::xxh3_digests_are_the_committed_table",

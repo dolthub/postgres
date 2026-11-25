@@ -28,5 +28,15 @@
 extern bool txn_outcome_outcome(HostIoIo *io, TxnMemtableVersionVersion *version, HostStatus *result,
 								HostError *error);
 extern bool txn_outcome_stamped(HostIoIo *io, uint64 xid, HostStatus *result, HostError *error);
+extern bool txn_outcome_entry(HostIoIo *io, HostXid sub, HostStatus *result, HostError *error);
+extern void txn_outcome_recording(uint64 point, bool rolled_back);
+extern void txn_outcome_decided(uint64 point, const StdVec *aborted, const StdVec *killed);
+extern bool txn_outcome_aborting(void);
+extern void txn_outcome_settled(StdVec *aborted, StdVec *killed);
+extern void txn_outcome_shut(void);
+
+#ifdef DOLTGRES_TEST_TXN
+extern void test_txn_outcome_tests_a_writers_outcome_answers_frozen_with_no_door_and_caches_an_ended_writers(void);
+#endif
 
 #endif							/* DOLTGRES_TXN_OUTCOME_H */

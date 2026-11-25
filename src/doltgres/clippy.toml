@@ -1,0 +1,126 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# clippy's doors for the workspace (design items 11 and 17), each allowed only where a reviewed exemption says: the
+# fork starts no threads or processes, keeps no thread-local state, waits only through Postgres, prints nothing,
+# opens no sockets, reaches files only through the file door over Postgres' fd.c, drops no obligation unrun, and uses
+# no hash map or set, whose order could reach a stored byte, a WAL record, or a result.
+
+disallowed-methods = [
+    { path = "std::thread::spawn", reason = "a backend is one thread: the fork starts none" },
+    { path = "std::thread::Builder::spawn", reason = "a backend is one thread: the fork starts none" },
+    { path = "std::thread::Builder::spawn_scoped", reason = "a backend is one thread: the fork starts none" },
+    { path = "std::thread::scope", reason = "a backend is one thread: the fork starts none" },
+    { path = "std::thread::sleep", reason = "waits go through Postgres, which handles interrupts" },
+    { path = "std::time::Instant::now", reason = "the clock is a host seam: call host's door (design item 14)" },
+    { path = "std::time::SystemTime::now", reason = "the clock is a host seam: call host's door (design item 14)" },
+    { path = "std::time::Instant::elapsed", reason = "reads the clock: subtract from host's instant door (design item 14)" },
+    { path = "std::time::SystemTime::elapsed", reason = "reads the clock: subtract from host's now door (design item 14)" },
+    { path = "std::process::id", reason = "the process id is a host seam: call host's door (design item 14)" },
+    { path = "std::sync::mpsc::Receiver::recv", reason = "waits go through Postgres, which handles interrupts" },
+    { path = "std::sync::mpsc::Receiver::recv_timeout", reason = "waits go through Postgres, which handles interrupts" },
+    { path = "std::sync::mpsc::Receiver::iter", reason = "waits go through Postgres, which handles interrupts" },
+    { path = "std::env::set_current_dir", reason = "Postgres owns the working directory" },
+    { path = "std::io::stdout", reason = "the fork reports through Postgres' log" },
+    { path = "std::io::stderr", reason = "the fork reports through Postgres' log" },
+    { path = "std::mem::forget", reason = "an obligation is discharged, never dropped unrun" },
+    { path = "std::mem::MaybeUninit::new", reason = "an obligation is discharged, never dropped unrun" },
+    { path = "std::boxed::Box::into_raw", reason = "an obligation is discharged, never dropped unrun" },
+    { path = "std::boxed::Box::leak", reason = "an obligation is discharged, never dropped unrun" },
+    { path = "std::rc::Rc::into_raw", reason = "an obligation is discharged, never dropped unrun" },
+    { path = "std::sync::Arc::into_raw", reason = "an obligation is discharged, never dropped unrun" },
+    { path = "std::vec::Vec::leak", reason = "an obligation is discharged, never dropped unrun" },
+    { path = "std::string::String::leak", reason = "an obligation is discharged, never dropped unrun" },
+    { path = "std::process::abort", reason = "an obligation is discharged, never dropped unrun" },
+    { path = "std::process::exit", reason = "an obligation is discharged, never dropped unrun" },
+    { path = "std::fs::read", reason = "files go through the file door over fd.c" },
+    { path = "std::fs::read_to_string", reason = "files go through the file door over fd.c" },
+    { path = "std::fs::write", reason = "files go through the file door over fd.c" },
+    { path = "std::fs::copy", reason = "files go through the file door over fd.c" },
+    { path = "std::fs::rename", reason = "files go through the file door over fd.c" },
+    { path = "std::fs::hard_link", reason = "files go through the file door over fd.c" },
+    { path = "std::fs::soft_link", reason = "files go through the file door over fd.c" },
+    { path = "std::fs::remove_file", reason = "files go through the file door over fd.c" },
+    { path = "std::fs::remove_dir", reason = "files go through the file door over fd.c" },
+    { path = "std::fs::remove_dir_all", reason = "files go through the file door over fd.c" },
+    { path = "std::fs::create_dir", reason = "files go through the file door over fd.c" },
+    { path = "std::fs::create_dir_all", reason = "files go through the file door over fd.c" },
+    { path = "std::fs::read_dir", reason = "files go through the file door over fd.c" },
+    { path = "std::fs::read_link", reason = "files go through the file door over fd.c" },
+    { path = "std::fs::metadata", reason = "files go through the file door over fd.c" },
+    { path = "std::fs::symlink_metadata", reason = "files go through the file door over fd.c" },
+    { path = "std::fs::canonicalize", reason = "files go through the file door over fd.c" },
+    { path = "std::fs::exists", reason = "files go through the file door over fd.c" },
+    { path = "std::fs::set_permissions", reason = "files go through the file door over fd.c" },
+    { path = "std::path::Path::exists", reason = "files go through the file door over fd.c" },
+    { path = "std::path::Path::try_exists", reason = "files go through the file door over fd.c" },
+    { path = "std::path::Path::is_file", reason = "files go through the file door over fd.c" },
+    { path = "std::path::Path::is_dir", reason = "files go through the file door over fd.c" },
+    { path = "std::path::Path::is_symlink", reason = "files go through the file door over fd.c" },
+    { path = "std::path::Path::metadata", reason = "files go through the file door over fd.c" },
+    { path = "std::path::Path::symlink_metadata", reason = "files go through the file door over fd.c" },
+    { path = "std::path::Path::canonicalize", reason = "files go through the file door over fd.c" },
+    { path = "std::path::Path::read_dir", reason = "files go through the file door over fd.c" },
+    { path = "std::path::Path::read_link", reason = "files go through the file door over fd.c" },
+    { path = "std::os::unix::fs::symlink", reason = "files go through the file door over fd.c", allow-invalid = true },
+    { path = "std::os::windows::fs::symlink_file", reason = "files go through the file door over fd.c", allow-invalid = true },
+    { path = "std::os::windows::fs::symlink_dir", reason = "files go through the file door over fd.c", allow-invalid = true },
+    { path = "shmem::cache::Cache::unpin", reason = "a shared pin count is lowered only through the backend's pin table (design item 14)", allow-invalid = true },
+    { path = "chunks::file::tail", reason = "a file's torn tail is made only by its owner, in its open or its whole rewrite, which holds that one tail for the file's life, so that no second tail goes stale under the owner's appends" },
+    { path = "chunks::file::write_appended", reason = "a file's torn tail is made only by its owner, in its open or its whole rewrite, which holds that one tail for the file's life, so that no second tail goes stale under the owner's appends" },
+    { path = "chunks::file::replace_records", reason = "a file's torn tail is made only by its owner, in its open or its whole rewrite, which holds that one tail for the file's life, so that no second tail goes stale under the owner's appends" },
+    { path = "trees::Tree::decoded", reason = "a Tree comes only from stored bytes: decode it there, or publish what a writer wrote" },
+    { path = "trees::TreeRef::written", reason = "a TreeRef comes only from a node store's write" },
+    { path = "trees::Published::decoded", reason = "a Published comes only from a branded writer's publish or an entry point's decoder" },
+    { path = "trees::Published::child", reason = "a Published names a child only in the decoders of records read through it" },
+    { path = "trees::Published::base", reason = "a published name becomes a Tree only at the doors that install a tree's base" },
+    { path = "host::remove_leftover", reason = "it reports a removal that didn't happen and returns, so it is only for a file whose name startup's cleanup also removes: an unfinished pack's file (design item 17)", allow-invalid = true },
+    { path = "host::rename_back", reason = "it reports a rename that didn't happen and returns, so it is only for names that read right with the rename not taken back: a kept file's generations (design item 17)", allow-invalid = true },
+    { path = "host::remove_tree", reason = "it reports what it couldn't remove and returns, and makes nothing durable, so it is only for a directory nothing reads again: a dropped repository's (design item 6)", allow-invalid = true },
+    { path = "host::pause", reason = "a pause is written `host::pause!(at, c\"...\")`, whose name is a literal, so the text of every pause shows the name the gates read (design item 14)", allow-invalid = true },
+    { path = "pg::btree_compare", reason = "it runs user code: call host's door `host::btree_compare`, which no lock of the fork's is held across (design item 13)", allow-invalid = true },
+]
+
+disallowed-types = [
+    { path = "std::fs::File", reason = "files go through the file door over fd.c" },
+    { path = "std::fs::OpenOptions", reason = "files go through the file door over fd.c" },
+    { path = "std::fs::DirBuilder", reason = "files go through the file door over fd.c" },
+    { path = "std::mem::ManuallyDrop", reason = "an obligation is discharged, never dropped unrun" },
+    { path = "std::process::Command", reason = "the fork starts no processes" },
+    { path = "std::sync::Condvar", reason = "waits go through Postgres, which handles interrupts" },
+    { path = "std::sync::Barrier", reason = "waits go through Postgres, which handles interrupts" },
+    { path = "std::net::TcpListener", reason = "the fork opens no sockets" },
+    { path = "std::net::TcpStream", reason = "the fork opens no sockets" },
+    { path = "std::net::UdpSocket", reason = "the fork opens no sockets" },
+    { path = "std::collections::HashMap", reason = "a hash map's order could reach a stored byte, a WAL record, or a result" },
+    { path = "std::collections::HashSet", reason = "a hash set's order could reach a stored byte, a WAL record, or a result" },
+    { path = "hashbrown::HashMap", reason = "a hash map's order could reach a stored byte, a WAL record, or a result", allow-invalid = true },
+    { path = "hashbrown::HashSet", reason = "a hash set's order could reach a stored byte, a WAL record, or a result", allow-invalid = true },
+    { path = "indexmap::IndexMap", reason = "a hash map's order could reach a stored byte, a WAL record, or a result", allow-invalid = true },
+    { path = "indexmap::IndexSet", reason = "a hash set's order could reach a stored byte, a WAL record, or a result", allow-invalid = true },
+    { path = "elsa::vec::FrozenVec", reason = "an elsa type the audit refuses" },
+    { path = "elsa::sync::FrozenMap", reason = "an elsa type the audit refuses" },
+    { path = "elsa::sync::FrozenVec", reason = "an elsa type the audit refuses" },
+    { path = "elsa::sync::FrozenBTreeMap", reason = "an elsa type the audit refuses" },
+    { path = "elsa::sync::LockFreeFrozenVec", reason = "an elsa type the audit refuses" },
+]
+
+disallowed-macros = [
+    { path = "std::thread_local", reason = "backend-local state lives in a static Mutex (design item 17)" },
+    { path = "std::print", reason = "the fork reports through Postgres' log" },
+    { path = "std::println", reason = "the fork reports through Postgres' log" },
+    { path = "std::eprint", reason = "the fork reports through Postgres' log" },
+    { path = "std::eprintln", reason = "the fork reports through Postgres' log" },
+    { path = "std::dbg", reason = "the fork reports through Postgres' log" },
+]

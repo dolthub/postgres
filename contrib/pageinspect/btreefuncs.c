@@ -33,6 +33,7 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_type.h"
+#include "doltgres/hooks.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pageinspect.h"
@@ -225,7 +226,7 @@ check_relation_block_range(Relation rel, int64 blkno)
 static void
 bt_index_block_validate(Relation rel, int64 blkno)
 {
-	if (!IS_INDEX(rel) || !IS_BTREE(rel))
+	if (!IS_INDEX(rel) || !IS_BTREE(rel) || doltgres_heap_only_refused(rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not a %s index",
@@ -858,7 +859,7 @@ bt_metap(PG_FUNCTION_ARGS)
 	relrv = makeRangeVarFromNameList(textToQualifiedNameList(relname));
 	rel = relation_openrv(relrv, AccessShareLock);
 
-	if (!IS_INDEX(rel) || !IS_BTREE(rel))
+	if (!IS_INDEX(rel) || !IS_BTREE(rel) || doltgres_heap_only_refused(rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not a %s index",

@@ -1032,6 +1032,25 @@ host_delta_retire(HostIoIo *io, const HostDeltaLeaving *records, size_t records_
 }
 
 /*
+ * host_delta_packing orders the delta's partly used blocks for a packing and
+ * returns the live pages of the shapes given, the ones its caller moves, to
+ * move out of the blocks it drains, each with its owner's shape and location
+ * and its size (bugs row 143), refusing out of memory when it can't reserve
+ * its lists.
+ */
+bool
+host_delta_packing(const uint64 *shapes, size_t shapes_len, StdVec *result, HostError *error)
+{
+	HostHost	host = host_current();
+
+	std_vec_new(result, sizeof(HostDeltaDirectoryPacked), _Alignof(HostDeltaDirectoryPacked));
+	if (host.ops->delta_packing(host.self, shapes, shapes_len, result))
+		return true;
+	*error = host_Error_out_of_memory();
+	return false;
+}
+
+/*
  * host_delta_advanced advances the epoch and returns the epoch it passed,
  * which every reader and hold begun before the call started at or below and
  * every one begun after it started above, and the oldest one a live reader

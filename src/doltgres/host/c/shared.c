@@ -103,14 +103,17 @@ HostSharedKind
 host_shared_Kind_pool(const HostSharedPoolOps *s)
 {
 	HostSharedForm form = {HOST_SHARED_FORM_POOL, {.pool = s->count}};
+	HostSharedKind kind = host_shared_Kind_of(&s->shape, form);
 
-	return host_shared_Kind_of(&s->shape, form);
+	kind.index = s->index;
+	return kind;
 }
 
 /*
  * host_shared_Kind_aged returns the line of a pool the delta's epochs free,
- * whose records hold one atomic past their shape's, the host's, for the
- * epoch of their retirement.
+ * whose records hold two atomics past their shape's, the host's: the epoch of
+ * their retirement, and their link in their kind's retired list (bugs row
+ * 309).
  */
 HostSharedKind
 host_shared_Kind_aged(const HostSharedAgedOps *s)
@@ -122,7 +125,7 @@ host_shared_Kind_aged(const HostSharedAgedOps *s)
 	form.u.aged.names = s->names;
 	form.u.aged.names_len = s->names_len;
 	kind = host_shared_Kind_of(&s->shape, form);
-	kind.atomics = STD_ADD(usize, kind.atomics, 1, 221, 9);
+	kind.atomics = STD_ADD(usize, kind.atomics, 2, 221, 9);
 	return kind;
 }
 
@@ -743,6 +746,58 @@ host_shared_sweep(HostSharedWithin within, const HostSharedPoolOps *s, size_t a,
 }
 
 /*
+ * host_shared_index_find answers the location its pool's index holds for a
+ * key, as many bytes as the pool's index takes, or nothing when it holds
+ * none (bugs row 405). The index holds what its pool's crate puts and
+ * removes, so the crate opens the location and checks the record it reaches.
+ */
+bool
+host_shared_index_find(HostSharedWithin within, const HostSharedPoolOps *s, const uint8 *key, bool *has,
+					   uint64 *location, HostError *error)
+{
+	HostHost	host = host_current();
+	HostMayRaise raise = host_MayRaise_of(within.ops->raises.raise(within.self));
+	HostSharedKind kind = host_shared_Kind_pool(s);
+
+	return host.ops->shared_index_find(host.self, &raise, &kind, key, has, location, error);
+}
+
+/* host_shared_index_put sets the location its pool's index holds for a key (bugs row 405). */
+bool
+host_shared_index_put(HostSharedWithin within, const HostSharedPoolOps *s, const uint8 *key, uint64 location,
+					  HostError *error)
+{
+	HostHost	host = host_current();
+	HostMayRaise raise = host_MayRaise_of(within.ops->raises.raise(within.self));
+	HostSharedKind kind = host_shared_Kind_pool(s);
+
+	return host.ops->shared_index_put(host.self, &raise, &kind, key, location, error);
+}
+
+/* host_shared_index_remove takes a key out of its pool's index when the index holds that location for it (bugs row 405). */
+bool
+host_shared_index_remove(HostSharedWithin within, const HostSharedPoolOps *s, const uint8 *key, uint64 location,
+						 HostError *error)
+{
+	HostHost	host = host_current();
+	HostMayRaise raise = host_MayRaise_of(within.ops->raises.raise(within.self));
+	HostSharedKind kind = host_shared_Kind_pool(s);
+
+	return host.ops->shared_index_remove(host.self, &raise, &kind, key, location, error);
+}
+
+/*
+ * host_shared_Owned_location returns the location an owned record's publish
+ * will answer, since a publish changes its slot's state and not its
+ * generation (bugs row 405).
+ */
+uint64
+host_shared_Owned_location(const HostSharedOwned *self)
+{
+	return self->host.ops->shared_location(self->host.self, self->place);
+}
+
+/*
  * host_shared_gone reports whether the record a location named no longer has
  * its slot: the slot's generation has moved on, or the slot is spent. It
  * takes no handle, any process may ask at any time, true is final, and a
@@ -885,6 +940,33 @@ host_shared_Record_flag(HostSharedRecord self, HostIoTakesShort io, size_t f,
 	*result = (HostSharedFlagGuard)
 	{
 		taker, self.place, f, held, raise
+	};
+	return true;
+}
+
+/*
+ * host_shared_Record_try_flag sets a flag when no process holds it, answering
+ * whether it did with the guard only when it did, and refuses one its own
+ * process holds.
+ */
+bool
+host_shared_Record_try_flag(HostSharedRecord self, HostIoTakesShort io, size_t f, bool *taken,
+							HostSharedFlagGuard *result, HostError *error)
+{
+	HostIoHeld *held;
+	StdAny		raise;
+	HostHost	host;
+	HostMayRaise may_raise;
+
+	io.ops->io_doors.read_doors.sealed.parts(io.self, &held, &raise);
+	host = host_current();
+	may_raise = host_MayRaise_of(raise);
+	if (!host.ops->flag_try(host.self, &may_raise, self.place, f, taken, error))
+		return false;
+	if (*taken)
+		*result = (HostSharedFlagGuard)
+	{
+		host, self.place, f, held, raise
 	};
 	return true;
 }

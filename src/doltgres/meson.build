@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The fork's Rust workspace (design items 11 and 18), from which cargo.pl builds the frontend program's library and
-# simc; the backend's postgres executable links the C port (doltgres_c and doltgres_cport).
+# The fork's Rust workspace (design items 11 and 18), from which cargo.pl builds simc; the backend's postgres
+# executable links the C port (doltgres_c and doltgres_cport).
 
 # A tree holds the Rust workspace when it holds Cargo.toml; one without it, the C port's form, builds the C
 # libraries, the server, and the C tests' modules.
@@ -22,12 +22,6 @@ doltgres_c_sources = files('doltgres/disk_space.c', 'doltgres/in_progress.c', 'd
   'doltgres/locale_ctype.c')
 if doltgres_rust
   doltgres_cargo = files('cargo.pl')
-
-  # The sanitizers the build uses, which meson gives as a string before 1.8 and as an array since.
-  doltgres_sanitize = get_option('b_sanitize')
-  if meson.version().version_compare('>=1.8')
-    doltgres_sanitize = ','.join(doltgres_sanitize)
-  endif
 
   # The folders Postgres' own C includes its headers from, each in the build tree and then the source tree as meson
   # searches them, and the vendored zstd's, which pg's build script reads Postgres' headers from.
@@ -39,12 +33,11 @@ if doltgres_rust
     doltgres_includes += subproject('zstd').get_variable('zstd_folder')
   endif
 
-  # The environment of cargo.pl's builds: where Postgres' headers and the vendored zstd are, the build's sanitizers,
-  # and the libclang bindgen uses.
+  # The environment of cargo.pl's builds: where Postgres' headers and the vendored zstd are, and the libclang bindgen
+  # uses.
   doltgres_env = {
     'DOLTGRES_INCLUDES': (host_system == 'windows' ? ';' : ':').join(doltgres_includes),
     'DOLTGRES_LIBS': zstd.found() ? fs.parent(subproject('zstd').get_variable('zstd_lib').full_path()) : '',
-    'DOLTGRES_SANITIZE': doltgres_sanitize,
     'LIBCLANG_PATH': get_option('libclang'),
   }
 endif
@@ -60,7 +53,7 @@ else
 endif
 
 # The C port of the crates (the port text): std's forms and each ported crate's files, which the server links, as
-# the C tests' modules link their closures.
+# the C tests' modules link their closures. The server's library hides its symbols, so postgres exports none of them.
 doltgres_cport_std_sources = files('std/c/alloc.c', 'std/c/any.c', 'std/c/btree.c', 'std/c/c_str.c', 'std/c/env.c', 'std/c/float.c', 'std/c/flt2dec.c', 'std/c/fmt.c', 'std/c/foldhash.c',
   'std/c/frozen_map.c', 'std/c/hash.c', 'std/c/hashmap.c', 'std/c/io.c', 'std/c/iter.c', 'std/c/path.c', 'std/c/ptr.c', 'std/c/rc.c', 'std/c/slice.c', 'std/c/str.c', 'std/c/sort.c', 'std/c/sync.c', 'std/c/time.c',
   'std/c/unicode.c', 'std/c/unwind.c', 'std/c/vec.c', 'std/c/vec_deque.c')
@@ -90,10 +83,12 @@ doltgres_xxhash = subproject('xxhash').get_variable('xxhash_dep')
 # that raise what an entry returns, compiled with the backend's flags into the postgres executable, with the fork's
 # one file of Postgres' own C written again, the builtin provider's C.UTF-8 ctype methods (design item 12), the
 # read of the kept WAL, whose page callback Postgres calls (design item 6), and the check of whether a transaction is
-# in progress from any process, which reads the proc array under its lock (bugs row 89).
+# in progress from any process, which reads the proc array under its lock (bugs row 89). Its symbols are hidden, and
+# postgres exports only the entry thunks, which gen_binding.pl marks PGDLLEXPORT.
 doltgres_c = static_library('doltgres_c',
   doltgres_c_sources + [doltgres_cport_pg_binding[0], doltgres_cport_pg_binding[1], doltgres_cport_pg_binding[2]],
   dependencies: [backend_code],
+  gnu_symbol_visibility: 'hidden',
   kwargs: internal_lib_args,
 )
 
@@ -102,6 +97,7 @@ doltgres_cport = static_library('doltgres_cport',
   c_args: doltgres_cport_c_args + ['-DDOLTGRES_GLOBAL_ALLOCATOR'],
   include_directories: [doltgres_cport_pg_include, doltgres_cport_doltgres_include],
   dependencies: [doltgres_xxhash, backend_code, doltgres_blake3, zstd],
+  gnu_symbol_visibility: 'hidden',
   kwargs: internal_lib_args + {'build_by_default': true},
 )
 

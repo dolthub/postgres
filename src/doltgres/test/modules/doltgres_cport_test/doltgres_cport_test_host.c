@@ -36,6 +36,7 @@
 #include "doltgres/std/btree.h"
 #include "doltgres/std/fmt.h"
 #include "doltgres/std/hash.h"
+#include "doltgres/std/hashmap.h"
 #include "doltgres/std/sort.h"
 #include "doltgres/std/str.h"
 #include "doltgres/std/sync.h"
@@ -82,6 +83,10 @@ static const CportTest CPORT_TESTS[] = {
 	test_std_vec_tests_an_over_aligned_element_stays_aligned},
 	{"delta::blocks::tests::a_body_takes_the_smallest_class_that_holds_it",
 	test_host_delta_blocks_tests_a_body_takes_the_smallest_class_that_holds_it},
+	{"delta::directory::tests::a_free_pass_loads_only_the_retirements",
+	test_host_delta_directory_tests_a_free_pass_loads_only_the_retirements},
+	{"delta::directory::tests::a_refused_allocations_pass_loads_only_the_retirements",
+	test_host_delta_directory_tests_a_refused_allocations_pass_loads_only_the_retirements},
 	{"delta::directory::tests::a_size_fits_its_word",
 	test_host_delta_directory_tests_a_size_fits_its_word},
 	{"delta::directory::tests::a_words_index_is_below_its_pages_count",
@@ -146,6 +151,14 @@ static const CportTest CPORT_TESTS[] = {
 	test_host_tests_the_doors_answer_from_the_installed_host},
 	{"tests::the_process_keeps_one_backend_local_value",
 	test_host_tests_the_process_keeps_one_backend_local_value},
+	{"cport::std::hashmap::tests::a_maps_copies_move_only_their_values",
+	test_std_hashmap_tests_a_maps_copies_move_only_their_values},
+	{"cport::host::delta::blocks::tests::a_packing_drains_only_what_the_blocks_ahead_hold",
+	test_host_delta_blocks_tests_a_packing_drains_only_what_the_blocks_ahead_hold},
+	{"cport::host::delta::directory::tests::a_packing_skips_a_live_slot_with_no_body",
+	test_host_delta_directory_tests_a_packing_skips_a_live_slot_with_no_body},
+	{"cport::host::delta::directory::tests::a_packing_leaves_a_block_a_take_holds_unemptied",
+	test_host_delta_directory_tests_a_packing_leaves_a_block_a_take_holds_unemptied},
 };
 
 

@@ -50,7 +50,9 @@ extern size_t STD_COPY_NAME(std_ptr_offset_from_unsigned) (const void *self, con
 
 /*
  * std_ptr_copy_nonoverlapping is ptr::copy_nonoverlapping of count elements
- * of a size and alignment, its precondition checked at core's own location.
+ * of a size and alignment, its precondition checked at core's own location;
+ * a copy of no bytes calls no memcpy, since core lets its pointers be null
+ * and memcpy doesn't.
  */
 void
 STD_COPY_NAME(std_ptr_copy_nonoverlapping) (const void *src, void *dst, size_t count, size_t size, size_t align)
@@ -69,7 +71,8 @@ STD_COPY_NAME(std_ptr_copy_nonoverlapping) (const void *src, void *dst, size_t c
 		STD_PTR_VIOLATED("ptr::copy_nonoverlapping requires that both pointer arguments are aligned and non-null "
 						 "and the specified memory ranges do not overlap", PTR_FILE, 553, 5);
 #endif
-	memcpy(dst, src, count * size);
+	if (count * size > 0)
+		memcpy(dst, src, count * size);
 }
 
 /*

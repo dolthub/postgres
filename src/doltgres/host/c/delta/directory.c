@@ -56,6 +56,8 @@ static void host_delta_directory_held(HostDeltaDirectoryDirectory directory, uin
 static bool host_delta_directory_raise(HostDeltaDirectoryDirectory directory, uint64 stamp);
 static bool host_delta_directory_owns(HostDeltaDirectoryDirectory directory, uint32 slot,
 									  HostDeltaDirectoryOwner owner, HostError *error);
+static void host_delta_directory_freed_slot(HostDeltaDirectoryDirectory directory, uint32 slot, uint64 loaded,
+											uint64 oldest, bool *has_kept, uint64 *kept, bool *keep);
 
 /* host_delta_directory_internal returns the fork's internal error with a message. */
 static HostError
@@ -995,10 +997,46 @@ host_delta_directory_seal(HostDeltaDirectoryDirectory directory,
 }
 
 /*
+ * host_delta_directory_listed_record pushes an aged record its retirement
+ * just retired onto its kind's retired list, by a compare-and-swap of the
+ * list's head (bugs row 309).
+ */
+static void
+host_delta_directory_listed_record(HostDeltaDirectoryDirectory directory, uint32 kind, uint32 index)
+{
+	for (;;)
+	{
+		uint64		head = directory.ops->record_retired_head(directory.self, kind);
+
+		directory.ops->set_record_link(directory.self, kind, index, head);
+		if (directory.ops->record_retired_swap(directory.self, kind, head, (uint64) index + 1))
+			return;
+	}
+}
+
+/*
+ * host_delta_directory_listed pushes a slot its retirement just retired onto
+ * the retired list, by a compare-and-swap of the list's head (bugs row 309).
+ */
+static void
+host_delta_directory_listed(HostDeltaDirectoryDirectory directory, uint32 slot)
+{
+	for (;;)
+	{
+		uint64		head = directory.ops->retired_head(directory.self);
+
+		directory.ops->set_link(directory.self, slot, (uint32) head);
+		if (directory.ops->retired_swap(directory.self, head, (uint64) slot + 1))
+			return;
+	}
+}
+
+/*
  * host_delta_directory_retire retires one batch of records and names under
  * one take of the epoch lock: it stores the batch's one stamp and then the
  * retired state in each record that is still published at its location and
- * each page that is still live at its name, and then advances the epoch.
+ * each page that is still live at its name, pushing each onto its retired
+ * list, and then advances the epoch.
  */
 void
 host_delta_directory_retire(HostDeltaDirectoryDirectory directory,
@@ -1032,7 +1070,8 @@ host_delta_directory_retire(HostDeltaDirectoryDirectory directory,
 		{
 			directory.ops->set_stamp(directory.self, kind, index, stamp);
 			directory.ops->stop(directory.self, HOST_DELTA_DIRECTORY_POINT_STAMPING);
-			directory.ops->record_swap(directory.self, kind, index, loaded, retired);
+			if (directory.ops->record_swap(directory.self, kind, index, loaded, retired))
+				host_delta_directory_listed_record(directory, kind, index);
 		}
 	}
 	for (size_t i = 0; i < names_len; i++)
@@ -1055,7 +1094,8 @@ host_delta_directory_retire(HostDeltaDirectoryDirectory directory,
 		{
 			directory.ops->store(directory.self, slot, HOST_DELTA_DIRECTORY_FIELD_STAMP, stamp);
 			directory.ops->stop(directory.self, HOST_DELTA_DIRECTORY_POINT_STAMPING);
-			directory.ops->swap(directory.self, slot, loaded, retired);
+			if (directory.ops->swap(directory.self, slot, loaded, retired))
+				host_delta_directory_listed(directory, slot);
 		}
 	}
 	directory.ops->stop(directory.self, HOST_DELTA_DIRECTORY_POINT_STAMPED);
@@ -1065,12 +1105,55 @@ host_delta_directory_retire(HostDeltaDirectoryDirectory directory,
 }
 
 /*
- * host_delta_directory_pass is the free pass: with the oldest published epoch
- * loaded once, it walks every aged kind's records in the table's order and
- * then the page directory, and claims each retired record or slot whose stamp
- * that epoch has passed and frees it at its next generation, a page's body
- * given back to its block first, each of which counts as a free. A pass that
- * loses a claim does nothing with that record or slot. A pass that left no
+ * host_delta_directory_freed_slot frees a retired slot whose stamp the oldest
+ * epoch has passed, a page's body given back to its block first, counting the
+ * free, or else sets keep and lowers the lowest stamp kept; a slot not
+ * retired is neither. Its claim can't lose, since only a pass's claim takes a
+ * word out of retired and passes run one at a time.
+ */
+static void
+host_delta_directory_freed_slot(HostDeltaDirectoryDirectory directory, uint32 slot, uint64 loaded, uint64 oldest,
+								bool *has_kept, uint64 *kept, bool *keep)
+{
+	uint64		freeing;
+	uint64		stamp;
+	uint64		released;
+	bool		claimed PG_USED_FOR_ASSERTS_ONLY;
+
+	*keep = false;
+	if (!host_delta_page_reap(loaded, &freeing))
+		return;
+	stamp = directory.ops->load(directory.self, slot, HOST_DELTA_DIRECTORY_FIELD_STAMP);
+	if (!host_delta_page_passed(stamp, oldest))
+	{
+		*kept = *has_kept ? std_min_u64(*kept, stamp) : stamp;
+		*has_kept = true;
+		*keep = true;
+		return;
+	}
+	claimed = directory.ops->swap(directory.self, slot, loaded, freeing);
+	Assert(claimed);
+	directory.ops->stop(directory.self, HOST_DELTA_DIRECTORY_POINT_CLAIMED);
+	host_delta_blocks_give(directory, directory.ops->load(directory.self, slot, HOST_DELTA_DIRECTORY_FIELD_BODY));
+	directory.ops->store(directory.self, slot, HOST_DELTA_DIRECTORY_FIELD_BODY, 0);
+	host_delta_directory_freed(directory, slot, false);
+	released = host_delta_directory_emptied(directory, slot, freeing);
+	directory.ops->stop(directory.self, HOST_DELTA_DIRECTORY_POINT_HINTING);
+	host_delta_directory_hinted(directory, slot, released);
+	directory.ops->freed(directory.self);
+}
+
+/*
+ * host_delta_directory_pass is the free pass, one at a time under the pass's
+ * lock: with the oldest published epoch loaded once, it takes each aged
+ * kind's retired list whole, in the table's order, and then the slots', and
+ * claims each retired record or slot whose stamp that epoch has passed and
+ * frees it at its next generation, a page's body given back to its block
+ * first, each of which counts as a free, pushing the ones it keeps back onto
+ * their list as one chain, so its work is the retirements it finds and never
+ * the directory's or a pool's size (bugs row 309). Its claims can't lose,
+ * since only a pass's claim takes a word out of retired, the pool's doors
+ * refusing an aged kind, and passes run one at a time. A pass that left no
  * retired record or slot unfreed clears the count of retirements it loaded,
  * unless a retirement since changed it. It loads the current epoch before the
  * oldest, and records the lowest stamp it kept (held).
@@ -1084,6 +1167,7 @@ host_delta_directory_pass(HostDeltaDirectoryDirectory directory)
 	uint64		current;
 	uint64		oldest;
 
+	directory.ops->lock_pass(directory.self);
 	directory.ops->stop(directory.self, HOST_DELTA_DIRECTORY_POINT_PASSING);
 	left = directory.ops->left(directory.self);
 	current = directory.ops->epoch(directory.self);
@@ -1091,12 +1175,21 @@ host_delta_directory_pass(HostDeltaDirectoryDirectory directory)
 	directory.ops->stop(directory.self, HOST_DELTA_DIRECTORY_POINT_OLDEST);
 	for (uint32 kind = 0, kind_len = directory.ops->aged(directory.self); kind < kind_len; kind++)
 	{
-		for (uint32 index = 0, index_len = directory.ops->records(directory.self, kind); index < index_len; index++)
+		uint64		at = directory.ops->record_retired_head(directory.self, kind);
+		uint64		first = 0;
+		uint32		last = 0;
+
+		while (!directory.ops->record_retired_swap(directory.self, kind, at, 0))
+			at = directory.ops->record_retired_head(directory.self, kind);
+		while (at != 0)
 		{
+			uint32		index = (uint32) (at - 1);
 			uint64		loaded = directory.ops->record_word(directory.self, kind, index);
 			uint64		freeing;
 			uint64		stamp;
+			bool		claimed PG_USED_FOR_ASSERTS_ONLY;
 
+			at = directory.ops->record_link(directory.self, kind, index);
 			if (!host_delta_page_reap(loaded, &freeing))
 				continue;
 			stamp = directory.ops->stamp(directory.self, kind, index);
@@ -1104,45 +1197,62 @@ host_delta_directory_pass(HostDeltaDirectoryDirectory directory)
 			{
 				kept = has_kept ? std_min_u64(kept, stamp) : stamp;
 				has_kept = true;
+				if (first == 0)
+					last = index;
+				directory.ops->set_record_link(directory.self, kind, index, first);
+				first = (uint64) index + 1;
 				continue;
 			}
-			if (!directory.ops->record_swap(directory.self, kind, index, loaded, freeing))
-				continue;
+			claimed = directory.ops->record_swap(directory.self, kind, index, loaded, freeing);
+			Assert(claimed);
 			directory.ops->record_swap(directory.self, kind, index, freeing, host_delta_page_released(freeing));
 			directory.ops->freed(directory.self);
 		}
+		while (first != 0)
+		{
+			uint64		head = directory.ops->record_retired_head(directory.self, kind);
+
+			directory.ops->set_record_link(directory.self, kind, last, head);
+			if (directory.ops->record_retired_swap(directory.self, kind, head, first))
+				break;
+		}
 	}
 	directory.ops->stop(directory.self, HOST_DELTA_DIRECTORY_POINT_WALKED);
-	for (uint32 slot = 0, slot_len = directory.ops->slots(directory.self); slot < slot_len; slot++)
 	{
-		uint64		loaded = directory.ops->word(directory.self, slot);
-		uint64		freeing;
-		uint64		stamp;
-		uint64		released;
+		uint64		at = directory.ops->retired_head(directory.self);
+		uint32		first = 0;
+		uint32		last = 0;
 
-		if (!host_delta_page_reap(loaded, &freeing))
-			continue;
-		stamp = directory.ops->load(directory.self, slot, HOST_DELTA_DIRECTORY_FIELD_STAMP);
-		if (!host_delta_page_passed(stamp, oldest))
+		while (!directory.ops->retired_swap(directory.self, at, 0))
+			at = directory.ops->retired_head(directory.self);
+		while (at != 0)
 		{
-			kept = has_kept ? std_min_u64(kept, stamp) : stamp;
-			has_kept = true;
-			continue;
+			uint32		slot = (uint32) (at - 1);
+			bool		keep;
+
+			at = directory.ops->link(directory.self, slot);
+			host_delta_directory_freed_slot(directory, slot, directory.ops->word(directory.self, slot), oldest,
+											&has_kept, &kept, &keep);
+			if (!keep)
+				continue;
+			if (first == 0)
+				last = slot;
+			directory.ops->set_link(directory.self, slot, first);
+			first = slot + 1;
 		}
-		if (!directory.ops->swap(directory.self, slot, loaded, freeing))
-			continue;
-		directory.ops->stop(directory.self, HOST_DELTA_DIRECTORY_POINT_CLAIMED);
-		host_delta_blocks_give(directory, directory.ops->load(directory.self, slot, HOST_DELTA_DIRECTORY_FIELD_BODY));
-		directory.ops->store(directory.self, slot, HOST_DELTA_DIRECTORY_FIELD_BODY, 0);
-		host_delta_directory_freed(directory, slot, false);
-		released = host_delta_directory_emptied(directory, slot, freeing);
-		directory.ops->stop(directory.self, HOST_DELTA_DIRECTORY_POINT_HINTING);
-		host_delta_directory_hinted(directory, slot, released);
-		directory.ops->freed(directory.self);
+		while (first != 0)
+		{
+			uint64		head = directory.ops->retired_head(directory.self);
+
+			directory.ops->set_link(directory.self, last, (uint32) head);
+			if (directory.ops->retired_swap(directory.self, head, (uint64) first))
+				break;
+		}
 	}
 	if (!has_kept)
 		directory.ops->settle(directory.self, left);
 	host_delta_directory_held(directory, current, oldest, has_kept ? kept : 0);
+	directory.ops->unlock_pass(directory.self);
 }
 
 /* host_delta_directory_rank orders kept stamps, zero, for none, after every stamp. */
@@ -1295,6 +1405,118 @@ host_delta_directory_woken(HostDeltaDirectoryDirectory directory)
 	directory.ops->count_waiter(directory.self, false);
 }
 
+/*
+ * host_delta_directory_packing orders the region's partly used blocks for a
+ * packing and returns the live pages to move out of the blocks it drains,
+ * each with its owner's shape and location and its size (bugs row 143). A
+ * block holding a live page of a shape the caller doesn't move, or a page
+ * still owned, which its writer is filling, is pinned, so the packing never
+ * plans to drain a block it can't empty. A slot whose body reads 0, in a
+ * take, release, or reap, pins and moves nothing (bugs row 486), since a
+ * take's page counts in its block's map, and so in its drain's pages, from
+ * host_delta_blocks_taken on, so a drain of its block only leaves it
+ * unemptied; its loads of a slot's word and body are unordered, and a stale
+ * body only pins a block or plans a move its owner's move checks again under
+ * the owner's lock. It answers false when it can't reserve its lists.
+ */
+bool
+host_delta_directory_packing(HostDeltaDirectoryDirectory directory, const uint64 *shapes, size_t shapes_len,
+							 StdVec *result)
+{
+	uint32		blocks = directory.ops->blocks(directory.self);
+	uint32		slots = directory.ops->slots(directory.self);
+	StdVec		pinned;
+	StdVec		left;
+	StdVec		drains;
+	uint8		zero = 0;
+	uint32		none = 0;
+	bool		ok;
+
+	std_vec_new(result, sizeof(HostDeltaDirectoryPacked), _Alignof(HostDeltaDirectoryPacked));
+	std_vec_new(&pinned, 1, 1);
+	std_vec_new(&left, sizeof(uint32), _Alignof(uint32));
+	if (!std_vec_try_reserve_exact(&pinned, blocks, 1, 1) ||
+		!std_vec_try_reserve_exact(&left, blocks, sizeof(uint32), _Alignof(uint32)))
+	{
+		std_vec_free_Checked(&pinned, 1, 1);
+		std_vec_free_Checked(&left, sizeof(uint32), _Alignof(uint32));
+		return false;
+	}
+	std_vec_resize(&pinned, blocks, &zero, 1, 1);
+	std_vec_resize(&left, blocks, &none, sizeof(uint32), _Alignof(uint32));
+	for (uint32 slot = 0; slot < slots; slot++)
+	{
+		uint64		word = directory.ops->word(directory.self, slot);
+		HostDeltaPageState state = host_delta_page_state(word);
+		uint64		body;
+		uint64		shape;
+		size_t		k;
+
+		if (state != HOST_DELTA_PAGE_STATE_LIVE && state != HOST_DELTA_PAGE_STATE_OWNED)
+			continue;
+		body = directory.ops->load(directory.self, slot, HOST_DELTA_DIRECTORY_FIELD_BODY);
+		if (body == 0)
+			continue;
+		Assert(STD_DIV_FOLDED(u64, body - 1, HOST_DELTA_PAGE_BLOCK) < blocks);
+		shape = directory.ops->load(directory.self, slot, HOST_DELTA_DIRECTORY_FIELD_SHAPE);
+		for (k = 0; state == HOST_DELTA_PAGE_STATE_LIVE && k < shapes_len && shapes[k] != shape; k++)
+			;
+		if (state == HOST_DELTA_PAGE_STATE_OWNED || k == shapes_len)
+			STD_VEC_AT(&pinned, uint8, STD_DIV_FOLDED(u64, body - 1, HOST_DELTA_PAGE_BLOCK)) = 1;
+	}
+	ok = host_delta_blocks_packing(directory, pinned.ptr, &drains);
+	std_vec_free_Checked(&pinned, 1, 1);
+	if (!ok)
+	{
+		std_vec_free_Checked(&left, sizeof(uint32), _Alignof(uint32));
+		return false;
+	}
+	for (size_t k = 0; k < drains.len; k++)
+		STD_VEC_AT(&left, uint32, STD_VEC_AT(&drains, HostDeltaBlocksDrain, k).block) =
+			STD_VEC_AT(&drains, HostDeltaBlocksDrain, k).pages;
+	for (uint32 slot = 0; ok && slot < slots && drains.len > 0; slot++)
+	{
+		uint64		word = directory.ops->word(directory.self, slot);
+		uint64		body;
+		uint64		shape;
+		uint32		block;
+		size_t		k;
+
+		if (host_delta_page_state(word) != HOST_DELTA_PAGE_STATE_LIVE)
+			continue;
+		body = directory.ops->load(directory.self, slot, HOST_DELTA_DIRECTORY_FIELD_BODY);
+		if (body == 0)
+			continue;
+		block = (uint32) STD_DIV_FOLDED(u64, body - 1, HOST_DELTA_PAGE_BLOCK);
+		Assert(block < blocks);
+		if (STD_VEC_AT(&left, uint32, block) == 0)
+			continue;
+		shape = directory.ops->load(directory.self, slot, HOST_DELTA_DIRECTORY_FIELD_SHAPE);
+		for (k = 0; k < shapes_len && shapes[k] != shape; k++)
+			;
+		if (k == shapes_len)
+			continue;
+		ok = std_vec_try_reserve(result, 1, sizeof(HostDeltaDirectoryPacked), _Alignof(HostDeltaDirectoryPacked));
+		if (ok)
+		{
+			HostDeltaDirectoryPacked packed = {
+				host_delta_page_Page_value(host_delta_page_Page_of(slot, word)),
+				directory.ops->load(directory.self, slot, HOST_DELTA_DIRECTORY_FIELD_SHAPE),
+				directory.ops->load(directory.self, slot, HOST_DELTA_DIRECTORY_FIELD_OWNER),
+				host_delta_directory_sized(directory.ops->load(directory.self, slot, HOST_DELTA_DIRECTORY_FIELD_SIZES)),
+			};
+
+			std_vec_push_Checked(result, &packed, sizeof(packed), _Alignof(HostDeltaDirectoryPacked));
+			STD_VEC_AT(&left, uint32, block)--;
+		}
+	}
+	std_vec_free_Checked(&drains, sizeof(HostDeltaBlocksDrain), _Alignof(HostDeltaBlocksDrain));
+	std_vec_free_Checked(&left, sizeof(uint32), _Alignof(uint32));
+	if (!ok)
+		std_vec_free_Checked(result, sizeof(HostDeltaDirectoryPacked), _Alignof(HostDeltaDirectoryPacked));
+	return ok;
+}
+
 #ifdef DOLTGRES_TEST_HOST
 
 /* host_delta_directory_tests_Array5U8_Debug_fmt is the Debug of a [u8; 5]: its bytes as a list. */
@@ -1375,6 +1597,756 @@ test_host_delta_directory_tests_a_words_index_is_below_its_pages_count(void)
 	STD_ASSERT_EQ(904, 9, left != NULL && memcmp(left, right, 5) == 0, &left,
 				  host_delta_directory_tests_ResultTupleArray5U8_Debug_fmt, &right,
 				  host_delta_directory_tests_ResultTupleArray5U8_Debug_fmt);
+}
+
+/* HOST_DELTA_DIRECTORY_TESTS_MOST is the most slots, and aged records, a test's directory holds. */
+#define HOST_DELTA_DIRECTORY_TESTS_MOST 4096
+
+/*
+ * host_delta_directory_tests_Directory_t is a test's directory in process
+ * memory: its slots and their words and links, one aged kind's records,
+ * stamps, and links, the lists' heads, the header's counts, the epochs, the
+ * region's words and each block's three words, one block for each slot, and
+ * the count of the slot and record words loaded while a case counts them.
+ */
+typedef struct host_delta_directory_tests_Directory_t
+{
+	uint32		slots;
+	uint64		words[HOST_DELTA_DIRECTORY_TESTS_MOST];
+	uint64		fields[HOST_DELTA_DIRECTORY_TESTS_MOST][7];
+	uint32		links[HOST_DELTA_DIRECTORY_TESTS_MOST];
+	uint64		records[HOST_DELTA_DIRECTORY_TESTS_MOST];
+	uint64		stamps[HOST_DELTA_DIRECTORY_TESTS_MOST];
+	uint64		record_links[HOST_DELTA_DIRECTORY_TESTS_MOST];
+	uint64		region[HOST_DELTA_BLOCKS_WORDS];
+	uint64		blocks[HOST_DELTA_DIRECTORY_TESTS_MOST][3];
+	uint64		head;
+	uint64		record_head;
+	uint64		frees;
+	uint64		left;
+	uint64		kept;
+	uint64		overshoot;
+	uint64		epoch;
+	uint64		oldest;
+	/* passing is whether visits counts the slot and record words loaded. */
+	bool		passing;
+	uint64		visits;
+} host_delta_directory_tests_Directory_t;
+
+/* HOST_DELTA_DIRECTORY_TESTS_AGED is the id of a test directory's one aged kind. */
+#define HOST_DELTA_DIRECTORY_TESTS_AGED UINT64CONST(0x74657374)
+
+/* host_delta_directory_tests_directory is the directory a case builds, too large for a stack. */
+static host_delta_directory_tests_Directory_t host_delta_directory_tests_directory;
+
+/* HOST_DELTA_DIRECTORY_TESTS_SELF is a test directory's ops' self as the directory it is. */
+#define HOST_DELTA_DIRECTORY_TESTS_SELF(self) ((host_delta_directory_tests_Directory_t *) (self))
+
+/* host_delta_directory_tests_slots is a test directory's count of slots. */
+static uint32
+host_delta_directory_tests_slots(void *self)
+{
+	return HOST_DELTA_DIRECTORY_TESTS_SELF(self)->slots;
+}
+
+/* host_delta_directory_tests_budget is a test directory's budget, one 64 KiB block for each slot. */
+static uint64
+host_delta_directory_tests_budget(void *self)
+{
+	return (uint64) HOST_DELTA_DIRECTORY_TESTS_SELF(self)->slots * HOST_DELTA_PAGE_BLOCK;
+}
+
+/* host_delta_directory_tests_word loads a slot's word, counting it while a case counts. */
+static uint64
+host_delta_directory_tests_word(void *self, uint32 slot)
+{
+	host_delta_directory_tests_Directory_t *d = HOST_DELTA_DIRECTORY_TESTS_SELF(self);
+
+	if (d->passing)
+		d->visits++;
+	return d->words[slot];
+}
+
+/* host_delta_directory_tests_swap stores a slot's word over the one loaded. */
+static bool
+host_delta_directory_tests_swap(void *self, uint32 slot, uint64 loaded, uint64 word)
+{
+	host_delta_directory_tests_Directory_t *d = HOST_DELTA_DIRECTORY_TESTS_SELF(self);
+
+	if (d->words[slot] != loaded)
+		return false;
+	d->words[slot] = word;
+	return true;
+}
+
+/* host_delta_directory_tests_load loads one of a slot's other words. */
+static uint64
+host_delta_directory_tests_load(void *self, uint32 slot, HostDeltaDirectoryField field)
+{
+	return HOST_DELTA_DIRECTORY_TESTS_SELF(self)->fields[slot][field];
+}
+
+/* host_delta_directory_tests_store stores one of a slot's other words. */
+static void
+host_delta_directory_tests_store(void *self, uint32 slot, HostDeltaDirectoryField field, uint64 value)
+{
+	HOST_DELTA_DIRECTORY_TESTS_SELF(self)->fields[slot][field] = value;
+}
+
+/* host_delta_directory_tests_blocks is a test directory's count of blocks, one for each slot. */
+static uint32
+host_delta_directory_tests_blocks(void *self)
+{
+	return HOST_DELTA_DIRECTORY_TESTS_SELF(self)->slots;
+}
+
+/* host_delta_directory_tests_region loads one of a test directory's region's words. */
+static uint64
+host_delta_directory_tests_region(void *self, HostDeltaBlocksRegion word)
+{
+	return HOST_DELTA_DIRECTORY_TESTS_SELF(self)->region[host_delta_blocks_Region_index(word)];
+}
+
+/* host_delta_directory_tests_set_region stores one of a test directory's region's words. */
+static void
+host_delta_directory_tests_set_region(void *self, HostDeltaBlocksRegion word, uint64 value)
+{
+	HOST_DELTA_DIRECTORY_TESTS_SELF(self)->region[host_delta_blocks_Region_index(word)] = value;
+}
+
+/* host_delta_directory_tests_block loads one of a block's words in a test directory's region. */
+static uint64
+host_delta_directory_tests_block(void *self, uint32 block, HostDeltaBlocksBlock word)
+{
+	return HOST_DELTA_DIRECTORY_TESTS_SELF(self)->blocks[block][word];
+}
+
+/* host_delta_directory_tests_set_block stores one of a block's words in a test directory's region. */
+static void
+host_delta_directory_tests_set_block(void *self, uint32 block, HostDeltaBlocksBlock word, uint64 value)
+{
+	HOST_DELTA_DIRECTORY_TESTS_SELF(self)->blocks[block][word] = value;
+}
+
+/* host_delta_directory_tests_nothing does nothing, as a test directory's locks and listings do. */
+static void
+host_delta_directory_tests_nothing(void *self)
+{
+}
+
+/* host_delta_directory_tests_frees is a test directory's count of frees. */
+static uint64
+host_delta_directory_tests_frees(void *self)
+{
+	return HOST_DELTA_DIRECTORY_TESTS_SELF(self)->frees;
+}
+
+/* host_delta_directory_tests_freed counts a free. */
+static void
+host_delta_directory_tests_freed(void *self)
+{
+	HOST_DELTA_DIRECTORY_TESTS_SELF(self)->frees++;
+}
+
+/* host_delta_directory_tests_left is a test directory's count of retirements. */
+static uint64
+host_delta_directory_tests_left(void *self)
+{
+	return HOST_DELTA_DIRECTORY_TESTS_SELF(self)->left;
+}
+
+/* host_delta_directory_tests_leave counts a retirement. */
+static void
+host_delta_directory_tests_leave(void *self)
+{
+	HOST_DELTA_DIRECTORY_TESTS_SELF(self)->left++;
+}
+
+/* host_delta_directory_tests_settle clears the count of retirements while it holds the one loaded. */
+static void
+host_delta_directory_tests_settle(void *self, uint64 loaded)
+{
+	host_delta_directory_tests_Directory_t *d = HOST_DELTA_DIRECTORY_TESTS_SELF(self);
+
+	if (d->left == loaded)
+		d->left = 0;
+}
+
+/* host_delta_directory_tests_kept is a test directory's kept stamp. */
+static uint64
+host_delta_directory_tests_kept(void *self)
+{
+	return HOST_DELTA_DIRECTORY_TESTS_SELF(self)->kept;
+}
+
+/* host_delta_directory_tests_kept_swap stores the kept stamp over the one loaded. */
+static bool
+host_delta_directory_tests_kept_swap(void *self, uint64 loaded, uint64 word)
+{
+	host_delta_directory_tests_Directory_t *d = HOST_DELTA_DIRECTORY_TESTS_SELF(self);
+
+	if (d->kept != loaded)
+		return false;
+	d->kept = word;
+	return true;
+}
+
+/* host_delta_directory_tests_zero answers 0 for a count no case moves. */
+static uint64
+host_delta_directory_tests_zero_count(void *self)
+{
+	return 0;
+}
+
+/* host_delta_directory_tests_count_waiter counts nothing, since no case waits. */
+static void
+host_delta_directory_tests_count_waiter(void *self, bool add)
+{
+}
+
+/* host_delta_directory_tests_overshoot is a test directory's overshoot word. */
+static uint64
+host_delta_directory_tests_overshoot(void *self)
+{
+	return HOST_DELTA_DIRECTORY_TESTS_SELF(self)->overshoot;
+}
+
+/* host_delta_directory_tests_overshoot_swap stores the overshoot word over the one loaded. */
+static bool
+host_delta_directory_tests_overshoot_swap(void *self, uint64 loaded, uint64 word)
+{
+	host_delta_directory_tests_Directory_t *d = HOST_DELTA_DIRECTORY_TESTS_SELF(self);
+
+	if (d->overshoot != loaded)
+		return false;
+	d->overshoot = word;
+	return true;
+}
+
+/* host_delta_directory_tests_hand is a test directory's hand, its first slot. */
+static uint32
+host_delta_directory_tests_hand(void *self)
+{
+	return 0;
+}
+
+/* host_delta_directory_tests_hint is a word of a test directory's free hint, which holds no free slot. */
+static uint64
+host_delta_directory_tests_hint(void *self, uint32 word)
+{
+	return 0;
+}
+
+/* host_delta_directory_tests_hint_slot sets or clears no bit, since no case frees a slot. */
+static void
+host_delta_directory_tests_hint_slot(void *self, uint32 slot)
+{
+}
+
+/* host_delta_directory_tests_spent is a test directory's count of spent slots, none. */
+static uint64
+host_delta_directory_tests_spent(void *self, bool over)
+{
+	return 0;
+}
+
+/* host_delta_directory_tests_spend counts no spent slot, since no case spends one. */
+static void
+host_delta_directory_tests_spend(void *self, bool over)
+{
+}
+
+/* host_delta_directory_tests_lock takes a test directory's allocation lock, which no other process takes. */
+static bool
+host_delta_directory_tests_lock(void *self, const void *raise, HostError *error)
+{
+	return true;
+}
+
+/* host_delta_directory_tests_zero_body zeroes no body, since no case takes one. */
+static void
+host_delta_directory_tests_zero_body(void *self, uint64 body, HostDeltaPageSize size)
+{
+}
+
+/* host_delta_directory_tests_write writes no body, since no case takes one. */
+static void
+host_delta_directory_tests_write(void *self, uint64 body, uint64 at, const uint8 *bytes, size_t bytes_len)
+{
+}
+
+/* host_delta_directory_tests_set stores no body word, since no case takes one. */
+static void
+host_delta_directory_tests_set(void *self, uint64 body, uint64 index, uint64 value)
+{
+}
+
+/* host_delta_directory_tests_own lists no page, since no case takes one. */
+static void
+host_delta_directory_tests_own(void *self, HostDeltaPagePage name)
+{
+}
+
+/* host_delta_directory_tests_retiring is the epoch a retirement stamps: the current one. */
+static uint64
+host_delta_directory_tests_retiring(void *self)
+{
+	return HOST_DELTA_DIRECTORY_TESTS_SELF(self)->epoch;
+}
+
+/* host_delta_directory_tests_retiring_now takes the epoch lock, which no other process holds. */
+static bool
+host_delta_directory_tests_retiring_now(void *self, uint64 *result)
+{
+	*result = HOST_DELTA_DIRECTORY_TESTS_SELF(self)->epoch;
+	return true;
+}
+
+/* host_delta_directory_tests_retired advances the epoch. */
+static void
+host_delta_directory_tests_retired(void *self)
+{
+	HOST_DELTA_DIRECTORY_TESTS_SELF(self)->epoch++;
+}
+
+/* host_delta_directory_tests_epoch is a test directory's current epoch. */
+static uint64
+host_delta_directory_tests_epoch(void *self)
+{
+	return HOST_DELTA_DIRECTORY_TESTS_SELF(self)->epoch;
+}
+
+/* host_delta_directory_tests_oldest is a test directory's oldest epoch, which a reader holds below every retirement. */
+static uint64
+host_delta_directory_tests_oldest(void *self)
+{
+	return HOST_DELTA_DIRECTORY_TESTS_SELF(self)->oldest;
+}
+
+/* host_delta_directory_tests_stop holds at no point. */
+static void
+host_delta_directory_tests_stop(void *self, HostDeltaDirectoryPoint point)
+{
+}
+
+/* host_delta_directory_tests_aged is a test directory's count of aged kinds: one. */
+static uint32
+host_delta_directory_tests_aged(void *self)
+{
+	return 1;
+}
+
+/* host_delta_directory_tests_aged_kind is the number of a test directory's one aged kind. */
+static bool
+host_delta_directory_tests_aged_kind(void *self, uint64 id, uint32 *result)
+{
+	*result = 0;
+	return id == HOST_DELTA_DIRECTORY_TESTS_AGED;
+}
+
+/* host_delta_directory_tests_records is the count of a test directory's aged records, one for each slot. */
+static uint32
+host_delta_directory_tests_records(void *self, uint32 kind)
+{
+	return HOST_DELTA_DIRECTORY_TESTS_SELF(self)->slots;
+}
+
+/* host_delta_directory_tests_record_word loads an aged record's word, counting it while a case counts. */
+static uint64
+host_delta_directory_tests_record_word(void *self, uint32 kind, uint32 index)
+{
+	host_delta_directory_tests_Directory_t *d = HOST_DELTA_DIRECTORY_TESTS_SELF(self);
+
+	if (d->passing)
+		d->visits++;
+	return d->records[index];
+}
+
+/* host_delta_directory_tests_record_swap stores an aged record's word over the one loaded. */
+static bool
+host_delta_directory_tests_record_swap(void *self, uint32 kind, uint32 index, uint64 loaded, uint64 word)
+{
+	host_delta_directory_tests_Directory_t *d = HOST_DELTA_DIRECTORY_TESTS_SELF(self);
+
+	if (d->records[index] != loaded)
+		return false;
+	d->records[index] = word;
+	return true;
+}
+
+/* host_delta_directory_tests_stamp loads an aged record's stamp. */
+static uint64
+host_delta_directory_tests_stamp(void *self, uint32 kind, uint32 index)
+{
+	return HOST_DELTA_DIRECTORY_TESTS_SELF(self)->stamps[index];
+}
+
+/* host_delta_directory_tests_set_stamp stores an aged record's stamp. */
+static void
+host_delta_directory_tests_set_stamp(void *self, uint32 kind, uint32 index, uint64 stamp)
+{
+	HOST_DELTA_DIRECTORY_TESTS_SELF(self)->stamps[index] = stamp;
+}
+
+/* host_delta_directory_tests_record_hand is an aged kind's hand, its first record. */
+static uint32
+host_delta_directory_tests_record_hand(void *self, uint32 kind)
+{
+	return 0;
+}
+
+/* host_delta_directory_tests_record_nothing does nothing with an aged record, as its clear and listings do here. */
+static void
+host_delta_directory_tests_record_nothing(void *self, uint32 kind, uint32 index)
+{
+}
+
+/* host_delta_directory_tests_retired_head loads the retired list's head. */
+static uint64
+host_delta_directory_tests_retired_head(void *self)
+{
+	return HOST_DELTA_DIRECTORY_TESTS_SELF(self)->head;
+}
+
+/* host_delta_directory_tests_retired_swap stores the retired list's head over the one loaded. */
+static bool
+host_delta_directory_tests_retired_swap(void *self, uint64 loaded, uint64 word)
+{
+	host_delta_directory_tests_Directory_t *d = HOST_DELTA_DIRECTORY_TESTS_SELF(self);
+
+	if (d->head != loaded)
+		return false;
+	d->head = word;
+	return true;
+}
+
+/* host_delta_directory_tests_link loads a slot's link. */
+static uint32
+host_delta_directory_tests_link(void *self, uint32 slot)
+{
+	return HOST_DELTA_DIRECTORY_TESTS_SELF(self)->links[slot];
+}
+
+/* host_delta_directory_tests_set_link stores a slot's link. */
+static void
+host_delta_directory_tests_set_link(void *self, uint32 slot, uint32 value)
+{
+	HOST_DELTA_DIRECTORY_TESTS_SELF(self)->links[slot] = value;
+}
+
+/* host_delta_directory_tests_record_retired_head loads the aged kind's retired list's head. */
+static uint64
+host_delta_directory_tests_record_retired_head(void *self, uint32 kind)
+{
+	return HOST_DELTA_DIRECTORY_TESTS_SELF(self)->record_head;
+}
+
+/* host_delta_directory_tests_record_retired_swap stores the aged kind's retired list's head over the one loaded. */
+static bool
+host_delta_directory_tests_record_retired_swap(void *self, uint32 kind, uint64 loaded, uint64 word)
+{
+	host_delta_directory_tests_Directory_t *d = HOST_DELTA_DIRECTORY_TESTS_SELF(self);
+
+	if (d->record_head != loaded)
+		return false;
+	d->record_head = word;
+	return true;
+}
+
+/* host_delta_directory_tests_record_link loads an aged record's link. */
+static uint64
+host_delta_directory_tests_record_link(void *self, uint32 kind, uint32 index)
+{
+	return HOST_DELTA_DIRECTORY_TESTS_SELF(self)->record_links[index];
+}
+
+/* host_delta_directory_tests_set_record_link stores an aged record's link. */
+static void
+host_delta_directory_tests_set_record_link(void *self, uint32 kind, uint32 index, uint64 value)
+{
+	HOST_DELTA_DIRECTORY_TESTS_SELF(self)->record_links[index] = value;
+}
+
+/* HOST_DELTA_DIRECTORY_TESTS_OPS is a test directory's Directory table. */
+static const HostDeltaDirectoryDirectoryOps HOST_DELTA_DIRECTORY_TESTS_OPS = {
+	.slots = host_delta_directory_tests_slots,
+	.budget = host_delta_directory_tests_budget,
+	.word = host_delta_directory_tests_word,
+	.swap = host_delta_directory_tests_swap,
+	.load = host_delta_directory_tests_load,
+	.store = host_delta_directory_tests_store,
+	.blocks = host_delta_directory_tests_blocks,
+	.region = host_delta_directory_tests_region,
+	.set_region = host_delta_directory_tests_set_region,
+	.block = host_delta_directory_tests_block,
+	.set_block = host_delta_directory_tests_set_block,
+	.lock_region = host_delta_directory_tests_nothing,
+	.unlock_region = host_delta_directory_tests_nothing,
+	.frees = host_delta_directory_tests_frees,
+	.freed = host_delta_directory_tests_freed,
+	.left = host_delta_directory_tests_left,
+	.leave = host_delta_directory_tests_leave,
+	.settle = host_delta_directory_tests_settle,
+	.kept = host_delta_directory_tests_kept,
+	.kept_swap = host_delta_directory_tests_kept_swap,
+	.waiting = host_delta_directory_tests_zero_count,
+	.count_waiter = host_delta_directory_tests_count_waiter,
+	.overshoot = host_delta_directory_tests_overshoot,
+	.overshoot_swap = host_delta_directory_tests_overshoot_swap,
+	.hand = host_delta_directory_tests_hand,
+	.hint = host_delta_directory_tests_hint,
+	.hint_set = host_delta_directory_tests_hint_slot,
+	.hint_clear = host_delta_directory_tests_hint_slot,
+	.spent = host_delta_directory_tests_spent,
+	.spend = host_delta_directory_tests_spend,
+	.lock = host_delta_directory_tests_lock,
+	.unlock = host_delta_directory_tests_nothing,
+	.zero = host_delta_directory_tests_zero_body,
+	.write = host_delta_directory_tests_write,
+	.set = host_delta_directory_tests_set,
+	.own = host_delta_directory_tests_own,
+	.disown = host_delta_directory_tests_own,
+	.retiring = host_delta_directory_tests_retiring,
+	.retiring_now = host_delta_directory_tests_retiring_now,
+	.retired = host_delta_directory_tests_retired,
+	.unretired = host_delta_directory_tests_nothing,
+	.epoch = host_delta_directory_tests_epoch,
+	.oldest = host_delta_directory_tests_oldest,
+	.stop = host_delta_directory_tests_stop,
+	.aged = host_delta_directory_tests_aged,
+	.aged_kind = host_delta_directory_tests_aged_kind,
+	.records = host_delta_directory_tests_records,
+	.record_word = host_delta_directory_tests_record_word,
+	.record_swap = host_delta_directory_tests_record_swap,
+	.stamp = host_delta_directory_tests_stamp,
+	.set_stamp = host_delta_directory_tests_set_stamp,
+	.record_hand = host_delta_directory_tests_record_hand,
+	.clear = host_delta_directory_tests_record_nothing,
+	.made = host_delta_directory_tests_record_nothing,
+	.unmade = host_delta_directory_tests_record_nothing,
+	.retired_head = host_delta_directory_tests_retired_head,
+	.retired_swap = host_delta_directory_tests_retired_swap,
+	.link = host_delta_directory_tests_link,
+	.set_link = host_delta_directory_tests_set_link,
+	.record_retired_head = host_delta_directory_tests_record_retired_head,
+	.record_retired_swap = host_delta_directory_tests_record_retired_swap,
+	.record_link = host_delta_directory_tests_record_link,
+	.set_record_link = host_delta_directory_tests_set_record_link,
+	.lock_pass = host_delta_directory_tests_nothing,
+	.unlock_pass = host_delta_directory_tests_nothing,
+};
+
+/*
+ * host_delta_directory_tests_retirements makes a test directory of a count of
+ * slots, every slot and aged record live, a reader holding the oldest epoch
+ * below every retirement, and retires ten pages and ten aged records, the
+ * last slots' and records'.
+ */
+static HostDeltaDirectoryDirectory
+host_delta_directory_tests_retirements(uint32 slots)
+{
+	host_delta_directory_tests_Directory_t *d = &host_delta_directory_tests_directory;
+	HostDeltaDirectoryDirectory directory = {&HOST_DELTA_DIRECTORY_TESTS_OPS, d};
+	HostDeltaPagePage names[10];
+	HostDeltaLeaving leaving[10];
+	uint64		owned;
+	uint64		live;
+
+	memset(d, 0, sizeof(*d));
+	d->slots = slots;
+	d->epoch = 5;
+	d->oldest = 1;
+	if (!host_delta_page_claim(0, &owned))
+		std_panic(__FILE__, __LINE__, 0, "a free slot is claimed", sizeof("a free slot is claimed") - 1);
+	live = host_delta_page_link(owned);
+	for (uint32 at = 0; at < slots; at++)
+	{
+		d->words[at] = live;
+		d->records[at] = live;
+	}
+	for (uint32 i = 0; i < 10; i++)
+	{
+		uint32		at = slots - 1 - i;
+
+		names[i] = host_delta_page_Page_of(at, live);
+		leaving[i].id = HOST_DELTA_DIRECTORY_TESTS_AGED;
+		leaving[i].location = host_delta_page_Page_value(host_delta_page_Page_of(at, live));
+	}
+	host_delta_directory_retire(directory, leaving, lengthof(leaving), names, lengthof(names));
+	return directory;
+}
+
+/* host_delta_directory_tests_visited asserts that a case loaded want words, citing this file's line. */
+static void
+host_delta_directory_tests_visited(uint32 line, uint64 want)
+{
+	uint64		visits = host_delta_directory_tests_directory.visits;
+
+	if (visits != want)
+		std_assert_failed(__FILE__, line, 0, "==", &visits, std_u64_Debug_fmt, &want, std_u64_Debug_fmt, NULL);
+}
+
+/*
+ * Bugs row 309's free pass: a pass after ten pages and ten aged records
+ * retire loads the words of those twenty and of no other slot or record,
+ * at a directory of 128 slots and at one of 4,096, so its work is the
+ * retirements and not the directory's size.
+ */
+void
+test_host_delta_directory_tests_a_free_pass_loads_only_the_retirements(void)
+{
+	static const uint32 sizes[] = {128, HOST_DELTA_DIRECTORY_TESTS_MOST};
+
+	for (size_t i = 0; i < lengthof(sizes); i++)
+	{
+		HostDeltaDirectoryDirectory directory = host_delta_directory_tests_retirements(sizes[i]);
+
+		host_delta_directory_tests_directory.passing = true;
+		host_delta_directory_pass(directory);
+		host_delta_directory_tests_visited(__LINE__, 20);
+		host_delta_directory_tests_directory.visits = 0;
+		host_delta_directory_pass(directory);
+		host_delta_directory_tests_visited(__LINE__, 20);
+		host_delta_directory_tests_directory.passing = false;
+	}
+}
+
+/*
+ * Bugs row 309's refused allocation: an allocation the directory refuses,
+ * every slot live, runs a free pass that loads the words of the ten pages
+ * and ten aged records retired and of no other, at both sizes.
+ */
+void
+test_host_delta_directory_tests_a_refused_allocations_pass_loads_only_the_retirements(void)
+{
+	static const uint32 sizes[] = {128, HOST_DELTA_DIRECTORY_TESTS_MOST};
+
+	for (size_t i = 0; i < lengthof(sizes); i++)
+	{
+		HostDeltaDirectoryDirectory directory = host_delta_directory_tests_retirements(sizes[i]);
+		HostDeltaPageSize wanted[1] = {{4096, 1}};
+		StdVec		names;
+		bool		has_full;
+		uint64		full;
+		HostError	error;
+
+		std_vec_with_capacity_Checked(&names, 1, sizeof(HostDeltaPagePage), _Alignof(HostDeltaPagePage));
+		host_delta_directory_tests_directory.passing = true;
+		if (!host_delta_directory_alloc(directory, NULL, wanted, lengthof(wanted), &names, &has_full, &full, &error))
+			std_panic(__FILE__, __LINE__, 0, "a refused allocation answers its budget's signal",
+					  sizeof("a refused allocation answers its budget's signal") - 1);
+		host_delta_directory_tests_directory.passing = false;
+		if (!has_full || full != 0)
+			std_panic(__FILE__, __LINE__, 0, "the allocation is refused", sizeof("the allocation is refused") - 1);
+		host_delta_directory_tests_visited(__LINE__, 20);
+		std_vec_free_Checked(&names, sizeof(HostDeltaPagePage), _Alignof(HostDeltaPagePage));
+	}
+}
+
+/* HOST_DELTA_DIRECTORY_TESTS_MOVED is the shape of the pages a packing case's packing moves. */
+#define HOST_DELTA_DIRECTORY_TESTS_MOVED UINT64CONST(0x6d6f766564)
+
+/* host_delta_directory_tests_taken takes a 1 KiB body from a test directory's region, as a slot's take does. */
+static uint64
+host_delta_directory_tests_taken(HostDeltaDirectoryDirectory directory)
+{
+	HostDeltaPageSize size = {1024, 0};
+	uint64		body;
+
+	STD_ASSERT(__LINE__, 9, host_delta_blocks_take(directory, size, false, &body), "the region gives a body");
+	return body;
+}
+
+/*
+ * host_delta_directory_tests_packable makes a test directory of 8 slots whose
+ * region's block 0 holds 3 pages and block 1 the page of slot 0, live and of
+ * the moved shape, plus a second page when a take is in flight in slot 1;
+ * slot 1 holds a body of 0, owned for that take or else live, as a release or
+ * a reap leaves it, so a packing drains block 1 into block 0.
+ */
+static HostDeltaDirectoryDirectory
+host_delta_directory_tests_packable(bool taking, uint64 *page, uint64 *taken)
+{
+	host_delta_directory_tests_Directory_t *d = &host_delta_directory_tests_directory;
+	HostDeltaDirectoryDirectory directory = {&HOST_DELTA_DIRECTORY_TESTS_OPS, d};
+	uint64		filled[64];
+	uint64		owned;
+
+	memset(d, 0, sizeof(*d));
+	d->slots = 8;
+	for (int i = 0; i < 64; i++)
+		filled[i] = host_delta_directory_tests_taken(directory);
+	*page = host_delta_directory_tests_taken(directory);
+	*taken = taking ? host_delta_directory_tests_taken(directory) : 0;
+	for (int i = 3; i < 64; i++)
+		host_delta_blocks_give(directory, filled[i]);
+	STD_ASSERT(__LINE__, 9, host_delta_page_claim(0, &owned), "a free slot is claimed");
+	d->words[0] = host_delta_page_link(owned);
+	d->fields[0][HOST_DELTA_DIRECTORY_FIELD_SHAPE] = HOST_DELTA_DIRECTORY_TESTS_MOVED;
+	d->fields[0][HOST_DELTA_DIRECTORY_FIELD_BODY] = *page;
+	d->words[1] = taking ? owned : host_delta_page_link(owned);
+	d->fields[1][HOST_DELTA_DIRECTORY_FIELD_SHAPE] = HOST_DELTA_DIRECTORY_TESTS_MOVED;
+	return directory;
+}
+
+/*
+ * Bugs row 486's live slot: a packing that drains a block skips a live slot
+ * whose body reads 0, as a release or a reap leaves it while the packing
+ * reads, and plans the move of the drained block's one page alone.
+ */
+void
+test_host_delta_directory_tests_a_packing_skips_a_live_slot_with_no_body(void)
+{
+	uint64		page;
+	uint64		taken;
+	HostDeltaDirectoryDirectory directory = host_delta_directory_tests_packable(false, &page, &taken);
+	uint64		shapes[] = {HOST_DELTA_DIRECTORY_TESTS_MOVED};
+	StdVec		packed;
+
+	STD_ASSERT(__LINE__, 9, host_delta_directory_packing(directory, shapes, lengthof(shapes), &packed),
+			   "a packing reserves its lists");
+	STD_ASSERT(__LINE__, 9, packed.len == 1, "the packing plans one move");
+	STD_ASSERT(__LINE__, 9, STD_VEC_AT(&packed, HostDeltaDirectoryPacked, 0).name ==
+			   host_delta_page_Page_value(host_delta_page_Page_of(0, host_delta_directory_tests_directory.words[0])),
+			   "the move is the drained block's page");
+	std_vec_free_Checked(&packed, sizeof(HostDeltaDirectoryPacked), _Alignof(HostDeltaDirectoryPacked));
+}
+
+/*
+ * Bugs row 486's take in flight: a packing that reads an owned slot's body as
+ * 0, its take's body taken in block 1 but not yet stored, drains block 1 and
+ * plans the move of its live page alone; once the take stores its body and
+ * the move takes a new body and gives the old one back, block 1 still holds
+ * the taken page, so the drain left it unemptied and freed nothing.
+ */
+void
+test_host_delta_directory_tests_a_packing_leaves_a_block_a_take_holds_unemptied(void)
+{
+	host_delta_directory_tests_Directory_t *d = &host_delta_directory_tests_directory;
+	uint64		page;
+	uint64		taken;
+	HostDeltaDirectoryDirectory directory = host_delta_directory_tests_packable(true, &page, &taken);
+	uint64		shapes[] = {HOST_DELTA_DIRECTORY_TESTS_MOVED};
+	StdVec		packed;
+	uint64		moved;
+
+	STD_ASSERT(__LINE__, 9, STD_DIV_FOLDED(u64, taken - 1, HOST_DELTA_PAGE_BLOCK) == 1, "the take is in block 1");
+	STD_ASSERT(__LINE__, 9, host_delta_directory_packing(directory, shapes, lengthof(shapes), &packed),
+			   "a packing reserves its lists");
+	STD_ASSERT(__LINE__, 9, packed.len == 1, "the packing plans one move");
+	STD_ASSERT(__LINE__, 9, STD_VEC_AT(&packed, HostDeltaDirectoryPacked, 0).name ==
+			   host_delta_page_Page_value(host_delta_page_Page_of(0, d->words[0])),
+			   "the move is the drained block's live page");
+	d->fields[1][HOST_DELTA_DIRECTORY_FIELD_BODY] = taken;
+	moved = host_delta_directory_tests_taken(directory);
+	host_delta_blocks_give(directory, page);
+	d->fields[0][HOST_DELTA_DIRECTORY_FIELD_BODY] = moved;
+	STD_ASSERT(__LINE__, 9, STD_DIV_FOLDED(u64, moved - 1, HOST_DELTA_PAGE_BLOCK) == 0,
+			   "the move takes its new body in block 0");
+	STD_ASSERT(__LINE__, 9, d->blocks[1][HOST_DELTA_BLOCKS_BLOCK_MAP] ==
+			   UINT64CONST(1) << ((taken - 1) % HOST_DELTA_PAGE_BLOCK / 1024),
+			   "block 1 still holds the taken page alone");
+	std_vec_free_Checked(&packed, sizeof(HostDeltaDirectoryPacked), _Alignof(HostDeltaDirectoryPacked));
 }
 
 #endif							/* DOLTGRES_TEST_HOST */

@@ -16,7 +16,7 @@
 # text's section 15): its portable code and dispatch, and on x86-64 each SIMD form in a library of its own built with
 # the instructions it needs, which the dispatch picks by what the processor has, as the Rust crate's does. With gcc
 # and clang off Windows every external name it defines also carries the prefix dg_ (names.h), as the vendored
-# zstd's and lz4's do.
+# zstd's and lz4's do. Its symbols are hidden, as theirs are, so postgres exports none of them.
 
 project('blake3', 'c', version: '1.8.7', default_options: ['warning_level=0'])
 
@@ -25,7 +25,7 @@ host_cpu = host_machine.cpu_family()
 
 blake3_c = files('c/blake3.c', 'c/blake3_dispatch.c', 'c/blake3_portable.c')
 blake3_simd = []
-blake3_args = []
+blake3_args = ['-DBLAKE3_API=', '-DBLAKE3_PRIVATE=']
 # Each floating-point operation rounds on its own, as in every build of the fork (design item 15); a subproject
 # doesn't get the flag from Postgres' own.
 if meson.get_compiler('c').get_id() in ['gcc', 'clang']
@@ -47,6 +47,7 @@ if host_cpu == 'x86_64'
     blake3_simd += static_library('blake3_' + form[0],
       files(form[1]),
       c_args: blake3_args + (cc.get_id() == 'msvc' ? form[3] : form[2]),
+      gnu_symbol_visibility: 'hidden',
     )
   endforeach
 elif host_cpu == 'aarch64'
@@ -56,5 +57,6 @@ else
   blake3_args += ['-DBLAKE3_NO_SSE2', '-DBLAKE3_NO_SSE41', '-DBLAKE3_NO_AVX2', '-DBLAKE3_NO_AVX512']
 endif
 
-blake3_lib = static_library('blake3', blake3_c, c_args: blake3_args, link_whole: blake3_simd)
+blake3_lib = static_library('blake3', blake3_c, c_args: blake3_args, link_whole: blake3_simd,
+  gnu_symbol_visibility: 'hidden')
 blake3_dep = declare_dependency(include_directories: blake3_includes, link_with: blake3_lib)

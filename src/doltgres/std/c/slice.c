@@ -771,7 +771,9 @@ std_slice_binary_search(const void *self, size_t len, size_t elem_size, const vo
 
 /*
  * std_bytes_starts_with is <[u8]>::starts_with: whether the bytes begin with
- * the needle's, compared after core's own check of the part it takes.
+ * the needle's, compared after core's own check of the part it takes; an
+ * empty needle compares no bytes, since an empty slice's pointer may be null
+ * and memcmp's may not.
  */
 bool
 std_bytes_starts_with(const uint8 *self, size_t len, const uint8 *needle, size_t n)
@@ -779,7 +781,7 @@ std_bytes_starts_with(const uint8 *self, size_t len, const uint8 *needle, size_t
 	if (!(len >= n))
 		return false;
 	std_range_to_check(n, len, STD_SLICE_MOD_FILE, 2635, 43);
-	return memcmp(needle, self, n) == 0;
+	return n == 0 || memcmp(needle, self, n) == 0;
 }
 
 /* std_slice_partition_point_closure_0_t is partition_point's closure's captures: the borrowed pred. */

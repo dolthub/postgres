@@ -174,7 +174,12 @@ doltgres_settle_IoMutexSettling_drop(void *value)
 static const StdDefaultType DOLTGRES_SETTLE_SETTLING_TYPE = {sizeof(HostLockIoMutexSettling),
 _Alignof(HostLockIoMutexSettling), host_lock_IoMutexSettling_Default_default, doltgres_settle_IoMutexSettling_drop};
 
-/* DOLTGRES_SETTLE_SETTLING is SETTLING: the backend's list, its BackendLocal header and the process's value. */
+/*
+ * DOLTGRES_SETTLE_SETTLING is SETTLING: the backend's list, its BackendLocal
+ * header and the process's value. Under its lock an operation allocates only
+ * fallibly, growing a list only into room it reserved first, so nothing there
+ * unwinds and the lock is never poisoned (bugs row 517).
+ */
 static struct
 {
 	HostLocalBackendLocal local;
@@ -344,55 +349,44 @@ doltgres_settle_named(HostIoIo *io, uint32 table, uint32 subtransaction, HostErr
 	return result.ok;
 }
 
-/* doltgres_settle_closed_captures_t is closed's captures: the level it pops, while live, and its tables. */
+/* doltgres_settle_closed_captures_t is closed's captures: the level it pops, and whether there was one. */
 typedef struct doltgres_settle_closed_captures_t
 {
 	StdVec		level;
-	bool		level_live;
-	StdVec	   *result;
+	bool		popped;
 } doltgres_settle_closed_captures_t;
 
-/* doltgres_settle_closed_op pops the innermost level and lists its tables in the order they were named. */
+/* doltgres_settle_closed_op pops the innermost level, which allocates nothing under the lock. */
 static void
 doltgres_settle_closed_op(DoltgresSettleSettling *settling, void *captures_)
 {
 	doltgres_settle_closed_captures_t *captures = captures_;
 
-	if (!std_vec_pop(&settling->levels, &captures->level, sizeof(StdVec)))
-	{
-		std_vec_new(captures->result, DOLTGRES_SETTLE_U32);
-		return;
-	}
-	captures->level_live = true;
-	std_vec_with_capacity_Checked(captures->result, captures->level.len, DOLTGRES_SETTLE_U32);
-	for (size_t i = 0; i < captures->level.len; i++)
-		std_vec_push_Checked(captures->result, &STD_VEC_AT(&captures->level, doltgres_TupleU32U32_t, i).f0,
-							 DOLTGRES_SETTLE_U32);
-	captures->level_live = false;
-	std_vec_free_Checked(&captures->level, DOLTGRES_SETTLE_PAIR);
-}
-
-/* doltgres_settle_closed_unwound frees the level closed popped, while live. */
-static void
-doltgres_settle_closed_unwound(void *captures_)
-{
-	doltgres_settle_closed_captures_t *captures = captures_;
-
-	if (captures->level_live)
-		std_vec_free_Checked(&captures->level, DOLTGRES_SETTLE_PAIR);
-	captures->level_live = false;
+	captures->popped = std_vec_pop(&settling->levels, &captures->level, sizeof(StdVec));
 }
 
 /*
  * doltgres_settle_closed closes the innermost level and returns its tables,
- * in the order they were named; with no level open it returns none.
+ * in the order they were named, listed after the lock is released (bugs row
+ * 517); with no level open it returns none.
  */
 void
 doltgres_settle_closed(HostIoIo *io, StdVec *result)
 {
-	doltgres_settle_closed_captures_t captures = {.result = result};
+	doltgres_settle_closed_captures_t captures = {0};
 
-	doltgres_settle_locked(io, doltgres_settle_closed_op, &captures, doltgres_settle_closed_unwound);
+	doltgres_settle_locked(io, doltgres_settle_closed_op, &captures, NULL);
+	std_vec_new(result, DOLTGRES_SETTLE_U32);
+	if (!captures.popped)
+		return;
+	if (!std_vec_try_reserve(result, captures.level.len, DOLTGRES_SETTLE_U32))
+	{
+		std_vec_free_Checked(&captures.level, DOLTGRES_SETTLE_PAIR);
+		std_handle_alloc_error(DOLTGRES_SETTLE_U32);
+	}
+	for (size_t i = 0; i < captures.level.len; i++)
+		std_vec_push_Checked(result, &STD_VEC_AT(&captures.level, doltgres_TupleU32U32_t, i).f0, DOLTGRES_SETTLE_U32);
+	std_vec_free_Checked(&captures.level, DOLTGRES_SETTLE_PAIR);
 }
 
 /* doltgres_settle_pending_captures_t is pending's captures: the tables it takes, while live, and its error. */
@@ -814,17 +808,21 @@ doltgres_settle_pin(HostIoIo *io, uint32 table, StdVec *columns, HostError *erro
 
 /*
  * doltgres_settle_held_captures_t is held's captures: the table, the copy it
- * makes, while live, and whether it found one.
+ * makes, whether it found one, and whether an allocation of the copy failed.
  */
 typedef struct doltgres_settle_held_captures_t
 {
 	uint32		table;
 	StdVec	   *result;
-	bool		copy_live;
 	bool		some;
+	bool		failed;
 } doltgres_settle_held_captures_t;
 
-/* doltgres_settle_held_op copies a table's old key columns, each column's key type cloned. */
+/*
+ * doltgres_settle_held_op copies a table's old key columns, each column's
+ * key type cloned, with fallible allocations alone, so a failed one leaves no
+ * copy and nothing unwinds under the lock (bugs row 517).
+ */
 static void
 doltgres_settle_held_op(DoltgresSettleSettling *settling, void *captures_)
 {
@@ -835,42 +833,42 @@ doltgres_settle_held_op(DoltgresSettleSettling *settling, void *captures_)
 	if (at == settling->pinned.len)
 		return;
 	columns = &STD_VEC_AT(&settling->pinned, doltgres_TupleU32Columns_t, at).f1;
-	std_vec_with_capacity_Checked(captures->result, columns->len, DOLTGRES_SETTLE_COLUMN);
-	captures->copy_live = true;
+	std_vec_new(captures->result, DOLTGRES_SETTLE_COLUMN);
+	if (!std_vec_try_reserve(captures->result, columns->len, DOLTGRES_SETTLE_COLUMN))
+	{
+		captures->failed = true;
+		return;
+	}
 	for (size_t i = 0; i < columns->len; i++)
 	{
 		const doltgres_TupleUsizeOrderKeyType_t *column = &STD_VEC_AT(columns, doltgres_TupleUsizeOrderKeyType_t, i);
 		doltgres_TupleUsizeOrderKeyType_t copy = {column->f0, column->f1};
 
-		access_key_KeyType_Clone_clone(&column->f2, &copy.f2);
+		if (!access_key_KeyType_try_clone(&column->f2, &copy.f2))
+		{
+			doltgres_settle_Columns_drop(captures->result);
+			captures->failed = true;
+			return;
+		}
 		std_vec_push_Checked(captures->result, &copy, DOLTGRES_SETTLE_COLUMN);
 	}
-	captures->copy_live = false;
 	captures->some = true;
-}
-
-/* doltgres_settle_held_unwound frees the copy held was making, while live. */
-static void
-doltgres_settle_held_unwound(void *captures_)
-{
-	doltgres_settle_held_captures_t *captures = captures_;
-
-	if (captures->copy_live)
-		doltgres_settle_Columns_drop(captures->result);
-	captures->copy_live = false;
 }
 
 /*
  * doltgres_settle_held returns a copy of a table's old key columns as its
  * naming recorded them, leaving them for its settle, or false for none; it
- * copies them, since the settle takes the record later.
+ * copies them, since the settle takes the record later, and raises a failed
+ * allocation of the copy once the lock is released.
  */
 bool
 doltgres_settle_held(HostIoIo *io, uint32 table, StdVec *result)
 {
 	doltgres_settle_held_captures_t captures = {.table = table, .result = result};
 
-	doltgres_settle_locked(io, doltgres_settle_held_op, &captures, doltgres_settle_held_unwound);
+	doltgres_settle_locked(io, doltgres_settle_held_op, &captures, NULL);
+	if (captures.failed)
+		std_handle_alloc_error(DOLTGRES_SETTLE_COLUMN);
 	return captures.some;
 }
 
@@ -901,3 +899,122 @@ doltgres_settle_pinned(HostIoIo *io, uint32 table, StdVec *result)
 	doltgres_settle_locked(io, doltgres_settle_pinned_op, &found, NULL);
 	return found.some;
 }
+
+#ifdef DOLTGRES_TEST_DOLTGRES
+#include "doltgres/pg/lib.h"
+#include "doltgres/simc/simc.h"
+#include "doltgres/std/test.h"
+
+#define RUST_FILE "doltgres" STD_SEP "src" STD_SEP "settle.rs"
+
+/* DoltgresSettleTestsCall is a failed-allocation case's call: the backend's Io, a table, and what the call returned. */
+typedef struct DoltgresSettleTestsCall
+{
+	HostIoIo   *io;
+	uint32		table;
+	StdVec		result;
+	bool		some;
+} DoltgresSettleTestsCall;
+
+/* doltgres_settle_tests_close is the close case's call: the innermost level closed. */
+static void
+doltgres_settle_tests_close(void *captures)
+{
+	DoltgresSettleTestsCall *call = captures;
+
+	doltgres_settle_closed(call->io, &call->result);
+}
+
+/* doltgres_settle_tests_hold is the held case's call: a copy of the table's old key columns. */
+static void
+doltgres_settle_tests_hold(void *captures)
+{
+	DoltgresSettleTestsCall *call = captures;
+
+	call->some = doltgres_settle_held(call->io, call->table, &call->result);
+}
+
+/* doltgres_settle_tests_failing runs a call with its nth allocation failing, answering whether it completed. */
+static bool
+doltgres_settle_tests_failing(void (*call) (void *captures), DoltgresSettleTestsCall *captures, uint32 nth)
+{
+	StdCaught	caught;
+	bool		ok;
+
+	pg_install();
+	pg_fail_nth_allocation(nth);
+	ok = std_catch_unwind(call, captures, &caught);
+	pg_fail_allocations(false);
+	if (!ok)
+		std_Caught_drop_Checked(&caught);
+	return ok;
+}
+
+/*
+ * test_doltgres_settle_tests_a_failed_allocation_in_a_close_keeps_the_outer_level:
+ * a close of an inner level whose allocations fail leaves the outer level's
+ * named table to the next close, which takes the list's lock again (bugs row
+ * 517). Before, the close allocated under the lock, its failure poisoned it,
+ * and the next take rebuilt an empty list.
+ */
+void
+test_doltgres_settle_tests_a_failed_allocation_in_a_close_keeps_the_outer_level(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostError	error;
+	DoltgresSettleTestsCall inner = {.io = io};
+	StdVec		outer;
+
+	STD_ASSERT(__LINE__, 5, doltgres_settle_opened(io, &error) && doltgres_settle_named(io, 1, 0, &error) &&
+			   doltgres_settle_opened(io, &error) && doltgres_settle_named(io, 2, 0, &error),
+			   "the two levels open with a table each");
+	STD_ASSERT(__LINE__, 5, !doltgres_settle_tests_failing(doltgres_settle_tests_close, &inner, 1),
+			   "a close whose reserve fails raises");
+	STD_ASSERT_EQ_U64(__LINE__, 5, pg_refused_size(), 4 * sizeof(uint32));
+	doltgres_settle_closed(io, &outer);
+	STD_ASSERT(__LINE__, 5, outer.len == 1 && STD_VEC_AT(&outer, uint32, 0) == 1,
+			   "the outer level's table outlived a failed close of the inner level");
+	std_vec_free_Checked(&outer, DOLTGRES_SETTLE_U32);
+	doltgres_settle_ended(io, true);
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * test_doltgres_settle_tests_a_failed_allocation_in_a_copy_of_old_key_columns_keeps_them:
+ * a copy of a pinned table's old key columns, an enum's labels among them,
+ * whose allocations fail leaves them pinned for the next copy, which takes
+ * the list's lock again (bugs row 517). Before, the copy cloned under the
+ * lock, its failure poisoned it, and the next take rebuilt a list with
+ * nothing pinned.
+ */
+void
+test_doltgres_settle_tests_a_failed_allocation_in_a_copy_of_old_key_columns_keeps_them(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostError	error;
+	StdVec		columns;
+	doltgres_TupleUsizeOrderKeyType_t column = {.f0 = 1, .f2 = access_key_KeyType_of(3500)};
+	access_TupleU32F32_t labels[] = {{16400, 1}, {16401, 2}};
+	DoltgresSettleTestsCall copy = {.io = io, .table = 9};
+	DoltgresSettleTestsCall again = {.io = io, .table = 9};
+
+	column.f2.inner.tag = ACCESS_KEY_INNER_ENUM;
+	std_slice_to_vec_Checked(&column.f2.inner.u.labels, labels, lengthof(labels), sizeof(access_TupleU32F32_t),
+							 _Alignof(access_TupleU32F32_t));
+	std_vec_new(&columns, DOLTGRES_SETTLE_COLUMN);
+	std_vec_push_Checked(&columns, &column, DOLTGRES_SETTLE_COLUMN);
+	STD_ASSERT(__LINE__, 5, doltgres_settle_pin(io, 9, &columns, &error), "the table's old key columns are pinned");
+	STD_ASSERT(__LINE__, 5, !doltgres_settle_tests_failing(doltgres_settle_tests_hold, &copy, 2),
+			   "a copy whose labels' clone fails raises");
+	STD_ASSERT_EQ_U64(__LINE__, 5, pg_refused_size(), 4 * sizeof(access_TupleU32F32_t));
+	doltgres_settle_tests_hold(&again);
+	STD_ASSERT(__LINE__, 5, again.some && again.result.len == 1 &&
+			   STD_VEC_AT(&again.result, doltgres_TupleUsizeOrderKeyType_t, 0).f2.inner.u.labels.len == 2,
+			   "the pinned columns outlived a failed copy");
+	doltgres_settle_Columns_drop(&again.result);
+	doltgres_settle_ended(io, true);
+	simc_TestIo_drop(&test_io);
+}
+#endif							/* DOLTGRES_TEST_DOLTGRES */

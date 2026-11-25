@@ -516,13 +516,14 @@ host_delta_list_List_open(const HostDeltaListList *self, uint64 *result, HostErr
 	return true;
 }
 
-static bool host_delta_list_List_at(const HostDeltaListList *self, const HostDeltaHold *hold, uint64 index,
-									HostDeltaListEntry *result, HostError *error);
+static bool host_delta_list_List_at(const HostDeltaListList *self, const HostDeltaHold *hold,
+									HostDeltaListCursor *cursor, uint64 index, HostDeltaListEntry *result,
+									HostError *error);
 
 /* host_delta_list_List_entry returns the entry at an index, refusing one past the list's length. */
 static bool
-host_delta_list_List_entry(const HostDeltaListList *self, const HostDeltaHold *hold, uint64 index,
-						   HostDeltaListEntry *result, HostError *error)
+host_delta_list_List_entry(const HostDeltaListList *self, const HostDeltaHold *hold, HostDeltaListCursor *cursor,
+						   uint64 index, HostDeltaListEntry *result, HostError *error)
 {
 	if (index >= host_delta_list_List_len(self))
 	{
@@ -531,7 +532,7 @@ host_delta_list_List_entry(const HostDeltaListList *self, const HostDeltaHold *h
 		*error = host_delta_list_internal(text, sizeof(text) - 1);
 		return false;
 	}
-	return host_delta_list_List_at(self, hold, index, result, error);
+	return host_delta_list_List_at(self, hold, cursor, index, result, error);
 }
 
 /*
@@ -550,6 +551,8 @@ host_delta_list_List_span(const HostDeltaListList *self, const HostDeltaHold *ho
 	STD_UNWIND_PUSH(&unwind);
 	if (sigsetjmp(unwind.jump, 0) == 0)
 	{
+		HostDeltaListCursor cursor = {0};
+
 		std_vec_new((StdVec *) &entries, sizeof(HostDeltaListEntry), _Alignof(HostDeltaListEntry));
 		entries_live = true;
 		if (!std_vec_try_reserve((StdVec *) &entries, (size_t) std_saturating_sub_u64(to, from),
@@ -565,7 +568,7 @@ host_delta_list_List_span(const HostDeltaListList *self, const HostDeltaHold *ho
 		{
 			HostDeltaListEntry entry;
 
-			if (!host_delta_list_List_at(self, hold, index, &entry, error))
+			if (!host_delta_list_List_at(self, hold, &cursor, index, &entry, error))
 			{
 				entries_live = false;
 				std_vec_free_Checked((StdVec *) &entries, sizeof(HostDeltaListEntry), _Alignof(HostDeltaListEntry));
@@ -587,13 +590,36 @@ host_delta_list_List_span(const HostDeltaListList *self, const HostDeltaHold *ho
 	return true;
 }
 
+/* host_delta_list_List_leaf opens the leaf page that holds an entry past the inline ones, from the list's root. */
+static bool
+host_delta_list_List_leaf(const HostDeltaListList *self, const HostDeltaHold *hold, uint64 entry,
+						  HostDeltaPageRef *result, HostError *error)
+{
+	uint64		level_end = 2;
+	uint64		level = host_delta_list_List_depth(self);
+	bool		level_done = level_end > level;
+
+	if (!host_delta_Hold_page(hold, host_delta_page_Page_named(host_delta_list_List_word(self, HOST_DELTA_LIST_ROOT)),
+							  result, error))
+		return false;
+	for (; !level_done; level_done = (level == level_end), level -= !level_done)
+	{
+		HostDeltaWord at;
+
+		if (!host_delta_PageRef_word(result, host_delta_list_digit(entry, level), &at, error))
+			return false;
+		if (!host_delta_Hold_page(hold, host_delta_page_Page_named(host_delta_Word_load(&at)), result, error))
+			return false;
+	}
+	return true;
+}
+
 /* host_delta_list_List_at returns the entry at an index the tree holds. */
 static bool
-host_delta_list_List_at(const HostDeltaListList *self, const HostDeltaHold *hold, uint64 index,
-						HostDeltaListEntry *result, HostError *error)
+host_delta_list_List_at(const HostDeltaListList *self, const HostDeltaHold *hold, HostDeltaListCursor *cursor,
+						uint64 index, HostDeltaListEntry *result, HostError *error)
 {
 	uint64		entry;
-	HostDeltaPageRef page;
 	HostDeltaWord word;
 
 	if (index < HOST_DELTA_LIST_INLINE)
@@ -602,25 +628,15 @@ host_delta_list_List_at(const HostDeltaListList *self, const HostDeltaHold *hold
 		return true;
 	}
 	entry = STD_SUB(u64, index, HOST_DELTA_LIST_INLINE, 325, 21);
-	if (!host_delta_Hold_page(hold, host_delta_page_Page_named(host_delta_list_List_word(self, HOST_DELTA_LIST_ROOT)),
-							  &page, error))
-		return false;
+	if (!cursor->has_leaf || cursor->leaf != STD_DIV_FOLDED(u64, entry, HOST_DELTA_LIST_FANOUT))
 	{
-		uint64		level_end = 2;
-		uint64		level = host_delta_list_List_depth(self);
-		bool		level_done = level_end > level;
-
-		for (; !level_done; level_done = (level == level_end), level -= !level_done)
-		{
-			HostDeltaWord at;
-
-			if (!host_delta_PageRef_word(&page, host_delta_list_digit(entry, level), &at, error))
-				return false;
-			if (!host_delta_Hold_page(hold, host_delta_page_Page_named(host_delta_Word_load(&at)), &page, error))
-				return false;
-		}
+		cursor->has_leaf = false;
+		if (!host_delta_list_List_leaf(self, hold, entry, &cursor->page, error))
+			return false;
+		cursor->has_leaf = true;
+		cursor->leaf = STD_DIV_FOLDED(u64, entry, HOST_DELTA_LIST_FANOUT);
 	}
-	if (!host_delta_PageRef_word(&page, STD_REM_FOLDED(u64, entry, HOST_DELTA_LIST_FANOUT), &word, error))
+	if (!host_delta_PageRef_word(&cursor->page, STD_REM_FOLDED(u64, entry, HOST_DELTA_LIST_FANOUT), &word, error))
 		return false;
 	result->tag = HOST_DELTA_LIST_AT_PAGED;
 	result->at.paged = word;
@@ -685,7 +701,9 @@ bool
 host_delta_list_ListView_entry(const HostDeltaListListView *self, const HostDeltaHold *hold,
 							   uint64 index, HostDeltaListEntry *result, HostError *error)
 {
-	return host_delta_list_List_entry(&self->list, hold, index, result, error);
+	HostDeltaListCursor cursor = {0};
+
+	return host_delta_list_List_entry(&self->list, hold, &cursor, index, result, error);
 }
 
 /* host_delta_list_ListView_get loads the entry at an index, refusing one past the list's length. */
@@ -693,9 +711,23 @@ bool
 host_delta_list_ListView_get(const HostDeltaListListView *self, const HostDeltaHold *hold,
 							 uint64 index, uint64 *result, HostError *error)
 {
+	HostDeltaListCursor cursor = {0};
+
+	return host_delta_list_ListView_get_at(self, hold, &cursor, index, result, error);
+}
+
+/*
+ * host_delta_list_ListView_get_at loads the entry at an index, refusing one
+ * past the list's length, as get does, through a cursor that keeps the leaf
+ * page it reached last (bugs row 355).
+ */
+bool
+host_delta_list_ListView_get_at(const HostDeltaListListView *self, const HostDeltaHold *hold,
+								HostDeltaListCursor *cursor, uint64 index, uint64 *result, HostError *error)
+{
 	HostDeltaListEntry entry;
 
-	if (!host_delta_list_List_entry(&self->list, hold, index, &entry, error))
+	if (!host_delta_list_List_entry(&self->list, hold, cursor, index, &entry, error))
 		return false;
 	*result = host_delta_list_Entry_load(&entry);
 	return true;
@@ -718,10 +750,11 @@ host_delta_list_ListMut_set(HostDeltaListListMut *self, const HostDeltaHold *hol
 {
 	uint64		length;
 	HostDeltaListEntry entry;
+	HostDeltaListCursor cursor = {0};
 
 	if (!host_delta_list_List_open(&self->list, &length, error))
 		return false;
-	if (!host_delta_list_List_entry(&self->list, hold, index, &entry, error))
+	if (!host_delta_list_List_entry(&self->list, hold, &cursor, index, &entry, error))
 		return false;
 	host_delta_list_Entry_store(&entry, value);
 	return true;
@@ -749,9 +782,10 @@ host_delta_list_ListMut_set_page(HostDeltaListListMut *self, const HostDeltaHold
 		uint64		length;
 		HostDeltaListEntry entry;
 		HostDeltaNames names;
+		HostDeltaListCursor cursor = {0};
 
 		if (!host_delta_list_List_open(&self->list, &length, (HostError *) &g_error) ||
-			!host_delta_list_List_entry(&self->list, hold, index, &entry, (HostError *) &g_error))
+			!host_delta_list_List_entry(&self->list, hold, &cursor, index, &entry, (HostError *) &g_error))
 		{
 			g_error_live = true;
 			page_live = false;
@@ -823,10 +857,11 @@ host_delta_list_ListMut_push(HostDeltaListListMut *self, const HostDeltaHold *ho
 {
 	uint64		length;
 	HostDeltaListEntry entry;
+	HostDeltaListCursor cursor = {0};
 
 	if (!host_delta_list_ListMut_slot(self, hold, spare, &length, error))
 		return false;
-	if (!host_delta_list_List_at(&self->list, hold, length, &entry, error))
+	if (!host_delta_list_List_at(&self->list, hold, &cursor, length, &entry, error))
 		return false;
 	host_delta_list_Entry_store(&entry, value);
 	host_delta_list_List_counted(&self->list, STD_ADD(u64, length, 1, 424, 27));
@@ -855,9 +890,10 @@ host_delta_list_ListMut_push_page(HostDeltaListListMut *self, const HostDeltaHol
 		uint64		length;
 		HostDeltaListEntry entry;
 		HostDeltaNames names;
+		HostDeltaListCursor cursor = {0};
 
 		if (!host_delta_list_ListMut_slot(self, hold, spare, &length, (HostError *) &g_error) ||
-			!host_delta_list_List_at(&self->list, hold, length, &entry, (HostError *) &g_error))
+			!host_delta_list_List_at(&self->list, hold, &cursor, length, &entry, (HostError *) &g_error))
 		{
 			g_error_live = true;
 			page_live = false;

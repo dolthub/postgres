@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The C port's test modules (the port text's section 13): one per test binary cargo builds, each built in that
-# binary's configuration, in the test installation only.
+# The C port's test modules (the port text's section 13): one per test binary of the crates' ported tests, each built
+# in that binary's configuration, in the test installation only.
 
 # The modules' link: on ELF, -Bsymbolic binds a module's references to its own definitions, so the server's copy of
 # the C port, which the postgres executable exports, doesn't take the place of the module's, built with its test
@@ -40,8 +40,8 @@ doltgres_cport_test_encoding = shared_module('doltgres_cport_test_encoding',
 )
 test_install_libs += doltgres_cport_test_encoding
 
-# encoding's tests/pg19_orders.rs, encoding built without its test switch over its closure, as cargo builds an
-# integration test, with the folder of encoding's tests, whose recorded orders it reads.
+# encoding's ported pg19_orders integration test, encoding built without its test switch over its closure, with the
+# folder of encoding's tests, whose recorded orders it reads.
 doltgres_cport_encoding_tests = configuration_data()
 doltgres_cport_encoding_tests.set_quoted('DOLTGRES_ENCODING_TESTS',
   meson.project_source_root() / 'src' / 'doltgres' / 'encoding' / 'tests')
@@ -70,7 +70,7 @@ if doltgres_rust
       '../../../std/c/test/sort/partial.c',
       '../../../std/c/test/num/flt2dec/estimator.c', '../../../std/c/test/num/flt2dec/mod.c',
       '../../../std/c/test/num/flt2dec/random.c', '../../../std/c/test/num/flt2dec/strategy/dragon.c',
-      '../../../std/c/test/num/flt2dec/strategy/grisu.c', 'doltgres_cport_test_run.c', 'doltgres_cport_test_judge.c', 'doltgres_cport_test_std.c'),
+      '../../../std/c/test/num/flt2dec/strategy/grisu.c', '../../../std/c/test/vec.c', '../../../std/c/test/zero_size.c', 'doltgres_cport_test_run.c', 'doltgres_cport_test_judge.c', 'doltgres_cport_test_std.c'),
     c_args: doltgres_cport_c_args + ['-DDOLTGRES_HOST_TESTING'],
     kwargs: doltgres_cport_test_mod_args + {
       'dependencies': pg_test_mod_args['dependencies'] + [zstd],
@@ -128,8 +128,7 @@ doltgres_cport_test_pg = shared_module('doltgres_cport_test_pg',
 )
 test_install_libs += doltgres_cport_test_pg
 
-# shmem's unit tests, shmem built with DOLTGRES_TEST_SHMEM over its closure (std and pg), as `cargo test -p shmem`
-# builds it.
+# shmem's unit tests, shmem built with DOLTGRES_TEST_SHMEM over its closure (std and pg).
 doltgres_cport_test_shmem = shared_module('doltgres_cport_test_shmem',
   doltgres_cport_std_sources + doltgres_cport_pg_sources + doltgres_cport_shmem_sources +
     files('doltgres_cport_test_run.c', 'doltgres_cport_test_judge.c', 'doltgres_cport_test_shmem.c'),
@@ -139,8 +138,7 @@ doltgres_cport_test_shmem = shared_module('doltgres_cport_test_shmem',
 )
 test_install_libs += doltgres_cport_test_shmem
 
-# pghost's unit tests, pghost built with DOLTGRES_TEST_PGHOST over its closure (std, host, pg, and shmem), as
-# `cargo test -p pghost` builds it.
+# pghost's unit tests, pghost built with DOLTGRES_TEST_PGHOST over its closure (std, host, pg, and shmem).
 doltgres_cport_test_pghost = shared_module('doltgres_cport_test_pghost',
   doltgres_cport_std_sources + doltgres_cport_host_sources + doltgres_cport_pg_sources +
     doltgres_cport_shmem_sources + doltgres_cport_pghost_sources +
@@ -242,8 +240,7 @@ if doltgres_rust
   test_install_libs += doltgres_cport_test_doltgres
 endif
 
-# access' unit tests, access built with DOLTGRES_TEST_ACCESS over its closure (std, host, chunks, encoding, and pg),
-# as `cargo test -p access` builds it.
+# access' unit tests, access built with DOLTGRES_TEST_ACCESS over its closure (std, host, chunks, encoding, and pg).
 doltgres_cport_test_access = shared_module('doltgres_cport_test_access',
   doltgres_cport_std_sources + doltgres_cport_host_sources + doltgres_cport_chunks_sources +
     doltgres_cport_encoding_sources + doltgres_cport_pg_sources + doltgres_cport_access_sources +

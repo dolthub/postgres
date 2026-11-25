@@ -78,11 +78,14 @@ extern bool chunks_packs_backend_copied_file(HostIoIoDoors io, const char *from_
 											 const char *to_path, size_t to_path_len, ChunksErrorError *error);
 extern bool chunks_packs_backend_Packs_close(ChunksPacksBackendPacks *self, HostIoIo *io,
 											 const HostSharedReader *reading, ChunksErrorError *error);
-extern bool chunks_packs_backend_Packs_flush(const ChunksPacksBackendPacks *self, HostIoIo *io,
+extern bool chunks_packs_backend_Packs_flush(const ChunksPacksBackendPacks *self, HostIoTakesShort io,
 											 const HostSharedReader *reading, ChunksErrorError *error);
 extern bool chunks_packs_backend_Packs_copied(const ChunksPacksBackendPacks *self, HostIoIo *io,
 											  const HostSharedReader *reading, const char *into, size_t into_len,
 											  ChunksErrorError *error);
+extern bool chunks_packs_backend_Packs_created(const ChunksPacksBackendPacks *self, HostIoIo *io,
+											   const HostSharedReader *reading, uint32 database, uint32 own,
+											   ChunksErrorError *error);
 extern uint64 chunks_packs_backend_Packs_location(const ChunksPacksBackendPacks *self);
 extern bool chunks_packs_backend_Packs_find(const ChunksPacksBackendPacks *self, HostIoIo *io,
 											const HostSharedReader *reading, const ChunksAddressAddress *address,
@@ -201,6 +204,9 @@ extern bool chunks_packs_backend_Packs_even_manifest(const ChunksPacksBackendPac
 													 ChunksErrorError *error);
 extern bool chunks_packs_backend_Packs_compact(const ChunksPacksBackendPacks *self, HostIoTakesShort io,
 											   const HostSharedReader *reading, bool all, ChunksErrorError *error);
+extern bool chunks_packs_backend_Packs_remove_space(const ChunksPacksBackendPacks *self, HostIoTakesShort io,
+													const HostSharedReader *reading, uint32 space,
+													ChunksErrorError *error);
 
 #ifdef DOLTGRES_TEST_CHUNKS
 extern void test_chunks_packs_backend_tests_a_collection_keeps_every_pack_from_the_lowest_a_process_has_open(void);
@@ -211,6 +217,7 @@ extern void test_chunks_packs_backend_tests_a_read_of_a_kept_file_at_any_step_of
 extern void test_chunks_packs_backend_tests_a_collection_between_a_writers_slot_and_its_number_keeps_the_writers_pack(void);
 extern void test_chunks_packs_backend_tests_a_terminated_backends_exit_removes_its_dropped_writers_file_and_appends_its_deferred_adds(void);
 extern void test_chunks_packs_backend_tests_a_failed_append_at_a_backends_exit_leaves_the_add_for_the_next_close(void);
+extern void test_chunks_packs_backend_tests_a_failed_allocation_in_a_packs_over_keeps_the_process_list(void);
 extern void test_chunks_packs_backend_tests_a_writers_number_is_under_a_bound_the_table_holds(void);
 extern void test_chunks_packs_backend_tests_a_repository_at_its_last_number_refuses_a_writer(void);
 extern void test_chunks_packs_backend_tests_a_manifests_write_marks_the_record_while_its_generations_may_differ(void);

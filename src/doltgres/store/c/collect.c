@@ -30,6 +30,7 @@
 #include "doltgres/chunks/file.h"
 #include "doltgres/chunks/header.h"
 #include "doltgres/chunks/pack.h"
+#include "doltgres/chunks/packs.h"
 #include "doltgres/chunks/packs/backend.h"
 #include "doltgres/chunks/packs/marking.h"
 #include "doltgres/chunks/packs/open.h"
@@ -45,21 +46,24 @@
 #include "doltgres/std/int128.h"
 #include "doltgres/std/num.h"
 #include "doltgres/std/slice.h"
+#include "doltgres/std/str.h"
 #include "doltgres/std/sync.h"
 #include "doltgres/std/time.h"
 #include "doltgres/std/tuple.h"
 #include "doltgres/std/unwind.h"
 #include "doltgres/std/vec.h"
 #include "doltgres/store/collect.h"
+#include "doltgres/store/lib.h"
 #include "doltgres/store/databases.h"
 #include "doltgres/txn/roots.h"
 #include "doltgres/txn/state.h"
 
 #ifdef DOLTGRES_TEST_STORE
 #include "doltgres/chunks/address.h"
+#include "doltgres/chunks/packs/check.h"
 #include "doltgres/simc/simc.h"
-#include "doltgres/std/str.h"
 #include "doltgres/std/test.h"
+#include "doltgres/std/test_fs.h"
 #include "doltgres/store/fixtures.h"
 #endif
 
@@ -360,7 +364,12 @@ store_collect_nanos(uint64 bytes, uint64 limit)
 	return quotient;
 }
 
-/* store_collect_Pacer_pace counts bytes read or copied and naps until they fit the limit. */
+/*
+ * store_collect_Pacer_pace counts bytes read or copied and naps until they
+ * fit the limit, first checking for a cancel or a stop, as Doltgrust's pace
+ * checks its stop before anything else, so a marking or a copy stops within
+ * a chunk (bugs row 503).
+ */
 static bool
 store_collect_Pacer_pace(StoreCollectPacer *self, HostIoIo *io, uint64 bytes, HostError *error)
 {
@@ -368,6 +377,8 @@ store_collect_Pacer_pace(StoreCollectPacer *self, HostIoIo *io, uint64 bytes, Ho
 	StdDuration wait;
 	StdInstant	now;
 
+	if (!host_io_Io_check(io, error))
+		return false;
 	if (self->limit == 0)
 		return true;
 	if (!self->has_started)
@@ -1456,14 +1467,25 @@ typedef struct store_collect_verified_frame_0_t
 	bool		wanted_live;
 	StdString	message;
 	bool		message_live;
+
+	/*
+	 * holding is whether it holds the process's interrupts, which its pad
+	 * gives back.
+	 */
+	bool		holding;
 } store_collect_verified_frame_0_t;
 
-/* store_collect_verified_pad_0 is verified's pad: a heal's message, the packs wanted, the marks, the capture, the numbers on a failure, then the retirement. */
+/* store_collect_verified_pad_0 is verified's pad: the interrupts it holds, a heal's message, the packs wanted, the marks, the capture, the numbers on a failure, then the retirement. */
 static void
 store_collect_verified_pad_0(void *frame_)
 {
 	store_collect_verified_frame_0_t *frame = frame_;
 
+	if (frame->holding)
+	{
+		frame->holding = false;
+		host_io_Io_resume(frame->io);
+	}
 	if (frame->message_live)
 	{
 		frame->message_live = false;
@@ -1493,6 +1515,81 @@ store_collect_verified_pad_0(void *frame_)
 	}
 }
 
+/* store_collect_capture_redo stores a capture's redo point, zero for none, into the store's record; the collector is its only writer. */
+static bool
+store_collect_capture_redo(HostLsn redo, HostError *error)
+{
+	HostSharedRecord record;
+	HostSharedOp load = {.tag = HOST_SHARED_OP_LOAD};
+	HostSharedOp exchange = {.tag = HOST_SHARED_OP_EXCHANGE};
+
+	if (!host_shared_single(&STORE_STORE_STATE_SINGLE_OPS, &record, error))
+		return false;
+	exchange.u.exchange.f0 = host_shared_Record_atomic(record, STORE_CAPTURE_REDO_INDEX, load);
+	exchange.u.exchange.f1 = redo;
+	(void) host_shared_Record_atomic(record, STORE_CAPTURE_REDO_INDEX, exchange);
+	return true;
+}
+
+/* store_collect_captured_frame_0_t is captured's state across its pad: its arguments, and whether it keeps the WAL. */
+typedef struct store_collect_captured_frame_0_t
+{
+	HostIoIo   *io;
+	uint32		database;
+	TxnRootsCaptured *result;
+	HostError  *error;
+	bool		ok;
+	bool		holding;
+} store_collect_captured_frame_0_t;
+
+/* store_collect_captured_body_0 is captured's body. */
+static void
+store_collect_captured_body_0(void *frame_)
+{
+	store_collect_captured_frame_0_t *frame = frame_;
+	HostIoIoDoors doors = HOST_IO_IO_IO_DOORS(frame->io);
+	HostLsn		redo;
+	HostLsn		again;
+
+	if (!host_last_redo(doors, &redo, frame->error) || !store_collect_capture_redo(redo, frame->error))
+		return;
+	frame->holding = true;
+	if (!host_last_redo(doors, &again, frame->error))
+		return;
+	frame->ok = txn_roots_roots(frame->io, frame->database, Max(redo, again), frame->result, frame->error);
+}
+
+/* store_collect_captured_pad_0 is captured's pad: it stops keeping the WAL. */
+static void
+store_collect_captured_pad_0(void *frame_)
+{
+	store_collect_captured_frame_0_t *frame = frame_;
+	HostError	failed;
+
+	if (frame->holding && !store_collect_capture_redo(0, &failed))
+		host_Error_drop(&failed);
+	frame->holding = false;
+}
+
+/*
+ * store_collect_captured captures a repository's roots for a collection, the
+ * WAL's from the last checkpoint's redo point among them, as Doltgrust's
+ * capture_roots does, keeping that WAL while it reads, as its collection's
+ * hold of the WAL does: it stores the redo point for KeepLogSeg, reads it
+ * again, and reads the WAL from the newer, since a checkpoint that moved it
+ * before the store recycled only what recovery no longer reads (bugs row
+ * 406).
+ */
+static bool
+store_collect_captured(HostIoIo *io, uint32 database, TxnRootsCaptured *result, HostError *error)
+{
+	store_collect_captured_frame_0_t frame = {.io = io, .database = database, .result = result, .error = error};
+
+	std_landing(&frame, store_collect_captured_body_0, store_collect_captured_pad_0);
+	store_collect_captured_pad_0(&frame);
+	return frame.ok;
+}
+
 /* store_collect_verified_marked marks from a fresh capture of the roots and finds the retired packs to list again, none when it reaches every chunk. */
 static bool
 store_collect_verified_marked(store_collect_verified_frame_0_t *frame)
@@ -1503,7 +1600,7 @@ store_collect_verified_marked(store_collect_verified_frame_0_t *frame)
 	StdVec		pending;
 	StdVec		touched;
 
-	if (!txn_roots_roots(frame->io, frame->database, &frame->captured, frame->error))
+	if (!store_collect_captured(frame->io, frame->database, &frame->captured, frame->error))
 		return false;
 	frame->captured_live = true;
 	if (!store_collect_pending(frame->io, frame->repo, &frame->captured, &pending, frame->error))
@@ -1532,6 +1629,37 @@ store_collect_verified_marked(store_collect_verified_frame_0_t *frame)
 	return true;
 }
 
+/*
+ * store_collect_verified_restored, for a verify that failed before its
+ * queue, lists again every pack the retirement still holds, as Doltgrust's
+ * settle unretires them, so that a failed check never deletes a pack (bugs
+ * row 503); the vectors no listed pack names then are the next marking's
+ * pass's to queue (H14). Interrupts wait meanwhile, since a pending
+ * termination would fail each restore's own checks. The verify's error
+ * stays the answer unless a restore fails, whose error then replaces it.
+ */
+static void
+store_collect_verified_restored(store_collect_verified_frame_0_t *frame)
+{
+	ChunksErrorError failed;
+	uint64		fresh;
+	bool		ok = true;
+
+	host_io_Io_hold(frame->io);
+	frame->holding = true;
+	while (ok && frame->retired->listed.len != 0)
+		ok = chunks_packs_retire_Retired_restore(frame->retired, frame->io, frame->reading,
+												 STD_VEC_AT(&frame->retired->listed, ChunksPacksTableEntry, 0).f0,
+												 &fresh, &failed);
+	frame->holding = false;
+	host_io_Io_resume(frame->io);
+	if (!ok)
+	{
+		host_Error_drop(frame->error);
+		*frame->error = chunks_packs_shared_raised(&failed);
+	}
+}
+
 /* store_collect_verified_body_0 is verified's body: marking again until it reaches every chunk, each retired pack it wants listed again, then the rest queued. */
 static void
 store_collect_verified_body_0(void *frame_)
@@ -1542,11 +1670,11 @@ store_collect_verified_body_0(void *frame_)
 	frame->ok = false;
 	std_vec_new(frame->result, sizeof(uint64), _Alignof(uint64));
 	if (!host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-collector-retired", frame->error))
-		goto done;
+		goto restored;
 	for (;;)
 	{
 		if (!store_collect_verified_marked(frame))
-			goto done;
+			goto restored;
 		if (frame->wanted.len == 0)
 			break;
 		for (size_t k = 0, k_len = frame->wanted.len; k < k_len; k++)
@@ -1563,12 +1691,12 @@ store_collect_verified_body_0(void *frame_)
 			if (!chunks_packs_retire_Retired_restore(frame->retired, frame->io, frame->reading, number, &fresh, &failed))
 			{
 				*frame->error = chunks_packs_shared_raised(&failed);
-				goto done;
+				goto restored;
 			}
 			if (!std_vec_try_reserve(frame->result, 1, sizeof(uint64), _Alignof(uint64)))
 			{
 				*frame->error = host_Error_out_of_memory();
-				goto done;
+				goto restored;
 			}
 			std_vec_push_Checked(frame->result, &fresh, sizeof(fresh), _Alignof(uint64));
 			std_fmt_format_Checked(&frame->message, &arguments);
@@ -1578,7 +1706,7 @@ store_collect_verified_body_0(void *frame_)
 			frame->message_live = false;
 			std_String_drop(&frame->message);
 			if (!logged)
-				goto done;
+				goto restored;
 		}
 		frame->wanted_live = false;
 		std_vec_free_Checked(&frame->wanted, sizeof(uint64), _Alignof(uint64));
@@ -1590,6 +1718,10 @@ store_collect_verified_body_0(void *frame_)
 		goto done;
 	}
 	frame->ok = true;
+	goto done;
+
+restored:
+	store_collect_verified_restored(frame);
 done:
 	store_collect_verified_pad_0(frame);
 }
@@ -1812,25 +1944,38 @@ raised:
 	return false;
 }
 
-/* store_collect_retiring_t is a retirement's keep's captures: the copies the marking reached, the packs chosen, the packs kept with dead copies, and their vectors' generation. */
+/* store_collect_retiring_t is a retirement's keep's captures: the collection's io and packs, the copies the marking reached, the packs chosen, the packs kept with dead copies, and their vectors' generation. */
 typedef struct store_collect_retiring_t
 {
+	HostIoIo   *io;
+	const ChunksPacksBackendPacks *packs;
 	const StdVec *seen;
 	const StdVec *chosen;
 	const StdVec *partly;
 	uint64		generation;
 } store_collect_retiring_t;
 
+static bool store_collect_retiring(void *captures, ChunksPacksRetireMarking *marking, StdVec *entries,
+								   StdVec *result, ChunksErrorError *error) STD_REQUIRES(CHUNKS_PACKS_BARRIER_HOLDING);
+
 /*
  * store_collect_retiring is a retirement's keep: every pack chosen when a
  * writer was answered with a copy the marking didn't reach, and otherwise
- * none, each pack kept with dead copies given its deletion vector.
+ * none, each pack kept with dead copies given its deletion vector, with a
+ * check for a cancel or a stop before each, since each is a durable change
+ * of its own and a Postgres process acts on a signal only at such a check
+ * (bugs row 499); Doltgrust checks its stop once before the retirement, as
+ * its keep writes no vector. The vectors' generation passes every one on
+ * disk, read here under the barrier, since a marking another collection took
+ * over still retires (H14).
  */
 static bool
 store_collect_retiring(void *captures, ChunksPacksRetireMarking *marking, StdVec *entries, StdVec *result,
 					   ChunksErrorError *error)
 {
 	const store_collect_retiring_t *retiring = captures;
+	uint64		highest = 0;
+	uint64		generation;
 	bool		unseen = false;
 
 	for (size_t k = 0, k_len = entries->len; k < k_len && !unseen; k++)
@@ -1846,12 +1991,22 @@ store_collect_retiring(void *captures, ChunksPacksRetireMarking *marking, StdVec
 			(void) store_collect_numbers_insert(result, STD_VEC_AT(retiring->chosen, uint64, k));
 		return true;
 	}
+	if (retiring->partly->len != 0 &&
+		!chunks_packs_marking_Packs_highest_vector(retiring->packs, retiring->io, &highest, error))
+		return false;
+	generation = Max(retiring->generation, STD_ADD(u64, highest, 1, 546, 39));
 	for (size_t k = 0, k_len = retiring->partly->len; k < k_len; k++)
 	{
 		const store_collect_partly_t *partly = &STD_VEC_AT(retiring->partly, store_collect_partly_t, k);
+		HostError	stopped;
 		bool		set;
 
-		if (!chunks_packs_retire_Marking_set_dead(marking, partly->number, retiring->generation, &partly->offsets, &set,
+		if (!host_io_Io_check(retiring->io, &stopped))
+		{
+			*error = chunks_error_Error_FromError_from(&stopped);
+			return false;
+		}
+		if (!chunks_packs_retire_Marking_set_dead(marking, partly->number, generation, &partly->offsets, &set,
 												  error))
 			return false;
 	}
@@ -1869,6 +2024,13 @@ typedef struct store_collect_marked_frame_0_t
 	uint64		newest;
 	uint64		limit;
 	uint64		percent;
+	uint32		emptied;
+
+	/*
+	 * ended is whether the retirement ended the marking, which a failure
+	 * after it then doesn't end again.
+	 */
+	bool	   *ended;
 	bool	   *has_result;
 	StoreCollectCollected *result;
 	HostError  *error;
@@ -2036,7 +2198,7 @@ store_collect_marked_marks(store_collect_marked_frame_0_t *frame, bool *stopped)
 	if (!chunks_packs_roots_Packs_registered(packs, frame->io, &registered, &failed))
 		return store_collect_raised(frame, &failed);
 	if (!host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-collector-registered", frame->error) ||
-		!txn_roots_roots(frame->io, frame->database, &frame->captured, frame->error))
+		!store_collect_captured(frame->io, frame->database, &frame->captured, frame->error))
 	{
 		std_vec_free_Checked(&registered, sizeof(chunks_TupleAddressLocator_t), _Alignof(chunks_TupleAddressLocator_t));
 		return false;
@@ -2131,6 +2293,8 @@ store_collect_marked_choose(store_collect_marked_frame_0_t *frame)
 		live = store_collect_bytes_get(&frame->marks.bytes, entry.f0);
 		if (live == 0)
 			std_vec_push_Checked(&frame->dead, &entry.f0, sizeof(uint64), _Alignof(uint64));
+		else if (entry.f1 == frame->emptied && frame->emptied != CHUNKS_PACKS_DEFAULT_SPACE)
+			store_collect_copied_push(&frame->copied, CHUNKS_PACKS_DEFAULT_SPACE, entry.f0);
 		else if (store_collect_over(chunks_pack_PackReader_records_len(std_arc_Deref_deref(reader,
 																						   _Alignof(ChunksPackPackReader))),
 									live, frame->percent))
@@ -2280,6 +2444,8 @@ store_collect_marked_retire(store_collect_marked_frame_0_t *frame)
 	wanted = STD_ADD(usize, STD_MUL(usize, frame->chosen.len, 3, 553, 43), frame->partly.len, 553, 43);
 	if (!chunks_packs_removal_reserve(frame->io, wanted, &reservation, &failed))
 		return store_collect_raised(frame, &failed);
+	retiring.io = frame->io;
+	retiring.packs = packs;
 	retiring.seen = &frame->marks.seen;
 	retiring.chosen = &frame->chosen;
 	retiring.partly = &frame->partly;
@@ -2290,6 +2456,7 @@ store_collect_marked_retire(store_collect_marked_frame_0_t *frame)
 										  &failed))
 		return store_collect_raised(frame, &failed);
 	frame->retirement_live = true;
+	*frame->ended = true;
 	return true;
 }
 
@@ -2387,12 +2554,12 @@ done:
  */
 static bool
 store_collect_marked(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading, uint32 database,
-					 const StdVec *old, uint64 newest, uint64 limit, uint64 percent, bool *has_result,
-					 StoreCollectCollected *result, HostError *error)
+					 const StdVec *old, uint64 newest, uint64 limit, uint64 percent, uint32 emptied, bool *ended,
+					 bool *has_result, StoreCollectCollected *result, HostError *error)
 {
 	store_collect_marked_frame_0_t frame = {.io = io, .repo = repo, .reading = reading, .database = database,
-		.old = old, .newest = newest, .limit = limit, .percent = percent, .has_result = has_result, .result = result,
-	.error = error};
+		.old = old, .newest = newest, .limit = limit, .percent = percent, .emptied = emptied, .ended = ended,
+	.has_result = has_result, .result = result, .error = error};
 
 	std_landing(&frame, store_collect_marked_body_0, store_collect_marked_pad_0);
 	return frame.ok;
@@ -2406,13 +2573,14 @@ store_collect_marked(HostIoIo *io, const RepoRepo *repo, const HostSharedReader 
  */
 static bool
 store_collect_marking(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading, uint32 database,
-					  const StdVec *old, uint64 limit, uint64 percent, bool *has_result,
+					  const StdVec *old, uint64 limit, uint64 percent, uint32 emptied, bool *has_result,
 					  StoreCollectCollected *result, HostError *error)
 {
 	const ChunksPacksBackendPacks *packs = &repo->packs;
 	ChunksErrorError failed;
 	HostError	collect_error;
 	uint64		newest;
+	bool		ended = false;
 	uint8		code[5];
 	StdString	message;
 	StdFmtPiece pieces[] = {STD_FMT_LIT("could not collect the repository of database "), STD_FMT_ARG(0)};
@@ -2421,8 +2589,8 @@ store_collect_marking(HostIoIo *io, const RepoRepo *repo, const HostSharedReader
 
 	if (!chunks_packs_marking_Packs_begin_marking(packs, io, reading, &newest, &failed))
 		goto raised;
-	if (store_collect_marked(io, repo, reading, database, old, newest, limit, percent, has_result, result,
-							 &collect_error))
+	if (store_collect_marked(io, repo, reading, database, old, newest, limit, percent, emptied, &ended, has_result,
+							 result, &collect_error))
 	{
 		if (*has_result)
 			return true;
@@ -2433,7 +2601,7 @@ store_collect_marking(HostIoIo *io, const RepoRepo *repo, const HostSharedReader
 	memcpy(code, host_Error_sqlstate(&collect_error), 5);
 	if (!host_warn(HOST_IO_IO_IO_DOORS(io), &collect_error, "versioned collection", error))
 		return false;
-	if (!chunks_packs_marking_Packs_end_marking(packs, io, &failed))
+	if (!ended && !chunks_packs_marking_Packs_end_marking(packs, io, &failed))
 		goto raised;
 	std_fmt_format_Checked(&message, &arguments);
 	*error = host_Error_fork(code, &message);
@@ -2441,6 +2609,60 @@ store_collect_marking(HostIoIo *io, const RepoRepo *repo, const HostSharedReader
 raised:
 	*error = chunks_packs_shared_raised(&failed);
 	return false;
+}
+
+/* store_collect_collected_frame_0_t is collected's state across its pad: its arguments, and whether its collection began. */
+typedef struct store_collect_collected_frame_0_t
+{
+	HostIoIo   *io;
+	const RepoRepo *repo;
+	const HostSharedReader *reading;
+	uint32		database;
+	uint64		limit;
+	uint64		percent;
+	uint32		emptied;
+	const StdVec *old;
+	bool	   *has_result;
+	StoreCollectCollected *result;
+	HostError  *error;
+	bool		ok;
+	bool		began;
+} store_collect_collected_frame_0_t;
+
+/* store_collect_collected_body_0 is collected's body: the collection, once a base backup counted in doesn't keep it from beginning. */
+static void
+store_collect_collected_body_0(void *frame_)
+{
+	store_collect_collected_frame_0_t *frame = frame_;
+
+	if (!txn_state_usable(frame->io, frame->database, frame->error))
+		return;
+	if (!host_collection_begin())
+	{
+		frame->ok = true;
+		return;
+	}
+	frame->began = true;
+	frame->ok = store_collect_marking(frame->io, frame->repo, frame->reading, frame->database, frame->old,
+									  frame->limit, frame->percent, frame->emptied, frame->has_result, frame->result,
+									  frame->error);
+}
+
+/*
+ * store_collect_collected_pad_0 is collected's pad: it ends the collection
+ * once begun, an unwind's too, so that no base backup waits on it forever
+ * (bugs row 499).
+ */
+static void
+store_collect_collected_pad_0(void *frame_)
+{
+	store_collect_collected_frame_0_t *frame = frame_;
+
+	if (frame->began)
+	{
+		frame->began = false;
+		host_collection_end();
+	}
 }
 
 /*
@@ -2451,23 +2673,24 @@ raised:
  * base backup is counted in. Its marking's reads and its copies run at limit
  * bytes a second, or unpaced at 0, and it copies out the live chunks of a
  * pack that passes them by percent. It answers nothing when a base backup
- * kept it from finishing.
+ * kept it from finishing. A tablespace it empties, unless that is
+ * CHUNKS_PACKS_DEFAULT_SPACE, has the live chunks of each of its packs copied
+ * into the repository's own directory whatever their share, so that the
+ * packs retire, as DROP TABLESPACE needs (bugs row 99).
  */
 bool
 store_collect_collected(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading, uint32 database,
-						uint64 limit, uint64 percent, const StdVec *old, bool *has_result,
+						uint64 limit, uint64 percent, uint32 emptied, const StdVec *old, bool *has_result,
 						StoreCollectCollected *result, HostError *error)
 {
-	bool		done;
+	store_collect_collected_frame_0_t frame = {.io = io, .repo = repo, .reading = reading, .database = database,
+		.limit = limit, .percent = percent, .emptied = emptied, .old = old, .has_result = has_result,
+	.result = result, .error = error};
 
 	*has_result = false;
-	if (!txn_state_usable(io, database, error))
-		return false;
-	if (!host_collection_begin())
-		return true;
-	done = store_collect_marking(io, repo, reading, database, old, limit, percent, has_result, result, error);
-	host_collection_end();
-	return done;
+	std_landing(&frame, store_collect_collected_body_0, store_collect_collected_pad_0);
+	store_collect_collected_pad_0(&frame);
+	return frame.ok;
 }
 
 /* store_collect_Collected_drop drops what a collection did, its old packs. */
@@ -2710,8 +2933,8 @@ store_collect_checked(HostIoIo *io, uint32 repository, const StoreCollectDatabas
 			old = held->old;
 			std_vec_new(&held->old, sizeof(uint64), _Alignof(uint64));
 		}
-		if (!store_collect_collected(io, &repo, reading, database->id, limit, settings->target_percent, &old, &has_done,
-									 &done, error))
+		if (!store_collect_collected(io, &repo, reading, database->id, limit, settings->target_percent,
+									 CHUNKS_PACKS_DEFAULT_SPACE, &old, &has_done, &done, error))
 		{
 			std_vec_free_Checked(&old, sizeof(uint64), _Alignof(uint64));
 			goto dropped;
@@ -2832,6 +3055,8 @@ store_collect_collect_due_body_0(void *frame_)
 	bool		measured;
 
 	frame->ok = false;
+	if (!store_collect_capture_redo(0, frame->error))
+		goto done;
 	if (!host_shared_read(io, &frame->reading, frame->error))
 		goto done;
 	frame->reading_live = true;
@@ -2895,6 +3120,8 @@ store_collect_collect_due_body_0(void *frame_)
 			store_collect_Held_drop(&entry->held);
 	}
 	frame->schedule->held.len = kept;
+	if (!host_pause(HOST_SHARED_IO_PAUSES(io), "doltgres-collector-removing", frame->error))
+		goto done;
 	if (!chunks_packs_removal_remove_due(io, &failed))
 	{
 		*frame->error = chunks_packs_shared_raised(&failed);
@@ -2914,7 +3141,9 @@ done:
  * database is gone is forgotten. Each repository is checked under its
  * database's lock, taken without waiting and passed over when a session
  * holds it, and opened only for its check; one that stands only as a
- * committed move's copy is passed over.
+ * committed move's copy is passed over. It first drops the redo point of a
+ * capture a terminated collector left, so its WAL is kept no longer (bugs
+ * row 406).
  */
 bool
 store_collect_collect_due(HostIoIo *io, StoreCollectSchedule *schedule, const StoreCollectDatabase *databases,
@@ -2927,9 +3156,88 @@ store_collect_collect_due(HostIoIo *io, StoreCollectSchedule *schedule, const St
 	return frame.ok;
 }
 
-/* store_collect_asked is an ask's full collection under its database's lock, the repository opened for it and closed after; its caller gives the lock back however it ends. */
+/*
+ * store_collect_unlisted takes an emptied tablespace out of a repository's
+ * lists once the repository lists none of its packs (bugs row 99).
+ */
 static bool
-store_collect_asked(HostIoIo *io, uint32 repository, const StoreCollectDatabase *database,
+store_collect_unlisted(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading, uint32 emptied,
+					   HostError *error)
+{
+	ChunksErrorError failed;
+	StdVec		spaces;
+	bool		listed = false;
+
+	if (!chunks_packs_backend_Packs_spaces(&repo->packs, io, reading, &spaces, &failed))
+	{
+		*error = chunks_packs_shared_raised(&failed);
+		return false;
+	}
+	for (size_t k = 0, k_len = spaces.len; k < k_len; k++)
+		listed |= STD_VEC_AT(&spaces, std_TupleU64U32_t, k).f1 == emptied;
+	std_vec_free_Checked(&spaces, sizeof(std_TupleU64U32_t), _Alignof(std_TupleU64U32_t));
+	if (listed)
+		return true;
+	if (!chunks_packs_backend_Packs_remove_space(&repo->packs, HOST_IO_IO_TAKES_SHORT(io), reading, emptied, &failed))
+	{
+		*error = chunks_packs_shared_raised(&failed);
+		return false;
+	}
+	return true;
+}
+
+/*
+ * store_collect_emptied removes the files due removal, and then a
+ * repository's directory in an emptied tablespace once no pack file is left
+ * in it, every one either copied out and retired with its readers ended or
+ * never listed; a pack file still there, a pack being written included,
+ * leaves the directory for a later ask. A writer that opens in the
+ * tablespace after the directory's listing finds it gone and its pack's
+ * write fails, which leaves its fold's delta for a retry that makes the
+ * directory again, and its relation's own file there makes Postgres refuse
+ * the DROP.
+ */
+static bool
+store_collect_emptied(HostIoIo *io, uint32 database, uint32 emptied, HostError *error)
+{
+	ChunksErrorError failed;
+	StdPathBuf	dir;
+	StdVec		names;
+	bool		has;
+	bool		packed = false;
+	bool		removed;
+	bool		ok = true;
+
+	if (!chunks_packs_removal_remove_due(io, &failed))
+	{
+		*error = chunks_packs_shared_raised(&failed);
+		return false;
+	}
+	dir = host_tablespace_dir(database, emptied);
+	if (!host_list_dir_if_there(HOST_IO_IO_READ_DOORS(io), (const char *) dir.bytes.ptr, dir.bytes.len, &has, &names,
+								error))
+		ok = false;
+	else if (has)
+	{
+		for (size_t k = 0, k_len = names.len; k < k_len; k++)
+		{
+			const StdString *name = &STD_VEC_AT(&names, StdString, k);
+
+			packed |= (name->len >= 5 && memcmp((const char *) name->ptr + name->len - 5, ".pack", 5) == 0) ||
+				(name->len >= 9 && memcmp((const char *) name->ptr + name->len - 9, ".pack.tmp", 9) == 0);
+		}
+		std_vec_drop_Checked(&names, sizeof(StdString), _Alignof(StdString), std_String_drop);
+		if (!packed)
+			ok = host_remove_tree(HOST_IO_IO_IO_DOORS(io), (const char *) dir.bytes.ptr, dir.bytes.len, &removed,
+								  error);
+	}
+	std_vec_free_Checked(&dir.bytes, 1, 1);
+	return ok;
+}
+
+/* store_collect_asked is an ask's full collection under its database's lock, emptying the tablespace it names, the repository opened for it and closed after; its caller gives the lock back however it ends. */
+static bool
+store_collect_asked(HostIoIo *io, uint32 repository, const StoreCollectDatabase *database, uint32 emptied,
 					const StoreCollectSettings *settings, bool *has_result, StoreCollectCollected *result,
 					HostError *error)
 {
@@ -2947,8 +3255,14 @@ store_collect_asked(HostIoIo *io, uint32 repository, const StoreCollectDatabase 
 		return false;
 	}
 	std_vec_new(&none, sizeof(uint64), _Alignof(uint64));
-	ok = store_collect_collected(io, &repo, &reading, database->id, 0, settings->target_percent, &none, has_result,
-								 result, error);
+	ok = store_collect_collected(io, &repo, &reading, database->id, 0, settings->target_percent, emptied, &none,
+								 has_result, result, error);
+	if (ok && *has_result && emptied != CHUNKS_PACKS_DEFAULT_SPACE &&
+		!store_collect_unlisted(io, &repo, &reading, emptied, error))
+	{
+		store_collect_Collected_drop(result);
+		ok = false;
+	}
 	if (!ok)
 		repo_Repo_drop(&repo);
 	else if (!repo_Repo_close(&repo, io, &reading, &failed))
@@ -2959,12 +3273,18 @@ store_collect_asked(HostIoIo *io, uint32 repository, const StoreCollectDatabase 
 		ok = false;
 	}
 	host_shared_Reader_drop(&reading);
+	if (ok && *has_result && emptied != CHUNKS_PACKS_DEFAULT_SPACE && !store_collect_emptied(io, repository, emptied, error))
+	{
+		store_collect_Collected_drop(result);
+		ok = false;
+	}
 	return ok;
 }
 
 /*
  * store_collect_collect_asked runs the full collection a backend asked of the
- * collector worker in a database's repository, recorded in the schedule as
+ * collector worker in a database's repository, emptying the tablespace the
+ * ask names (collected), recorded in the schedule as
  * its own, under the database's lock as collect_due takes it, and returns its
  * counts, a [u64; 3]: the packs it retired, those it copied out, and its live
  * bytes, all 0 when the database may not be collected, a session holds its
@@ -2972,8 +3292,8 @@ store_collect_asked(HostIoIo *io, uint32 repository, const StoreCollectDatabase 
  */
 bool
 store_collect_collect_asked(HostIoIo *io, StoreCollectSchedule *schedule, const StoreCollectDatabase *databases,
-							size_t databases_len, uint32 id, const StoreCollectSettings *settings, uint64 *result,
-							HostError *error)
+							size_t databases_len, uint32 id, uint32 emptied, const StoreCollectSettings *settings,
+							uint64 *result, HostError *error)
 {
 	const StoreCollectDatabase *database = store_collect_find(databases, databases_len, id, true);
 	StoreCollectCollected done;
@@ -2996,7 +3316,7 @@ store_collect_collect_asked(HostIoIo *io, StoreCollectSchedule *schedule, const 
 		return false;
 	if (!locked)
 		return true;
-	ok = store_collect_asked(io, id, database, settings, &has, &done, error);
+	ok = store_collect_asked(io, id, database, emptied, settings, &has, &done, error);
 	host_database_unlocked(id);
 	if (!ok)
 		return false;
@@ -3168,27 +3488,39 @@ typedef struct store_collect_tests_named_t
 	ChunksTrailerLocator at;
 } store_collect_tests_named_t;
 
-/* store_collect_tests_base is a save's gathering: one storage's base, whose record names one chunk. */
+/* store_collect_tests_bases_t is a save's captures: the chunks its base records name. */
+typedef struct store_collect_tests_bases_t
+{
+	const store_collect_tests_named_t *named;
+	size_t		len;
+} store_collect_tests_bases_t;
+
+/* store_collect_tests_base is a save's gathering: a base for each chunk given, storage k + 1's record naming chunk k. */
 static bool
 store_collect_tests_base(void *captures, HostIoIo *io, const RepoRead *read, StdVec *result, ChunksErrorError *error)
 {
-	const store_collect_tests_named_t *named = captures;
-	RepoGathered gathered = {.tag = REPO_GATHERED_BASE};
-	chunks_TupleU32Locator_t address = {0, named->at};
+	const store_collect_tests_bases_t *bases = captures;
 
 	(void) io;
 	(void) read;
 	(void) error;
-	std_vec_with_capacity_Checked(result, 1, sizeof(RepoGathered), _Alignof(RepoGathered));
-	gathered.u.base.storage.tablespace = HOST_PG_DEFAULT;
-	gathered.u.base.storage.relation = 1;
-	std_slice_to_vec_Checked(&gathered.u.base.record.bytes, (const uint8 *) &named->address,
-							 sizeof(ChunksAddressAddress), 1, 1);
-	std_vec_with_capacity_Checked(&gathered.u.base.record.addresses, 1, sizeof(address),
-								  _Alignof(chunks_TupleU32Locator_t));
-	std_vec_push_Checked(&gathered.u.base.record.addresses, &address, sizeof(address), _Alignof(chunks_TupleU32Locator_t));
-	gathered.u.base.folded = 5;
-	std_vec_push_Checked(result, &gathered, sizeof(gathered), _Alignof(RepoGathered));
+	std_vec_with_capacity_Checked(result, bases->len, sizeof(RepoGathered), _Alignof(RepoGathered));
+	for (size_t k = 0; k < bases->len; k++)
+	{
+		RepoGathered gathered = {.tag = REPO_GATHERED_BASE};
+		chunks_TupleU32Locator_t address = {0, bases->named[k].at};
+
+		gathered.u.base.storage.tablespace = HOST_PG_DEFAULT;
+		gathered.u.base.storage.relation = (uint32) k + 1;
+		std_slice_to_vec_Checked(&gathered.u.base.record.bytes, (const uint8 *) &bases->named[k].address,
+								 sizeof(ChunksAddressAddress), 1, 1);
+		std_vec_with_capacity_Checked(&gathered.u.base.record.addresses, 1, sizeof(address),
+									  _Alignof(chunks_TupleU32Locator_t));
+		std_vec_push_Checked(&gathered.u.base.record.addresses, &address, sizeof(address),
+							 _Alignof(chunks_TupleU32Locator_t));
+		gathered.u.base.folded = 5;
+		std_vec_push_Checked(result, &gathered, sizeof(gathered), _Alignof(RepoGathered));
+	}
 	return true;
 }
 
@@ -3202,16 +3534,26 @@ store_collect_tests_after(void *captures, HostIoIo *io, ChunksErrorError *error)
 	return true;
 }
 
+/* store_collect_tests_saved_each saves a manifest whose base records name the chunks given, one each, which unwraps at a line and column. */
+static void
+store_collect_tests_saved_each(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading,
+							   const store_collect_tests_named_t *named, size_t named_len, uint32 line, uint32 col)
+{
+	store_collect_tests_bases_t bases = {named, named_len};
+	ChunksErrorError failed;
+
+	store_collect_tests_chunks_ok(repo_Repo_save(repo, io, reading, false, NULL, store_collect_tests_base, &bases,
+												 store_collect_tests_after, NULL, &failed), &failed, line, col);
+}
+
 /* store_collect_tests_saved saves a manifest whose base record names one chunk, which unwraps at a line and column. */
 static void
 store_collect_tests_saved(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading,
 						  ChunksAddressAddress address, ChunksTrailerLocator at, uint32 line, uint32 col)
 {
 	store_collect_tests_named_t named = {address, at};
-	ChunksErrorError failed;
 
-	store_collect_tests_chunks_ok(repo_Repo_save(repo, io, reading, false, NULL, store_collect_tests_base, &named,
-												 store_collect_tests_after, NULL, &failed), &failed, line, col);
+	store_collect_tests_saved_each(io, repo, reading, &named, 1, line, col);
 }
 
 /* store_collect_tests_created creates a repository in pg_default and returns it with a reader, which unwrap at a line. */
@@ -3238,8 +3580,8 @@ store_collect_tests_collected(HostIoIo *io, const RepoRepo *repo, const HostShar
 	bool		has;
 
 	std_vec_new(&none, sizeof(uint64), _Alignof(uint64));
-	store_collect_tests_ok(store_collect_collected(io, repo, reading, database, limit, 50, old == NULL ? &none : old,
-												   &has, &done, &error), &error, line, col);
+	store_collect_tests_ok(store_collect_collected(io, repo, reading, database, limit, 50, CHUNKS_PACKS_DEFAULT_SPACE,
+												   old == NULL ? &none : old, &has, &done, &error), &error, line, col);
 	if (!has)
 		std_option_unwrap_failed(RUST_FILE, line, some_col);
 	return done;
@@ -3408,8 +3750,8 @@ test_store_collect_tests_a_collection_runs_nothing_while_a_base_backup_is_counte
 	store_collect_tests_ok(host_backup_begin(io, &error), &error, 924, 32);
 	STD_ASSERT(925, 9, host_backups_running(), "host::backups_running()");
 	std_vec_new(&none, sizeof(uint64), _Alignof(uint64));
-	store_collect_tests_ok(store_collect_collected(io, &repo, &reading, 832, 0, 50, &none, &has, &collected, &error),
-						   &error, 926, 85);
+	store_collect_tests_ok(store_collect_collected(io, &repo, &reading, 832, 0, 50, CHUNKS_PACKS_DEFAULT_SPACE, &none,
+												   &has, &collected, &error), &error, 926, 85);
 	if (!store_collect_tests_option_eq(has, &collected, false, NULL))
 	{
 		StdOptionRef left = {has, STD_ITEM(&collected, store_collect_Collected_Debug_fmt)};
@@ -3794,6 +4136,626 @@ test_store_collect_tests_a_chunk_named_by_address_alone_marks_every_record_of_it
 	host_shared_Reader_drop(&reading);
 	repo_Repo_drop(&repo);
 	simc_TestIo_drop(&test_io);
+}
+
+
+/* STORE_COLLECT_TESTS_PARTLY is how many packs a test's full collection keeps partly dead. */
+#define STORE_COLLECT_TESTS_PARTLY 3
+
+/* store_collect_tests_partly writes a pack of a live chunk, noise led by a byte, beside a dead chunk into a repository, lists it, and returns its number. */
+static uint64
+store_collect_tests_partly(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading, uint8 lead,
+						   store_collect_tests_named_t *live)
+{
+	ChunksPackPackWriterInDir writer = store_collect_tests_writer(io, repo, reading, 1110, 73);
+	ChunksErrorError failed;
+	ChunksAddressAddress dead;
+	ChunksTrailerLocator dead_at;
+	uint8		body[] = {'d', lead};
+	StdVec		noise = store_collect_tests_noise(8192);
+	StdVec		stored;
+
+	STD_VEC_AT(&noise, uint8, 0) = lead;
+	live->address = store_collect_tests_chunk(noise.ptr, noise.len, &stored);
+	std_vec_free_Checked(&noise, 1, 1);
+	store_collect_tests_chunks_ok(chunks_pack_PackWriterInDir_write(&writer, io, live->address, stored.ptr, stored.len,
+																	true, &live->at, &failed), &failed, 1111, 57);
+	std_vec_free_Checked(&stored, 1, 1);
+	dead = store_collect_tests_chunk(body, sizeof(body), &stored);
+	store_collect_tests_chunks_ok(chunks_pack_PackWriterInDir_write(&writer, io, dead, stored.ptr, stored.len, true,
+																	&dead_at, &failed), &failed, 1112, 57);
+	std_vec_free_Checked(&stored, 1, 1);
+	return store_collect_tests_added(io, repo, reading, &writer, 1113, 38, 1113, 43);
+}
+
+/* store_collect_tests_vectored_t is a read's captures: a test's partly dead packs, and their deletion vectors' generations, 0 for none. */
+typedef struct store_collect_tests_vectored_t
+{
+	const uint64 *numbers;
+	uint64	   *generations;
+} store_collect_tests_vectored_t;
+
+/* store_collect_tests_vectored is a read of the pack table: the generation of each partly dead pack's deletion vector. */
+static bool
+store_collect_tests_vectored(void *captures, ChunksPacksViewView *view, HostIoIo *io, ChunksErrorError *error)
+{
+	const store_collect_tests_vectored_t *vectored = captures;
+	const ChunksPacksTable *table = chunks_packs_view_View_table(view);
+
+	(void) io;
+	(void) error;
+	for (size_t k = 0; k < STORE_COLLECT_TESTS_PARTLY; k++)
+	{
+		vectored->generations[k] = 0;
+		for (size_t j = 0, j_len = table->packs.len; j < j_len; j++)
+		{
+			const chunks_TupleU64Listed_t *entry = &STD_VEC_AT(&table->packs, chunks_TupleU64Listed_t, j);
+
+			if (entry->f0 == vectored->numbers[k] && entry->f1.has_dead)
+				vectored->generations[k] = entry->f1.dead;
+		}
+	}
+	return true;
+}
+
+/* store_collect_tests_generations returns the generations of a test's partly dead packs' deletion vectors, 0 for none, which unwraps at a line and column. */
+static void
+store_collect_tests_generations(HostIoIo *io, const RepoRepo *repo, const uint64 *numbers, uint64 *generations,
+								uint32 line, uint32 col)
+{
+	store_collect_tests_vectored_t vectored = {numbers, generations};
+	ChunksErrorError failed;
+
+	store_collect_tests_chunks_ok(chunks_packs_backend_Packs_viewed(&repo->packs, io, store_collect_tests_vectored,
+																	&vectored, &failed), &failed, line, col);
+}
+
+/* store_collect_tests_covered returns how many of a test's partly dead packs have a deletion vector newer than before, asserting at a line that they lead the packs. */
+static size_t
+store_collect_tests_covered(HostIoIo *io, const RepoRepo *repo, const uint64 *numbers, const uint64 *before,
+							uint32 line)
+{
+	uint64		generations[STORE_COLLECT_TESTS_PARTLY];
+	size_t		covered = 0;
+
+	store_collect_tests_generations(io, repo, numbers, generations, line, 13);
+	while (covered < STORE_COLLECT_TESTS_PARTLY && generations[covered] > before[covered])
+		covered++;
+	for (size_t k = covered; k < STORE_COLLECT_TESTS_PARTLY; k++)
+		STD_ASSERT(line, 9, generations[k] == before[k],
+				   "a pack has a new deletion vector while one before it has none");
+	return covered;
+}
+
+/* store_collect_tests_files_t is a read's captures: the directory of a repository's packs, and the files its lists name there, a Vec<PathBuf>. */
+typedef struct store_collect_tests_files_t
+{
+	StdPathBuf	dir;
+	StdVec		named;
+} store_collect_tests_files_t;
+
+/* store_collect_tests_listed_files is a read of the lists: each listed pack's file and the vector the table names for it, and each run the runs file lists. */
+static bool
+store_collect_tests_listed_files(void *captures, ChunksPacksViewView *view, HostIoIo *io, ChunksErrorError *error)
+{
+	store_collect_tests_files_t *files = captures;
+	const ChunksPacksTable *table = chunks_packs_view_View_table(view);
+	const ChunksPacksViewReadRuns *runs = chunks_packs_view_runs_get(&view->runs, CHUNKS_PACKS_DEFAULT_SPACE);
+
+	(void) io;
+	(void) error;
+	std_slice_to_vec_Checked(&files->dir.bytes, view->dir.bytes.ptr, view->dir.bytes.len, 1, 1);
+	for (size_t k = 0, k_len = table->packs.len; k < k_len; k++)
+	{
+		const chunks_TupleU64Listed_t *entry = &STD_VEC_AT(&table->packs, chunks_TupleU64Listed_t, k);
+		StdArcInner *const *pack = chunks_packs_view_View_pack(view, entry->f0);
+		const char *path;
+		size_t		path_len;
+		StdPathBuf	file;
+
+		STD_ASSERT(1134, 9, pack != NULL, "a pack the table lists has no reader");
+		path = chunks_pack_PackReader_path(std_arc_Deref_deref(*pack, _Alignof(ChunksPackPackReader)), &path_len);
+		std_path_to_path_buf(path, path_len, &file);
+		std_vec_push_Checked(&files->named, &file, sizeof(file), _Alignof(StdPathBuf));
+		if (!entry->f1.has_dead)
+			continue;
+		file = chunks_dead_Dead_path(path, path_len, entry->f1.dead);
+		std_vec_push_Checked(&files->named, &file, sizeof(file), _Alignof(StdPathBuf));
+	}
+	for (size_t k = 0, k_len = runs == NULL ? 0 : runs->list.lines.len; k < k_len; k++)
+	{
+		const StdString *line = &STD_VEC_AT(&runs->list.lines, StdString, k);
+		StdStr		name = chunks_packs_run_name(line->ptr, line->len);
+		StdPathBuf	file;
+
+		std_path_join((const char *) files->dir.bytes.ptr, files->dir.bytes.len, name.ptr, name.len, &file);
+		std_vec_push_Checked(&files->named, &file, sizeof(file), _Alignof(StdPathBuf));
+	}
+	return true;
+}
+
+/* store_collect_tests_paths_drop drops a Vec<PathBuf>. */
+static void
+store_collect_tests_paths_drop(StdVec *paths)
+{
+	for (size_t k = 0, k_len = paths->len; k < k_len; k++)
+		std_vec_free_Checked(&STD_VEC_AT(paths, StdPathBuf, k).bytes, 1, 1);
+	std_vec_free_Checked(paths, sizeof(StdPathBuf), _Alignof(StdPathBuf));
+}
+
+/* store_collect_tests_paths_hold reports whether a Vec<PathBuf> holds a path. */
+static bool
+store_collect_tests_paths_hold(const StdVec *paths, const StdPathBuf *path)
+{
+	for (size_t k = 0, k_len = paths->len; k < k_len; k++)
+	{
+		const StdVec *bytes = &STD_VEC_AT(paths, StdPathBuf, k).bytes;
+
+		if (bytes->len == path->bytes.len && memcmp(bytes->ptr, path->bytes.ptr, bytes->len) == 0)
+			return true;
+	}
+	return false;
+}
+
+/* store_collect_tests_ends_with reports whether a name's bytes end with some text. */
+static bool
+store_collect_tests_ends_with(const uint8 *name, size_t name_len, const char *ending)
+{
+	size_t		len = strlen(ending);
+
+	return name_len >= len && memcmp(name + name_len - len, ending, len) == 0;
+}
+
+/*
+ * store_collect_tests_unnamed returns the pack, run, and vector files in the
+ * directory of a repository's packs that neither its lists name nor its
+ * removal queue holds, a Vec<PathBuf>, asserting at a line that the queue
+ * holds no file the lists name, which the reads unwrap at too.
+ */
+static StdVec
+store_collect_tests_unnamed(HostIoIo *io, const RepoRepo *repo, uint32 id, uint32 line)
+{
+	store_collect_tests_files_t files;
+	ChunksErrorError failed;
+	HostError	error;
+	StdVec		queued;
+	StdVec		names;
+	StdVec		unnamed;
+
+	std_vec_new(&files.named, sizeof(StdPathBuf), _Alignof(StdPathBuf));
+	store_collect_tests_chunks_ok(chunks_packs_backend_Packs_viewed(&repo->packs, io, store_collect_tests_listed_files,
+																	&files, &failed), &failed, line, 13);
+	store_collect_tests_chunks_ok(chunks_packs_removal_queued(io, id, &queued, &failed), &failed, line, 13);
+	for (size_t k = 0, k_len = queued.len; k < k_len; k++)
+	{
+		StdString	name = chunks_packs_removal_file_name(&STD_VEC_AT(&queued, ChunksPacksSingleRemoval, k));
+		StdPathBuf	file;
+
+		std_path_join((const char *) files.dir.bytes.ptr, files.dir.bytes.len, (const char *) name.ptr, name.len,
+					  &file);
+		std_vec_free_Checked(&name, 1, 1);
+		STD_ASSERT(line, 9, !store_collect_tests_paths_hold(&files.named, &file),
+				   "the removal queue holds a file the lists still name");
+		std_vec_push_Checked(&files.named, &file, sizeof(file), _Alignof(StdPathBuf));
+	}
+	std_vec_free_Checked(&queued, sizeof(ChunksPacksSingleRemoval), _Alignof(ChunksPacksSingleRemoval));
+	store_collect_tests_ok(host_list_dir(HOST_IO_IO_READ_DOORS(io), (const char *) files.dir.bytes.ptr,
+										 files.dir.bytes.len, &names, &error), &error, line, 13);
+	std_vec_new(&unnamed, sizeof(StdPathBuf), _Alignof(StdPathBuf));
+	for (size_t k = 0, k_len = names.len; k < k_len; k++)
+	{
+		const StdString *name = &STD_VEC_AT(&names, StdString, k);
+		StdPathBuf	file;
+
+		if (!store_collect_tests_ends_with(name->ptr, name->len, ".pack") &&
+			!store_collect_tests_ends_with(name->ptr, name->len, ".idx") &&
+			!store_collect_tests_ends_with(name->ptr, name->len, ".dead"))
+			continue;
+		std_path_join((const char *) files.dir.bytes.ptr, files.dir.bytes.len, (const char *) name->ptr, name->len,
+					  &file);
+		if (store_collect_tests_paths_hold(&files.named, &file))
+			std_vec_free_Checked(&file.bytes, 1, 1);
+		else
+			std_vec_push_Checked(&unnamed, &file, sizeof(file), _Alignof(StdPathBuf));
+	}
+	std_vec_drop_Checked(&names, sizeof(StdString), _Alignof(StdString), std_String_drop);
+	store_collect_tests_paths_drop(&files.named);
+	std_vec_free_Checked(&files.dir.bytes, 1, 1);
+	return unnamed;
+}
+
+/*
+ * store_collect_tests_retirements reports whether every file a failed
+ * collection left neither listed nor queued is a vector or the retired
+ * pack's own file or run, with that pack no longer listed: what a failed
+ * Retired_queue leaves, bugs row 500, which a pack's restore or the stray
+ * pass doesn't take.
+ */
+static bool
+store_collect_tests_retirements(const StdVec *unnamed, const StdVec *listed, const store_collect_tests_written_t *dead,
+								const StdPathBuf *dead_path)
+{
+	size_t		stem = dead_path->bytes.len - strlen(".pack");
+
+	if (store_collect_tests_holds(listed, dead->number))
+		return false;
+	for (size_t k = 0, k_len = unnamed->len; k < k_len; k++)
+	{
+		const StdVec *bytes = &STD_VEC_AT(unnamed, StdPathBuf, k).bytes;
+		bool		of_dead = bytes->len > stem && memcmp(bytes->ptr, dead_path->bytes.ptr, stem) == 0;
+
+		if (!store_collect_tests_ends_with(bytes->ptr, bytes->len, ".dead") &&
+			!(of_dead && (store_collect_tests_ends_with(bytes->ptr, bytes->len, ".pack") ||
+						  store_collect_tests_ends_with(bytes->ptr, bytes->len, ".idx"))))
+			return false;
+	}
+	return true;
+}
+
+/* store_collect_tests_collect_t is a caught collection's captures: its arguments, and what it answered. */
+typedef struct store_collect_tests_collect_t
+{
+	HostIoIo   *io;
+	const RepoRepo *repo;
+	const HostSharedReader *reading;
+	uint32		id;
+	const StdVec *none;
+	bool		finished;
+	bool		has;
+	StoreCollectCollected collected;
+	HostError	error;
+} store_collect_tests_collect_t;
+
+/* store_collect_tests_collect_body runs a full collection of a repository's packs, for a catch of its unwind. */
+static void
+store_collect_tests_collect_body(void *captures)
+{
+	store_collect_tests_collect_t *c = captures;
+
+	c->finished = store_collect_collected(c->io, c->repo, c->reading, c->id, 0, 50, CHUNKS_PACKS_DEFAULT_SPACE, c->none,
+										  &c->has, &c->collected, &c->error);
+}
+
+/*
+ * store_collect_tests_swept runs a full collection of a test's packs, the
+ * kept ones and a pack of a dead chunk alone, in a fresh repository once
+ * for each n, after a first full collection when `again` is set, until an n
+ * past its last lets it finish. It fails each at its n-th check for a
+ * cancel or, with `allocation`, at its n-th allocation, an allocation's
+ * returned 53200 or its unwind alike, and checks what each failure leaves.
+ * It returns whether some cancel fell between two kept packs' new vectors,
+ * or some allocation failure between the keep and the install, and sets
+ * restored when some failure left the retired pack listed again under
+ * another number, a failed verify's restore.
+ */
+static bool
+store_collect_tests_swept(uint32 *id, bool allocation, bool again, bool *restored)
+{
+	bool		between = false;
+
+	*restored = false;
+
+	for (uint32 n = 0;; n++)
+	{
+		SimcTestIo	test_io = simc_io();
+		HostIoIo   *io = &test_io.io;
+		ChunksFileInterruptible interruptible = {&CHUNKS_FILE_IO_INTERRUPTIBLE_OPS, io};
+		HostSharedReader reading;
+		RepoRepo	repo = store_collect_tests_created(io, ++*id, 1115, &reading);
+		store_collect_tests_named_t named[STORE_COLLECT_TESTS_PARTLY];
+		uint64		numbers[STORE_COLLECT_TESTS_PARTLY];
+		uint64		before[STORE_COLLECT_TESTS_PARTLY] = {0};
+		store_collect_tests_written_t dead = {0};
+		StoreCollectCollected collected;
+		ChunksPacksCheckChecked checked;
+		store_collect_tests_collect_t collect;
+		ChunksErrorError failed;
+		StdArcInner *reader;
+		StdPathBuf	dead_path;
+		StdCaught	caught;
+		StdVec		listed;
+		StdVec		unnamed;
+		StdVec		none;
+		uint64		collecting;
+		uint64		held;
+		size_t		covered;
+		bool		finished;
+		bool		leaked;
+		bool		unwound;
+		bool		has;
+
+		STD_ASSERT(1116, 9, n < 65536, "a full collection fails at fewer than 65536 points");
+		for (size_t k = 0; k < STORE_COLLECT_TESTS_PARTLY; k++)
+			numbers[k] = store_collect_tests_partly(io, &repo, &reading, (uint8) k, &named[k]);
+		store_collect_tests_saved_each(io, &repo, &reading, named, STORE_COLLECT_TESTS_PARTLY, 1118, 9);
+		std_vec_new(&none, sizeof(uint64), _Alignof(uint64));
+		if (again)
+		{
+			collected = store_collect_tests_collected(io, &repo, &reading, *id, 0, &none, 1119, 74, 83);
+			store_collect_Collected_drop(&collected);
+			store_collect_tests_generations(io, &repo, numbers, before, 1119, 13);
+		}
+		dead = store_collect_tests_written(io, &repo, &reading, "retired");
+		store_collect_tests_chunks_ok(chunks_packs_backend_Packs_pack_reader(&repo.packs, io, &reading, dead.number,
+																			 &has, &reader, &failed), &failed, 1120,
+									  13);
+		STD_ASSERT(1120, 9, has, "a test's dead pack has no reader");
+		{
+			size_t		path_len;
+			const char *path = chunks_pack_PackReader_path(std_arc_Deref_deref(reader, _Alignof(ChunksPackPackReader)),
+														   &path_len);
+
+			std_path_to_path_buf(path, path_len, &dead_path);
+		}
+		chunks_pack_ArcPackReader_drop(reader);
+		collecting = simc_collecting();
+		held = simc_interrupts_held();
+		if (allocation)
+			simc_fail_allocation(n + 1);
+		else
+			simc_interrupt_at(n);
+		collect.io = io;
+		collect.repo = &repo;
+		collect.reading = &reading;
+		collect.id = *id;
+		collect.none = &none;
+		collect.finished = false;
+		unwound = !std_catch_unwind(store_collect_tests_collect_body, &collect, &caught);
+		simc_fail_allocation(0);
+		simc_interrupt_at(PG_UINT64_MAX);
+		if (unwound)
+			std_Caught_drop_Checked(&caught);
+		finished = collect.finished;
+		has = collect.has;
+		collected = collect.collected;
+		if (finished)
+		{
+			if (has)
+				store_collect_Collected_drop(&collected);
+			STD_ASSERT(1121, 9,
+					   store_collect_tests_covered(io, &repo, numbers, before, 1121) == STORE_COLLECT_TESTS_PARTLY,
+					   "a full collection gave a pack it keeps partly dead no new deletion vector");
+			unnamed = store_collect_tests_unnamed(io, &repo, *id, 1122);
+			STD_ASSERT(1122, 9, unnamed.len == 0, "a full collection left a file neither listed nor queued");
+			store_collect_tests_paths_drop(&unnamed);
+			std_vec_free_Checked(&dead_path.bytes, 1, 1);
+			std_vec_free_Checked(&none, sizeof(uint64), _Alignof(uint64));
+			host_shared_Reader_drop(&reading);
+			repo_Repo_drop(&repo);
+			simc_TestIo_drop(&test_io);
+			return between;
+		}
+		STD_ASSERT(1123, 9, allocation || !unwound, "a cancelled collection unwound");
+		if (!unwound)
+		{
+			STD_ASSERT(1123, 9, memcmp(host_Error_sqlstate(&collect.error), allocation ? "53200" : "57014", 5) == 0,
+					   "a full collection failed with other than its fault's error");
+			host_Error_drop(&collect.error);
+		}
+		STD_ASSERT(1123, 9, simc_collecting() == collecting, "a failed collection left its collection begun");
+		STD_ASSERT(1123, 9, simc_interrupts_held() == held, "a failed collection left the interrupts held");
+		listed = store_collect_tests_numbers(io, &repo, &reading, 1124, 56);
+		covered = store_collect_tests_covered(io, &repo, numbers, before, 1124);
+		for (size_t k = 0; k < STORE_COLLECT_TESTS_PARTLY; k++)
+		{
+			STD_ASSERT(1125, 13, store_collect_tests_holds(&listed, numbers[k]),
+					   "a failed collection retired a pack it keeps");
+			store_collect_tests_reads_eq(io, &repo, &reading, &named[k].address, named[k].at, 1126, 13, 64);
+		}
+		if (store_collect_tests_holds(&listed, dead.number))
+			store_collect_tests_reads_eq(io, &repo, &reading, &dead.address, dead.at, 1126, 13, 64);
+		else
+		{
+			ChunksTrailerLocator found;
+
+			store_collect_tests_chunks_ok(chunks_packs_backend_Packs_find(&repo.packs, io, &reading, &dead.address, &has,
+																		  &found, &failed), &failed, 1126, 13);
+			*restored = *restored || (has && store_collect_tests_holds(&listed, found.pack));
+		}
+		unnamed = store_collect_tests_unnamed(io, &repo, *id, 1127);
+		leaked = allocation && store_collect_tests_retirements(&unnamed, &listed, &dead, &dead_path);
+		for (size_t k = 0, k_len = unnamed.len; k < k_len && !leaked; k++)
+		{
+			const StdVec *bytes = &STD_VEC_AT(&unnamed, StdPathBuf, k).bytes;
+
+			STD_ASSERT(1127, 13, store_collect_tests_ends_with(bytes->ptr, bytes->len, ".dead"),
+					   "a failed collection left a pack or run file neither listed nor queued, but for bugs row 500's");
+		}
+		store_collect_tests_paths_drop(&unnamed);
+		between = between || (allocation ? covered == STORE_COLLECT_TESTS_PARTLY &&
+							  store_collect_tests_holds(&listed, dead.number) :
+							  covered > 0 && covered < STORE_COLLECT_TESTS_PARTLY);
+		std_vec_free_Checked(&listed, sizeof(uint64), _Alignof(uint64));
+		store_collect_tests_generations(io, &repo, numbers, before, 1128, 13);
+		collected = store_collect_tests_collected(io, &repo, &reading, *id, 0, &none, 1129, 74, 83);
+		store_collect_Collected_drop(&collected);
+		STD_ASSERT(1129, 9,
+				   store_collect_tests_covered(io, &repo, numbers, before, 1129) == STORE_COLLECT_TESTS_PARTLY,
+				   "a full collection after a failed one gave a pack it keeps partly dead no new deletion vector");
+		for (size_t k = 0; k < STORE_COLLECT_TESTS_PARTLY; k++)
+			store_collect_tests_reads_eq(io, &repo, &reading, &named[k].address, named[k].at, 1130, 13, 64);
+		chunks_packs_check_check(interruptible, *id, HOST_PG_DEFAULT, &checked);
+		STD_ASSERT(1131, 9, checked.found.len == 0,
+				   "the packs' check after a failed collection and another found something");
+		chunks_packs_check_Checked_drop(&checked);
+		unnamed = store_collect_tests_unnamed(io, &repo, *id, 1132);
+
+		/*
+		 * TODO: bugs row 500: a failed Retired_queue leaves the retirement's
+		 * pack and run files neither listed nor queued; this exception goes
+		 * when it lands.
+		 */
+		STD_ASSERT(1132, 9, unnamed.len == 0 || leaked,
+				   "a full collection after a failed one left a file neither listed nor queued, but for bugs row 500's");
+		store_collect_tests_paths_drop(&unnamed);
+		std_vec_free_Checked(&dead_path.bytes, 1, 1);
+		std_vec_free_Checked(&none, sizeof(uint64), _Alignof(uint64));
+		host_shared_Reader_drop(&reading);
+		repo_Repo_drop(&repo);
+		simc_TestIo_drop(&test_io);
+	}
+}
+
+/* STORE_COLLECT_TESTS_QUEUED is the generation of a vector a test's removal queue holds and no file has, past any a collection would give. */
+#define STORE_COLLECT_TESTS_QUEUED 1000
+
+/* STORE_COLLECT_TESTS_STRAYS is how many generations of never-named vectors a test leaves beside a pack, past any a collection would give. */
+#define STORE_COLLECT_TESTS_STRAYS 64
+
+/*
+ * store_collect_tests_crashed writes beside a repository's pack what a crash
+ * in or after a vector's write and before its naming leaves: a vector of
+ * each generation from 1 that the table never named, and a write's
+ * temporary of the next, which unwraps at a line.
+ */
+static void
+store_collect_tests_crashed(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading, uint64 number,
+							uint32 line)
+{
+	static const uint8 torn[] = {0x64, 0x65};
+	uint64		offset = 0;
+	StdBTreeMap none = std_btree_BTreeSetU64_FromArray_from(&offset, 1);
+	ChunksErrorError failed;
+	StdArcInner *reader;
+	StdPathBuf	temp;
+	StdIoError	io_error;
+	const char *path;
+	size_t		path_len;
+	bool		has;
+
+	store_collect_tests_chunks_ok(chunks_packs_backend_Packs_pack_reader(&repo->packs, io, reading, number, &has,
+																		 &reader, &failed), &failed, line, 13);
+	STD_ASSERT(line, 9, has, "a test's pack has no reader");
+	path = chunks_pack_PackReader_path(std_arc_Deref_deref(reader, _Alignof(ChunksPackPackReader)), &path_len);
+	for (uint64 generation = 1; generation <= STORE_COLLECT_TESTS_STRAYS; generation++)
+		store_collect_tests_chunks_ok(chunks_dead_Dead_write(HOST_IO_IO_IO_DOORS(io), path, path_len, generation, &none,
+															 &failed), &failed, line, 13);
+	temp = chunks_dead_Dead_path(path, path_len, STORE_COLLECT_TESTS_STRAYS + 1);
+	temp.bytes.len -= strlen("dead");
+	std_vec_extend_from_slice_Checked(&temp.bytes, "tmp", strlen("tmp"), 1, 1);
+	if (!std_fs_write(temp.bytes.ptr, temp.bytes.len, torn, sizeof(torn), &io_error))
+		STD_RESULT_EXPECT_FAILED(line, 9, "called `Result::unwrap()` on an `Err` value", &io_error,
+								 std_io_Error_Debug_fmt);
+	std_vec_free_Checked(&temp.bytes, 1, 1);
+	chunks_pack_ArcPackReader_drop(reader);
+	std_btree_BTreeMapU64Set_drop(&none);
+}
+
+/*
+ * test_store_collect_tests_a_cancel_at_any_check_of_a_full_collection_leaves_its_packs_whole:
+ * bugs rows 499 and 503: three packs a full collection keeps partly dead,
+ * each a live chunk beside a dead one, and a pack of a dead chunk alone,
+ * which it retires; a cancel at each of the collection's checks in turn, in
+ * a repository's first full collection and in its second, which replaces
+ * each kept pack's deletion vector, and an allocation failure at each of a
+ * first collection's allocations, stop it with Postgres' error, its
+ * collection ended and the interrupts not held, every kept pack still listed
+ * and its chunk reading, the dead pack's chunk reading while it is listed
+ * (a failed verify restores it), the kept packs given a new vector leading
+ * the three, and every pack and run file beside them named by the lists or
+ * queued for removal, a vector named by neither the only stray, but for what
+ * a failed Retired_queue leaves (bugs row 500); some cancel falls between
+ * two kept packs' vectors, and some allocation failure between the keep and
+ * the install; and after each, a collection finishes, every kept pack has a
+ * new vector, the packs' check finds nothing, and every pack, run, and
+ * vector file is named or queued, none of them both, but for row 500's.
+ * Beside what a crash between a vector's write and its naming leaves (bugs
+ * row 499, H14), never-named vectors of the generations a collection would
+ * give and a write's temporary, a full collection queues each, removes the
+ * temporary, and gives its own vectors a generation past them; and beside
+ * a vector the removal queue holds whose file is already gone, as a
+ * duplicate entry's second is once the first removed it, a full collection
+ * gives its vectors a generation past the queued one, so no entry removes a
+ * vector written again under its name.
+ */
+void
+test_store_collect_tests_a_cancel_at_any_check_of_a_full_collection_leaves_its_packs_whole(void)
+{
+	uint32		id = 40000;
+	bool		restored;
+
+	STD_ASSERT(1133, 9, store_collect_tests_swept(&id, false, false, &restored),
+			   "no cancel fell between two packs' deletion vectors");
+	STD_ASSERT(1133, 9, restored, "no cancel fell in a verify that restored the retired pack");
+	STD_ASSERT(1133, 9, store_collect_tests_swept(&id, false, true, &restored),
+			   "no cancel fell between two packs' deletion vectors");
+	STD_ASSERT(1133, 9, store_collect_tests_swept(&id, true, false, &restored),
+			   "no allocation failure fell between the keep and the install");
+	{
+		SimcTestIo	test_io = simc_io();
+		HostIoIo   *io = &test_io.io;
+		ChunksFileInterruptible interruptible = {&CHUNKS_FILE_IO_INTERRUPTIBLE_OPS, io};
+		HostSharedReader reading;
+		RepoRepo	repo = store_collect_tests_created(io, ++id, 1134, &reading);
+		store_collect_tests_named_t named[STORE_COLLECT_TESTS_PARTLY];
+		uint64		numbers[STORE_COLLECT_TESTS_PARTLY];
+		uint64		before[STORE_COLLECT_TESTS_PARTLY] = {0};
+		StoreCollectCollected collected;
+		ChunksPacksCheckChecked checked;
+		StdVec		unnamed;
+
+		for (size_t k = 0; k < STORE_COLLECT_TESTS_PARTLY; k++)
+			numbers[k] = store_collect_tests_partly(io, &repo, &reading, (uint8) k, &named[k]);
+		store_collect_tests_saved_each(io, &repo, &reading, named, STORE_COLLECT_TESTS_PARTLY, 1135, 9);
+		store_collect_tests_crashed(io, &repo, &reading, numbers[0], 1136);
+		collected = store_collect_tests_collected(io, &repo, &reading, id, 0, NULL, 1137, 74, 83);
+		store_collect_Collected_drop(&collected);
+		STD_ASSERT(1138, 9,
+				   store_collect_tests_covered(io, &repo, numbers, before, 1138) == STORE_COLLECT_TESTS_PARTLY,
+				   "a full collection beside a crash's vectors gave a pack it keeps partly dead no vector");
+		for (size_t k = 0; k < STORE_COLLECT_TESTS_PARTLY; k++)
+			store_collect_tests_reads_eq(io, &repo, &reading, &named[k].address, named[k].at, 1139, 13, 64);
+		chunks_packs_check_check(interruptible, id, HOST_PG_DEFAULT, &checked);
+		STD_ASSERT(1140, 9, checked.found.len == 0, "the packs' check beside a crash's vectors found something");
+		chunks_packs_check_Checked_drop(&checked);
+		unnamed = store_collect_tests_unnamed(io, &repo, id, 1141);
+		STD_ASSERT(1141, 9, unnamed.len == 0,
+				   "a full collection left a crash's vector neither listed nor queued");
+		store_collect_tests_paths_drop(&unnamed);
+		host_shared_Reader_drop(&reading);
+		repo_Repo_drop(&repo);
+		simc_TestIo_drop(&test_io);
+	}
+	{
+		SimcTestIo	test_io = simc_io();
+		HostIoIo   *io = &test_io.io;
+		HostSharedReader reading;
+		RepoRepo	repo = store_collect_tests_created(io, ++id, 1142, &reading);
+		store_collect_tests_named_t named[STORE_COLLECT_TESTS_PARTLY];
+		uint64		numbers[STORE_COLLECT_TESTS_PARTLY];
+		uint64		generations[STORE_COLLECT_TESTS_PARTLY];
+		ChunksPacksRemovalReservation reservation;
+		ChunksPacksRemovalFile file;
+		StoreCollectCollected collected;
+		ChunksErrorError failed;
+		StdArcInner *reader;
+		bool		has;
+
+		for (size_t k = 0; k < STORE_COLLECT_TESTS_PARTLY; k++)
+			numbers[k] = store_collect_tests_partly(io, &repo, &reading, (uint8) k, &named[k]);
+		store_collect_tests_saved_each(io, &repo, &reading, named, STORE_COLLECT_TESTS_PARTLY, 1143, 9);
+		store_collect_tests_chunks_ok(chunks_packs_backend_Packs_pack_reader(&repo.packs, io, &reading, numbers[0],
+																			 &has, &reader, &failed), &failed, 1144,
+									  13);
+		STD_ASSERT(1144, 9, has, "a test's pack has no reader");
+		file.f0 = repo.packs.own;
+		file.f1.tag = CHUNKS_PACKS_SINGLE_QUEUED_VECTOR;
+		file.f1.u.vector = STORE_COLLECT_TESTS_QUEUED;
+		file.f2 = ((const ChunksPackPackReader *) std_arc_Deref_deref(reader, _Alignof(ChunksPackPackReader)))->id;
+		chunks_pack_ArcPackReader_drop(reader);
+		store_collect_tests_chunks_ok(chunks_packs_removal_reserve(io, 1, &reservation, &failed), &failed, 1145, 13);
+		store_collect_tests_chunks_ok(chunks_packs_removal_queue(io, &reservation, id, &file, 1, &failed), &failed,
+									  1145, 13);
+		collected = store_collect_tests_collected(io, &repo, &reading, id, 0, NULL, 1146, 74, 83);
+		store_collect_Collected_drop(&collected);
+		store_collect_tests_generations(io, &repo, numbers, generations, 1147, 13);
+		for (size_t k = 0; k < STORE_COLLECT_TESTS_PARTLY; k++)
+			STD_ASSERT(1147, 13, generations[k] > STORE_COLLECT_TESTS_QUEUED,
+					   "a full collection gave a vector a generation the removal queue holds a name of");
+		host_shared_Reader_drop(&reading);
+		repo_Repo_drop(&repo);
+		simc_TestIo_drop(&test_io);
+	}
 }
 
 #endif							/* DOLTGRES_TEST_STORE */

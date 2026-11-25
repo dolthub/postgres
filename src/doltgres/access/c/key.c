@@ -106,50 +106,75 @@ access_TupleUsizeOrderKeyType_drop(void *keyed)
 }
 
 /*
- * access_key_box_clone returns a new box of a clone of a boxed key type, the
- * box made before its clone, as Box's Clone makes it.
+ * access_key_box_try_clone makes a new box of a clone of a boxed key type,
+ * the box made before its clone, as Box's Clone makes it, answering false
+ * with nothing made when an allocation fails.
  */
-static AccessKeyKeyType *
-access_key_box_clone(const AccessKeyKeyType *boxed)
+static bool
+access_key_box_try_clone(const AccessKeyKeyType *boxed, AccessKeyKeyType **result)
 {
-	AccessKeyKeyType *made = std_alloc(ACCESS_KEY_KEY_TYPE);
-	StdUnwind	unwind;
+	AccessKeyKeyType *made = std_global_alloc(ACCESS_KEY_KEY_TYPE);
 
-	STD_UNWIND_PUSH(&unwind);
-	if (sigsetjmp(unwind.jump, 0) == 0)
-	{
-		access_key_KeyType_Clone_clone(boxed, made);
-		std_unwind_pop(&unwind);
-	}
-	else
+	if (made == NULL)
+		return false;
+	if (!access_key_KeyType_try_clone(boxed, made))
 	{
 		std_free(made, ACCESS_KEY_KEY_TYPE);
-		std_unwind_resume(&unwind);
+		return false;
 	}
-	return made;
+	*result = made;
+	return true;
 }
 
-/* access_key_attribute_clone is Attribute's derived Clone as a vector's element clone. */
-static void
-access_key_attribute_clone(const void *attribute, void *result)
+/* access_key_Attribute_try_clone copies an attribute, its key type with it, answering false with nothing made when an allocation fails. */
+static bool
+access_key_Attribute_try_clone(const AccessKeyAttribute *self, AccessKeyAttribute *result)
 {
-	access_key_Attribute_Clone_clone(attribute, result);
+	if (!access_key_KeyType_try_clone(&self->key_type, &result->key_type))
+		return false;
+	result->len = self->len;
+	result->by_value = self->by_value;
+	result->align = self->align;
+	result->dropped = self->dropped;
+	return true;
 }
 
 /* access_key_Attribute_Clone_clone copies an attribute, its key type with it. */
 void
 access_key_Attribute_Clone_clone(const AccessKeyAttribute *self, AccessKeyAttribute *result)
 {
-	access_key_KeyType_Clone_clone(&self->key_type, &result->key_type);
-	result->len = self->len;
-	result->by_value = self->by_value;
-	result->align = self->align;
-	result->dropped = self->dropped;
+	if (!access_key_Attribute_try_clone(self, result))
+		std_handle_alloc_error(ACCESS_KEY_KEY_TYPE);
 }
 
-/* access_key_Inner_Clone_clone copies an inner, what it holds with it. */
-void
-access_key_Inner_Clone_clone(const AccessKeyInner *self, AccessKeyInner *result)
+/* access_key_row_try_clone copies a row's attributes, answering false with nothing made when an allocation fails. */
+static bool
+access_key_row_try_clone(const StdVec *row, StdVec *result)
+{
+	std_vec_new(result, ACCESS_KEY_ATTRIBUTE);
+	if (!std_vec_try_reserve(result, row->len, ACCESS_KEY_ATTRIBUTE))
+		return false;
+	for (size_t i = 0; i < row->len; i++)
+	{
+		AccessKeyAttribute copy;
+
+		if (!access_key_Attribute_try_clone(&STD_VEC_AT(row, AccessKeyAttribute, i), &copy))
+		{
+			std_vec_drop_Checked(result, ACCESS_KEY_ATTRIBUTE, access_key_attribute_drop);
+			return false;
+		}
+		std_vec_push_Checked(result, &copy, ACCESS_KEY_ATTRIBUTE);
+	}
+	return true;
+}
+
+/*
+ * access_key_Inner_try_clone copies an inner, what it holds with it,
+ * answering false with nothing made when an allocation fails, so a caller
+ * under a lock clones with nothing that unwinds (bugs row 517).
+ */
+static bool
+access_key_Inner_try_clone(const AccessKeyInner *self, AccessKeyInner *result)
 {
 	*result = *self;
 	switch (self->tag)
@@ -158,31 +183,50 @@ access_key_Inner_Clone_clone(const AccessKeyInner *self, AccessKeyInner *result)
 		case ACCESS_KEY_INNER_COMPARED:
 			break;
 		case ACCESS_KEY_INNER_ARRAY:
-			result->u.array.key_type = access_key_box_clone(self->u.array.key_type);
-			break;
+			return access_key_box_try_clone(self->u.array.key_type, &result->u.array.key_type);
 		case ACCESS_KEY_INNER_RANGE:
-			result->u.range.key_type = access_key_box_clone(self->u.range.key_type);
-			break;
+			return access_key_box_try_clone(self->u.range.key_type, &result->u.range.key_type);
 		case ACCESS_KEY_INNER_MULTIRANGE:
-			result->u.multirange = access_key_box_clone(self->u.multirange);
-			break;
+			return access_key_box_try_clone(self->u.multirange, &result->u.multirange);
 		case ACCESS_KEY_INNER_ROW:
-			std_slice_to_vec_clone(&result->u.row, self->u.row.ptr, self->u.row.len, ACCESS_KEY_ATTRIBUTE,
-								   access_key_attribute_clone, access_key_attribute_drop);
-			break;
+			return access_key_row_try_clone(&self->u.row, &result->u.row);
 		case ACCESS_KEY_INNER_ENUM:
-			std_slice_to_vec_Checked(&result->u.labels, self->u.labels.ptr, self->u.labels.len, ACCESS_KEY_LABEL);
+			std_vec_new(&result->u.labels, ACCESS_KEY_LABEL);
+			if (!std_vec_try_reserve(&result->u.labels, self->u.labels.len, ACCESS_KEY_LABEL))
+				return false;
+			std_vec_extend_from_slice_Checked(&result->u.labels, self->u.labels.ptr, self->u.labels.len,
+											  ACCESS_KEY_LABEL);
 			break;
 	}
+	return true;
+}
+
+/* access_key_Inner_Clone_clone copies an inner, what it holds with it. */
+void
+access_key_Inner_Clone_clone(const AccessKeyInner *self, AccessKeyInner *result)
+{
+	if (!access_key_Inner_try_clone(self, result))
+		std_handle_alloc_error(ACCESS_KEY_KEY_TYPE);
+}
+
+/*
+ * access_key_KeyType_try_clone copies a key type, what it holds with it,
+ * answering false with nothing made when an allocation fails (bugs row 517).
+ */
+bool
+access_key_KeyType_try_clone(const AccessKeyKeyType *self, AccessKeyKeyType *result)
+{
+	result->typid = self->typid;
+	result->collation = self->collation;
+	return access_key_Inner_try_clone(&self->inner, &result->inner);
 }
 
 /* access_key_KeyType_Clone_clone copies a key type, what it holds with it. */
 void
 access_key_KeyType_Clone_clone(const AccessKeyKeyType *self, AccessKeyKeyType *result)
 {
-	result->typid = self->typid;
-	result->collation = self->collation;
-	access_key_Inner_Clone_clone(&self->inner, &result->inner);
+	if (!access_key_KeyType_try_clone(self, result))
+		std_handle_alloc_error(ACCESS_KEY_KEY_TYPE);
 }
 
 /* access_key_Collation_PartialEq_eq reports whether two collations are the same variant with the same collation. */

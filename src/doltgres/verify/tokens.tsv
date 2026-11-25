@@ -11,96 +11,98 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# The C port's tokens (the port text's section 7): one row per Rust compile-fail case of a crate with a C port, naming
-# the C form that keeps the case's token, what the C keeps and can't refuse, and the C case that shows it, a t/117
-# subtest ("t/117: <name>"), a C test case ("c: <crate>::<module>::tests::<name>"), or a sim or lockstep case
-# ("rust: <path>::<name>"), several separated by "; ", or the form outstanding, with "-" for its item, keeps, and check, for
-# a case whose C form is still owed. t/117 checks that each case has one row, that each check exists, and that no case
-# with a C form of its own is outstanding; the port lands only with no row outstanding.
+# The C port's tokens (the port text's section 7): one row per compile-fail case of the deleted Rust port, whose sources
+# are at commit 2017b9d2f4a, and one per token of the fork's own C, whose rust_case is its C case's path
+# (`<crate>/c/fail/<name>`), each naming the C form that keeps the token, what the C keeps and can't refuse, and the C
+# case that shows it, a t/117 subtest ("t/117: <name>") or a C test case ("c: <crate>::<module>::tests::<name>"),
+# several separated by "; ", or the form outstanding, for a case whose C form is still owed, with the case's statement
+# of what the C form must refuse for its item and "-" for keeps and check. t/117 checks that each check exists and that
+# no case with a C form of its own is outstanding; the port lands only with no row outstanding.
 # crate	rust_case	item	c_form	keeps	check
 chunks	chunks/fail/chunk_forged	chunks::chunk::Chunk	opaque-storage	a ChunksChunkChunk is opaque storage whose layout only chunk.c knows, so no other C names its parts, though the C can't refuse a value of it zero-initialized or with bytes copied into it; outside chunk.c, t/117 refuses a ChunksChunkChunk value or pointer made by an initializer list, a compound literal, a cast of another pointer to its pointer, or a copy or set of its bytes, while a whole-value assignment moves a value already made and an enclosing aggregate's initializer or copy, which zero-fills or copies a member as a whole, isn't seen	t/117: chunk_forged is refused with its diagnostic; t/117: no file but its owner writes a ChunksChunkChunk's opaque storage
-chunks	chunks/fail/forwarded_forged	-	outstanding	-	-
+chunks	chunks/fail/forwarded_forged	A proof of forwards made by hand, which would let packs retire before their live chunks' forwards are durable.	outstanding	-	-
 chunks	chunks/fail/raw_forged	chunks::pack::Raw	opaque-storage	a ChunksPackRaw is opaque storage whose layout only pack.c knows, so no other C names its parts, though the C can't refuse a value of it zero-initialized or with bytes copied into it; outside pack.c, t/117 refuses a ChunksPackRaw value or pointer made by an initializer list, a compound literal, a cast of another pointer to its pointer, or a copy or set of its bytes, while a whole-value assignment moves a value already made and an enclosing aggregate's initializer or copy, which zero-fills or copies a member as a whole, isn't seen	t/117: raw_forged is refused with its diagnostic; t/117: no file but its owner writes a ChunksPackRaw's opaque storage
-chunks	chunks/fail/read_without_a_reader	-	outstanding	-	-
-chunks	chunks/fail/registration_outlives_its_scope	-	outstanding	-	-
-chunks	chunks/fail/reservation_forged	-	outstanding	-	-
-chunks	chunks/fail/retire_unforwarded	-	outstanding	-	-
+chunks	chunks/fail/read_without_a_reader	A read of a repository's packs with no published reader's epoch, which would let the removal's pass take a file the read then opens.	outstanding	-	-
+chunks	chunks/fail/registration_outlives_its_scope	A root's registration returned from the scope that lent its slot, where the entry's whole `Io`, and with it user code, would be back while the registration lasts.	outstanding	-	-
+chunks	chunks/fail/reservation_forged	Room in the removal queue made by hand, which would let a retirement queue files no entry was reserved for.	outstanding	-	-
+chunks	chunks/fail/retire_unforwarded	Packs retired without the proof that their live chunks' forwards are durable, which would leave locators into them reading nothing.	outstanding	-	-
 chunks	chunks/fail/root_slot_registered_twice	chunks::packs::roots::RootSlot	capability	a ChunksPacksRootsRootSlot is a capability under clang's analysis: RootSlots' one and fold acquire it inside register's run, and a pin or RootSlot_unused releases it, so a second pin through one slot is refused as a release of a capability not held; msvc's and gcc's builds can't refuse it, a pin that fails releases the slot all the same, and a Pin's drop doesn't give the slot back, so the C refuses a pin after a failed pin or a dropped pin on the same slot, which the Rust's ended borrow allows	t/117: root_slot_registered_twice is refused with its diagnostic
 chunks	chunks/fail/torn_tail_cloned	chunks::file::TornTail	move-out	the C has no clone of a ChunksFileTornTail either, which t/117 refuses to find, and outside file.c t/117 refuses a bitwise copy of one into a variable or through a pointer from anything but a call's result, which would leave two storages holding one tail; a copy into a struct's member or an enclosing aggregate's copy isn't seen	t/117: no C clone of a ChunksFileTornTail exists; t/117: no file but its owner copies a ChunksFileTornTail
 chunks	chunks/fail/torn_tail_forged	chunks::file::TornTail	opaque-storage	a ChunksFileTornTail is opaque storage whose layout only file.c knows, so no other C names its parts, though the C can't refuse a value of it zero-initialized or with bytes copied into it; outside file.c, t/117 refuses a ChunksFileTornTail value or pointer made by an initializer list, a compound literal, a cast of another pointer to its pointer, or a copy or set of its bytes, while a whole-value assignment moves a value already made and an enclosing aggregate's initializer or copy, which zero-fills or copies a member as a whole, isn't seen	t/117: torn_tail_forged is refused with its diagnostic; t/117: no file but its owner writes a ChunksFileTornTail's opaque storage
 chunks	chunks/fail/torn_tail_reused	chunks::file::TornTail	move-out	a door that takes a ChunksFileTornTail (cut, append, write_end, of_generation) moves it out of its caller's storage before anything that can fail, so a failed door takes it too, and that storage's next read or door panics as an unwrap of None at the Rust's use of the tail while its drop frees nothing; outside file.c, t/117 refuses a copy of a tail into a variable or through a pointer from anything but a call's result, so no second storage holds the tail a door empties, though it doesn't see a copy into a struct's member or an enclosing aggregate's copy	c: chunks::file::tests::a_torn_tail_a_door_took_panics_at_its_next_use_and_a_failed_door_still_takes_it; t/117: no file but its owner copies a ChunksFileTornTail
-chunks	chunks/fail/verified_kept	-	outstanding	-	-
-fsck	fsck/fehost/fail/make_an_io	-	outstanding	-	-
-fsck	fsck/fehost/fail/write_with_a_read_io	-	outstanding	-	-
-host	host/fail/cache_pinned_past_its_entry	-	outstanding	-	-
-host	host/fail/comparison_under_a_key_lock	-	outstanding	-	-
-host	host/fail/delta_aged_claimed	-	outstanding	-	-
-host	host/fail/delta_aged_freed	-	outstanding	-	-
-host	host/fail/delta_aged_opened	-	outstanding	-	-
-host	host/fail/delta_aged_reclaimed	-	outstanding	-	-
-host	host/fail/delta_aged_swept	-	outstanding	-	-
-host	host/fail/delta_append_by_a_name	-	outstanding	-	-
-host	host/fail/delta_append_under_a_shared_guard	-	outstanding	-	-
-host	host/fail/delta_bytes_past_their_hold	-	outstanding	-	-
-host	host/fail/delta_hold_past_its_io	-	outstanding	-	-
-host	host/fail/delta_list_insert_without_removes	-	outstanding	-	-
-host	host/fail/delta_list_set_under_a_shared_guard	-	outstanding	-	-
-host	host/fail/delta_list_under_another_shapes_guard	-	outstanding	-	-
-host	host/fail/delta_lock_through_a_made	-	outstanding	-	-
-host	host/fail/delta_owned_past_its_entry	-	outstanding	-	-
-host	host/fail/delta_page_past_its_hold	-	outstanding	-	-
-host	host/fail/delta_record_past_its_hold	-	outstanding	-	-
-host	host/fail/delta_seal_by_a_name	-	outstanding	-	-
-host	host/fail/delta_seal_under_a_shared_guard	-	outstanding	-	-
-host	host/fail/io_cloned	-	outstanding	-	-
-host	host/fail/io_door_in_a_locked_expression	-	outstanding	-	-
-host	host/fail/io_door_under_a_lock	-	outstanding	-	-
-host	host/fail/io_door_under_a_read_lock	-	outstanding	-	-
-host	host/fail/io_forged	-	outstanding	-	-
-host	host/fail/io_from_held	-	outstanding	-	-
-host	host/fail/io_lender_under_a_lock	-	outstanding	-	-
-host	host/fail/io_sent	-	outstanding	-	-
-host	host/fail/key_lock_past_its_io	-	outstanding	-	-
-host	host/fail/lending_lock_from_held	-	outstanding	-	-
-host	host/fail/pause_named_by_a_constant	-	outstanding	-	-
-host	host/fail/pause_without_a_capability	-	outstanding	-	-
-host	host/fail/scratch_file_past_its_entry	-	outstanding	-	-
-host	host/fail/shared_array_of_two_disciplines	-	outstanding	-	-
-host	host/fail/shared_blob_declared_twice	-	outstanding	-	-
-host	host/fail/shared_blob_under_another_lock	-	outstanding	-	-
-host	host/fail/shared_claim_under_another_shapes_lock	-	outstanding	-	-
-host	host/fail/shared_entry_set_under_a_shared_lock	-	outstanding	-	-
-host	host/fail/shared_flag_from_a_flags_capability	-	outstanding	-	-
-host	host/fail/shared_flag_out_of_order	-	outstanding	-	-
-host	host/fail/shared_flag_under_a_long_lock	-	outstanding	-	-
-host	host/fail/shared_freed_twice	-	outstanding	-	-
-host	host/fail/shared_guard_past_its_handle	-	outstanding	-	-
-host	host/fail/shared_lock_from_a_guards_lend	-	outstanding	-	-
-host	host/fail/shared_lock_out_of_order	-	outstanding	-	-
-host	host/fail/shared_long_lock_out_of_order	-	outstanding	-	-
-host	host/fail/shared_long_lock_under_a_short_lock	-	outstanding	-	-
-host	host/fail/shared_record_freed	-	outstanding	-	-
-host	host/fail/shared_record_past_its_handle	-	outstanding	-	-
-host	host/fail/shared_slots_read_under_a_shared_barrier	-	outstanding	-	-
-host	host/fail/shared_words_sent	-	outstanding	-	-
-host	host/fail/shared_write_under_a_shared_lock	-	outstanding	-	-
-host	host/fail/short_lender_under_a_short_lender	-	outstanding	-	-
-host	host/fail/user_code_under_a_lock	-	outstanding	-	-
-host	host/fail/wait_under_a_key_lock	-	outstanding	-	-
-trees	trees/fail/brand_a_temporary_writer	-	outstanding	-	-
-trees	trees/fail/finished_forged	-	outstanding	-	-
-trees	trees/fail/fresh_minted	-	outstanding	-	-
-trees	trees/fail/hold_another_writers_root	-	outstanding	-	-
-trees	trees/fail/hold_memory_root	-	outstanding	-	-
-trees	trees/fail/hold_on_a_loose_writer	-	outstanding	-	-
-trees	trees/fail/hold_scratch_root	-	outstanding	-	-
-trees	trees/fail/mutate_inside_a_registration	-	outstanding	-	-
-trees	trees/fail/node_unchecked	-	outstanding	-	-
-trees	trees/fail/publish_with_another_writer	-	outstanding	-	-
-trees	trees/fail/published_deref	-	outstanding	-	-
-trees	trees/fail/published_tree	-	outstanding	-	-
-trees	trees/fail/temporary_writer_past_its_entry	-	outstanding	-	-
-txn	txn/fail/index_open_forged	-	outstanding	-	-
-txn	txn/fail/index_open_under_a_shared_guard	-	outstanding	-	-
-txn	txn/fail/table_unlist_without_an_open	-	outstanding	-	-
-txn	txn/fail/version_push_without_an_open	-	outstanding	-	-
+chunks	chunks/fail/verified_kept	A verified chunk kept past the walk that verified it, whose locator goes stale once its pack retires.	outstanding	-	-
+fsck	fsck/fehost/fail/make_an_io	The capability a write door takes, made in a frontend program's build, which has no way to make one.	outstanding	-	-
+fsck	fsck/fehost/fail/write_with_a_read_io	A write through a frontend program's capability to read, which no write door takes.	outstanding	-	-
+host	host/fail/cache_pinned_past_its_entry	A pinned node stored in state that outlives the entry that took it, whose resource owner may release the pin between calls.	outstanding	-	-
+host	host/fail/comparison_under_a_key_lock	A class's comparison function, user code, called through host's door while a key lock's guard holds the entry's `Io` (design item 13's Order 2a, (4b)'s key lock).	outstanding	-	-
+host	host/fail/delta_aged_claimed	A pool's claim of a record of a kind the delta's epochs free, which no claimant owns once published.	outstanding	-	-
+host	host/fail/delta_aged_freed	A pool's free of a record of a kind the delta's epochs free, which only a retirement frees.	outstanding	-	-
+host	host/fail/delta_aged_opened	A pool's open of a record of a kind the delta's epochs free, which has no holders to count.	outstanding	-	-
+host	host/fail/delta_aged_reclaimed	A pool's reclaim of a record of a kind the delta's epochs free, which has no reclaim.	outstanding	-	-
+host	host/fail/delta_aged_swept	A pool's sweep of a kind the delta's epochs free, which has no reclaim to sweep for.	outstanding	-	-
+host	host/fail/delta_append_by_a_name	An append to a page of the delta by its name alone, with no page opened under a hold, so that the page could be freed under the append.	outstanding	-	-
+host	host/fail/delta_append_under_a_shared_guard	An append to a page of the delta under its record's lock held shared, which other appenders may hold too.	outstanding	-	-
+host	host/fail/delta_bytes_past_their_hold	Bytes a page of the delta lent, returned past the hold that opened the page, after which the page may be freed.	outstanding	-	-
+host	host/fail/delta_hold_past_its_io	A hold on the delta's pages stored in state that outlives the entry that took it, which would keep retired pages from being freed across calls.	outstanding	-	-
+host	host/fail/delta_list_insert_without_removes	An insert into a list that isn't `Removes`, whose entries keep their indexes.	outstanding	-	-
+host	host/fail/delta_list_set_under_a_shared_guard	A store to a list through its record's guard held shared, which only reads.	outstanding	-	-
+host	host/fail/delta_list_under_another_shapes_guard	A list reached through the guard of another shape's lock, which doesn't guard it.	outstanding	-	-
+host	host/fail/delta_lock_through_a_made	A lock of a record its maker hasn't linked, taken through the `Made` that no lock may reach.	outstanding	-	-
+host	host/fail/delta_owned_past_its_entry	Pages of the delta their allocator owns, stored in state that outlives the entry that allocated them, where they would be held through a wait no door can see.	outstanding	-	-
+host	host/fail/delta_page_past_its_hold	A page of the delta opened under a hold, returned past the hold, after which the page may be freed.	outstanding	-	-
+host	host/fail/delta_record_past_its_hold	A record of a kind the delta's epochs free, opened under a hold and returned past it, after which it may be freed.	outstanding	-	-
+host	host/fail/delta_seal_by_a_name	A seal of a page of the delta by its name alone, with no page opened under a hold, so that the page could be freed under the seal.	outstanding	-	-
+host	host/fail/delta_seal_under_a_shared_guard	A seal of a page of the delta under its record's lock held shared, while an appender may hold the lock too.	outstanding	-	-
+host	host/fail/io_cloned	A second `Io` made by cloning the backend's.	outstanding	-	-
+host	host/fail/io_door_in_a_locked_expression	A door called in the same expression as a lock whose guard is a temporary, as a lock that extends its list with a directory's names would hold the lock across the listing.	outstanding	-	-
+host	host/fail/io_door_under_a_lock	A door called while a backend lock's guard holds the backend's `Io`.	outstanding	-	-
+host	host/fail/io_door_under_a_read_lock	A door called while a reader-writer backend lock's read guard holds the backend's `Io`.	outstanding	-	-
+host	host/fail/io_forged	An `Io` built outside `pghost`'s entries and the tests' constructor.	outstanding	-	-
+host	host/fail/io_from_held	A door given the `Held` a backend lock's guard lends, which reaches no door.	outstanding	-	-
+host	host/fail/io_lender_under_a_lock	A lender, a lock held across file I/O, taken under a backend lock's guard with the `Held` it lends.	outstanding	-	-
+host	host/fail/io_sent	The backend's `Io` sent to another thread, which a backend never starts.	outstanding	-	-
+host	host/fail/key_lock_past_its_io	A key lock's guard kept past the `Io` it borrows, so a stripe would outlive the entry that took it ((4b)'s key lock).	outstanding	-	-
+host	host/fail/lending_lock_from_held	A lending lock taken with a `Held` alone, which reaches no door to lend.	outstanding	-	-
+host	host/fail/pause_named_by_a_constant	A pause whose name is a constant and not a literal, so that the text of the call doesn't show the name the gates read.	outstanding	-	-
+host	host/fail/pause_without_a_capability	A pause with a value that isn't what a crate holds at a place where it may pause: the backend's lock scope, which carries no capability to raise.	outstanding	-	-
+host	host/fail/scratch_file_past_its_entry	A scratch file stored in state that outlives the entry that opened it, whose transaction's resource owner closes the file at its end.	outstanding	-	-
+host	host/fail/shared_array_of_two_disciplines	An array declared both as entries under its record's lock and as slots under another record's barrier, so that one's holder would write an entry while the other's claims it.	outstanding	-	-
+host	host/fail/shared_blob_declared_twice	A blob declared a second time, under another lock, so that one lock's holder would read its bytes while the other's writes them.	outstanding	-	-
+host	host/fail/shared_blob_under_another_lock	A blob read under a lock other than the one that guards it.	outstanding	-	-
+host	host/fail/shared_claim_under_another_shapes_lock	A slot claimed under a long lock of another shape, which isn't the barrier of the record the slots name.	outstanding	-	-
+host	host/fail/shared_entry_set_under_a_shared_lock	An array's entry set under its lock held shared, while another holder may be reading its bytes.	outstanding	-	-
+host	host/fail/shared_flag_from_a_flags_capability	A flag taken through the top-level door with a flag's capability, around the shape's order.	outstanding	-	-
+host	host/fail/shared_flag_out_of_order	A record's earlier flag taken under a later one, which the shape's order refuses.	outstanding	-	-
+host	host/fail/shared_flag_under_a_long_lock	A flag taken under a lock held across I/O, which would wait under an LWLock.	outstanding	-	-
+host	host/fail/shared_freed_twice	A record freed twice through one owner.	outstanding	-	-
+host	host/fail/shared_guard_past_its_handle	A record's lock held past the handle that opened the record, which would give the slot back with a lock held.	outstanding	-	-
+host	host/fail/shared_lock_from_a_guards_lend	A lock taken through the top-level door with what a guard lends, around the shape's order.	outstanding	-	-
+host	host/fail/shared_lock_out_of_order	A record's earlier lock taken under a later one, which the shape's order refuses.	outstanding	-	-
+host	host/fail/shared_long_lock_out_of_order	A long lock taken under a later long lock of its record, against the order its shape declares.	outstanding	-	-
+host	host/fail/shared_long_lock_under_a_short_lock	A long lock taken under a short lock, which would do file I/O under a lock that does none.	outstanding	-	-
+host	host/fail/shared_record_freed	A record freed through a handle that doesn't own it.	outstanding	-	-
+host	host/fail/shared_record_past_its_handle	A record kept past the handle that opened it, after which its slot may hold another record.	outstanding	-	-
+host	host/fail/shared_slots_read_under_a_shared_barrier	A slots array read under its barrier held shared, while another holder may be claiming a slot.	outstanding	-	-
+host	host/fail/shared_words_sent	A process's handle of its own words sent to another thread, where it would store another process's word.	outstanding	-	-
+host	host/fail/shared_write_under_a_shared_lock	A blob written under its lock held shared, while another holder may be reading its bytes.	outstanding	-	-
+host	host/fail/short_lender_under_a_short_lender	A short lender taken under another, whose view lends no lender on.	outstanding	-	-
+host	host/fail/user_code_under_a_lock	A class's comparison function, user code, called through host's door while a backend lock's guard holds the backend's `Io` (design item 13).	outstanding	-	-
+host	host/fail/wait_under_a_key_lock	A wait for another transaction called while a key lock's stripe is held: the striping token the guard borrows is made from the entry's `Waits`, which the wait door takes ((4b)'s key lock).	outstanding	-	-
+trees	trees/fail/brand_a_temporary_writer	A temporary writer branded, which would let it publish roots in a pack no repository adds.	outstanding	-	-
+trees	trees/fail/finished_forged	A proof that a writer finished made by hand, which would publish roots whose packs were never added.	outstanding	-	-
+trees	trees/fail/fresh_minted	A root made by hand rather than by a store's top-level write, which would let a writer hold a chunk it never wrote.	outstanding	-	-
+trees	trees/fail/hold_another_writers_root	A root one writer wrote held by another, whose packs may be added without it, or whose repository holds other packs.	outstanding	-	-
+trees	trees/fail/hold_memory_root	A root of a store in memory held, though no repository holds it.	outstanding	-	-
+trees	trees/fail/hold_on_a_loose_writer	A root held by a writer with no brand, which publishes nothing.	outstanding	-	-
+trees	trees/fail/hold_scratch_root	A temporary writer's root held, though no repository ever adds the pack that holds it.	outstanding	-	-
+trees	trees/fail/mutate_inside_a_registration	A tree mutated inside a root's registration, where a comparator tree's mutate would run a class's comparison function, user code, while the registration lasts.	outstanding	-	-
+trees	trees/fail/node_unchecked	A node viewed in bytes no read checked against their address, as a damaged record would give them.	outstanding	-	-
+trees	trees/fail/publish_with_another_writer	A root one writer held published by another writer's finish, which adds only its own packs.	outstanding	-	-
+trees	trees/fail/published_deref	A published name read as the tree it names, which would drop the registration that keeps a just-written root a root.	outstanding	-	-
+trees	trees/fail/published_tree	A published name turned into a stored tree name, which would drop the registration that keeps a just-written root a root.	outstanding	-	-
+trees	trees/fail/temporary_writer_past_its_entry	A temporary writer stored in state that outlives the entry that made it, whose transaction's resource owner closes the scratch file of the writer's pack at its end.	outstanding	-	-
+txn	txn/fail/index_open_forged	An open of a range's record made without its open, which loads the record's closed mark first.	outstanding	-	-
+txn	txn/fail/index_open_under_a_shared_guard	An open of a range's record for a change to its key index through its guard held shared, which only reads.	outstanding	-	-
+txn	txn/fail/table_unlist_without_an_open	A removal of an entry of a memtable's list with its guard alone, not the value that its open makes after it finds the memtable open.	outstanding	-	-
+txn	txn/fail/version_push_without_an_open	A push of a version to a range with its guard alone, not the value that its open makes after it finds the record open.	outstanding	-	-
+chunks	chunks/c/fail/set_dead_unbarriered	chunks_packs_retire_Marking_set_dead	capability	CHUNKS_PACKS_BARRIER_HOLDING, this process's exclusive hold of a repository's barrier, is a capability under clang's analysis: chunks_packs_barrier_held marks it held and chunks_packs_barrier_left gives it back, around Packs_retire's call of its keep and around the marking's begin's pass over the deletion vectors, each with the barrier's guard taken, and set_dead, the collector's keep (store_collect_retiring), and the pass's listing require it, so in the clang builds (-Werror=thread-safety) a vector written or listed outside the barrier is a compile error (H14); it can't follow the keep's call through its function pointer, so a keep that sets a vector must itself require the capability, which the analysis then checks at each keep's definition, nor see that the held mark matches the guard really taken, and msvc's and gcc's builds check nothing	t/117: set_dead_unbarriered is refused with its diagnostic

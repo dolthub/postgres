@@ -39,8 +39,11 @@
 #ifndef FRONTEND
 #include "utils/memutils.h"
 
-/* std_port_heap is the port's one heap, which std_heap_make makes at the process's first entry. */
+/* std_port_heap is the heap the port's allocations go to, the port heap std_heap_make makes at the process's first entry. */
 static MemoryContext std_port_heap = NULL;
+
+/* std_reads_heap is the spill reads' heap, a child of the port heap std_heap_make makes with it (bugs row 487). */
+static MemoryContext std_reads_heap = NULL;
 
 /*
  * std_heap_make makes the port heap, a child of TopMemoryContext that a
@@ -55,6 +58,48 @@ std_heap_make(void)
 		return;
 	std_port_heap = AllocSetContextCreate(TopMemoryContext, "doltgres port heap", ALLOCSET_DEFAULT_SIZES);
 	MemoryContextAllowInCriticalSection(std_port_heap, true);
+	std_reads_heap = AllocSetContextCreate(std_port_heap, "doltgres spill reads", ALLOCSET_DEFAULT_SIZES);
+	MemoryContextAllowInCriticalSection(std_reads_heap, true);
+}
+
+/* std_heap_current returns the heap the port's allocations go to now, which std_heap_left puts back. */
+void *
+std_heap_current(void)
+{
+	return std_port_heap;
+}
+
+/*
+ * std_heap_reads_entered makes the spill reads' heap the one the port's
+ * allocations go to, so a spill read's own allocations show as that heap's
+ * in pg_backend_memory_contexts (bugs row 487), answering the heap it
+ * replaces, which std_heap_left puts back; a free finds each allocation's
+ * own heap, so frees need no switch.
+ */
+void *
+std_heap_reads_entered(void)
+{
+	MemoryContext previous = std_port_heap;
+
+	std_port_heap = std_reads_heap;
+	return previous;
+}
+
+/* std_heap_left puts back the heap std_heap_reads_entered replaced, or one std_heap_current answered. */
+void
+std_heap_left(void *previous)
+{
+	std_port_heap = previous;
+}
+
+/* std_heap_reads_bytes returns the bytes the spill reads' heap holds in use, as Postgres accounts them, for the cases. */
+uint64
+std_heap_reads_bytes(void)
+{
+	MemoryContextCounters consumed;
+
+	MemoryContextMemConsumed(std_reads_heap, &consumed);
+	return (uint64) (consumed.totalspace - consumed.freespace);
 }
 
 /*
@@ -105,6 +150,26 @@ std_System_GlobalAlloc_dealloc(void *ptr, size_t size, size_t align)
 	pfree(ptr);
 }
 #else
+
+/* std_heap_current is the frontend's: its one allocator has no heaps, so it answers none. */
+void *
+std_heap_current(void)
+{
+	return NULL;
+}
+
+/* std_heap_reads_entered is the frontend's: its one allocator has no heaps to switch, so it answers none. */
+void *
+std_heap_reads_entered(void)
+{
+	return NULL;
+}
+
+/* std_heap_left is the frontend's, which has no heap to put back. */
+void
+std_heap_left(void *previous)
+{
+}
 
 /*
  * STD_MIN_ALIGN is sys::alloc's MIN_ALIGN on the 64-bit targets: the

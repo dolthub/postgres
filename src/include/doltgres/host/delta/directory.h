@@ -76,6 +76,15 @@ typedef struct HostDeltaDirectoryOpened
 	HostDeltaPageSize size;
 } HostDeltaDirectoryOpened;
 
+/* HostDeltaDirectoryPacked is a live page a packing moves: its name, its owner's shape and location, and its size. */
+typedef struct HostDeltaDirectoryPacked
+{
+	uint64		name;
+	uint64		shape;
+	uint64		location;
+	HostDeltaPageSize size;
+} HostDeltaDirectoryPacked;
+
 /* The module's trait and functions, which take lib.h's types, follow its include. */
 #include "doltgres/host/lib.h"
 
@@ -141,6 +150,16 @@ typedef struct HostDeltaDirectoryDirectoryOps
 	void		(*clear) (void *self, uint32 kind, uint32 index);
 	void		(*made) (void *self, uint32 kind, uint32 index);
 	void		(*unmade) (void *self, uint32 kind, uint32 index);
+	uint64		(*retired_head) (void *self);
+	bool		(*retired_swap) (void *self, uint64 loaded, uint64 word);
+	uint32		(*link) (void *self, uint32 slot);
+	void		(*set_link) (void *self, uint32 slot, uint32 value);
+	uint64		(*record_retired_head) (void *self, uint32 kind);
+	bool		(*record_retired_swap) (void *self, uint32 kind, uint64 loaded, uint64 word);
+	uint64		(*record_link) (void *self, uint32 kind, uint32 index);
+	void		(*set_record_link) (void *self, uint32 kind, uint32 index, uint64 value);
+	void		(*lock_pass) (void *self);
+	void		(*unlock_pass) (void *self);
 } HostDeltaDirectoryDirectoryOps;
 
 /* HOST_DELTA_DIRECTORY_HINTED is the count of slots each word of the free hint has a bit for. */
@@ -206,10 +225,16 @@ extern void host_delta_directory_pass(HostDeltaDirectoryDirectory directory);
 extern void host_delta_directory_released(HostDeltaDirectoryDirectory directory, uint64 epoch);
 extern void host_delta_directory_waiting(HostDeltaDirectoryDirectory directory);
 extern void host_delta_directory_woken(HostDeltaDirectoryDirectory directory);
+extern bool host_delta_directory_packing(HostDeltaDirectoryDirectory directory, const uint64 *shapes,
+										 size_t shapes_len, StdVec *result);
 
 #ifdef DOLTGRES_TEST_HOST
 extern void test_host_delta_directory_tests_a_size_fits_its_word(void);
 extern void test_host_delta_directory_tests_a_words_index_is_below_its_pages_count(void);
+extern void test_host_delta_directory_tests_a_free_pass_loads_only_the_retirements(void);
+extern void test_host_delta_directory_tests_a_refused_allocations_pass_loads_only_the_retirements(void);
+extern void test_host_delta_directory_tests_a_packing_skips_a_live_slot_with_no_body(void);
+extern void test_host_delta_directory_tests_a_packing_leaves_a_block_a_take_holds_unemptied(void);
 #endif
 
 #endif							/* DOLTGRES_HOST_DELTA_DIRECTORY_H */

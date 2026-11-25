@@ -1297,7 +1297,7 @@ txn_memtable_slice_row_versions_body_0(void *frame_)
 	}
 	std_vec_new(&frame->spilled, sizeof(TxnMemtableVersionVersion), _Alignof(TxnMemtableVersionVersion));
 	if (!txn_spill_versions(&TXN_SPILL_STATE_HOME_OPS, frame->io, frame->hold, frame->state, TXN_RUNS_KIND_SPILLED_ROWS,
-							frame->key, frame->key_len, &frame->spilled, frame->error))
+							frame->key, frame->key_len, NULL, &frame->spilled, frame->error))
 	{
 		txn_memtable_slice_row_versions_pad_0(frame);
 		return;

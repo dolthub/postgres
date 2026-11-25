@@ -32,6 +32,7 @@
 
 extern StdRwLockWriteGuard pghost_shared_own(StdRwLock *list, void *data);
 extern bool pghost_shared_limits(const PgMayRaise *raise, HostSharedLimits *result, PgPgError *error);
+extern bool pghost_shared_held(uint64 id, uint64 *result, HostError *error);
 extern bool pghost_shared_kinds(const PgMayRaise *raise, const HostSharedKind *table, size_t table_len,
 								StdVec *result, PgPgError *error);
 extern void pghost_shared_placed(uint64 place, size_t *result_0, uint32 *result_1);

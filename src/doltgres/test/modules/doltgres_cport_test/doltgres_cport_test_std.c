@@ -331,6 +331,10 @@ static const CportTest CPORT_TESTS[] = {
 	{"str::slice_index::rangeto_len::index_fail", test_alloctests_str_slice_index_rangeto_len_index_fail, true, "out of bounds"},
 	{"str::utf8_char_counts", test_alloctests_str_utf8_char_counts},
 	{"time::tests::duration_debug_matches_rust", test_std_time_tests_duration_debug_matches_rust},
+	{"vec::tests::an_empty_slice_at_null_extends_by_nothing", test_std_vec_tests_an_empty_slice_at_null_extends_by_nothing},
+	{"zero_size::tests::bytes_start_with_an_empty_needle_at_null", test_std_zero_size_tests_bytes_start_with_an_empty_needle_at_null},
+	{"zero_size::tests::ptr_copy_of_nothing_takes_null", test_std_zero_size_tests_ptr_copy_of_nothing_takes_null},
+	{"zero_size::tests::ptr_write_bytes_of_nothing_takes_null", test_std_zero_size_tests_ptr_write_bytes_of_nothing_takes_null},
 };
 
 /* doltgres_cport_test_std_print prints a literal line, as println! does. */

@@ -32,6 +32,9 @@
 #include "doltgres/chunks/trailer.h"
 #include "doltgres/host/delta.h"
 #include "doltgres/host/lib.h"
+#include "doltgres/host/local.h"
+#include "doltgres/host/lock.h"
+#include "doltgres/host/shared.h"
 #include "doltgres/std/fmt.h"
 #include "doltgres/std/unwind.h"
 #include "doltgres/trees/node.h"
@@ -40,6 +43,18 @@
 #include "doltgres/txn/memtable/table.h"
 #include "doltgres/txn/spill.h"
 #include "doltgres/txn/written.h"
+
+#ifdef DOLTGRES_TEST_TXN
+#include "doltgres/repo/lib.h"
+#include "doltgres/simc/simc.h"
+#include "doltgres/std/test.h"
+#include "doltgres/trees/blob.h"
+#include "doltgres/trees/chunker.h"
+#include "doltgres/txn/status.h"
+
+/* RUST_FILE is the file the tests' asserts name, blobs.rs. */
+#define RUST_FILE "txn" STD_SEP "src" STD_SEP "blobs.rs"
+#endif
 
 /* txn_blobs_unread returns the error of a read of a cut, which a blob's write never makes. */
 static ChunksErrorError
@@ -458,6 +473,7 @@ txn_blobs_written_closure_body_0(void *frame_)
 		!txn_memtable_branch_finish(frame->io, frame->prepared, c->writer, c->bytes, has_lsn, lsn, &handle,
 									frame->error))
 	{
+		host_DelayCheckpoint_failed(&frame->window, frame->error);
 		txn_blobs_written_closure_pad_0(frame);
 		return;
 	}
@@ -632,6 +648,589 @@ txn_blobs_written(HostIoIo *io, const HostSharedHeld *deltas, uint32 repository,
 	return frame.ok;
 }
 
+/* txn_blobs_Writer_t is an entry of CHUNK_WRITERS: a writer's xid, its top-level transaction's (its own for a top-level writer), and the repository its chunks went to. */
+typedef struct txn_blobs_Writer_t
+{
+	uint64		xid;
+	uint64		top;
+	uint32		repository;
+} txn_blobs_Writer_t;
+
+/* taken at Vec<Writer> and IoMutex<Vec<Writer>>, which blobs.c alone uses. */
+#define HOST_LOCK_SCOPE static
+#define HOST_LOCK_DECLARE
+#define HOST_LOCK_DEFINE
+#define HOST_LOCK_TAKEN_TS VecWriter
+#define HOST_LOCK_TAKEN_T StdVec
+#define HOST_LOCK_TAKEN_DEFAULT(place) std_vec_new((place), sizeof(txn_blobs_Writer_t), _Alignof(txn_blobs_Writer_t))
+#define HOST_LOCK_TAKEN_DROP(place) \
+	std_vec_free_Checked((place), sizeof(txn_blobs_Writer_t), _Alignof(txn_blobs_Writer_t))
+#define HOST_LOCK_TAKEN_TYPE TXN_BLOBS_WRITERS_LOCK_TYPE
+#define HOST_LOCK_IO_MUTEX
+#define HOST_LOCK_TS VecWriter
+#define HOST_LOCK_T StdVec
+#define HOST_LOCK_DEFAULT(place) std_vec_new((place), sizeof(txn_blobs_Writer_t), _Alignof(txn_blobs_Writer_t))
+#include "doltgres/host/lock_template.h"
+
+/* txn_blobs_IoMutexVecWriter_drop is IoMutex<Vec<Writer>>' drop glue: its value's. */
+static void
+txn_blobs_IoMutexVecWriter_drop(void *value)
+{
+	HostLockIoMutexVecWriter *self = value;
+
+	std_vec_free_Checked(&self->value, sizeof(txn_blobs_Writer_t), _Alignof(txn_blobs_Writer_t));
+}
+
+/* TXN_BLOBS_WRITERS_TYPE is IoMutex<Vec<Writer>>' size, Default, and drop. */
+static const StdDefaultType TXN_BLOBS_WRITERS_TYPE = {sizeof(HostLockIoMutexVecWriter),
+	_Alignof(HostLockIoMutexVecWriter), host_lock_IoMutexVecWriter_Default_default,
+txn_blobs_IoMutexVecWriter_drop};
+
+/*
+ * TXN_BLOBS_CHUNK_WRITERS is CHUNK_WRITERS: the startup process's running
+ * writers whose blobs' chunks its redo or its load of a checkpoint's runs
+ * pushed into a working state's delta, each once with the repository, until
+ * the transaction's commit or abort replays, so that an abort walks only the
+ * repositories its writers' chunks went to (bugs row 332); its BackendLocal
+ * header and the process's value, which follows it.
+ */
+static struct
+{
+	HostLocalBackendLocal local;
+	HostLockIoMutexVecWriter process;
+}			TXN_BLOBS_CHUNK_WRITERS = {HOST_LOCAL_BACKEND_LOCAL_NEW};
+
+/* txn_blobs_writers_frame_0_t is the state of a step under CHUNK_WRITERS' lock across its pad: the local and its guard, while live. */
+typedef struct txn_blobs_writers_frame_0_t
+{
+	HostIoIo   *io;
+	void		(*step) (void *captures, StdVec *writers);
+	void	   *captures;
+	HostLocalLocal local;
+	bool		local_live;
+	HostLockLockedRwLockWriteGuard guard;
+	bool		guard_live;
+} txn_blobs_writers_frame_0_t;
+
+/* txn_blobs_writers_pad_0 is the pad of a step under CHUNK_WRITERS' lock: the guard, then the local, while live. */
+static void
+txn_blobs_writers_pad_0(void *frame_)
+{
+	txn_blobs_writers_frame_0_t *frame = frame_;
+
+	if (frame->guard_live)
+	{
+		frame->guard_live = false;
+		host_lock_LockedRwLockWriteGuard_drop(&frame->guard);
+	}
+	if (frame->local_live)
+	{
+		frame->local_live = false;
+		host_local_Local_drop(&frame->local, &TXN_BLOBS_WRITERS_TYPE);
+	}
+}
+
+/* txn_blobs_writers_body_0 runs a step on CHUNK_WRITERS under its lock. */
+static void
+txn_blobs_writers_body_0(void *frame_)
+{
+	txn_blobs_writers_frame_0_t *frame = frame_;
+
+	frame->local = host_local_BackendLocal_get(&TXN_BLOBS_CHUNK_WRITERS.local, &TXN_BLOBS_WRITERS_TYPE);
+	frame->local_live = true;
+	frame->guard = host_lock_IoMutex_lock((HostLockIoMutex *) host_local_Local_Deref_deref(&frame->local,
+																						   &TXN_BLOBS_WRITERS_TYPE),
+										  &TXN_BLOBS_WRITERS_LOCK_TYPE, &frame->io->held);
+	frame->guard_live = true;
+	frame->step(frame->captures, host_lock_LockedRwLockWriteGuard_DerefMut_deref_mut(&frame->guard));
+	txn_blobs_writers_pad_0(frame);
+}
+
+/* txn_blobs_writers_locked runs a step on the process's CHUNK_WRITERS under its lock. */
+static void
+txn_blobs_writers_locked(HostIoIo *io, void (*step) (void *captures, StdVec *writers), void *captures)
+{
+	txn_blobs_writers_frame_0_t frame = {.io = io, .step = step, .captures = captures};
+
+	std_landing(&frame, txn_blobs_writers_body_0, txn_blobs_writers_pad_0);
+}
+
+/* txn_blobs_wrote_t is wrote's step's captures: the entry, and whether the list holds it after. */
+typedef struct txn_blobs_wrote_t
+{
+	txn_blobs_Writer_t writer;
+	bool		done;
+} txn_blobs_wrote_t;
+
+/* txn_blobs_wrote_closure_0 is wrote's step: the entry recorded once, done unless the list's growth failed. */
+static void
+txn_blobs_wrote_closure_0(void *captures, StdVec *writers)
+{
+	txn_blobs_wrote_t *c = captures;
+
+	for (size_t k = 0; k < writers->len; k++)
+	{
+		const txn_blobs_Writer_t *at = &STD_VEC_AT(writers, txn_blobs_Writer_t, k);
+
+		if (at->xid == c->writer.xid && at->top == c->writer.top && at->repository == c->writer.repository)
+		{
+			c->done = true;
+			return;
+		}
+	}
+	c->done = std_vec_try_reserve(writers, 1, sizeof(txn_blobs_Writer_t), _Alignof(txn_blobs_Writer_t));
+	if (c->done)
+		std_vec_push_Checked(writers, &c->writer, sizeof(txn_blobs_Writer_t), _Alignof(txn_blobs_Writer_t));
+}
+
+/*
+ * txn_blobs_wrote records, in the startup process, that a running writer's
+ * blob's chunk went into a repository's working state's delta, once for each
+ * writer and repository.
+ */
+bool
+txn_blobs_wrote(HostIoIo *io, TxnMemtableVersionWriter writer, uint32 repository, HostError *error)
+{
+	txn_blobs_wrote_t captures = {{writer.xid, writer.has_top ? writer.top : writer.xid, repository}};
+
+	txn_blobs_writers_locked(io, txn_blobs_wrote_closure_0, &captures);
+	if (!captures.done)
+		*error = host_Error_out_of_memory();
+	return captures.done;
+}
+
+/* txn_blobs_redo_committed_closure_0 is redo_committed's step: the committed transaction's entries taken out. */
+static void
+txn_blobs_redo_committed_closure_0(void *captures, StdVec *writers)
+{
+	uint64		xid = *(const uint64 *) captures;
+	size_t		kept = 0;
+
+	for (size_t k = 0; k < writers->len; k++)
+	{
+		txn_blobs_Writer_t at = STD_VEC_AT(writers, txn_blobs_Writer_t, k);
+
+		if (at.top != xid)
+			STD_VEC_AT(writers, txn_blobs_Writer_t, kept++) = at;
+	}
+	writers->len = kept;
+}
+
+/* txn_blobs_redo_committed forgets, in the startup process, the entries of a replayed committed top-level transaction and its subtransactions. */
+void
+txn_blobs_redo_committed(HostIoIo *io, uint64 xid)
+{
+	txn_blobs_writers_locked(io, txn_blobs_redo_committed_closure_0, &xid);
+}
+
+/* txn_blobs_aborted_t is redo_aborted's step's captures: the abort's xids, the repositories its entries named, a Vec<u32>, and whether that list couldn't grow. */
+typedef struct txn_blobs_aborted_t
+{
+	const uint64 *aborting;
+	size_t		aborting_len;
+	StdVec	   *repositories;
+	bool		full;
+} txn_blobs_aborted_t;
+
+/* txn_blobs_redo_aborted_closure_0 is redo_aborted's step: the abort's entries taken out, their repositories gathered once each. */
+static void
+txn_blobs_redo_aborted_closure_0(void *captures, StdVec *writers)
+{
+	txn_blobs_aborted_t *c = captures;
+	size_t		kept = 0;
+
+	for (size_t k = 0; k < writers->len; k++)
+	{
+		txn_blobs_Writer_t at = STD_VEC_AT(writers, txn_blobs_Writer_t, k);
+		TxnMemtableVersionWriter writer = {.xid = at.xid, .has_top = true, .top = at.top};
+		bool		gathered = false;
+
+		if (c->full || !txn_memtable_table_aborting(writer, c->aborting, c->aborting_len))
+		{
+			STD_VEC_AT(writers, txn_blobs_Writer_t, kept++) = at;
+			continue;
+		}
+		for (size_t j = 0; j < c->repositories->len && !gathered; j++)
+			gathered = STD_VEC_AT(c->repositories, uint32, j) == at.repository;
+		if (gathered)
+			continue;
+		if (!std_vec_try_reserve(c->repositories, 1, sizeof(uint32), _Alignof(uint32)))
+		{
+			c->full = true;
+			STD_VEC_AT(writers, txn_blobs_Writer_t, kept++) = at;
+			continue;
+		}
+		std_vec_push_Checked(c->repositories, &at.repository, sizeof(uint32), _Alignof(uint32));
+	}
+	writers->len = kept;
+}
+
+/* txn_blobs_aborted_keys_t is redo_aborted's walk's captures: the abort's xids, and the keys of its chunks, ADDRESS bytes each. */
+typedef struct txn_blobs_aborted_keys_t
+{
+	const uint64 *aborting;
+	size_t		aborting_len;
+	StdVec	   *keys;
+} txn_blobs_aborted_keys_t;
+
+/* txn_blobs_redo_aborted_each is redo_aborted's walk's step: a blob's chunk's key kept when one of its versions is the abort's. */
+static bool
+txn_blobs_redo_aborted_each(void *captures, HostIoIo *io, const uint8 *key, size_t key_len, const StdVec *values,
+							size_t values_len, HostError *error)
+{
+	txn_blobs_aborted_keys_t *c = captures;
+
+	(void) io;
+	if (key_len != TXN_MEMTABLE_BRANCH_ADDRESS)
+		return true;
+	for (size_t k = 0; k < values_len; k++)
+	{
+		TxnMemtableVersionRecord record = txn_memtable_version_Record_of(values[k].ptr, values[k].len);
+
+		if (!txn_memtable_table_aborting(txn_memtable_version_Record_writer(&record), c->aborting,
+										 c->aborting_len))
+			continue;
+		if (!std_vec_try_reserve(c->keys, TXN_MEMTABLE_BRANCH_ADDRESS, 1, 1))
+		{
+			*error = host_Error_out_of_memory();
+			return false;
+		}
+		std_vec_extend_from_slice_Checked(c->keys, key, TXN_MEMTABLE_BRANCH_ADDRESS, 1, 1);
+		return true;
+	}
+	return true;
+}
+
+/* txn_blobs_redo_aborted_frame_0_t is redo_aborted's state across its pad: the repositories, a delta found, and its keys, while live. */
+typedef struct txn_blobs_redo_aborted_frame_0_t
+{
+	HostIoIo   *io;
+	const uint64 *aborting;
+	size_t		aborting_len;
+	HostError  *error;
+	bool		ok;
+	StdVec		repositories;
+	bool		repositories_live;
+	HostSharedHeld held;
+	bool		held_live;
+	StdVec		keys;
+	bool		keys_live;
+} txn_blobs_redo_aborted_frame_0_t;
+
+/* txn_blobs_redo_aborted_pad_0 is redo_aborted's pad: the keys, the delta, and the repositories, while live. */
+static void
+txn_blobs_redo_aborted_pad_0(void *frame_)
+{
+	txn_blobs_redo_aborted_frame_0_t *frame = frame_;
+
+	if (frame->keys_live)
+	{
+		frame->keys_live = false;
+		std_vec_free_Checked(&frame->keys, 1, 1);
+	}
+	if (frame->held_live)
+	{
+		frame->held_live = false;
+		host_shared_Held_drop(&frame->held);
+	}
+	if (frame->repositories_live)
+	{
+		frame->repositories_live = false;
+		std_vec_free_Checked(&frame->repositories, sizeof(uint32), _Alignof(uint32));
+	}
+}
+
+/* txn_blobs_redo_aborted_pruned prunes the abort's versions of each key of the frame's held delta. */
+static bool
+txn_blobs_redo_aborted_pruned(txn_blobs_redo_aborted_frame_0_t *frame)
+{
+	for (size_t at = 0; at < frame->keys.len; at += TXN_MEMTABLE_BRANCH_ADDRESS)
+		if (!txn_memtable_table_pruned(&TXN_MEMTABLE_BRANCH_CHUNKS_TREE_OPS, frame->io,
+									   host_shared_Held_record(&frame->held), (const uint8 *) frame->keys.ptr + at,
+									   TXN_MEMTABLE_BRANCH_ADDRESS, frame->aborting, frame->aborting_len,
+									   frame->error))
+			return false;
+	return true;
+}
+
+/* txn_blobs_redo_aborted_body_0 is redo_aborted's body. */
+static void
+txn_blobs_redo_aborted_body_0(void *frame_)
+{
+	txn_blobs_redo_aborted_frame_0_t *frame = frame_;
+	txn_blobs_aborted_t aborted = {frame->aborting, frame->aborting_len, &frame->repositories};
+	txn_blobs_aborted_keys_t walk = {frame->aborting, frame->aborting_len, &frame->keys};
+
+	std_vec_new(&frame->repositories, sizeof(uint32), _Alignof(uint32));
+	frame->repositories_live = true;
+	txn_blobs_writers_locked(frame->io, txn_blobs_redo_aborted_closure_0, &aborted);
+	if (aborted.full)
+	{
+		*frame->error = host_Error_out_of_memory();
+		txn_blobs_redo_aborted_pad_0(frame);
+		return;
+	}
+	for (size_t k = 0; k < frame->repositories.len; k++)
+	{
+		bool		some;
+
+		if (!txn_memtable_branch_find(HOST_SHARED_IO_WITHIN(frame->io), STD_VEC_AT(&frame->repositories, uint32, k),
+									  &some, &frame->held, frame->error))
+		{
+			txn_blobs_redo_aborted_pad_0(frame);
+			return;
+		}
+		if (!some)
+			continue;
+		frame->held_live = true;
+		std_vec_new(&frame->keys, 1, 1);
+		frame->keys_live = true;
+		if (!txn_memtable_table_walked(&TXN_MEMTABLE_BRANCH_CHUNKS_TREE_OPS, frame->io,
+									   host_shared_Held_record(&frame->held), txn_blobs_redo_aborted_each, &walk,
+									   NULL, frame->error) ||
+			!txn_blobs_redo_aborted_pruned(frame))
+		{
+			txn_blobs_redo_aborted_pad_0(frame);
+			return;
+		}
+		frame->keys_live = false;
+		std_vec_free_Checked(&frame->keys, 1, 1);
+		frame->held_live = false;
+		host_shared_Held_drop(&frame->held);
+	}
+	frame->ok = true;
+	txn_blobs_redo_aborted_pad_0(frame);
+}
+
+/*
+ * txn_blobs_redo_aborted takes out of the working states' deltas the blobs'
+ * chunks a replayed abort's xids, or their subtransactions, wrote, as the
+ * transaction's abort took them out on its primary (bugs row 332): it walks
+ * only the chunk trees of the repositories CHUNK_WRITERS names for them, and
+ * forgets those entries.
+ */
+bool
+txn_blobs_redo_aborted(HostIoIo *io, const uint64 *aborting, size_t aborting_len, HostError *error)
+{
+	txn_blobs_redo_aborted_frame_0_t frame = {.io = io, .aborting = aborting, .aborting_len = aborting_len,
+	.error = error};
+
+	std_landing(&frame, txn_blobs_redo_aborted_body_0, txn_blobs_redo_aborted_pad_0);
+	return frame.ok;
+}
+
+/* txn_blobs_tops_t is redo_ended's step's captures: the entries' top-level xids, a Vec<u64>, each once, and whether that list couldn't grow. */
+typedef struct txn_blobs_tops_t
+{
+	StdVec	   *tops;
+	bool		full;
+} txn_blobs_tops_t;
+
+/* txn_blobs_redo_ended_closure_0 is redo_ended's step: each entry's top-level xid gathered once. */
+static void
+txn_blobs_redo_ended_closure_0(void *captures, StdVec *writers)
+{
+	txn_blobs_tops_t *c = captures;
+
+	for (size_t k = 0; k < writers->len && !c->full; k++)
+	{
+		uint64		top = STD_VEC_AT(writers, txn_blobs_Writer_t, k).top;
+		bool		gathered = false;
+
+		for (size_t j = 0; j < c->tops->len && !gathered; j++)
+			gathered = STD_VEC_AT(c->tops, uint64, j) == top;
+		if (gathered)
+			continue;
+		c->full = !std_vec_try_reserve(c->tops, 1, sizeof(uint64), _Alignof(uint64));
+		if (!c->full)
+			std_vec_push_Checked(c->tops, &top, sizeof(uint64), _Alignof(uint64));
+	}
+}
+
+/* txn_blobs_redo_ended_frame_0_t is redo_ended's state across its pad: the top-level xids, while live. */
+typedef struct txn_blobs_redo_ended_frame_0_t
+{
+	HostIoIo   *io;
+	bool		(*picked) (void *captures, HostIoIo *io, uint64 top, bool *result, HostError *error);
+	void	   *picked_captures;
+	HostError  *error;
+	bool		ok;
+	StdVec		tops;
+	bool		tops_live;
+} txn_blobs_redo_ended_frame_0_t;
+
+/* txn_blobs_redo_ended_pad_0 is redo_ended's pad: the top-level xids, while live. */
+static void
+txn_blobs_redo_ended_pad_0(void *frame_)
+{
+	txn_blobs_redo_ended_frame_0_t *frame = frame_;
+
+	if (frame->tops_live)
+	{
+		frame->tops_live = false;
+		std_vec_free_Checked(&frame->tops, sizeof(uint64), _Alignof(uint64));
+	}
+}
+
+/* txn_blobs_redo_ended_body_0 is redo_ended's body. */
+static void
+txn_blobs_redo_ended_body_0(void *frame_)
+{
+	txn_blobs_redo_ended_frame_0_t *frame = frame_;
+	txn_blobs_tops_t gathered = {&frame->tops};
+	size_t		kept = 0;
+
+	std_vec_new(&frame->tops, sizeof(uint64), _Alignof(uint64));
+	frame->tops_live = true;
+	txn_blobs_writers_locked(frame->io, txn_blobs_redo_ended_closure_0, &gathered);
+	if (gathered.full)
+	{
+		*frame->error = host_Error_out_of_memory();
+		txn_blobs_redo_ended_pad_0(frame);
+		return;
+	}
+	for (size_t k = 0; k < frame->tops.len; k++)
+	{
+		uint64		top = STD_VEC_AT(&frame->tops, uint64, k);
+		bool		ended;
+
+		if (!frame->picked(frame->picked_captures, frame->io, top, &ended, frame->error))
+		{
+			txn_blobs_redo_ended_pad_0(frame);
+			return;
+		}
+		if (ended)
+			STD_VEC_AT(&frame->tops, uint64, kept++) = top;
+	}
+	frame->ok = kept == 0 || txn_blobs_redo_aborted(frame->io, frame->tops.ptr, kept, frame->error);
+	txn_blobs_redo_ended_pad_0(frame);
+}
+
+/*
+ * txn_blobs_redo_ended takes out of the working states' deltas, as a
+ * replayed abort does (redo_aborted), the blobs' chunks of each running
+ * writer whose top-level transaction picked answers ended with no abort
+ * record, as a crash ends it (bugs row 359).
+ */
+bool
+txn_blobs_redo_ended(HostIoIo *io, bool (*picked) (void *captures, HostIoIo *io, uint64 top, bool *result,
+												   HostError *error),
+					 void *picked_captures, HostError *error)
+{
+	txn_blobs_redo_ended_frame_0_t frame = {.io = io, .picked = picked, .picked_captures = picked_captures,
+	.error = error};
+
+	std_landing(&frame, txn_blobs_redo_ended_body_0, txn_blobs_redo_ended_pad_0);
+	return frame.ok;
+}
+
+/* txn_blobs_kept_t is redo_prepared's step's captures: each entry's top-level xid and repository once, a Vec<(u64, u32)>, and whether that list couldn't grow. */
+typedef struct txn_blobs_kept_t
+{
+	StdVec	   *kept;
+	bool		full;
+} txn_blobs_kept_t;
+
+/* txn_blobs_redo_prepared_closure_0 is redo_prepared's step: every entry taken out, each top and repository gathered once. */
+static void
+txn_blobs_redo_prepared_closure_0(void *captures, StdVec *writers)
+{
+	txn_blobs_kept_t *c = captures;
+	size_t		kept = 0;
+
+	for (size_t k = 0; k < writers->len; k++)
+	{
+		txn_blobs_Writer_t at = STD_VEC_AT(writers, txn_blobs_Writer_t, k);
+		txn_blobs_Writer_t entry = {.top = at.top, .repository = at.repository};
+		bool		gathered = false;
+
+		for (size_t j = 0; j < c->kept->len && !gathered; j++)
+			gathered = STD_VEC_AT(c->kept, txn_blobs_Writer_t, j).top == at.top &&
+				STD_VEC_AT(c->kept, txn_blobs_Writer_t, j).repository == at.repository;
+		if (gathered)
+			continue;
+		if (c->full || !std_vec_try_reserve(c->kept, 1, sizeof(entry), _Alignof(txn_blobs_Writer_t)))
+		{
+			c->full = true;
+			STD_VEC_AT(writers, txn_blobs_Writer_t, kept++) = at;
+			continue;
+		}
+		std_vec_push_Checked(c->kept, &entry, sizeof(entry), _Alignof(txn_blobs_Writer_t));
+	}
+	writers->len = kept;
+}
+
+/* txn_blobs_redo_prepared_frame_0_t is redo_prepared's state across its pad: the entries taken out, while live. */
+typedef struct txn_blobs_redo_prepared_frame_0_t
+{
+	HostIoIo   *io;
+	HostError  *error;
+	bool		ok;
+	StdVec		kept;
+	bool		kept_live;
+} txn_blobs_redo_prepared_frame_0_t;
+
+/* txn_blobs_redo_prepared_pad_0 is redo_prepared's pad: the entries taken out, while live. */
+static void
+txn_blobs_redo_prepared_pad_0(void *frame_)
+{
+	txn_blobs_redo_prepared_frame_0_t *frame = frame_;
+
+	if (frame->kept_live)
+	{
+		frame->kept_live = false;
+		std_vec_free_Checked(&frame->kept, sizeof(txn_blobs_Writer_t), _Alignof(txn_blobs_Writer_t));
+	}
+}
+
+/* txn_blobs_redo_prepared_body_0 is redo_prepared's body. */
+static void
+txn_blobs_redo_prepared_body_0(void *frame_)
+{
+	txn_blobs_redo_prepared_frame_0_t *frame = frame_;
+	txn_blobs_kept_t gathered = {&frame->kept};
+
+	std_vec_new(&frame->kept, sizeof(txn_blobs_Writer_t), _Alignof(txn_blobs_Writer_t));
+	frame->kept_live = true;
+	txn_blobs_writers_locked(frame->io, txn_blobs_redo_prepared_closure_0, &gathered);
+	if (gathered.full)
+	{
+		*frame->error = host_Error_out_of_memory();
+		txn_blobs_redo_prepared_pad_0(frame);
+		return;
+	}
+	for (size_t k = 0; k < frame->kept.len; k++)
+	{
+		const txn_blobs_Writer_t *at = &STD_VEC_AT(&frame->kept, txn_blobs_Writer_t, k);
+		HostStorage storage = txn_spill_chunks_storage(at->repository);
+		bool		spilled;
+
+		if (!txn_spill_spilled(frame->io, &storage, TXN_WRITTEN_OF_CHUNKS, at->top, &spilled, frame->error))
+		{
+			txn_blobs_redo_prepared_pad_0(frame);
+			return;
+		}
+	}
+	frame->ok = true;
+	txn_blobs_redo_prepared_pad_0(frame);
+}
+
+/*
+ * txn_blobs_redo_prepared spills, at the end of recovery, the blobs' chunks
+ * of each running writer CHUNK_WRITERS still names, a prepared transaction's
+ * once redo_ended took the others, from each repository's chunk tree, as a
+ * live prepare's relief spills them, so its ROLLBACK or COMMIT PREPARED finds
+ * them listed as a live one's are (bugs row 362), and forgets the entries.
+ */
+bool
+txn_blobs_redo_prepared(HostIoIo *io, HostError *error)
+{
+	txn_blobs_redo_prepared_frame_0_t frame = {.io = io, .error = error};
+
+	std_landing(&frame, txn_blobs_redo_prepared_body_0, txn_blobs_redo_prepared_pad_0);
+	return frame.ok;
+}
+
 /* txn_blobs_redo_closure_captures_t is redo's prepare's closure's captures: the writer, the piece's bytes it takes, and the record's end. */
 typedef struct txn_blobs_redo_closure_captures_t
 {
@@ -686,13 +1285,101 @@ txn_blobs_redo_pad_0(void *frame_)
 	}
 }
 
-/* txn_blobs_redo_piece pushes one piece unless the delta holds its version already. */
+/* txn_blobs_spilled_frame_0_t is spilled's state across its pad: the hold and the key's spilled versions, while live. */
+typedef struct txn_blobs_spilled_frame_0_t
+{
+	HostIoIo   *io;
+	HostSharedRecord deltas;
+	const StdVec *key;
+	bool		blob;
+	uint64		lsn;
+	bool	   *result;
+	HostError  *error;
+	bool		ok;
+	HostDeltaHold hold;
+	bool		hold_live;
+	StdVec		versions;
+	bool		versions_live;
+} txn_blobs_spilled_frame_0_t;
+
+/* txn_blobs_spilled_pad_0 is spilled's pad: the versions, then the hold, while live. */
+static void
+txn_blobs_spilled_pad_0(void *frame_)
+{
+	txn_blobs_spilled_frame_0_t *frame = frame_;
+
+	if (frame->versions_live)
+	{
+		frame->versions_live = false;
+		txn_memtable_version_versions_drop(&frame->versions, 0);
+	}
+	if (frame->hold_live)
+	{
+		frame->hold_live = false;
+		host_delta_Hold_drop(&frame->hold);
+	}
+}
+
+/* txn_blobs_spilled_body_0 is spilled's body. */
+static void
+txn_blobs_spilled_body_0(void *frame_)
+{
+	txn_blobs_spilled_frame_0_t *frame = frame_;
+
+	*frame->result = false;
+	if (!host_delta_hold(frame->io, &frame->hold, frame->error))
+		return;
+	frame->hold_live = true;
+	if (!txn_spill_chunk_versions(frame->io, &frame->hold, frame->deltas, frame->key->ptr, frame->key->len,
+								  &frame->versions, frame->error))
+	{
+		txn_blobs_spilled_pad_0(frame);
+		return;
+	}
+	frame->versions_live = true;
+	for (size_t k = 0; k < frame->versions.len && !*frame->result; k++)
+	{
+		TxnMemtableVersionRecord record = txn_memtable_version_Version_record(&STD_VEC_AT(&frame->versions,
+																						  TxnMemtableVersionVersion,
+																						  k));
+		uint64		lsn;
+
+		*frame->result = txn_memtable_version_Record_lsn(&record, &lsn) && (!frame->blob || lsn == frame->lsn);
+	}
+	frame->ok = true;
+	txn_blobs_spilled_pad_0(frame);
+}
+
+/*
+ * txn_blobs_spilled reports whether the repository's chunk spills hold a
+ * version of a replayed piece's key that its redo pushed already: a blob's
+ * of the record's end, or a built node piece's of any logged record.
+ */
 static bool
-txn_blobs_redo_piece(txn_blobs_redo_frame_0_t *frame, TxnMemtableVersionWriter writer, txn_TupleVecU8VecU8_t *piece)
+txn_blobs_spilled(HostIoIo *io, HostSharedRecord deltas, const StdVec *key, bool blob, uint64 lsn, bool *result,
+				  HostError *error)
+{
+	txn_blobs_spilled_frame_0_t frame = {.io = io, .deltas = deltas, .key = key, .blob = blob, .lsn = lsn,
+	.result = result, .error = error};
+
+	std_landing(&frame, txn_blobs_spilled_body_0, txn_blobs_spilled_pad_0);
+	return frame.ok;
+}
+
+/*
+ * txn_blobs_redo_piece pushes one piece under its writer, counted toward its
+ * transaction's replayed bytes, unless the delta or the chunk spills hold
+ * its version already.
+ */
+static bool
+txn_blobs_redo_piece(txn_blobs_redo_frame_0_t *frame, TxnMemtableVersionWriter writer, bool blob,
+					 txn_TupleVecU8VecU8_t *piece)
 {
 	HostSharedRecord record = host_shared_Held_record(frame->deltas);
-	TxnMemtableVersionWriter none = TXN_MEMTABLE_VERSION_NO_TRANSACTION;
-	bool		blob = !txn_memtable_version_Writer_PartialEq_eq(&writer, &none);
+	HostStorage storage = txn_spill_chunks_storage(frame->chunk.repository);
+	uint64		top = writer.has_top ? writer.top : writer.xid;
+	uint64		replayed;
+	bool		spilled;
 	bool		held;
 	size_t		need;
 	txn_blobs_redo_closure_captures_t captures = {writer, &piece->f1, frame->lsn};
@@ -701,21 +1388,17 @@ txn_blobs_redo_piece(txn_blobs_redo_frame_0_t *frame, TxnMemtableVersionWriter w
 										   frame->error) :
 		  txn_memtable_branch_durable(frame->io, record, piece->f0.ptr, piece->f0.len, &held, frame->error)))
 		return false;
+	if (!held && !txn_blobs_spilled(frame->io, record, &piece->f0, blob, frame->lsn, &held, frame->error))
+		return false;
 	if (held)
 		return true;
+	if (blob && !txn_blobs_wrote(frame->io, writer, frame->chunk.repository, frame->error))
+		return false;
 	need = txn_memtable_version_largest(piece->f1.len);
-	if (blob)
-	{
-		HostStorage storage = txn_spill_chunks_storage(frame->chunk.repository);
-		uint64		top = writer.has_top ? writer.top : writer.xid;
-		uint64		replayed;
-		bool		spilled;
-
-		if (!txn_spill_replayed(frame->io, &storage, TXN_WRITTEN_OF_CHUNKS, top, need, &replayed, frame->error) ||
-			(replayed >= txn_spill_threshold() &&
-			 !txn_spill_spilled(frame->io, &storage, TXN_WRITTEN_OF_CHUNKS, top, &spilled, frame->error)))
-			return false;
-	}
+	if (!txn_spill_replayed(frame->io, &storage, TXN_WRITTEN_OF_CHUNKS, top, need, &replayed, frame->error) ||
+		(replayed >= txn_spill_threshold() &&
+		 !txn_spill_spilled(frame->io, &storage, TXN_WRITTEN_OF_CHUNKS, top, &spilled, frame->error)))
+		return false;
 	return txn_memtable_branch_prepare(frame->io, record, piece->f0.ptr, piece->f0.len, need, txn_blobs_redo_closure_0,
 									   &captures, NULL, frame->error);
 }
@@ -725,10 +1408,11 @@ static void
 txn_blobs_redo_body_0(void *frame_)
 {
 	txn_blobs_redo_frame_0_t *frame = frame_;
-	TxnMemtableVersionWriter writer = TXN_MEMTABLE_VERSION_NO_TRANSACTION;
+	bool		blob = frame->chunk.has_writer;
+	TxnMemtableVersionWriter writer = {.xid = frame->chunk.node.writer};
 	uint32		repository = frame->chunk.repository;
 
-	if (frame->chunk.has_writer)
+	if (blob)
 		writer = frame->chunk.writer;
 	if (!txn_record_ChunkWrite_pieces(&frame->chunk, &frame->pieces, frame->error))
 		return;
@@ -737,7 +1421,7 @@ txn_blobs_redo_body_0(void *frame_)
 	while (frame->moved < frame->pieces.len)
 	{
 		txn_TupleVecU8VecU8_t *piece = &STD_VEC_AT(&frame->pieces, txn_TupleVecU8VecU8_t, frame->moved);
-		bool		pushed = txn_blobs_redo_piece(frame, writer, piece);
+		bool		pushed = txn_blobs_redo_piece(frame, writer, blob, piece);
 
 		std_vec_free_Checked(&piece->f0, 1, 1);
 		std_vec_free_Checked(&piece->f1, 1, 1);
@@ -755,10 +1439,11 @@ txn_blobs_redo_body_0(void *frame_)
 /*
  * txn_blobs_redo pushes a replayed chunk's logged version into its
  * repository's working state's delta, with no catalog access, each piece of
- * a built node's on its own unless the delta holds a logged version of that
- * key already, and a blob's chunk under its writer unless the delta holds
- * the version this record pushed; a blob's chunk counts toward its
- * transaction's replayed bytes. It takes the chunk.
+ * a built node's on its own under its record's writer unless the delta or
+ * the chunk spills hold a logged version of that key already, and a blob's
+ * chunk under its writer unless they hold the version this record pushed;
+ * each counts toward its transaction's replayed bytes (bugs row 332). It
+ * takes the chunk.
  */
 bool
 txn_blobs_redo(HostIoIo *io, const HostSharedHeld *deltas, TxnRecordChunkWrite chunk, uint64 lsn, HostError *error)
@@ -768,3 +1453,506 @@ txn_blobs_redo(HostIoIo *io, const HostSharedHeld *deltas, TxnRecordChunkWrite c
 	std_landing(&frame, txn_blobs_redo_body_0, txn_blobs_redo_pad_0);
 	return frame.ok;
 }
+
+#ifdef DOLTGRES_TEST_TXN
+/* TXN_BLOBS_TESTS_UNWRAP is Result::unwrap's panic text. */
+#define TXN_BLOBS_TESTS_UNWRAP "called `Result::unwrap()` on an `Err` value"
+
+/* txn_blobs_tests_ok unwraps a host result at a line and column. */
+static void
+txn_blobs_tests_ok(bool ok, HostError *error, uint32 line, uint32 col)
+{
+	if (!ok)
+		STD_RESULT_EXPECT_FAILED(line, col, TXN_BLOBS_TESTS_UNWRAP, error, host_Error_Debug_fmt);
+}
+
+/* txn_blobs_tests_unpacked is the tests' packed closure: the packs hold no chunk. */
+static bool
+txn_blobs_tests_unpacked(void *captures, HostIoIo *io, const ChunksAddressAddress *address, bool *result,
+						 HostError *error)
+{
+	(void) captures;
+	(void) io;
+	(void) address;
+	(void) error;
+	*result = false;
+	return true;
+}
+
+/* txn_blobs_tests_current returns the running actor's transaction as a chunk's writer, its xid assigned. */
+static TxnMemtableVersionWriter
+txn_blobs_tests_current(HostIoIo *io)
+{
+	HostXid		sub;
+	HostXid		top;
+	HostError	error;
+	TxnMemtableVersionWriter writer = {0};
+
+	txn_blobs_tests_ok(host_current_writer(HOST_IO_IO_IO_DOORS(io), &sub, &top, &error), &error, 289, 51);
+	writer.xid = sub.f0;
+	writer.has_top = sub.f0 != top.f0;
+	writer.top = top.f0;
+	return writer;
+}
+
+/* txn_blobs_tests_chunk returns a test's one chunk of some bytes, by its address. */
+static StdVec
+txn_blobs_tests_chunk(const uint8 *bytes, size_t bytes_len)
+{
+	StdVec		chunks;
+	txn_TupleAddressVecU8_t chunk = {.f0 = chunks_address_Address_of(bytes, bytes_len)};
+
+	std_vec_new(&chunks, sizeof(txn_TupleAddressVecU8_t), _Alignof(txn_TupleAddressVecU8_t));
+	std_slice_to_vec_Checked(&chunk.f1, bytes, bytes_len, 1, 1);
+	std_vec_push_Checked(&chunks, &chunk, sizeof(chunk), _Alignof(txn_TupleAddressVecU8_t));
+	return chunks;
+}
+
+/* txn_blobs_tests_chunked returns a test's chunks, each of 100 bytes of one value, by their addresses. */
+static StdVec
+txn_blobs_tests_chunked(uint8 first, uint8 end)
+{
+	StdVec		chunks;
+
+	std_vec_new(&chunks, sizeof(txn_TupleAddressVecU8_t), _Alignof(txn_TupleAddressVecU8_t));
+	for (uint32 value = first; value < end; value++)
+	{
+		uint8		bytes[100];
+		StdVec		one;
+
+		memset(bytes, (int) value, sizeof(bytes));
+		one = txn_blobs_tests_chunk(bytes, sizeof(bytes));
+		std_vec_push_Checked(&chunks, one.ptr, sizeof(txn_TupleAddressVecU8_t), _Alignof(txn_TupleAddressVecU8_t));
+		std_vec_free_Checked(&one, sizeof(txn_TupleAddressVecU8_t), _Alignof(txn_TupleAddressVecU8_t));
+	}
+	return chunks;
+}
+
+/* txn_blobs_tests_chunks_drop drops a test's chunks. */
+static void
+txn_blobs_tests_chunks_drop(StdVec *chunks)
+{
+	for (size_t k = 0; k < chunks->len; k++)
+		std_vec_free_Checked(&STD_VEC_AT(chunks, txn_TupleAddressVecU8_t, k).f1, 1, 1);
+	std_vec_free_Checked(chunks, sizeof(txn_TupleAddressVecU8_t), _Alignof(txn_TupleAddressVecU8_t));
+}
+
+/* txn_blobs_tests_deltas returns a repository's working state's deltas, which unwraps at a line and column. */
+static HostSharedHeld
+txn_blobs_tests_deltas(HostIoIo *io, uint32 repository, uint32 line, uint32 col)
+{
+	HostSharedHeld held;
+	HostError	error;
+
+	txn_blobs_tests_ok(txn_memtable_branch_deltas(io, repository, HOST_PG_DEFAULT, &held, &error), &error, line, col);
+	return held;
+}
+
+/* txn_blobs_tests_written writes chunks under a writer, taking them, which unwraps at a line and column. */
+static void
+txn_blobs_tests_written(HostIoIo *io, const HostSharedHeld *deltas, uint32 repository, TxnMemtableVersionWriter writer,
+						StdVec chunks, bool logged, uint32 line, uint32 col)
+{
+	HostError	error;
+
+	txn_blobs_tests_ok(txn_blobs_written(io, deltas, repository, writer, &chunks, logged, txn_blobs_tests_unpacked,
+										 NULL, NULL, &error), &error, line, col);
+}
+
+/* txn_blobs_tests_got reads a chunk from the delta, answering whether it holds one, into bytes when given. */
+static bool
+txn_blobs_tests_got(HostIoIo *io, const HostSharedHeld *deltas, const ChunksAddressAddress *address, StdVec *bytes,
+					uint32 line, uint32 col)
+{
+	StdVec		read;
+	bool		some;
+	HostError	error;
+
+	txn_blobs_tests_ok(txn_memtable_branch_get(io, host_shared_Held_record(deltas), address->f0, sizeof(address->f0),
+											   &some, &read, &error), &error, line, col);
+	if (some && bytes != NULL)
+		*bytes = read;
+	else if (some)
+		std_vec_free_Checked(&read, 1, 1);
+	return some;
+}
+
+/* txn_blobs_tests_durable reports whether the delta's chunk is durable, which unwraps at a line and column. */
+static bool
+txn_blobs_tests_durable(HostIoIo *io, const HostSharedHeld *deltas, const ChunksAddressAddress *address, uint32 line,
+						uint32 col)
+{
+	bool		durable;
+	HostError	error;
+
+	txn_blobs_tests_ok(txn_memtable_branch_durable(io, host_shared_Held_record(deltas), address->f0,
+												   sizeof(address->f0), &durable, &error), &error, line, col);
+	return durable;
+}
+
+/* txn_blobs_tests_spilled reads a chunk from its transaction's chunk spill, answering whether it holds one, into bytes when given. */
+static bool
+txn_blobs_tests_spilled(HostIoIo *io, const HostSharedHeld *deltas, const ChunksAddressAddress *address, StdVec *bytes,
+						uint32 line, uint32 col)
+{
+	StdVec		read;
+	bool		some;
+	HostError	error;
+
+	txn_blobs_tests_ok(txn_spill_chunk(io, host_shared_Held_record(deltas), address->f0, sizeof(address->f0), &some,
+									   &read, &error), &error, line, col);
+	if (some && bytes != NULL)
+		*bytes = read;
+	else if (some)
+		std_vec_free_Checked(&read, 1, 1);
+	return some;
+}
+
+/* txn_blobs_tests_logged_t is a logged chunk record of a repository with its end. */
+typedef struct txn_blobs_tests_logged_t
+{
+	TxnRecordChunkWrite chunk;
+	uint64		end;
+} txn_blobs_tests_logged_t;
+
+/* txn_blobs_tests_logged returns the chunk records the simulation logged for a repository, with their ends. */
+static StdVec
+txn_blobs_tests_logged(uint32 repository)
+{
+	StdVec		logged = simc_logged();
+	StdVec		records;
+
+	std_vec_new(&records, sizeof(txn_blobs_tests_logged_t), _Alignof(txn_blobs_tests_logged_t));
+	for (size_t k = 0; k < logged.len; k++)
+	{
+		simc_TupleU8VecU8Lsn_t *one = &STD_VEC_AT(&logged, simc_TupleU8VecU8Lsn_t, k);
+		txn_blobs_tests_logged_t record = {.end = one->f2};
+		HostWalKind kind;
+		HostError	error;
+
+		if (host_WalKind_of(one->f0, &kind) && kind == HOST_WAL_KIND_CHUNK)
+		{
+			if (!txn_record_ChunkWrite_decode(one->f1.ptr, one->f1.len, &record.chunk, &error))
+				host_Error_drop(&error);
+			else if (record.chunk.repository != repository)
+				txn_record_ChunkWrite_drop(&record.chunk);
+			else
+				std_vec_push_Checked(&records, &record, sizeof(record), _Alignof(txn_blobs_tests_logged_t));
+		}
+		std_vec_free_Checked(&one->f1, 1, 1);
+	}
+	std_vec_free_Checked(&logged, sizeof(simc_TupleU8VecU8Lsn_t), _Alignof(simc_TupleU8VecU8Lsn_t));
+	return records;
+}
+
+/* txn_blobs_tests_logged_drop frees what logged returned. */
+static void
+txn_blobs_tests_logged_drop(StdVec *records)
+{
+	for (size_t k = 0; k < records->len; k++)
+		txn_record_ChunkWrite_drop(&STD_VEC_AT(records, txn_blobs_tests_logged_t, k).chunk);
+	std_vec_free_Checked(records, sizeof(txn_blobs_tests_logged_t), _Alignof(txn_blobs_tests_logged_t));
+}
+
+/* txn_blobs_tests_ended ends the running actor's transaction, committed or aborted, and its written list with it. */
+static void
+txn_blobs_tests_ended(HostIoIo *io, bool committed, uint32 line, uint32 col)
+{
+	HostError	error;
+
+	simc_end(committed);
+	txn_blobs_tests_ok(committed ? txn_written_ended(io, &error) : txn_written_aborted(io, 0, &error), &error, line, col);
+}
+
+/*
+ * test_txn_blobs_tests_a_logged_write_logs_a_chunk_an_unlogged_one_left_and_redo_makes_it_durable:
+ * the out-of-line values text's V2, a chunk an unlogged write put into the
+ * working state's delta is not durable, so a logged write of the same chunk
+ * pushes and logs its own version, which makes it durable; a second logged
+ * write passes over it; and redo of the logged records on another working
+ * state makes the chunk durable there.
+ */
+void
+test_txn_blobs_tests_a_logged_write_logs_a_chunk_an_unlogged_one_left_and_redo_makes_it_durable(void)
+{
+	SimcProcess process = simc_process();
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedHeld deltas = txn_blobs_tests_deltas(io, 9320, 228, 73);
+	HostSharedHeld replica;
+	ChunksAddressAddress address = chunks_address_Address_of((const uint8 *) "blob", 4);
+	TxnMemtableVersionWriter writer = txn_blobs_tests_current(io);
+	StdVec		records;
+	StdVec		bytes;
+	size_t		count;
+	size_t		one = 1;
+
+	txn_blobs_tests_written(io, &deltas, 9320, writer, txn_blobs_tests_chunk((const uint8 *) "blob", 4), false, 233,
+							83);
+	STD_ASSERT(234, 9, txn_blobs_tests_got(io, &deltas, &address, NULL, 234, 62),
+			   "branch::get(io, deltas.record(), &address.0).unwrap().is_some()");
+	STD_ASSERT(235, 9, !txn_blobs_tests_durable(io, &deltas, &address, 235, 67),
+			   "!branch::durable(io, deltas.record(), &address.0).unwrap()");
+	records = txn_blobs_tests_logged(9320);
+	STD_ASSERT(244, 9, records.len == 0, "logged().is_empty()");
+	txn_blobs_tests_logged_drop(&records);
+	txn_blobs_tests_written(io, &deltas, 9320, writer, txn_blobs_tests_chunk((const uint8 *) "blob", 4), true, 245,
+							82);
+	STD_ASSERT(246, 9, txn_blobs_tests_durable(io, &deltas, &address, 246, 66),
+			   "branch::durable(io, deltas.record(), &address.0).unwrap()");
+	txn_blobs_tests_written(io, &deltas, 9320, writer, txn_blobs_tests_chunk((const uint8 *) "blob", 4), true, 247,
+							82);
+	records = txn_blobs_tests_logged(9320);
+	count = records.len;
+	STD_ASSERT_EQ(249, 9, count == 1, &count, std_usize_Debug_fmt, &one, std_usize_Debug_fmt);
+	replica = txn_blobs_tests_deltas(io, 9321, 250, 94);
+	for (size_t k = 0; k < records.len; k++)
+	{
+		txn_blobs_tests_logged_t *record = &STD_VEC_AT(&records, txn_blobs_tests_logged_t, k);
+		HostError	error;
+
+		txn_blobs_tests_ok(txn_blobs_redo(io, &replica, record->chunk, record->end, &error), &error, 252, 44);
+	}
+	std_vec_free_Checked(&records, sizeof(txn_blobs_tests_logged_t), _Alignof(txn_blobs_tests_logged_t));
+	STD_ASSERT(254, 9, txn_blobs_tests_durable(io, &replica, &address, 254, 67),
+			   "branch::durable(io, replica.record(), &address.0).unwrap()");
+	STD_ASSERT(255, 9, txn_blobs_tests_got(io, &replica, &address, &bytes, 255, 66) && bytes.len == 4 &&
+			   memcmp(bytes.ptr, "blob", 4) == 0,
+			   "branch::get(io, replica.record(), &address.0).unwrap().as_deref() == Some(&b\"blob\"[..])");
+	std_vec_free_Checked(&bytes, 1, 1);
+	txn_blobs_tests_ended(io, true, 257, 35);
+	host_shared_Held_drop(&replica);
+	host_shared_Held_drop(&deltas);
+	simc_TestIo_drop(&test_io);
+	simc_Process_drop(&process);
+}
+
+/*
+ * test_txn_blobs_tests_a_blob_in_the_delta_reads_back_through_blobs: PLAN
+ * item 5's TOAST read, a blob tree whose chunks a write put into the working
+ * state's delta reads back whole and in slices through Blobs, and with no
+ * delta published its chunks aren't found.
+ */
+void
+test_txn_blobs_tests_a_blob_in_the_delta_reads_back_through_blobs(void)
+{
+	SimcProcess process = simc_process();
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	StdVec		owned;
+	uint8	   *data;
+	TxnBlobsCut cut;
+	TreesStoreTreeRef root;
+	TreesStoreMemoryStore packs = trees_store_MemoryStore_new();
+	TxnBlobsBlobs unread;
+	TxnBlobsBlobs blobs;
+	HostSharedHeld deltas;
+	TxnMemtableVersionWriter writer;
+	StdVec		read;
+	uint8		slice[3000];
+	ChunksErrorError failed;
+	HostError	error;
+
+	std_vec_from_elem_zeroed(&owned, 100000, 1, 1);
+	data = owned.ptr;
+	for (uint32 i = 0; i < 100000; i++)
+		data[i] = (uint8) ((i * UINT64CONST(2654435761) & PG_UINT32_MAX) >> 24);
+	txn_blobs_Cut_Default_default(&cut);
+	if (!trees_blob_write_blob(io, TXN_BLOBS_CUT_NODE_STORE(&cut), data, 100000, TREES_CHUNKER_DEFAULT_TARGET, &root,
+							   &failed))
+		STD_RESULT_EXPECT_FAILED(270, 82, TXN_BLOBS_TESTS_UNWRAP, &failed, chunks_error_Error_Debug_fmt);
+	STD_ASSERT_MSG(271, 9, cut.chunks.len > 1, "the blob fit one chunk");
+	txn_blobs_tests_ok(txn_blobs_Blobs_new(io, 9322, TREES_STORE_MEMORY_STORE_NODE_STORE(&packs), &unread, &error),
+					   &error, 273, 57);
+	if (trees_blob_read_blob(io, TXN_BLOBS_BLOBS_NODE_STORE(&unread), TREES_STORE_TREE_REF_NAMED(&root), &read,
+							 &failed))
+		STD_ASSERT_MSG(274, 9, false, "a blob no delta holds was read");
+	chunks_error_Error_drop(&failed);
+	txn_blobs_Blobs_drop(&unread);
+	deltas = txn_blobs_tests_deltas(io, 9322, 275, 73);
+	writer = txn_blobs_tests_current(io);
+	txn_blobs_tests_written(io, &deltas, 9322, writer, cut.chunks, false, 277, 89);
+	txn_blobs_tests_ok(txn_blobs_Blobs_new(io, 9322, TREES_STORE_MEMORY_STORE_NODE_STORE(&packs), &blobs, &error),
+					   &error, 278, 56);
+	if (!trees_blob_read_blob(io, TXN_BLOBS_BLOBS_NODE_STORE(&blobs), TREES_STORE_TREE_REF_NAMED(&root), &read,
+							  &failed))
+		STD_RESULT_EXPECT_FAILED(279, 55, TXN_BLOBS_TESTS_UNWRAP, &failed, chunks_error_Error_Debug_fmt);
+	STD_ASSERT(279, 9, read.len == 100000 && memcmp(read.ptr, data, 100000) == 0,
+			   "trees::read_blob(io, &blobs, root).unwrap() == data");
+	std_vec_free_Checked(&read, 1, 1);
+	if (!trees_blob_read_slice(io, TXN_BLOBS_BLOBS_NODE_STORE(&blobs), TREES_STORE_TREE_REF_NAMED(&root), 40000,
+							   slice, sizeof(slice), &failed))
+		STD_RESULT_EXPECT_FAILED(281, 65, TXN_BLOBS_TESTS_UNWRAP, &failed, chunks_error_Error_Debug_fmt);
+	STD_ASSERT(282, 9, memcmp(slice, data + 40000, sizeof(slice)) == 0, "slice == data[40_000..43_000]");
+	txn_blobs_tests_ended(io, true, 284, 35);
+	txn_blobs_Blobs_drop(&blobs);
+	host_shared_Held_drop(&deltas);
+	trees_store_MemoryStore_drop(&packs);
+	std_vec_free_Checked(&owned, 1, 1);
+	simc_TestIo_drop(&test_io);
+	simc_Process_drop(&process);
+}
+
+/*
+ * test_txn_blobs_tests_a_transactions_chunks_spill_read_back_and_leave_at_its_abort:
+ * PLAN's chunk spill row, a transaction's chunks spill out of the working
+ * state's delta into its chunk spill, where spill::chunk reads them back, and
+ * its abort takes the spill out of the manifest, so none reads back after.
+ */
+void
+test_txn_blobs_tests_a_transactions_chunks_spill_read_back_and_leave_at_its_abort(void)
+{
+	SimcProcess process = simc_process();
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	RepoRepo	repo;
+	HostSharedHeld deltas;
+	TxnMemtableVersionWriter writer;
+	HostStorage storage = txn_spill_chunks_storage(9324);
+	StdVec		chunks;
+	bool		spilled;
+	ChunksErrorError failed;
+	HostError	error;
+
+	if (!repo_Repo_create(io, 9324, HOST_PG_DEFAULT, &repo, &failed))
+		STD_RESULT_EXPECT_FAILED(306, 74, TXN_BLOBS_TESTS_UNWRAP, &failed, chunks_error_Error_Debug_fmt);
+	deltas = txn_blobs_tests_deltas(io, 9324, 307, 73);
+	writer = txn_blobs_tests_current(io);
+	txn_blobs_tests_written(io, &deltas, 9324, writer, txn_blobs_tests_chunked(0, 3), true, 309, 91);
+	txn_blobs_tests_ok(txn_spill_spilled(io, &storage, TXN_WRITTEN_OF_CHUNKS, writer.xid, &spilled, &error), &error,
+					   310, 96);
+	STD_ASSERT(310, 9, spilled,
+			   "spill::spilled(io, &spill::chunks_storage(repository), Of::Chunks, writer.xid).unwrap()");
+	chunks = txn_blobs_tests_chunked(0, 3);
+	for (size_t k = 0; k < chunks.len; k++)
+	{
+		txn_TupleAddressVecU8_t *chunk = &STD_VEC_AT(&chunks, txn_TupleAddressVecU8_t, k);
+		StdVec		bytes;
+
+		STD_ASSERT_MSG(312, 13, !txn_blobs_tests_got(io, &deltas, &chunk->f0, NULL, 312, 69), "a spilled chunk stayed");
+		STD_ASSERT(313, 13, txn_blobs_tests_spilled(io, &deltas, &chunk->f0, &bytes, 313, 70) &&
+				   bytes.len == chunk->f1.len && memcmp(bytes.ptr, chunk->f1.ptr, bytes.len) == 0,
+				   "spill::chunk(io, deltas.record(), &address.0).unwrap() == Some(bytes)");
+		std_vec_free_Checked(&bytes, 1, 1);
+	}
+	txn_blobs_tests_ended(io, false, 316, 37);
+	for (size_t k = 0; k < chunks.len; k++)
+		STD_ASSERT_MSG(318, 13, !txn_blobs_tests_spilled(io, &deltas, &STD_VEC_AT(&chunks, txn_TupleAddressVecU8_t,
+																				  k).f0, NULL, 318, 70),
+					   "an aborted spill's chunk read");
+	txn_blobs_tests_chunks_drop(&chunks);
+	host_shared_Held_drop(&deltas);
+	repo_Repo_drop(&repo);
+	simc_TestIo_drop(&test_io);
+	simc_Process_drop(&process);
+}
+
+/* txn_blobs_tests_holding_t is the holding test's actors' captures: the io, the deltas, and the end each actor's turn makes. */
+typedef struct txn_blobs_tests_holding_t
+{
+	HostIoIo   *io;
+	const HostSharedHeld *deltas;
+	bool		committed;
+} txn_blobs_tests_holding_t;
+
+/* txn_blobs_tests_holding_write is an actor's turn that writes the holding test's chunk under its own transaction. */
+static void
+txn_blobs_tests_holding_write(void *captures)
+{
+	txn_blobs_tests_holding_t *c = captures;
+
+	txn_blobs_tests_written(c->io, c->deltas, 9325, txn_blobs_tests_current(c->io), txn_blobs_tests_chunked(7, 8),
+							true, 334, 95);
+}
+
+/* txn_blobs_tests_holding_end is an actor's turn that ends its transaction as its captures say. */
+static void
+txn_blobs_tests_holding_end(void *captures)
+{
+	txn_blobs_tests_holding_t *c = captures;
+
+	txn_blobs_tests_ended(c->io, c->committed, c->committed ? 345 : 340, c->committed ? 39 : 41);
+}
+
+/*
+ * test_txn_blobs_tests_a_chunk_another_running_transaction_holds_stays_after_that_ones_abort:
+ * PLAN's chunk spill row, the writer's rule, a transaction writing a chunk
+ * another running transaction holds pushes its own version of it, so the
+ * other's abort, which takes its versions back, leaves the chunk the first
+ * one names.
+ */
+void
+test_txn_blobs_tests_a_chunk_another_running_transaction_holds_stays_after_that_ones_abort(void)
+{
+	SimcProcess process = simc_process();
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedHeld deltas = txn_blobs_tests_deltas(io, 9325, 330, 73);
+	StdVec		chunks = txn_blobs_tests_chunked(7, 8);
+	txn_TupleAddressVecU8_t *chunk = &STD_VEC_AT(&chunks, txn_TupleAddressVecU8_t, 0);
+	txn_blobs_tests_holding_t captures = {.io = io, .deltas = &deltas};
+	StdVec		bytes;
+
+	simc_as_actor(1, txn_blobs_tests_holding_write, &captures);
+	simc_as_actor(2, txn_blobs_tests_holding_write, &captures);
+	captures.committed = false;
+	simc_as_actor(1, txn_blobs_tests_holding_end, &captures);
+	STD_ASSERT(342, 9, txn_blobs_tests_spilled(io, &deltas, &chunk->f0, &bytes, 342, 66) &&
+			   bytes.len == chunk->f1.len && memcmp(bytes.ptr, chunk->f1.ptr, bytes.len) == 0,
+			   "spill::chunk(io, deltas.record(), &address.0).unwrap() == Some(bytes)");
+	std_vec_free_Checked(&bytes, 1, 1);
+	captures.committed = true;
+	simc_as_actor(2, txn_blobs_tests_holding_end, &captures);
+	txn_blobs_tests_chunks_drop(&chunks);
+	host_shared_Held_drop(&deltas);
+	simc_TestIo_drop(&test_io);
+	simc_Process_drop(&process);
+}
+
+/*
+ * test_txn_blobs_tests_a_rolled_back_chunk_takes_nothing_from_its_tops_count:
+ * PLAN's chunk spill row, a chunk's version counts at no status entry, so a
+ * subtransaction's rollback, which prunes its chunk versions, leaves its
+ * top-level transaction's count as its rows left it.
+ */
+void
+test_txn_blobs_tests_a_rolled_back_chunk_takes_nothing_from_its_tops_count(void)
+{
+	SimcProcess process = simc_process();
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedHeld deltas = txn_blobs_tests_deltas(io, 9326, 357, 73);
+	HostXid		top = {txn_blobs_tests_current(io).xid};
+	TxnMemtableVersionWriter sub;
+	TxnStatusRoomed roomed;
+	TxnStatusEntry entry;
+	StdVec		chunks;
+	uint64		added;
+	bool		has;
+	uint64		got;
+	uint64		want = 1;
+	HostError	error;
+
+	txn_blobs_tests_ok(txn_status_roomed(io, top, &roomed, &error), &error, 359, 45);
+	txn_blobs_tests_ok(txn_status_add(io, top, 1, &has, &added, &error), &error, 360, 45);
+	simc_savepoint();
+	sub = txn_blobs_tests_current(io);
+	txn_blobs_tests_ok(txn_written_sub_started(io, (uint32) sub.xid, &error), &error, 363, 57);
+	txn_blobs_tests_written(io, &deltas, 9326, sub, txn_blobs_tests_chunked(3, 5), true, 364, 88);
+	simc_rollback_to();
+	txn_blobs_tests_ok(txn_written_sub_aborted(io, (uint32) sub.xid, &error), &error, 366, 57);
+	chunks = txn_blobs_tests_chunked(3, 4);
+	STD_ASSERT(367, 9, !txn_blobs_tests_spilled(io, &deltas, &STD_VEC_AT(&chunks, txn_TupleAddressVecU8_t, 0).f0, NULL,
+												367, 77),
+			   "spill::chunk(io, deltas.record(), &chunked(3..4)[0].0.0).unwrap() == None");
+	txn_blobs_tests_chunks_drop(&chunks);
+	txn_blobs_tests_ok(txn_status_lookup(io, top, &has, &entry, &error), &error, 368, 56);
+	got = has ? entry.count : 0;
+	STD_ASSERT_EQ(368, 9, has && entry.count == 1, &got, std_u64_Debug_fmt, &want, std_u64_Debug_fmt);
+	txn_blobs_tests_ended(io, true, 370, 35);
+	host_shared_Held_drop(&deltas);
+	simc_TestIo_drop(&test_io);
+	simc_Process_drop(&process);
+}
+
+#endif							/* DOLTGRES_TEST_TXN */

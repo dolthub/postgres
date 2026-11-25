@@ -1073,4 +1073,285 @@ for my $carrying (@carrying)
 		"an update carries its old row's lock to the new row's xmax as heap's does, with columns ($columns)");
 }
 
+
+# A primary key WITHOUT OVERLAPS is an exclusion constraint's, so an insert or
+# an update that writes an existing row's key is refused with the exclusion
+# violation, 23P01, as heap's exclusion check refuses it (bugs row 317), not
+# with a unique index's 23505, the existing row folded into the base. On a
+# node of its own, with the fold launcher held, no fold worker left running,
+# and no other process's xmin or xid holding the horizon, the case's own fold
+# installs that base.
+my $overlap = PostgreSQL::Test::Cluster->new('overlap');
+$overlap->init;
+$overlap->start;
+$overlap->safe_psql('postgres',
+	"CREATE EXTENSION injection_points; CREATE EXTENSION doltgres_test; SELECT injection_points_attach('doltgres-fold-launch', 'wait')"
+);
+$overlap->poll_query_until('postgres',
+	"SELECT count(*) = 1 FROM pg_stat_activity WHERE wait_event = 'doltgres-fold-launch'"
+) or die 'the fold launcher is not held';
+$overlap->safe_psql(
+	'postgres', q{
+CREATE TABLE overlapped (id int4range, valid_at daterange, CONSTRAINT overlapped_pkey PRIMARY KEY (id, valid_at WITHOUT OVERLAPS));
+INSERT INTO overlapped VALUES ('[1,2)', daterange('2000-01-01', '2000-02-15')), ('[1,2)', daterange('2001-01-01', '2002-01-01'));
+});
+$overlap->poll_query_until('postgres',
+	"SELECT count(*) = 0 FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND (backend_type = 'fold worker' OR backend_xmin IS NOT NULL OR backend_xid IS NOT NULL)"
+) or die 'a process holds the fold back';
+is( $overlap->safe_psql(
+		'postgres', "SELECT doltgres_test_fold('overlapped')"),
+	't',
+	'a WITHOUT OVERLAPS primary key\'s table folds its rows into its base');
+my @refused;
+for my $statement (
+	"INSERT INTO overlapped VALUES ('[1,2)', daterange('2000-01-01', '2000-02-15'))",
+	"UPDATE overlapped SET valid_at = daterange('2000-01-01', '2000-04-01') WHERE id = '[1,2)'"
+  )
+{
+	my (undef, undef, $err) =
+	  $overlap->psql('postgres', "\\set VERBOSITY verbose\n$statement");
+	push @refused,
+	  join("\n",
+		grep { /^(?:psql:<stdin>:\d+: )?(?:ERROR|DETAIL):/ } split /\n/,
+		$err);
+}
+is_deeply(
+	\@refused,
+	[
+		qq{psql:<stdin>:2: ERROR:  23P01: conflicting key value violates exclusion constraint "overlapped_pkey"\nDETAIL:  Key (id, valid_at)=([1,2), [2000-01-01,2000-02-15)) conflicts with existing key (id, valid_at)=([1,2), [2000-01-01,2000-02-15)).},
+		qq{psql:<stdin>:2: ERROR:  23P01: conflicting key value violates exclusion constraint "overlapped_pkey"\nDETAIL:  Key (id, valid_at)=([1,2), [2000-01-01,2000-04-01)) conflicts with existing key (id, valid_at)=([1,2), [2000-01-01,2000-04-01)).}
+	],
+	"an insert or an update of a WITHOUT OVERLAPS primary key's existing key is refused as heap's exclusion check refuses it"
+);
+$overlap->stop;
+
+# An update's flagged take of its replaced row's block, whose read a spill of the block's running writer moves
+# after it, finishes with the block's spilled entry, and an error at the block's read again fails only the update
+# (bugs row 342).
+my $flagging = PostgreSQL::Test::Cluster->new('flagging');
+$flagging->init(allows_streaming => 1);
+$flagging->append_conf('postgresql.conf',
+	"fold_threshold = 1GB\nfold_timeout = 3600s\nautovacuum = off");
+$flagging->start;
+$flagging->safe_psql('postgres',
+	'CREATE EXTENSION injection_points; CREATE EXTENSION doltgres_test');
+$flagging->backup('flagging_backup');
+my $flagging_standby = PostgreSQL::Test::Cluster->new('flagging_standby');
+$flagging_standby->init_from_backup($flagging, 'flagging_backup',
+	has_streaming => 1);
+$flagging_standby->start;
+
+# flagging_made makes a table whose block 0, nearly full and left for block 1, holds a folded row, so an update to
+# 3000 bytes moves it to block 1.
+sub flagging_made
+{
+	my ($table) = @_;
+	$flagging->safe_psql(
+		'postgres', qq{
+CREATE TABLE $table (k int4, v text);
+ALTER TABLE $table ALTER COLUMN v SET STORAGE PLAIN;
+INSERT INTO $table VALUES (1, repeat('v', 2500));
+INSERT INTO $table VALUES (4, repeat('v', 4500));
+INSERT INTO $table VALUES (3, repeat('v', 1500));
+SELECT doltgres_test_fold('$table');
+});
+}
+
+# flagging_held runs the update of a table's row 1 held after its flagged read, while the writer spills its takes on
+# block 0, its second turn's flagged read erring when error is set; it returns the update's errors.
+sub flagging_held
+{
+	my ($table, $error) = @_;
+	my $writer = $flagging->background_psql('postgres');
+	$writer->query_safe(
+		"BEGIN; INSERT INTO $table VALUES (2, repeat('v', 600))");
+	my $updater = $flagging->background_psql('postgres', on_error_stop => 0);
+	$updater->query_safe('SELECT injection_points_set_local()');
+	$updater->query_safe(
+		"SELECT injection_points_attach('doltgres-insert-flagged-read', 'wait')"
+	);
+	$updater->query_until(qr/started/,
+		"\\echo started\nUPDATE $table SET v = repeat('w', 3000) WHERE k = 1;\n"
+	);
+	$flagging->wait_for_event('client backend',
+		'doltgres-insert-flagged-read');
+	$writer->query_safe('SELECT doltgres_test_delta(61, 0, 0)') for 1 .. 4;
+	$flagging->safe_psql('postgres',
+		"SELECT injection_points_detach('doltgres-insert-flagged-read')");
+	$flagging->safe_psql('postgres',
+		"SELECT injection_points_attach('doltgres-insert-flagged-read', 'error')"
+	) if $error;
+	$flagging->safe_psql('postgres',
+		"SELECT injection_points_wakeup('doltgres-insert-flagged-read')");
+	$updater->query('SELECT 1');
+	$flagging->safe_psql('postgres',
+		"SELECT injection_points_detach('doltgres-insert-flagged-read')")
+	  if $error;
+	my $errors = $updater->{stderr};
+	$updater->quit;
+	$writer->query_safe('COMMIT');
+	$writer->quit;
+	return $errors;
+}
+my $flagging_entry = q{SELECT doltgres_test_free_space('%s', 0)};
+
+flagging_made('flagged_spilled');
+flagging_held('flagged_spilled', 0);
+flagging_made('flagged_plain');
+$flagging->safe_psql(
+	'postgres', q{
+INSERT INTO flagged_plain VALUES (2, repeat('v', 600));
+UPDATE flagged_plain SET v = repeat('w', 3000) WHERE k = 1;
+});
+is( $flagging->safe_psql(
+		'postgres', sprintf($flagging_entry, 'flagged_spilled')),
+	$flagging->safe_psql(
+		'postgres', sprintf($flagging_entry, 'flagged_plain')),
+	"an update's flagged take after a spill moved its block's takes leaves the entry an unspilled update leaves"
+);
+
+flagging_made('flagged_erred');
+my $erred = flagging_held('flagged_erred', 1);
+like(
+	$erred,
+	qr/doltgres-insert-flagged-read/,
+	"an error at the flagged block's read again fails the update");
+is( $flagging->safe_psql(
+		'postgres', q{SELECT length(v) FROM flagged_erred WHERE k = 1}),
+	'2500',
+	"the failed update leaves its row as it was");
+$flagging->safe_psql('postgres',
+	q{UPDATE flagged_erred SET v = repeat('w', 3000) WHERE k = 1});
+flagging_made('flagged_undone');
+$flagging->safe_psql(
+	'postgres', q{
+INSERT INTO flagged_undone VALUES (2, repeat('v', 600));
+BEGIN;
+UPDATE flagged_undone SET v = repeat('w', 3000) WHERE k = 1;
+ROLLBACK;
+UPDATE flagged_undone SET v = repeat('w', 3000) WHERE k = 1;
+});
+is( $flagging->safe_psql(
+		'postgres', sprintf($flagging_entry, 'flagged_erred')),
+	$flagging->safe_psql(
+		'postgres', sprintf($flagging_entry, 'flagged_undone')),
+	"a later update after the failed one leaves the entry a rolled-back update leaves"
+);
+
+$flagging->wait_for_catchup($flagging_standby);
+foreach my $table ('flagged_spilled', 'flagged_plain', 'flagged_erred',
+	'flagged_undone')
+{
+	is( $flagging_standby->safe_psql(
+			'postgres', sprintf($flagging_entry, $table)),
+		$flagging->safe_psql('postgres', sprintf($flagging_entry, $table)),
+		"the standby's entry of $table matches the primary's");
+}
+# The k=2 update's prune clears block 0's full flag, as Postgres' prune clears PD_PAGE_FULL, so the live primary's
+# entry of block 0 is $flagging_cleared, and the standby's and a crash-recovered primary's are the same wherever a
+# checkpoint falls around a pair's two updates (bugs row 370).
+my $flagging_cleared = '400 {' . join(',', 5 .. 291) . '}';
+
+# flagging_pair makes a pair of flagged tables: <pair>_spilled, whose block 0's takes a spill moved, and <pair>_plain.
+sub flagging_pair
+{
+	my ($pair) = @_;
+	flagging_made("${pair}_spilled");
+	flagging_held("${pair}_spilled", 0);
+	flagging_made("${pair}_plain");
+	$flagging->safe_psql(
+		'postgres', qq{
+INSERT INTO ${pair}_plain VALUES (2, repeat('v', 600));
+UPDATE ${pair}_plain SET v = repeat('w', 3000) WHERE k = 1;
+});
+}
+
+# flagging_entries returns a pair's block 0 entries on a node, the spilled table's, then the plain one's.
+sub flagging_entries
+{
+	my ($node, $pair) = @_;
+	return join(
+		' / ',
+		map {
+			$node->safe_psql('postgres',
+				sprintf($flagging_entry, "${pair}_$_"))
+		} ('spilled', 'plain'));
+}
+
+# flagging_updated runs a pair's k=2 updates, the plain table's, then the spilled one's, with a CHECKPOINT at the
+# place given (none, before, between, or after them), and checks the live primary's, the standby's, and a
+# crash-recovered primary's entries.
+sub flagging_updated
+{
+	my ($pair, $place) = @_;
+	my $live = "$flagging_cleared / $flagging_cleared";
+	my $when =
+	  $place eq 'none'
+	  ? 'with no checkpoint'
+	  : "with a checkpoint $place the updates";
+
+	$flagging->safe_psql('postgres', 'CHECKPOINT') if $place eq 'before';
+	$flagging->safe_psql('postgres',
+		"UPDATE ${pair}_plain SET v = repeat('x', 10) WHERE k = 2");
+	$flagging->safe_psql('postgres', 'CHECKPOINT') if $place eq 'between';
+	$flagging->safe_psql('postgres',
+		"UPDATE ${pair}_spilled SET v = repeat('x', 10) WHERE k = 2");
+	$flagging->safe_psql('postgres', 'CHECKPOINT') if $place eq 'after';
+	is(flagging_entries($flagging, $pair),
+		$live, "the live primary's entries $when");
+	$flagging->wait_for_catchup($flagging_standby);
+	is(flagging_entries($flagging_standby, $pair),
+		$live, "the standby's entries match the live primary's $when");
+	$flagging->stop('immediate');
+	$flagging->start;
+	is(flagging_entries($flagging, $pair),
+		$live,
+		"a crash-recovered primary's entries match the live ones $when");
+}
+flagging_updated('flagged', 'before');
+flagging_pair('unchecked');
+flagging_updated('unchecked', 'none');
+flagging_pair('between');
+flagging_updated('between', 'between');
+flagging_pair('after');
+flagging_updated('after', 'after');
+
+# A standby whose restartpoint falls between a pair's updates reads the live primary's entries after a restart and
+# after its promotion, and the prune's clear of the full flag is logged as a TidsFreed record naming the block with no
+# conflict horizon (bugs row 370).
+flagging_pair('restarted');
+$flagging->safe_psql('postgres', 'CREATE EXTENSION pg_walinspect');
+my $cleared_from =
+  $flagging->safe_psql('postgres', 'SELECT pg_current_wal_insert_lsn()');
+$flagging->safe_psql('postgres',
+	"UPDATE restarted_plain SET v = repeat('x', 10) WHERE k = 2");
+is( $flagging->safe_psql(
+		'postgres',
+		"SELECT string_agg(description, ' | ') FROM pg_get_wal_records_info('$cleared_from', pg_current_wal_insert_lsn()) WHERE resource_manager = 'Versioned' AND record_type = 'TidsFreed'"
+	),
+	$flagging->safe_psql(
+		'postgres',
+		q{SELECT 'rel 1663/' || oid || '/' || pg_relation_filenode('restarted_plain') || '; horizon 0; 0 tids; 0 dead; cleared block 0' FROM pg_database WHERE datname = current_database()}
+	),
+	"the update's prune logs its clear of block 0's full flag");
+$flagging->safe_psql('postgres', 'CHECKPOINT');
+$flagging->wait_for_catchup($flagging_standby);
+$flagging_standby->safe_psql('postgres', 'CHECKPOINT');
+$flagging->safe_psql('postgres',
+	"UPDATE restarted_spilled SET v = repeat('x', 10) WHERE k = 2");
+$flagging->wait_for_catchup($flagging_standby);
+$flagging_standby->stop('immediate');
+$flagging_standby->start;
+$flagging->wait_for_catchup($flagging_standby);
+is( flagging_entries($flagging_standby, 'restarted'),
+	"$flagging_cleared / $flagging_cleared",
+	"a standby restarted after a restartpoint between the updates reads the live primary's entries"
+);
+$flagging_standby->promote;
+is( flagging_entries($flagging_standby, 'restarted'),
+	"$flagging_cleared / $flagging_cleared",
+	"and so does the standby once promoted");
+$flagging_standby->stop;
+$flagging->stop;
+
 done_testing();

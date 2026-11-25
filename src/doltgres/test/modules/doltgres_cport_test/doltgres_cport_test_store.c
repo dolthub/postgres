@@ -35,6 +35,8 @@ PG_MODULE_MAGIC;
 
 /* CPORT_TESTS are store's tests, as its Rust harness runs them, sorted by name. */
 static const CportTest CPORT_TESTS[] = {
+	{"collect::tests::a_cancel_at_any_check_of_a_full_collection_leaves_its_packs_whole",
+	test_store_collect_tests_a_cancel_at_any_check_of_a_full_collection_leaves_its_packs_whole},
 	{"collect::tests::a_chunk_named_by_address_alone_marks_every_record_of_it",
 	test_store_collect_tests_a_chunk_named_by_address_alone_marks_every_record_of_it},
 	{"collect::tests::a_collection_retires_a_pack_nothing_names_and_keeps_a_named_one",

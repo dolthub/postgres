@@ -15,4 +15,4 @@
 # fsck's C port with its generated exported entry, which only the C port's frontend configuration builds.
 doltgres_cport_fsck_sources = files(
   'lib.c',
-) + [doltgres_cport_pg_fe_binding[6]]
+) + [doltgres_cport_pg_fe_binding[4]]

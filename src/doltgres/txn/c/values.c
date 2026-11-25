@@ -35,6 +35,22 @@
 #include "doltgres/txn/state.h"
 #include "doltgres/txn/values.h"
 
+#ifdef DOLTGRES_TEST_TXN
+#include "doltgres/repo/lib.h"
+#include "doltgres/simc/simc.h"
+#include "doltgres/std/test.h"
+
+/* The map's takes that keep nothing, whose prepare's closure returns nothing. */
+#define TXN_MEMTABLE_MAP_RS Unit
+#define TXN_MEMTABLE_MAP_RETURNS bool
+#define TXN_MEMTABLE_MAP_RESULT_PARAMS , HostError *error
+#define TXN_MEMTABLE_MAP_TS Unit
+#define TXN_MEMTABLE_MAP_KEPT_OUT
+#define TXN_MEMTABLE_MAP_KEPT_IN
+#define TXN_MEMTABLE_MAP_DECLARE
+#include "doltgres/txn/memtable/map_template.h"
+#endif
+
 #define RUST_FILE "txn" STD_SEP "src" STD_SEP "values.rs"
 
 /* txn_values_maxaligned rounds a length up to Postgres' MAXALIGN, eight bytes. */
@@ -405,3 +421,319 @@ txn_values_entry(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *
 	txn_values_entry_pad(&frame);
 	return frame.decoded;
 }
+
+#ifdef DOLTGRES_TEST_TXN
+
+/* TXN_VALUES_TESTS_UNWRAP_FAILED is a Result's unwrap's panic on a HostError at a line and column. */
+#define TXN_VALUES_TESTS_UNWRAP_FAILED(line, col, error) \
+	STD_RESULT_EXPECT_FAILED((line), (col), "called `Result::unwrap()` on an `Err` value", (error), \
+							 host_Error_Debug_fmt)
+
+/* txn_values_tests_refused reports whether a value fails to decode as an entry with data corruption, XX001. */
+static bool
+txn_values_tests_refused(const uint8 *value, size_t value_len)
+{
+	TxnValuesEntry entry;
+	HostError	error;
+	bool		refused;
+
+	if (txn_values_Entry_decode(value, value_len, &entry, &error))
+		return false;
+	refused = memcmp(host_Error_sqlstate(&error), "XX001", 5) == 0;
+	host_Error_drop(&error);
+	return refused;
+}
+
+/*
+ * test_txn_values_tests_a_value_map_entry_reads_back_and_refuses_every_other_form:
+ * an entry reads back as it was written, in MOST's room without growing its
+ * buffer, and one cut short, one with a byte past its count, and one whose
+ * count is zero are data corruption.
+ */
+void
+test_txn_values_tests_a_value_map_entry_reads_back_and_refuses_every_other_form(void)
+{
+	TxnValuesEntry entry = {.address = chunks_address_Address_of((const uint8 *) "blob", 4),
+	.locator = chunks_trailer_Locator_at(3, 640, 64), .raw = 4000, .stored = 4000, .count = 1};
+	TxnValuesEntry zero = entry;
+	TxnValuesEntry decoded;
+	StdVec		out;
+	StdVec		longer;
+	StdVec		none;
+	const void *at;
+	uint8		key[4];
+	uint8		past = 0;
+	HostError	error;
+
+	std_vec_with_capacity_Checked(&out, TXN_VALUES_MOST, 1, 1);
+	at = out.ptr;
+	txn_values_Entry_encode_into(&entry, &out);
+	STD_ASSERT(__LINE__, 9, out.ptr == at, "an entry fits MOST's room");
+	if (!txn_values_Entry_decode(out.ptr, out.len, &decoded, &error))
+		TXN_VALUES_TESTS_UNWRAP_FAILED(__LINE__, 9, &error);
+	STD_ASSERT_EQ(__LINE__, 9, txn_values_Entry_PartialEq_eq(&decoded, &entry), &decoded, txn_values_Entry_Debug_fmt,
+				  &entry, txn_values_Entry_Debug_fmt);
+	txn_values_key(258, key);
+	STD_ASSERT(__LINE__, 9, key[0] == 0 && key[1] == 0 && key[2] == 1 && key[3] == 2, "a key is its id big-endian");
+	STD_ASSERT(__LINE__, 9, txn_values_tests_refused(out.ptr, out.len - 1), "a cut entry decoded");
+	std_slice_to_vec_Checked(&longer, out.ptr, out.len, 1, 1);
+	std_vec_push_Checked(&longer, &past, 1, 1);
+	STD_ASSERT(__LINE__, 9, txn_values_tests_refused(longer.ptr, longer.len),
+			   "an entry with a byte past its count decoded");
+	STD_ASSERT(__LINE__, 9, txn_values_tests_refused(out.ptr, 20), "an entry with half an address decoded");
+	zero.count = 0;
+	std_vec_new(&none, 1, 1);
+	txn_values_Entry_encode_into(&zero, &none);
+	STD_ASSERT(__LINE__, 9, txn_values_tests_refused(none.ptr, none.len), "a count of zero decoded");
+	std_vec_free_Checked(&none, 1, 1);
+	std_vec_free_Checked(&longer, 1, 1);
+	std_vec_free_Checked(&out, 1, 1);
+}
+
+/* txn_values_tests_made_t is a TOAST relation's state in a new repository, with the reader its store reads through. */
+typedef struct txn_values_tests_made_t
+{
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld toast;
+} txn_values_tests_made_t;
+
+/* txn_values_tests_made returns a new database's TOAST relation's state of a relation in pg_default. */
+static txn_values_tests_made_t
+txn_values_tests_made(HostIoIo *io, uint32 database, uint32 relation)
+{
+	HostStorage storage = {.tablespace = HOST_PG_DEFAULT, .database = database, .relation = relation};
+	txn_values_tests_made_t made;
+	ChunksErrorError failed;
+	HostError	error;
+
+	if (!repo_Repo_create(io, database, HOST_PG_DEFAULT, &made.repo, &failed))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, "called `Result::unwrap()` on an `Err` value", &failed,
+								 chunks_error_Error_Debug_fmt);
+	if (!host_shared_read(io, &made.reading, &error) ||
+		!txn_state_state(io, &made.repo, &made.reading, &storage, TXN_STATE_PERSISTENCE_PERMANENT, false, NULL,
+						 &made.toast, &error))
+		TXN_VALUES_TESTS_UNWRAP_FAILED(__LINE__, 0, &error);
+	return made;
+}
+
+/* txn_values_tests_made_drop frees what made returned. */
+static void
+txn_values_tests_made_drop(txn_values_tests_made_t *made)
+{
+	host_shared_Held_drop(&made->toast);
+	host_shared_Reader_drop(&made->reading);
+	repo_Repo_drop(&made->repo);
+}
+
+/* txn_values_tests_put is a take's step that puts the entry its captures hold. */
+static TxnMemtableMapStep
+txn_values_tests_put(void *captures, bool has_current, const uint8 *current, size_t current_len, StdVec *out)
+{
+	txn_values_Entry_encode_into(captures, out);
+	return TXN_MEMTABLE_MAP_STEP_PUT;
+}
+
+/* txn_values_tests_nothing is a take's then that does nothing. */
+static void
+txn_values_tests_nothing(void *captures)
+{
+}
+
+/* txn_values_tests_written_t is written's closure's captures: the writer and the entry it puts. */
+typedef struct txn_values_tests_written_t
+{
+	TxnMemtableVersionWriter writer;
+	TxnValuesEntry *entry;
+} txn_values_tests_written_t;
+
+/* txn_values_tests_written_inside is written's prepare's closure: the one take's finish. */
+static bool
+txn_values_tests_written_inside(void *captures, HostIoIo *io, TxnMemtableTablePreparedState *prepared,
+								HostError *error)
+{
+	txn_values_tests_written_t *c = captures;
+	TxnStatusRoomed unroomed = {0};
+	TxnMemtableMapTaken taken;
+
+	return txn_memtable_map_finish_Unit(HOST_IO_IO_TAKES_SHORT(io), prepared, 0, c->writer, false, unroomed, false, 0,
+										false, NULL, 0, NULL, txn_values_tests_put, c->entry, NULL,
+										txn_values_tests_nothing, NULL, NULL, &taken, error);
+}
+
+/* txn_values_tests_written puts a value id's entry into a TOAST relation's value map by a writer. */
+static void
+txn_values_tests_written(HostIoIo *io, const HostSharedHeld *toast, uint32 id, uint64 xid, TxnValuesEntry *entry)
+{
+	TxnMemtableMapTake take = {.state = host_shared_Held_record(toast), .map = TXN_MEMTABLE_MAP_MAP_VALUES,
+	.key = id, .most = TXN_VALUES_MOST};
+	txn_values_tests_written_t c = {.writer = {.xid = xid}, .entry = entry};
+	HostError	error;
+
+	if (!txn_memtable_map_prepare_Unit(io, &take, 1, txn_values_tests_written_inside, &c, NULL, &error))
+		TXN_VALUES_TESTS_UNWRAP_FAILED(__LINE__, 9, &error);
+}
+
+/*
+ * test_txn_values_tests_a_value_id_the_map_holds_is_skipped: an id the TOAST
+ * relation's value map holds in its delta is skipped, as GetNewOidWithIndex
+ * skips one the TOAST index holds, and the next id is taken.
+ */
+void
+test_txn_values_tests_a_value_id_the_map_holds_is_skipped(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	txn_values_tests_made_t made = txn_values_tests_made(io, 9310, 16390);
+	TreesStoreReader store = repo_Repo_reader(&made.repo, HOST_CACHE_PLACEMENT_SERVER, &made.reading);
+	TxnValuesEntry entry = {.address = chunks_address_Address_of((const uint8 *) "v", 1),
+	.locator = chunks_trailer_Locator_Default_default(), .raw = 4000, .stored = 4000, .count = 1};
+	bool		held;
+	bool		next;
+	HostError	error;
+
+	txn_values_tests_written(io, &made.toast, 100, 41, &entry);
+	if (!txn_values_free(io, TREES_STORE_READER_NODE_STORE(&store), &made.toast, 100, &held, &error) ||
+		!txn_values_free(io, TREES_STORE_READER_NODE_STORE(&store), &made.toast, 101, &next, &error))
+		TXN_VALUES_TESTS_UNWRAP_FAILED(__LINE__, 9, &error);
+	STD_ASSERT(__LINE__, 9, !held, "an id the map holds is not free");
+	STD_ASSERT(__LINE__, 9, next, "the next id is free");
+	txn_values_tests_made_drop(&made);
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * test_txn_values_tests_a_value_ids_entry_reads_back: a value id's entry the
+ * delta holds reads back as it was written, and an id the map doesn't hold
+ * has none.
+ */
+void
+test_txn_values_tests_a_value_ids_entry_reads_back(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	txn_values_tests_made_t made = txn_values_tests_made(io, 9311, 16391);
+	TreesStoreReader store = repo_Repo_reader(&made.repo, HOST_CACHE_PLACEMENT_SERVER, &made.reading);
+	TxnValuesEntry written = txn_values_Entry_new(chunks_address_Address_of((const uint8 *) "value", 5), 5000);
+	TxnValuesEntry read;
+	TxnValuesEntry absent;
+	bool		has_read;
+	bool		has_absent;
+	HostError	error;
+
+	txn_values_tests_written(io, &made.toast, 200, 42, &written);
+	if (!txn_values_entry(io, TREES_STORE_READER_NODE_STORE(&store), &made.toast, 200, &has_read, &read, &error) ||
+		!txn_values_entry(io, TREES_STORE_READER_NODE_STORE(&store), &made.toast, 201, &has_absent, &absent,
+						  &error))
+		TXN_VALUES_TESTS_UNWRAP_FAILED(__LINE__, 9, &error);
+	STD_ASSERT(__LINE__, 9, has_read && txn_values_Entry_PartialEq_eq(&read, &written),
+			   "an id's entry reads back as written");
+	STD_ASSERT(__LINE__, 9, !has_absent, "an id the map doesn't hold has no entry");
+	txn_values_tests_made_drop(&made);
+	simc_TestIo_drop(&test_io);
+}
+
+/* txn_values_tests_sized returns a value's sizes by its stored bytes: its entries, its rows, and its heap bytes. */
+static TxnBaseSizes
+txn_values_tests_sized(uint64 stored)
+{
+	TxnValuesEntry entry = {.address = chunks_address_Address_of((const uint8 *) "blob", 4),
+	.locator = chunks_trailer_Locator_Default_default(), .raw = stored + 4, .stored = stored, .count = 1};
+	StdVec		value;
+	uint8		key[4];
+	TxnBaseSizes sizes;
+	HostError	error;
+
+	std_vec_new(&value, 1, 1);
+	txn_values_Entry_encode_into(&entry, &value);
+	txn_values_key(1, key);
+	if (!txn_values_sizes(key, sizeof(key), value.ptr, value.len, &sizes, &error))
+		TXN_VALUES_TESTS_UNWRAP_FAILED(__LINE__, 9, &error);
+	std_vec_free_Checked(&value, 1, 1);
+	return sizes;
+}
+
+/* txn_values_tests_sized_is asserts a value's entries, rows, and heap bytes. */
+static void
+txn_values_tests_sized_is(uint32 line, uint64 stored, uint64 entries, uint64 rows, uint64 heap_bytes)
+{
+	TxnBaseSizes sizes = txn_values_tests_sized(stored);
+
+	STD_ASSERT(line, 5, sizes.entries == entries && sizes.rows == rows && sizes.heap_bytes == heap_bytes,
+			   "a value counts heap's toast chunks");
+}
+
+/*
+ * test_txn_values_tests_a_value_counts_heaps_toast_chunks: a value counts the
+ * toast chunks heap stores it in, TOAST_MAX_CHUNK_SIZE bytes each but its
+ * last, and their heap tuples' bytes with their line pointers, a short last
+ * chunk taking a one-byte varlena header.
+ */
+void
+test_txn_values_tests_a_value_counts_heaps_toast_chunks(void)
+{
+	STD_ASSERT_EQ_U64(__LINE__, 5, TXN_VALUES_TOAST_MAX_CHUNK_SIZE, 1996);
+	txn_values_tests_sized_is(__LINE__, 6400, 1, 4, 3 * 2036 + 452);
+	txn_values_tests_sized_is(__LINE__, 2560, 1, 2, 2036 + 604);
+	txn_values_tests_sized_is(__LINE__, 2112, 1, 2, 2036 + 156);
+	txn_values_tests_sized_is(__LINE__, 1996, 1, 1, 2036);
+}
+
+/*
+ * test_txn_values_tests_a_take_down_takes_one_from_a_count_and_removes_the_last:
+ * a take-down takes its amount from a value's count and removes the entry at
+ * its last, an add then a take-down leaves the count as it was, and a key
+ * with no entry, one that doesn't decode, or a count below the amount is
+ * refused.
+ */
+void
+test_txn_values_tests_a_take_down_takes_one_from_a_count_and_removes_the_last(void)
+{
+	TxnValuesEntry entry = {.address = chunks_address_Address_of((const uint8 *) "blob", 4),
+	.locator = chunks_trailer_Locator_Default_default(), .raw = 4000, .stored = 4000, .count = 2};
+	TxnValuesEntry decoded;
+	StdVec		two;
+	StdVec		one;
+	StdVec		three;
+	StdVec		back;
+	StdVec		scratch;
+	HostError	error;
+
+	std_vec_new(&two, 1, 1);
+	std_vec_new(&one, 1, 1);
+	std_vec_new(&three, 1, 1);
+	std_vec_new(&back, 1, 1);
+	std_vec_new(&scratch, 1, 1);
+	txn_values_Entry_encode_into(&entry, &two);
+	STD_ASSERT(__LINE__, 5, txn_values_taken_down(true, two.ptr, two.len, &one, 1) == TXN_MEMTABLE_MAP_STEP_PUT,
+			   "a take-down of one from two puts");
+	if (!txn_values_Entry_decode(one.ptr, one.len, &decoded, &error))
+		TXN_VALUES_TESTS_UNWRAP_FAILED(__LINE__, 16, &error);
+	STD_ASSERT_EQ_U64(__LINE__, 5, decoded.count, 1);
+	STD_ASSERT(__LINE__, 5,
+			   txn_values_taken_down(true, one.ptr, one.len, &scratch, 1) == TXN_MEMTABLE_MAP_STEP_REMOVE,
+			   "a take-down of the last removes the entry");
+	STD_ASSERT(__LINE__, 5,
+			   txn_values_taken_down(true, two.ptr, two.len, &scratch, 2) == TXN_MEMTABLE_MAP_STEP_REMOVE,
+			   "a take-down of the whole count removes the entry");
+	STD_ASSERT(__LINE__, 5,
+			   txn_values_taken_down(true, two.ptr, two.len, &scratch, 3) == TXN_MEMTABLE_MAP_STEP_REFUSE,
+			   "a take-down past the count is refused");
+	STD_ASSERT(__LINE__, 5, txn_values_added(true, two.ptr, two.len, &three) == TXN_MEMTABLE_MAP_STEP_PUT,
+			   "an add puts");
+	STD_ASSERT(__LINE__, 5, txn_values_taken_down(true, three.ptr, three.len, &back, 1) == TXN_MEMTABLE_MAP_STEP_PUT,
+			   "a take-down after an add puts");
+	STD_ASSERT(__LINE__, 5, back.len == two.len && memcmp(back.ptr, two.ptr, two.len) == 0,
+			   "an add then a take-down leaves the count as it was");
+	STD_ASSERT(__LINE__, 5, txn_values_taken_down(false, NULL, 0, &scratch, 1) == TXN_MEMTABLE_MAP_STEP_REFUSE,
+			   "a key with no entry is refused");
+	STD_ASSERT(__LINE__, 5, txn_values_taken_down(true, two.ptr, 10, &scratch, 1) == TXN_MEMTABLE_MAP_STEP_REFUSE,
+			   "an entry that doesn't decode is refused");
+	std_vec_free_Checked(&scratch, 1, 1);
+	std_vec_free_Checked(&back, 1, 1);
+	std_vec_free_Checked(&three, 1, 1);
+	std_vec_free_Checked(&one, 1, 1);
+	std_vec_free_Checked(&two, 1, 1);
+}
+
+#endif							/* DOLTGRES_TEST_TXN */

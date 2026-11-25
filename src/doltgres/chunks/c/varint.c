@@ -16,9 +16,7 @@
 
 /*
  * Variable-length unsigned integers: seven bits per byte, low bits first,
- * with the high bit set on every byte but the last. Verus proves the Rust's
- * put_varint, varint_len, and decode against their specification; the C's
- * guarantee is tested equivalence.
+ * with the high bit set on every byte but the last.
  */
 #ifndef FRONTEND
 #include "postgres.h"

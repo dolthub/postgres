@@ -93,6 +93,13 @@ typedef enum HostDeltaBlocksBlock
 	HOST_DELTA_BLOCKS_BLOCK_LINKS,
 }			HostDeltaBlocksBlock;
 
+/* HostDeltaBlocksDrain is a block a packing empties, and how many of its pages move out (bugs row 143). */
+typedef struct HostDeltaBlocksDrain
+{
+	uint32		block;
+	uint32		pages;
+} HostDeltaBlocksDrain;
+
 /* The page directory's Directory, which the functions take; directory.h includes this file for the types above. */
 struct HostDeltaDirectoryDirectory;
 
@@ -102,9 +109,12 @@ extern uint64 host_delta_blocks_used(struct HostDeltaDirectoryDirectory director
 extern bool host_delta_blocks_take(struct HostDeltaDirectoryDirectory directory, HostDeltaPageSize size,
 								   bool overshooting, uint64 *result);
 extern void host_delta_blocks_give(struct HostDeltaDirectoryDirectory directory, uint64 body);
+extern bool host_delta_blocks_packing(struct HostDeltaDirectoryDirectory directory, const uint8 *pinned,
+									  StdVec *result);
 
 #ifdef DOLTGRES_TEST_HOST
 extern void test_host_delta_blocks_tests_a_body_takes_the_smallest_class_that_holds_it(void);
+extern void test_host_delta_blocks_tests_a_packing_drains_only_what_the_blocks_ahead_hold(void);
 #endif
 
 #endif							/* DOLTGRES_HOST_DELTA_BLOCKS_H */

@@ -78,11 +78,16 @@ typedef struct ShmemRecordsSpot
 	ShmemRecordsForm form;
 } ShmemRecordsSpot;
 
-/* ShmemRecordsPlaced is a kind in the region: its spot, and the hand its makes sweep from. */
+/*
+ * ShmemRecordsPlaced is a kind in the region: its spot, the hand its makes
+ * sweep from, and for an aged kind the head of its retired list, its first
+ * record plus one, 0 for none (bugs row 309).
+ */
 typedef struct ShmemRecordsPlaced
 {
 	ShmemRecordsSpot spot;
 	pg_atomic_uint64 hand;
+	pg_atomic_uint64 retired;
 } ShmemRecordsPlaced;
 
 /*
@@ -373,18 +378,26 @@ shmem_records_part(size_t offset, size_t index, size_t size)
 	return STD_PTR_AT(base, std_wrapping_add_usize(0, tmp_2), 1);
 }
 
+/* ShmemRecordsResolved is a kind as a process resolves it: its place and counts, and its records' layout. */
+typedef struct ShmemRecordsResolved
+{
+	ShmemRecordsSpot spot;
+	ShmemRecordsLayout layout;
+} ShmemRecordsResolved;
+
 /* ShmemRecordsMapped is a record in this process's mapping of the region, with its kind's counts and its layout. */
 typedef struct ShmemRecordsMapped
 {
 	uint8	   *base;
-	ShmemRecordsSpot spot;
-	ShmemRecordsLayout layout;
+	const ShmemRecordsSpot *spot;
+	const ShmemRecordsLayout *layout;
 } ShmemRecordsMapped;
 
 /* shmem_records_Mapped_of returns the record at an index among a kind's records, refusing an index past the kind's count. */
 static ShmemRecordsMapped
-shmem_records_Mapped_of(const ShmemRecordsSpot *spot, size_t index)
+shmem_records_Mapped_of(const ShmemRecordsResolved *resolved, size_t index)
 {
+	const ShmemRecordsSpot *spot = &resolved->spot;
 	ShmemRecordsMapped result;
 	size_t		tmp_1;
 
@@ -392,8 +405,8 @@ shmem_records_Mapped_of(const ShmemRecordsSpot *spot, size_t index)
 		STD_PANIC(419, 9, "a shared record's number is past its kind's count");
 	tmp_1 = STD_MUL(usize, index, (size_t) spot->size, 420, 53);
 	result.base = (uint8 *) shmem_records_part((size_t) spot->at, tmp_1, 1);
-	result.spot = *spot;
-	result.layout = shmem_records_layout(spot);
+	result.spot = spot;
+	result.layout = &resolved->layout;
 	return result;
 }
 
@@ -419,41 +432,41 @@ shmem_records_Mapped_part(const ShmemRecordsMapped *self, size_t at, uint32 coun
 static LWLock *
 shmem_records_Mapped_lock(const ShmemRecordsMapped *self, size_t index)
 {
-	return shmem_records_Mapped_part(self, 0, self->spot.locks, index, sizeof(LWLock));
+	return shmem_records_Mapped_part(self, 0, self->spot->locks, index, sizeof(LWLock));
 }
 
 /* shmem_records_Mapped_flag returns a flag's address. */
 static ShmemRecordsFlagSlot *
 shmem_records_Mapped_flag(const ShmemRecordsMapped *self, size_t index)
 {
-	return shmem_records_Mapped_part(self, self->layout.flags, self->spot.flags, index, sizeof(ShmemRecordsFlagSlot));
+	return shmem_records_Mapped_part(self, self->layout->flags, self->spot->flags, index, sizeof(ShmemRecordsFlagSlot));
 }
 
 /* shmem_records_Mapped_atomic returns an atomic's address. */
 static pg_atomic_uint64 *
 shmem_records_Mapped_atomic(const ShmemRecordsMapped *self, size_t index)
 {
-	return shmem_records_Mapped_part(self, self->layout.atomics, self->spot.atomics, index, sizeof(pg_atomic_uint64));
+	return shmem_records_Mapped_part(self, self->layout->atomics, self->spot->atomics, index, sizeof(pg_atomic_uint64));
 }
 
 /* shmem_records_Mapped_blob returns the address of a blob's length, which its bytes follow. */
 static uint64 *
 shmem_records_Mapped_blob(const ShmemRecordsMapped *self, size_t index)
 {
-	if (!(index < (size_t) self->spot.blobs))
+	if (!(index < (size_t) self->spot->blobs))
 		STD_PANIC(447, 9, "a shared record's part index is past its shape's count");
 	std_index_check(index, SHMEM_RECORDS_BLOBS, RUST_FILE, 448, 32);
-	return STD_PTR_AT(self->base, self->layout.blobs[index], 1);
+	return STD_PTR_AT(self->base, self->layout->blobs[index], 1);
 }
 
 /* shmem_records_Mapped_array returns the address of an array's count, which its name and then its entries follow. */
 static pg_atomic_uint64 *
 shmem_records_Mapped_array(const ShmemRecordsMapped *self, size_t index)
 {
-	if (!(index < (size_t) self->spot.arrays))
+	if (!(index < (size_t) self->spot->arrays))
 		STD_PANIC(453, 9, "a shared record's part index is past its shape's count");
 	std_index_check(index, SHMEM_RECORDS_ARRAYS, RUST_FILE, 454, 32);
-	return STD_PTR_AT(self->base, self->layout.arrays[index], 1);
+	return STD_PTR_AT(self->base, self->layout->arrays[index], 1);
 }
 
 /* shmem_records_Mapped_entries returns the address of an array's first entry. */
@@ -470,12 +483,12 @@ shmem_records_Mapped_entry(const ShmemRecordsMapped *self, size_t array, uint64 
 	uint8	   *first = shmem_records_Mapped_entries(self, array);
 
 	std_index_check(array, SHMEM_RECORDS_ARRAYS, RUST_FILE, 465, 28);
-	if (entry < (uint64) self->spot.entries[array])
+	if (entry < (uint64) self->spot->entries[array])
 	{
 		size_t		tmp_1;
 
 		std_index_check(array, SHMEM_RECORDS_ARRAYS, RUST_FILE, 466, 58);
-		tmp_1 = STD_MUL(usize, (size_t) entry, (size_t) self->spot.widths[array], 466, 41);
+		tmp_1 = STD_MUL(usize, (size_t) entry, (size_t) self->spot->widths[array], 466, 41);
 		return STD_PTR_AT(first, tmp_1, 1);
 	}
 	return NULL;
@@ -483,6 +496,58 @@ shmem_records_Mapped_entry(const ShmemRecordsMapped *self, size_t array, uint64 
 
 /* shmem_records_record returns the record at an index among a kind's records. */
 static ShmemRecordsMapped shmem_records_record(size_t kind, uint32 index);
+
+/*
+ * SHMEM_RECORDS_RESOLVED holds, once this process first reaches a record, each
+ * kind's place, counts, and layout as offsets from the process's own mapping
+ * of the region, a Vec<Resolved> read-only after it is made: the postmaster
+ * fixes the places for its life, a process attaches once, and the region's
+ * initialize, which a crash restart runs again, clears it (bugs row 355).
+ */
+static StdVec SHMEM_RECORDS_RESOLVED = STD_VEC_NEW;
+
+/* shmem_records_unresolved clears this process's resolutions, for the region's initialize. */
+static void
+shmem_records_unresolved(void)
+{
+	std_vec_free_Checked(&SHMEM_RECORDS_RESOLVED, sizeof(ShmemRecordsResolved), _Alignof(ShmemRecordsResolved));
+	std_vec_new(&SHMEM_RECORDS_RESOLVED, sizeof(ShmemRecordsResolved), _Alignof(ShmemRecordsResolved));
+}
+
+/*
+ * shmem_records_resolved returns a kind as this process resolved it, the
+ * first call resolving every kind of the region from its places, refusing a
+ * kind the region doesn't hold, which only a caller that passes a kind this
+ * module didn't give it could ask for.
+ */
+static const ShmemRecordsResolved *
+shmem_records_resolved(size_t kind)
+{
+	if (SHMEM_RECORDS_RESOLVED.len == 0)
+	{
+		ShmemControl *control = shmem_records_control();
+		size_t		kinds;
+
+		STD_CHECK_ALIGNED(control, _Alignof(ShmemControl), 321, 24);
+		STD_CHECK_NULL_DEREF(control, 321, 24);
+		kinds = (size_t) control->kinds;
+		std_vec_with_capacity_Checked(&SHMEM_RECORDS_RESOLVED, kinds, sizeof(ShmemRecordsResolved),
+									  _Alignof(ShmemRecordsResolved));
+		for (size_t each = 0; each < kinds; each++)
+		{
+			ShmemRecordsResolved resolved;
+
+			resolved.spot = ((ShmemRecordsPlaced *) shmem_records_part(SHMEM_RECORDS_PLACED, each,
+																	   sizeof(ShmemRecordsPlaced)))->spot;
+			resolved.layout = shmem_records_layout(&resolved.spot);
+			std_vec_push_Checked(&SHMEM_RECORDS_RESOLVED, &resolved, sizeof(resolved),
+								 _Alignof(ShmemRecordsResolved));
+		}
+	}
+	if (!(kind < SHMEM_RECORDS_RESOLVED.len))
+		STD_PANIC(321, 9, "a shared record's kind is past the region's kinds");
+	return &STD_VEC_AT(&SHMEM_RECORDS_RESOLVED, ShmemRecordsResolved, kind);
+}
 
 /* shmem_records_initialize_frame_0_t is initialize's state across its pad: its arguments and the plan. */
 typedef struct shmem_records_initialize_frame_0_t
@@ -507,6 +572,7 @@ shmem_records_initialize_body_0(void *frame_)
 	size_t		procs = (size_t) pg_calls_max_procs();
 	uint32		flag_wait;
 
+	shmem_records_unresolved();
 	frame->plan = shmem_records_plan(frame->kinds, frame->kinds_len, procs);
 	frame->plan_live = true;
 	if (!pg_calls_wait_event_new(frame->raise, SHMEM_RECORDS_FLAG_WAIT, &flag_wait, frame->error))
@@ -519,7 +585,6 @@ shmem_records_initialize_body_0(void *frame_)
 	pg_calls_lwlock_initialize(&control->epoch_lock, frame->tranche);
 	control->epoch = 1;
 	control->procs = (uint32) procs;
-	control->tranche = frame->tranche;
 	control->flag_wait = flag_wait;
 	control->kinds = (uint32) frame->kinds_len;
 	control->slots = (uint32) frame->plan.slots;
@@ -535,16 +600,20 @@ shmem_records_initialize_body_0(void *frame_)
 		size_t		kind = count;
 		const ShmemRecordsSpot *spot = (const ShmemRecordsSpot *) STD_PTR_AT(frame->plan.spots.ptr, i,
 																			 sizeof(ShmemRecordsSpot));
+		ShmemRecordsResolved planned;
 		ShmemRecordsPlaced *placed;
 
 		count = std_Enumerate_count_step(count);
+		planned.spot = *spot;
+		planned.layout = shmem_records_layout(spot);
 		placed = shmem_records_part(SHMEM_RECORDS_PLACED, kind, sizeof(ShmemRecordsPlaced));
 		placed->spot = *spot;
 		pg_calls_atomic_init_u64(&placed->hand, 0);
+		pg_calls_atomic_init_u64(&placed->retired, 0);
 		for (size_t index = 0, index_end = (size_t) spot->count; index < index_end;
 			 index = std_forward_unchecked_usize_Checked(index, 1))
 		{
-			ShmemRecordsMapped record = shmem_records_Mapped_of(spot, index);
+			ShmemRecordsMapped record = shmem_records_Mapped_of(&planned, index);
 
 			for (size_t lock = 0, lock_end = (size_t) spot->locks; lock < lock_end;
 				 lock = std_forward_unchecked_usize_Checked(lock, 1))
@@ -617,13 +686,7 @@ shmem_records_initialize(const PgMayRaise *raise, ShmemControl *control, int32 t
 static ShmemRecordsSpot
 shmem_records_spot(size_t kind)
 {
-	ShmemControl *control = shmem_records_control();
-
-	STD_CHECK_ALIGNED(control, _Alignof(ShmemControl), 321, 24);
-	STD_CHECK_NULL_DEREF(control, 321, 24);
-	if (!(kind < (size_t) control->kinds))
-		STD_PANIC(321, 9, "a shared record's kind is past the region's kinds");
-	return ((ShmemRecordsPlaced *) shmem_records_part(SHMEM_RECORDS_PLACED, kind, sizeof(ShmemRecordsPlaced)))->spot;
+	return shmem_records_resolved(kind)->spot;
 }
 
 /* shmem_records_kinds returns the number of the region's kinds. */
@@ -769,12 +832,30 @@ shmem_records_hand(size_t kind)
 	return (uint32) STD_REM(u64, hand, (uint64) spot.count, 406, 6);
 }
 
+/* shmem_records_retired loads an aged kind's retired list's head: its first record plus one, 0 for none. */
+uint64
+shmem_records_retired(size_t kind)
+{
+	ShmemRecordsPlaced *placed = shmem_records_part(SHMEM_RECORDS_PLACED, kind, sizeof(ShmemRecordsPlaced));
+
+	return pg_calls_atomic_read_u64(&placed->retired);
+}
+
+/* shmem_records_retired_swap stores an aged kind's retired list's head over the one loaded, reporting whether it was still there. */
+bool
+shmem_records_retired_swap(size_t kind, uint64 loaded, uint64 word)
+{
+	ShmemRecordsPlaced *placed = shmem_records_part(SHMEM_RECORDS_PLACED, kind, sizeof(ShmemRecordsPlaced));
+	uint64		seen = loaded;
+
+	pg_calls_atomic_exchange_u64(&placed->retired, &seen, word);
+	return seen == loaded;
+}
+
 static ShmemRecordsMapped
 shmem_records_record(size_t kind, uint32 index)
 {
-	ShmemRecordsSpot spot = shmem_records_spot(kind);
-
-	return shmem_records_Mapped_of(&spot, (size_t) index);
+	return shmem_records_Mapped_of(shmem_records_resolved(kind), (size_t) index);
 }
 
 /* SHMEM_RECORDS_READERS_LOCK is READERS' RwLock, which guards SHMEM_RECORDS_READERS. */
@@ -821,20 +902,20 @@ shmem_records_clear(size_t kind, uint32 index)
 {
 	ShmemRecordsMapped record = shmem_records_record(kind, index);
 
-	for (size_t atomic = 0, atomic_end = (size_t) record.spot.atomics; atomic < atomic_end;
+	for (size_t atomic = 0, atomic_end = (size_t) record.spot->atomics; atomic < atomic_end;
 		 atomic = std_forward_unchecked_usize_Checked(atomic, 1))
 		pg_calls_atomic_write_u64(shmem_records_Mapped_atomic(&record, atomic), 0);
-	for (size_t blob = 0, blob_end = (size_t) record.spot.blobs; blob < blob_end;
+	for (size_t blob = 0, blob_end = (size_t) record.spot->blobs; blob < blob_end;
 		 blob = std_forward_unchecked_usize_Checked(blob, 1))
 		*shmem_records_Mapped_blob(&record, blob) = 0;
-	for (size_t array = 0, array_end = (size_t) record.spot.arrays; array < array_end;
+	for (size_t array = 0, array_end = (size_t) record.spot->arrays; array < array_end;
 		 array = std_forward_unchecked_usize_Checked(array, 1))
 	{
 		uint32		tmp_1;
 
 		std_index_check(array, SHMEM_RECORDS_ARRAYS, RUST_FILE, 506, 51);
 		std_index_check(array, SHMEM_RECORDS_ARRAYS, RUST_FILE, 506, 80);
-		tmp_1 = STD_MUL(u32, record.spot.entries[array], record.spot.widths[array],
+		tmp_1 = STD_MUL(u32, record.spot->entries[array], record.spot->widths[array],
 						506, 51);
 		std_ptr_write_bytes(shmem_records_Mapped_entries(&record, array), 0, (size_t) tmp_1, 1, 1);
 	}
@@ -934,7 +1015,7 @@ shmem_records_room(const PgMayRaise *raise, PgPgError *error)
 	return true;
 }
 
-/* shmem_records_flag_take_frame_0_t is flag_take's state across its pad: the flag it lists and the list's guard. */
+/* shmem_records_flag_take_frame_0_t is flag_try's state across its pad: the flag it lists and the list's guard. */
 typedef struct shmem_records_flag_take_frame_0_t
 {
 	std_TupleUsizeU32Usize_t held;
@@ -942,7 +1023,7 @@ typedef struct shmem_records_flag_take_frame_0_t
 	bool		flags_live;
 } shmem_records_flag_take_frame_0_t;
 
-/* shmem_records_flag_take_body_0 is flag_take's push of the flag it took onto the process's list. */
+/* shmem_records_flag_take_body_0 is flag_try's push of the flag it took onto the process's list. */
 static void
 shmem_records_flag_take_body_0(void *frame_)
 {
@@ -955,7 +1036,7 @@ shmem_records_flag_take_body_0(void *frame_)
 	std_RwLockWriteGuard_drop(&frame->flags);
 }
 
-/* shmem_records_flag_take_pad_0 is flag_take's pad: the list's guard while it is live. */
+/* shmem_records_flag_take_pad_0 is flag_try's pad: the list's guard while it is live. */
 static void
 shmem_records_flag_take_pad_0(void *frame_)
 {
@@ -966,47 +1047,71 @@ shmem_records_flag_take_pad_0(void *frame_)
 }
 
 /*
- * shmem_records_flag_take sets a record's flag, waiting interruptibly while
- * another process holds it, and refusing one this process holds. It makes
- * room for the flag in the process's list before it sets it, so nothing after
- * the set can fail and leave a flag that no exit clears.
+ * shmem_records_flag_try sets a record's flag when no process holds it,
+ * answering whether it did, and refuses one this process holds. It makes room
+ * for the flag in the process's list before it sets it, so nothing after the
+ * set can fail and leave a flag that no exit clears.
  */
 bool
-shmem_records_flag_take(const PgMayRaise *raise, size_t kind, uint32 index, size_t flag, PgPgError *error)
+shmem_records_flag_try(const PgMayRaise *raise, size_t kind, uint32 index, size_t flag, bool *taken,
+					   PgPgError *error)
 {
 	ShmemRecordsMapped tmp_1;
 	ShmemRecordsFlagSlot *slot;
 	uint32		me;
-	ShmemControl *control;
-	uint32		wait;
+	uint32		seen = 0;
 
+	*taken = false;
 	if (!shmem_records_room(raise, error))
 		return false;
 	tmp_1 = shmem_records_record(kind, index);
 	slot = shmem_records_Mapped_flag(&tmp_1, flag);
 	me = STD_ADD(u32, (uint32) pg_calls_my_proc_number(), 1, 548, 14);
-	control = shmem_records_control();
+	pg_calls_atomic_exchange_u32(&slot->holder, &seen, me);
+	if (seen == me)
+	{
+		*error = SHMEM_RECORDS_INTERNAL("a backend set a shared flag it already holds");
+		return false;
+	}
+	if (seen != 0)
+		return true;
+	{
+		shmem_records_flag_take_frame_0_t frame = {.held = {kind, index, flag}};
+
+		std_landing(&frame, shmem_records_flag_take_body_0, shmem_records_flag_take_pad_0);
+	}
+	*taken = true;
+	return true;
+}
+
+/*
+ * shmem_records_flag_take sets a record's flag, trying it again each time
+ * another process clears it, waiting interruptibly in between, and refusing
+ * one this process holds.
+ */
+bool
+shmem_records_flag_take(const PgMayRaise *raise, size_t kind, uint32 index, size_t flag, PgPgError *error)
+{
+	ShmemRecordsMapped tmp_1 = shmem_records_record(kind, index);
+	ShmemRecordsFlagSlot *slot = shmem_records_Mapped_flag(&tmp_1, flag);
+	ShmemControl *control = shmem_records_control();
+	uint32		wait;
+
 	STD_CHECK_ALIGNED(control, _Alignof(ShmemControl), 551, 25);
 	STD_CHECK_NULL_DEREF(control, 551, 25);
 	wait = control->flag_wait;
 	for (;;)
 	{
-		uint32		seen = 0;
+		bool		taken;
 
-		pg_calls_atomic_exchange_u32(&slot->holder, &seen, me);
-		if (seen == 0 || seen == me)
+		if (!shmem_records_flag_try(raise, kind, index, flag, &taken, error))
 		{
 			pg_calls_cv_cancel();
-			if (seen == me)
-			{
-				*error = SHMEM_RECORDS_INTERNAL("a backend set a shared flag it already holds");
-				return false;
-			}
-			{
-				shmem_records_flag_take_frame_0_t frame = {.held = {kind, index, flag}};
-
-				std_landing(&frame, shmem_records_flag_take_body_0, shmem_records_flag_take_pad_0);
-			}
+			return false;
+		}
+		if (taken)
+		{
+			pg_calls_cv_cancel();
 			return true;
 		}
 		if (!pg_calls_cv_sleep(raise, &slot->cv, wait, error))
@@ -1065,6 +1170,9 @@ shmem_records_atomic(size_t kind, uint32 index, size_t atomic, ShmemRecordsOp op
 				pg_calls_atomic_exchange_u64(at, &seen, op.u.exchange.f1);
 				return seen;
 			}
+		case SHMEM_RECORDS_OP_LOAD_ACQUIRE:
+			pg_calls_read_barrier();
+			return pg_calls_atomic_read_u64(at);
 	}
 	pg_unreachable();
 }
@@ -1097,7 +1205,7 @@ shmem_records_blob_write(size_t kind, uint32 index, size_t blob, const uint8 *by
 	uint64	   *length = shmem_records_Mapped_blob(&record, blob);
 
 	std_index_check(blob, SHMEM_RECORDS_BLOBS, RUST_FILE, 626, 22);
-	if (bytes_len > (size_t) record.spot.maxes[blob])
+	if (bytes_len > (size_t) record.spot->maxes[blob])
 	{
 		*error = SHMEM_RECORDS_INTERNAL("a shared blob's bytes are longer than its largest size");
 		return false;
@@ -1133,7 +1241,7 @@ shmem_records_entry_read(size_t kind, uint32 index, size_t array, size_t entry, 
 		return false;
 	}
 	std_index_check(array, SHMEM_RECORDS_ARRAYS, RUST_FILE, 647, 49);
-	width = (size_t) record.spot.widths[array];
+	width = (size_t) record.spot->widths[array];
 	std_slice_from_raw_parts_check(at, width, 1, 1, RUST_FILE, 647, 17);
 	std_slice_to_vec_Checked(result, at, width, 1, 1);
 	return true;
@@ -1166,7 +1274,7 @@ shmem_records_entry_write(size_t kind, uint32 index, size_t array, size_t entry,
 		return false;
 	}
 	std_index_check(array, SHMEM_RECORDS_ARRAYS, RUST_FILE, 656, 23);
-	if (bytes_len != (size_t) record.spot.widths[array])
+	if (bytes_len != (size_t) record.spot->widths[array])
 	{
 		*error = SHMEM_RECORDS_INTERNAL("a shared array's entry is of another length than its bytes");
 		return false;
@@ -1255,10 +1363,10 @@ shmem_records_slots_claim(const PgMayRaise *raise, size_t kind, uint32 index, si
 	uint8	   *at;
 
 	std_index_check(array, SHMEM_RECORDS_ARRAYS, RUST_FILE, 713, 24);
-	if (!(bytes_len == (size_t) record.spot.widths[array]))
+	if (!(bytes_len == (size_t) record.spot->widths[array]))
 		STD_PANIC(712, 5, "a shared slot's bytes are of another length than its array's entries");
 	std_index_check(array, SHMEM_RECORDS_ARRAYS, RUST_FILE, 718, 59);
-	if (pg_calls_atomic_read_u64(count) >= (uint64) record.spot.entries[array])
+	if (pg_calls_atomic_read_u64(count) >= (uint64) record.spot->entries[array])
 	{
 		*result = false;
 		return true;
@@ -1320,10 +1428,10 @@ shmem_records_slots_read_body_0(void *frame_)
 	size_t		len;
 
 	std_index_check(frame->array, SHMEM_RECORDS_ARRAYS, RUST_FILE, 739, 50);
-	width = (size_t) record.spot.widths[frame->array];
+	width = (size_t) record.spot->widths[frame->array];
 	count = pg_calls_atomic_read_u64(shmem_records_Mapped_array(&record, frame->array));
 	std_index_check(frame->array, SHMEM_RECORDS_ARRAYS, RUST_FILE, 742, 83);
-	count = std_min_u64(count, (uint64) record.spot.entries[frame->array]);
+	count = std_min_u64(count, (uint64) record.spot->entries[frame->array]);
 	len = (size_t) count;
 	std_vec_with_capacity_Checked(&frame->entries, len, sizeof(StdVec), _Alignof(StdVec));
 	frame->entries_live = true;
@@ -1985,6 +2093,178 @@ shmem_records_zero_words(void)
 			shmem_records_word_store(kind, word, 0);
 		}
 	}
+}
+
+/* SHMEM_RECORDS_INDEX_PARTITIONS is the count of the index's partitions, each under its own lock, as NUM_BUFFER_PARTITIONS. */
+#define SHMEM_RECORDS_INDEX_PARTITIONS ((size_t) 128)
+
+/*
+ * ShmemRecordsIndex is the index's region (bugs row 405): its partitions'
+ * locks, the id of the one kind it indexes, and the length of that kind's
+ * keys. Its table, a shared hash table partitioned as Postgres' buffer table
+ * is, maps a key to a record's location, held in the entry after the key at
+ * the next multiple of eight bytes.
+ */
+typedef struct ShmemRecordsIndex
+{
+	LWLock		partitions[SHMEM_RECORDS_INDEX_PARTITIONS];
+	uint64		id;
+	size_t		key;
+} ShmemRecordsIndex;
+
+/* shmem_records_indexed returns the one kind with an index, or NULL when no kind has one. */
+static const ShmemRecordsKind *
+shmem_records_indexed(const ShmemRecordsKind *kinds, size_t kinds_len)
+{
+	const ShmemRecordsKind *indexed = NULL;
+
+	for (size_t k = 0; k < kinds_len; k++)
+	{
+		if (kinds[k].index == 0)
+			continue;
+		Assert(indexed == NULL);
+		indexed = &kinds[k];
+	}
+	return indexed;
+}
+
+/* shmem_records_index_located returns where an entry of keys of a length holds its location. */
+static size_t
+shmem_records_index_located(size_t key)
+{
+	return std_next_multiple_of_usize(key, sizeof(uint64));
+}
+
+/*
+ * shmem_records_index_request asks Postgres for the index's region and its
+ * table, in the postmaster's request callback, when a kind has an index: an
+ * entry for each of its records and one for each partition, so no put finds
+ * the table full, as Postgres sizes its buffer table.
+ */
+bool
+shmem_records_index_request(const PgMayRaise *raise, const ShmemRecordsKind *kinds, size_t kinds_len,
+							PgPgError *error)
+{
+	const ShmemRecordsKind *indexed = shmem_records_indexed(kinds, kinds_len);
+	size_t		entries;
+	size_t		entry;
+
+	if (indexed == NULL)
+		return true;
+	entries = STD_ADD(usize, indexed->count, SHMEM_RECORDS_INDEX_PARTITIONS, __LINE__, 0);
+	entry = STD_ADD(usize, shmem_records_index_located(indexed->index), sizeof(uint64), __LINE__, 0);
+	return pg_calls_request_pool_index(raise, sizeof(ShmemRecordsIndex), error) &&
+		pg_calls_request_pool_index_table(raise, (int64) entries, indexed->index, entry, error);
+}
+
+/* shmem_records_index_initialize sets the index's region up in the postmaster's initialization callback, when a kind has an index. */
+bool
+shmem_records_index_initialize(const PgMayRaise *raise, const ShmemRecordsKind *kinds, size_t kinds_len,
+							   PgPgError *error)
+{
+	const ShmemRecordsKind *indexed = shmem_records_indexed(kinds, kinds_len);
+	ShmemRecordsIndex *index;
+	int32		tranche;
+
+	if (indexed == NULL)
+		return true;
+	tranche = shmem_tranche(DOLTGRES_TRANCHE_RECORDS_INDEX);
+	index = (ShmemRecordsIndex *) pg_calls_pool_index_base();
+	for (size_t at = 0; at < SHMEM_RECORDS_INDEX_PARTITIONS; at++)
+		pg_calls_lwlock_initialize(&index->partitions[at], tranche);
+	index->id = indexed->id;
+	index->key = indexed->index;
+	return true;
+}
+
+/*
+ * shmem_records_index_locked takes the partition lock of a key of a kind's
+ * index, shared or exclusive, answering its hash, or refuses a kind the
+ * index isn't of as an internal error.
+ */
+static bool
+shmem_records_index_locked(const PgMayRaise *raise, uint64 id, const uint8 *key, bool exclusive, uint32 *hash,
+						   LWLock **lock, PgPgError *error)
+{
+	ShmemRecordsIndex *index = (ShmemRecordsIndex *) pg_calls_pool_index_base();
+
+	if (index == NULL || index->id != id)
+	{
+		*error = SHMEM_RECORDS_INTERNAL("a kind of records the index isn't of was looked up in it");
+		return false;
+	}
+	*hash = pg_calls_hash_value(pg_calls_pool_index_table(), key);
+	*lock = &index->partitions[*hash % SHMEM_RECORDS_INDEX_PARTITIONS];
+	return pg_calls_lwlock_acquire(raise, *lock, exclusive ? LW_EXCLUSIVE : LW_SHARED, error);
+}
+
+/* shmem_records_index_entry_location returns the location an entry of the index holds. */
+static uint64
+shmem_records_index_entry_location(const uint8 *entry)
+{
+	const ShmemRecordsIndex *index = (const ShmemRecordsIndex *) pg_calls_pool_index_base();
+	uint64		location;
+
+	memcpy(&location, entry + shmem_records_index_located(index->key), sizeof(location));
+	return location;
+}
+
+/* shmem_records_index_find answers the location a kind's index holds for a key, or nothing when it holds none (bugs row 405). */
+bool
+shmem_records_index_find(const PgMayRaise *raise, uint64 id, const uint8 *key, bool *has, uint64 *location,
+						 PgPgError *error)
+{
+	uint32		hash;
+	LWLock	   *lock;
+	const uint8 *entry;
+
+	if (!shmem_records_index_locked(raise, id, key, false, &hash, &lock, error))
+		return false;
+	entry = pg_calls_hash_find(pg_calls_pool_index_table(), key, hash);
+	*has = entry != NULL;
+	if (entry != NULL)
+		*location = shmem_records_index_entry_location(entry);
+	pg_calls_lwlock_release(lock);
+	return true;
+}
+
+/* shmem_records_index_put sets the location a kind's index holds for a key (bugs row 405). */
+bool
+shmem_records_index_put(const PgMayRaise *raise, uint64 id, const uint8 *key, uint64 location, PgPgError *error)
+{
+	const ShmemRecordsIndex *index;
+	uint32		hash;
+	LWLock	   *lock;
+	uint8	   *entry;
+
+	if (!shmem_records_index_locked(raise, id, key, true, &hash, &lock, error))
+		return false;
+	index = (const ShmemRecordsIndex *) pg_calls_pool_index_base();
+	if (!pg_calls_hash_enter(raise, pg_calls_pool_index_table(), key, hash, (void **) &entry, error))
+	{
+		pg_calls_lwlock_release(lock);
+		return false;
+	}
+	memcpy(entry + shmem_records_index_located(index->key), &location, sizeof(location));
+	pg_calls_lwlock_release(lock);
+	return true;
+}
+
+/* shmem_records_index_remove takes a key out of a kind's index when the index holds that location for it (bugs row 405). */
+bool
+shmem_records_index_remove(const PgMayRaise *raise, uint64 id, const uint8 *key, uint64 location, PgPgError *error)
+{
+	uint32		hash;
+	LWLock	   *lock;
+	const uint8 *entry;
+
+	if (!shmem_records_index_locked(raise, id, key, true, &hash, &lock, error))
+		return false;
+	entry = pg_calls_hash_find(pg_calls_pool_index_table(), key, hash);
+	if (entry != NULL && shmem_records_index_entry_location(entry) == location)
+		pg_calls_hash_remove(pg_calls_pool_index_table(), key, hash);
+	pg_calls_lwlock_release(lock);
+	return true;
 }
 
 #ifdef DOLTGRES_TEST_SHMEM

@@ -24,6 +24,7 @@
 #include "doltgres/chunks/packs.h"
 #include "doltgres/host/io.h"
 #include "doltgres/host/shared.h"
+#include "doltgres/std/capability.h"
 
 /*
  * CHUNKS_PACKS_SHARED_PACK_STATE_POOL_OPS is PackState's Pool, its Shape
@@ -123,6 +124,25 @@ extern bool chunks_packs_shared_Snapshot_PartialEq_eq(const ChunksPacksSharedSna
 extern HostError chunks_packs_shared_raised(ChunksErrorError *error);
 extern bool chunks_packs_shared_even_manifests(HostIoIo *io, ChunksErrorError *error);
 extern bool chunks_packs_shared_marked(HostIoIo *io, bool *result, ChunksErrorError *error);
+
+/*
+ * ChunksPacksBarrierHolding is this process's exclusive hold of a
+ * repository's barrier, under which no deletion vector is written and the
+ * pack table's vectors don't change (bugs row 499, H14). It is the
+ * capability clang's analysis checks the vector writer and the stray pass
+ * by; it has no value.
+ */
+typedef struct ChunksPacksBarrierHolding
+{
+	int			unused;
+}			STD_CAPABILITY("barrier")
+ChunksPacksBarrierHolding;
+
+/* CHUNKS_PACKS_BARRIER_HOLDING is this process's exclusive hold of a repository's barrier. */
+extern ChunksPacksBarrierHolding CHUNKS_PACKS_BARRIER_HOLDING;
+
+extern void chunks_packs_barrier_held(void) STD_ACQUIRE(CHUNKS_PACKS_BARRIER_HOLDING) STD_NO_THREAD_SAFETY_ANALYSIS;
+extern void chunks_packs_barrier_left(void) STD_RELEASE(CHUNKS_PACKS_BARRIER_HOLDING) STD_NO_THREAD_SAFETY_ANALYSIS;
 
 #ifdef DOLTGRES_TEST_CHUNKS
 extern void test_chunks_packs_shared_tests_a_snapshot_read_back_is_the_snapshot_written_up_to_its_largest_size(void);

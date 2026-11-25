@@ -55,9 +55,12 @@
 
 #define RUST_FILE "store" STD_SEP "src" STD_SEP "lib.rs"
 
-/* STORE_STORE_STATE_SINGLE_OPS is StoreState's Shape and Single: store's single record, of one atomic, the kept redo point. */
+/*
+ * STORE_STORE_STATE_SINGLE_OPS is StoreState's Shape and Single: store's
+ * single record, of two atomics, the kept redo point and a capture's.
+ */
 const HostSharedSingleOps STORE_STORE_STATE_SINGLE_OPS = {
-	.shape = {.id = UINT64CONST(0x73746f7265000001), .atomics = 1},
+	.shape = {.id = UINT64CONST(0x73746f7265000001), .atomics = 2},
 	.words = host_shared_Single_words,
 };
 
@@ -343,7 +346,9 @@ store_read_kept_wal(HostIoIo *io, HostLsn from, HostLsn to, HostError *error)
  * store_kept_segment returns the oldest WAL segment to keep, given the
  * oldest Postgres keeps: the segment of the stored redo point when a
  * repository's manifest generations may differ as the WAL is counted, and
- * otherwise the one given, as in a bootstrap process.
+ * otherwise the one given, as in a bootstrap process. While a collection's
+ * capture reads the WAL it also keeps the segment of the capture's redo
+ * point, as Doltgrust's collection holds the WAL (bugs row 406).
  */
 bool
 store_kept_segment(HostIoIo *io, uint64 segment, uint64 segment_size, uint64 *result, HostError *error)
@@ -352,6 +357,7 @@ store_kept_segment(HostIoIo *io, uint64 segment, uint64 segment_size, uint64 *re
 	HostSharedOp load = {.tag = HOST_SHARED_OP_LOAD};
 	ChunksErrorError failed;
 	HostLsn		kept;
+	HostLsn		captured;
 	bool		marked;
 
 	*result = segment;
@@ -359,6 +365,9 @@ store_kept_segment(HostIoIo *io, uint64 segment, uint64 segment_size, uint64 *re
 		return true;
 	if (!host_shared_single(&STORE_STORE_STATE_SINGLE_OPS, &record, error))
 		return false;
+	captured = host_shared_Record_atomic(record, STORE_CAPTURE_REDO_INDEX, load);
+	if (captured != 0)
+		*result = Min(segment, STD_DIV(u64, captured, segment_size, 128, 20));
 	kept = host_shared_Record_atomic(record, STORE_KEPT_REDO_INDEX, load);
 	if (kept == 0)
 		return true;
@@ -368,7 +377,7 @@ store_kept_segment(HostIoIo *io, uint64 segment, uint64 segment_size, uint64 *re
 		return false;
 	}
 	if (marked)
-		*result = Min(segment, STD_DIV(u64, kept, segment_size, 128, 20));
+		*result = Min(*result, STD_DIV(u64, kept, segment_size, 128, 20));
 	return true;
 }
 

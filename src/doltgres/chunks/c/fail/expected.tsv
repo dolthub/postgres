@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # chunks' C compile-fail cases (t/117_cport_compile_fail.pl): a case, a compiler family, and the diagnostic that
-# family refuses the case's c/fail/<case>.c with, the counterparts of chunks/fail/expected.tsv's Rust cases.
+# family refuses the case's c/fail/<case>.c with, the counterparts of the Rust port's compile-fail cases.
 raw_forged	clang	no member named 'flag' in 'struct ChunksPackRaw'
 raw_forged	gcc	'ChunksPackRaw' has no member named 'flag'
 raw_forged	msvc	error C2039: 'flag': is not a member of 'ChunksPackRaw'
@@ -24,3 +24,4 @@ torn_tail_forged	clang	no member named 'end' in 'struct ChunksFileTornTail'
 torn_tail_forged	gcc	'ChunksFileTornTail' has no member named 'end'
 torn_tail_forged	msvc	error C2039: 'end': is not a member of 'ChunksFileTornTail'
 root_slot_registered_twice	clang	releasing root slot 'slot' that was not held
+set_dead_unbarriered	clang	calling function 'chunks_packs_retire_Marking_set_dead' requires holding barrier 'CHUNKS_PACKS_BARRIER_HOLDING' exclusively

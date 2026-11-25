@@ -84,6 +84,16 @@ typedef struct StdLayoutError
 struct StdFormatter;
 extern void std_ptr_copy(const void *src, void *dst, size_t count, size_t size, size_t align);
 extern void std_ptr_write_bytes(void *dst, uint8 val, size_t count, size_t size, size_t align);
+
+/* test_std_zero_size_tests_bytes_start_with_an_empty_needle_at_null is starts_with's zero-size edge test, which std's test module runs. */
+extern void test_std_zero_size_tests_bytes_start_with_an_empty_needle_at_null(void);
+
+/* test_std_zero_size_tests_ptr_copy_of_nothing_takes_null is ptr::copy's zero-size edge test, which std's test module runs. */
+extern void test_std_zero_size_tests_ptr_copy_of_nothing_takes_null(void);
+
+/* test_std_zero_size_tests_ptr_write_bytes_of_nothing_takes_null is ptr::write_bytes' zero-size edge test, which std's test module runs. */
+extern void test_std_zero_size_tests_ptr_write_bytes_of_nothing_takes_null(void);
+
 extern void std_ptr_swap_nonoverlapping(void *x, void *y, size_t count, size_t size, size_t align,
 										const char *file, uint32 line, uint32 col);
 extern void std_slice_from_raw_parts_check(const void *data, size_t len, size_t size, size_t align,

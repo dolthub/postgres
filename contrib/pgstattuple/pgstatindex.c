@@ -34,6 +34,7 @@
 #include "access/relation.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_am.h"
+#include "doltgres/hooks.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
@@ -222,7 +223,7 @@ pgstatindex_impl(Relation rel, FunctionCallInfo fcinfo)
 	ReadStream *stream;
 	BlockNumber startblk;
 
-	if (!IS_INDEX(rel) || !IS_BTREE(rel))
+	if (!IS_INDEX(rel) || !IS_BTREE(rel) || doltgres_heap_only_refused(rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("relation \"%s\" is not a btree index",
@@ -541,7 +542,7 @@ pgstatginindex_internal(Oid relid, FunctionCallInfo fcinfo)
 	 */
 	rel = relation_open(relid, AccessShareLock);
 
-	if (!IS_INDEX(rel) || !IS_GIN(rel))
+	if (!IS_INDEX(rel) || !IS_GIN(rel) || doltgres_heap_only_refused(rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("relation \"%s\" is not a GIN index",
@@ -631,7 +632,7 @@ pgstathashindex(PG_FUNCTION_ARGS)
 	 */
 	rel = relation_open(relid, AccessShareLock);
 
-	if (!IS_INDEX(rel) || !IS_HASH(rel))
+	if (!IS_INDEX(rel) || !IS_HASH(rel) || doltgres_heap_only_refused(rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("relation \"%s\" is not a hash index",

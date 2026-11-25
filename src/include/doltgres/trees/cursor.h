@@ -162,6 +162,8 @@ extern size_t trees_cursor_Cursor_index(const TreesCursorCursor *self);
 extern StdBytes trees_cursor_Cursor_key(const TreesCursorCursor *self);
 extern StdBytes trees_cursor_Cursor_value(const TreesCursorCursor *self);
 extern TreesStoreTree trees_cursor_Cursor_child_tree(const TreesCursorCursor *self);
+extern bool trees_cursor_Cursor_find_in_node(TreesCursorCursor *self, HostIoIo *io, const uint8 *key, size_t key_len,
+											 const TreesKeyOrder *order, bool *result, ChunksErrorError *error);
 extern bool trees_cursor_Cursor_stamps(const TreesCursorCursor *self, HostIoIo *io, TreesPinPin *pin, StdVec *result,
 									   ChunksErrorError *error);
 extern bool trees_cursor_Cursor_values(const TreesCursorCursor *self, HostIoIo *io, TreesPinPin *pin, StdVec *result,
@@ -189,6 +191,9 @@ extern void trees_cursor_Cursor_drop(TreesCursorCursor *self);
 extern TreesCursorLeafStamps trees_cursor_LeafStamps_Default_default(void);
 extern bool trees_cursor_LeafStamps_of(TreesCursorLeafStamps *self, HostIoIo *io, TreesPinPin *pin,
 									   const TreesCursorCursor *cursor, StdVec *result, ChunksErrorError *error);
+extern bool trees_cursor_LeafStamps_stamp_of(TreesCursorLeafStamps *self, HostIoIo *io, TreesPinPin *pin,
+											 const TreesCursorCursor *cursor, uint64 tuple, uint64 *copies, bool *some,
+											 ChunksTrailerStamp *result, StdVec *values, ChunksErrorError *error);
 extern void trees_cursor_LeafStamps_drop(TreesCursorLeafStamps *self);
 
 #endif							/* DOLTGRES_TREES_CURSOR_H */

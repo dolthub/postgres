@@ -22,6 +22,7 @@
 
 #include "doltgres/chunks/error.h"
 #include "doltgres/chunks/packs/removal.h"
+#include "doltgres/chunks/packs/shared.h"
 #include "doltgres/chunks/trailer.h"
 #include "doltgres/host/io.h"
 #include "doltgres/host/shared.h"
@@ -64,7 +65,8 @@ extern bool chunks_packs_retire_Forwarded_join(ChunksPacksRetireForwarded *self,
 											   ChunksPacksRetireForwarded *result, ChunksErrorError *error);
 extern bool chunks_packs_retire_Forwarded_covers(const ChunksPacksRetireForwarded *self, uint64 pack, uint64 offset);
 extern bool chunks_packs_retire_Marking_set_dead(ChunksPacksRetireMarking *self, uint64 number, uint64 generation,
-												 const StdBTreeMap *offsets, bool *result, ChunksErrorError *error);
+												 const StdBTreeMap *offsets, bool *result, ChunksErrorError *error)
+			STD_REQUIRES(CHUNKS_PACKS_BARRIER_HOLDING);
 extern bool chunks_packs_retire_Packs_retire(const ChunksPacksBackendPacks *self, HostIoIo *io, const uint64 *numbers,
 											 size_t numbers_len, ChunksPacksRetireForwarded *forwarded,
 											 ChunksPacksRemovalReservation *reservation,

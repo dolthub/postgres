@@ -262,7 +262,12 @@ static struct
 	HostLockIoMutexAltering process;
 }			DOLTGRES_LAYOUTS_ALTERING = {HOST_LOCAL_BACKEND_LOCAL_NEW};
 
-/* DOLTGRES_LAYOUTS_KEPT is KEPT: what this transaction's DDL keeps, which its end clears. */
+/*
+ * DOLTGRES_LAYOUTS_KEPT is KEPT: what this transaction's DDL keeps, which its
+ * end clears. Under its lock an operation grows a list only into room it
+ * reserved first, so nothing there unwinds and the lock is never poisoned
+ * (bugs row 517).
+ */
 static struct
 {
 	HostLocalBackendLocal local;
@@ -943,15 +948,25 @@ typedef struct doltgres_layouts_changed_push_t
 	doltgres_TupleU32Chained_t chained;
 	bool		keyless;
 	doltgres_TupleU32Rekey_t rekey;
+	/* pushed is whether KEPT took the transform, into room reserved first. */
+	bool		pushed;
 } doltgres_layouts_changed_push_t;
 
-/* doltgres_layouts_changed_push keeps a chained transform, and a keyless table for its re-key. */
+/*
+ * doltgres_layouts_changed_push keeps a chained transform, and a keyless
+ * table for its re-key, into room it reserves first, so it changes nothing
+ * when the room isn't there (bugs row 517).
+ */
 static void
 doltgres_layouts_changed_push(void *value, void *captures)
 {
 	DoltgresLayoutsKept *kept = value;
 	doltgres_layouts_changed_push_t *push = captures;
 
+	push->pushed = std_vec_try_reserve(&kept->chained, 1, DOLTGRES_LAYOUTS_CHAINED) &&
+		(!push->keyless || std_vec_try_reserve(&kept->rekeys, 1, DOLTGRES_LAYOUTS_REKEY));
+	if (!push->pushed)
+		return;
 	std_vec_push_Checked(&kept->chained, &push->chained, DOLTGRES_LAYOUTS_CHAINED);
 	if (push->keyless)
 		std_vec_push_Checked(&kept->rekeys, &push->rekey, DOLTGRES_LAYOUTS_REKEY);
@@ -1016,6 +1031,14 @@ doltgres_layouts_changed_body(void *frame_)
 	push.rekey.f1.storage = storage;
 	frame->layouts_live = false;
 	doltgres_layouts_kept_locked(frame->io, doltgres_layouts_changed_push, &push);
+	if (!push.pushed)
+	{
+		HostError	oom = host_Error_out_of_memory();
+
+		frame->layouts_live = true;
+		*frame->error = pghost_raised(&oom);
+		return;
+	}
 	frame->ok = true;
 }
 
@@ -1850,5 +1873,127 @@ doltgres_layouts_ended(HostIoIo *io)
 	doltgres_layouts_kept_locked(io, doltgres_layouts_swap_kept, &kept);
 	doltgres_layouts_Kept_drop(&kept);
 }
+
+#ifdef DOLTGRES_TEST_DOLTGRES
+#include "doltgres/pg/lib.h"
+#include "doltgres/simc/simc.h"
+#include "doltgres/std/test.h"
+
+/* DoltgresLayoutsTestsKeep is the keep case's call: the backend's Io and the transform it keeps. */
+typedef struct DoltgresLayoutsTestsKeep
+{
+	HostIoIo   *io;
+	doltgres_layouts_changed_push_t push;
+} DoltgresLayoutsTestsKeep;
+
+/* DoltgresLayoutsTestsCounts is what KEPT holds: its chained transforms and re-keys, and the transforms' room. */
+typedef struct DoltgresLayoutsTestsCounts
+{
+	size_t		chained;
+	size_t		room;
+	size_t		rekeys;
+} DoltgresLayoutsTestsCounts;
+
+/* doltgres_layouts_tests_count reads KEPT's counts under its lock. */
+static void
+doltgres_layouts_tests_count(void *value, void *captures)
+{
+	DoltgresLayoutsKept *kept = value;
+	DoltgresLayoutsTestsCounts *counts = captures;
+
+	counts->chained = kept->chained.len;
+	counts->room = kept->chained.cap;
+	counts->rekeys = kept->rekeys.len;
+}
+
+/* doltgres_layouts_tests_counts returns KEPT's counts, taking its lock. */
+static DoltgresLayoutsTestsCounts
+doltgres_layouts_tests_counts(HostIoIo *io)
+{
+	DoltgresLayoutsTestsCounts counts;
+
+	doltgres_layouts_kept_locked(io, doltgres_layouts_tests_count, &counts);
+	return counts;
+}
+
+/* doltgres_layouts_tests_empty returns a layout of no columns. */
+static AccessHeaptupleRowLayout
+doltgres_layouts_tests_empty(void)
+{
+	StdVec		columns;
+	StdVec		key;
+	AccessHeaptupleRowLayout layout;
+
+	std_vec_new(&columns, sizeof(AccessHeaptupleColumn), _Alignof(AccessHeaptupleColumn));
+	std_vec_new(&key, sizeof(access_TupleUsizeOrderKeyType_t), _Alignof(access_TupleUsizeOrderKeyType_t));
+	access_heaptuple_RowLayout_new(&columns, &key, &layout);
+	return layout;
+}
+
+/* doltgres_layouts_tests_keeping returns a keep of a keyless table's transform at a subtransaction. */
+static DoltgresLayoutsTestsKeep
+doltgres_layouts_tests_keeping(HostIoIo *io, uint32 subtransaction)
+{
+	DoltgresLayoutsTestsKeep keep = {.io = io, .push = {.keyless = true}};
+
+	keep.push.chained.f0 = subtransaction;
+	keep.push.chained.f1.before = doltgres_layouts_tests_empty();
+	keep.push.chained.f1.after = doltgres_layouts_tests_empty();
+	keep.push.rekey.f0 = subtransaction;
+	keep.push.rekey.f1.relation = 16400 + subtransaction;
+	return keep;
+}
+
+/* doltgres_layouts_tests_keep is the keep case's call: the transform kept under KEPT's lock. */
+static void
+doltgres_layouts_tests_keep(void *captures)
+{
+	DoltgresLayoutsTestsKeep *keep = captures;
+
+	doltgres_layouts_kept_locked(keep->io, doltgres_layouts_changed_push, &keep->push);
+}
+
+/*
+ * test_doltgres_layouts_tests_a_failed_allocation_in_a_kept_transform_keeps_the_earlier_ones:
+ * with KEPT's transforms at their room, a keep whose allocations fail keeps
+ * nothing and leaves every earlier transform and re-key for the next take of
+ * the lock (bugs row 517). Before, the keep grew the lists under the lock,
+ * its failure poisoned it, and the next take rebuilt them empty.
+ */
+void
+test_doltgres_layouts_tests_a_failed_allocation_in_a_kept_transform_keeps_the_earlier_ones(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	DoltgresLayoutsTestsKeep failing;
+	DoltgresLayoutsTestsCounts counts;
+	StdCaught	caught;
+	uint32		subtransaction = 0;
+	bool		ok;
+
+	do
+	{
+		DoltgresLayoutsTestsKeep keep = doltgres_layouts_tests_keeping(io, ++subtransaction);
+
+		doltgres_layouts_tests_keep(&keep);
+		STD_ASSERT(__LINE__, 9, keep.push.pushed, "a keep with room is kept");
+		counts = doltgres_layouts_tests_counts(io);
+	} while (counts.chained < counts.room);
+	failing = doltgres_layouts_tests_keeping(io, ++subtransaction);
+	pg_install();
+	pg_fail_allocations(true);
+	ok = std_catch_unwind(doltgres_layouts_tests_keep, &failing, &caught);
+	pg_fail_allocations(false);
+	if (!ok)
+		std_Caught_drop_Checked(&caught);
+	STD_ASSERT(__LINE__, 5, ok && !failing.push.pushed, "a keep past the room whose allocations fail keeps nothing");
+	doltgres_layouts_Chained_drop(&failing.push.chained.f1);
+	counts = doltgres_layouts_tests_counts(io);
+	STD_ASSERT(__LINE__, 5, counts.chained == subtransaction - 1 && counts.rekeys == subtransaction - 1,
+			   "every earlier transform and re-key outlived a failed keep");
+	doltgres_layouts_ended(io);
+	simc_TestIo_drop(&test_io);
+}
+#endif							/* DOLTGRES_TEST_DOLTGRES */
 
 #endif							/* FRONTEND */

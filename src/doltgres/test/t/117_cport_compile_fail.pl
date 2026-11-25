@@ -16,7 +16,7 @@
 # c/fail/expected.tsv names a case, a compiler family, and the diagnostic that
 # family gives, and the case's snippet, c/fail/<case>.c, passes only when the
 # build's own compiler, with the build's flags, refuses it with that
-# diagnostic, as each Rust fail crate's case is refused with its error.
+# diagnostic, as the Rust port's compile-fail case it ports was refused.
 #
 # Each crate's c/fail/opaque.tsv names its opaque-storage types, a public
 # struct of fixed size whose layout one file alone knows, with that file and,
@@ -29,12 +29,13 @@
 # storages holding one value, so no other file copies such a value into a
 # variable or through a pointer from anything but a call's result.
 #
-# verify/tokens.tsv accounts for each Rust compile-fail case of a crate with a
-# C port: one row each, naming the C form that keeps its token and the C case
-# that shows it, a subtest of this test or a C or Rust test case, or the form
-# outstanding for a case whose C form is still owed, which a case with a C
-# form of its own can't keep. The port lands only with no row outstanding,
-# which the environment's doltgres_tokens_landing makes this test require.
+# verify/tokens.tsv accounts for each compile-fail case of the deleted Rust
+# port: one row each, naming the C form that keeps its token and the C case
+# that shows it, a subtest of this test or a C test case, or the form
+# outstanding, with the case's statement of what the C form must refuse, for a
+# case whose C form is still owed, which a case with a C form of its own can't
+# keep. The port lands only with no row outstanding, which the environment's
+# doltgres_tokens_landing makes this test require.
 
 use strict;
 use warnings FATAL => 'all';
@@ -280,16 +281,10 @@ sub sources
 }
 
 my $c_text = join "\n", sources($root, qr/\.c$/);
-my $rust_text = join "\n", sources($root, qr/\.rs$/);
 my %forms =
   map { $_ => 1 } qw(opaque opaque-storage shape capability move-out);
-my $port_map = join "\n", sources("$root/verify", qr/^port-map\.tsv$/);
 
-# The tree's form: the Rust workspace's, or the C form the dolthub tree carries
-# with every Rust file removed, where a row's Rust case and its Rust checks are
-# absent by design, so only what the form carries is read.
-my $rust = -f "$root/Cargo.toml";
-my (%rows, %outstanding, @wrong);
+my (%outstanding, @wrong);
 open my $tokens, '<', "$root/verify/tokens.tsv"
   or die "cannot read $root/verify/tokens.tsv: $!";
 while (my $line = <$tokens>)
@@ -298,20 +293,18 @@ while (my $line = <$tokens>)
 	next if $line eq '' || $line =~ /^#/;
 	my ($crate, $rust_case, $item, $c_form, $keeps, $check) =
 	  split /\t/, $line, -1;
-	$rows{$rust_case}++;
-	push @wrong, "$rust_case: no Rust case"
-	  unless !$rust || -f "$root/$rust_case/src/lib.rs";
 	push @wrong, "$rust_case: not $crate\'s"
 	  unless $rust_case =~ m{^\Q$crate\E/};
 	if ($c_form eq 'outstanding')
 	{
 		my $case = (split m{/}, $rust_case)[-1];
 		push @{ $outstanding{$crate} }, $rust_case;
+		push @wrong, "$rust_case: outstanding without its statement"
+		  unless $item ne '' && $item ne '-';
 		push @wrong, "$rust_case: outstanding with a form's parts"
-		  unless $item eq '-' && $keeps eq '-' && $check eq '-';
+		  unless $keeps eq '-' && $check eq '-';
 		push @wrong, "$rust_case: outstanding with a C form"
-		  if -f "$root/$crate/c/fail/$case.c"
-		  || $port_map =~ /^\Q$case\E::case\t[^\t]*\t(?!-\t)/m;
+		  if -f "$root/$crate/c/fail/$case.c";
 		next;
 	}
 	push @wrong, "$rust_case: form $c_form" unless $forms{$c_form};
@@ -328,8 +321,7 @@ while (my $line = <$tokens>)
 			(my $function = "test_$1") =~ s/::/_/g;
 			$c_text =~ /\b\Q$function\E\b/;
 		  }
-		  : $named =~ /^rust: .*::(\w+)$/ ? !$rust || $rust_text =~ /\bfn \Q$1\E\b/
-		  :                                 0;
+		  : 0;
 		push @wrong, "$rust_case: no check $named" unless $found;
 	}
 }
@@ -337,20 +329,6 @@ close $tokens;
 is(join("\n", @wrong),
 	'',
 	'every row of tokens.tsv names its case, form, and an existing check');
-
-foreach my $crate_dir (sort grep { -d "$_/c" } glob("$root/*"))
-{
-	my $crate = substr($crate_dir, length($root) + 1);
-	my @cases =
-	  map { substr(dirname(dirname($_)), length($root) + 1) }
-	  glob("$crate_dir/fail/*/src/lib.rs"),
-	  glob("$crate_dir/*/fail/*/src/lib.rs");
-	my @unaccounted = grep { ($rows{$_} // 0) != 1 } sort @cases;
-	is( join("\n", @unaccounted),
-		'',
-		"each of the $crate crate's Rust compile-fail cases has one row of tokens.tsv"
-	);
-}
 
 my $owed = 0;
 $owed += scalar @{ $outstanding{$_} } foreach keys %outstanding;
@@ -365,5 +343,99 @@ else
 	pass("tokens.tsv has $owed rows outstanding"
 		  . ($owed ? " ($counts)" : ''));
 }
+
+# hashmap_layouts returns the refusals of a file's text, each with its line: a
+# StdHashMapType initializer, a definition's or a compound literal's, that
+# doesn't open with STD_HASHMAP_SHAPE or STD_HASHSET_SHAPE or that designates
+# a layout field itself, and an assignment to a layout field of a
+# StdHashMapType through . or ->, so that std/hashmap.h's two macros alone
+# write a map type's layout, which its copies are sized by (bugs rows 411 and
+# 430).
+sub hashmap_layouts
+{
+	my ($text) = @_;
+	my $fields = qr/(?:size|align|key_size|value_offset|value_size)/;
+	my @found;
+	while ($text =~
+		/\bStdHashMapType\s+\w+\s*=\s*\{|\(\s*(?:const\s+)?StdHashMapType\s*\)\s*\{/g
+	  )
+	{
+		my $start = pos($text);
+		my ($depth, $at) = (1, $start);
+		while ($depth > 0 && $at < length $text)
+		{
+			my $c = substr($text, $at++, 1);
+			$depth++ if $c eq '{';
+			$depth-- if $c eq '}';
+		}
+		my $body = substr($text, $start, $at - 1 - $start);
+		my $line = 1 + (() = substr($text, 0, $start) =~ /\n/g);
+		push @found,
+		  "line $line: a map type's initializer opens with no shape macro"
+		  unless $body =~ /\A\s*STD_HASH(?:MAP|SET)_SHAPE\s*\(/;
+		push @found,
+		  "line $line: a map type's initializer sets a layout field"
+		  if $body =~ /\.\s*$fields\s*=/;
+	}
+	my %names = map { $_ => 1 } $text =~ /\bStdHashMapType\s*\*?\s*(\w+)/g;
+	my $number = 0;
+	foreach my $line (split /\n/, $text)
+	{
+		$number++;
+		foreach my $name (sort keys %names)
+		{
+			push @found, "line $number: a map type's layout field is assigned"
+			  if $line =~ /\b\Q$name\E\s*(?:\.|->)\s*$fields\s*=(?!=)/;
+		}
+	}
+	return @found;
+}
+
+my @layouts = hashmap_layouts(<<'EOF');
+static const StdHashMapType BY_HAND = {
+	.size = sizeof(Elem), .align = _Alignof(Elem), .key_size = 4,
+	.value_offset = 8, .value_size = 1, .key_hash = hash,
+};
+static const StdHashMapType POSITIONAL = {16, 8, 4, 8, 1};
+static const StdHashMapType SHAPED = {
+	STD_HASHMAP_SHAPE(Elem),
+	.key_hash = hash,
+};
+static void
+reshaped(StdHashMapType *rewritten)
+{
+	rewritten->value_size = 0;
+}
+EOF
+is( join("\n", @layouts),
+	join("\n",
+		"line 1: a map type's initializer opens with no shape macro",
+		"line 1: a map type's initializer sets a layout field",
+		"line 5: a map type's initializer opens with no shape macro",
+		"line 13: a map type's layout field is assigned"),
+	'the check refuses a map type laid out by hand, a positional one, and an assignment to a layout field, and lets a shaped one pass'
+);
+
+my @mapped;
+find(
+	sub {
+		$File::Find::prune = 1 if $_ eq 'doltgrust' || $_ eq 'target';
+		push @mapped, $File::Find::name if /\.[ch]$/;
+	},
+	$root,
+	"$root/../include/doltgres");
+my @laid;
+foreach my $file (sort @mapped)
+{
+	next if $file =~ m{include/doltgres/std/hashmap\.h$};
+	open my $fh, '<', $file or die "cannot read $file: $!";
+	my $text = do { local $/; <$fh> };
+	close $fh;
+	push @laid, map { "$file: $_" } hashmap_layouts($text);
+}
+is( join("\n", @laid),
+	'',
+	'no file but std/hashmap.h writes a map type\'s layout but through STD_HASHMAP_SHAPE or STD_HASHSET_SHAPE'
+);
 
 done_testing();

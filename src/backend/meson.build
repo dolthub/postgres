@@ -2,7 +2,7 @@
 
 backend_build_deps = [backend_code]
 backend_sources = []
-backend_link_with = [pgport_srv, common_srv, doltgres_c, doltgres_cport]
+backend_link_with = [pgport_srv, common_srv]
 
 generated_backend_sources = []
 post_export_backend_sources = []
@@ -155,7 +155,9 @@ postgres = executable('postgres',
   sources: post_export_backend_sources,
   objects: backend_objs,
   link_args: backend_link_args,
-  link_with: backend_link_with,
+  # The fork's C links here, outside postgres_lib, so that with msvc
+  # postgres.def lists none of its names (design item 17).
+  link_with: backend_link_with + [doltgres_c, doltgres_cport],
   link_depends: backend_link_depends,
   export_dynamic: true,
   implib: 'postgres',
