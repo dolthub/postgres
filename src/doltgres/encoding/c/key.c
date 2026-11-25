@@ -20,8 +20,7 @@
  * value, or NULL last) and then the value's encoding, inverted for a
  * descending column. Every value encoding is self-delimiting, so a shorter
  * value never compares as a prefix of a longer one by accident, and the
- * column after it starts at a known place. Verus proves the Rust's encodings
- * order as their values do; the C's guarantee is tested equivalence.
+ * column after it starts at a known place.
  */
 #ifndef FRONTEND
 #include "postgres.h"

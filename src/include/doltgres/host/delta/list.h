@@ -91,6 +91,20 @@ typedef struct HostDeltaListListView
 } HostDeltaListListView;
 
 /*
+ * HostDeltaListCursor is one reader's run of reads of a list under one hold
+ * of its record's guard, in which no store reaches the list: the leaf page it
+ * reached last, which stays so while the guard is held, since the list's
+ * entries change only under the guard held exclusively. Zero-initialized, it
+ * has read nothing.
+ */
+typedef struct HostDeltaListCursor
+{
+	bool		has_leaf;
+	uint64		leaf;
+	HostDeltaPageRef page;
+} HostDeltaListCursor;
+
+/*
  * HostDeltaListListMut is a list read and stored under its record's guard
  * held exclusively, which it keeps for its links, with the lock's index in
  * place of its marker.
@@ -152,6 +166,9 @@ extern bool host_delta_list_ListView_entry(const HostDeltaListListView *self,
 extern bool host_delta_list_ListView_get(const HostDeltaListListView *self,
 										 const HostDeltaHold *hold, uint64 index, uint64 *result,
 										 HostError *error);
+extern bool host_delta_list_ListView_get_at(const HostDeltaListListView *self, const HostDeltaHold *hold,
+											HostDeltaListCursor *cursor, uint64 index, uint64 *result,
+											HostError *error);
 extern HostDeltaListListView host_delta_list_ListMut_view(const HostDeltaListListMut *self);
 extern bool host_delta_list_ListMut_set(HostDeltaListListMut *self, const HostDeltaHold *hold,
 										uint64 index, uint64 value, HostError *error);

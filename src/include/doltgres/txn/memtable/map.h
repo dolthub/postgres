@@ -27,6 +27,7 @@
 #include "doltgres/host/shared.h"
 #include "doltgres/std/vec.h"
 #include "doltgres/txn/memtable/version.h"
+#include "doltgres/txn/status.h"
 
 /* TXN_MEMTABLE_MAP_KEY is KEY, the length of a map's key, a u32 in big-endian order. */
 #define TXN_MEMTABLE_MAP_KEY 4
@@ -66,13 +67,45 @@ typedef enum TxnMemtableMapStep
 	TXN_MEMTABLE_MAP_STEP_REFUSE,
 } TxnMemtableMapStep;
 
-/* TxnMemtableMapTaken is Taken<T>'s variants: what a take did; a took's T comes beside it. */
+/*
+ * TxnMemtableMapTaken is Taken<T>'s variants: what a take did, moved when the
+ * entry its finish found or the base generation wasn't its caller's read; a
+ * took's T comes beside it.
+ */
 typedef enum TxnMemtableMapTaken
 {
 	TXN_MEMTABLE_MAP_TAKEN_TOOK,
 	TXN_MEMTABLE_MAP_TAKEN_RETRY,
 	TXN_MEMTABLE_MAP_TAKEN_REFUSED,
+	TXN_MEMTABLE_MAP_TAKEN_MOVED,
 } TxnMemtableMapTaken;
+
+/*
+ * TxnMemtableMapRead is what a take's caller read of its key outside the
+ * window, which its step computes from: the key's entry, or none, and the
+ * state's base generation read with it. A take with a read answers moved
+ * when the entry its finish finds or the generation differs, as a spill or a
+ * fold between them makes it (bugs row 342).
+ */
+typedef struct TxnMemtableMapRead
+{
+	bool		has_entry;
+	const uint8 *entry;
+	size_t		entry_len;
+	uint64		generation;
+} TxnMemtableMapRead;
+
+/*
+ * TxnMemtableMapDecision is a kept take's decision before its caller's
+ * window: what the take does, and for a take, its step's answer and the
+ * value a put writes.
+ */
+typedef struct TxnMemtableMapDecision
+{
+	TxnMemtableMapTaken taken;
+	TxnMemtableMapStep answer;
+	StdVec		value;
+} TxnMemtableMapDecision;
 
 /* TxnMemtableMapEntry is Entry, an Option<Vec<u8>>: a key's newest entry in a map, its value, or none for a removal. */
 typedef struct TxnMemtableMapEntry
@@ -130,19 +163,48 @@ extern const struct TxnMemtableTableTreeOps TXN_MEMTABLE_MAP_VALUES_TREE_OPS;
 
 extern bool txn_memtable_map_Map_Debug_fmt(const void *value, StdFormatter *f);
 extern bool txn_memtable_map_named(HostIoTakesShort io, struct TxnMemtableTablePreparedState *prepared, size_t take,
-								   TxnMemtableVersionWriter writer, bool has_lsn, uint64 lsn, HostRow tuple,
-								   StdVec *values, HostError *error);
+								   TxnMemtableVersionWriter writer, bool has_roomed, TxnStatusRoomed roomed,
+								   bool has_lsn, uint64 lsn, HostRow tuple, StdVec *values, HostError *error);
 extern size_t txn_memtable_map_named_most(size_t count);
+extern bool txn_memtable_map_kept(HostIoTakesShort io, struct TxnMemtableTablePreparedState *prepared,
+								  const size_t *takes, size_t len, HostError *error);
+extern bool txn_memtable_map_kept_unmoved(struct TxnMemtableTablePreparedState *prepared, size_t take,
+										  HostSharedRecord state, bool has_base, const uint8 *base, size_t base_len,
+										  const TxnMemtableMapRead *read, bool *result, HostError *error);
+extern bool txn_memtable_map_decided(struct TxnMemtableTablePreparedState *prepared, size_t take,
+									 HostSharedRecord state, bool has_base, const uint8 *base, size_t base_len,
+									 const TxnMemtableMapRead *read,
+									 TxnMemtableMapStep (*step) (void *captures, bool has_current,
+																 const uint8 *current, size_t current_len,
+																 StdVec *out),
+									 void *captures, TxnMemtableMapDecision *result, HostError *error);
+extern void txn_memtable_map_Decision_drop(TxnMemtableMapDecision *self);
+extern bool txn_memtable_map_decided_finish(HostIoTakesShort io, struct TxnMemtableTablePreparedState *prepared,
+											size_t take, TxnMemtableVersionWriter writer, bool has_roomed,
+											TxnStatusRoomed roomed, bool has_lsn, uint64 lsn,
+											const TxnMemtableMapDecision *decision, HostRow tuple,
+											void (*then) (void *captures), void *then_captures, HostError *error);
 extern bool txn_memtable_map_valued(const TxnMemtableVersionVersion *version, bool *some, StdBytes *result,
 									HostError *error);
 extern bool txn_memtable_map_versions(const struct TxnMemtableTableTreeOps *tree, HostIoIo *io,
 									  const HostDeltaHold *hold, HostSharedRecord state, uint32 key, StdVec *result,
 									  HostError *error);
+extern bool txn_memtable_map_in_memtable(HostIoIo *io, HostSharedRecord state, TxnMemtableMapMap map, uint32 key,
+										 bool *some, TxnMemtableMapEntry *result, HostError *error);
+extern bool txn_memtable_map_newest_at(HostIoIo *io, HostSharedRecord state, TxnMemtableMapMap map, uint32 key,
+									   uint64 point, bool *some, TxnMemtableMapEntry *result, HostError *error);
+extern bool txn_memtable_map_spilled_newest(HostIoIo *io, HostSharedRecord state, uint32 key, bool *some,
+											TxnMemtableMapEntry *result, HostError *error);
 extern bool txn_memtable_map_newest(HostIoIo *io, HostSharedRecord state, TxnMemtableMapMap map, uint32 key,
 									bool *some, TxnMemtableMapEntry *result, HostError *error);
+extern bool txn_memtable_map_taker(const TxnMemtableVersionVersion *version,
+								   txn_TupleWriterRowEntryU64TupleVecU32Bool_t *taker, HostError *error);
+extern bool txn_memtable_map_spilled_takes(HostIoIo *io, HostSharedRecord state, uint32 block, StdVec *result,
+										   HostError *error);
 extern bool txn_memtable_map_takers(HostIoIo *io, HostSharedRecord state, TxnMemtableMapMap map, uint32 key,
 									StdVec *result, HostError *error);
-extern bool txn_memtable_map_ended(HostIoIo *io, HostSharedRecord state, HostRow tid, uint32 ender, HostError *error);
+extern bool txn_memtable_map_ended(HostIoIo *io, HostSharedRecord state, HostRow tid, uint64 writer, uint32 ender,
+								   HostError *error);
 extern void txn_memtable_map_takers_drop(StdVec *takers);
 extern HostRow txn_memtable_map_taken(TxnMemtableVersionOpRef op);
 extern bool txn_memtable_map_marked(HostIoIo *io, HostSharedRecord state, uint32 block, uint64 lsn, StdVec *result,
@@ -156,9 +218,10 @@ extern bool txn_memtable_map_raised(HostSharedRecord state, const uint8 *key, si
 extern bool txn_memtable_map_cut(HostIoIo *io, HostSharedRecord state, bool *some, txn_TupleU64VecVecU8_t *result,
 								 HostError *error);
 extern bool txn_memtable_map_took_core(HostIoTakesShort io, struct TxnMemtableTablePreparedState *prepared,
-									   size_t take, TxnMemtableVersionWriter writer, bool has_lsn, uint64 lsn,
+									   size_t take, TxnMemtableVersionWriter writer, bool has_roomed,
+									   TxnStatusRoomed roomed, bool has_lsn, uint64 lsn,
 									   bool has_claim, HostRow claim_tid, uint64 claim_bytes, bool has_base,
-									   const uint8 *base, size_t base_len,
+									   const uint8 *base, size_t base_len, const TxnMemtableMapRead *read,
 									   TxnMemtableMapStep (*step) (void *captures, bool has_current,
 																   const uint8 *current, size_t current_len,
 																   StdVec *out),
@@ -176,6 +239,7 @@ extern void test_txn_memtable_map_tests_a_seek_reads_on_after_a_writer_follows_i
 extern void test_txn_memtable_map_tests_one_window_takes_in_the_rows_storage_and_its_toast_relations(void);
 extern void test_txn_memtable_map_tests_a_cut_reads_the_counter_with_its_blocks_entry_from_the_last_range(void);
 extern void test_txn_memtable_map_tests_a_map_only_prepare_takes_its_entry_and_makes_no_rows_memtable(void);
+extern void test_txn_memtable_map_tests_a_take_whose_read_moved_answers_moved_and_pushes_nothing(void);
 extern void test_txn_memtable_map_tests_the_free_space_maps_takes_newest_and_seek(void);
 extern void test_txn_memtable_map_tests_the_value_maps_takes_newest_and_seek(void);
 extern void test_txn_memtable_map_tests_a_maps_seek_goes_on_past_a_ranges_end(void);

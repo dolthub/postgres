@@ -205,20 +205,21 @@ $node->safe_psql(
 	CREATE TABLE refused (id int PRIMARY KEY, name text);
 	CREATE INDEX refused_picky ON refused (picky(name));
 });
-my $kept =
-  entries('refused', q{INSERT INTO refused VALUES (1, 'a')}, 'refused_picky')
-  . ' '
-  . rows('refused');
+entries('refused', q{INSERT INTO refused VALUES (1, 'a')}, 'refused_picky');
 my ($code, $out, $err) = $node->psql(
 	'postgres', q{
 	SELECT doltgres_test_index_routine('refused_picky');
 	SELECT doltgres_test_write('refused', true, 'UPDATE refused SET name = ''boom'' WHERE id = 1');
 });
+
+# The aborted update's entry versions stay beside the committed ones until a
+# fold's logged decision drops them (bugs row 432), and the row reads back as
+# it was.
 is( ($err =~ /(ERROR:\s+division by zero)/)[0] . ' / '
 	  . entries('refused', undef, 'refused_picky') . ' '
 	  . rows('refused'),
-	"ERROR:  division by zero / $kept",
-	"an update whose index expression raises after the row's change rolls back the row and its entries together"
+	"ERROR:  division by zero / delete, put\ndelete, put (1,a)",
+	"an update whose index expression raises after the row's change rolls back the row, its entries left for a fold"
 );
 
 $node->safe_psql(
@@ -237,15 +238,19 @@ $node->safe_psql(
 	SELECT doltgres_test_write('saved', true, 'UPDATE saved SET name = ''c'' WHERE id = 1');
 	COMMIT;
 });
+
+# The rolled-back subtransaction's entry versions stay until a fold's logged
+# decision drops them (bugs row 432), here and in the expression index's
+# lists after it.
 is( entries('saved', undef, 'saved_name') . ' ' . rows('saved'),
-	"delete, put\nput (1,c)",
+	"delete, delete, put\nput\nput (1,c)",
 	"an update after a subtransaction's update was rolled back removes the old row's entry through the same removal"
 );
 
 entries('refused', q{UPDATE refused SET name = 'b' WHERE id = 1},
 	'refused_picky');
 is( entries('refused', q{DELETE FROM refused WHERE id = 1}, 'refused_picky'),
-	"delete, put\ndelete, put\ndelete, put, delete, put",
+	"delete, delete, put\ndelete, put\ndelete, put, delete, delete, put",
 	"an update and a delete remove an expression index's old entries");
 
 $node->safe_psql(
@@ -333,9 +338,12 @@ foreach my $statement (
 	});
 	$undone .= ' / ' . entries('undone', undef, 'undone_name');
 }
+
+# Each aborted writer's entry versions stay until a fold's logged decision
+# drops them (bugs row 432), and the table reads as before.
 is( $undone . ' ' . rows('undone'),
-	"put / put / put (1,a)",
-	"a rolled back insert's and delete's index versions are taken back and the index reads as before"
+	"put / put\nput / delete, put\nput (1,a)",
+	"a rolled back insert's and delete's index versions stay until a fold and the index reads as before"
 );
 
 $node->safe_psql('postgres', q{
@@ -1992,9 +2000,16 @@ my $cu_routines = join('',
 	map { "DO \$\$ BEGIN PERFORM doltgres_test_index_routine('$_'); END \$\$;" } ('cu_k', 'cu_pkey'));
 $node->safe_psql('postgres',
 	"$cu_routines SELECT doltgres_test_write('cu', true, 'INSERT INTO cu VALUES (1, 1), (2, 2)');");
+# The row the index lacks is written while the index isn't ready for inserts,
+# as a concurrent build's first phase leaves it, so no write reaches the index
+# (bugs row 386).
+$node->safe_psql('postgres',
+	"UPDATE pg_index SET indisready = false WHERE indexrelid = 'cu_k'::regclass");
 $node->safe_psql('postgres',
 	"DO \$\$ BEGIN PERFORM doltgres_test_index_routine('cu_pkey'); END \$\$;"
 	  . " SELECT doltgres_test_write('cu', true, 'INSERT INTO cu VALUES (3, 1)');");
+$node->safe_psql('postgres',
+	"UPDATE pg_index SET indisready = true WHERE indexrelid = 'cu_k'::regclass");
 my ($cu_ret, $cu_out, $cu_err) = $node->psql('postgres',
 	"$cu_routines SELECT doltgres_test_index_validate('cu', 'cu_k')",
 	extra_params => [ '-v', 'VERBOSITY=verbose' ]);
@@ -2481,5 +2496,172 @@ is( $node->safe_psql('postgres',
 	't|t',
 	"an answer of none leaves the caller's handle and datum as they were");
 
+# Bugs row 313: a concurrent build's validation forms no key of a row its
+# build's snapshot saw, which the build indexed, so a REINDEX CONCURRENTLY runs
+# an indexed row's expression once, as heap's validation does: the regress
+# suite's concur_reindex_ddl sequence gives the reference's one NOTICE and its
+# two errors.
+my (undef, undef, $ddl_err) = $node->psql(
+	'postgres', q{
+CREATE TABLE concur_reindex_ddl_tab (i int);
+INSERT INTO concur_reindex_ddl_tab VALUES (1);
+CREATE FUNCTION concur_reindex_ddl_f() RETURNS void LANGUAGE plpgsql AS
+  'begin DROP INDEX IF EXISTS public.concur_reindex_ddl_ind2; end';
+CREATE FUNCTION concur_reindex_ddl_im(int) RETURNS int
+  LANGUAGE plpgsql IMMUTABLE AS
+  'begin perform public.concur_reindex_ddl_f(); return $1; end';
+CREATE INDEX concur_reindex_ddl_ind1 ON
+  concur_reindex_ddl_tab (concur_reindex_ddl_im(i));
+CREATE INDEX concur_reindex_ddl_ind2 ON concur_reindex_ddl_tab (i);
+REINDEX TABLE CONCURRENTLY concur_reindex_ddl_tab;
+REINDEX INDEX CONCURRENTLY concur_reindex_ddl_ind2;
+REINDEX INDEX CONCURRENTLY concur_reindex_ddl_ind1;
+REINDEX INDEX CONCURRENTLY concur_reindex_ddl_ind2;
+},
+	on_error_stop => 0,
+	extra_params => [ '-v', 'VERBOSITY=verbose' ]);
+is( join("\n", $ddl_err =~ /((?:NOTICE|ERROR):  \w{5}: [^\n]*)/g),
+	join("\n",
+		'NOTICE:  00000: index "concur_reindex_ddl_ind2" does not exist, skipping',
+		'ERROR:  55006: cannot DROP INDEX "concur_reindex_ddl_ind2" because it is being used by active queries in this session',
+		'ERROR:  42P01: relation "concur_reindex_ddl_ind2" does not exist'),
+	"a REINDEX CONCURRENTLY computes an indexed row's expression once, as heap's validation does"
+);
+
+# Bugs row 313: CREATE INDEX CONCURRENTLY and REINDEX CONCURRENTLY of a fork
+# btree expression index while another session, which held its lock across the
+# build, inserts while the command waits for writers before its validation:
+# the index is valid and holds every row once. The index's expression waits on
+# an advisory lock at one row, so the writer's lock comes after the build's
+# first wait.
+$node->safe_psql(
+	'postgres', q{
+CREATE FUNCTION validated_at(k int) RETURNS int IMMUTABLE LANGUAGE plpgsql
+	AS $$ BEGIN IF k = 2 THEN PERFORM pg_advisory_xact_lock_shared(45); END IF; RETURN k; END $$;
+CREATE TABLE validated (k int);
+INSERT INTO validated SELECT generate_series(1, 3);
+});
+my $validated_locker = $node->background_psql('postgres');
+my $validated_builder = $node->background_psql('postgres');
+my $validated_writer = $node->background_psql('postgres');
+my $validated_first = 4;
+foreach my $statement (
+	'CREATE INDEX CONCURRENTLY validated_k ON validated ((validated_at(k)))',
+	'REINDEX INDEX CONCURRENTLY validated_k')
+{
+	$validated_locker->query_safe('SELECT pg_advisory_lock(45)');
+	$validated_builder->query_until(qr/start/, "\\echo start\n$statement;\n");
+	$node->poll_query_until('postgres',
+		q{SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event = 'advisory' AND query ~ 'CONCURRENTLY')}
+	);
+	$validated_writer->query_safe(
+		'BEGIN; LOCK TABLE validated IN ROW EXCLUSIVE MODE');
+	$validated_locker->query_safe('SELECT pg_advisory_unlock(45)');
+	$node->poll_query_until('postgres',
+		q{SELECT EXISTS (SELECT 1 FROM pg_stat_progress_create_index WHERE phase = 'waiting for writers before validation')}
+	);
+	my $last = $validated_first + 1;
+	$validated_writer->query_safe(
+		"INSERT INTO validated SELECT generate_series($validated_first, $last); COMMIT"
+	);
+	$validated_builder->query_safe('SELECT 1');
+	is( $node->safe_psql(
+			'postgres',
+			"SET enable_seqscan = off; SET enable_bitmapscan = off; SELECT (SELECT indisvalid FROM pg_index WHERE indexrelid = 'validated_k'::regclass) || ' ' || string_agg(k::text, ',' ORDER BY k) FROM validated WHERE validated_at(k) > 0"
+		),
+		'true ' . join(',', 1 .. $last),
+		"$statement while another session inserts before its validation leaves a valid index holding every row once"
+	);
+	$validated_first = $last + 1;
+}
+$_->quit for $validated_locker, $validated_builder, $validated_writer;
+
 $node->stop;
+
+# P2's index build and index move: a build whose snapshot predates another
+# transaction's committed insert of rows past a 4 MB delta_memory carries their
+# late entries to spill files under the writer's xid and completes; held
+# unfolded by an older snapshot, the index then moves into a tablespace with
+# those entries carried again, never waiting at the budget, and its storage
+# holds an entry for every row after the move and after a crash.
+my $moving_index = PostgreSQL::Test::Cluster->new('index_move');
+$moving_index->init;
+$moving_index->append_conf('postgresql.conf',
+	"delta_memory = 4MB\nfold_threshold = 1GB\nfold_timeout = 3600s\ncollector_naptime = 3600s\nallow_in_place_tablespaces = on"
+);
+$moving_index->start;
+$moving_index->safe_psql(
+	'postgres', q{
+	CREATE EXTENSION doltgres_test;
+	CREATE TABLESPACE index_moved LOCATION '';
+	CREATE TABLE indexed (id int PRIMARY KEY, name text);
+});
+my $entries = sub {
+	scalar(() = $moving_index->safe_psql('postgres', q{SELECT doltgres_test_index_entries('indexed_name')}) =~ /^put$/mg);
+};
+my $index_older = $moving_index->background_psql('postgres');
+$index_older->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
+my $index_builder = $moving_index->background_psql('postgres');
+$index_builder->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
+$moving_index->safe_psql('postgres',
+	q{SELECT doltgres_test_write('indexed', true, 'INSERT INTO indexed SELECT g, repeat(md5(g::text), 31) FROM generate_series(1, 10000) g')},
+	timeout => 600);
+$index_builder->query_safe('CREATE INDEX indexed_name ON indexed (name)');
+$index_builder->query_safe('COMMIT');
+$index_builder->quit;
+is($entries->(), 10000, "a build at a 4 MB delta_memory carries every late entry of another transaction's rows");
+$moving_index->safe_psql('postgres',
+	q{SELECT doltgres_test_index_routine('indexed_name'); SELECT doltgres_test_index_move('indexed_name', 'index_moved')},
+	timeout => 600);
+is($entries->(), 10000, "an index move held unfolded carries every entry of another transaction past delta_memory");
+$index_older->query_safe('COMMIT');
+$index_older->quit;
+$moving_index->stop('immediate');
+$moving_index->start;
+is($entries->(), 10000, 'and the moved entries survive a crash');
+$moving_index->stop;
+
+# A partial index's build sets the table's reltuples to every live row, not to
+# the rows its predicate admits, as heap's build counts before the predicate:
+# its own transaction's inserts count and its own deletes don't.
+$node->start;
+$node->safe_psql(
+	'postgres', q{
+	CREATE TABLE counted (k int, v int);
+	INSERT INTO counted SELECT g, g FROM generate_series(1, 10000) g;
+	ANALYZE counted;
+});
+my $reltuples = sub {
+	$node->safe_psql('postgres', "$_[0] SELECT reltuples FROM pg_class WHERE relname = 'counted'");
+};
+is($reltuples->('CREATE INDEX counted_btree ON counted (v) WHERE k = 9999;'),
+	10000, "a partial btree's build leaves the table's reltuples at every live row");
+is($reltuples->('CREATE INDEX counted_hash ON counted USING hash (v) WHERE k = 9999;'),
+	10000, "a partial hash index's build leaves the table's reltuples at every live row");
+is( $node->safe_psql(
+		'postgres', q{
+		BEGIN;
+		INSERT INTO counted SELECT g, g FROM generate_series(10001, 10005) g;
+		DELETE FROM counted WHERE k <= 3;
+		CREATE INDEX counted_own ON counted (v) WHERE k = 9999;
+		SELECT reltuples FROM pg_class WHERE relname = 'counted';
+		COMMIT;
+	}),
+	10002,
+	"a partial build counts its own transaction's inserts and not its own deletes");
+
+# A fold of each index the aborted writers above wrote to drops their entry
+# versions as it applies the committed ones (bugs row 432): each delta is left
+# empty and each base holds an entry for each row its table reads.
+is( join(
+		' | ',
+		map {
+			$node->safe_psql('postgres', "SELECT doltgres_test_index_fold('$_')");
+			$node->safe_psql('postgres', "SELECT doltgres_test_index_entries('$_')") . ' '
+			  . $node->safe_psql('postgres', "SELECT doltgres_test_index_base('$_')")
+		} qw(refused_picky saved_name undone_name)),
+	'none none | none - | none -',
+	"a fold drops the aborted writers' entry versions and leaves the committed rows' entries");
+$node->stop;
+
 done_testing();

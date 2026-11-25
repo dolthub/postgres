@@ -40,15 +40,19 @@ typedef struct StdRawTableInner
 
 /*
  * StdHashMapType is a map's generic parameters as data: its element's size
- * and alignment and where its value starts, the key's Hash, Eq, and drop,
- * the value's drop, and the BuildHasher S with S's Default. A set's value
- * is ().
+ * and alignment, its key's size, where its value starts and the value's
+ * size, the key's Hash, Eq, and drop, the value's drop, and the BuildHasher
+ * S with S's Default. A set's value is (). Its layout is written only by
+ * STD_HASHMAP_SHAPE or STD_HASHSET_SHAPE, so a copy of a key or a value
+ * moves exactly the key's or the value's own bytes (bugs row 411).
  */
 typedef struct StdHashMapType
 {
 	size_t		size;
 	size_t		align;
+	size_t		key_size;
 	size_t		value_offset;
+	size_t		value_size;
 	void		(*key_hash) (const void *key, StdHasher state);
 	bool		(*key_eq) (const void *a, const void *b);
 	void		(*key_drop) (void *key);
@@ -56,6 +60,19 @@ typedef struct StdHashMapType
 	const StdBuildHasherOps *hasher;
 	void		(*hasher_default) (void *result);
 } StdHashMapType;
+
+/*
+ * STD_HASHMAP_SHAPE is the layout of a map whose elements are Elem, its key
+ * in f0 and its value in f1, each sized by its own field.
+ */
+#define STD_HASHMAP_SHAPE(Elem) \
+	.size = sizeof(Elem), .align = _Alignof(Elem), .key_size = sizeof(((Elem *) 0)->f0), \
+	.value_offset = offsetof(Elem, f1), .value_size = sizeof(((Elem *) 0)->f1)
+
+/* STD_HASHSET_SHAPE is the layout of a set whose elements are Elem, each its own key, with no value. */
+#define STD_HASHSET_SHAPE(Elem) \
+	.size = sizeof(Elem), .align = _Alignof(Elem), .key_size = sizeof(Elem), .value_offset = sizeof(Elem), \
+	.value_size = 0
 
 /* StdHashBuilder is a map's BuildHasher, one of the port's two. */
 typedef union StdHashBuilder
@@ -121,5 +138,8 @@ extern bool std_HashMap_PartialEq_eq(const StdHashMap *map, const StdHashMap *ot
 									 const StdHashMapType *t,
 									 bool (*value_eq) (const void *a, const void *b));
 extern void std_HashMap_drop(StdHashMap *map, const StdHashMapType *t);
+#ifdef DOLTGRES_TEST_HOST
+extern void test_std_hashmap_tests_a_maps_copies_move_only_their_values(void);
+#endif
 
 #endif							/* DOLTGRES_STD_HASHMAP_H */

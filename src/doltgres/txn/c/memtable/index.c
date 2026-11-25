@@ -47,9 +47,6 @@
 /* TXN_MEMTABLE_INDEX_LEVELS is LEVELS, the first bit of a node's height in its place word, above its key's length. */
 #define TXN_MEMTABLE_INDEX_LEVELS 56
 
-/* TXN_MEMTABLE_INDEX_WORDS is WORDS, the count of a node's words before its links: its head and its place word. */
-#define TXN_MEMTABLE_INDEX_WORDS UINT64CONST(2)
-
 /* A range's pages are at most the delta's slots, so a page's index fits a node's name above its word. */
 StaticAssertDecl(HOST_DELTA_PAGE_SLOTS <= UINT64CONST(1) << 32, "a page's index fits a node's name");
 
@@ -154,7 +151,7 @@ HostDeltaPageSize
 txn_memtable_index_least(const uint8 *key, size_t key_len)
 {
 	HostDeltaPageSize size = {(uint32) key_len,
-	(uint32) (1 + TXN_MEMTABLE_INDEX_WORDS + TXN_MEMTABLE_INDEX_HEIGHT)};
+	(uint32) TXN_MEMTABLE_INDEX_LEAST_WORDS};
 
 	return size;
 }
@@ -188,20 +185,31 @@ typedef struct TxnMemtableIndexPlace
 	uint64		word;
 } TxnMemtableIndexPlace;
 
+/* txn_memtable_index_Place_cursor opens a node's page through the range's list of pages with a walk's cursor. */
+static bool
+txn_memtable_index_Place_cursor(const TxnMemtableIndexClosesOps *closes, const HostSharedGuard *guard,
+								const HostDeltaHold *hold, HostDeltaListCursor *cursor, TxnMemtableIndexNode node,
+								TxnMemtableIndexPlace *result, HostError *error)
+{
+	HostDeltaListListView list = host_delta_list_Guard_list(guard, closes->shape, TXN_MEMTABLE_INDEX_PAGES);
+	uint64		name;
+
+	if (!host_delta_list_ListView_get_at(&list, hold, cursor, txn_memtable_index_Node_page(node), &name, error) ||
+		!host_delta_Hold_page(hold, host_delta_page_Page_named(name), &result->page, error))
+		return false;
+	result->word = txn_memtable_index_Node_word(node);
+	return true;
+}
+
 /* txn_memtable_index_Place_at opens a node's page through the range's list of pages. */
 static bool
 txn_memtable_index_Place_at(const TxnMemtableIndexClosesOps *closes, const HostSharedGuard *guard,
 							const HostDeltaHold *hold, TxnMemtableIndexNode node, TxnMemtableIndexPlace *result,
 							HostError *error)
 {
-	HostDeltaListListView list = host_delta_list_Guard_list(guard, closes->shape, TXN_MEMTABLE_INDEX_PAGES);
-	uint64		name;
+	HostDeltaListCursor cursor = {0};
 
-	if (!host_delta_list_ListView_get(&list, hold, txn_memtable_index_Node_page(node), &name, error) ||
-		!host_delta_Hold_page(hold, host_delta_page_Page_named(name), &result->page, error))
-		return false;
-	result->word = txn_memtable_index_Node_word(node);
-	return true;
+	return txn_memtable_index_Place_cursor(closes, guard, hold, &cursor, node, result, error);
 }
 
 /* txn_memtable_index_Place_head returns the node's head word, which names its key's newest version. */
@@ -258,6 +266,42 @@ txn_memtable_index_Place_loaded(const TxnMemtableIndexPlace *self, uint64 level,
 }
 
 /*
+ * txn_memtable_index_Place_cmp compares a key with the key of the node at an
+ * opened place, lent and given back at once, answering false on an error.
+ */
+static bool
+txn_memtable_index_Place_cmp(const TxnMemtableIndexPlace *self, const uint8 *key, size_t key_len,
+							 StdOrdering *result, HostError *error)
+{
+	HostDeltaLent lent;
+	StdBytes	bytes;
+
+	if (!txn_memtable_index_Place_key(self, &lent, error))
+		return false;
+	bytes = host_delta_Lent_Deref_deref(&lent);
+	*result = std_bytes_Ord_cmp(key, key_len, bytes.ptr, bytes.len);
+	host_delta_Lent_drop(&lent);
+	return true;
+}
+
+/*
+ * txn_memtable_index_Place_next loads the link at a level of the node at an
+ * opened place afresh, answering false on an error and setting some when it
+ * names a node.
+ */
+static bool
+txn_memtable_index_Place_next(const TxnMemtableIndexPlace *self, uint64 level, bool *some,
+							  TxnMemtableIndexNode *result, HostError *error)
+{
+	uint64		link;
+
+	if (!txn_memtable_index_Place_loaded(self, level, &link, error))
+		return false;
+	*some = txn_memtable_index_Node_named(link, result);
+	return true;
+}
+
+/*
  * txn_memtable_index_key_cmp compares a key with a node's key, lent and
  * given back at once, answering false on an error.
  */
@@ -267,16 +311,9 @@ txn_memtable_index_key_cmp(const TxnMemtableIndexKeyedOps *keyed, const HostShar
 						   StdOrdering *result, HostError *error)
 {
 	TxnMemtableIndexPlace place;
-	HostDeltaLent lent;
-	StdBytes	bytes;
 
-	if (!txn_memtable_index_Place_at(&keyed->closes, guard, hold, node, &place, error) ||
-		!txn_memtable_index_Place_key(&place, &lent, error))
-		return false;
-	bytes = host_delta_Lent_Deref_deref(&lent);
-	*result = std_bytes_Ord_cmp(key, key_len, bytes.ptr, bytes.len);
-	host_delta_Lent_drop(&lent);
-	return true;
+	return txn_memtable_index_Place_at(&keyed->closes, guard, hold, node, &place, error) &&
+		txn_memtable_index_Place_cmp(&place, key, key_len, result, error);
 }
 
 /*
@@ -289,13 +326,9 @@ txn_memtable_index_next_at(const TxnMemtableIndexKeyedOps *keyed, const HostShar
 						   TxnMemtableIndexNode *result, HostError *error)
 {
 	TxnMemtableIndexPlace place;
-	uint64		link;
 
-	if (!txn_memtable_index_Place_at(&keyed->closes, guard, hold, node, &place, error) ||
-		!txn_memtable_index_Place_loaded(&place, level, &link, error))
-		return false;
-	*some = txn_memtable_index_Node_named(link, result);
-	return true;
+	return txn_memtable_index_Place_at(&keyed->closes, guard, hold, node, &place, error) &&
+		txn_memtable_index_Place_next(&place, level, some, result, error);
 }
 
 /* txn_memtable_index_first returns the index's first node, or nothing while it holds no key. */
@@ -516,7 +549,12 @@ typedef struct TxnMemtableIndexPath
 /*
  * txn_memtable_index_path searches the index for a key from its first node,
  * at each level from the highest down following links while the next node's
- * key is below the key.
+ * key is below the key. It opens each node it reaches once and keeps its
+ * place, a page the hold keeps open, loading each link from it afresh, so a
+ * link stored since is seen as a reopen would see it (bugs row 355). A node
+ * on the page of the node before it takes that page, since its caller holds
+ * the range's lock through the walk and the range's list changes its entries
+ * only under that lock held exclusively.
  */
 static bool
 txn_memtable_index_path(const TxnMemtableIndexKeyedOps *keyed, const HostSharedGuard *guard,
@@ -525,13 +563,16 @@ txn_memtable_index_path(const TxnMemtableIndexKeyedOps *keyed, const HostSharedG
 {
 	TxnMemtableIndexNode first;
 	TxnMemtableIndexNode at;
+	TxnMemtableIndexPlace at_place;
+	HostDeltaListCursor cursor = {0};
 	StdOrdering order;
 
 	result->has_before = false;
 	result->has_at = false;
 	if (!txn_memtable_index_first(keyed, guard, &first))
 		return true;
-	if (!txn_memtable_index_key_cmp(keyed, guard, hold, first, key, key_len, &order, error))
+	if (!txn_memtable_index_Place_cursor(&keyed->closes, guard, hold, &cursor, first, &at_place, error) ||
+		!txn_memtable_index_Place_cmp(&at_place, key, key_len, &order, error))
 		return false;
 	if (order != STD_ORDERING_GREATER)
 	{
@@ -546,21 +587,31 @@ txn_memtable_index_path(const TxnMemtableIndexKeyedOps *keyed, const HostSharedG
 		{
 			bool		some;
 			TxnMemtableIndexNode next;
+			TxnMemtableIndexPlace next_place;
 
-			if (!txn_memtable_index_next_at(keyed, guard, hold, at, level, &some, &next, error))
+			if (!txn_memtable_index_Place_next(&at_place, level, &some, &next, error))
 				return false;
 			if (!some)
 				break;
-			if (!txn_memtable_index_key_cmp(keyed, guard, hold, next, key, key_len, &order, error))
+			if (txn_memtable_index_Node_page(next) == txn_memtable_index_Node_page(at))
+			{
+				next_place.page = at_place.page;
+				next_place.word = txn_memtable_index_Node_word(next);
+			}
+			else if (!txn_memtable_index_Place_cursor(&keyed->closes, guard, hold, &cursor, next, &next_place,
+													  error))
+				return false;
+			if (!txn_memtable_index_Place_cmp(&next_place, key, key_len, &order, error))
 				return false;
 			if (order != STD_ORDERING_GREATER)
 				break;
 			at = next;
+			at_place = next_place;
 		}
 		result->before[level] = at;
 	}
 	result->has_before = true;
-	return txn_memtable_index_next_at(keyed, guard, hold, at, 0, &result->has_at, &result->at, error);
+	return txn_memtable_index_Place_next(&at_place, 0, &result->has_at, &result->at, error);
 }
 
 /*
@@ -2142,7 +2193,8 @@ test_txn_memtable_index_tests_a_new_keys_version_and_node_go_together_on_a_fresh
 		STD_OPTION_UNWRAP_FAILED(693, 45);
 	std_vec_new(&spare, sizeof(HostDeltaOwned), _Alignof(HostDeltaOwned));
 	std_vec_new(&buffer, 1, 1);
-	if (!txn_memtable_version_push(&open, &hold, c, sizeof(c), &change, &has_fresh, &fresh, &spare, &buffer, &wanted,
+	if (!txn_memtable_version_push(&open, &hold, c, sizeof(c), &change, false, &has_fresh, &fresh, &spare, &buffer,
+								   &wanted,
 								   &error))
 		STD_RESULT_EXPECT_FAILED(710, 21, "called `Result::unwrap()` on an `Err` value", &error,
 								 host_Error_Debug_fmt);
@@ -2192,6 +2244,103 @@ test_txn_memtable_index_tests_a_seek_past_the_last_key_leaves_its_node_as_it_was
 	host_shared_Guard_drop(&guard);
 	host_delta_Hold_drop(&hold);
 	std_vec_free_Checked(&past, 1, 1);
+	host_shared_Held_drop(&held);
+	simc_TestIo_drop(&test_io);
+}
+
+/* txn_memtable_index_tests_listed is the value a cursor's test stores at an index of its list. */
+static uint64
+txn_memtable_index_tests_listed(uint64 index)
+{
+	return UINT64CONST(0x100000) + index;
+}
+
+/*
+ * test_txn_memtable_index_tests_a_walks_cursor_reads_each_leaf_it_moves_to:
+ * one cursor reads a list of two levels whose entries fill three leaves, back
+ * and forth between leaves and in and out of the record's inline entries,
+ * each read the value stored at its index, and refuses an index at the
+ * list's length (bugs row 355).
+ */
+void
+test_txn_memtable_index_tests_a_walks_cursor_reads_each_leaf_it_moves_to(void)
+{
+	static const uint64 reads[] = {
+		HOST_DELTA_LIST_INLINE + 5, HOST_DELTA_LIST_INLINE + HOST_DELTA_LIST_FANOUT + 5, HOST_DELTA_LIST_INLINE + 7, 2,
+		HOST_DELTA_LIST_INLINE + 9, HOST_DELTA_LIST_INLINE + 2 * HOST_DELTA_LIST_FANOUT,
+		HOST_DELTA_LIST_INLINE + HOST_DELTA_LIST_FANOUT + 9,
+	};
+	static const char past[] = "an index of a list is past its length";
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedHeld held;
+	uint64		keys = txn_memtable_index_tests_keyed(__LINE__, 5, io, &held);
+	uint64		length = HOST_DELTA_LIST_INLINE + 2 * HOST_DELTA_LIST_FANOUT + 1;
+	HostDeltaPageSize list_page = HOST_DELTA_LIST_PAGE;
+	HostDeltaHold hold;
+	HostSharedGuard guard;
+	HostDeltaListListView view;
+	HostDeltaListListMut list;
+	HostDeltaListCursor cursor = {0};
+	HostDeltaFull full;
+	StdVec		sizes;
+	StdVec		spare;
+	size_t		wanted;
+	bool		allocated;
+	uint64		got;
+	StdStr		message;
+	HostError	error;
+
+	if (!txn_memtable_index_tests_opened(io, keys, false, &hold, &guard, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 5, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	view = host_delta_list_Guard_list(&guard, &TXN_MEMTABLE_TESTING_KEYS_AGED_OPS.shape, TXN_MEMTABLE_INDEX_PAGES);
+	wanted = host_delta_list_ListView_reserving(&view, length);
+	host_shared_Guard_drop(&guard);
+	host_delta_Hold_drop(&hold);
+	std_vec_new(&sizes, sizeof(HostDeltaPageSize), _Alignof(HostDeltaPageSize));
+	for (size_t k = 0; k < wanted; k++)
+		std_vec_push_Checked(&sizes, &list_page, sizeof(list_page), _Alignof(HostDeltaPageSize));
+	if (!host_delta_alloc(io, sizes.ptr, sizes.len, &allocated, &spare, &full, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 5, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT(__LINE__, 5, allocated, "the delta gives a list's pages");
+	if (!txn_memtable_index_tests_opened(io, keys, true, &hold, &guard, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 5, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	list = host_delta_list_GuardExclusive_list_mut(&guard, &TXN_MEMTABLE_TESTING_KEYS_AGED_OPS.shape,
+												   TXN_MEMTABLE_TESTING_KEYS_LOCK, TXN_MEMTABLE_INDEX_PAGES);
+	for (uint64 index = 0; index < length; index++)
+		if (!host_delta_list_ListMut_push(&list, &hold, txn_memtable_index_tests_listed(index), &spare, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 13, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+	host_shared_Guard_drop(&guard);
+	host_delta_Hold_drop(&hold);
+	if (!txn_memtable_index_tests_opened(io, keys, false, &hold, &guard, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 5, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	view = host_delta_list_Guard_list(&guard, &TXN_MEMTABLE_TESTING_KEYS_AGED_OPS.shape, TXN_MEMTABLE_INDEX_PAGES);
+	for (size_t k = 0; k < lengthof(reads); k++)
+	{
+		uint64		stored = txn_memtable_index_tests_listed(reads[k]);
+
+		if (!host_delta_list_ListView_get_at(&view, &hold, &cursor, reads[k], &got, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		STD_ASSERT_EQ(__LINE__, 9, got == stored, &got, std_u64_Debug_fmt, &stored, std_u64_Debug_fmt);
+	}
+	STD_ASSERT(__LINE__, 5, !host_delta_list_ListView_get_at(&view, &hold, &cursor, length, &got, &error),
+			   "a cursor refuses an index at the list's length");
+	message = host_Error_message(&error);
+	STD_ASSERT(__LINE__, 5, message.len == sizeof(past) - 1 && memcmp(message.ptr, past, message.len) == 0,
+			   "an index at the list's length is refused as past it");
+	host_Error_drop(&error);
+	host_shared_Guard_drop(&guard);
+	host_delta_Hold_drop(&hold);
+	for (size_t k = 0; k < spare.len; k++)
+		host_delta_Owned_drop(&STD_VEC_AT(&spare, HostDeltaOwned, k));
+	std_vec_free_Checked(&spare, sizeof(HostDeltaOwned), _Alignof(HostDeltaOwned));
+	std_vec_free_Checked(&sizes, sizeof(HostDeltaPageSize), _Alignof(HostDeltaPageSize));
 	host_shared_Held_drop(&held);
 	simc_TestIo_drop(&test_io);
 }

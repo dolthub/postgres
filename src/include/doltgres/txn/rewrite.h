@@ -142,6 +142,18 @@ typedef struct txn_TupleU32TupleEntryU64_t
 	txn_TupleEntryU64_t f1;
 } txn_TupleU32TupleEntryU64_t;
 
+/*
+ * TxnRewriteCarry is Carry: a version a rewrite, a move, or an index build
+ * carries into its new storage, its row change, under its own writer, with
+ * the command it showed and the row lock it held.
+ */
+typedef struct TxnRewriteCarry
+{
+	TxnRecordRowChange f0;
+	TxnMemtableVersionShown f1;
+	TxnMemtableLockMode f2;
+} TxnRewriteCarry;
+
 extern bool txn_rewrite_based(HostIoIo *io, TreesStoreNodeStore store, bool has_root, TreesStoreTree root,
 							  StdVec *result, HostError *error);
 extern bool txn_rewrite_keys(HostIoIo *io, const HostSharedHeld *held, const TxnRewriteBased *based,
@@ -152,8 +164,11 @@ extern bool txn_rewrite_new_base(StdVec *based, StdVec *copied, bool keyless, ui
 								 const host_TupleRowU32_t *carried, size_t carried_len,
 								 TxnFoldTrees *result_0, TxnBaseBase *result_1, HostError *error);
 extern bool txn_rewrite_carried(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held,
-								const TxnRecordRowChange *change, TxnMemtableVersionShown shown,
-								TxnMemtableLockMode lock, bool logged, const TxnInsertPage *page, HostError *error);
+								const TxnRecordMapCarried *spaces, size_t spaces_len, const TxnRewriteCarry *carries,
+								size_t carries_len, bool logged, const TxnInsertPage *page, uint16 most,
+								HostError *error);
+extern bool txn_rewrite_moved_point(HostIoIo *io, HostLsn folded, const uint64 *writers, size_t writers_len,
+									HostLsn *result, HostError *error);
 
 /* txn_rewrite_value_map's values are in ascending order of id, each id once, as the BTreeMap's. */
 extern bool txn_rewrite_value_map(const txn_TupleU32TupleEntryU64_t *values, size_t values_len,

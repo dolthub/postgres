@@ -278,14 +278,14 @@ typedef struct host_TupleRowU32_t
 /*
  * HostWalKind is a kind of the fork's WAL records, the one registry of them
  * (design items 8 and 11): each kind is appended only by the crate its doc
- * names, and its value fits the four bits Postgres gives a resource manager
- * in a record's info, so there are at most 15.
+ * names; a value up to 15 is the fork's first resource manager's kind, in the
+ * four bits Postgres gives a resource manager in a record's info, and a value
+ * from 16 is its second's, 15 less.
  */
 typedef enum HostWalKind
 {
 	HOST_WAL_KIND_REPOSITORY_CREATED,
 	HOST_WAL_KIND_REPOSITORY_DROPPED,
-	HOST_WAL_KIND_REPOSITORY_COPIED,
 	HOST_WAL_KIND_REPOSITORY_MOVED,
 	HOST_WAL_KIND_ROW_CHANGE,
 	HOST_WAL_KIND_PAGE_LEFT,
@@ -299,6 +299,8 @@ typedef enum HostWalKind
 	HOST_WAL_KIND_TIDS_FREED,
 	HOST_WAL_KIND_MAP_CARRIED,
 	HOST_WAL_KIND_DATABASE_CHANGE,
+	HOST_WAL_KIND_CARRY_UNLISTED,
+	HOST_WAL_KIND_FOLD_STATUSES,
 } HostWalKind;
 
 /*
@@ -536,10 +538,13 @@ typedef struct HostHostOps
 	StdSystemTime (*now) (void *self);
 	StdInstant	(*instant) (void *self);
 	uint32		(*process_id) (void *self);
+	uint64		(*work_mem) (void *self);
 	bool		(*session_database) (void *self, uint32 *out_0, uint32 *out_1);
 	bool		(*exiting) (void *self);
 	uint64		(*unique) (void *self);
 	bool		(*check_interrupts) (void *self, const HostMayRaise *raise, HostError *error);
+	void		(*hold_interrupts) (void *self);
+	void		(*resume_interrupts) (void *self);
 	bool		(*open_) (void *self, const HostMayRaise *raise, const char *path, size_t path_len,
 						  HostOpen how, int32 *result, HostError *error);
 	bool		(*create_if_absent) (void *self, const HostMayRaise *raise, const char *path,
@@ -595,7 +600,7 @@ typedef struct HostHostOps
 	bool		(*warn_kept_wal) (void *self, const HostMayRaise *raise, HostLsn from, HostLsn to,
 								  uint32 timeline, HostLsn upto, HostError *error);
 	bool		(*next_fork_record) (void *self, const HostMayRaise *raise, HostLsn from, uint32 kinds,
-									 bool *has_result, HostForkRecord *result, HostError *error);
+									 bool received, bool *has_result, HostForkRecord *result, HostError *error);
 	bool		(*warn) (void *self, const HostMayRaise *raise, HostError *error_,
 						 const char *context, HostError *error);
 	bool		(*log) (void *self, const HostMayRaise *raise, const char *message,
@@ -604,7 +609,10 @@ typedef struct HostHostOps
 	bool		(*delay_checkpoints) (void *self, const HostMayRaise *raise,
 									  const char *const *pauses, size_t pauses_len,
 									  HostError *error);
+	bool		(*load_pauses) (void *self, const HostMayRaise *raise, const char *const *pauses,
+								size_t pauses_len, HostError *error);
 	void		(*resume_checkpoints) (void *self, bool finished);
+	void		(*fail_checkpoints) (void *self, const HostError *error);
 	bool		(*xid_status) (void *self, const HostMayRaise *raise, HostXid xid,
 							   HostStatus *result, HostError *error);
 	bool		(*xid_in_progress) (void *self, const HostMayRaise *raise, HostXid xid,
@@ -669,6 +677,12 @@ typedef struct HostHostOps
 	void		(*shared_unreclaim) (void *self, uint64 place);
 	bool		(*shared_sweep) (void *self, const HostMayRaise *raise, const HostSharedKind *kind,
 								 size_t atomic, StdVec *result, HostError *error);
+	bool		(*shared_index_find) (void *self, const HostMayRaise *raise, const HostSharedKind *kind,
+									  const uint8 *key, bool *has, uint64 *location, HostError *error);
+	bool		(*shared_index_put) (void *self, const HostMayRaise *raise, const HostSharedKind *kind,
+									 const uint8 *key, uint64 location, HostError *error);
+	bool		(*shared_index_remove) (void *self, const HostMayRaise *raise, const HostSharedKind *kind,
+										const uint8 *key, uint64 location, HostError *error);
 	bool		(*shared_single) (void *self, const HostSharedKind *kind, uint64 *result,
 								  HostError *error);
 	bool		(*shared_ready) (void *self);
@@ -677,6 +691,8 @@ typedef struct HostHostOps
 	void		(*shared_unlock) (void *self, uint64 place, size_t lock);
 	bool		(*flag_take) (void *self, const HostMayRaise *raise, uint64 place, size_t flag,
 							  HostError *error);
+	bool		(*flag_try) (void *self, const HostMayRaise *raise, uint64 place, size_t flag,
+							 bool *result, HostError *error);
 	void		(*flag_clear) (void *self, uint64 place, size_t flag);
 	uint64		(*atomic) (void *self, uint64 place, size_t atomic, HostSharedOp op);
 	size_t		(*shared_atomics) (void *self, uint64 place);
@@ -749,6 +765,13 @@ typedef struct HostHostOps
 								 const HostDeltaPagePage *names, size_t names_len);
 
 	/*
+	 * delta_packing orders the delta's partly used blocks for a packing and
+	 * returns the live pages of the shapes given to move out of the blocks it
+	 * drains (bugs row 143), answering false when it can't reserve its lists.
+	 */
+	bool		(*delta_packing) (void *self, const uint64 *shapes, size_t shapes_len, StdVec *result);
+
+	/*
 	 * delta_make's inner Result<(u64, u64), u64> is result_ok with result_0
 	 * and result_1 for Ok, or result_err for Err.
 	 */
@@ -772,11 +795,12 @@ typedef struct HostHostOps
 	bool		(*backups_running) (void *self);
 	bool		(*collection_begin) (void *self);
 	void		(*collection_end) (void *self);
-	bool		(*collection_ask) (void *self, const HostMayRaise *raise, uint32 database, uint64 *result,
-								   HostError *error);
-	bool		(*collection_asked) (void *self, uint64 *result_0, uint32 *result_1);
+	bool		(*collection_ask) (void *self, const HostMayRaise *raise, uint32 database, uint32 emptied,
+								   uint64 *result, HostError *error);
+	bool		(*collection_asked) (void *self, uint64 *result_0, uint32 *result_1, uint32 *result_2);
 	void		(*collection_answer) (void *self, uint64 word, const uint64 *counts);
 	void		(*collector_started) (void *self);
+	bool		(*collector_running) (void *self);
 	bool		(*database_locked) (void *self, const HostMayRaise *raise, uint32 database, bool *result,
 									HostError *error);
 	void		(*database_unlocked) (void *self, uint32 database);
@@ -820,6 +844,9 @@ typedef struct HostHostOps
  * in a directory named by the database's id.
  */
 #define HOST_VERSIONED "pg_versioned"
+
+/* HOST_PAUSE_NAME is the bytes of a pause's name with its NUL, Postgres' INJ_NAME_MAXLEN. */
+#define HOST_PAUSE_NAME 64
 
 /*
  * HOST_PG_DEFAULT is the id of Postgres' default tablespace, pg_default,
@@ -866,6 +893,7 @@ extern uint8 host_WalKind_value(HostWalKind self);
 extern const char *host_WalKind_name(HostWalKind self);
 extern void host_DelayCheckpoint_finish(HostDelayCheckpoint *self);
 extern void host_DelayCheckpoint_drop(HostDelayCheckpoint *self);
+extern void host_DelayCheckpoint_failed(HostDelayCheckpoint *self, const HostError *error);
 extern HostCompressDictionary host_CompressDictionary_new(StdAny *prepared);
 extern StdAny host_CompressDictionary_prepared(const HostCompressDictionary *self);
 extern void host_CompressDictionary_drop(HostCompressDictionary *self);
@@ -876,6 +904,7 @@ extern bool host_Storage_PartialEq_eq(const HostStorage *self, const HostStorage
 extern bool host_Storage_Debug_fmt(const void *value, StdFormatter *f);
 extern bool host_Xid_PartialEq_eq(const HostXid *self, const HostXid *other);
 extern bool host_Xid_Debug_fmt(const void *value, StdFormatter *f);
+extern bool host_Command_Debug_fmt(const void *value, StdFormatter *f);
 extern bool host_Row_PartialEq_eq(const HostRow *self, const HostRow *other);
 extern bool host_Row_Debug_fmt(const void *value, StdFormatter *f);
 extern bool host_Refused_Debug_fmt(const void *value, StdFormatter *f);
@@ -893,6 +922,7 @@ extern StdSystemTime host_now(void);
 extern StdInstant host_instant(void);
 extern StdDuration host_elapsed(StdInstant since);
 extern uint32 host_process_id(void);
+extern uint64 host_work_mem(void);
 extern bool host_session_database(uint32 *result_0, uint32 *result_1, HostError *error);
 extern bool host_exiting(void);
 extern uint64 host_unique(void);
@@ -947,6 +977,7 @@ extern bool host_tree_bytes(HostIoIoDoors io, const char *path, size_t path_len,
 extern bool host_nap(HostIoIoDoors io, StdDuration duration, HostError *error);
 extern bool host_wal_insert(HostIoIoDoors io, HostWalKind kind, const uint8 *body,
 							size_t body_len, HostLsn *result, HostError *error);
+extern bool host_NewCid_Debug_fmt(const void *value, StdFormatter *f);
 extern bool host_wal_new_cid(HostIoIoDoors io, const HostStorage *storage, HostRow tid,
 							 HostNewCid cid, HostLsn *result, HostError *error);
 extern bool host_wal_flush(HostIoIoDoors io, HostLsn lsn, HostError *error);
@@ -995,12 +1026,13 @@ extern void host_TupleGuard_drop(HostTupleGuard *self);
 extern HostWalStand host_wal_stand(HostIoIoDoors io);
 extern bool host_warn_kept_wal(HostIoIoDoors io, HostLsn from, HostLsn to, uint32 timeline,
 							   HostLsn upto, HostError *error);
-extern bool host_next_fork_record(HostIoIoDoors io, HostLsn from, uint32 kinds, bool *has_result,
+extern bool host_next_fork_record(HostIoIoDoors io, HostLsn from, uint32 kinds, bool received, bool *has_result,
 								  HostForkRecord *result, HostError *error);
 extern bool host_warn(HostIoIoDoors io, HostError *error_, const char *context,
 					  HostError *error);
 extern bool host_log(HostIoIoDoors io, const char *message, HostError *error);
 extern void host_refuse_recovery(HostIoIoDoors io, const char *detail, size_t detail_len);
+extern bool host_load_pauses(HostIoIoDoors io, const char *const *pauses, size_t pauses_len, HostError *error);
 extern bool host_delay_checkpoint(HostIoIoDoors io, const char *const *pauses,
 								  size_t pauses_len, HostDelayCheckpoint *result,
 								  HostError *error);
@@ -1022,10 +1054,11 @@ extern void host_backup_end(void);
 extern bool host_backups_running(void);
 extern bool host_collection_begin(void);
 extern void host_collection_end(void);
-extern bool host_collection_ask(HostIoIo *io, uint32 database, uint64 *result, HostError *error);
-extern bool host_collection_asked(uint64 *result_0, uint32 *result_1);
+extern bool host_collection_ask(HostIoIo *io, uint32 database, uint32 emptied, uint64 *result, HostError *error);
+extern bool host_collection_asked(uint64 *result_0, uint32 *result_1, uint32 *result_2);
 extern void host_collection_answer(uint64 word, const uint64 *counts);
 extern void host_collector_started(void);
+extern bool host_collector_running(void);
 extern bool host_database_locked(HostIoIo *io, uint32 database, bool *result, HostError *error);
 extern void host_database_unlocked(uint32 database);
 extern bool host_database_lock_waited(HostIoIo *io, uint32 database, bool *result, HostError *error);

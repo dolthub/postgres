@@ -39,7 +39,11 @@
 #include "doltgres/txn/memtable/table.h"
 #include "doltgres/txn/memtable/tuples.h"
 #include "doltgres/txn/rewrite.h"
+#include "doltgres/txn/spill.h"
+#include "doltgres/txn/state.h"
+#include "doltgres/txn/status.h"
 #include "doltgres/txn/visible.h"
+#include "doltgres/txn/written.h"
 #include "port/pg_bswap.h"
 
 #define RUST_FILE "txn" STD_SEP "src" STD_SEP "rewrite.rs"
@@ -292,6 +296,9 @@ typedef struct txn_rewrite_keys_frame_t
 	HostDeltaHold hold;
 	bool		versions_live;
 	StdVec		versions;
+	/* after is the key the walk handed last, while has_after. */
+	bool		has_after;
+	StdVec		after;
 	HostError  *error;
 	bool		ok;
 } txn_rewrite_keys_frame_t;
@@ -334,35 +341,7 @@ txn_rewrite_place(const txn_rewrite_keys_frame_t *frame, const uint8 *key, size_
 	return false;
 }
 
-/* txn_rewrite_keys_closure_1 is keys' walk of the delta's rows: each key with its place and its unfolded versions. */
-static bool
-txn_rewrite_keys_closure_1(void *captures, HostIoIo *io, const uint8 *key, size_t key_len, const StdVec *values,
-						   size_t values_len, HostError *error)
-{
-	txn_rewrite_keys_frame_t *frame = captures;
-	HostSharedRecord record = host_shared_Held_record(frame->held);
-	size_t		place = 0;
-	bool		has_place;
-
-	if (!host_delta_hold(io, &frame->hold, error))
-		return false;
-	frame->hold_live = true;
-	if (!txn_visible_versions(io, &frame->hold, record, key, key_len, frame->folded, &frame->versions, error))
-		return false;
-	frame->versions_live = true;
-	has_place = txn_rewrite_place(frame, key, key_len, &place);
-	if (has_place)
-		STD_VEC_AT(&frame->handed, bool, place) = true;
-	if (!frame->each(frame->each_captures, io, key, key_len, has_place, place, &frame->versions, error))
-		return false;
-	frame->versions_live = false;
-	txn_memtable_version_versions_drop(&frame->versions, 0);
-	frame->hold_live = false;
-	host_delta_Hold_drop(&frame->hold);
-	return true;
-}
-
-/* txn_rewrite_keys_body walks the delta's keys, then hands each base entry it didn't hand with no versions. */
+/* txn_rewrite_keys_body walks the delta's keys, its memtable's and its spills' merged, then hands each base entry it didn't hand with no versions. */
 static void
 txn_rewrite_keys_body(void *frame_)
 {
@@ -380,9 +359,43 @@ txn_rewrite_keys_body(void *frame_)
 	frame->handed_live = true;
 	for (size_t at = 0; at < frame->based_len; at++)
 		std_vec_push_Checked(&frame->handed, &unhanded, sizeof(bool), _Alignof(bool));
-	if (!txn_memtable_table_walked(&TXN_MEMTABLE_TABLE_ROWS_TREE_OPS, frame->io, host_shared_Held_record(frame->held),
-								   txn_rewrite_keys_closure_1, frame, NULL, frame->error))
-		return;
+	for (;;)
+	{
+		txn_TupleVecU8VecVersion_t next;
+		bool		some;
+		size_t		place = 0;
+		bool		has_place;
+
+		if (!host_delta_hold(frame->io, &frame->hold, frame->error))
+			return;
+		frame->hold_live = true;
+		if (!txn_visible_next(frame->io, &frame->hold, host_shared_Held_record(frame->held), frame->has_after,
+							  frame->after.ptr, frame->after.len, TXN_MEMTABLE_TABLE_DIRECTION_FORWARD, frame->folded,
+							  &some, &next, frame->error))
+			return;
+		if (!some)
+		{
+			frame->hold_live = false;
+			host_delta_Hold_drop(&frame->hold);
+			break;
+		}
+		if (frame->has_after)
+			std_vec_free_Checked(&frame->after, 1, 1);
+		frame->after = next.f0;
+		frame->has_after = true;
+		frame->versions = next.f1;
+		frame->versions_live = true;
+		has_place = txn_rewrite_place(frame, frame->after.ptr, frame->after.len, &place);
+		if (has_place)
+			STD_VEC_AT(&frame->handed, bool, place) = true;
+		if (!frame->each(frame->each_captures, frame->io, frame->after.ptr, frame->after.len, has_place, place,
+						 &frame->versions, frame->error))
+			return;
+		frame->versions_live = false;
+		txn_memtable_version_versions_drop(&frame->versions, 0);
+		frame->hold_live = false;
+		host_delta_Hold_drop(&frame->hold);
+	}
 	for (size_t at = 0; at < frame->based_len; at++)
 	{
 		if (STD_VEC_AT(&frame->handed, bool, at))
@@ -406,6 +419,9 @@ txn_rewrite_keys_pad(void *frame_)
 
 	if (frame->versions_live)
 		txn_memtable_version_versions_drop(&frame->versions, 0);
+	if (frame->has_after)
+		std_vec_free_Checked(&frame->after, 1, 1);
+	frame->has_after = false;
 	if (frame->hold_live)
 		host_delta_Hold_drop(&frame->hold);
 	if (frame->handed_live)
@@ -421,8 +437,9 @@ txn_rewrite_keys_pad(void *frame_)
  * txn_rewrite_keys hands each every key a base's entries or a storage's delta
  * holds, once, with the place of its entry among the base's and its versions
  * newest first, less those the base folded at folded applied: the delta's
- * keys in their bytes' order, then the base's other entries in its key order
- * with none.
+ * keys in their bytes' order, its memtable's and its spills' merged, so a key
+ * whose versions a spill took out of the memtable is carried too, then the
+ * base's other entries in its key order with none.
  */
 bool
 txn_rewrite_keys(HostIoIo *io, const HostSharedHeld *held, const TxnRewriteBased *based, size_t based_len,
@@ -704,9 +721,9 @@ txn_rewrite_new_base_body(void *frame_)
 	*frame->result = *frame->made;
 	frame->made_live = false;
 	frame->result->folded = frame->folded;
+	frame->result->read = frame->folded;
 	frame->result->max_folded = frame->max_folded;
 	frame->result->max_ended = frame->max_ended;
-	frame->result->counter = frame->packed.f0;
 	frame->result->fresh_end = frame->packed.f0;
 	frame->result->sizes = sizes;
 	frame->trees_live = false;
@@ -759,7 +776,7 @@ txn_rewrite_new_base_pad(void *frame_)
  * tuple id; its tuple id tree pairs each new tuple id with its key and heap
  * bytes; its free space map holds the last page's free bytes while that page
  * has an offset left, and each carried put's tuple id free with its heap
- * bytes; its counter and fresh end are the tuple id past every one the
+ * bytes; its fresh end is the tuple id past every one the
  * packing gave; and its sizes are counted from its entries and pairs.
  */
 bool
@@ -796,17 +813,25 @@ typedef struct txn_rewrite_carried_closure_5_captures_t
 	size_t		marking;
 	TxnRecordEncoding *encoding;
 	bool	   *encoding_live;
+
+	/*
+	 * moved is whether the place's take found its block's entry moved since
+	 * its read, pushing nothing.
+	 */
+	bool		moved;
 } txn_rewrite_carried_closure_5_captures_t;
 
 /*
  * txn_rewrite_carried_closure_5_frame_t is the closure's state across its pad:
- * its window and its record's body, each while live.
+ * its place's decision, its window, and its record's body, each while live.
  */
 typedef struct txn_rewrite_carried_closure_5_frame_t
 {
 	txn_rewrite_carried_closure_5_captures_t *captures;
 	HostIoIo   *io;
 	TxnMemtableTablePreparedState *prepared;
+	TxnMemtableMapDecision placing;
+	bool		placing_live;
 	HostDelayCheckpoint window;
 	bool		window_live;
 	StdVec		body;
@@ -816,8 +841,9 @@ typedef struct txn_rewrite_carried_closure_5_frame_t
 } txn_rewrite_carried_closure_5_frame_t;
 
 /*
- * txn_rewrite_carried_closure_5_body takes the place, appends the record,
- * pushes the mark, the version, and the slot, in one window.
+ * txn_rewrite_carried_closure_5_body decides the place's take before its
+ * window, then in one window appends the record and pushes the place's take,
+ * the mark, the version, and the slot.
  */
 static void
 txn_rewrite_carried_closure_5_body(void *frame_)
@@ -830,13 +856,22 @@ txn_rewrite_carried_closure_5_body(void *frame_)
 	.shown = c->shown};
 	TxnMemtableVersionHandle handle;
 
+	c->moved = false;
+	if (c->has_placed)
+	{
+		if (!txn_insert_place_decided(io, frame->prepared, 0, record, c->placed, &frame->placing, &c->moved,
+									  frame->error))
+			return;
+		frame->placing_live = true;
+		if (c->moved)
+		{
+			frame->ok = true;
+			return;
+		}
+	}
 	if (!host_delay_checkpoint(HOST_IO_IO_IO_DOORS(frame->io), NULL, 0, &frame->window, frame->error))
 		return;
 	frame->window_live = true;
-	if (c->has_placed &&
-		(!txn_insert_place_taken(io, frame->prepared, 0, record, c->change->writer, c->placed, frame->error) ||
-		 !txn_memtable_table_counted(io, frame->prepared, c->has_roomed, c->roomed, frame->error)))
-		return;
 	if (c->logged)
 	{
 		*c->encoding_live = false;
@@ -849,15 +884,19 @@ txn_rewrite_carried_closure_5_body(void *frame_)
 		frame->body_live = false;
 		std_vec_free_Checked(&frame->body, 1, 1);
 	}
+	if (c->has_placed &&
+		!txn_insert_place_taken(io, frame->prepared, 0, c->change->writer, c->has_roomed, c->roomed, pushed.has_lsn,
+								pushed.lsn, c->placed, &frame->placing, frame->error))
+		return;
+	txn_memtable_table_unkept(frame->prepared);
 	if (c->has_marks)
 	{
 		StdVec		marks = *c->marks;
 
 		c->has_marks = false;
 		std_vec_new(c->marks, TXN_REWRITE_ID);
-		if (!txn_memtable_map_named(io, frame->prepared, c->marking, c->change->writer, pushed.has_lsn, pushed.lsn,
-									c->tuple, &marks, frame->error) ||
-			!txn_memtable_table_counted(io, frame->prepared, c->has_roomed, c->roomed, frame->error))
+		if (!txn_memtable_map_named(io, frame->prepared, c->marking, c->change->writer, c->has_roomed, c->roomed,
+									pushed.has_lsn, pushed.lsn, c->tuple, &marks, frame->error))
 			return;
 	}
 	if (!txn_memtable_table_finish(io, frame->prepared, &pushed, c->has_roomed, c->roomed, &handle, frame->error))
@@ -879,7 +918,10 @@ txn_rewrite_carried_closure_5_pad(void *frame_)
 		std_vec_free_Checked(&frame->body, 1, 1);
 	if (frame->window_live)
 		host_DelayCheckpoint_drop(&frame->window);
-	frame->body_live = frame->window_live = false;
+	if (frame->placing_live)
+		txn_memtable_map_Decision_drop(&frame->placing);
+	txn_memtable_table_unkept(frame->prepared);
+	frame->body_live = frame->window_live = frame->placing_live = false;
 }
 
 /* txn_rewrite_carried_closure_5 is carried's prepare's closure. */
@@ -890,6 +932,8 @@ txn_rewrite_carried_closure_5(void *captures, HostIoIo *io, TxnMemtableTablePrep
 	.error = error};
 
 	std_landing(&frame, txn_rewrite_carried_closure_5_body, txn_rewrite_carried_closure_5_pad);
+	if (frame.window_live && !frame.ok)
+		host_DelayCheckpoint_failed(&frame.window, frame.error);
 	txn_rewrite_carried_closure_5_pad(&frame);
 	return frame.ok;
 }
@@ -914,6 +958,7 @@ typedef struct txn_rewrite_carried_frame_t
 	StdVec		marks;
 	bool		encoding_live;
 	TxnRecordEncoding encoding;
+	TxnMemtableTableRefusal refusal;
 	HostError  *error;
 	bool		ok;
 } txn_rewrite_carried_frame_t;
@@ -968,10 +1013,60 @@ txn_rewrite_carried_body(void *frame_)
 	row.f0.ptr = change->key.ptr;
 	row.f0.len = change->key.len;
 	row.f1 = txn_memtable_version_encoded(&change->writer, &change->op, frame->shown, captures.logged, 0);
+	if (!locks)
+	{
+		uint64		top = change->writer.has_top ? change->writer.top : change->writer.xid;
+		uint64		touched;
+		bool		rows;
+		bool		takes_over = false;
+		bool		spilled;
+
+		if (!txn_written_touched(frame->io, top, &change->storage, TXN_WRITTEN_OF_ROWS, change->key.ptr,
+								 change->key.len, row.f1, &touched, frame->error))
+			return;
+		rows = touched >= txn_spill_threshold();
+		for (size_t k = 0; k < takes_len; k++)
+		{
+			uint8		block[4];
+
+			std_u32_to_be_bytes(takes[k].key, block);
+			if (!txn_written_touched(frame->io, top, &change->storage, TXN_WRITTEN_OF_FREE, block, sizeof(block),
+									 takes[k].most, &touched, frame->error))
+				return;
+			takes_over |= touched >= txn_spill_threshold();
+		}
+		if ((rows && !txn_spill_spilled(frame->io, &change->storage, TXN_WRITTEN_OF_ROWS, top, &spilled,
+										frame->error)) ||
+			(takes_over && !txn_spill_spilled(frame->io, &change->storage, TXN_WRITTEN_OF_FREE, top, &spilled,
+											  frame->error)))
+			return;
+	}
 	txn_record_RowChange_encoding(change, &frame->encoding);
 	frame->encoding_live = true;
-	frame->ok = txn_memtable_table_prepare_Unit(frame->io, record, &row, 1, takes, takes_len, captures.has_tuple,
-												txn_rewrite_carried_closure_5, &captures, NULL, frame->error);
+	for (;;)
+	{
+		if (!txn_memtable_table_readied(frame->io, true, record, &row, 1, takes, takes_len, captures.has_tuple,
+										txn_rewrite_carried_closure_5, &captures, NULL, &frame->refusal,
+										frame->error))
+			return;
+		if (!frame->refusal.refused && !captures.moved)
+		{
+			frame->ok = true;
+			return;
+		}
+		if (frame->refusal.refused && !txn_memtable_table_waited(frame->io, frame->refusal.full, false, frame->error))
+			return;
+		if (frame->placed_live)
+		{
+			frame->placed_live = false;
+			txn_insert_Placed_drop(&frame->placed);
+			if (!txn_insert_Placed_read(frame->io, frame->store, frame->held, put->tuple, put->heap_bytes,
+										frame->page, &frame->placed, frame->error))
+				return;
+			frame->placed_live = true;
+			takes[0] = txn_insert_Placed_take(&frame->placed, record);
+		}
+	}
 }
 
 /* txn_rewrite_carried_pad frees what carried holds live. */
@@ -990,20 +1085,24 @@ txn_rewrite_carried_pad(void *frame_)
 }
 
 /*
- * txn_rewrite_carried pushes a version a rewrite carries into its new
- * storage: in one checkpoint window, a logged storage's row change record
- * under the version's own writer, whose end becomes the version's LSN, then
- * the version with the command it showed and the row lock it held, counted
- * at its writer's top-level entry, and a table row's tuple id in the tuple id
- * table; a lock is never logged and counts nothing. Given the page a rewrite
- * placed it on, a table row's put first takes its tuple id's place as the
- * writer's, counted at the writer's entry, and one that names values out of
- * line pushes its values mark after its record.
+ * txn_rewrite_own_carried pushes a version of the carrying transaction's own
+ * into its new storage: in one checkpoint window, a logged storage's row
+ * change record under the version's own writer, whose end becomes the
+ * version's LSN, then the version with the command it showed and the row
+ * lock it held, counted at its writer's top-level entry, and a table row's
+ * tuple id in the tuple id table; a lock is never logged and counts nothing.
+ * Given the page a rewrite placed it on, a table row's put first takes its
+ * tuple id's place as the writer's, counted at the writer's entry, and one
+ * that names values out of line pushes its values mark after its record. It
+ * counts toward the transaction's own spill, row and take, as an insert's
+ * does, so a rewrite of its own rows past the threshold spills them rather
+ * than waiting at the budget (bugs row 229), and a refusal all the same waits
+ * at the budget, reading its place again.
  */
-bool
-txn_rewrite_carried(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held,
-					const TxnRecordRowChange *change, TxnMemtableVersionShown shown, TxnMemtableLockMode lock,
-					bool logged, const TxnInsertPage *page, HostError *error)
+static bool
+txn_rewrite_own_carried(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held,
+						const TxnRecordRowChange *change, TxnMemtableVersionShown shown, TxnMemtableLockMode lock,
+						bool logged, const TxnInsertPage *page, HostError *error)
 {
 	txn_rewrite_carried_frame_t frame = {.io = io, .store = store, .held = held, .change = change, .shown = shown,
 	.lock = lock, .logged = logged, .page = page, .error = error};
@@ -1011,6 +1110,463 @@ txn_rewrite_carried(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHel
 	std_landing(&frame, txn_rewrite_carried_body, txn_rewrite_carried_pad);
 	txn_rewrite_carried_pad(&frame);
 	return frame.ok;
+}
+
+/* txn_rewrite_top returns a writer's top-level xid. */
+static uint64
+txn_rewrite_top(const TxnMemtableVersionWriter *writer)
+{
+	return writer->has_top ? writer->top : writer->xid;
+}
+
+/*
+ * txn_rewrite_chained adds a version, which it takes, to the chain of a
+ * tree's key a carry spills, after the versions it holds, starting a chain
+ * for a key it holds none of; the key is copied into the chain it starts,
+ * which owns it.
+ */
+static bool
+txn_rewrite_chained(StdVec *chains, TxnWrittenOf of, const uint8 *key, size_t key_len, uint64 xid, StdVec record,
+					HostError *error)
+{
+	TxnSpillChain *chain = NULL;
+	txn_TupleU64VecU8_t version = {xid, record};
+
+	for (size_t k = chains->len; k > 0 && chain == NULL; k--)
+	{
+		TxnSpillChain *at = &STD_VEC_AT(chains, TxnSpillChain, k - 1);
+
+		if (at->of == of && at->key.len == key_len && memcmp(at->key.ptr, key, key_len) == 0)
+			chain = at;
+	}
+	if (chain == NULL)
+	{
+		TxnSpillChain made = {.of = of};
+
+		if (!std_vec_try_reserve(chains, 1, sizeof(made), _Alignof(TxnSpillChain)))
+		{
+			std_vec_free_Checked(&record, 1, 1);
+			*error = host_Error_out_of_memory();
+			return false;
+		}
+		std_slice_to_vec_Checked(&made.key, key, key_len, 1, 1);
+		std_vec_new(&made.versions, sizeof(txn_TupleU64VecU8_t), _Alignof(txn_TupleU64VecU8_t));
+		std_vec_push_Checked(chains, &made, sizeof(made), _Alignof(TxnSpillChain));
+		chain = &STD_VEC_AT(chains, TxnSpillChain, chains->len - 1);
+	}
+	if (!std_vec_try_reserve(&chain->versions, 1, sizeof(version), _Alignof(txn_TupleU64VecU8_t)))
+	{
+		std_vec_free_Checked(&record, 1, 1);
+		*error = host_Error_out_of_memory();
+		return false;
+	}
+	std_vec_push_Checked(&chain->versions, &version, sizeof(version), _Alignof(txn_TupleU64VecU8_t));
+	return true;
+}
+
+/*
+ * TxnRewriteTheirs is carried's spilled part: each map key's versions below
+ * its own run, as a view of its MapCarried, the other writers' carries, the
+ * puts among them and their takes, and whether the storage is logged.
+ */
+typedef struct TxnRewriteTheirs
+{
+	/*
+	 * spaces is a Vec<MapCarried>, each a view of its versions below its own
+	 * run.
+	 */
+	StdVec		spaces;
+	/* carries is a Vec<&Carry>. */
+	StdVec		carries;
+	/* puts is a Vec<CarriedPut>, and takes the Vec<CarriedTake> of them. */
+	StdVec		puts;
+	StdVec		takes;
+	bool		logged;
+} TxnRewriteTheirs;
+
+/* txn_rewrite_theirs_closure_0 is carried's logging under the spill files' hold: each spilled key's map versions as one record, each spilled row version's own, and the takes, as chains. */
+static bool
+txn_rewrite_theirs_closure_0(void *captures, HostSharedLongIo *io, StdVec *chains, HostError *error)
+{
+	TxnRewriteTheirs *c = captures;
+	HostIoIoDoors doors = HOST_SHARED_LONG_IO_IO_DOORS(io);
+	TxnMemtableVersionShown command = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND};
+
+	for (size_t s = 0; s < c->spaces.len; s++)
+	{
+		const TxnRecordMapCarried *space = &STD_VEC_AT(&c->spaces, TxnRecordMapCarried, s);
+		TxnWrittenOf of = space->map == TXN_MEMTABLE_MAP_MAP_FREE ? TXN_WRITTEN_OF_FREE : TXN_WRITTEN_OF_VALUES;
+		bool		has_lsn = c->logged;
+		uint64		lsn = 0;
+		uint8		key[4];
+
+		if (c->logged)
+		{
+			StdVec		body;
+			bool		ok;
+
+			txn_record_MapCarried_encode(space, &body);
+			ok = host_wal_insert(doors, HOST_WAL_KIND_MAP_CARRIED, body.ptr, body.len, &lsn, error);
+			std_vec_free_Checked(&body, 1, 1);
+			if (!ok)
+				return false;
+		}
+		std_u32_to_be_bytes(space->key, key);
+		for (size_t v = 0; v < space->versions.len; v++)
+		{
+			const TxnRecordCarriedTake *version = &STD_VEC_AT(&space->versions, TxnRecordCarriedTake, v);
+			TxnMemtableOp op = {0};
+			StdVec		record;
+
+			if (version->has_mark)
+			{
+				op.tag = TXN_MEMTABLE_OP_NAMED;
+				op.u.named.f0 = version->tuple;
+				op.u.named.f1 = version->mark;
+			}
+			else if (version->has_value)
+			{
+				op.tag = TXN_MEMTABLE_OP_PUT;
+				op.u.put.value = version->value;
+				op.u.put.tuple = version->tuple;
+			}
+			else if (version->tuple.f0 == 0)
+				op.tag = TXN_MEMTABLE_OP_DELETE;
+			else
+			{
+				op.tag = TXN_MEMTABLE_OP_EMPTIED;
+				op.u.emptied = version->tuple;
+			}
+			std_vec_new(&record, 1, 1);
+			txn_memtable_version_encode(&version->writer, &op, TXN_MEMTABLE_LOCK_MODE_UPDATE, command, has_lsn, lsn,
+										&record);
+			if (version->ender != 0)
+				txn_memtable_version_ended(&record, (uint32) version->ender);
+			if (!txn_rewrite_chained(chains, of, key, sizeof(key), txn_rewrite_top(&version->writer), record, error))
+				return false;
+		}
+	}
+	for (size_t k = 0; k < c->carries.len; k++)
+	{
+		const TxnRewriteCarry *carry = STD_VEC_AT(&c->carries, const TxnRewriteCarry *, k);
+		const TxnRecordRowChange *change = &carry->f0;
+		bool		locks = change->op.tag == TXN_MEMTABLE_OP_LOCK || change->op.tag == TXN_MEMTABLE_OP_LOCK_ROW;
+		bool		has_lsn = c->logged && !locks;
+		uint64		lsn = 0;
+		StdVec		record;
+
+		if (has_lsn)
+		{
+			TxnRecordEncoding encoding;
+			StdVec		body;
+			bool		ok;
+
+			txn_record_RowChange_encoding(change, &encoding);
+			txn_record_RowChange_encode_with(change, &encoding, &body);
+			ok = host_wal_insert(doors, HOST_WAL_KIND_ROW_CHANGE, body.ptr, body.len, &lsn, error);
+			std_vec_free_Checked(&body, 1, 1);
+			if (!ok)
+				return false;
+		}
+		std_vec_new(&record, 1, 1);
+		txn_memtable_version_encode(&change->writer, &change->op, carry->f2, carry->f1, has_lsn, lsn, &record);
+		if (!txn_rewrite_chained(chains, TXN_WRITTEN_OF_ROWS, change->key.ptr, change->key.len,
+								 txn_rewrite_top(&change->writer), record, error))
+			return false;
+	}
+	for (size_t k = 0; k < c->takes.len; k++)
+	{
+		TxnInsertCarriedTake *take = &STD_VEC_AT(&c->takes, TxnInsertCarriedTake, k);
+		const TxnInsertCarriedPut *put = &STD_VEC_AT(&c->puts, TxnInsertCarriedPut, k);
+		uint8		block[4];
+		StdVec		record = take->record;
+
+		std_vec_new(&take->record, 1, 1);
+		std_u32_to_be_bytes(take->block, block);
+		if (!txn_rewrite_chained(chains, TXN_WRITTEN_OF_FREE, block, sizeof(block), txn_rewrite_top(&put->writer),
+								 record, error))
+			return false;
+	}
+	return true;
+}
+
+/* txn_rewrite_carried_frame_1_t is carried's state across its pad: the own runs' views and carries, and the spilled part, while live. */
+typedef struct txn_rewrite_carried_frame_1_t
+{
+	HostIoIo   *io;
+	TreesStoreNodeStore store;
+	const HostSharedHeld *held;
+	const TxnRecordMapCarried *spaces;
+	size_t		spaces_len;
+	const TxnRewriteCarry *carries;
+	size_t		carries_len;
+	bool		logged;
+	const TxnInsertPage *page;
+	uint16		most;
+	HostError  *error;
+	bool		ok;
+	/* own_spaces is a Vec<MapCarried> of views, and own a Vec<&Carry>. */
+	StdVec		own_spaces;
+	StdVec		own;
+	TxnRewriteTheirs theirs;
+	bool		live;
+
+	/*
+	 * writers is a Vec<u64>: the top-level xids the carry of others' versions
+	 * may spill under.
+	 */
+	StdVec		writers;
+} txn_rewrite_carried_frame_1_t;
+
+/* txn_rewrite_carried_pad_1 is carried's pad: its vectors, while live. */
+static void
+txn_rewrite_carried_pad_1(void *frame_)
+{
+	txn_rewrite_carried_frame_1_t *frame = frame_;
+
+	if (!frame->live)
+		return;
+	frame->live = false;
+	std_vec_free_Checked(&frame->own_spaces, sizeof(TxnRecordMapCarried), _Alignof(TxnRecordMapCarried));
+	std_vec_free_Checked(&frame->own, sizeof(const TxnRewriteCarry *), _Alignof(const TxnRewriteCarry *));
+	std_vec_free_Checked(&frame->theirs.spaces, sizeof(TxnRecordMapCarried), _Alignof(TxnRecordMapCarried));
+	std_vec_free_Checked(&frame->theirs.carries, sizeof(const TxnRewriteCarry *), _Alignof(const TxnRewriteCarry *));
+	std_vec_free_Checked(&frame->theirs.puts, sizeof(TxnInsertCarriedPut), _Alignof(TxnInsertCarriedPut));
+	txn_insert_carried_takes_drop(&frame->theirs.takes);
+	std_vec_free_Checked(&frame->writers, sizeof(uint64), _Alignof(uint64));
+}
+
+/* txn_rewrite_carried_push adds an element to one of carried's vectors, refusing it when the vector can't grow. */
+static bool
+txn_rewrite_carried_push(txn_rewrite_carried_frame_1_t *frame, StdVec *vector, const void *elem, size_t size,
+						 size_t align)
+{
+	if (!std_vec_try_reserve(vector, 1, size, align))
+	{
+		*frame->error = host_Error_out_of_memory();
+		return false;
+	}
+	std_vec_push_Checked(vector, elem, size, align);
+	return true;
+}
+
+/* txn_rewrite_current reports whether a writer's top-level transaction is the carrying one. */
+static bool
+txn_rewrite_current(HostIoIo *io, const TxnMemtableVersionWriter *writer)
+{
+	HostXid		xid = {txn_rewrite_top(writer)};
+
+	return host_is_current(HOST_IO_IO_IO_DOORS(io), xid);
+}
+
+/* txn_rewrite_writer adds a top-level xid to the carry's writers once, leaving out one below the first normal xid. */
+static bool
+txn_rewrite_writer(txn_rewrite_carried_frame_1_t *frame, uint64 top)
+{
+	for (size_t k = 0; k < frame->writers.len; k++)
+		if (STD_VEC_AT(&frame->writers, uint64, k) == top)
+			return true;
+	return top < TXN_STATUS_FIRST_NORMAL ||
+		txn_rewrite_carried_push(frame, &frame->writers, &top, sizeof(uint64), _Alignof(uint64));
+}
+
+/* txn_rewrite_writers gathers the top-level xids of the other writers' versions the carry may spill under. */
+static bool
+txn_rewrite_writers(txn_rewrite_carried_frame_1_t *frame)
+{
+	for (size_t s = 0; s < frame->theirs.spaces.len; s++)
+	{
+		const TxnRecordMapCarried *space = &STD_VEC_AT(&frame->theirs.spaces, TxnRecordMapCarried, s);
+
+		for (size_t v = 0; v < space->versions.len; v++)
+			if (!txn_rewrite_writer(frame, txn_rewrite_top(&STD_VEC_AT(&space->versions, TxnRecordCarriedTake,
+																	   v).writer)))
+				return false;
+	}
+	for (size_t k = 0; k < frame->theirs.carries.len; k++)
+		if (!txn_rewrite_writer(frame, txn_rewrite_top(&STD_VEC_AT(&frame->theirs.carries, const TxnRewriteCarry *,
+																   k)->f0.writer)))
+			return false;
+	for (size_t k = 0; k < frame->theirs.puts.len; k++)
+		if (!txn_rewrite_writer(frame, txn_rewrite_top(&STD_VEC_AT(&frame->theirs.puts, TxnInsertCarriedPut, k).writer)))
+			return false;
+	return true;
+}
+
+/* txn_rewrite_carried_body_1 is carried's body. */
+static void
+txn_rewrite_carried_body_1(void *frame_)
+{
+	txn_rewrite_carried_frame_1_t *frame = frame_;
+
+	std_vec_new(&frame->own_spaces, sizeof(TxnRecordMapCarried), _Alignof(TxnRecordMapCarried));
+	std_vec_new(&frame->own, sizeof(const TxnRewriteCarry *), _Alignof(const TxnRewriteCarry *));
+	std_vec_new(&frame->theirs.spaces, sizeof(TxnRecordMapCarried), _Alignof(TxnRecordMapCarried));
+	std_vec_new(&frame->theirs.carries, sizeof(const TxnRewriteCarry *), _Alignof(const TxnRewriteCarry *));
+	std_vec_new(&frame->theirs.puts, sizeof(TxnInsertCarriedPut), _Alignof(TxnInsertCarriedPut));
+	std_vec_new(&frame->writers, sizeof(uint64), _Alignof(uint64));
+	std_vec_new(&frame->theirs.takes, sizeof(TxnInsertCarriedTake), _Alignof(TxnInsertCarriedTake));
+	frame->theirs.logged = frame->logged;
+	frame->live = true;
+	for (size_t s = 0; s < frame->spaces_len; s++)
+	{
+		const TxnRecordMapCarried *space = &frame->spaces[s];
+		size_t		split = space->versions.len;
+		TxnRecordMapCarried view = *space;
+
+		while (split > 0 && txn_rewrite_current(frame->io, &STD_VEC_AT(&space->versions, TxnRecordCarriedTake,
+																	   split - 1).writer))
+			split--;
+		if (split < space->versions.len)
+		{
+			view.versions = (StdVec)
+			{
+				.ptr = (uint8 *) space->versions.ptr + split * sizeof(TxnRecordCarriedTake),
+					.len = space->versions.len - split, .cap = space->versions.len - split
+			};
+			if (!txn_rewrite_carried_push(frame, &frame->own_spaces, &view, sizeof(view),
+										  _Alignof(TxnRecordMapCarried)))
+				return;
+		}
+		if (split > 0)
+		{
+			view.versions = (StdVec)
+			{
+				.ptr = space->versions.ptr, .len = split, .cap = split
+			};
+			if (!txn_rewrite_carried_push(frame, &frame->theirs.spaces, &view, sizeof(view),
+										  _Alignof(TxnRecordMapCarried)))
+				return;
+		}
+	}
+	for (size_t start = 0; start < frame->carries_len;)
+	{
+		const StdVec *key = &frame->carries[start].f0.key;
+		size_t		end = start;
+		size_t		split;
+
+		while (end < frame->carries_len && frame->carries[end].f0.key.len == key->len &&
+			   memcmp(frame->carries[end].f0.key.ptr, key->ptr, key->len) == 0)
+			end++;
+		split = end;
+		while (split > start && txn_rewrite_current(frame->io, &frame->carries[split - 1].f0.writer))
+			split--;
+		for (size_t k = start; k < end; k++)
+		{
+			const TxnRewriteCarry *carry = &frame->carries[k];
+
+			if (!txn_rewrite_carried_push(frame, k < split ? &frame->theirs.carries : &frame->own, &carry,
+										  sizeof(carry), _Alignof(const TxnRewriteCarry *)))
+				return;
+		}
+		start = end;
+	}
+	if (frame->theirs.spaces.len > 0 || frame->theirs.carries.len > 0)
+	{
+		for (size_t k = 0; k < frame->theirs.carries.len; k++)
+		{
+			const TxnRecordRowChange *change = &STD_VEC_AT(&frame->theirs.carries, const TxnRewriteCarry *, k)->f0;
+			const TxnMemtablePut *put;
+			TxnInsertCarriedPut carried;
+
+			if (change->has_index || !txn_record_RowChange_put(change, &put))
+				continue;
+			carried = (TxnInsertCarriedPut)
+			{
+				put->tuple, put->heap_bytes, change->writer
+			};
+			if (!txn_rewrite_carried_push(frame, &frame->theirs.puts, &carried, sizeof(carried),
+										  _Alignof(TxnInsertCarriedPut)))
+				return;
+		}
+		if (frame->page != NULL)
+		{
+			std_vec_free_Checked(&frame->theirs.takes, sizeof(TxnInsertCarriedTake), _Alignof(TxnInsertCarriedTake));
+			if (!txn_insert_carried_takes(frame->io, frame->store, frame->held, frame->theirs.puts.ptr,
+										  frame->theirs.puts.len, frame->page, &frame->theirs.takes, frame->error))
+			{
+				std_vec_new(&frame->theirs.takes, sizeof(TxnInsertCarriedTake), _Alignof(TxnInsertCarriedTake));
+				return;
+			}
+		}
+		if (!txn_rewrite_writers(frame) ||
+			!txn_spill_carried(frame->io, frame->held, frame->writers.ptr, frame->writers.len,
+							   txn_rewrite_theirs_closure_0, &frame->theirs, frame->error))
+			return;
+	}
+	for (size_t s = 0; s < frame->own_spaces.len; s++)
+		if (!txn_rewrite_spaced(frame->io, frame->held, &STD_VEC_AT(&frame->own_spaces, TxnRecordMapCarried, s),
+								frame->logged, frame->most, false, 0, frame->error))
+			return;
+	for (size_t k = 0; k < frame->own.len; k++)
+	{
+		const TxnRewriteCarry *carry = STD_VEC_AT(&frame->own, const TxnRewriteCarry *, k);
+
+		if (!txn_rewrite_own_carried(frame->io, frame->store, frame->held, &carry->f0, carry->f1, carry->f2,
+									 frame->logged, frame->page, frame->error))
+			return;
+	}
+	frame->ok = true;
+}
+
+/*
+ * txn_rewrite_carried carries a rewrite's, a move's, or an index build's
+ * versions into its new storage (P2), each key's chain, its map versions'
+ * and its rows', given oldest first: every version below a chain's newest
+ * run of the carrying transaction's own goes, with a rewrite's takes of the
+ * places of other writers' puts (insert's carried_takes), into spill files
+ * under each writer's top-level xid (spill's carried), disk to disk, so the
+ * carry never waits at the delta's budget on versions it can't spill; then
+ * each chain's own run goes into the memtable, a key's map versions as
+ * spaced pushes them and its rows as own_carried does, above them. Under the
+ * spill files' hold it logs, for a logged storage, each spilled key's map
+ * versions as one record and each spilled row version's own record, whose
+ * end each version keeps as its LSN; a lock is never logged. It leaves the
+ * new storage's totals unknown, since no commit counts a carried version
+ * (bugs row 316).
+ */
+bool
+txn_rewrite_carried(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held,
+					const TxnRecordMapCarried *spaces, size_t spaces_len, const TxnRewriteCarry *carries,
+					size_t carries_len, bool logged, const TxnInsertPage *page, uint16 most, HostError *error)
+{
+	txn_rewrite_carried_frame_1_t frame = {.io = io, .store = store, .held = held, .spaces = spaces,
+		.spaces_len = spaces_len, .carries = carries, .carries_len = carries_len, .logged = logged, .page = page,
+	.most = most, .error = error};
+
+	std_landing(&frame, txn_rewrite_carried_body_1, txn_rewrite_carried_pad_1);
+	txn_rewrite_carried_pad_1(&frame);
+	if (frame.ok)
+		txn_state_totals_unknown(host_shared_Held_record(held));
+	return frame.ok;
+}
+
+/*
+ * txn_rewrite_moved_point returns the fold point of a move's new base (P2):
+ * the old base's, or just below the commit end of the oldest writer of a
+ * carried version that committed at or below it, which only a map version a
+ * fold kept above an older running writer's has, so no carried spill file
+ * needs a residual's mark. The base holds the old one's content, and so
+ * commits past that point, but only those with no version left in the new
+ * storage's spills or memtable, whose files the old fold took out; nothing
+ * applies them twice.
+ */
+bool
+txn_rewrite_moved_point(HostIoIo *io, HostLsn folded, const uint64 *writers, size_t writers_len, HostLsn *result,
+						HostError *error)
+{
+	*result = folded;
+	for (size_t k = 0; k < writers_len; k++)
+	{
+		HostXid		xid = {writers[k]};
+		TxnStatusCommit commit;
+
+		if (!txn_status_committed(io, xid, &commit, error))
+			return false;
+		if (commit.tag == TXN_STATUS_COMMIT_AT && commit.u.at <= folded)
+			*result = Min(*result, commit.u.at > 0 ? commit.u.at - 1 : 0);
+	}
+	return true;
 }
 
 /* txn_rewrite_value_map_frame_t is value_map's state across its pad: the trees it builds, unless it answers them. */
@@ -1264,7 +1820,11 @@ txn_rewrite_spaces(HostIoIo *io, const HostSharedHeld *held, HostStorage storage
 	return frame.ok;
 }
 
-/* txn_rewrite_carried_value is a carried map version's step: its entry put, or its removal for none. */
+/*
+ * txn_rewrite_carried_value is a carried map version's step: its entry put,
+ * or its removal for none. It reads no current entry, so its take has no
+ * read to compare (bugs row 342).
+ */
 static TxnMemtableMapStep
 txn_rewrite_carried_value(void *captures, bool has_current, const uint8 *current, size_t current_len, StdVec *out)
 {
@@ -1289,71 +1849,100 @@ txn_rewrite_nothing(void *captures)
 {
 }
 
+/* txn_rewrite_Room_t is a carried version's writer's room, which it counts at, or none for a writer with no entry. */
+typedef struct txn_rewrite_Room_t
+{
+	bool		has_roomed;
+	TxnStatusRoomed roomed;
+} txn_rewrite_Room_t;
+
 /* txn_rewrite_spaced_closure_2_captures_t is spaced's prepare's closure's captures. */
 typedef struct txn_rewrite_spaced_closure_2_captures_t
 {
+	HostSharedRecord record;
 	const TxnRecordMapCarried *carried;
-	const StdVec *body;
+	const StdVec *rooms;
+	/* logged is whether each group logs a record of its versions. */
+	bool		logged;
 	bool		has_replayed;
 	uint64		replayed;
 } txn_rewrite_spaced_closure_2_captures_t;
 
-/* txn_rewrite_spaced_closure_2_frame_t is the closure's state across its pad: its window, while live. */
+/* txn_rewrite_spaced_closure_2_frame_t is the closure's state across its pad: its group's record's body and its window, each while live. */
 typedef struct txn_rewrite_spaced_closure_2_frame_t
 {
 	txn_rewrite_spaced_closure_2_captures_t *captures;
 	HostIoIo   *io;
 	TxnMemtableTablePreparedState *prepared;
+	StdVec		body;
+	bool		body_live;
 	HostDelayCheckpoint window;
 	bool		window_live;
 	HostError  *error;
 	bool		ok;
 } txn_rewrite_spaced_closure_2_frame_t;
 
-/* txn_rewrite_spaced_closure_2_body appends the record outside redo and pushes each version in one window. */
+/*
+ * txn_rewrite_spaced_closure_2_body appends the record of the prepare's group
+ * of versions outside redo and pushes the group's versions in one window
+ * (bugs row 372).
+ */
 static void
 txn_rewrite_spaced_closure_2_body(void *frame_)
 {
 	txn_rewrite_spaced_closure_2_frame_t *frame = frame_;
 	txn_rewrite_spaced_closure_2_captures_t *c = frame->captures;
+	TxnMemtableTablePreparedState *prepared = frame->prepared;
 	HostIoTakesShort io = HOST_IO_IO_TAKES_SHORT(frame->io);
 	bool		has_lsn = c->has_replayed;
 	HostLsn		lsn = c->replayed;
 	HostRow		unclaimed = {0};
 	TxnMemtableMapTaken taken;
 
+	if (c->logged)
+	{
+		TxnRecordMapCarried group = *c->carried;
+
+		group.versions.ptr = (TxnRecordCarriedTake *) c->carried->versions.ptr + prepared->first;
+		group.versions.len = group.versions.cap = prepared->aims_len;
+		txn_record_MapCarried_encode(&group, &frame->body);
+		frame->body_live = true;
+	}
 	if (!c->has_replayed)
 	{
 		if (!host_delay_checkpoint(HOST_IO_IO_IO_DOORS(frame->io), NULL, 0, &frame->window, frame->error))
 			return;
 		frame->window_live = true;
 	}
-	if (c->body != NULL)
+	if (frame->body_live)
 	{
-		if (!host_wal_insert(HOST_IO_IO_IO_DOORS(frame->io), HOST_WAL_KIND_MAP_CARRIED, c->body->ptr, c->body->len,
-							 &lsn, frame->error))
+		if (!host_wal_insert(HOST_IO_IO_IO_DOORS(frame->io), HOST_WAL_KIND_MAP_CARRIED, frame->body.ptr,
+							 frame->body.len, &lsn, frame->error))
 			return;
 		has_lsn = true;
 	}
-	for (size_t at = 0; at < c->carried->versions.len; at++)
+	for (size_t at = 0; at < prepared->aims_len; at++)
 	{
-		const TxnRecordCarriedTake *version = &STD_VEC_AT(&c->carried->versions, TxnRecordCarriedTake, at);
+		const TxnRecordCarriedTake *version = &STD_VEC_AT(&c->carried->versions, TxnRecordCarriedTake,
+														  prepared->first + at);
+		const txn_rewrite_Room_t *room = &STD_VEC_AT(c->rooms, txn_rewrite_Room_t, prepared->first + at);
 
 		if (version->has_mark)
 		{
 			StdVec		mark;
 
 			std_slice_to_vec_Checked(&mark, version->mark.ptr, version->mark.len, TXN_REWRITE_ID);
-			if (!txn_memtable_map_named(io, frame->prepared, at, version->writer, has_lsn, lsn, version->tuple, &mark,
-										frame->error))
+			if (!txn_memtable_map_named(io, frame->prepared, at, version->writer, room->has_roomed, room->roomed,
+										has_lsn, lsn, version->tuple, &mark, frame->error))
 				return;
-			continue;
 		}
-		if (!txn_memtable_map_took_Unit(io, frame->prepared, at, version->writer, has_lsn, lsn, false, unclaimed, 0,
-										false, NULL, 0, txn_rewrite_carried_value, (void *) version, NULL,
-										txn_rewrite_carried_tuple, (void *) version, NULL, txn_rewrite_nothing, NULL,
-										NULL, &taken, frame->error))
+		else if (!txn_memtable_map_took_Unit(io, frame->prepared, at, version->writer, room->has_roomed,
+											 room->roomed, has_lsn, lsn, false, unclaimed, 0, false, NULL, 0, NULL,
+											 txn_rewrite_carried_value, (void *) version, NULL,
+											 txn_rewrite_carried_tuple, (void *) version, NULL, txn_rewrite_nothing,
+											 NULL, NULL, &taken, frame->error))
 			return;
+		txn_state_raised(c->record, STD_ADD(u64, version->tuple.f0, 1, 0, 0));
 	}
 	if (frame->window_live)
 	{
@@ -1363,7 +1952,7 @@ txn_rewrite_spaced_closure_2_body(void *frame_)
 	frame->ok = true;
 }
 
-/* txn_rewrite_spaced_closure_2_pad drops the closure's window, while live. */
+/* txn_rewrite_spaced_closure_2_pad drops the closure's window and its record's body, while live. */
 static void
 txn_rewrite_spaced_closure_2_pad(void *frame_)
 {
@@ -1371,7 +1960,9 @@ txn_rewrite_spaced_closure_2_pad(void *frame_)
 
 	if (frame->window_live)
 		host_DelayCheckpoint_drop(&frame->window);
-	frame->window_live = false;
+	if (frame->body_live)
+		std_vec_free_Checked(&frame->body, 1, 1);
+	frame->window_live = frame->body_live = false;
 }
 
 /* txn_rewrite_spaced_closure_2 is spaced's prepare's closure. */
@@ -1383,11 +1974,13 @@ txn_rewrite_spaced_closure_2(void *captures, HostIoIo *io, TxnMemtableTablePrepa
 	.error = error};
 
 	std_landing(&frame, txn_rewrite_spaced_closure_2_body, txn_rewrite_spaced_closure_2_pad);
+	if (frame.window_live && !frame.ok)
+		host_DelayCheckpoint_failed(&frame.window, frame.error);
 	txn_rewrite_spaced_closure_2_pad(&frame);
 	return frame.ok;
 }
 
-/* txn_rewrite_spaced_frame_t is spaced's state across its pad: its takes and its record's body, each while live. */
+/* txn_rewrite_spaced_frame_t is spaced's state across its pad: its takes and its rooms, each while live. */
 typedef struct txn_rewrite_spaced_frame_t
 {
 	HostIoIo   *io;
@@ -1399,21 +1992,25 @@ typedef struct txn_rewrite_spaced_frame_t
 	uint64		replayed;
 	bool		takes_live;
 	StdVec		takes;
-	bool		body_live;
-	StdVec		body;
+	bool		rooms_live;
+	StdVec		rooms;
 	HostError  *error;
 	bool		ok;
 } txn_rewrite_spaced_frame_t;
 
-/* txn_rewrite_spaced_body readies a take for each carried version, runs the prepare, and stores each stored ender. */
+/*
+ * txn_rewrite_spaced_body readies a take for each carried version and its
+ * writer's room when its writer has an entry, runs the prepare, and stores
+ * each stored ender.
+ */
 static void
 txn_rewrite_spaced_body(void *frame_)
 {
 	txn_rewrite_spaced_frame_t *frame = frame_;
 	const TxnRecordMapCarried *carried = frame->carried;
 	HostSharedRecord record = host_shared_Held_record(frame->held);
-	txn_rewrite_spaced_closure_2_captures_t captures = {.carried = carried, .has_replayed = frame->has_replayed,
-	.replayed = frame->replayed};
+	txn_rewrite_spaced_closure_2_captures_t captures = {.record = record, .carried = carried, .rooms = &frame->rooms,
+	.has_replayed = frame->has_replayed, .replayed = frame->replayed};
 	size_t		most;
 
 	if (frame->has_replayed)
@@ -1441,12 +2038,19 @@ txn_rewrite_spaced_body(void *frame_)
 
 		std_vec_push_Checked(&frame->takes, &take, sizeof(take), _Alignof(TxnMemtableMapTake));
 	}
-	if (frame->logged && !frame->has_replayed)
+	std_vec_with_capacity_Checked(&frame->rooms, carried->versions.len, sizeof(txn_rewrite_Room_t),
+								  _Alignof(txn_rewrite_Room_t));
+	frame->rooms_live = true;
+	for (size_t i = 0; i < carried->versions.len; i++)
 	{
-		txn_record_MapCarried_encode(carried, &frame->body);
-		frame->body_live = true;
-		captures.body = &frame->body;
+		const TxnRecordCarriedTake *version = &STD_VEC_AT(&carried->versions, TxnRecordCarriedTake, i);
+		txn_rewrite_Room_t room = {0};
+
+		if (!txn_status_kept_roomed(frame->io, &version->writer, &room.has_roomed, &room.roomed, frame->error))
+			return;
+		std_vec_push_Checked(&frame->rooms, &room, sizeof(room), _Alignof(txn_rewrite_Room_t));
 	}
+	captures.logged = frame->logged && !frame->has_replayed;
 	if (!txn_memtable_map_prepare_Unit(frame->io, frame->takes.ptr, frame->takes.len, txn_rewrite_spaced_closure_2,
 									   &captures, NULL, frame->error))
 		return;
@@ -1455,7 +2059,8 @@ txn_rewrite_spaced_body(void *frame_)
 		const TxnRecordCarriedTake *version = &STD_VEC_AT(&carried->versions, TxnRecordCarriedTake, i);
 
 		if (version->ender != 0 &&
-			!txn_memtable_map_ended(frame->io, record, version->tuple, (uint32) version->ender, frame->error))
+			!txn_memtable_map_ended(frame->io, record, version->tuple, version->writer.xid, (uint32) version->ender,
+									frame->error))
 			return;
 	}
 	frame->ok = true;
@@ -1467,21 +2072,25 @@ txn_rewrite_spaced_pad(void *frame_)
 {
 	txn_rewrite_spaced_frame_t *frame = frame_;
 
-	if (frame->body_live)
-		std_vec_free_Checked(&frame->body, 1, 1);
 	if (frame->takes_live)
 		std_vec_free_Checked(&frame->takes, sizeof(TxnMemtableMapTake), _Alignof(TxnMemtableMapTake));
-	frame->body_live = frame->takes_live = false;
+	if (frame->rooms_live)
+		std_vec_free_Checked(&frame->rooms, sizeof(txn_rewrite_Room_t), _Alignof(txn_rewrite_Room_t));
+	frame->takes_live = frame->rooms_live = false;
 }
 
 /*
  * txn_rewrite_spaced pushes a key's carried map versions into a moved
- * storage's new storage, in one checkpoint window outside redo: a logged
- * storage's record first, whose end each version keeps as its LSN, or redo's
- * record's end, then each version as its put of its entry, its removal, or
- * its values mark, with its writer and tuple id, and then each take's or
- * mark's stored ender. Redo passes over a key whose chain holds the record's
- * LSN already.
+ * storage's new storage, in a checkpoint window outside redo for each group
+ * the prepare readies: a logged storage's record of the group's versions
+ * first, whose end each of them keeps as its LSN, or redo's record's end,
+ * then each version as its put of its entry, its removal, or its values
+ * mark, with its writer and tuple id, counted at its writer's entry when the
+ * writer has one, the counter raised past its tuple id after it (bugs row
+ * 489), with no insert between, since redo's startup process alone takes
+ * tuple ids and a live carrier holds its table's AccessExclusiveLock, and
+ * then each take's or mark's stored
+ * ender. Redo passes over a key whose chain holds the record's LSN already.
  */
 bool
 txn_rewrite_spaced(HostIoIo *io, const HostSharedHeld *held, const TxnRecordMapCarried *carried, bool logged,

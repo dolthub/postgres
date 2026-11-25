@@ -28,9 +28,11 @@
 #include "doltgres/doltgres/deletes.h"
 #include "doltgres/doltgres/kinds.h"
 #include "doltgres/doltgres/layout.h"
+#include "doltgres/doltgres/layouts.h"
 #include "doltgres/doltgres/locale.h"
 #include "doltgres/doltgres/relation.h"
 #include "doltgres/doltgres/scan.h"
+#include "doltgres/doltgres/settle.h"
 #include "doltgres/doltgres/sizes.h"
 #include "doltgres_cport_test.h"
 
@@ -38,8 +40,14 @@ PG_MODULE_MAGIC;
 
 /* CPORT_TESTS are the doltgres crate's tests, in the order the Rust harness runs them, sorted by name. */
 static const CportTest CPORT_TESTS[] = {
+	{"cport::doltgres::layouts::tests::a_failed_allocation_in_a_kept_transform_keeps_the_earlier_ones",
+	test_doltgres_layouts_tests_a_failed_allocation_in_a_kept_transform_keeps_the_earlier_ones},
 	{"cport::doltgres::scan::tests::a_scan_with_no_sample_or_range_leaves_its_answers_as_they_were",
 	test_doltgres_scan_tests_a_scan_with_no_sample_or_range_leaves_its_answers_as_they_were},
+	{"cport::doltgres::settle::tests::a_failed_allocation_in_a_close_keeps_the_outer_level",
+	test_doltgres_settle_tests_a_failed_allocation_in_a_close_keeps_the_outer_level},
+	{"cport::doltgres::settle::tests::a_failed_allocation_in_a_copy_of_old_key_columns_keeps_them",
+	test_doltgres_settle_tests_a_failed_allocation_in_a_copy_of_old_key_columns_keeps_them},
 	{"deletes::tests::a_bottom_up_deletion_visits_heaps_blocks_in_heaps_order",
 	test_doltgres_deletes_tests_a_bottom_up_deletion_visits_heaps_blocks_in_heaps_order},
 	{"deletes::tests::a_simple_deletion_marks_the_rows_no_snapshot_keeps",
@@ -118,8 +126,12 @@ static const CportTest CPORT_TESTS[] = {
 	test_doltgres_scan_tests_a_parallel_tid_ranges_blocks_are_heaps},
 	{"scan::tests::a_sample_of_many_blocks_walks_the_delta_once",
 	test_doltgres_scan_tests_a_sample_of_many_blocks_walks_the_delta_once},
+	{"scan::tests::a_scan_held_inside_its_delta_read_across_an_install_and_drop_gives_every_row_once",
+	test_doltgres_scan_tests_a_scan_held_inside_its_delta_read_across_an_install_and_drop_gives_every_row_once},
 	{"scan::tests::a_scan_merges_the_deltas_rows_with_the_bases_in_key_order",
 	test_doltgres_scan_tests_a_scan_merges_the_deltas_rows_with_the_bases_in_key_order},
+	{"scan::tests::a_scan_moves_to_a_newer_base_at_its_next_read_and_gives_every_row_once",
+	test_doltgres_scan_tests_a_scan_moves_to_a_newer_base_at_its_next_read_and_gives_every_row_once},
 	{"scan::tests::a_scan_reads_a_bases_rows_in_order_across_calls",
 	test_doltgres_scan_tests_a_scan_reads_a_bases_rows_in_order_across_calls},
 	{"scan::tests::a_scan_reads_backward_and_turns_as_heaps_does",
@@ -136,6 +148,8 @@ static const CportTest CPORT_TESTS[] = {
 	test_doltgres_scan_tests_a_tuple_id_is_valid_within_the_storages_blocks},
 	{"scan::tests::each_keyless_copy_fetches_by_its_own_tuple_id",
 	test_doltgres_scan_tests_each_keyless_copy_fetches_by_its_own_tuple_id},
+	{"scan::tests::fetches_through_one_memo_give_each_keyless_copys_own_stamp",
+	test_doltgres_scan_tests_fetches_through_one_memo_give_each_keyless_copys_own_stamp},
 	{"scan::tests::scans_of_one_base_keep_their_own_places",
 	test_doltgres_scan_tests_scans_of_one_base_keep_their_own_places},
 	{"sizes::tests::a_tables_blocks_are_its_rows_packed_and_at_least_its_ctid_blocks",

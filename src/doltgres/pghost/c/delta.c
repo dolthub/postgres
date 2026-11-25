@@ -216,11 +216,18 @@ pghost_delta_slot_of(uint32 aged, uint32 index)
 	return STD_ADD(u32, at, index, 112, 5);
 }
 
-/* pghost_delta_stamp_of returns the place among a record's atomics of the epoch of its retirement: its last. */
+/* pghost_delta_stamp_of returns the place among a record's atomics of the epoch of its retirement: the one before its last. */
 static size_t
 pghost_delta_stamp_of(size_t kind)
 {
-	return STD_SUB(usize, shmem_records_atomics(kind), 1, 117, 5);
+	return STD_SUB(usize, shmem_records_atomics(kind), 2, 117, 5);
+}
+
+/* pghost_delta_link_of returns the place among a record's atomics of its link in its kind's retired list: its last (bugs row 309). */
+static size_t
+pghost_delta_link_of(size_t kind)
+{
+	return shmem_records_atomics(kind) - 1;
 }
 
 /* pghost_delta_Pages_Directory_slots is the directory's count of slots. */
@@ -801,6 +808,101 @@ pghost_delta_Pages_Directory_unmade(void *self, uint32 kind, uint32 index)
 	std_RwLockWriteGuard_drop(&made);
 }
 
+/* pghost_delta_Pages_Directory_retired_head loads the retired list's head. */
+static uint64
+pghost_delta_Pages_Directory_retired_head(void *self)
+{
+	(void) self;
+	return shmem_delta_retired();
+}
+
+/* pghost_delta_Pages_Directory_retired_swap stores the retired list's head over the one loaded. */
+static bool
+pghost_delta_Pages_Directory_retired_swap(void *self, uint64 loaded, uint64 word)
+{
+	(void) self;
+	return shmem_delta_retired_swap(loaded, word);
+}
+
+/* pghost_delta_Pages_Directory_link loads a slot's link in the retired list. */
+static uint32
+pghost_delta_Pages_Directory_link(void *self, uint32 slot)
+{
+	(void) self;
+	return shmem_delta_link(slot);
+}
+
+/* pghost_delta_Pages_Directory_set_link stores a slot's link in the retired list. */
+static void
+pghost_delta_Pages_Directory_set_link(void *self, uint32 slot, uint32 value)
+{
+	(void) self;
+	shmem_delta_set_link(slot, value);
+}
+
+/* pghost_delta_Pages_Directory_record_retired_head loads an aged kind's retired list's head. */
+static uint64
+pghost_delta_Pages_Directory_record_retired_head(void *self, uint32 kind)
+{
+	(void) self;
+	return shmem_records_retired(pghost_delta_kind_of(kind));
+}
+
+/* pghost_delta_Pages_Directory_record_retired_swap stores an aged kind's retired list's head over the one loaded. */
+static bool
+pghost_delta_Pages_Directory_record_retired_swap(void *self, uint32 kind, uint64 loaded, uint64 word)
+{
+	(void) self;
+	return shmem_records_retired_swap(pghost_delta_kind_of(kind), loaded, word);
+}
+
+/* pghost_delta_Pages_Directory_record_link loads an aged record's link in its kind's retired list. */
+static uint64
+pghost_delta_Pages_Directory_record_link(void *self, uint32 kind, uint32 index)
+{
+	size_t		region_kind = pghost_delta_kind_of(kind);
+	ShmemRecordsOp load = {SHMEM_RECORDS_OP_LOAD};
+
+	(void) self;
+	return shmem_records_atomic(region_kind, index, pghost_delta_link_of(region_kind), load);
+}
+
+/* pghost_delta_Pages_Directory_set_record_link stores an aged record's link in its kind's retired list by exchanges. */
+static void
+pghost_delta_Pages_Directory_set_record_link(void *self, uint32 kind, uint32 index, uint64 value)
+{
+	size_t		region_kind = pghost_delta_kind_of(kind);
+	ShmemRecordsOp load = {SHMEM_RECORDS_OP_LOAD};
+	uint64		held = shmem_records_atomic(region_kind, index, pghost_delta_link_of(region_kind), load);
+
+	(void) self;
+	for (;;)
+	{
+		ShmemRecordsOp exchange = {SHMEM_RECORDS_OP_EXCHANGE, {.exchange = {held, value}}};
+		uint64		before = shmem_records_atomic(region_kind, index, pghost_delta_link_of(region_kind), exchange);
+
+		if (before == held)
+			return;
+		held = before;
+	}
+}
+
+/* pghost_delta_Pages_Directory_lock_pass takes the free pass's lock. */
+static void
+pghost_delta_Pages_Directory_lock_pass(void *self)
+{
+	(void) self;
+	shmem_delta_lock_pass();
+}
+
+/* pghost_delta_Pages_Directory_unlock_pass releases the free pass's lock. */
+static void
+pghost_delta_Pages_Directory_unlock_pass(void *self)
+{
+	(void) self;
+	shmem_delta_unlock_pass();
+}
+
 /* PGHOST_DELTA_PAGES_DIRECTORY_OPS is Pages' Directory table. */
 static const HostDeltaDirectoryDirectoryOps PGHOST_DELTA_PAGES_DIRECTORY_OPS = {
 	.slots = pghost_delta_Pages_Directory_slots,
@@ -858,6 +960,16 @@ static const HostDeltaDirectoryDirectoryOps PGHOST_DELTA_PAGES_DIRECTORY_OPS = {
 	.clear = pghost_delta_Pages_Directory_clear,
 	.made = pghost_delta_Pages_Directory_made,
 	.unmade = pghost_delta_Pages_Directory_unmade,
+	.retired_head = pghost_delta_Pages_Directory_retired_head,
+	.retired_swap = pghost_delta_Pages_Directory_retired_swap,
+	.link = pghost_delta_Pages_Directory_link,
+	.set_link = pghost_delta_Pages_Directory_set_link,
+	.record_retired_head = pghost_delta_Pages_Directory_record_retired_head,
+	.record_retired_swap = pghost_delta_Pages_Directory_record_retired_swap,
+	.record_link = pghost_delta_Pages_Directory_record_link,
+	.set_record_link = pghost_delta_Pages_Directory_set_record_link,
+	.lock_pass = pghost_delta_Pages_Directory_lock_pass,
+	.unlock_pass = pghost_delta_Pages_Directory_unlock_pass,
 };
 
 /* PGHOST_DELTA_DIRECTORY is &Pages as host's sequences take it. */
@@ -1015,11 +1127,53 @@ pghost_delta_ended(uint64 epoch)
 	host_delta_directory_released(PGHOST_DELTA_DIRECTORY, epoch);
 }
 
-/* pghost_delta_open opens a page under an epoch. */
+/* PGHOST_DELTA_OPENS is how many admitted opens a process keeps, a power of two a name's slot indexes. */
+#define PGHOST_DELTA_OPENS 1024
+StaticAssertDecl((PGHOST_DELTA_OPENS & (PGHOST_DELTA_OPENS - 1)) == 0,
+				 "PGHOST_DELTA_OPENS is a power of two");
+
+/* PghostDeltaOpen is an open the directory admitted: the page's name, the hold's epoch, and what it reached. */
+typedef struct PghostDeltaOpen
+{
+	bool		some;
+	HostDeltaPagePage name;
+	uint64		epoch;
+	HostDeltaDirectoryOpened opened;
+} PghostDeltaOpen;
+
+/*
+ * PGHOST_DELTA_OPENED is this process's last admitted open of each of
+ * PGHOST_DELTA_OPENS sets of names (bugs row 355). An entry answers only the
+ * same name, generation included, at the same epoch, and only an admission,
+ * never a refusal: for one name and epoch the directory's answer never turns
+ * from admitted to refused while a hold at that epoch can ask, since a
+ * retirement stamps an epoch at least that of every hold it can be seen
+ * under, and a slot is freed and given its next generation only once every
+ * hold at an epoch at or below that stamp has dropped, so no hold begun
+ * after it has the epoch. Its body and size are fixed while its generation
+ * holds the slot. The body is an offset into this process's mapping, which a
+ * process never outlives, so nothing clears the table.
+ */
+static PghostDeltaOpen PGHOST_DELTA_OPENED[PGHOST_DELTA_OPENS];
+
+/* pghost_delta_open opens a page under an epoch, answering a repeat of an admitted open from the process's table. */
 bool
 pghost_delta_open(HostDeltaPagePage name, uint64 epoch, HostDeltaDirectoryOpened *result, HostError *error)
 {
-	return host_delta_directory_open(PGHOST_DELTA_DIRECTORY, name, epoch, result, error);
+	PghostDeltaOpen *open = &PGHOST_DELTA_OPENED[host_delta_page_Page_number(name) & (PGHOST_DELTA_OPENS - 1)];
+
+	if (open->some && open->name.f0 == name.f0 && open->epoch == epoch)
+	{
+		*result = open->opened;
+		return true;
+	}
+	if (!host_delta_directory_open(PGHOST_DELTA_DIRECTORY, name, epoch, result, error))
+		return false;
+	*open = (PghostDeltaOpen)
+	{
+		true, name, epoch, *result
+	};
+	return true;
 }
 
 /* pghost_delta_bytes_of returns bytes of an opened page, mapped from the region. */
@@ -1181,6 +1335,13 @@ pghost_delta_retire(const HostDeltaLeaving *records, size_t records_len, const H
 					size_t names_len)
 {
 	host_delta_directory_retire(PGHOST_DELTA_DIRECTORY, records, records_len, names, names_len);
+}
+
+/* pghost_delta_packing orders the delta's partly used blocks and returns the live pages a packing moves. */
+bool
+pghost_delta_packing(const uint64 *shapes, size_t shapes_len, StdVec *result)
+{
+	return host_delta_directory_packing(PGHOST_DELTA_DIRECTORY, shapes, shapes_len, result);
 }
 
 /* pghost_delta_pass passes the delta's epoch on. */

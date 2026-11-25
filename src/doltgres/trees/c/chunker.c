@@ -20,8 +20,7 @@
  * size, so boundaries depend only on the keys and their sizes. The threshold
  * follows a Weibull distribution of node sizes (shape 4, scale the target
  * size), computed with integers only so every platform draws the same
- * boundaries. Verus proves the Rust's grow, reset, and the first entry's
- * lemma; the C's guarantee is tested equivalence.
+ * boundaries.
  */
 #ifndef FRONTEND
 #include "postgres.h"

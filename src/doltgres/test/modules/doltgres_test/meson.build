@@ -17,8 +17,7 @@
 # points, as the test entries it calls are.
 
 doltgres_test = shared_module('doltgres_test',
-  files('doltgres_test.c', 'doltgres_test_none.c') + [doltgres_cport_pg_binding[0], doltgres_cport_pg_binding[4]],
-  include_directories: [doltgres_cport_pg_include],
+  files('doltgres_test.c'),
   kwargs: pg_test_mod_args,
 )
 test_install_libs += doltgres_test

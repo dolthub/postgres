@@ -100,9 +100,9 @@ typedef struct TxnBaseKey
 /*
  * TxnBaseBase is Base: a storage's base record, its root, its fold point, the
  * largest top-level xid it folded, the epoch its rows are stored at, its
- * tuple id tree, the tuple id counter and the fresh end, the free space map,
- * its sizes, its key, its table's and index's object ids, the newest xid that
- * ended a row it applied, and its table's pending transforms.
+ * tuple id tree, the fresh end, the free space map, its sizes, its key, its
+ * table's and index's object ids, the newest xid that ended a row it applied,
+ * its table's pending transforms, and its read point.
  */
 typedef struct TxnBaseBase
 {
@@ -119,8 +119,6 @@ typedef struct TxnBaseBase
 	uint32		epoch;
 	bool		has_tuple_ids;
 	TreesStoreTree tuple_ids;
-	/* counter is the next tuple id a write takes. */
-	uint64		counter;
 	/* fresh_end is the next tuple id past every row the base holds. */
 	uint64		fresh_end;
 	bool		has_free_space;
@@ -151,6 +149,13 @@ typedef struct TxnBaseBase
 	 */
 	bool		has_chain;
 	TreesStoreTree chain;
+
+	/*
+	 * read is the read point, the point readers decide by which delta and
+	 * spilled versions the base applies, below a moved base's fold point and
+	 * equal to it on every other base.
+	 */
+	uint64		read;
 } TxnBaseBase;
 
 /*
@@ -213,6 +218,13 @@ extern void txn_base_pending_value(uint64 ender, uint32 heap_bytes, const uint32
 								   StdVec *result);
 extern bool txn_base_pending_read(const uint8 *value, size_t value_len, uint64 *result_0, uint32 *result_1,
 								  StdVec *result_2, HostError *error);
+
+/*
+ * TXN_BASE_OWN is OWN, the bit of a pending tuple id's ender word that marks
+ * a row its own writer ended, whose free waits for the horizon to pass that
+ * writer and logs no conflict horizon; full xids stay below it.
+ */
+#define TXN_BASE_OWN (UINT64CONST(1) << 63)
 
 #ifdef DOLTGRES_TEST_TXN
 extern void txn_base_Base_Clone_clone(const TxnBaseBase *self, TxnBaseBase *result);

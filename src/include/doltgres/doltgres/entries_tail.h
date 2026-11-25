@@ -107,6 +107,22 @@ typedef struct doltgres_entries_opened_t
 extern bool doltgres_entries_open(HostIoIo *io, doltgres_entries_opened_t *opened, PgPgError *error);
 extern void doltgres_entries_opened_drop(doltgres_entries_opened_t *opened);
 extern const RepoRepo *doltgres_entries_opened_repo(const doltgres_entries_opened_t *opened);
+
+/*
+ * DoltgresEntriesScanned is a scanned table's shape for its scans' costs:
+ * whether the fork stores it, whether the index is its primary key's, and
+ * the blocks of its tree and of its tuple id tree.
+ */
+typedef struct DoltgresEntriesScanned
+{
+	bool		stored;
+	bool		keyed;
+	TxnBaseBlockCounts rows;
+	TxnBaseBlockCounts tuple_ids;
+} DoltgresEntriesScanned;
+
+extern bool doltgres_entries_scanned(const PgCatalogCaps *caps, uint32 indexoid, uint32 tableoid,
+									 DoltgresEntriesScanned *result, PgPgError *error);
 extern void doltgres_entries_Record_drop(txn_TupleVecU8Op_t *record);
 
 /* DoltgresEntriesLockedOp is one operation on a backend's value under its IoMutex, with its captures. */

@@ -852,12 +852,13 @@ chunks_trailer_Stamps_holds_closure_3(void *captures, const void *elem)
 }
 
 /*
- * chunks_trailer_Stamps_holds reports whether an entry has a stamp of a tuple
- * id, by a search of its stamps, which are in tuple id order as a fold writes
- * them.
+ * chunks_trailer_Stamps_stamp_of finds an entry's stamp of a tuple id, by a
+ * search of its stamps, which are in tuple id order as a fold writes them,
+ * and answers whether it has one: a run's stamp of a tuple id is its first
+ * stamp's transaction with that tuple id.
  */
 bool
-chunks_trailer_Stamps_holds(const ChunksTrailerStamps *self, size_t i, uint64 tuple)
+chunks_trailer_Stamps_stamp_of(const ChunksTrailerStamps *self, size_t i, uint64 tuple, ChunksTrailerStamp *result)
 {
 	uint64		start;
 	uint64		end;
@@ -873,8 +874,12 @@ chunks_trailer_Stamps_holds(const ChunksTrailerStamps *self, size_t i, uint64 tu
 	uint64		at_2;
 
 	if (!chunks_trailer_Stamps_span(self, i, &start, &end))
-		return !self->has_ends && i < self->single.len &&
-			STD_VEC_AT(&self->single, ChunksTrailerStamp, i).tuple == tuple;
+	{
+		if (self->has_ends || i >= self->single.len || STD_VEC_AT(&self->single, ChunksTrailerStamp, i).tuple != tuple)
+			return false;
+		*result = STD_VEC_AT(&self->single, ChunksTrailerStamp, i);
+		return true;
+	}
 	from = std_slice_partition_point(self->runs.ptr, self->runs.len, sizeof(chunks_trailer_Stamps_runs_t),
 									 chunks_trailer_Stamps_holds_closure_1, &start, NULL);
 	to = std_slice_partition_point(self->runs.ptr, self->runs.len, sizeof(chunks_trailer_Stamps_runs_t),
@@ -898,7 +903,20 @@ chunks_trailer_Stamps_holds(const ChunksTrailerStamps *self, size_t i, uint64 tu
 	else
 		run_start = 0;
 	at_2 = std_saturating_add_u64(run_start, STD_SUB(u64, tuple, first.tuple, 312, 43));
-	return at_2 >= std_max_u64(start, run_start) && at_2 < std_min_u64(end, run_end);
+	if (at_2 < std_max_u64(start, run_start) || at_2 >= std_min_u64(end, run_end))
+		return false;
+	result->txn = first.txn;
+	result->tuple = tuple;
+	return true;
+}
+
+/* chunks_trailer_Stamps_holds reports whether an entry has a stamp of a tuple id, as stamp_of finds it. */
+bool
+chunks_trailer_Stamps_holds(const ChunksTrailerStamps *self, size_t i, uint64 tuple)
+{
+	ChunksTrailerStamp stamp;
+
+	return chunks_trailer_Stamps_stamp_of(self, i, tuple, &stamp);
 }
 
 /*
@@ -1941,6 +1959,11 @@ chunks_trailer_Stored_of_trailer(StdBytes hashed, StdBytes locators, StdBytes st
 	return result;
 }
 
+#ifdef USE_INJECTION_POINTS
+/* chunks_trailer_stamps_decoded is how many trailers' stamps the process has decoded, which tests count. */
+uint64		chunks_trailer_stamps_decoded;
+#endif
+
 /*
  * chunks_trailer_Stored_stamps returns the row stamps of the chunk's
  * entries, or an internal tree node's subtrees' highest tuple ids.
@@ -1951,6 +1974,9 @@ chunks_trailer_Stored_stamps(const ChunksTrailerStored *self, ChunksTrailerStamp
 	StdVec		max_tuples;
 	chunks_trailer_subtree_maxes_error_t malformed;
 
+#ifdef USE_INJECTION_POINTS
+	chunks_trailer_stamps_decoded++;
+#endif
 	if (!self->max_tuples)
 		return chunks_trailer_Stamps_read(self->stamps.ptr, self->stamps.len, self->runs, self->values, result, error);
 	if (chunks_trailer_subtree_maxes(self->stamps.ptr, self->stamps.len, &max_tuples, &malformed))
@@ -3811,6 +3837,78 @@ test_chunks_trailer_tests_xxh3_digests_are_the_committed_table(void)
 	}
 	std_vec_free_Checked(&committed, 1, 1);
 	std_vec_free_Checked(&table, 1, 1);
+}
+
+/* CHUNKS_TRAILER_TESTS_SPREAD is how many copies the stamp_of case's spread entry holds. */
+#define CHUNKS_TRAILER_TESTS_SPREAD 600
+
+/*
+ * test_chunks_trailer_tests_stamp_of_finds_each_copys_stamp_among_its_runs:
+ * an entry of copies whose tuple ids are 4 apart, so each is its own run, of
+ * three transactions, between two other entries, written and read back,
+ * gives each copy's own stamp by stamp_of, none for a tuple id between,
+ * past, or of another entry, and the single form gives its one stamp.
+ */
+void
+test_chunks_trailer_tests_stamp_of_finds_each_copys_stamp_among_its_runs(void)
+{
+	ChunksTrailerStamps stamps = chunks_trailer_Stamps_Default_default();
+	ChunksTrailerStamps read;
+	ChunksTrailerStamps single;
+	ChunksTrailerStamp before = {1, 1};
+	ChunksTrailerStamp after[3] = {{7, 5000}, {7, 5001}, {7, 5002}};
+	ChunksTrailerStamp spread[CHUNKS_TRAILER_TESTS_SPREAD];
+	ChunksTrailerStamp stamp;
+	ChunksErrorError error;
+	StdVec		out;
+	StdVec		one;
+
+	for (size_t i = 0; i < CHUNKS_TRAILER_TESTS_SPREAD; i++)
+	{
+		spread[i].txn = 100 + i / 200;
+		spread[i].tuple = 3 + 4 * i;
+	}
+	chunks_trailer_Stamps_push(&stamps, &before, 1);
+	chunks_trailer_Stamps_push(&stamps, spread, CHUNKS_TRAILER_TESTS_SPREAD);
+	chunks_trailer_Stamps_push(&stamps, after, lengthof(after));
+	std_vec_new(&out, 1, 1);
+	chunks_trailer_Stamps_write(&stamps, &out);
+	if (!chunks_trailer_Stamps_read(out.ptr, out.len, true, false, &read, &error))
+		std_result_unwrap_failed("called `Result::unwrap()` on an `Err` value",
+								 sizeof("called `Result::unwrap()` on an `Err` value") - 1, &error,
+								 chunks_error_Error_Debug_fmt, RUST_FILE, __LINE__, 9);
+	STD_ASSERT(__LINE__, 9, chunks_trailer_Stamps_entry_len(&read, 1) == CHUNKS_TRAILER_TESTS_SPREAD,
+			   "read.entry_len(1) == SPREAD");
+	for (size_t i = 0; i < CHUNKS_TRAILER_TESTS_SPREAD; i++)
+		STD_ASSERT(__LINE__, 13,
+				   chunks_trailer_Stamps_stamp_of(&read, 1, spread[i].tuple, &stamp) &&
+				   chunks_trailer_Stamp_PartialEq_eq(&stamp, &spread[i]),
+				   "read.stamp_of(1, spread[i].tuple) == Some(spread[i])");
+	STD_ASSERT(__LINE__, 9,
+			   !chunks_trailer_Stamps_stamp_of(&read, 1, 4, &stamp) &&
+			   !chunks_trailer_Stamps_stamp_of(&read, 1, 3 + 4 * CHUNKS_TRAILER_TESTS_SPREAD, &stamp) &&
+			   !chunks_trailer_Stamps_stamp_of(&read, 1, 1, &stamp) &&
+			   !chunks_trailer_Stamps_stamp_of(&read, 0, 3, &stamp) &&
+			   !chunks_trailer_Stamps_stamp_of(&read, 2, 3, &stamp),
+			   "no stamp for a tuple id between, past, or of another entry");
+	STD_ASSERT(__LINE__, 9,
+			   chunks_trailer_Stamps_stamp_of(&read, 0, 1, &stamp) && chunks_trailer_Stamp_PartialEq_eq(&stamp, &before) &&
+			   chunks_trailer_Stamps_stamp_of(&read, 2, 5001, &stamp) &&
+			   chunks_trailer_Stamp_PartialEq_eq(&stamp, &after[1]),
+			   "read.stamp_of(0, 1) == Some(before) && read.stamp_of(2, 5001) == Some(after[1])");
+	std_vec_new(&one, sizeof(ChunksTrailerStamp), _Alignof(ChunksTrailerStamp));
+	std_vec_push_Checked(&one, &spread[5], sizeof(ChunksTrailerStamp), _Alignof(ChunksTrailerStamp));
+	single = chunks_trailer_Stamps_FromVecStamp_from(&one);
+	STD_ASSERT(__LINE__, 9,
+			   chunks_trailer_Stamps_stamp_of(&single, 0, spread[5].tuple, &stamp) &&
+			   chunks_trailer_Stamp_PartialEq_eq(&stamp, &spread[5]) &&
+			   !chunks_trailer_Stamps_stamp_of(&single, 0, spread[6].tuple, &stamp) &&
+			   !chunks_trailer_Stamps_stamp_of(&single, 1, spread[5].tuple, &stamp),
+			   "the single form's stamp_of gives its one stamp and none else");
+	chunks_trailer_Stamps_drop(&single);
+	chunks_trailer_Stamps_drop(&read);
+	std_vec_free_Checked(&out, 1, 1);
+	chunks_trailer_Stamps_drop(&stamps);
 }
 
 #endif							/* DOLTGRES_TEST_CHUNKS */

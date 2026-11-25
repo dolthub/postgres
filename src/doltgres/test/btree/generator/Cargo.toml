@@ -1,0 +1,37 @@
+# Copyright 2026 Dolthub, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The btree differential's generator (the btree text's section 3): records Doltgrust's keys and values of a
+# non-unique index's entries, at 9b345931d, over the corpus in src/main.rs, into ../expected.tsv. run.sh builds it in
+# a scratch directory beside a read-only extract of Doltgrust at that commit, `../doltgrust/`, outside the fork's
+# workspace.
+
+[package]
+name = "btree-corpus"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+types = { path = "../doltgrust/crates/types" }
+nodes = { path = "../doltgrust/crates/nodes" }
+encoding = { path = "../doltgrust/crates/encoding" }
+
+# Doltgrust's own patches of its workspace root, which a crate built outside that workspace doesn't inherit.
+[patch.crates-io]
+icu_collator = { path = "../doltgrust/third_party/icu_collator" }
+libmimalloc-sys = { path = "../doltgrust/third_party/libmimalloc-sys" }
+pg_query = { path = "../doltgrust/third_party/pg_query" }

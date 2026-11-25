@@ -461,6 +461,12 @@ chunks_packs_open_exists(HostIoReadDoors io, const StdPathBuf *dir, const char *
 typedef struct chunks_packs_open_repositories_frame_0_t
 {
 	HostIoReadDoors io;
+
+	/*
+	 * creations is whether the list is of the repositories a creation marked,
+	 * which the list of repositories leaves out (bugs row 404).
+	 */
+	bool		creations;
 	StdVec	   *result;
 	ChunksErrorError *error;
 	bool		ok;
@@ -521,7 +527,8 @@ chunks_packs_open_repositories_body_0(void *frame_)
 			uint32		repository;
 			StdParseIntError parsed;
 			bool		moved;
-			bool		own;
+			bool		creating;
+			bool		own = false;
 			bool		looked = true;
 
 			if (!std_str_parse_u32(name->ptr, name->len, &repository, &parsed) || repository == 0)
@@ -532,11 +539,20 @@ chunks_packs_open_repositories_body_0(void *frame_)
 				looked = false;
 			else if (!moved)
 			{
-				looked = chunks_packs_dropped_marked(frame->io, frame->dir.bytes.ptr, frame->dir.bytes.len, &own,
-													 frame->error);
-				for (size_t n = 0; n < lengthof(names) && looked && !own; n++)
-					looked = chunks_packs_open_exists(frame->io, &frame->dir, names[n], false, &own, frame->error) &&
-						(own || chunks_packs_open_exists(frame->io, &frame->dir, names[n], true, &own, frame->error));
+				looked = chunks_packs_open_exists(frame->io, &frame->dir, CHUNKS_PACKS_DROPPED_CREATING, false,
+												  &creating, frame->error);
+				if (looked && frame->creations)
+					own = creating;
+				else if (looked && !creating)
+				{
+					looked = chunks_packs_dropped_marked(frame->io, frame->dir.bytes.ptr, frame->dir.bytes.len, &own,
+														 frame->error);
+					for (size_t n = 0; n < lengthof(names) && looked && !own; n++)
+						looked = chunks_packs_open_exists(frame->io, &frame->dir, names[n], false, &own,
+														  frame->error) &&
+							(own || chunks_packs_open_exists(frame->io, &frame->dir, names[n], true, &own,
+															 frame->error));
+				}
 				if (looked && own)
 				{
 					std_TupleU32U32_t found = {repository, space};
@@ -573,16 +589,18 @@ done:
 }
 
 /*
- * chunks_packs_open_repositories returns every repository the server's
+ * chunks_packs_open_repositories_into returns the repositories the server's
  * tablespaces hold a directory of, in order of id, each with the tablespace
  * of its own directory: the one that holds the pack table's file, the
  * forwarding file, or the manifest, in either generation, or the dropped
- * mark, and none a move's finish marked.
+ * mark, and none a move's finish marked, or for creations the one that holds
+ * a creation's mark.
  */
-bool
-chunks_packs_open_repositories(HostIoReadDoors io, StdVec *result, ChunksErrorError *error)
+static bool
+chunks_packs_open_repositories_into(HostIoReadDoors io, bool creations, StdVec *result, ChunksErrorError *error)
 {
-	chunks_packs_open_repositories_frame_0_t frame = {.io = io, .result = result, .error = error};
+	chunks_packs_open_repositories_frame_0_t frame = {.io = io, .creations = creations, .result = result,
+	.error = error};
 
 	std_vec_new(&frame.spaces, sizeof(uint32), _Alignof(uint32));
 	std_vec_new(&frame.found, sizeof(std_TupleU32U32_t), _Alignof(std_TupleU32U32_t));
@@ -591,6 +609,24 @@ chunks_packs_open_repositories(HostIoReadDoors io, StdVec *result, ChunksErrorEr
 	std_PathBuf_new(&frame.dir);
 	std_landing(&frame, chunks_packs_open_repositories_body_0, chunks_packs_open_repositories_pad_0);
 	return frame.ok;
+}
+
+/* chunks_packs_open_repositories returns every repository but those a creation marked, each with its own directory's tablespace. */
+bool
+chunks_packs_open_repositories(HostIoReadDoors io, StdVec *result, ChunksErrorError *error)
+{
+	return chunks_packs_open_repositories_into(io, false, result, error);
+}
+
+/*
+ * chunks_packs_open_creations returns every repository whose own directory
+ * holds a creation's mark, each with that directory's tablespace, which the
+ * creation's outcome settles (bugs row 404).
+ */
+bool
+chunks_packs_open_creations(HostIoReadDoors io, StdVec *result, ChunksErrorError *error)
+{
+	return chunks_packs_open_repositories_into(io, true, result, error);
 }
 
 /*

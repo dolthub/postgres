@@ -174,6 +174,8 @@ extern size_t chunks_trailer_Stamps_entries(const ChunksTrailerStamps *self);
 extern uint64 chunks_trailer_Stamps_entry_len(const ChunksTrailerStamps *self, size_t i);
 extern bool chunks_trailer_Stamps_first(const ChunksTrailerStamps *self, size_t i, ChunksTrailerStamp *result);
 extern void chunks_trailer_Stamps_entry(const ChunksTrailerStamps *self, size_t i, StdVec *result);
+extern bool chunks_trailer_Stamps_stamp_of(const ChunksTrailerStamps *self, size_t i, uint64 tuple,
+										   ChunksTrailerStamp *result);
 extern bool chunks_trailer_Stamps_holds(const ChunksTrailerStamps *self, size_t i, uint64 tuple);
 extern uint64 chunks_trailer_Stamps_max_tuple(const ChunksTrailerStamps *self);
 extern void chunks_trailer_Stamps_push(ChunksTrailerStamps *self, const ChunksTrailerStamp *entry, size_t entry_len);
@@ -195,6 +197,9 @@ extern void chunks_trailer_Stored_trailer(const ChunksTrailerStored *self, StdBy
 										  uint8 *out_2);
 extern ChunksTrailerStored chunks_trailer_Stored_of_trailer(StdBytes hashed, StdBytes locators, StdBytes stamps,
 															uint8 reads);
+#ifdef USE_INJECTION_POINTS
+extern uint64 chunks_trailer_stamps_decoded;
+#endif
 extern bool chunks_trailer_Stored_stamps(const ChunksTrailerStored *self, ChunksTrailerStamps *result,
 										 ChunksErrorError *error);
 
@@ -206,6 +211,7 @@ extern void test_chunks_trailer_tests_corrupt_runs_fail_without_overflowing_or_a
 extern void test_chunks_trailer_tests_a_flipped_byte_anywhere_in_a_trailer_fails_the_split(void);
 extern void test_chunks_trailer_tests_a_locator_keeps_its_three_numbers_at_their_widths(void);
 extern void test_chunks_trailer_tests_xxh3_digests_are_the_committed_table(void);
+extern void test_chunks_trailer_tests_stamp_of_finds_each_copys_stamp_among_its_runs(void);
 extern void test_chunks_trailer_tests_a_leafs_value_ids_follow_its_stamps_and_refuse_every_other_form(void);
 extern void test_chunks_trailer_tests_internal_nodes_store_their_subtrees_highest_tuple_ids(void);
 #endif

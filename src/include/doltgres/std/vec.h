@@ -148,6 +148,9 @@ extern bool std_str_is_char_boundary(const char *self, size_t self_len, size_t i
 extern void test_std_vec_tests_an_over_aligned_element_stays_aligned(void);
 #endif
 
+/* test_std_vec_tests_an_empty_slice_at_null_extends_by_nothing is extend_from_slice's edge test, which std's test module runs. */
+extern void test_std_vec_tests_an_empty_slice_at_null_extends_by_nothing(void);
+
 
 #include "doltgres/std/slice.h"
 

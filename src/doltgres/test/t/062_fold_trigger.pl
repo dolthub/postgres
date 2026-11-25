@@ -468,8 +468,9 @@ my $run_launcher = sub {
 	);
 };
 my $folds = sub {
-	my ($table, $count) = @_;
-	for my $fold (1 .. $count)
+	my ($table, $count, $first) = @_;
+	$first //= 1;
+	for my $fold ($first .. $first + $count - 1)
 	{
 		my $from = 10 * $fold - 9;
 		$node->safe_psql('postgres',
@@ -767,13 +768,21 @@ $holder->quit;
 # 062's budget case (bugs rows 111 and 160) through the real commands: with
 # delta_memory at 1 MB and neither of the fold's thresholds met, committed
 # writes far past it finish, a writer refused at the budget asking for folds
-# whose drops give the delta back and wake it.
+# whose drops give the delta back and wake it. A count right after the last
+# commit, held after it read the table's spill slots while a fold installs a
+# base that applies the spilled rows and drops them from the delta, moves to
+# that base at its next read and counts every row (bugs row 241); the fold
+# launcher is held from before the count, so no fold but the case's own
+# installs a base.
 my $budget = PostgreSQL::Test::Cluster->new('budget');
 $budget->init;
 $budget->append_conf('postgresql.conf',
-	"delta_memory = 1MB\nfold_threshold = '1GB'\nfold_timeout = 3600s");
+	"delta_memory = 1MB\nfold_threshold = '1GB'\nfold_timeout = 3600s\nautovacuum = off"
+);
 $budget->start;
-$budget->safe_psql('postgres', 'CREATE TABLE committed (k int4, v text)');
+$budget->safe_psql('postgres',
+	'CREATE EXTENSION injection_points; CREATE EXTENSION doltgres_test; CREATE TABLE committed (k int4, v text)'
+);
 my $refused = 0;
 for my $batch (0 .. 49)
 {
@@ -785,8 +794,241 @@ for my $batch (0 .. 49)
 }
 is($refused, 0,
 	"fifty committed writes past a 1 MB delta_memory finish with neither of the fold's thresholds met");
+$budget->safe_psql('postgres',
+	"SELECT injection_points_attach('doltgres-fold-launch', 'wait')");
+$budget->poll_query_until('postgres',
+	q{SELECT count(*) = 1 FROM pg_stat_activity WHERE wait_event = 'doltgres-fold-launch'}
+) or die 'the fold launcher never waited';
+$budget->poll_query_until('postgres',
+	q{SELECT count(*) = 0 FROM pg_stat_activity WHERE backend_type = 'fold worker'}
+) or die 'a fold worker kept running';
+my $counter = $budget->background_psql('postgres');
+$counter->query_safe(
+	"SELECT injection_points_set_local(); SELECT injection_points_attach('doltgres-spill-slots-read', 'wait')"
+);
+$counter->query_until(qr/held/,
+	"\\echo held\nSELECT count(*) FROM committed;\n");
+$budget->wait_for_event('client backend', 'doltgres-spill-slots-read');
+is( $budget->safe_psql('postgres', "SELECT doltgres_test_fold('committed')"),
+	't',
+	'a fold under the held count installs a base');
+$budget->safe_psql('postgres',
+	"SELECT injection_points_detach('doltgres-fold-launch'); SELECT injection_points_wakeup('doltgres-fold-launch')"
+);
+$budget->safe_psql('postgres',
+	"SELECT injection_points_detach('doltgres-spill-slots-read'); SELECT injection_points_wakeup('doltgres-spill-slots-read')"
+);
+my $counted = $counter->query_safe('SELECT 1');
+$counter->quit;
+like($counted, qr/^50000$/m,
+	'a count right after the last commit, held across a fold that applied its spilled rows, counts every row'
+);
 is($budget->safe_psql('postgres', 'SELECT count(*) FROM committed'),
 	'50000', 'and every row reads back');
 $budget->stop;
 
+# Bugs row 306: a fold worker held inside its fold, its snapshot taken, keeps
+# neither CREATE INDEX CONCURRENTLY nor REINDEX TABLE CONCURRENTLY of other
+# tables waiting for it, as a VACUUM doesn't.
+my $built = PostgreSQL::Test::Cluster->new('built');
+$built->init;
+$built->append_conf('postgresql.conf',
+	"fold_threshold = 16kB\nfold_timeout = 3600s\nautovacuum = off");
+$built->start;
+$built->safe_psql(
+	'postgres', q{
+CREATE EXTENSION injection_points;
+CREATE EXTENSION doltgres_test;
+CREATE TABLE indexed (k int4);
+INSERT INTO indexed SELECT generate_series(1, 100);
+CREATE TABLE reindexed (k int4);
+INSERT INTO reindexed SELECT generate_series(1, 100);
+CREATE INDEX reindexed_k ON reindexed (k);
+CREATE TABLE held (k int4, v text);
+SELECT injection_points_attach('doltgres-fold-relation', 'wait');
+});
+$built->safe_psql('postgres',
+	"SELECT doltgres_test_write('held', true, 'INSERT INTO held SELECT n, repeat(''h'', 200) FROM generate_series(1, 200) n')"
+);
+$built->wait_for_event('fold worker', 'doltgres-fold-relation');
+is( $built->safe_psql(
+		'postgres',
+		q{SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'fold worker' AND wait_event = 'doltgres-fold-relation' AND backend_xmin IS NOT NULL}
+	),
+	'1',
+	'the held fold worker has its snapshot');
+my ($built_ret, $built_out, $built_err) = $built->psql('postgres',
+	"SET lock_timeout = '30s'; CREATE INDEX CONCURRENTLY indexed_k ON indexed (k)"
+);
+is($built_ret, 0,
+	"CREATE INDEX CONCURRENTLY doesn't wait for a fold worker held inside its fold"
+);
+($built_ret, $built_out, $built_err) = $built->psql('postgres',
+	"SET lock_timeout = '30s'; REINDEX TABLE CONCURRENTLY reindexed");
+is($built_ret, 0,
+	"REINDEX TABLE CONCURRENTLY doesn't wait for a fold worker held inside its fold"
+);
+$built->safe_psql('postgres',
+	"SELECT injection_points_detach('doltgres-fold-relation'); SELECT injection_points_wakeup('doltgres-fold-relation')"
+);
+ok( $built->poll_query_until(
+		'postgres',
+		"SELECT split_part(doltgres_test_base_sizes('held'), ' ', 2) = '200'"
+	),
+	'the released fold installs its base');
+is( $built->safe_psql(
+		'postgres',
+		'SET enable_seqscan = off; SELECT count(*) FROM indexed WHERE k <= 50; SELECT count(*) FROM reindexed WHERE k <= 50'
+	),
+	"50\n50",
+	'and the built and the rebuilt index read their tables');
+
+# A CREATE INDEX CONCURRENTLY of the very table a held fold worker folds, its
+# snapshot older than the deletes and inserts made before the build, doesn't
+# wait for it, and once the fold installs its base the new index gives every
+# row a sequential scan gives.
+$built->safe_psql(
+	'postgres', q{
+CREATE TABLE own (k int4, v text);
+INSERT INTO own SELECT n, 'o' FROM generate_series(1, 100) n;
+SELECT injection_points_attach('doltgres-fold-relation', 'wait');
+});
+$built->safe_psql('postgres',
+	"SELECT doltgres_test_write('own', true, 'INSERT INTO own SELECT n, repeat(''o'', 200) FROM generate_series(101, 300) n')"
+);
+$built->wait_for_event('fold worker', 'doltgres-fold-relation');
+$built->safe_psql('postgres',
+	q{DELETE FROM own WHERE k <= 20; INSERT INTO own SELECT n, 'n' FROM generate_series(301, 350) n}
+);
+($built_ret, $built_out, $built_err) = $built->psql('postgres',
+	"SET lock_timeout = '30s'; CREATE INDEX CONCURRENTLY own_k ON own (k)");
+is($built_ret, 0,
+	"CREATE INDEX CONCURRENTLY of a table a held fold worker folds doesn't wait for it"
+);
+$built->safe_psql('postgres',
+	"SELECT injection_points_detach('doltgres-fold-relation'); SELECT injection_points_wakeup('doltgres-fold-relation')"
+);
+ok( $built->poll_query_until(
+		'postgres',
+		q{SELECT count(*) = 0 FROM pg_stat_activity WHERE backend_type = 'fold worker'}
+	),
+	"the table's released fold ends");
+my $counted_rows = q{SELECT count(*) || ' ' || sum(k) FROM own WHERE k > 0};
+my $by_index =
+  "SET enable_seqscan = off; SET enable_bitmapscan = off; $counted_rows";
+my $by_scan =
+  "SET enable_indexscan = off; SET enable_bitmapscan = off; SET enable_indexonlyscan = off; $counted_rows";
+is($built->safe_psql('postgres', $by_index),
+	'330 61215', 'and the new index gives every row');
+is($built->safe_psql('postgres', $by_scan),
+	'330 61215', 'as a sequential scan does');
+$built->safe_psql('postgres',
+	"SELECT doltgres_test_fold('own'); SELECT doltgres_test_index_fold('own_k')"
+);
+is($built->safe_psql('postgres', $by_index),
+	'330 61215',
+	'and still does once the table and the index fold every row');
+$built->stop;
+
+# A replayed free's take-out passes over a later take of its tuple id (bugs
+# row 320): with a standby's launcher held, the primary folds three rounds of
+# a comparator-keyed table, each deleting a row and freeing its tuple id at a
+# VACUUM, the next round's insert taking that tuple id again on another key,
+# and a fourth round's take of it stays live. Once the launcher runs, the
+# standby folds each point and does each free's deferred take-outs past it,
+# which meet the later takes; every root matches its primary's at each fold,
+# and after a last VACUUM every row reads back as on the primary.
+$node->safe_psql('postgres',
+	"ALTER SYSTEM SET fold_threshold = '1GB'; ALTER SYSTEM SET fold_timeout = '3600s'; SELECT pg_reload_conf()"
+);
+$node->backup('retaken');
+my $retaken = PostgreSQL::Test::Cluster->new('retaken');
+$retaken->init_from_backup($node, 'retaken', has_streaming => 1);
+$retaken->start;
+ok($held_launcher->($retaken), "the retaken standby's launcher is held");
+$node->safe_psql('postgres',
+	'CREATE TABLE retaken_keys (k ranged PRIMARY KEY, v text)');
+$folds->('retaken_keys', 3);
+$node->safe_psql('postgres',
+	"SELECT doltgres_test_write('retaken_keys', true, 'INSERT INTO retaken_keys SELECT ranged(n, n + 1), ''r'' FROM generate_series(31, 40) n')"
+);
+$node->safe_psql('postgres', "SELECT doltgres_test_fold('retaken_keys')");
+$node->safe_psql('postgres',
+	"SELECT doltgres_test_vacuum('retaken_keys', 'auto')");
+$node->wait_for_replay_catchup($retaken);
+$offset = -s $retaken->logfile;
+$run_launcher->($retaken);
+ok( $same_base->($retaken, 'retaken_keys'),
+	"a lagging standby whose deferred take-outs meet later takes of their tuple ids folds each point to its primary's roots"
+);
+ok( !$retaken->log_contains(qr/does not match its primary's/, $offset),
+	"the retaken standby's rows, tuple id, free space, and pending tuple id roots match each record's"
+);
+$node->safe_psql('postgres',
+	"SELECT doltgres_test_vacuum('retaken_keys', 'auto')");
+$node->wait_for_replay_catchup($retaken);
+my $retaken_rows =
+  q{SELECT doltgres_test_standing('retaken_keys', 'SELECT string_agg(lower(k)::text, '' '' ORDER BY lower(k)) FROM retaken_keys')};
+is( $retaken->safe_psql('postgres', $retaken_rows),
+	$node->safe_psql('postgres', $retaken_rows),
+	"after a last VACUUM every row, the live retake's included, reads back on the standby as on its primary"
+);
+$retaken->stop;
+
+# A standby's startup that finds no reached point on entry to its fold, its
+# worker having folded the first, checks the key of each point its catch-up
+# reaches (bugs row 341): with the launcher held, the primary folds a
+# comparator-keyed table twice, its standby's slot keeping the first point and
+# leaving the second's record to the WAL, and then a third time; the startup
+# is held after replaying the third fold's record while the woken worker
+# folds the first point and is held after its install; the released startup
+# then reads the second's record from the WAL and leaves that point to the
+# worker rather than fold it in its bytes' order, and every root is the
+# primary's.
+$node->backup('caught');
+my $caught = PostgreSQL::Test::Cluster->new('caught');
+$caught->init_from_backup($node, 'caught', has_streaming => 1);
+$caught->start;
+ok($held_launcher->($caught), "the caught standby's launcher is held");
+$node->safe_psql('postgres',
+	'CREATE TABLE caught_keys (k ranged PRIMARY KEY, v text)');
+$folds->('caught_keys', 1);
+my $caught_sizes = "SELECT doltgres_test_base_sizes('caught_keys')";
+my $caught_first = $node->safe_psql('postgres', $caught_sizes);
+$folds->('caught_keys', 1, 2);
+$node->wait_for_catchup($caught, 'replay', $node->lsn('insert'));
+$caught->safe_psql('postgres',
+	"SELECT injection_points_attach('doltgres-redo-advanced-unkept', 'wait'); SELECT injection_points_attach('doltgres-fold-in-order-installed', 'wait')"
+);
+$node->safe_psql('postgres',
+	"SELECT doltgres_test_write('caught_keys', true, 'INSERT INTO caught_keys SELECT ranged(n, n + 1), ''c'' FROM generate_series(21, 30) n')"
+);
+$node->safe_psql('postgres', "SELECT doltgres_test_fold('caught_keys')");
+$caught->wait_for_event('startup', 'doltgres-redo-advanced-unkept');
+$offset = -s $caught->logfile;
+$run_launcher->($caught);
+$caught->wait_for_event('fold worker', 'doltgres-fold-in-order-installed');
+ok( $caught->poll_query_until('postgres', "$caught_sizes = '$caught_first'"),
+	"before the startup is released, the worker has installed the first point alone"
+);
+$caught->safe_psql('postgres',
+	"SELECT injection_points_detach('doltgres-redo-advanced-unkept'); SELECT injection_points_wakeup('doltgres-redo-advanced-unkept')"
+);
+ok( $caught->poll_query_until(
+		'postgres',
+		"SELECT count(*) = 0 FROM pg_stat_activity WHERE backend_type = 'startup' AND wait_event = 'doltgres-redo-advanced-unkept'"
+	),
+	"the released startup goes on past the third fold's record while the worker is held after its install"
+);
+$caught->safe_psql('postgres',
+	"SELECT injection_points_detach('doltgres-fold-in-order-installed'); SELECT injection_points_wakeup('doltgres-fold-in-order-installed')"
+);
+ok($same_base->($caught, 'caught_keys'),
+	"the worker folds the points the startup left, each root its primary's");
+ok( !$caught->log_contains(
+		qr/read in an order it was not written in|does not match its primary's/,
+		$offset),
+	"the caught standby reads no node out of its order and matches each record's roots"
+);
+$caught->stop;
 done_testing();

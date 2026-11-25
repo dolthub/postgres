@@ -120,6 +120,7 @@ extern const TxnVisibleRuleOps TXN_FOLD_FOLDING_RULE_OPS;
 
 /* TXN_FOLD_COMMITTING_RULE_OPS is Committing's Rule. */
 extern const TxnVisibleRuleOps TXN_FOLD_COMMITTING_RULE_OPS;
+extern const TxnVisibleRuleOps TXN_FOLD_EVERY_RULE_OPS;
 
 /*
  * TxnFoldCtidEdit is CtidEdit: a fold's edit of its base's tuple id tree, a
@@ -206,14 +207,28 @@ typedef enum TxnFoldCaught
 } TxnFoldCaught;
 
 /*
- * TxnFoldReached is Reached: the base a standby's fold checks against, and the
- * reports of comparator roots that differ.
+ * TxnFoldStatuses is a fold's statuses read back from its records: the
+ * writers it answered aborted and the committed writers whose killed versions
+ * it answered aborted, each a Vec<u64>, ascending, both empty under the empty
+ * rule (bugs row 432).
+ */
+typedef struct TxnFoldStatuses
+{
+	StdVec		aborted;
+	StdVec		killed;
+} TxnFoldStatuses;
+
+/*
+ * TxnFoldReached is Reached: the base a standby's fold checks against, the
+ * reports of comparator roots that differ, and the statuses the fold answers
+ * its writers by, as its primary did.
  */
 typedef struct TxnFoldReached
 {
 	const TxnBaseBase *base;
 	/* warned is a Vec<String>. */
 	StdVec	   *warned;
+	const TxnFoldStatuses *statuses;
 } TxnFoldReached;
 
 /*
@@ -278,11 +293,37 @@ typedef struct TxnFoldReform
 
 extern void txn_fold_CtidEdit_drop(void *edit_);
 extern void txn_fold_KeyFold_drop(TxnFoldKeyFold *self);
+
+/* TXN_FOLD_DIGEST_LEN is the length of a repository's digest. */
+#define TXN_FOLD_DIGEST_LEN 32
+
+/*
+ * TxnFoldDigestKind is what the digest folds a storage as: keyed, keyless, or
+ * unknown, which it folds keyed, as no backend recorded its key.
+ */
+typedef enum TxnFoldDigestKind
+{
+	TXN_FOLD_DIGEST_KEYED,
+	TXN_FOLD_DIGEST_KEYLESS,
+	TXN_FOLD_DIGEST_UNKNOWN,
+} TxnFoldDigestKind;
+
+/* TxnFoldDigested is a storage the digest folded, by its tablespace and relation, and its kind. */
+typedef struct TxnFoldDigested
+{
+	uint32		tablespace;
+	uint32		relation;
+	uint8		kind;
+} TxnFoldDigested;
+
+extern bool txn_fold_digest(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading, uint32 database,
+							const StdVec *given, StdVec *kinds, uint8 *result, bool *disagreed, TxnFoldDigested *at,
+							HostError *error);
 extern bool txn_fold_folded_key(HostIoIo *io, TreesStoreNodeStore store, bool has_base, TreesStoreTree base,
 								const TreesKeyOrder *order, bool keyless, bool index, TxnVisibleRule rule,
 								const uint8 *key, size_t key_len, TxnMemtableVersionVersion *versions,
 								size_t versions_len, bool *has_result, TxnFoldKeyFold *result, uint64 *max_ended,
-								HostError *error);
+								StdVec *gone, HostError *error);
 extern void txn_fold_FoldedRows_drop(TxnFoldFoldedRows *self);
 extern bool txn_fold_folded_rows(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held, bool has_base,
 								 TreesStoreTree base, bool has_tuple_ids, TreesStoreTree tuple_ids,
@@ -290,7 +331,8 @@ extern bool txn_fold_folded_rows(HostIoIo *io, TreesStoreNodeStore store, const 
 								 TxnFoldFoldedRows *result, HostError *error);
 extern bool txn_fold_folded(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading,
 							const HostSharedHeld *held, const TreesKeyOrder *order, bool keyless, HostLsn point,
-							TxnFoldReform *reform, TxnFoldReached *reached, bool *result, HostError *error);
+							const TxnInsertPage *page, TxnFoldReform *reform, TxnFoldReached *reached,
+							bool rolled_back, bool *result, HostError *error);
 extern bool txn_fold_caught_up(HostIoIo *io, const HostSharedHeld *held, const TxnInsertPage *page, uint64 upto,
 							   TxnFoldCaught *result, HostError *error);
 extern bool txn_fold_Applied_PartialEq_eq(const TxnFoldApplied *self, const TxnFoldApplied *other);
@@ -299,6 +341,12 @@ extern bool txn_fold_applied(HostIoIo *io, TxnMemtableVersionVersion *version, H
 							 TxnFoldApplied *result, HostError *error);
 extern bool txn_fold_applied_by(HostIoIo *io, TxnMemtableVersionWriter writer, bool has_lsn, uint64 lsn,
 								HostStatus status, HostLsn point, TxnFoldApplied *result, HostError *error);
+extern bool txn_fold_map_applied(HostIoIo *io, TxnMemtableVersionVersion *version, HostLsn point,
+								 TxnFoldApplied *result, HostError *error);
+extern bool txn_fold_whole(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading,
+						   const HostSharedHeld *held, TreesStoreBrandedWriter *writer, const bool *has_roots,
+						   const size_t *roots, TxnBaseBase *base, HostLsn point, HostLsn read, uint64 generation,
+						   uint64 horizon, bool has_nodes, uint64 nodes, bool *result, HostError *error);
 extern bool txn_fold_built(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading,
 						   const HostSharedHeld *held, const TreesKeyOrder *order, TxnFoldTrees *trees,
 						   TxnBaseBase *base, HostLsn point, bool has_nodes, uint64 nodes, uint64 horizon,
@@ -307,36 +355,40 @@ extern bool txn_fold_chained(HostIoIo *io, const RepoRepo *repo, const HostShare
 							 const HostSharedHeld *held, TxnBasePending *pending, HostError *error);
 extern bool txn_fold_committed_moves(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held,
 									 bool has_base, TreesStoreTree base, bool has_tuple_ids, TreesStoreTree tuple_ids,
-									 const TreesKeyOrder *order, bool keyless, bool index, uint64 own,
-									 const uint8 *key, size_t key_len, TxnBaseSizes *result_0,
+									 const TreesKeyOrder *order, bool keyless, bool index, HostLsn folded,
+									 uint64 own, const uint8 *key, size_t key_len, TxnBaseSizes *result_0,
 									 TxnBaseSizes *result_1, HostError *error);
 extern bool txn_fold_committed_value_moves(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held,
 										   bool has_root, TreesStoreTree root, uint64 own, const uint8 *key,
 										   size_t key_len, TxnBaseSizes *result_0, TxnBaseSizes *result_1,
 										   HostError *error);
 extern bool txn_fold_copied(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading,
-							const HostSharedHeld *held, TxnBaseBase *base, HostLsn point, bool has_nodes,
-							uint64 nodes, TxnFoldCopies *memo, bool *result, HostError *error);
+							const HostSharedHeld *held, TxnBaseBase *base, HostLsn point, HostLsn read,
+							bool has_nodes, uint64 nodes, TxnFoldCopies *memo, bool *result, HostError *error);
 extern void txn_fold_Copies_drop(TxnFoldCopies *self);
 extern bool txn_fold_fold_now(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading,
 							  const HostSharedHeld *held, const TreesKeyOrder *order, bool keyless, bool has_point,
 							  HostLsn point, uint64 horizon, StdVec *warned, const TxnInsertPage *page,
-							  TxnFoldReform *reform, bool *result, HostError *error);
+							  TxnFoldReform *reform, bool rolled_back, bool *result, HostError *error);
 extern bool txn_fold_kept_out(HostIoIo *io, uint64 top, uint64 horizon, HostLsn *bound, HostError *error);
 extern bool txn_fold_point(HostIoIo *io, bool *has_result, HostLsn *result, HostError *error);
 extern bool txn_fold_recount(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held,
 							 const TreesKeyOrder *order, bool keyless, bool *has_result, TxnBaseSizes *result,
 							 HostError *error);
+extern void txn_fold_statuses_redone(const TxnRecordFoldStatuses *statuses, uint64 start);
+extern void txn_fold_Statuses_drop(TxnFoldStatuses *self);
+extern bool txn_fold_statuses_replayed(HostIoIo *io, const TxnRecordBaseAdvanced *advanced, uint64 start, uint64 end,
+									   uint64 *from, TxnFoldStatuses *result, HostError *error);
 extern bool txn_fold_redo(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading,
-						  const HostSharedHeld *held, const TxnRecordBaseAdvanced *advanced, uint64 end, bool *result,
-						  HostError *error);
+						  const HostSharedHeld *held, const TxnRecordBaseAdvanced *advanced,
+						  const TxnFoldStatuses *statuses, uint64 from, uint64 end, bool *result, HostError *error);
 extern bool txn_fold_redo_chained(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading,
 								  const HostSharedHeld *held, const TxnBasePending *entries, size_t entries_len,
-								  TxnBaseBase *recorded, HostError *error);
+								  TxnBaseBase *recorded, HostLsn end, HostError *error);
 extern bool txn_fold_settled(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading,
 							 const HostSharedHeld *held, StdVec *result, HostError *error);
 extern bool txn_fold_startup_fold(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading,
-								  const HostSharedHeld *held, const TxnInsertPage *page, uint64 upto, bool *result,
-								  HostError *error);
+								  const HostSharedHeld *held, const TxnInsertPage *page, uint64 upto,
+								  const TxnFoldStatuses *redone, bool *result, HostError *error);
 
 #endif							/* DOLTGRES_TXN_FOLD_H */

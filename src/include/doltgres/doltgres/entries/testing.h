@@ -96,7 +96,10 @@ extern bool doltgres_entries_testing_doltgres_test_index_fetch_key(const PgCatal
 extern bool doltgres_entries_testing_doltgres_test_fold(const PgCatalogCaps *caps, const PgRel *target, bool *result,
 														PgPgError *error);
 extern bool doltgres_entries_testing_doltgres_test_free_space(const PgCatalogCaps *caps, const PgRel *target,
-															  int32 block, PgDatum *result, PgPgError *error);
+															  int32 block, int64 point,
+															  PgDatum *result, PgPgError *error);
+extern bool doltgres_entries_testing_doltgres_test_base_points(const PgCatalogCaps *caps, const PgRel *target,
+															   PgDatum *result, PgPgError *error);
 extern bool doltgres_entries_testing_doltgres_test_base_sizes(const PgCatalogCaps *caps, const PgRel *target,
 															  PgDatum *result, PgPgError *error);
 extern bool doltgres_entries_testing_doltgres_test_index_entries(const PgCatalogCaps *caps, const PgRel *target,
@@ -117,14 +120,40 @@ extern bool doltgres_entries_testing_doltgres_test_changes(const PgCatalogCaps *
 extern bool doltgres_entries_testing_doltgres_test_built_nodes(const PgCaps *caps, PgDatum *result, PgPgError *error);
 extern bool doltgres_entries_testing_doltgres_test_mapped(const PgCatalogCaps *caps, const PgRel *target, bool *result,
 														  PgPgError *error);
+extern bool doltgres_entries_testing_doltgres_test_rolling(const PgCatalogCaps *caps, const PgRel *target, bool *result,
+														   PgPgError *error);
 extern bool doltgres_entries_testing_doltgres_test_identity(const PgCatalogCaps *caps, int32 kind, uint32 number,
 															int32 attnum, PgDatum *result, PgPgError *error);
 extern bool doltgres_entries_testing_doltgres_test_epochs(const PgCaps *caps, PgDatum *result, PgPgError *error);
+extern bool doltgres_entries_testing_doltgres_test_identity_versions(const PgCaps *caps, int32 kind, uint32 number,
+																	 PgDatum *result, PgPgError *error);
+extern bool doltgres_entries_testing_doltgres_test_save(const PgCaps *caps, PgDatum *result, PgPgError *error);
+extern bool doltgres_entries_testing_doltgres_test_delta_held(const PgCaps *caps, int64 *result, PgPgError *error);
+extern bool doltgres_entries_testing_doltgres_test_chunks(const PgCaps *caps, int64 xid, int64 *result,
+														  PgPgError *error);
 extern bool doltgres_entries_testing_doltgres_test_base_levels(const PgCatalogCaps *caps, const PgRel *target,
 															   int32 *result, PgPgError *error);
+extern bool doltgres_entries_testing_doltgres_test_unplaced(const PgCatalogCaps *caps, const PgRel *target,
+															int32 *result, PgPgError *error);
+extern bool doltgres_entries_testing_doltgres_test_unrooted(const PgCatalogCaps *caps, const PgRel *target,
+															int32 *result, PgPgError *error);
+extern bool doltgres_entries_testing_doltgres_test_tuples_record(const PgCatalogCaps *caps, const PgRel *target,
+																 int32 *result, PgPgError *error);
+extern bool doltgres_entries_testing_doltgres_test_tuples_moved(const PgCatalogCaps *caps, const PgRel *target,
+																int32 *result, PgPgError *error);
 extern bool doltgres_entries_testing_doltgres_test_totals(const PgCatalogCaps *caps, const PgRel *target,
 														  PgDatum *result, PgPgError *error);
+extern bool doltgres_entries_testing_doltgres_test_scan_shape(const PgCatalogCaps *caps, const PgRel *target,
+															  PgDatum *result, PgPgError *error);
 extern bool doltgres_entries_testing_doltgres_test_count(const PgCatalogCaps *caps, const PgRel *target,
 														 PgDatum *result, PgPgError *error);
+extern bool doltgres_entries_testing_doltgres_test_listed_unwritten(const PgCaps *caps, const PgRel *target,
+																	bool *result, PgPgError *error);
+extern bool doltgres_entries_testing_doltgres_test_step_unwritten(const PgCatalogCaps *caps, PgIndexScan *scan,
+																  bool *result, PgPgError *error);
+extern bool doltgres_entries_testing_doltgres_test_stamps_decoded(const PgCaps *caps, int64 *result, PgPgError *error);
+extern bool doltgres_entries_testing_doltgres_test_bases_decoded(const PgCaps *caps, int64 *result, PgPgError *error);
+extern bool doltgres_entries_testing_doltgres_test_spill_reads(const PgCaps *caps, int32 which, int64 *result,
+															   PgPgError *error);
 
 #endif							/* DOLTGRES_DOLTGRES_ENTRIES_TESTING_H */

@@ -213,7 +213,7 @@ AS 'MODULE_PATHNAME', 'dg_index_routine' LANGUAGE C STRICT;
 CREATE FUNCTION doltgres_test_vacuum(target regclass, index_cleanup text) RETURNS void
 AS 'MODULE_PATHNAME', 'dg_vacuum' LANGUAGE C STRICT;
 
-CREATE FUNCTION doltgres_test_free_space(target regclass, block int4) RETURNS text
+CREATE FUNCTION doltgres_test_free_space(target regclass, block int4, point pg_lsn DEFAULT 'FFFFFFFF/FFFFFFFF') RETURNS text
 AS 'MODULE_PATHNAME', 'dg_free_space' LANGUAGE C STRICT;
 
 CREATE FUNCTION doltgres_test_base_sizes(target regclass) RETURNS text
@@ -332,3 +332,48 @@ AS 'MODULE_PATHNAME', 'dg_listed_unwritten' LANGUAGE C STRICT;
 
 CREATE FUNCTION doltgres_test_step_unwritten() RETURNS bool
 AS 'MODULE_PATHNAME', 'dg_step_unwritten' LANGUAGE C STRICT;
+
+CREATE FUNCTION doltgres_test_scan_shape(target regclass) RETURNS text
+AS 'MODULE_PATHNAME', 'dg_scan_shape' LANGUAGE C STRICT;
+
+CREATE FUNCTION doltgres_test_index_move(index regclass, tablespace text) RETURNS void
+AS 'MODULE_PATHNAME', 'dg_index_move' LANGUAGE C STRICT;
+
+CREATE FUNCTION doltgres_test_base_points(target regclass) RETURNS text
+AS 'MODULE_PATHNAME', 'dg_base_points' LANGUAGE C STRICT;
+
+CREATE FUNCTION doltgres_test_identity_versions(kind int4, number oid) RETURNS text
+AS 'MODULE_PATHNAME', 'dg_identity_versions' LANGUAGE C STRICT;
+
+CREATE FUNCTION doltgres_test_save() RETURNS text
+AS 'MODULE_PATHNAME', 'dg_save' LANGUAGE C STRICT;
+
+CREATE FUNCTION doltgres_test_chunks(xid int8) RETURNS int8
+AS 'MODULE_PATHNAME', 'dg_chunks' LANGUAGE C STRICT;
+
+CREATE FUNCTION doltgres_test_unplaced(target regclass) RETURNS int8
+AS 'MODULE_PATHNAME', 'dg_unplaced' LANGUAGE C STRICT;
+
+CREATE FUNCTION doltgres_test_unrooted(target regclass) RETURNS int8
+AS 'MODULE_PATHNAME', 'dg_unrooted' LANGUAGE C STRICT;
+
+CREATE FUNCTION doltgres_test_delta_held() RETURNS int8
+AS 'MODULE_PATHNAME', 'dg_delta_held' LANGUAGE C STRICT;
+
+CREATE FUNCTION doltgres_test_tuples_record(target regclass) RETURNS int8
+AS 'MODULE_PATHNAME', 'dg_tuples_record' LANGUAGE C STRICT;
+
+CREATE FUNCTION doltgres_test_tuples_moved(target regclass) RETURNS int8
+AS 'MODULE_PATHNAME', 'dg_tuples_moved' LANGUAGE C STRICT;
+
+CREATE FUNCTION doltgres_test_stamps_decoded() RETURNS int8
+AS 'MODULE_PATHNAME', 'dg_stamps_decoded' LANGUAGE C STRICT;
+
+CREATE FUNCTION doltgres_test_bases_decoded() RETURNS int8
+AS 'MODULE_PATHNAME', 'dg_bases_decoded' LANGUAGE C STRICT;
+
+CREATE FUNCTION doltgres_test_spill_reads(which int4) RETURNS int8
+AS 'MODULE_PATHNAME', 'dg_spill_reads' LANGUAGE C STRICT;
+
+CREATE FUNCTION doltgres_test_rolling(target regclass) RETURNS bool
+AS 'MODULE_PATHNAME', 'dg_rolling' LANGUAGE C STRICT;

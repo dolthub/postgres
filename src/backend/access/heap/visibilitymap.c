@@ -101,6 +101,7 @@
 #include "access/visibilitymap.h"
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
+#include "doltgres/hooks.h"
 #include "miscadmin.h"
 #include "port/pg_bitutils.h"
 #include "storage/bufmgr.h"
@@ -378,6 +379,9 @@ visibilitymap_count(Relation rel, BlockNumber *all_visible, BlockNumber *all_fro
 
 	/* all_visible must be specified */
 	Assert(all_visible);
+
+	if (doltgres_visibility_counted(rel, all_visible, all_frozen))
+		return;
 
 	for (mapBlock = 0;; mapBlock++)
 	{

@@ -2533,6 +2533,68 @@ test_simc_tests_a_scripted_run_runs_each_actor_until_its_point_and_terminates_on
 	simc_TestIo_drop(&test_io);
 }
 
+/* test_simc_tests_trace_Debug_fmt is the trace case's Vec<usize> Debug. */
+static bool
+test_simc_tests_trace_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const StdVec *trace = value;
+	StdDebugList list = std_fmt_debug_list(f);
+
+	for (size_t k = 0; k < trace->len; k++)
+		std_DebugList_entry(&list, &STD_VEC_AT(trace, size_t, k), std_usize_Debug_fmt);
+	return std_DebugList_finish(&list);
+}
+
+/*
+ * test_simc_tests_a_reports_trace_is_the_rusts:
+ * a finished run's trace is its report's, each yield point's actor in order
+ * as the Rust's Debug of the report shows it, the first actor's pause first.
+ */
+static void
+test_simc_tests_a_reports_trace_is_the_rusts(void)
+{
+	static const StdFmtPiece report_pieces[] = {STD_FMT_ARG(0)};
+	static const StdFmtPiece trace_pieces[] = {STD_FMT_LIT("trace: "), STD_FMT_ARG(0), STD_FMT_LIT(", exits")};
+	SimcTestIo	test_io = simc_io();
+	SimcRun		run = simc_Run_new(13);
+	SimcActor	first = {test_simc_tests_pausing_actor, (void *) (intptr_t) 1};
+	SimcActor	second = {test_simc_tests_pausing_actor, (void *) (intptr_t) 2};
+	SimcStep	steps[] = {{"second", 6, PG_UINT64_MAX}, {"first", 5, PG_UINT64_MAX}};
+	SimcReport	report;
+	StdVec		trace;
+	StdString text;
+	StdString	shown;
+	StdFmtArg	report_args[1];
+	StdFmtArg	trace_args[1];
+	StdFmtArguments report_formatted = {report_pieces, lengthof(report_pieces), report_args};
+	StdFmtArguments trace_formatted = {trace_pieces, lengthof(trace_pieces), trace_args};
+	bool		found = false;
+
+	test_simc_tests_FINISHED = 0;
+	simc_Run_actor(&run, "first", 5, first);
+	simc_Run_actor(&run, "second", 6, second);
+	simc_Run_until(&run, "first", 5, "doltgres-simc-case-first");
+	simc_Run_script(&run, steps, lengthof(steps));
+	report = simc_Run_finish(run);
+	trace = simc_Report_trace(&report);
+	report_args[0].value = &report;
+	report_args[0].fmt = simc_Report_Debug_fmt;
+	std_fmt_format_Checked(&text, &report_formatted);
+	trace_args[0].value = &trace;
+	trace_args[0].fmt = test_simc_tests_trace_Debug_fmt;
+	std_fmt_format_Checked(&shown, &trace_formatted);
+	for (size_t at = 0; !found && at + shown.len <= text.len; at++)
+		found = memcmp((const uint8 *) text.ptr + at, shown.ptr, shown.len) == 0;
+	STD_ASSERT(__LINE__, 5, trace.len >= 2 && STD_VEC_AT(&trace, size_t, 0) == 0,
+			   "the first actor's pause is the trace's first yield");
+	STD_ASSERT(__LINE__, 5, found, "the trace is the report's");
+	std_vec_free_Checked(&shown, 1, 1);
+	std_vec_free_Checked(&text, 1, 1);
+	std_vec_free_Checked(&trace, sizeof(size_t), _Alignof(size_t));
+	simc_Report_drop(&report);
+	simc_TestIo_drop(&test_io);
+}
+
 /* test_simc_tests_acting is the acting case's body: it records that it ran. */
 static void
 test_simc_tests_acting(void *captures)
@@ -3307,6 +3369,301 @@ test_simc_tests_the_checkpoint_delay_doors_answer_as_the_simulations_host(void)
 	simc_TestIo_drop(&test_io);
 }
 
+/* test_simc_tests_horizon is the horizon case's actor: a NonVacuumable snapshot's removable xids. */
+static void
+test_simc_tests_horizon(void *captures)
+{
+	HostHost	host = host_current();
+	HostMayRaise raise = host_doors(HOST_IO_IO_READ_DOORS((HostIoIo *) captures));
+	HostXid		horizon = {100};
+	HostXid		below = {99};
+	SimcTaken	taken = simc_non_vacuumable(horizon);
+	HostSnapshot snapshot = simc_Taken_lent(&taken);
+	HostError	error;
+	bool		removable;
+
+	STD_ASSERT(__LINE__, 5, snapshot.kind == HOST_SNAPSHOT_KIND_NON_VACUUMABLE, "the snapshot is NonVacuumable");
+	STD_ASSERT(__LINE__, 5, host.ops->removable_in(host.self, &raise, snapshot.of, below, &removable, &error) &&
+			   removable, "an xid below the horizon is removable");
+	STD_ASSERT(__LINE__, 5, host.ops->removable_in(host.self, &raise, snapshot.of, horizon, &removable, &error) &&
+			   !removable, "the horizon's own xid isn't");
+	simc_Taken_drop(&taken);
+}
+
+/*
+ * test_simc_tests_a_non_vacuumable_snapshot_finds_xids_below_its_horizon_removable:
+ * a NonVacuumable snapshot is of its kind, and through the removable_in door
+ * it finds an xid below its horizon removable and the horizon's own not.
+ */
+static void
+test_simc_tests_a_non_vacuumable_snapshot_finds_xids_below_its_horizon_removable(void)
+{
+	SimcTestIo	test_io = simc_io();
+
+	simc_as_actor(55, test_simc_tests_horizon, &test_io.io);
+	simc_TestIo_drop(&test_io);
+}
+
+/* test_simc_tests_logging is the logged case's actor: it inserts a record and reads it back as the WAL took it. */
+static void
+test_simc_tests_logging(void *captures)
+{
+	static const uint8 body[] = {1, 2, 3};
+	HostHost	host = host_current();
+	HostMayRaise raise = host_doors(HOST_IO_IO_READ_DOORS((HostIoIo *) captures));
+	HostError	error;
+	HostLsn		end;
+	StdVec		logged;
+	const simc_TupleU8VecU8Lsn_t *last;
+
+	STD_ASSERT(__LINE__, 5, host.ops->wal_insert(host.self, &raise, HOST_WAL_KIND_CHUNK, body, sizeof(body), &end,
+												 &error), "the record is inserted");
+	logged = simc_logged();
+	STD_ASSERT(__LINE__, 5, logged.len > 0, "the WAL took a record");
+	last = &STD_VEC_AT(&logged, simc_TupleU8VecU8Lsn_t, logged.len - 1);
+	STD_ASSERT(__LINE__, 5, last->f0 == host_WalKind_value(HOST_WAL_KIND_CHUNK) && last->f1.len == sizeof(body) &&
+			   memcmp(last->f1.ptr, body, sizeof(body)) == 0 && last->f2 == end,
+			   "the last record logged is the record, its kind, and its end");
+	for (size_t i = 0; i < logged.len; i++)
+		std_vec_free_Checked(&STD_VEC_AT(&logged, simc_TupleU8VecU8Lsn_t, i).f1, 1, 1);
+	std_vec_free_Checked(&logged, sizeof(simc_TupleU8VecU8Lsn_t), _Alignof(simc_TupleU8VecU8Lsn_t));
+}
+
+/*
+ * test_simc_tests_the_logged_records_are_the_records_the_wal_took: the
+ * records simc lists are those the WAL door took, each with its kind, its
+ * body, and its end.
+ */
+static void
+test_simc_tests_the_logged_records_are_the_records_the_wal_took(void)
+{
+	SimcTestIo	test_io = simc_io();
+
+	simc_as_actor(56, test_simc_tests_logging, &test_io.io);
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * test_simc_tests_a_delta_page_takes_one_of_the_directorys_free_slots: a page
+ * the delta takes holds one of its directory's free slots until it's given
+ * back.
+ */
+static void
+test_simc_tests_a_delta_page_takes_one_of_the_directorys_free_slots(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostHost	host = host_current();
+	HostMayRaise raise = host_doors(HOST_IO_IO_READ_DOORS(&test_io.io));
+	HostDeltaPageSize size = {.bytes = 512, .words = 4};
+	HostError	error;
+	StdVec		names;
+	bool		refused;
+	uint64		frees;
+	size_t		before = simc_free_slots();
+
+	std_vec_with_capacity_Checked(&names, 1, sizeof(HostDeltaPagePage), _Alignof(HostDeltaPagePage));
+	STD_ASSERT(__LINE__, 5, host.ops->delta_alloc(host.self, &raise, &size, 1, &names, &refused, &frees, &error) &&
+			   !refused, "the page is taken");
+	STD_ASSERT(__LINE__, 5, simc_free_slots() == before - 1, "the page holds one free slot");
+	host.ops->delta_give_back(host.self, STD_VEC_AT(&names, HostDeltaPagePage, 0));
+	std_vec_free_Checked(&names, sizeof(HostDeltaPagePage), _Alignof(HostDeltaPagePage));
+	host.ops->delta_pass(host.self);
+	simc_TestIo_drop(&test_io);
+}
+
+/* test_simc_tests_new_ciding is the new cid case's actor: it logs a row's command ids and reads the record back. */
+static void
+test_simc_tests_new_ciding(void *captures)
+{
+	HostHost	host = host_current();
+	HostMayRaise raise = host_doors(HOST_IO_IO_READ_DOORS((HostIoIo *) captures));
+	HostStorage storage = {HOST_PG_DEFAULT, 9301, 16384};
+	HostRow		row = {UINT64CONST(1) << 16 | 2};
+	HostNewCid	cid = {.has_cmin = true, .cmin = {3}, .has_combo = true, .combo = {5}};
+	HostError	error;
+	HostLsn		end;
+	StdVec		cids;
+	const simc_TupleStorageRowNewCidLsn_t *last;
+
+	STD_ASSERT(__LINE__, 5, host.ops->wal_new_cid(host.self, &raise, &storage, row, cid, &end, &error),
+			   "the new cid record is logged");
+	cids = simc_new_cids();
+	STD_ASSERT(__LINE__, 5, cids.len > 0, "the WAL took a new cid record");
+	last = &STD_VEC_AT(&cids, simc_TupleStorageRowNewCidLsn_t, cids.len - 1);
+	STD_ASSERT(__LINE__, 5, last->f0.database == 9301 && last->f0.relation == 16384 && last->f1.f0 == row.f0 &&
+			   last->f2.has_cmin && last->f2.cmin.f0 == 3 && !last->f2.has_cmax && last->f2.has_combo &&
+			   last->f2.combo.f0 == 5 && last->f3 == end, "the last record is the row's, its cids, and its end");
+	std_vec_free_Checked(&cids, sizeof(simc_TupleStorageRowNewCidLsn_t), _Alignof(simc_TupleStorageRowNewCidLsn_t));
+}
+
+/*
+ * test_simc_tests_the_new_cid_door_logs_its_record_as_the_simulations_host:
+ * the wal_new_cid door logs a row's command ids with its storage and row,
+ * which simc lists with the record's end.
+ */
+static void
+test_simc_tests_the_new_cid_door_logs_its_record_as_the_simulations_host(void)
+{
+	SimcTestIo	test_io = simc_io();
+
+	simc_as_actor(57, test_simc_tests_new_ciding, &test_io.io);
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * test_simc_tests_the_wal_flush_door_answers_as_the_simulations_host: a
+ * flush of the WAL up to a record's end answers, as the simulation's host
+ * flushes it.
+ */
+static void
+test_simc_tests_the_wal_flush_door_answers_as_the_simulations_host(void)
+{
+	static const uint8 body[] = {1, 2, 3};
+	SimcTestIo	test_io = simc_io();
+	HostHost	host = host_current();
+	HostMayRaise raise = host_doors(HOST_IO_IO_READ_DOORS(&test_io.io));
+	HostError	error;
+	HostLsn		end;
+
+	STD_ASSERT(__LINE__, 5, host.ops->wal_insert(host.self, &raise, HOST_WAL_KIND_CHUNK, body, sizeof(body), &end,
+												 &error), "the record is inserted");
+	STD_ASSERT(__LINE__, 5, host.ops->wal_flush(host.self, &raise, end, &error), "the WAL is flushed to its end");
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * test_simc_tests_the_injected_door_answers_as_the_simulations_host: the
+ * simulation attaches no injection point, so the injected door answers false
+ * for a point's name.
+ */
+static void
+test_simc_tests_the_injected_door_answers_as_the_simulations_host(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostHost	host = host_current();
+	HostMayRaise raise = host_doors(HOST_IO_IO_READ_DOORS(&test_io.io));
+	HostError	error;
+	bool		injected = true;
+
+	STD_ASSERT(__LINE__, 5, host.ops->injected(host.self, &raise, "doltgres-vacuum-found", &injected, &error) &&
+			   !injected, "the simulation attaches no injection point");
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * test_simc_tests_a_hold_of_the_test_process_keeps_its_data_directory_past_its_capability:
+ * a hold of the test process taken before a test's capability keeps the
+ * test's data directory once the capability drops, and its release ends the
+ * test.
+ */
+static void
+test_simc_tests_a_hold_of_the_test_process_keeps_its_data_directory_past_its_capability(void)
+{
+	SimcProcess process = simc_process();
+	SimcTestIo	test_io = simc_io();
+	StdPathBuf	before = simc_data_dir();
+	StdPathBuf	after;
+
+	simc_TestIo_drop(&test_io);
+	after = simc_data_dir();
+	STD_ASSERT(__LINE__, 5, before.bytes.len == after.bytes.len &&
+			   memcmp(before.bytes.ptr, after.bytes.ptr, before.bytes.len) == 0,
+			   "the data directory outlives the capability");
+	std_vec_free_Checked(&after.bytes, 1, 1);
+	std_vec_free_Checked(&before.bytes, 1, 1);
+	simc_Process_drop(&process);
+}
+
+/*
+ * test_simc_tests_a_pools_index_answers_as_the_simulations_host: a pool's
+ * index answers nothing for a key never put, the location a put gives it,
+ * the newer location a second put gives it, keeps it when a remove names
+ * another location, and answers nothing once a remove names its own (bugs
+ * row 405).
+ */
+static void
+test_simc_tests_a_pools_index_answers_as_the_simulations_host(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostHost	host = host_current();
+	HostMayRaise raise = host_doors(HOST_IO_IO_READ_DOORS(&test_io.io));
+	HostSharedKind kind = TEST_SIMC_TESTS_POOLED;
+	static const uint8 key[4] = "key!";
+	HostError	error;
+	bool		has;
+	uint64		location;
+
+	kind.index = sizeof(key);
+	STD_ASSERT(__LINE__, 5, host.ops->shared_index_find(host.self, &raise, &kind, key, &has, &location, &error) && !has,
+			   "an index holds nothing for a key never put");
+	STD_ASSERT(__LINE__, 5, host.ops->shared_index_put(host.self, &raise, &kind, key, 7, &error) &&
+			   host.ops->shared_index_find(host.self, &raise, &kind, key, &has, &location, &error) && has &&
+			   location == 7, "an index holds the location a put gives a key");
+	STD_ASSERT(__LINE__, 5, host.ops->shared_index_put(host.self, &raise, &kind, key, 9, &error) &&
+			   host.ops->shared_index_find(host.self, &raise, &kind, key, &has, &location, &error) && has &&
+			   location == 9, "a second put replaces the location");
+	STD_ASSERT(__LINE__, 5, host.ops->shared_index_remove(host.self, &raise, &kind, key, 7, &error) &&
+			   host.ops->shared_index_find(host.self, &raise, &kind, key, &has, &location, &error) && has &&
+			   location == 9, "a remove that names another location keeps the key");
+	STD_ASSERT(__LINE__, 5, host.ops->shared_index_remove(host.self, &raise, &kind, key, 9, &error) &&
+			   host.ops->shared_index_find(host.self, &raise, &kind, key, &has, &location, &error) && !has,
+			   "a remove that names the key's location takes it out");
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * test_simc_tests_trying_actor is the flag try case's body: a record made,
+ * its flag tried, tried again by the process that holds it, cleared, and
+ * tried once more.
+ */
+static bool
+test_simc_tests_trying_actor(void *captures, HostIoIo *io, HostError *error)
+{
+	HostHost	host = host_current();
+	HostMayRaise raise = host_doors(HOST_IO_IO_READ_DOORS(io));
+	uint64		place;
+	bool		made;
+	bool		taken;
+	HostError	refused;
+
+	(void) captures;
+	if (!host.ops->shared_make(host.self, &raise, &TEST_SIMC_TESTS_FLAGGED, &made, &place, error))
+		return false;
+	STD_ASSERT(__LINE__, 5, made, "the pool has a free record");
+	if (!host.ops->flag_try(host.self, &raise, place, 0, &taken, error))
+		return false;
+	STD_ASSERT(__LINE__, 5, taken, "a try takes a free flag");
+	STD_ASSERT(__LINE__, 5, !host.ops->flag_try(host.self, &raise, place, 0, &taken, &refused),
+			   "a try of a flag the process holds is refused");
+	host_Error_drop(&refused);
+	host.ops->flag_clear(host.self, place, 0);
+	if (!host.ops->flag_try(host.self, &raise, place, 0, &taken, error))
+		return false;
+	STD_ASSERT(__LINE__, 5, taken, "a try takes the flag again once it is cleared");
+	host.ops->flag_clear(host.self, place, 0);
+	return true;
+}
+
+/*
+ * test_simc_tests_a_flag_try_takes_a_free_flag_and_refuses_its_own: a try
+ * takes a record's free flag, refuses the flag its own process holds, as a
+ * take does, and takes it again once it is cleared (bugs row 451).
+ */
+static void
+test_simc_tests_a_flag_try_takes_a_free_flag_and_refuses_its_own(void)
+{
+	SimcTestIo	test_io = simc_io();
+	SimcRun		run = simc_Run_new(13);
+	SimcActor	trying = {test_simc_tests_trying_actor, NULL};
+	SimcReport	report;
+
+	simc_Run_actor(&run, "trier", 5, trying);
+	report = simc_Run_finish(run);
+	STD_ASSERT(__LINE__, 5, report.outcome.tag == SIMC_OUTCOME_ENDED, "the run ends");
+	simc_Report_drop(&report);
+	simc_TestIo_drop(&test_io);
+}
+
 static const CportTest CPORT_TESTS[] = {
 	{"simc::tests::a_body_as_an_actor_runs_with_that_actors_id_in_the_data_directory",
 	test_simc_tests_a_body_as_an_actor_runs_with_that_actors_id_in_the_data_directory},
@@ -3322,6 +3679,8 @@ static const CportTest CPORT_TESTS[] = {
 	test_simc_tests_a_crash_fails_each_call_until_a_recovery_takes_the_files_back_to_their_syncs},
 	{"simc::tests::a_delta_page_is_taken_written_and_given_back_as_the_simulations_host",
 	test_simc_tests_a_delta_page_is_taken_written_and_given_back_as_the_simulations_host},
+	{"simc::tests::a_delta_page_takes_one_of_the_directorys_free_slots",
+	test_simc_tests_a_delta_page_takes_one_of_the_directorys_free_slots},
 	{"simc::tests::a_dictionary_simc_prepares_compresses_and_decompresses_and_drops_in_the_c",
 	test_simc_tests_a_dictionary_simc_prepares_compresses_and_decompresses_and_drops_in_the_c},
 	{"simc::tests::a_failed_allocation_of_a_listings_names_frees_the_names_made_and_raises_out_of_memory",
@@ -3336,10 +3695,14 @@ static const CportTest CPORT_TESTS[] = {
 	test_simc_tests_a_hinted_c_error_crosses_to_sim_as_its_literals},
 	{"simc::tests::a_historic_snapshot_lends_its_bounds_command_and_sorted_xids",
 	test_simc_tests_a_historic_snapshot_lends_its_bounds_command_and_sorted_xids},
+	{"simc::tests::a_hold_of_the_test_process_keeps_its_data_directory_past_its_capability",
+	test_simc_tests_a_hold_of_the_test_process_keeps_its_data_directory_past_its_capability},
 	{"simc::tests::a_linked_delta_page_opens_reads_appends_seals_and_retires_as_the_simulations_host",
 	test_simc_tests_a_linked_delta_page_opens_reads_appends_seals_and_retires_as_the_simulations_host},
 	{"simc::tests::a_nap_is_counted_and_the_disk_space_set_is_answered",
 	test_simc_tests_a_nap_is_counted_and_the_disk_space_set_is_answered},
+	{"simc::tests::a_non_vacuumable_snapshot_finds_xids_below_its_horizon_removable",
+	test_simc_tests_a_non_vacuumable_snapshot_finds_xids_below_its_horizon_removable},
 	{"simc::tests::a_pause_a_warning_a_log_and_the_last_redo_answer_as_the_simulations_host",
 	test_simc_tests_a_pause_a_warning_a_log_and_the_last_redo_answer_as_the_simulations_host},
 	{"simc::tests::a_pooled_records_doors_answer_as_the_simulations_host",
@@ -3356,6 +3719,8 @@ static const CportTest CPORT_TESTS[] = {
 	test_simc_tests_a_refused_take_fails_once_and_refuse_nothing_takes_back_the_rest},
 	{"simc::tests::a_reports_debug_is_the_rusts",
 	test_simc_tests_a_reports_debug_is_the_rusts},
+	{"simc::tests::a_reports_trace_is_the_rusts",
+	test_simc_tests_a_reports_trace_is_the_rusts},
 	{"simc::tests::a_returning_actor_ends_ok_and_its_endings_compare_as_the_rusts",
 	test_simc_tests_a_returning_actor_ends_ok_and_its_endings_compare_as_the_rusts},
 	{"simc::tests::a_run_check_fails_the_run_at_a_yield_with_its_message",
@@ -3426,8 +3791,14 @@ static const CportTest CPORT_TESTS[] = {
 	test_simc_tests_the_delta_hold_and_budget_doors_answer_as_the_simulations_host},
 	{"simc::tests::the_epoch_doors_answer_as_the_simulations_host",
 	test_simc_tests_the_epoch_doors_answer_as_the_simulations_host},
+	{"simc::tests::the_injected_door_answers_as_the_simulations_host",
+	test_simc_tests_the_injected_door_answers_as_the_simulations_host},
 	{"simc::tests::the_key_doors_answer_as_the_simulations_host",
 	test_simc_tests_the_key_doors_answer_as_the_simulations_host},
+	{"simc::tests::the_logged_records_are_the_records_the_wal_took",
+	test_simc_tests_the_logged_records_are_the_records_the_wal_took},
+	{"simc::tests::the_new_cid_door_logs_its_record_as_the_simulations_host",
+	test_simc_tests_the_new_cid_door_logs_its_record_as_the_simulations_host},
 	{"simc::tests::the_next_decompression_runs_out_of_memory_when_asked",
 	test_simc_tests_the_next_decompression_runs_out_of_memory_when_asked},
 	{"simc::tests::the_node_cache_installs_finds_and_unpins_a_nodes_frame",
@@ -3444,6 +3815,12 @@ static const CportTest CPORT_TESTS[] = {
 	test_simc_tests_the_test_only_std_fs_writes_reads_appends_and_removes_a_file},
 	{"simc::tests::the_wal_a_checkpoint_and_a_databases_quiet_answer_as_the_simulations_host",
 	test_simc_tests_the_wal_a_checkpoint_and_a_databases_quiet_answer_as_the_simulations_host},
+	{"simc::tests::the_wal_flush_door_answers_as_the_simulations_host",
+	test_simc_tests_the_wal_flush_door_answers_as_the_simulations_host},
+	{"simc::tests::a_pools_index_answers_as_the_simulations_host",
+	test_simc_tests_a_pools_index_answers_as_the_simulations_host},
+	{"simc::tests::a_flag_try_takes_a_free_flag_and_refuses_its_own",
+	test_simc_tests_a_flag_try_takes_a_free_flag_and_refuses_its_own},
 };
 
 PG_FUNCTION_INFO_V1(doltgres_cport_test_simc);

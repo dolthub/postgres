@@ -1070,6 +1070,34 @@ trees_cursor_Cursor_index(const TreesCursorCursor *self)
 	return trees_cursor_Cursor_bottom(self)->idx;
 }
 
+/*
+ * trees_cursor_Cursor_find_in_node moves the cursor to the entry of its own
+ * node whose key is the key, by a search of that node alone, and answers
+ * whether the node holds one, leaving the cursor where it was otherwise: a
+ * tree's keys are unique, so an entry found is the tree's entry of the key.
+ */
+bool
+trees_cursor_Cursor_find_in_node(TreesCursorCursor *self, HostIoIo *io, const uint8 *key, size_t key_len,
+								 const TreesKeyOrder *order, bool *result, ChunksErrorError *error)
+{
+	TreesNodeNode node = trees_cursor_Cursor_node(self);
+	size_t		at;
+	StdBytes	found;
+
+	*result = false;
+	if (!trees_node_Node_search(&node, io, key, key_len, order, &at, error))
+		return false;
+	if (at >= trees_node_Node_len(&node))
+		return true;
+	found = trees_node_Node_key(&node, at);
+	if (found.len != key_len || memcmp(found.ptr, key, key_len) != 0)
+		return true;
+	STD_VEC_AT(&self->path, TreesCursorFrame, std_wrapping_sub_usize(self->path.len, 1)).idx = at;
+	self->valid = true;
+	*result = true;
+	return true;
+}
+
 /* trees_cursor_Cursor_key returns the key of the entry the cursor is at. */
 StdBytes
 trees_cursor_Cursor_key(const TreesCursorCursor *self)
@@ -1098,108 +1126,37 @@ trees_cursor_Cursor_child_tree(const TreesCursorCursor *self)
 	return trees_node_Node_child_tree(&node, i);
 }
 
-/* trees_cursor_Cursor_stamps_frame_0_t is stamps' and values' state across their pads: the Arc<Stamps> they hold while live. */
-typedef struct trees_cursor_Cursor_stamps_frame_0_t
-{
-	const TreesCursorCursor *self;
-	HostIoIo   *io;
-	TreesPinPin *pin;
-	StdArcInner *stamps;
-	bool		stamps_live;
-	StdVec	   *result;
-	ChunksErrorError *error;
-	bool		ok;
-} trees_cursor_Cursor_stamps_frame_0_t;
-
-/* trees_cursor_Cursor_stamps_body_0 is stamps' body. */
-static void
-trees_cursor_Cursor_stamps_body_0(void *frame_)
-{
-	trees_cursor_Cursor_stamps_frame_0_t *frame = frame_;
-	TreesStoreTree tree = trees_cursor_Cursor_node_tree(frame->self);
-	const ChunksTrailerStamps *stamps;
-	size_t		index;
-
-	if (!trees_pin_Pin_stamps(frame->pin, frame->io, TREES_STORE_TREE_NAMED(&tree), &frame->stamps, frame->error))
-	{
-		frame->ok = false;
-		return;
-	}
-	frame->stamps_live = true;
-	stamps = std_arc_Deref_deref(frame->stamps, _Alignof(ChunksTrailerStamps));
-	index = trees_cursor_Cursor_index(frame->self);
-	chunks_trailer_Stamps_entry(stamps, index, frame->result);
-	frame->stamps_live = false;
-	trees_cursor_ArcStamps_drop(frame->stamps);
-	frame->ok = true;
-}
-
-/* trees_cursor_Cursor_stamps_pad_0 is stamps' and values' pad: the Arc<Stamps>, while live. */
-static void
-trees_cursor_Cursor_stamps_pad_0(void *frame_)
-{
-	trees_cursor_Cursor_stamps_frame_0_t *frame = frame_;
-
-	if (frame->stamps_live)
-		trees_cursor_ArcStamps_drop(frame->stamps);
-}
-
 /*
  * trees_cursor_Cursor_stamps returns the row stamps of the leaf entry the
- * cursor is at, one for each copy of a row it counts, which reads the leaf's
- * stamps.
+ * cursor is at, one for each copy of a row it counts, which the cursor's
+ * node holds decoded.
  */
 bool
 trees_cursor_Cursor_stamps(const TreesCursorCursor *self, HostIoIo *io, TreesPinPin *pin, StdVec *result,
 						   ChunksErrorError *error)
 {
-	trees_cursor_Cursor_stamps_frame_0_t frame = {.self = self, .io = io, .pin = pin, .result = result,
-	.error = error};
+	TreesNodeNode node = trees_cursor_Cursor_node(self);
+	ChunksTrailerStamps stamps = trees_node_Node_stamps_view(&node);
 
-	std_landing(&frame, trees_cursor_Cursor_stamps_body_0, trees_cursor_Cursor_stamps_pad_0);
-	return frame.ok;
-}
-
-/* trees_cursor_Cursor_values_body_0 is values' body. */
-static void
-trees_cursor_Cursor_values_body_0(void *frame_)
-{
-	trees_cursor_Cursor_stamps_frame_0_t *frame = frame_;
-	TreesStoreTree tree = trees_cursor_Cursor_node_tree(frame->self);
-	const ChunksTrailerStamps *stamps;
-	size_t		index;
-	const uint32 *values;
-	size_t		values_len;
-
-	if (!trees_pin_Pin_stamps(frame->pin, frame->io, TREES_STORE_TREE_NAMED(&tree), &frame->stamps, frame->error))
-	{
-		frame->ok = false;
-		return;
-	}
-	frame->stamps_live = true;
-	stamps = std_arc_Deref_deref(frame->stamps, _Alignof(ChunksTrailerStamps));
-	index = trees_cursor_Cursor_index(frame->self);
-	values = chunks_trailer_Stamps_values(stamps, index, &values_len);
-	std_slice_to_vec_Checked(frame->result, values, values_len, sizeof(uint32), _Alignof(uint32));
-	frame->stamps_live = false;
-	trees_cursor_ArcStamps_drop(frame->stamps);
-	frame->ok = true;
+	chunks_trailer_Stamps_entry(&stamps, trees_cursor_Cursor_index(self), result);
+	return true;
 }
 
 /*
  * trees_cursor_Cursor_values returns the value ids of the row of the leaf
  * entry the cursor is at, in the row's order, none for a row with no value
- * out of line, which reads the leaf's stamps.
+ * out of line, which the cursor's node holds decoded.
  */
 bool
 trees_cursor_Cursor_values(const TreesCursorCursor *self, HostIoIo *io, TreesPinPin *pin, StdVec *result,
 						   ChunksErrorError *error)
 {
-	trees_cursor_Cursor_stamps_frame_0_t frame = {.self = self, .io = io, .pin = pin, .result = result,
-	.error = error};
+	TreesNodeNode node = trees_cursor_Cursor_node(self);
+	size_t		values_len;
+	const uint32 *values = trees_node_Node_values(&node, trees_cursor_Cursor_index(self), &values_len);
 
-	std_landing(&frame, trees_cursor_Cursor_values_body_0, trees_cursor_Cursor_stamps_pad_0);
-	return frame.ok;
+	std_slice_to_vec_Checked(result, values, values_len, sizeof(uint32), _Alignof(uint32));
+	return true;
 }
 
 /* trees_cursor_Cursor_at_node_end reports whether the cursor is at its node's last entry. */
@@ -1690,7 +1647,7 @@ trees_cursor_LeafStamps_Default_default(void)
 	return result;
 }
 
-/* trees_cursor_LeafStamps_of_frame_0_t is of's state across its pad: the pair it took from the cache, while live. */
+/* trees_cursor_LeafStamps_of_frame_0_t is of's and stamp_of's state across their pad: the pair taken from the cache, while live, and their answers. */
 typedef struct trees_cursor_LeafStamps_of_frame_0_t
 {
 	TreesCursorLeafStamps *self;
@@ -1700,22 +1657,23 @@ typedef struct trees_cursor_LeafStamps_of_frame_0_t
 	trees_TupleTreeArcStamps_t taken;
 	bool		taken_live;
 	StdVec	   *result;
+	uint64		tuple;
+	uint64	   *copies;
+	bool	   *some;
+	ChunksTrailerStamp *stamp;
 	ChunksErrorError *error;
 	bool		ok;
 } trees_cursor_LeafStamps_of_frame_0_t;
 
 /*
- * trees_cursor_LeafStamps_of_body_0 is of's body: the cached pair taken, put
- * back when it is the cursor's leaf's, or else the leaf's stamps read and
- * stored, the taken pair dropped after, at the end of the let.
+ * trees_cursor_LeafStamps_read is of's and stamp_of's read: the cached pair
+ * taken, put back when it is the cursor's leaf's, or else the leaf's stamps
+ * read and stored, the taken pair dropped after, at the end of the let.
  */
-static void
-trees_cursor_LeafStamps_of_body_0(void *frame_)
+static bool
+trees_cursor_LeafStamps_read(trees_cursor_LeafStamps_of_frame_0_t *frame)
 {
-	trees_cursor_LeafStamps_of_frame_0_t *frame = frame_;
 	TreesStoreTree node = trees_cursor_Cursor_node_tree(frame->cursor);
-	const ChunksTrailerStamps *stamps;
-	size_t		index;
 
 	frame->taken_live = frame->self->has_f0;
 	frame->taken = frame->self->f0;
@@ -1737,8 +1695,7 @@ trees_cursor_LeafStamps_of_body_0(void *frame_)
 				frame->taken_live = false;
 				trees_cursor_ArcStamps_drop(frame->taken.f1);
 			}
-			frame->ok = false;
-			return;
+			return false;
 		}
 		frame->self->f0.f0 = node;
 		frame->self->f0.f1 = read;
@@ -1749,9 +1706,40 @@ trees_cursor_LeafStamps_of_body_0(void *frame_)
 			trees_cursor_ArcStamps_drop(frame->taken.f1);
 		}
 	}
+	return true;
+}
+
+/* trees_cursor_LeafStamps_of_body_0 is of's body. */
+static void
+trees_cursor_LeafStamps_of_body_0(void *frame_)
+{
+	trees_cursor_LeafStamps_of_frame_0_t *frame = frame_;
+
+	if (!trees_cursor_LeafStamps_read(frame))
+		return;
+	chunks_trailer_Stamps_entry(std_arc_Deref_deref(frame->self->f0.f1, _Alignof(ChunksTrailerStamps)),
+								trees_cursor_Cursor_index(frame->cursor), frame->result);
+	frame->ok = true;
+}
+
+/* trees_cursor_LeafStamps_stamp_of_body_0 is stamp_of's body. */
+static void
+trees_cursor_LeafStamps_stamp_of_body_0(void *frame_)
+{
+	trees_cursor_LeafStamps_of_frame_0_t *frame = frame_;
+	const ChunksTrailerStamps *stamps;
+	size_t		index;
+	const uint32 *values;
+	size_t		values_len;
+
+	if (!trees_cursor_LeafStamps_read(frame))
+		return;
 	stamps = std_arc_Deref_deref(frame->self->f0.f1, _Alignof(ChunksTrailerStamps));
 	index = trees_cursor_Cursor_index(frame->cursor);
-	chunks_trailer_Stamps_entry(stamps, index, frame->result);
+	*frame->copies = chunks_trailer_Stamps_entry_len(stamps, index);
+	*frame->some = chunks_trailer_Stamps_stamp_of(stamps, index, frame->tuple, frame->stamp);
+	values = chunks_trailer_Stamps_values(stamps, index, &values_len);
+	std_slice_to_vec_Checked(frame->result, values, values_len, sizeof(uint32), _Alignof(uint32));
 	frame->ok = true;
 }
 
@@ -1778,6 +1766,25 @@ trees_cursor_LeafStamps_of(TreesCursorLeafStamps *self, HostIoIo *io, TreesPinPi
 	.result = result, .error = error};
 
 	std_landing(&frame, trees_cursor_LeafStamps_of_body_0, trees_cursor_LeafStamps_of_pad_0);
+	return frame.ok;
+}
+
+/*
+ * trees_cursor_LeafStamps_stamp_of returns the number of row stamps of the
+ * leaf entry a cursor is at, one for each copy of a row it counts, its stamp
+ * of a tuple id, or nothing when it has none, by a search of the leaf's
+ * stamps, and its row's value ids as Cursor's values gives them, the leaf's
+ * stamps read only when the cursor is in another leaf than the last.
+ */
+bool
+trees_cursor_LeafStamps_stamp_of(TreesCursorLeafStamps *self, HostIoIo *io, TreesPinPin *pin,
+								 const TreesCursorCursor *cursor, uint64 tuple, uint64 *copies, bool *some,
+								 ChunksTrailerStamp *result, StdVec *values, ChunksErrorError *error)
+{
+	trees_cursor_LeafStamps_of_frame_0_t frame = {.self = self, .io = io, .pin = pin, .cursor = cursor,
+	.result = values, .tuple = tuple, .copies = copies, .some = some, .stamp = result, .error = error};
+
+	std_landing(&frame, trees_cursor_LeafStamps_stamp_of_body_0, trees_cursor_LeafStamps_of_pad_0);
 	return frame.ok;
 }
 

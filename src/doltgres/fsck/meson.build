@@ -16,20 +16,6 @@
 # C port's frontend library with the frontend wrappers gen_binding.pl generates, and Postgres' WAL reader, linked
 # with Postgres' frontend code.
 
-# fsck's Rust, the frontend workspace built by cargo.pl, which stays built for verification and links into nothing.
-if doltgres_rust
-  doltgres_fsck_build = custom_target('fsck',
-    output: [host_system == 'windows' ? 'fsck.lib' : 'libfsck.a', 'fe_calls.c', 'fe_calls.h'],
-    depfile: 'libfsck.d',
-    depend_files: files('Cargo.toml', 'Cargo.lock', 'fehost/Cargo.toml', '../pg/build.rs', '../pg/gen_binding.pl',
-      '../pg/fe_wrapper.h', '../pg/frontend-calls.list', '../pg/frontend-entries.list'),
-    env: doltgres_env,
-    command: [perl, doltgres_cargo, 'build-frontend', meson.current_source_dir() / '..',
-      meson.current_build_dir() / 'target', get_option('cassert') ? 'cassert' : 'release',
-      '@OUTPUT0@', '@DEPFILE@'] + cc.cmd_array(),
-  )
-endif
-
 # pg_checkversioned links the C port's frontend configuration, whose fsck holds the check's entry (the C switch).
 pg_checkversioned = executable('pg_checkversioned',
   files('pg_checkversioned.c', '../../backend/access/transam/xlogreader.c'),

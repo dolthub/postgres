@@ -207,6 +207,159 @@ chunks_packs_dropped_mark(HostIoIoDoors io, const char *dir, size_t dir_len, Chu
 	return frame.ok;
 }
 
+/*
+ * chunks_packs_dropped_creation_frame_0_t is the creation mark's functions'
+ * state across their pad: their arguments, their results, and the
+ * repository's directory, the mark's path, and its bytes they hold.
+ */
+typedef struct chunks_packs_dropped_creation_frame_0_t
+{
+	HostIoIoDoors io;
+	HostIoReadDoors read;
+	uint32		repository;
+	uint32		own;
+	uint64		xid;
+	bool	   *has_result;
+	uint64	   *result;
+	ChunksErrorError *error;
+	bool		ok;
+	StdPathBuf	dir;
+	StdPathBuf	path;
+	StdVec		bytes;
+	bool		bytes_live;
+} chunks_packs_dropped_creation_frame_0_t;
+
+/* chunks_packs_dropped_creation_pad_0 is the creation mark's functions' pad: the mark's bytes, then its path and the directory. */
+static void
+chunks_packs_dropped_creation_pad_0(void *frame_)
+{
+	chunks_packs_dropped_creation_frame_0_t *frame = frame_;
+
+	if (frame->bytes_live)
+	{
+		frame->bytes_live = false;
+		std_vec_free_Checked(&frame->bytes, 1, 1);
+	}
+	std_vec_free_Checked(&frame->path.bytes, 1, 1);
+	std_PathBuf_new(&frame->path);
+	std_vec_free_Checked(&frame->dir.bytes, 1, 1);
+	std_PathBuf_new(&frame->dir);
+}
+
+/* chunks_packs_dropped_creation_path_0 sets the frame's directory to the repository's own and its path to the creation mark's there. */
+static void
+chunks_packs_dropped_creation_path_0(chunks_packs_dropped_creation_frame_0_t *frame)
+{
+	frame->dir = host_tablespace_dir(frame->repository, frame->own);
+	std_path_join(frame->dir.bytes.ptr, frame->dir.bytes.len, CHUNKS_PACKS_DROPPED_CREATING,
+				  strlen(CHUNKS_PACKS_DROPPED_CREATING), &frame->path);
+}
+
+/* chunks_packs_dropped_creation_mark_body_0 is creation_mark's body. */
+static void
+chunks_packs_dropped_creation_mark_body_0(void *frame_)
+{
+	chunks_packs_dropped_creation_frame_0_t *frame = frame_;
+	uint8		bytes[8];
+
+	std_u64_to_le_bytes(frame->xid, bytes);
+	chunks_packs_dropped_creation_path_0(frame);
+	frame->ok = chunks_file_write_file(frame->io, frame->path.bytes.ptr, frame->path.bytes.len, bytes,
+									   sizeof(bytes), frame->error);
+	chunks_packs_dropped_creation_pad_0(frame);
+}
+
+/*
+ * chunks_packs_dropped_creation_mark writes a copied repository's creation
+ * mark into its own directory in the tablespace given, durably: the xid of
+ * the transaction creating it, eight bytes little-endian (bugs row 404).
+ */
+bool
+chunks_packs_dropped_creation_mark(HostIoIoDoors io, uint32 repository, uint32 own, uint64 xid,
+								   ChunksErrorError *error)
+{
+	chunks_packs_dropped_creation_frame_0_t frame = {.io = io, .repository = repository, .own = own, .xid = xid,
+	.error = error};
+
+	std_PathBuf_new(&frame.dir);
+	std_PathBuf_new(&frame.path);
+	std_landing(&frame, chunks_packs_dropped_creation_mark_body_0, chunks_packs_dropped_creation_pad_0);
+	return frame.ok;
+}
+
+/* chunks_packs_dropped_creating_body_0 is creating's body. */
+static void
+chunks_packs_dropped_creating_body_0(void *frame_)
+{
+	chunks_packs_dropped_creation_frame_0_t *frame = frame_;
+
+	chunks_packs_dropped_creation_path_0(frame);
+	frame->ok = chunks_file_exists(frame->read, frame->path.bytes.ptr, frame->path.bytes.len, frame->has_result,
+								   frame->error);
+	if (frame->ok && *frame->has_result)
+	{
+		frame->ok = chunks_file_read_file(frame->read, frame->path.bytes.ptr, frame->path.bytes.len, &frame->bytes,
+										  frame->error);
+		frame->bytes_live = frame->ok;
+		if (frame->ok && frame->bytes.len != 8)
+		{
+			StdString	message;
+
+			std_string_from_Checked(&message, "a repository's creation mark isn't eight bytes", 47);
+			*frame->error = chunks_error_Error_corrupt(&message);
+			frame->ok = false;
+		}
+		if (frame->ok)
+			*frame->result = std_u64_from_le_bytes(frame->bytes.ptr);
+	}
+	chunks_packs_dropped_creation_pad_0(frame);
+}
+
+/*
+ * chunks_packs_dropped_creating reads a repository's creation mark, the xid
+ * of the transaction creating it, or nothing for a repository with none; a
+ * mark of another length is corrupt (bugs row 404).
+ */
+bool
+chunks_packs_dropped_creating(HostIoReadDoors io, uint32 repository, uint32 own, bool *has_result, uint64 *result,
+							  ChunksErrorError *error)
+{
+	chunks_packs_dropped_creation_frame_0_t frame = {.read = io, .repository = repository, .own = own,
+	.has_result = has_result, .result = result, .error = error};
+
+	std_PathBuf_new(&frame.dir);
+	std_PathBuf_new(&frame.path);
+	std_landing(&frame, chunks_packs_dropped_creating_body_0, chunks_packs_dropped_creation_pad_0);
+	return frame.ok;
+}
+
+/* chunks_packs_dropped_created_body_0 is created's body. */
+static void
+chunks_packs_dropped_created_body_0(void *frame_)
+{
+	chunks_packs_dropped_creation_frame_0_t *frame = frame_;
+	bool		removed;
+
+	chunks_packs_dropped_creation_path_0(frame);
+	frame->ok = chunks_file_remove_if_there(frame->io, frame->path.bytes.ptr, frame->path.bytes.len, &removed,
+											frame->error) &&
+		chunks_file_sync_dir(frame->io, frame->dir.bytes.ptr, frame->dir.bytes.len, frame->error);
+	chunks_packs_dropped_creation_pad_0(frame);
+}
+
+/* chunks_packs_dropped_created takes a repository's creation mark away, durably, once its creation committed (bugs row 404). */
+bool
+chunks_packs_dropped_created(HostIoIoDoors io, uint32 repository, uint32 own, ChunksErrorError *error)
+{
+	chunks_packs_dropped_creation_frame_0_t frame = {.io = io, .repository = repository, .own = own,
+	.error = error};
+
+	std_PathBuf_new(&frame.dir);
+	std_PathBuf_new(&frame.path);
+	std_landing(&frame, chunks_packs_dropped_created_body_0, chunks_packs_dropped_creation_pad_0);
+	return frame.ok;
+}
+
 /* chunks_packs_dropped_removed is host::remove_tree as chunks' error: whether everything under a path is gone. */
 static bool
 chunks_packs_dropped_removed(HostIoIoDoors io, const char *path, size_t path_len, bool *result,

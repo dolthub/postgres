@@ -274,6 +274,7 @@ extern bool host_delta_alloc_replacing(HostIoIo *io, HostDeltaPageSize size, Hos
 extern bool host_delta_wait(HostIoIo *io, HostDeltaFull *full, HostError *error);
 extern bool host_delta_retire(HostIoIo *io, const HostDeltaLeaving *records, size_t records_len,
 							  StdIterator pages, HostError *error);
+extern bool host_delta_packing(const uint64 *shapes, size_t shapes_len, StdVec *result, HostError *error);
 extern void host_delta_advanced(uint64 *result_0, uint64 *result_1);
 extern uint64 host_delta_used(void);
 extern uint64 host_delta_budget(void);

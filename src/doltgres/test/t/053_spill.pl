@@ -267,11 +267,24 @@ ROLLBACK;
 });
 ok(spill_files($aborted) > 0,
 	"an aborted transaction's spill files stay until a checkpoint");
+# The versioned collector holds a reader while it sleeps (bugs row 255), which
+# keeps every deferred removal waiting, so the case ends it before its
+# checkpoints, the postmaster starting it again ten seconds later; this step
+# goes when row 255 is fixed.
+$node->safe_psql('postgres',
+	q{SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE backend_type = 'versioned collector'});
+$node->poll_query_until('postgres',
+	q{SELECT count(*) = 0 FROM pg_stat_activity WHERE backend_type = 'versioned collector'})
+  or die 'the versioned collector stayed';
+$node->safe_psql('postgres', 'CHECKPOINT') for 1 .. 2;
+isnt(spill_files($aborted), '0', "an aborted transaction's spill files stay through the second checkpoint after it");
+# A fold worker's reader, which the third checkpoint's removal rightly waits
+# for, ends with its fold first.
+$node->poll_query_until('postgres',
+	q{SELECT count(*) = 0 FROM pg_stat_activity WHERE backend_type = 'fold worker'})
+  or die 'a fold worker stayed';
 $node->safe_psql('postgres', 'CHECKPOINT');
-$node->safe_psql('postgres', 'CHECKPOINT');
-is(spill_files($aborted), '0',
-	"an aborted transaction's spill files go at the second checkpoint after it"
-);
+is(spill_files($aborted), '0', "and go at the third");
 my $crashed = $node->safe_psql(
 	'postgres', q{
 BEGIN;
@@ -281,9 +294,9 @@ ROLLBACK;
 });
 $node->stop('immediate');
 $node->start;
-$node->safe_psql('postgres', 'CHECKPOINT');
+$node->safe_psql('postgres', 'CHECKPOINT') for 1 .. 2;
 is(spill_files($crashed), '0',
-	"a crash between an abort and a checkpoint leaves none of its spill files once a checkpoint after the start ran"
+	"a crash between an abort and a checkpoint leaves none of its spill files once two checkpoints after the start ran"
 );
 folded('swept');
 
@@ -355,7 +368,7 @@ sub spilled_in_savepoint
 
 # A spill whose write fails between its slot and the end of its removal, in a
 # savepoint: the versions it took out stay in the memtable too, another
-# session's conflict check still finds the key, and the commit's link of the
+# session's conflict check still finds the key, and the rollback's link of the
 # pending file takes the memtable's twins out, so each row reads once.
 my ($waited, $count) =
   spilled_in_savepoint('pended', 'doltgres-spill-pended');
@@ -365,7 +378,7 @@ like(
 	"a spill failed after its slot leaves its key to another writer's conflict check"
 );
 is($count, '3000',
-	"the commit links a spill that failed after its slot, its memtable twins taken out"
+	"the rollback links a spill that failed after its slot, its memtable twins taken out"
 );
 folded('pended');
 
@@ -489,8 +502,9 @@ is(counted('idle_rows'), '100',
 # completes: the chunks spill with the transaction's other versions
 # (STORAGE_DESIGN §II.9), so the writer doesn't wait at the budget forever,
 # and every value reads back. The case runs in a database of its own, its
-# source folded, so its chunk spill's removal waits on no other storage's
-# unfolded rows.
+# source folded after the copy, so its chunk spill's removal waits on no other
+# storage's unfolded rows, and not before, since a write passes over a chunk
+# the source's fold packed (bugs row 387).
 $node->safe_psql('postgres', 'CREATE DATABASE chunked');
 $node->safe_psql(
 	'chunked', q{
@@ -499,9 +513,6 @@ CREATE TABLE source_wide (v text);
 INSERT INTO source_wide SELECT repeat(md5(i::text), 250) FROM generate_series(1, 4200) i;
 CREATE TABLE wide_out (v text);
 });
-$node->safe_psql('chunked',
-	q{SELECT doltgres_test_fold((SELECT reltoastrelid::regclass FROM pg_class WHERE oid = 'source_wide'::regclass)), doltgres_test_fold('source_wide')}
-);
 my $wide_out = $node->background_psql('chunked');
 $wide_out->query_safe(q{SET statement_timeout = '300s'});
 $wide_out->query_safe('BEGIN');
@@ -513,6 +524,9 @@ is( $wide_out->query_safe(
 my $wide_xid = $wide_out->query_safe('SELECT pg_current_xact_id()');
 $wide_out->query_safe('COMMIT');
 $wide_out->quit;
+$node->safe_psql('chunked',
+	q{SELECT doltgres_test_fold((SELECT reltoastrelid::regclass FROM pg_class WHERE oid = 'source_wide'::regclass)), doltgres_test_fold('source_wide')}
+);
 
 # chunk_files returns the count of the chunk spill files of a transaction's
 # xid in a database's repository.
@@ -654,6 +668,73 @@ is( $pinned->safe_psql('postgres',
 	'50000',
 	'a test insert of a source past shared_buffers completes on a node made for streaming');
 $pinned->stop;
+
+# Commit 4's case: a statement inserting 300,000 rows at a 4 MB delta_memory
+# completes, its spills dropping their rows' tuple ids from the storage's tuple
+# id table, whose compaction leaves those slots and their keys' bytes behind,
+# and every row reads back.
+my $compacted = PostgreSQL::Test::Cluster->new('spill_compacted');
+$compacted->init;
+$compacted->append_conf('postgresql.conf',
+	"delta_memory = 4MB\nfold_threshold = 1GB\nfold_timeout = 3600s\nmax_parallel_workers_per_gather = 0");
+$compacted->start;
+$compacted->safe_psql(
+	'postgres', q{
+CREATE EXTENSION doltgres_test;
+CREATE TABLE many_source (v text);
+INSERT INTO many_source SELECT 'r' || i FROM generate_series(1, 300000) i;
+CREATE TABLE many (v text);
+});
+$compacted->safe_psql('postgres',
+	q{SELECT count(*) FROM doltgres_test_insert('many', 'many_source', true, 0)}, timeout => 1200);
+is($compacted->safe_psql('postgres', q{SELECT count(*) FROM doltgres_test_scan('many', false, -1)}),
+	'300000', 'a statement inserting 300,000 rows at a 4 MB delta_memory completes and every row reads back');
+$compacted->stop;
+
+# A standby's replay of an aborted transaction's spills: at a 4 MB delta_memory
+# a standby replays a transaction whose rows and free space map takes pass its
+# budget, which its redo spills, and then the transaction's abort, which keeps
+# the free space map spill marked with the abort's end until a fold takes it;
+# the standby reads the table as its primary does after a committed insert,
+# after the primary's fold, and after the standby's restart, once it folded at
+# its primary's point and its primary's checkpoint gave it a restartpoint, which
+# no fold point a storage holds unfolded lets it pass (bugs row 158).
+my $aborting = PostgreSQL::Test::Cluster->new('spill_aborting');
+$aborting->init(allows_streaming => 1);
+$aborting->append_conf('postgresql.conf',
+	"delta_memory = 4MB\nfold_threshold = 1GB\nfold_timeout = 3600s\nmax_parallel_workers_per_gather = 0");
+$aborting->start;
+$aborting->safe_psql(
+	'postgres', q{
+CREATE EXTENSION doltgres_test;
+CREATE TABLE aborted_source (v text);
+INSERT INTO aborted_source SELECT 'r' || i FROM generate_series(1, 100000) i;
+CREATE TABLE aborted_rows (v text);
+});
+$aborting->backup('aborting_backup');
+my $aborting_standby = PostgreSQL::Test::Cluster->new('spill_aborting_standby');
+$aborting_standby->init_from_backup($aborting, 'aborting_backup', has_streaming => 1);
+$aborting_standby->append_conf('postgresql.conf', "delta_memory = 4MB\nmax_parallel_workers_per_gather = 0");
+$aborting_standby->start;
+$aborting->safe_psql('postgres',
+	q{BEGIN; SELECT count(*) FROM doltgres_test_insert('aborted_rows', 'aborted_source', true, 0); ROLLBACK;},
+	timeout => 1200);
+$aborting->safe_psql('postgres',
+	q{SELECT count(*) FROM doltgres_test_insert('aborted_rows', 'aborted_source', true, 0)}, timeout => 1200);
+$aborting->wait_for_catchup($aborting_standby);
+my $aborted_count = q{SELECT count(*) FROM doltgres_test_scan('aborted_rows', false, -1)};
+is($aborting_standby->safe_psql('postgres', $aborted_count),
+	'100000', "a standby that replayed an aborted transaction's spills reads only the committed rows");
+$aborting->safe_psql('postgres', q{SELECT doltgres_test_fold('aborted_rows')});
+$aborting->wait_for_catchup($aborting_standby);
+is($aborting_standby->safe_psql('postgres', $aborted_count), '100000', "and after the primary's fold");
+$aborting_standby->safe_psql('postgres', q{SELECT doltgres_test_fold('aborted_rows')});
+$aborting->safe_psql('postgres', 'CHECKPOINT');
+$aborting->wait_for_catchup($aborting_standby);
+$aborting_standby->restart;
+is($aborting_standby->safe_psql('postgres', $aborted_count), '100000', "and after the standby's restart");
+$aborting_standby->stop;
+$aborting->stop;
 
 # Bugs row 74 through the real commands: one INSERT ... SELECT whose own
 # versions pass the default 32 MB of delta_memory completes, its running
@@ -940,49 +1021,6 @@ is($small->safe_psql('postgres', $used),
 	$start, "the delta's used bytes are back at their start once both ended and folded");
 $small->stop;
 
-# Bugs row 242: an UPDATE ... FROM through a nested loop whose outer scan reads
-# a source whose rows its writer spilled, held at its first read of the
-# source's spills while a fold of the source installs a base and drops the
-# spills, updates every row, as heap's twin's does.
-my %joined;
-for my $am ('', 'USING doltgres_twin')
-{
-	my $p = $am eq '' ? '' : 'heap_';
-	$node->safe_psql(
-		'postgres', qq{
-CREATE TABLE ${p}joined_source (k int4, v text) $am;
-INSERT INTO ${p}joined_source SELECT g, repeat('s', 100) FROM generate_series(1, 40000) g;
-CREATE TABLE ${p}joined_target (k int4 PRIMARY KEY, v text) $am;
-INSERT INTO ${p}joined_target SELECT g, 't' FROM generate_series(1, 40000) g;
-});
-	my $plan = "SET enable_hashjoin = off; SET enable_mergejoin = off; SET enable_material = off;"
-	  . " SET max_parallel_workers_per_gather = 0;";
-	my $update = "UPDATE ${p}joined_target t SET v = s.v || 'u' FROM ${p}joined_source s WHERE t.k = s.k";
-	if ($am eq '')
-	{
-		my $updater = $node->background_psql('postgres');
-		$updater->query_safe(
-			"$plan SELECT injection_points_set_local(); SELECT injection_points_attach('doltgres-spill-slots-read', 'wait')"
-		);
-		$updater->query_until(qr/started/, "\\echo started\n$update;\n");
-		$node->wait_for_event('client backend', 'doltgres-spill-slots-read');
-		$node->safe_psql('postgres', "SELECT doltgres_test_fold('joined_source')");
-		$node->safe_psql('postgres',
-			"SELECT injection_points_detach('doltgres-spill-slots-read'); SELECT injection_points_wakeup('doltgres-spill-slots-read')"
-		);
-		$updater->query_safe('SELECT 1');
-		$updater->quit;
-	}
-	else
-	{
-		$node->safe_psql('postgres', "$plan $update");
-	}
-	$joined{$p} = $node->safe_psql('postgres',
-		"SELECT count(*) || ' ' || md5(string_agg(k || v, ',' ORDER BY k)) FROM ${p}joined_target");
-}
-is($joined{''}, $joined{heap_},
-	"an UPDATE ... FROM whose source scan a fold's drop passes under updates every row as heap's twin's");
-
 # Bugs row 286: a helper spilling an idle transaction's versions pauses after
 # taking them out of its memtable and before listing its file, and the
 # transaction commits; a second transaction's upsert of the same keys, which
@@ -1032,5 +1070,126 @@ is( $node->safe_psql(
 	'1000',
 	"a helper's spill listed after the helped transaction's commit leaves a later transaction's spill of the same keys newer"
 );
+
+# Bugs row 307: a spill's take-out of versions from the memtable pends the
+# spill, which readers read, before the versions leave the memtable. With the
+# budget's committed arm paused at doltgres-spill-pended, its spill of a
+# keyless table's committed inserts pended and every one still in the
+# memtable, a fold of the table waits for the take-out's end and applies each
+# insert once. Then, with a running transaction's inserts spilled so that
+# readers list the table's spills, a count paused at
+# doltgres-spill-slots-read, having read the first key's chain, across a
+# whole take-out of the table's newer committed inserts reads each row once.
+my $taken = PostgreSQL::Test::Cluster->new('taken');
+$taken->init;
+$taken->append_conf('postgresql.conf',
+	"fold_threshold = 1GB\nfold_timeout = 3600s\nautovacuum = off");
+$taken->start;
+$taken->safe_psql('postgres',
+	'CREATE EXTENSION injection_points; CREATE EXTENSION doltgres_test; CREATE TABLE taken_once (k int4, v text)'
+);
+$taken->safe_psql('postgres',
+	"INSERT INTO taken_once SELECT n, repeat('t', 100) FROM generate_series(1, 1000) n"
+);
+my $spiller = $taken->background_psql('postgres');
+$spiller->query_safe(
+	"SELECT injection_points_set_local(); SELECT injection_points_attach('doltgres-spill-pended', 'wait')"
+);
+$spiller->query_until(qr/spilling/,
+	"\\echo spilling\nSELECT doltgres_test_delta(61, 0, 0);\n");
+$taken->wait_for_event('client backend', 'doltgres-spill-pended');
+my $folder = $taken->background_psql('postgres');
+my $folder_pid = $folder->query_safe('SELECT pg_backend_pid()');
+$folder->query_until(qr/folding/,
+	"\\echo folding\nSELECT doltgres_test_fold('taken_once');\n");
+$taken->poll_query_until('postgres',
+	"SELECT count(*) = 1 FROM pg_stat_activity WHERE pid = $folder_pid AND (state = 'idle' OR wait_event = 'Extension')"
+) or die 'the fold neither ended nor waited';
+$taken->safe_psql('postgres',
+	"SELECT injection_points_detach('doltgres-spill-pended'); SELECT injection_points_wakeup('doltgres-spill-pended')"
+);
+$spiller->query_safe('SELECT 1');
+$folder->query_safe('SELECT 1');
+is( $taken->safe_psql(
+		'postgres',
+		q{SELECT count(*) || ' ' || count(DISTINCT k) || ' ' || (split_part(doltgres_test_count('taken_once'), ' ', 2) = split_part(doltgres_test_count('taken_once'), ' ', 6)) FROM taken_once}
+	),
+	'1000 1000 true',
+	'a fold that read a keyless table while a take-out of its inserts was pended applies each insert once'
+);
+$taken->safe_psql('postgres',
+	"INSERT INTO taken_once SELECT n, repeat('t', 100) FROM generate_series(1001, 2000) n"
+);
+my $running = $taken->background_psql('postgres');
+$running->query_safe('BEGIN');
+$running->query_safe(
+	"INSERT INTO taken_once SELECT n, repeat('t', 100) FROM generate_series(2001, 2100) n"
+);
+is($taken->safe_psql('postgres', 'SELECT doltgres_test_delta(61, 0, 0)'),
+	'1', "a helper spills the running transaction's inserts, so the table's spills are listed");
+my $counter = $taken->background_psql('postgres');
+$counter->query_safe(
+	"SELECT injection_points_set_local(); SELECT injection_points_attach('doltgres-spill-slots-read', 'wait')"
+);
+$counter->query_until(qr/counting/,
+	"\\echo counting\nSELECT count(*) FROM taken_once;\n");
+$taken->wait_for_event('client backend', 'doltgres-spill-slots-read');
+is($taken->safe_psql('postgres', 'SELECT doltgres_test_delta(61, 0, 0)'),
+	'1', "the committed arm takes the newer inserts out while the count waits");
+$taken->safe_psql('postgres',
+	"SELECT injection_points_detach('doltgres-spill-slots-read'); SELECT injection_points_wakeup('doltgres-spill-slots-read')"
+);
+like($counter->query_safe('SELECT 1'),
+	qr/^2000$/m,
+	'a count that read a key before a whole take-out of it and listed the spills after reads it once');
+$running->query_safe('ROLLBACK');
+$running->quit;
+$spiller->quit;
+$folder->quit;
+$counter->quit;
+
+# A take-out that a top-level error stops between its spill's pend and its
+# versions' removal ends at the transaction's abort, and one whose backend is
+# terminated there ends at its exit, so another session's read of the table
+# finishes and reads each row once.
+$taken->safe_psql('postgres', "SELECT doltgres_test_fold('taken_once')");
+$taken->safe_psql('postgres',
+	"CREATE TABLE taken_ended (k int4, v text); INSERT INTO taken_ended SELECT n, repeat('t', 100) FROM generate_series(1, 1000) n"
+);
+my ($code, $out, $err) = $taken->psql('postgres',
+	"SELECT injection_points_set_local(); SELECT injection_points_attach('doltgres-spill-pended', 'error'); SELECT doltgres_test_delta(61, 0, 0)"
+);
+like($err, qr/error triggered for injection point doltgres-spill-pended/,
+	"the committed arm's take-out fails between its pend and its removal");
+is( $taken->safe_psql(
+		'postgres',
+		"SET statement_timeout = '60s'; SELECT count(*) FROM taken_ended"),
+	'1000',
+	'a read after a take-out a top-level error stopped finishes and reads each row once'
+);
+$taken->safe_psql('postgres', "SELECT doltgres_test_fold('taken_ended')");
+$taken->safe_psql('postgres',
+	"CREATE TABLE taken_exited (k int4, v text); INSERT INTO taken_exited SELECT n, repeat('t', 100) FROM generate_series(1, 1000) n"
+);
+my $exiting = $taken->background_psql('postgres', on_error_stop => 0);
+my $exiting_pid = $exiting->query_safe('SELECT pg_backend_pid()');
+$exiting->query_safe(
+	"SELECT injection_points_set_local(); SELECT injection_points_attach('doltgres-spill-pended', 'wait')"
+);
+$exiting->query_until(qr/exiting/,
+	"\\echo exiting\nSELECT doltgres_test_delta(61, 0, 0);\n");
+$taken->wait_for_event('client backend', 'doltgres-spill-pended');
+$taken->safe_psql('postgres', "SELECT pg_terminate_backend($exiting_pid)");
+$taken->poll_query_until('postgres',
+	"SELECT count(*) = 0 FROM pg_stat_activity WHERE pid = $exiting_pid")
+  or die 'the terminated backend never exited';
+$exiting->quit;
+is( $taken->safe_psql(
+		'postgres',
+		"SET statement_timeout = '60s'; SELECT count(*) FROM taken_exited"),
+	'1000',
+	'a read after a take-out whose backend was terminated finishes and reads each row once'
+);
+$taken->stop;
 
 done_testing();

@@ -57,6 +57,7 @@
 #include "doltgres/trees/store.h"
 #include "doltgres/txn/base.h"
 #include "doltgres/txn/blobs.h"
+#include "doltgres/txn/memtable/branch.h"
 #include "doltgres/txn/state.h"
 #include "pg_calls.h"
 
@@ -111,7 +112,8 @@ typedef struct DoltgresEntriesSearchesRange
  * index's description (an Arc<Described>), its table's keyed layout, the
  * reader's scan record, the search of its keys, what the reader keeps of the
  * search it reads, whether a parallel scan's participant has a unit it
- * reads, its mark, and the scan's own long values (an Arc<Probes>).
+ * reads, its mark, the scan's own long values (an Arc<Probes>), and the
+ * session repository's delta its reads found.
  */
 typedef struct DoltgresEntriesSearchesSearch
 {
@@ -126,6 +128,23 @@ typedef struct DoltgresEntriesSearchesSearch
 	bool		has_mark;
 	AccessNbtsearchBtMark mark;
 	StdArcInner *probes;
+
+	/*
+	 * deltas is the handle on the session repository's working-state delta
+	 * that a read found at its first out-of-line field, kept for the scan's
+	 * later reads, so each finds it once and not by a sweep of the pool (bugs
+	 * row 358); a read that finds none keeps none and finds again. It is what
+	 * a fresh find would give at every later read: txn_memtable_branch_deltas
+	 * publishes a repository's delta only when find finds none, under the
+	 * makers' lock, the pool's reclaim frees only a delta no process holds, a
+	 * drop's txn_memtable_branch_dropped runs only with no session in the
+	 * database, and shared memory is made again only once every backend has
+	 * ended. Rescan drops it, and so does the record's drop at amendscan and
+	 * at an abort's release of its owner. It pins one pool slot, the same one
+	 * for every scan of the backend's database.
+	 */
+	bool		has_deltas;
+	HostSharedHeld deltas;
 } DoltgresEntriesSearchesSearch;
 
 /* doltgres_entries_searches_Range_Default_default is Range's Default: forward, with nothing to pass over, and no far bound. */
@@ -183,6 +202,8 @@ doltgres_entries_searches_Search_drop(void *record)
 		access_nbtsearch_BtMark_drop(&self->mark);
 	std_arc_drop(self->probes, sizeof(HostLockIoMutexVecProbe), _Alignof(HostLockIoMutexVecProbe),
 				 doltgres_layout_Probes_drop);
+	if (self->has_deltas)
+		host_shared_Held_drop(&self->deltas);
 }
 
 /* DOLTGRES_ENTRIES_SEARCHES_SEARCHES is SEARCHES, the backend's index scans. */
@@ -394,7 +415,7 @@ doltgres_entries_searches_begin(const PgCatalogCaps *caps, const PgRel *index, i
 	return frame.ok;
 }
 
-/* doltgres_entries_searches_rescan_closure_0 is rescan's lend: the search started over, and the reader's record. */
+/* doltgres_entries_searches_rescan_closure_0 is rescan's lend: the search started over, its delta dropped, and the reader's record. */
 static bool
 doltgres_entries_searches_rescan_closure_0(void *captures, HostIoIo *io, DoltgresEntriesSearchesSearch *search,
 										   doltgres_OptionHandle_t *result, HostError *error)
@@ -411,6 +432,9 @@ doltgres_entries_searches_rescan_closure_0(void *captures, HostIoIo *io, Doltgre
 	if (search->has_mark)
 		access_nbtsearch_BtMark_drop(&search->mark);
 	search->has_mark = false;
+	if (search->has_deltas)
+		host_shared_Held_drop(&search->deltas);
+	search->has_deltas = false;
 	result->has = search->has_reader;
 	result->handle = search->reader;
 	return true;
@@ -924,6 +948,13 @@ typedef struct DoltgresEntriesSearchesEntries
 	bool		has_row;
 	DoltgresScanRow row;
 	StdVec		decoded;
+
+	/*
+	 * has_deltas and deltas are the read's lent handle on the repository's
+	 * delta, which a read's fields borrow or set.
+	 */
+	bool	   *has_deltas;
+	HostSharedHeld *deltas;
 } DoltgresEntriesSearchesEntries;
 
 /* doltgres_entries_searches_Entries_drop is Entries' drop glue: its order, its table's attnums, its range, its row, and its values. */
@@ -1439,6 +1470,7 @@ typedef struct doltgres_entries_searches_Entries_fields_frame_0_t
 	const DoltgresEntriesSearchesEntries *self;
 	const PgCatalogCaps *caps;
 	const DoltgresScanRow *row;
+	TreesStoreReader packs;
 	TxnBlobsBlobs blobs;
 	bool		blobs_live;
 	StdVec	   *result;
@@ -1447,6 +1479,40 @@ typedef struct doltgres_entries_searches_Entries_fields_frame_0_t
 	bool		ok;
 } doltgres_entries_searches_Entries_fields_frame_0_t;
 
+/*
+ * doltgres_entries_searches_Entries_fields_blobs makes the blobs an entry's
+ * out-of-line fields read through, at the first such field, so an entry
+ * whose fields are all inline finds no delta (bugs row 357): over the read's
+ * packs, through the delta the read borrows from its search, or one found
+ * through the session's repository, which the read lends back to its search
+ * (bugs row 358). The blobs borrow the delta and never drop it.
+ */
+static bool
+doltgres_entries_searches_Entries_fields_blobs(doltgres_entries_searches_Entries_fields_frame_0_t *frame, HostIoIo *io)
+{
+	const DoltgresEntriesSearchesEntries *self = frame->self;
+	HostError	failed;
+	uint32		database;
+	uint32		tablespace;
+
+	if (frame->blobs_live)
+		return true;
+	frame->packs = repo_Repo_reader(self->repo, HOST_CACHE_PLACEMENT_SERVER, self->reading);
+	if (!*self->has_deltas &&
+		(!host_session_database(&database, &tablespace, &failed) ||
+		 !txn_memtable_branch_find(HOST_SHARED_IO_WITHIN(io), database, self->has_deltas, self->deltas, &failed)))
+	{
+		*frame->error = pghost_raised(&failed);
+		return false;
+	}
+	frame->blobs.packs = TREES_STORE_READER_NODE_STORE(&frame->packs);
+	frame->blobs.has_deltas = *self->has_deltas;
+	if (frame->blobs.has_deltas)
+		frame->blobs.deltas = *self->deltas;
+	frame->blobs_live = true;
+	return true;
+}
+
 /* doltgres_entries_searches_Entries_fields_body_0 reads each field of the row's value through the session's repository. */
 static void
 doltgres_entries_searches_Entries_fields_body_0(void *frame_)
@@ -1454,31 +1520,23 @@ doltgres_entries_searches_Entries_fields_body_0(void *frame_)
 	doltgres_entries_searches_Entries_fields_frame_0_t *frame = frame_;
 	HostIoIo	io = pghost_io_catalog(frame->caps);
 	EncodingTupleTuple tuple;
-	TreesStoreReader packs;
-	HostError	failed;
-	uint32		database;
-	uint32		tablespace;
 
 	if (!encoding_tuple_Tuple_parse(frame->row->tuple.ptr, frame->row->tuple.len, &tuple))
 	{
 		*frame->error = doltgres_entries_searches_corrupt();
 		return;
 	}
-	packs = repo_Repo_reader(frame->self->repo, HOST_CACHE_PLACEMENT_SERVER, frame->self->reading);
-	if (!host_session_database(&database, &tablespace, &failed) ||
-		!txn_blobs_Blobs_new(&io, database, TREES_STORE_READER_NODE_STORE(&packs), &frame->blobs, &failed))
-	{
-		*frame->error = pghost_raised(&failed);
-		return;
-	}
-	frame->blobs_live = true;
 	std_vec_with_capacity_Checked(frame->result, encoding_tuple_Tuple_len(&tuple), sizeof(access_OptionVecU8_t),
 								  _Alignof(access_OptionVecU8_t));
 	frame->result_live = true;
 	for (size_t at = 0; at < encoding_tuple_Tuple_len(&tuple); at++)
 	{
 		access_OptionVecU8_t field;
+		EncodingTupleFieldTag tag = encoding_tuple_Tuple_field(&tuple, at).tag;
 
+		if (tag != ENCODING_TUPLE_FIELD_NULL && tag != ENCODING_TUPLE_FIELD_VALUE &&
+			!doltgres_entries_searches_Entries_fields_blobs(frame, &io))
+			return;
 		if (!doltgres_entries_searches_field(&io, &frame->blobs, &tuple, at, &field, frame->error))
 			return;
 		std_vec_push_Checked(frame->result, &field, sizeof(field), _Alignof(access_OptionVecU8_t));
@@ -1487,7 +1545,7 @@ doltgres_entries_searches_Entries_fields_body_0(void *frame_)
 	frame->ok = true;
 }
 
-/* doltgres_entries_searches_Entries_fields_pad_0 drops the fields of a failed read, then the blobs. */
+/* doltgres_entries_searches_Entries_fields_pad_0 drops the fields of a failed read; the blobs borrow what they hold. */
 static void
 doltgres_entries_searches_Entries_fields_pad_0(void *frame_)
 {
@@ -1495,8 +1553,6 @@ doltgres_entries_searches_Entries_fields_pad_0(void *frame_)
 
 	if (frame->result_live)
 		doltgres_entries_searches_fields_drop(frame->result);
-	if (frame->blobs_live)
-		txn_blobs_Blobs_drop(&frame->blobs);
 	frame->result_live = frame->blobs_live = false;
 }
 
@@ -2401,6 +2457,12 @@ typedef struct DoltgresEntriesSearchesSink
 	const PgSnapshot *snapshot;
 	const HostSnapshot *seen;
 	int64		added;
+
+	/*
+	 * kept is the base the sink's fetches of rows by key keep between entries
+	 * (bugs row 478).
+	 */
+	DoltgresScanKept kept;
 } DoltgresEntriesSearchesSink;
 
 /* doltgres_entries_searches_Sink_drop is Sink's drop glue: the entry it was given, if any. */
@@ -2476,7 +2538,7 @@ doltgres_entries_searches_taken(const PgCatalogCaps *caps, DoltgresEntriesSearch
 			return false;
 		by.key = row_key.ptr;
 		by.key_len = row_key.len;
-		if (!doltgres_entries_rows(caps, sink->heap, sink->snapshot, sink->seen, by, &rows, error))
+		if (!doltgres_entries_rows_kept(caps, sink->heap, sink->snapshot, sink->seen, by, &sink->kept, &rows, error))
 			return false;
 		has_tuple = rows.len > 0;
 		if (has_tuple)
@@ -2496,7 +2558,8 @@ doltgres_entries_searches_taken(const PgCatalogCaps *caps, DoltgresEntriesSearch
 /*
  * doltgres_entries_searches_Lent_t is what read takes out of a search's
  * record: the description's and the probes' Arcs, the reader's record, the
- * search, the range, and whether a parallel participant has a unit.
+ * search, the range, whether a parallel participant has a unit, and the
+ * repository's delta.
  */
 typedef struct doltgres_entries_searches_Lent_t
 {
@@ -2507,6 +2570,8 @@ typedef struct doltgres_entries_searches_Lent_t
 	DoltgresEntriesSearchesRange range;
 	bool		taken;
 	StdArcInner *probes;
+	bool		has_deltas;
+	HostSharedHeld deltas;
 } doltgres_entries_searches_Lent_t;
 
 /* Search's Table's with at what read takes out. */
@@ -2595,7 +2660,7 @@ typedef struct doltgres_entries_searches_read_frame_0_t
 	bool		ok;
 } doltgres_entries_searches_read_frame_0_t;
 
-/* doltgres_entries_searches_read_closure_0 is read's lend: the record's description, reader, search, range, and probes taken out. */
+/* doltgres_entries_searches_read_closure_0 is read's lend: the record's description, reader, search, range, probes, and delta taken out. */
 static bool
 doltgres_entries_searches_read_closure_0(void *captures, HostIoIo *io, DoltgresEntriesSearchesSearch *search,
 										 doltgres_entries_searches_Lent_t *result, HostError *error)
@@ -2613,6 +2678,9 @@ doltgres_entries_searches_read_closure_0(void *captures, HostIoIo *io, DoltgresE
 	result->scan = search->scan;
 	search->has_scan = false;
 	result->taken = search->taken;
+	result->has_deltas = search->has_deltas;
+	result->deltas = search->deltas;
+	search->has_deltas = false;
 	return true;
 }
 
@@ -2640,7 +2708,7 @@ doltgres_entries_searches_read_closure_4(void *captures, HostIoIo *io, DoltgresE
 	return true;
 }
 
-/* doltgres_entries_searches_read_closure_5 is read's lend that puts the search, its range, and its unit back. */
+/* doltgres_entries_searches_read_closure_5 is read's lend that puts the search, its range, its unit, and its delta back. */
 static bool
 doltgres_entries_searches_read_closure_5(void *captures, HostIoIo *io, DoltgresEntriesSearchesSearch *record,
 										 HostError *error)
@@ -2658,15 +2726,32 @@ doltgres_entries_searches_read_closure_5(void *captures, HostIoIo *io, DoltgresE
 	record->range = frame->entries.range;
 	doltgres_entries_searches_Range_Default_default(&frame->entries.range);
 	record->taken = frame->lent.taken;
+	record->has_deltas = frame->lent.has_deltas;
+	record->deltas = frame->lent.deltas;
+	frame->lent.has_deltas = false;
 	return true;
 }
 
-/* doltgres_entries_searches_read_closure_3 is read's lent call: the base the scan's snapshot reads, as splits' is. */
+/* doltgres_entries_searches_read_captures_t is read's lent call's captures: the snapshot and the generation it reads. */
+typedef struct doltgres_entries_searches_read_captures_t
+{
+	const HostSnapshot *read;
+	uint64		generation;
+} doltgres_entries_searches_read_captures_t;
+
+/*
+ * doltgres_entries_searches_read_closure_3 is read's lent call: the base the
+ * scan's snapshot reads, as splits' is, with the base generation read
+ * before it.
+ */
 static bool
 doltgres_entries_searches_read_closure_3(void *captures, HostIoIo *io, const RepoRepo *repo, const HostSharedHeld *held, bool *some,
 										 TxnBaseBase *result, HostError *error)
 {
-	return doltgres_entries_searches_Entries_splits_closure_0(captures, io, repo, held, some, result, error);
+	doltgres_entries_searches_read_captures_t *c = captures;
+
+	c->generation = txn_state_generation(host_shared_Held_record(held));
+	return doltgres_entries_searches_Entries_splits_closure_0((void *) c->read, io, repo, held, some, result, error);
 }
 
 /* doltgres_entries_searches_unsnapshotted returns the error of an index scan asked to read with no snapshot. */
@@ -2828,6 +2913,7 @@ doltgres_entries_searches_read_body_0(void *frame_)
 		TreesStoreReader store;
 		TreesKeyOrder order;
 		bool		ok;
+		doltgres_entries_searches_read_captures_t c = {&frame->read};
 
 		if (!host_owned_TableDoltgresEntriesSearchesSearch_withVecU8(&DOLTGRES_ENTRIES_SEARCHES_SEARCHES, &frame->io,
 																	 frame->owned,
@@ -2843,8 +2929,8 @@ doltgres_entries_searches_read_body_0(void *frame_)
 			  doltgres_entries_index_making(&frame->io, index, &found, frame->error)))
 			return;
 		if (!txn_state_held_OptionBase(&frame->io, STD_ARC_VALUE(frame->repo, _Alignof(RepoRepo)), &frame->reading,
-									   found, doltgres_entries_searches_read_closure_3, &frame->read, NULL, &some,
-									   &base, &failed))
+									   found, doltgres_entries_searches_read_closure_3, &c, NULL, &some, &base,
+									   &failed))
 		{
 			*frame->error = pghost_raised(&failed);
 			return;
@@ -2854,7 +2940,8 @@ doltgres_entries_searches_read_body_0(void *frame_)
 		trees_KeyOrder_Clone_clone(&frame->order, &order);
 		frame->keyed_live = false;
 		ok = doltgres_scan_scan_begin(&frame->io, TREES_STORE_READER_NODE_STORE(&store), 0, some ? &base : NULL,
-									  &frame->keyed, pg_calls_index_table(index), &order, &reader, &failed);
+									  c.generation, &frame->keyed, pg_calls_index_table(index), &order, &reader,
+									  &failed);
 		if (some)
 			txn_base_Base_drop(&base);
 		if (!ok ||
@@ -2885,6 +2972,8 @@ doltgres_entries_searches_read_body_0(void *frame_)
 	}
 	frame->entries.includes = pg_calls_index_scan_wants_tuple(frame->scan);
 	frame->entries.reader = reader;
+	frame->entries.has_deltas = &frame->lent.has_deltas;
+	frame->entries.deltas = &frame->lent.deltas;
 	frame->entries.range = frame->lent.range;
 	doltgres_entries_searches_Range_Default_default(&frame->lent.range);
 	std_vec_new(&frame->entries.decoded, sizeof(access_OptionU64_t), _Alignof(access_OptionU64_t));
@@ -2943,6 +3032,8 @@ doltgres_entries_searches_read_pad_0(void *frame_)
 			access_nbtsearch_BtScan_drop(&frame->lent.scan);
 		std_arc_drop(frame->lent.described, sizeof(DoltgresIndexDescribed), _Alignof(DoltgresIndexDescribed),
 					 doltgres_entries_searches_Described_drop);
+		if (frame->lent.has_deltas)
+			host_shared_Held_drop(&frame->lent.deltas);
 	}
 	frame->values_live = frame->row_live = frame->columns_live = frame->entries_live = frame->keyed_live = false;
 	frame->slot_live = frame->heap_live = frame->reading_live = frame->repo_live = frame->search_live = false;
@@ -3034,7 +3125,7 @@ doltgres_entries_searches_next_body_0(void *frame_)
 	frame->ok = true;
 }
 
-/* doltgres_entries_searches_next_pad_0 drops the packed values and the sink's entry. */
+/* doltgres_entries_searches_next_pad_0 drops the packed values, the sink's entry, and its kept base. */
 static void
 doltgres_entries_searches_next_pad_0(void *frame_)
 {
@@ -3043,6 +3134,7 @@ doltgres_entries_searches_next_pad_0(void *frame_)
 	if (frame->packed_live)
 		std_vec_free_Checked(&frame->packed, 1, 1);
 	doltgres_entries_searches_Sink_drop(&frame->sink);
+	doltgres_scan_Kept_drop(&frame->sink.kept);
 	frame->packed_live = false;
 }
 
@@ -3112,7 +3204,7 @@ doltgres_entries_searches_bitmap_body_0(void *frame_)
 	frame->ok = true;
 }
 
-/* doltgres_entries_searches_bitmap_pad_0 drops the index's table. */
+/* doltgres_entries_searches_bitmap_pad_0 drops the index's table and the sink's kept base. */
 static void
 doltgres_entries_searches_bitmap_pad_0(void *frame_)
 {
@@ -3121,6 +3213,7 @@ doltgres_entries_searches_bitmap_pad_0(void *frame_)
 	if (frame->heap_live)
 		pg_OwnedRel_drop(&frame->heap);
 	frame->heap_live = false;
+	doltgres_scan_Kept_drop(&frame->sink.kept);
 }
 
 /*

@@ -767,6 +767,7 @@ extern PgIndexFetch *pg_IndexScan_heap_fetch(PgIndexScan *self);
 extern const PgRel *pg_IndexScan_index(const PgIndexScan *self);
 extern const PgSnapshot *pg_IndexScan_snapshot(const PgIndexScan *self);
 extern PgIndexScan *pg_IndexScanDesc_scan(PgIndexScanDesc *self);
+extern bool pg_transaction_snapshot_view(const PgMayRaise *raise, PgSnapshotView *result, PgPgError *error);
 extern bool pg_snapshot_view(const PgMayRaise *raise, const PgSnapshot *snapshot, PgSnapshotView *result,
 							 PgPgError *error);
 extern DgScanKeys pg_ScanKeys_with_count(const PgScanKeys *keys, int32 count);
@@ -818,6 +819,8 @@ extern bool pg_sort_key_of(const PgMayRaise *raise, const PgCatalog *catalog, ui
 extern void pg_replayed(uint64 *out_0, uint32 *out_1);
 #if defined(USE_INJECTION_POINTS) || defined(DOLTGRES_PG_OUTSIDE_POSTGRES)
 extern void pg_fail_allocations(bool fail);
+extern void pg_fail_nth_allocation(uint32 nth);
+extern uint64 pg_refused_size(void);
 #endif
 #if defined(DOLTGRES_TEST_PG) || defined(DOLTGRES_PG_OUTSIDE_POSTGRES)
 extern size_t pg_heap_in_use(void);

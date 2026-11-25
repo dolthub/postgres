@@ -434,6 +434,17 @@ chunks_packs_table_runs_insert(StdVec *runs, uint32 space, ChunksPacksTail tail)
 					   298, 27);
 }
 
+/* chunks_packs_table_runs_remove is BTreeMap::remove of a table's runs tails: a tablespace's taken out when they hold one. */
+void
+chunks_packs_table_runs_remove(StdVec *runs, uint32 space)
+{
+	size_t		at;
+	chunks_TupleU32Tail_t removed;
+
+	if (chunks_packs_table_runs_find(runs, space, &at))
+		std_vec_remove(runs, at, &removed, sizeof(removed), _Alignof(chunks_TupleU32Tail_t), RUST_FILE, 0, 0);
+}
+
 /*
  * chunks_packs_Table_whole returns the record that begins a pack table's
  * file: the generation, the highest number a pack was added at, the bound of

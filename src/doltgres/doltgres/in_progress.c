@@ -25,6 +25,9 @@
 #include "postgres.h"
 
 #include "access/subtrans.h"
+#include "access/transam.h"
+#include "access/xlog.h"
+#include "access/xlogutils.h"
 #include "doltgres/in_progress.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
@@ -33,7 +36,10 @@
  * doltgres_xid_in_progress says whether a transaction or a subtransaction is
  * in progress, as TransactionIdIsInProgress does, also for a caller outside the
  * proc array: the transaction in the slot at the caller's offset, its cached
- * subtransactions, and, past its cache, the ones pg_subtrans records.
+ * subtransactions, and, past its cache, the ones pg_subtrans records. In
+ * recovery with no standby's bookkeeping, where redo marks pg_xact but never
+ * advances latestCompletedXid, it answers from pg_xact alone, an xid below
+ * the oldest one pg_xact keeps being one that ended (bugs row 340).
  */
 bool
 doltgres_xid_in_progress(TransactionId xid)
@@ -43,6 +49,16 @@ doltgres_xid_in_progress(TransactionId xid)
 	bool		found = false;
 	bool		overflowed = false;
 
+	if (standbyState == STANDBY_DISABLED && RecoveryInProgress())
+	{
+		if (!TransactionIdIsNormal(xid))
+			return false;
+		LWLockAcquire(XactTruncationLock, LW_SHARED);
+		found = !TransactionIdPrecedes(xid, TransamVariables->oldestClogXid) && !TransactionIdDidCommit(xid) &&
+			!TransactionIdDidAbort(xid);
+		LWLockRelease(XactTruncationLock);
+		return found;
+	}
 	if (TransactionIdIsInProgress(xid))
 		return true;
 	if (MyProc == NULL || !TransactionIdIsNormal(xid))

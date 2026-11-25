@@ -29,6 +29,7 @@
 #include "doltgres/host/shared.h"
 #include "doltgres/repo/lib.h"
 #include "doltgres/std/vec.h"
+#include "doltgres/trees/cursor.h"
 #include "doltgres/trees/lib.h"
 #include "doltgres/trees/store.h"
 #include "doltgres/txn/base.h"
@@ -187,8 +188,9 @@ typedef struct DoltgresScanLayout
 
 /*
  * DoltgresScanTrees is Trees: the trees of the base a read takes, its table
- * tree and its tuple id tree, each none for a storage with no base, and its
- * fold point.
+ * tree and its tuple id tree, each none for a storage with no base, its fold
+ * point, and the storage's base generation the base was read at or after,
+ * which a read checks after its delta read (txn_state_moved_past).
  */
 typedef struct DoltgresScanTrees
 {
@@ -197,7 +199,23 @@ typedef struct DoltgresScanTrees
 	bool		has_tuple_ids;
 	TreesStoreTree tuple_ids;
 	uint64		folded;
+	uint64		generation;
 } DoltgresScanTrees;
+
+/*
+ * DoltgresScanKept is Kept: what a scan's fetches keep between its rows (bugs
+ * row 478): whether they have read yet, their storage's key, fixed when its
+ * state is made, and the trees and epochs of the base they read last, which
+ * each fetch checks against the storage's base generation after its delta
+ * read and moves to the newest base when an install moved it.
+ */
+typedef struct DoltgresScanKept
+{
+	bool		live;
+	TxnBaseKey	key;
+	DoltgresScanTrees trees;
+	DoltgresScanEpochs epochs;
+} DoltgresScanKept;
 
 /*
  * DoltgresScanShared is Shared: the base a parallel scan's workers all read
@@ -270,9 +288,10 @@ extern bool doltgres_scan_bitmap_step(HostIoIo *io, HostOwnedHandle handle, Dolt
 extern bool doltgres_scan_bitmap_ended(HostIoIo *io, HostOwnedHandle handle, HostError *error);
 extern bool doltgres_scan_blocks(HostIoIo *io, HostOwnedHandle handle, uint64 *result, HostError *error);
 extern bool doltgres_scan_Direction_Debug_fmt(const void *value, struct StdFormatter *f);
+extern DoltgresScanTrees doltgres_scan_Trees_of(const TxnBaseBase *base, uint64 generation);
 extern bool doltgres_scan_scan_begin(HostIoIo *io, TreesStoreNodeStore store, uint64 blocks, const TxnBaseBase *base,
-									 StdVec *keyed, uint32 table, TreesKeyOrder *order, HostOwnedHandle *result,
-									 HostError *error);
+									 uint64 generation, StdVec *keyed, uint32 table, TreesKeyOrder *order,
+									 HostOwnedHandle *result, HostError *error);
 extern bool doltgres_scan_next(HostIoIo *io, const DoltgresScanStores *stores, const DoltgresScanUnder *under,
 							   HostOwnedHandle handle, DoltgresScanDirection way, bool *has_result,
 							   DoltgresScanRow *result, HostError *error);
@@ -284,16 +303,32 @@ extern bool doltgres_scan_seek(HostIoIo *io, const DoltgresScanStores *stores, H
 extern bool doltgres_scan_scan_end(HostIoIo *io, HostOwnedHandle handle, HostError *error);
 extern bool doltgres_scan_tid_valid(HostIoIo *io, HostOwnedHandle handle, uint64 tuple_id, uint16 most_offset,
 									bool *result, HostError *error);
+
+/*
+ * DoltgresScanResolved is the memo of the base leaf a scan's fetches last
+ * resolved a row in, one immutable leaf named by its content at most, which
+ * lives no longer than its scan or its fetch: the leaf's row stamps, and a
+ * cursor kept in it, whose path starts at the root it was sought from.
+ */
+typedef struct DoltgresScanResolved
+{
+	TreesCursorLeafStamps stamps;
+	bool		has_kept;
+	TreesCursorKeptCursor kept;
+} DoltgresScanResolved;
+
+extern void doltgres_scan_Resolved_drop(DoltgresScanResolved *self);
+extern void doltgres_scan_Kept_drop(void *record);
 extern bool doltgres_scan_fetch(HostIoIo *io, TreesStoreNodeStore store, const DoltgresScanUnder *under,
-								DoltgresScanEpochs *epochs, DoltgresScanTrees trees, DoltgresScanLayout *layout,
-								uint64 tuple_id, bool *has_result, DoltgresScanRow *result, HostError *error);
-extern bool doltgres_scan_keyed(HostIoIo *io, TreesStoreNodeStore store, HostSharedRecord state, bool has_tuple_ids,
-								TreesStoreTree tuple_ids, uint64 tuple_id, bool *has_result, StdVec *result_0,
-								bool *result_1, HostError *error);
+								DoltgresScanEpochs *epochs, DoltgresScanResolved *resolved, DoltgresScanTrees *trees,
+								DoltgresScanLayout *layout, uint64 tuple_id, bool *has_result, DoltgresScanRow *result,
+								HostError *error);
+extern bool doltgres_scan_keyed(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held, uint64 tuple_id,
+								bool *has_result, StdVec *result_0, bool *result_1, HostError *error);
 extern bool doltgres_scan_based(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held, uint64 tuple_id,
 								bool *result, HostError *error);
 extern bool doltgres_scan_fetch_key(HostIoIo *io, TreesStoreNodeStore store, const DoltgresScanUnder *under,
-									DoltgresScanEpochs *epochs, DoltgresScanTrees trees, DoltgresScanLayout *layout,
+									DoltgresScanEpochs *epochs, DoltgresScanTrees *trees, DoltgresScanLayout *layout,
 									const uint8 *key, size_t key_len, StdVec *result, HostError *error);
 extern bool doltgres_scan_end_before(HostIoIo *io, HostOwnedHandle handle, uint64 xid, uint32 command, uint64 sub,
 									 HostError *error);
@@ -307,8 +342,9 @@ extern bool doltgres_scan_next_in_range(HostIoIo *io, TreesStoreNodeStore store,
 										DoltgresScanRow *result, HostError *error);
 extern void doltgres_scan_splits(const StdVec *starts, size_t starts_len, StdVec *result);
 extern bool doltgres_scan_split_keys(const uint8 *bytes, size_t bytes_len, StdVec *result, HostError *error);
-extern bool doltgres_scan_begin_parallel(HostIoIo *io, DoltgresScanShared *shared, StdVec *keyed, uint32 table,
-										 TreesKeyOrder *order, HostOwnedHandle *result, HostError *error);
+extern bool doltgres_scan_begin_parallel(HostIoIo *io, DoltgresScanShared *shared, uint64 generation, StdVec *keyed,
+										 uint32 table, TreesKeyOrder *order, HostOwnedHandle *result,
+										 HostError *error);
 extern bool doltgres_scan_is_parallel(HostIoIo *io, HostOwnedHandle handle, bool *result, HostError *error);
 extern bool doltgres_scan_start_unit(HostIoIo *io, HostOwnedHandle handle, uint64 unit, HostError *error);
 extern bool doltgres_scan_next_parallel(HostIoIo *io, const DoltgresScanStores *stores,
@@ -344,6 +380,9 @@ extern void test_doltgres_scan_tests_a_leaders_split_keys_are_its_range_starts_s
 extern void test_doltgres_scan_tests_a_parallel_scan_over_an_empty_base_reads_each_delta_key_once_by_the_leaders_splits(void);
 extern void test_doltgres_scan_tests_a_sample_of_many_blocks_walks_the_delta_once(void);
 extern void test_doltgres_scan_tests_a_scan_with_no_sample_or_range_leaves_its_answers_as_they_were(void);
+extern void test_doltgres_scan_tests_a_scan_moves_to_a_newer_base_at_its_next_read_and_gives_every_row_once(void);
+extern void test_doltgres_scan_tests_a_scan_held_inside_its_delta_read_across_an_install_and_drop_gives_every_row_once(void);
+extern void test_doltgres_scan_tests_fetches_through_one_memo_give_each_keyless_copys_own_stamp(void);
 #endif
 
 #endif							/* DOLTGRES_DOLTGRES_SCAN_H */

@@ -80,9 +80,8 @@ typedef struct TreesNodeNode
 	 * order.
 	 */
 	StdBytes	locators;
-	/* stamps are the trailer's stamps, and reads how they read. */
+	/* stamps are the trailer's stamps, decoded, eight-byte aligned. */
 	StdBytes	stamps;
-	uint8		reads;
 } TreesNodeNode;
 
 /* TreesNodeFlat is Flat: a node's flat bytes as a store read them, pinned in a node cache or the read's own. */
@@ -98,7 +97,9 @@ extern TreesNodeNode trees_node_Flat_node(const TreesNodeFlat *self);
 extern void trees_node_Flat_drop(TreesNodeFlat *self);
 extern bool trees_node_Node_Debug_fmt(const void *value, StdFormatter *f);
 extern TreesNodeNode trees_node_Node_view(const uint8 *flat, size_t flat_len);
-extern bool trees_node_Node_stamps(const TreesNodeNode *self, ChunksTrailerStamps *result, ChunksErrorError *error);
+extern ChunksTrailerStamps trees_node_Node_stamps_view(const TreesNodeNode *self);
+extern const uint32 *trees_node_Node_values(const TreesNodeNode *self, size_t i, size_t *result_len);
+extern void trees_node_Node_stamps(const TreesNodeNode *self, ChunksTrailerStamps *result);
 extern ChunksAddressAddress trees_node_Node_address(const TreesNodeNode *self);
 extern StdBytes trees_node_Node_bytes(const TreesNodeNode *self);
 extern uint8 trees_node_Node_level(const TreesNodeNode *self);
@@ -148,6 +149,7 @@ extern bool trees_node_VecTupleU32Locator_PartialEqVecTupleU32Locator_eq(const S
 extern void test_trees_node_tests_leaves_and_internal_nodes_round_trip(void);
 extern void test_trees_node_tests_front_coded_leaf_keys_round_trip_at_prefix_boundaries(void);
 extern void test_trees_node_tests_refuses_offsets_and_counts_its_accessors_cannot_read(void);
+extern void test_trees_node_tests_a_flat_nodes_stamps_read_in_place_as_its_trailer_decodes(void);
 #endif
 
 #endif							/* DOLTGRES_TREES_NODE_H */

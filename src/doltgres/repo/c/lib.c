@@ -150,14 +150,21 @@ repo_runs_pad_0(void *frame_)
 	}
 }
 
-/* repo_runs_file reads one file of a manifest's runs from its item, refusing what runs refuses. */
+/*
+ * repo_runs_file reads one file of a manifest's runs from its item, refusing
+ * what runs refuses: a spill's xid without its number, its number without its
+ * xid, or its passing point or residual's point without either; and a file
+ * without the tablespace its names carry.
+ */
 static bool
 repo_runs_file(const ChunksRecordRecord *item, RepoRunFile *file, ChunksErrorError *error)
 {
-	static const uint32 numbers[] = {1, 2, 3, 4, 5, 6, 7};
+	static const uint32 numbers[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
 	uint64		kind;
 	bool		has_xid;
 	bool		has_number;
+	bool		has_passed;
+	bool		has_from;
 
 	if (!repo_known(item, numbers, lengthof(numbers)))
 		return repo_corrupt(error);
@@ -168,14 +175,25 @@ repo_runs_file(const ChunksRecordRecord *item, RepoRunFile *file, ChunksErrorErr
 	file->kind = (uint8) kind;
 	has_xid = chunks_record_Record_field(item, 6) != NULL;
 	has_number = chunks_record_Record_field(item, 7) != NULL;
-	if (has_xid != has_number)
+	has_passed = chunks_record_Record_field(item, 8) != NULL;
+	has_from = chunks_record_Record_field(item, 9) != NULL;
+	if (has_xid != has_number || (!has_xid && (has_passed || has_from)))
 		return repo_corrupt(error);
 	file->has_spilled = has_xid;
 	if (has_xid && (!chunks_record_Record_uint(item, 6, &file->spilled.xid, error) ||
 					!repo_narrow(item, 7, &file->spilled.number, error)))
 		return false;
+	if (has_xid)
+	{
+		file->spilled.has_passed = has_passed;
+		file->spilled.has_from = has_from;
+		if ((has_passed && !chunks_record_Record_uint(item, 8, &file->spilled.passed, error)) ||
+			(has_from && !chunks_record_Record_uint(item, 9, &file->spilled.from, error)))
+			return false;
+	}
 	return repo_narrow(item, 2, &file->tablespace, error) && repo_narrow(item, 3, &file->relation, error) &&
-		chunks_record_Record_uint(item, 4, &file->len, error) && chunks_record_Record_uint(item, 5, &file->hash, error);
+		chunks_record_Record_uint(item, 4, &file->len, error) && chunks_record_Record_uint(item, 5, &file->hash, error) &&
+		repo_narrow(item, 10, &file->space, error);
 }
 
 /* repo_runs_body_0 is runs's body. */
@@ -346,7 +364,12 @@ repo_Manifest_encode_body_0(void *frame_)
 			{
 				chunks_record_RecordWriter_uint(&frame->item, 6, file->spilled.xid);
 				chunks_record_RecordWriter_uint(&frame->item, 7, file->spilled.number);
+				if (file->spilled.has_passed)
+					chunks_record_RecordWriter_uint(&frame->item, 8, file->spilled.passed);
+				if (file->spilled.has_from)
+					chunks_record_RecordWriter_uint(&frame->item, 9, file->spilled.from);
 			}
+			chunks_record_RecordWriter_uint(&frame->item, 10, file->space);
 			std_vec_push_Checked(&frame->files, &frame->item, sizeof(frame->item), _Alignof(ChunksRecordRecordWriter));
 			frame->item_live = false;
 		}
@@ -612,10 +635,14 @@ bool
 repo_Spilled_Debug_fmt(const void *value, StdFormatter *f)
 {
 	const RepoSpilled *self = value;
+	StdOptionRef passed = {self->has_passed, {&self->passed, std_u64_Debug_fmt}};
+	StdOptionRef from = {self->has_from, {&self->from, std_u64_Debug_fmt}};
 	StdDebugStruct s = std_fmt_debug_struct(f, "Spilled", strlen("Spilled"));
 
 	std_DebugStruct_field(&s, "xid", strlen("xid"), &self->xid, std_u64_Debug_fmt);
 	std_DebugStruct_field(&s, "number", strlen("number"), &self->number, std_u32_Debug_fmt);
+	std_DebugStruct_field(&s, "passed", strlen("passed"), &passed, std_option_Debug_fmt);
+	std_DebugStruct_field(&s, "from", strlen("from"), &from, std_option_Debug_fmt);
 	return std_DebugStruct_finish(&s);
 }
 
@@ -623,7 +650,9 @@ repo_Spilled_Debug_fmt(const void *value, StdFormatter *f)
 bool
 repo_Spilled_PartialEq_eq(const RepoSpilled *self, const RepoSpilled *other)
 {
-	return self->xid == other->xid && self->number == other->number;
+	return self->xid == other->xid && self->number == other->number && self->has_passed == other->has_passed &&
+		(!self->has_passed || self->passed == other->passed) && self->has_from == other->has_from &&
+		(!self->has_from || self->from == other->from);
 }
 
 /* repo_RunFile_Debug_fmt is RunFile's derived Debug. */
@@ -640,6 +669,7 @@ repo_RunFile_Debug_fmt(const void *value, StdFormatter *f)
 	std_DebugStruct_field(&s, "len", strlen("len"), &self->len, std_u64_Debug_fmt);
 	std_DebugStruct_field(&s, "hash", strlen("hash"), &self->hash, std_u64_Debug_fmt);
 	std_DebugStruct_field(&s, "spilled", strlen("spilled"), &spilled, std_option_Debug_fmt);
+	std_DebugStruct_field(&s, "space", strlen("space"), &self->space, std_u32_Debug_fmt);
 	return std_DebugStruct_finish(&s);
 }
 
@@ -649,7 +679,8 @@ repo_RunFile_PartialEq_eq(const RepoRunFile *self, const RepoRunFile *other)
 {
 	return self->kind == other->kind && self->tablespace == other->tablespace && self->relation == other->relation &&
 		self->len == other->len && self->hash == other->hash && self->has_spilled == other->has_spilled &&
-		(!self->has_spilled || repo_Spilled_PartialEq_eq(&self->spilled, &other->spilled));
+		(!self->has_spilled || repo_Spilled_PartialEq_eq(&self->spilled, &other->spilled)) &&
+		self->space == other->space;
 }
 
 /* repo_Runs_files_Debug_fmt is the Debug of a Vec<RunFile>, a list's. */
@@ -1563,6 +1594,15 @@ typedef struct repo_Repo_save_frame_0_t
 	/* The runs the pass writes: those given, or those it read. */
 	bool		has_written;
 	RepoRuns	written;
+	/* Whether the runs the pass writes are those given. */
+	bool		given;
+
+	/*
+	 * For a move's rekey, the tablespace the runs a pass reads move from and
+	 * to, so a manifest names every storage by one key (bugs row 442).
+	 */
+	uint32		moved_from;
+	uint32		moved_to;
 	StdVec		gathered;
 	size_t		gathered_at;
 	bool		gathered_live;
@@ -1845,9 +1885,10 @@ repo_decoded(TreesPublishedRepoId repo, bool has, const chunks_TupleAddressLocat
 
 /*
  * repo_Repo_save_run_0 is save's run under the root slots: it holds and
- * publishes the roots the pass wrote, writes the manifest that names them
- * if no kept file of the repository was written since the pass's read, and
- * takes the runs back out of it.
+ * publishes the roots the pass wrote, lists every pack whose add the
+ * repository defers, writes the manifest that names them if no kept file of
+ * the repository was written since the pass's read, and takes the runs back
+ * out of it.
  */
 static bool
 repo_Repo_save_run_inner(repo_Repo_save_frame_0_t *frame, HostIoRegistering *registering,
@@ -1904,6 +1945,8 @@ repo_Repo_save_run_inner(repo_Repo_save_frame_0_t *frame, HostIoRegistering *reg
 	}
 	manifest->has_runs = false;
 	frame->written_manifest_live = true;
+	if (!chunks_packs_backend_Packs_flush(&frame->self->packs, io, frame->reading, error))
+		return false;
 	if (!host_last_redo(doors, &manifest->redo, &host_error))
 	{
 		*error = chunks_error_Error_FromError_from(&host_error);
@@ -2007,6 +2050,7 @@ repo_Repo_save_body_0(void *frame_)
 	for (;;)
 	{
 		const RepoManifest *read;
+		bool		moved = false;
 
 		if (!repo_Repo_current(self, frame->io, &frame->read.rotations, &frame->manifest, frame->error))
 		{
@@ -2030,7 +2074,9 @@ repo_Repo_save_body_0(void *frame_)
 			trees_published_Published_parts(&read->identity, &frame->read_identity.f0, &frame->read_identity.f1);
 		}
 		frame->has_read_identity = read->has_identity;
-		if (frame->has_runs)
+		frame->given = frame->has_runs &&
+			(frame->checkpoint || !read->has_runs || read->runs.redo < frame->runs.redo);
+		if (frame->given)
 		{
 			frame->written = frame->runs;
 			frame->has_runs = false;
@@ -2040,6 +2086,16 @@ repo_Repo_save_body_0(void *frame_)
 		{
 			repo_Runs_Clone_clone(&read->runs, &frame->written);
 			frame->has_written = true;
+			for (size_t k = 0; frame->moved_from != frame->moved_to && k < frame->written.files.len; k++)
+			{
+				RepoRunFile *file = &STD_VEC_AT(&frame->written.files, RepoRunFile, k);
+
+				if (file->tablespace == frame->moved_from)
+				{
+					file->tablespace = frame->moved_to;
+					moved = true;
+				}
+			}
 		}
 		if (!frame->gather(frame->gather_captures, frame->io, &frame->read, &frame->gathered, frame->error))
 		{
@@ -2048,7 +2104,7 @@ repo_Repo_save_body_0(void *frame_)
 		}
 		frame->gathered_at = 0;
 		frame->gathered_live = true;
-		if (frame->gathered.len == 0 && !frame->checkpoint)
+		if (frame->gathered.len == 0 && !frame->checkpoint && !moved)
 		{
 			frame->ok = true;
 			repo_Repo_save_pad_0(frame);
@@ -2094,11 +2150,18 @@ repo_Repo_save_body_0(void *frame_)
 		}
 		if (frame->landed)
 		{
+			HostError	host_error;
+
 			repo_Repo_save_pad_0(frame);
+			if (!host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-repo-save-landed", &host_error))
+			{
+				*frame->error = chunks_error_Error_FromError_from(&host_error);
+				return;
+			}
 			frame->ok = frame->saved(frame->saved_captures, frame->io, frame->error);
 			return;
 		}
-		if (frame->checkpoint && frame->has_written)
+		if (frame->given && frame->has_written)
 		{
 			frame->runs = frame->written;
 			frame->has_runs = true;
@@ -2137,6 +2200,30 @@ repo_Repo_save(const RepoRepo *self, HostIoIo *io, const HostSharedReader *readi
 	return frame.ok;
 }
 
+/*
+ * repo_Repo_save_between is a save between checkpoints given runs at the
+ * redo point of the last checkpoint: a pass whose read names runs from
+ * before that point, or none, writes the runs given, and any other pass the
+ * runs it read, so a repository that checkpoint passed over gets its runs at
+ * that point from its first save after it (bugs row 417).  It takes the runs
+ * given.
+ */
+bool
+repo_Repo_save_between(const RepoRepo *self, HostIoIo *io, const HostSharedReader *reading, RepoRuns *runs,
+					   bool (*gather) (void *captures, HostIoIo *io, const RepoRead *read, StdVec *result,
+									   ChunksErrorError *error),
+					   void *gather_captures,
+					   bool (*saved) (void *captures, HostIoIo *io, ChunksErrorError *error), void *saved_captures,
+					   ChunksErrorError *error)
+{
+	repo_Repo_save_frame_0_t frame = {.self = self, .io = io, .reading = reading, .gather = gather,
+		.gather_captures = gather_captures, .saved = saved, .saved_captures = saved_captures, .error = error,
+	.has_runs = true, .runs = *runs};
+
+	std_landing(&frame, repo_Repo_save_body_0, repo_Repo_save_pad_0);
+	return frame.ok;
+}
+
 /* The pin scope returning Result<Vec<Gathered>>, rekeyed's. */
 #define TREES_PIN_SCOPE static
 #define TREES_PIN_DECLARE
@@ -2149,11 +2236,16 @@ repo_Repo_save(const RepoRepo *self, HostIoIo *io, const HostSharedReader *readi
 #define TREES_PIN_RESULT_ARGS , frame->result, frame->error
 #include "doltgres/trees/pin_template.h"
 
-/* repo_rekeyed_t is what rekeyed's gather takes: the repository, its reader's guard, and the tablespaces it moves between. */
+/*
+ * repo_rekeyed_t is what rekeyed's gather and records' walk take: the
+ * repository, its reader's guard, whether the walk moves entries, and for a
+ * move the tablespaces it moves between.
+ */
 typedef struct repo_rekeyed_t
 {
 	const RepoRepo *self;
 	const HostSharedReader *reading;
+	bool		moving;
 	uint32		from;
 	uint32		to;
 	TreesStoreTree tree;
@@ -2200,8 +2292,9 @@ repo_rekeyed_scope_pad_0(void *frame_)
 }
 
 /*
- * repo_rekeyed_scope_body_0 is the scope's body: each entry under the old
- * tablespace put under its new key and taken out under its old.
+ * repo_rekeyed_scope_body_0 is the scope's body: for a move, each entry under
+ * the old tablespace put under its new key and taken out under its old; for
+ * a listing, every entry as it is.
  */
 static void
 repo_rekeyed_scope_body_0(void *frame_)
@@ -2212,10 +2305,12 @@ repo_rekeyed_scope_body_0(void *frame_)
 	TreesStoreTree tree = rekeyed->tree;
 	uint8		prefix[4];
 
+	size_t		prefix_len = rekeyed->moving ? sizeof(prefix) : 0;
+
 	std_u32_to_be_bytes(rekeyed->from, prefix);
 	std_vec_new(&frame->gathered, sizeof(RepoGathered), _Alignof(RepoGathered));
 	frame->gathered_live = true;
-	if (!trees_cursor_Cursor_seek(frame->io, frame->pin, TREES_STORE_TREE_NAMED(&tree), prefix, sizeof(prefix), &order,
+	if (!trees_cursor_Cursor_seek(frame->io, frame->pin, TREES_STORE_TREE_NAMED(&tree), prefix, prefix_len, &order,
 								  &frame->cursor, frame->error))
 	{
 		repo_rekeyed_scope_pad_0(frame);
@@ -2229,7 +2324,7 @@ repo_rekeyed_scope_body_0(void *frame_)
 		TreesNodeNode node;
 		uint32		relation;
 
-		if (key.len < sizeof(prefix) || memcmp(key.ptr, prefix, sizeof(prefix)) != 0)
+		if (key.len < prefix_len || memcmp(key.ptr, prefix, prefix_len) != 0)
 			break;
 		if (key.len < 8)
 		{
@@ -2249,15 +2344,18 @@ repo_rekeyed_scope_body_0(void *frame_)
 		std_slice_to_vec_Checked(&frame->edit.u.base.record.bytes, value.ptr, value.len, 1, 1);
 		trees_node_Node_value_addresses(&node, trees_cursor_Cursor_index(&frame->cursor),
 										&frame->edit.u.base.record.addresses);
-		frame->edit.u.base.storage.tablespace = rekeyed->to;
+		frame->edit.u.base.storage.tablespace = rekeyed->moving ? rekeyed->to : std_u32_from_be_bytes(key.ptr);
 		frame->edit.u.base.storage.relation = relation;
 		frame->edit.u.base.folded = 0;
 		std_vec_push_Checked(&frame->gathered, &frame->edit, sizeof(frame->edit), _Alignof(RepoGathered));
 		frame->edit_live = false;
-		frame->edit.tag = REPO_GATHERED_UNLINKED;
-		frame->edit.u.unlinked.tablespace = rekeyed->from;
-		frame->edit.u.unlinked.relation = relation;
-		std_vec_push_Checked(&frame->gathered, &frame->edit, sizeof(frame->edit), _Alignof(RepoGathered));
+		if (rekeyed->moving)
+		{
+			frame->edit.tag = REPO_GATHERED_UNLINKED;
+			frame->edit.u.unlinked.tablespace = rekeyed->from;
+			frame->edit.u.unlinked.relation = relation;
+			std_vec_push_Checked(&frame->gathered, &frame->edit, sizeof(frame->edit), _Alignof(RepoGathered));
+		}
 		if (!trees_cursor_Cursor_next(&frame->cursor, frame->io, frame->pin, frame->error))
 		{
 			repo_rekeyed_scope_pad_0(frame);
@@ -2281,7 +2379,11 @@ repo_rekeyed_scope_0(void *captures, HostIoIo *io, TreesPinPin *pin, StdVec *res
 	return frame.ok;
 }
 
-/* repo_rekeyed_gather_0 is rekeyed's gather: nothing for a manifest with no base tree, else every storage under the old tablespace moved. */
+/*
+ * repo_rekeyed_gather_0 is rekeyed's gather and records' walk: nothing for a
+ * manifest with no base tree, else for a move every storage under the old
+ * tablespace moved, and for a listing every storage's entry.
+ */
 static bool
 repo_rekeyed_gather_0(void *captures, HostIoIo *io, const RepoRead *read, StdVec *result, ChunksErrorError *error)
 {
@@ -2309,20 +2411,43 @@ repo_rekeyed_saved_0(void *captures, HostIoIo *io, ChunksErrorError *error)
 }
 
 /*
- * repo_Repo_rekeyed moves every storage the newest manifest's base tree
- * holds under one tablespace to another, in one new manifest, each entry put
- * under its new key and taken out under its old; a manifest that holds none
- * under the old one writes nothing, so a finish run again rekeys nothing
- * twice.
+ * repo_Repo_rekeyed moves every storage the newest manifest's base tree and
+ * runs hold under one tablespace to another, in one new manifest, each base
+ * entry put under its new key and taken out under its old and each run
+ * file's key moved, its names kept, so the manifest names every storage by
+ * one key (bugs row 442); a manifest that holds none under the old one
+ * writes nothing, so a finish run again rekeys nothing twice. No record a
+ * start replays over this manifest names the database's storages under the
+ * old tablespace: movedb takes the database's lock, finds no other process
+ * of it, fold workers included, and keeps any from connecting until its
+ * finish, so nothing writes them after its second checkpoint, at or after
+ * which every redo past its commit starts.
  */
 bool
 repo_Repo_rekeyed(const RepoRepo *self, HostIoIo *io, const HostSharedReader *reading, uint32 from, uint32 to,
 				  ChunksErrorError *error)
 {
-	repo_rekeyed_t rekeyed = {self, reading, from, to};
+	repo_rekeyed_t rekeyed = {self, reading, true, from, to};
+	repo_Repo_save_frame_0_t frame = {.self = self, .io = io, .reading = reading, .gather = repo_rekeyed_gather_0,
+		.gather_captures = &rekeyed, .saved = repo_rekeyed_saved_0, .error = error, .moved_from = from,
+	.moved_to = to};
 
-	return repo_Repo_save(self, io, reading, false, NULL, repo_rekeyed_gather_0, &rekeyed, repo_rekeyed_saved_0, NULL,
-						  error);
+	std_landing(&frame, repo_Repo_save_body_0, repo_Repo_save_pad_0);
+	return frame.ok;
+}
+
+/*
+ * repo_Repo_records returns every storage's entry in the newest manifest's
+ * base tree, in key order, each as a base edit of its storage and record,
+ * which a checkpoint's runs read their storages' cuts from (bugs row 408).
+ */
+bool
+repo_Repo_records(const RepoRepo *self, HostIoIo *io, const HostSharedReader *reading, StdVec *result,
+				  ChunksErrorError *error)
+{
+	repo_rekeyed_t rekeyed = {self, reading, false};
+
+	return repo_rekeyed_gather_0(&rekeyed, io, NULL, result, error);
 }
 
 #ifdef DOLTGRES_TEST_REPO
@@ -2966,7 +3091,7 @@ repo_tests_runs(HostLsn redo, RepoRuns *result)
 		{.kind = 0, .tablespace = HOST_PG_DEFAULT, .relation = 16384, .len = 4096, .hash = 0xfeed},
 		{.kind = 3, .tablespace = 0, .relation = 0, .len = 128, .hash = PG_UINT64_MAX},
 		{.kind = 5, .tablespace = HOST_PG_DEFAULT, .relation = 16384, .len = 512, .hash = 7, .has_spilled = true,
-		.spilled = {((uint64) 1 << 40) | 742, 3}},
+		.spilled = {((uint64) 1 << 40) | 742, 3, true, ((uint64) 1 << 33) | 5, true, ((uint64) 1 << 33) | 9}},
 	};
 
 	result->redo = redo;
@@ -3045,7 +3170,7 @@ repo_tests_runs_body_0(void *frame_)
 	{
 		uint32		number;
 		uint64		value;
-	}			listings[] = {{1, 256}, {2, (uint64) 1 << 32}, {3, (uint64) 1 << 32}, {6, 1}, {7, 1}, {8, 1}};
+	}			listings[] = {{1, 256}, {2, (uint64) 1 << 32}, {3, (uint64) 1 << 32}, {6, 1}, {7, 1}, {8, 1}, {9, 1}};
 
 	for (size_t k = 0, k_len = 3; k < k_len; k++)
 	{

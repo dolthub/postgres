@@ -52,10 +52,7 @@ host_io_InDrop_new(void)
 }
 
 #ifndef FRONTEND
-/*
- * host_io_Io_new_for_pghost makes the capability around pg's; the typed lint
- * refuses a call from any crate but pghost.
- */
+/* host_io_Io_new_for_pghost makes the capability around pg's, for pghost alone. */
 HostIoIo
 host_io_Io_new_for_pghost(StdAny raise)
 {
@@ -81,6 +78,30 @@ host_io_Io_check(HostIoIo *self, HostError *error)
 	HostMayRaise raise = host_MayRaise_of(self->raise);
 
 	return host.ops->check_interrupts(host.self, &raise, error);
+}
+
+/*
+ * host_io_Io_hold holds the process's interrupts, as Postgres'
+ * HOLD_INTERRUPTS does, until a resume, so a cancel or a termination waits for
+ * work that must finish once begun (bugs row 461).
+ */
+void
+host_io_Io_hold(HostIoIo *self)
+{
+	HostHost	host = host_current();
+
+	(void) self;
+	host.ops->hold_interrupts(host.self);
+}
+
+/* host_io_Io_resume gives back a hold of the process's interrupts, as Postgres' RESUME_INTERRUPTS does. */
+void
+host_io_Io_resume(HostIoIo *self)
+{
+	HostHost	host = host_current();
+
+	(void) self;
+	host.ops->resume_interrupts(host.self);
 }
 
 #ifdef DOLTGRES_HOST_TESTING
@@ -120,7 +141,7 @@ host_io_Io_DerefMut_deref_mut(void *self)
 }
 
 #ifndef FRONTEND
-/* host_io_Waits_new_for_pghost makes the capability; the typed lint refuses a call from any crate but pghost. */
+/* host_io_Waits_new_for_pghost makes the capability, for pghost alone. */
 HostIoWaits
 host_io_Waits_new_for_pghost(void)
 {
@@ -340,7 +361,7 @@ const HostIoTakesShortOps HOST_IO_REGISTERING_TAKES_SHORT_OPS = {
 };
 
 #ifdef FRONTEND
-/* host_io_ReadIo_new_for_fehost makes the capability; the typed lint refuses a call from any crate but fehost. */
+/* host_io_ReadIo_new_for_fehost makes the capability, for fehost alone. */
 HostIoReadIo
 host_io_ReadIo_new_for_fehost(void)
 {

@@ -88,6 +88,13 @@ typedef struct StdUnwind
 	StdPayload	payload;
 	void	   *box;
 	void	   *exception;
+
+	/*
+	 * heap is a catching frame's port heap when it was pushed, which ending
+	 * its unwind puts back, so a panic out of a heap switch leaves the heap
+	 * as the catch found it (bugs row 487).
+	 */
+	void	   *heap;
 } StdUnwind;
 
 /*
@@ -138,7 +145,7 @@ typedef struct StdCaught
 	((unwind)->prev = std_unwind_top, (unwind)->landed = false, (unwind)->catches = false, std_unwind_top = (unwind))
 
 /* STD_UNWIND_PUSH_CATCHING pushes the frame of a pad that catches the unwind, an entry's or catch_unwind's. */
-#define STD_UNWIND_PUSH_CATCHING(unwind) (STD_UNWIND_PUSH(unwind), (unwind)->catches = true)
+#define STD_UNWIND_PUSH_CATCHING(unwind) std_unwind_push_catching(unwind)
 
 /*
  * STD_NOUNWIND_PUSH pushes the frame of a region Rust compiles as a nounwind
@@ -214,6 +221,7 @@ pg_noreturn extern void std_option_unwrap_failed(const char *file, uint32 line, 
 pg_noreturn extern void std_result_unwrap_failed(const char *msg, size_t msg_len, const void *error,
 												 bool (*error_fmt) (const void *, struct StdFormatter *),
 												 const char *file, uint32 line, uint32 col);
+extern void std_unwind_push_catching(StdUnwind *unwind);
 extern StdCaught std_unwind_end(StdUnwind *unwind);
 extern void std_Caught_drop_Checked(StdCaught *self);
 extern bool std_Caught_downcast_string_Checked(const StdCaught *self, const char **text, size_t *len);

@@ -175,7 +175,7 @@ extern void chunks_packs_view_View_Default_default(ChunksPacksViewView *result);
 extern void chunks_packs_view_View_new(uint32 repository, uint32 own, ChunksPacksViewView *result);
 extern void chunks_packs_view_View_drop(ChunksPacksViewView *self);
 extern void chunks_packs_view_View_space_dir(const ChunksPacksViewView *self, uint32 space, StdPathBuf *result);
-extern bool chunks_packs_view_View_refresh(ChunksPacksViewView *self, HostIoIo *io, HostSharedRecord record,
+extern bool chunks_packs_view_View_refresh(ChunksPacksViewView *self, HostIoTakesShort io, HostSharedRecord record,
 										   ChunksErrorError *error);
 extern bool chunks_packs_view_View_refresh_under(ChunksPacksViewView *self, HostSharedLongIo *io,
 												 HostSharedRecord record, ChunksPacksSharedSnapshot *result,
@@ -194,6 +194,7 @@ extern const ChunksIndexAddressIndexLocator *chunks_packs_view_View_forwards(con
 extern const ChunksPacksTable *chunks_packs_view_View_table(const ChunksPacksViewView *self);
 extern ChunksPacksViewReadRuns *chunks_packs_view_runs_get(const StdVec *runs, uint32 space);
 extern ChunksPacksViewReadRuns *chunks_packs_view_runs_entry(StdVec *runs, uint32 space);
+extern void chunks_packs_view_runs_remove(StdVec *runs, uint32 space);
 extern bool chunks_packs_view_missing_contains(const StdVec *missing, uint32 space);
 
 /* reads.c's reads through a view. */

@@ -629,6 +629,468 @@ chunks_packs_marking_Packs_relist_strays(const ChunksPacksBackendPacks *self, Ho
 	return frame.ok;
 }
 
+/*
+ * chunks_packs_marking_vector_of reports whether a file name is a deletion
+ * vector's, `<id>.<generation>.dead`, or its write's temporary,
+ * `<id>.<generation>.tmp`, giving the pack's id, the generation, and which.
+ */
+static bool
+chunks_packs_marking_vector_of(const StdString *name, ChunksPackPackId *id, uint64 *generation, bool *temp)
+{
+	const char *chars = (const char *) name->ptr;
+	size_t		at = 33;
+	size_t		digits = 0;
+	uint64		value = 0;
+
+	if (name->len < 34 || !chunks_pack_PackId_of_name(chars, name->len, id) || chars[32] != '.')
+		return false;
+	while (at < name->len && chars[at] >= '0' && chars[at] <= '9' && digits < 19)
+	{
+		value = value * 10 + (uint64) (chars[at] - '0');
+		at++;
+		digits++;
+	}
+	if (digits == 0)
+		return false;
+	*generation = value;
+	*temp = name->len - at == strlen(".tmp") && memcmp(chars + at, ".tmp", strlen(".tmp")) == 0;
+	return *temp || (name->len - at == strlen(".dead") && memcmp(chars + at, ".dead", strlen(".dead")) == 0);
+}
+
+/*
+ * chunks_packs_marking_names_vector reports whether a view keeps a pack's
+ * vector of a generation: its table names that generation for the pack, or
+ * the pack is a deferred add the table doesn't list yet.
+ */
+static bool
+chunks_packs_marking_names_vector(const ChunksPacksViewView *view, const ChunksPackPackId *id, uint64 generation)
+{
+	const StdVec *packs = &chunks_packs_view_View_table(view)->packs;
+
+	for (size_t k = 0, k_len = packs->len; k < k_len; k++)
+	{
+		const ChunksPacksListed *listed = &STD_VEC_AT(packs, chunks_TupleU64Listed_t, k).f1;
+
+		if (chunks_pack_PackId_PartialEq_eq(&listed->id, id))
+			return listed->has_dead && listed->dead == generation;
+	}
+	for (size_t k = 0, k_len = view->deferred.len; k < k_len; k++)
+		if (chunks_pack_PackId_PartialEq_eq(&STD_VEC_AT(&view->deferred, ChunksPacksTableEntry, k).f2, id))
+			return true;
+	return false;
+}
+
+/* chunks_packs_marking_queues_vector reports whether the removal queue's entries hold a pack's vector of a generation. */
+static bool
+chunks_packs_marking_queues_vector(const StdVec *queued, const ChunksPackPackId *id, uint64 generation)
+{
+	for (size_t k = 0, k_len = queued->len; k < k_len; k++)
+	{
+		const ChunksPacksSingleRemoval *entry = &STD_VEC_AT(queued, ChunksPacksSingleRemoval, k);
+
+		if (entry->kind.tag == CHUNKS_PACKS_SINGLE_QUEUED_VECTOR && entry->kind.u.vector == generation &&
+			chunks_pack_PackId_PartialEq_eq(&entry->id, id))
+			return true;
+	}
+	return false;
+}
+
+/* chunks_packs_marking_vectors_frame_0_t is queue_vectors' state across its pad: the queue's entries, the directories and a listing, a path, the strays, the view, the barrier, the lists' guard and snapshot, and the reservation. */
+typedef struct chunks_packs_marking_vectors_frame_0_t
+{
+	const ChunksPacksBackendPacks *self;
+	HostIoIo   *io;
+	ChunksErrorError *error;
+	bool		ok;
+
+	/*
+	 * queued is a Vec<Removal> of the removal queue's entries for the
+	 * repository.
+	 */
+	StdVec		queued;
+	bool		queued_live;
+
+	/*
+	 * dirs is a Vec<(u32, PathBuf)> of the repository's directories with
+	 * their tablespaces.
+	 */
+	StdVec		dirs;
+	bool		dirs_live;
+	StdVec		names;
+	bool		names_live;
+	StdPathBuf	path;
+	bool		path_live;
+
+	/*
+	 * strays is a Vec<File> of the vector files the pack table doesn't name,
+	 * to queue.
+	 */
+	StdVec		strays;
+	bool		strays_live;
+	HostLockLending view;
+	bool		view_live;
+	HostSharedLongGuard barrier;
+	bool		barrier_live;
+	HostSharedLongGuard lists;
+	bool		lists_live;
+	ChunksPacksSharedSnapshot snapshot;
+	bool		snapshot_live;
+	ChunksPacksRemovalReservation reservation;
+	bool		reservation_live;
+} chunks_packs_marking_vectors_frame_0_t;
+
+/* chunks_packs_marking_stray_lt reports whether a stray vector sorts before another: by tablespace, pack id, then generation. */
+static bool
+chunks_packs_marking_stray_lt(const ChunksPacksRemovalFile *a, const ChunksPacksRemovalFile *b)
+{
+	StdOrdering ids = chunks_pack_PackId_Ord_cmp(&a->f2, &b->f2);
+
+	if (a->f0 != b->f0)
+		return a->f0 < b->f0;
+	if (ids != STD_ORDERING_EQUAL)
+		return ids == STD_ORDERING_LESS;
+	return a->f1.u.vector < b->f1.u.vector;
+}
+
+/* chunks_packs_marking_strays_insert inserts a stray vector into the strays in order, so the queue stores them in one order on every platform. */
+static void
+chunks_packs_marking_strays_insert(StdVec *strays, const ChunksPacksRemovalFile *file)
+{
+	size_t		at = strays->len;
+
+	while (at > 0 && chunks_packs_marking_stray_lt(file, &STD_VEC_AT(strays, ChunksPacksRemovalFile, at - 1)))
+		at--;
+	std_vec_insert(strays, at, file, sizeof(*file), _Alignof(ChunksPacksRemovalFile), RUST_FILE, 0, 0);
+}
+
+static bool chunks_packs_marking_vectors_found(chunks_packs_marking_vectors_frame_0_t *frame)
+			STD_REQUIRES(CHUNKS_PACKS_BARRIER_HOLDING);
+
+/* chunks_packs_marking_vectors_pad_0 is queue_vectors' pad: what it holds, the latest first. */
+static void
+chunks_packs_marking_vectors_pad_0(void *frame_)
+{
+	chunks_packs_marking_vectors_frame_0_t *frame = frame_;
+
+	if (frame->reservation_live)
+	{
+		frame->reservation_live = false;
+		chunks_packs_removal_Reservation_drop(&frame->reservation);
+	}
+	if (frame->snapshot_live)
+	{
+		frame->snapshot_live = false;
+		chunks_packs_shared_Snapshot_drop(&frame->snapshot);
+	}
+	if (frame->lists_live)
+	{
+		frame->lists_live = false;
+		host_shared_LongGuard_drop(&frame->lists);
+	}
+	if (frame->barrier_live)
+	{
+		frame->barrier_live = false;
+		host_shared_LongGuard_drop(&frame->barrier);
+	}
+	if (frame->view_live)
+	{
+		frame->view_live = false;
+		host_lock_Lending_drop(&frame->view);
+	}
+	if (frame->strays_live)
+	{
+		frame->strays_live = false;
+		std_vec_free_Checked(&frame->strays, sizeof(ChunksPacksRemovalFile), _Alignof(ChunksPacksRemovalFile));
+	}
+	if (frame->path_live)
+	{
+		frame->path_live = false;
+		std_vec_free_Checked(&frame->path.bytes, 1, 1);
+	}
+	if (frame->names_live)
+	{
+		frame->names_live = false;
+		std_vec_drop_Checked(&frame->names, sizeof(StdString), _Alignof(StdString), std_String_drop);
+	}
+	if (frame->dirs_live)
+	{
+		frame->dirs_live = false;
+		for (size_t k = 0, k_len = frame->dirs.len; k < k_len; k++)
+			std_vec_free_Checked(&STD_VEC_AT(&frame->dirs, chunks_TupleU32PathBuf_t, k).f1.bytes, 1, 1);
+		std_vec_free_Checked(&frame->dirs, sizeof(chunks_TupleU32PathBuf_t), _Alignof(chunks_TupleU32PathBuf_t));
+	}
+	if (frame->queued_live)
+	{
+		frame->queued_live = false;
+		std_vec_free_Checked(&frame->queued, sizeof(ChunksPacksSingleRemoval), _Alignof(ChunksPacksSingleRemoval));
+	}
+}
+
+/*
+ * chunks_packs_marking_vectors_found lists the vector files in the
+ * repository's directories under its barrier held exclusively, so that none
+ * is being written or named meanwhile: it removes each write's temporary,
+ * which no view or queue entry can name, and keeps each vector the table
+ * doesn't name and the queue doesn't hold as a stray to queue, in order.
+ */
+static bool
+chunks_packs_marking_vectors_found(chunks_packs_marking_vectors_frame_0_t *frame)
+{
+	const ChunksPacksViewView *view = host_lock_Lending_DerefMut_deref_mut(&frame->view);
+	const ChunksPacksBackendPacks *self = frame->self;
+
+	for (size_t d = 0, d_len = frame->dirs.len; d < d_len; d++)
+	{
+		const chunks_TupleU32PathBuf_t *dir = &STD_VEC_AT(&frame->dirs, chunks_TupleU32PathBuf_t, d);
+
+		if (!chunks_file_file_names(HOST_IO_IO_READ_DOORS(frame->io), dir->f1.bytes.ptr, dir->f1.bytes.len,
+									&frame->names, frame->error))
+			return false;
+		frame->names_live = true;
+		for (size_t k = 0, k_len = frame->names.len; k < k_len; k++)
+		{
+			const StdString *name = &STD_VEC_AT(&frame->names, StdString, k);
+			ChunksPackPackId id;
+			uint64		generation;
+			bool		temp;
+
+			if (!chunks_packs_marking_vector_of(name, &id, &generation, &temp))
+				continue;
+			if (temp)
+			{
+				std_path_join(dir->f1.bytes.ptr, dir->f1.bytes.len, name->ptr, name->len, &frame->path);
+				frame->path_live = true;
+				host_remove_leftover(HOST_IO_IO_IO_DOORS(frame->io), frame->path.bytes.ptr, frame->path.bytes.len);
+				frame->path_live = false;
+				std_vec_free_Checked(&frame->path.bytes, 1, 1);
+			}
+			else if (!chunks_packs_marking_names_vector(view, &id, generation) &&
+					 !chunks_packs_marking_queues_vector(&frame->queued, &id, generation))
+			{
+				ChunksPacksRemovalFile file = {dir->f0 == CHUNKS_PACKS_DEFAULT_SPACE ? self->own : dir->f0,
+				{CHUNKS_PACKS_SINGLE_QUEUED_VECTOR, {generation}}, id};
+
+				chunks_packs_marking_strays_insert(&frame->strays, &file);
+			}
+		}
+		frame->names_live = false;
+		std_vec_drop_Checked(&frame->names, sizeof(StdString), _Alignof(StdString), std_String_drop);
+	}
+	return true;
+}
+
+/*
+ * chunks_packs_marking_vectors_body_0 is queue_vectors' body: the queue's
+ * entries read with nothing held, the directories listed under the barrier
+ * once the view is current under the lists lock, and with the barrier given
+ * back, the strays queued in as many entries as their reservation has.
+ */
+static void
+chunks_packs_marking_vectors_body_0(void *frame_)
+{
+	chunks_packs_marking_vectors_frame_0_t *frame = frame_;
+	const ChunksPacksBackendPacks *self = frame->self;
+	HostSharedRecord record = host_shared_Held_record(&self->held);
+	HostSharedLongIo barrier_io;
+	HostSharedLongIo lists_io;
+	HostError	host;
+	size_t		queued;
+	bool		found;
+
+	frame->ok = false;
+	if (!chunks_packs_removal_queued(frame->io, (uint32) self->repository, &frame->queued, frame->error))
+		return;
+	frame->queued_live = true;
+	if (!chunks_packs_open_spaced_directories(HOST_IO_IO_READ_DOORS(frame->io), (uint32) self->repository, self->own,
+											  &frame->dirs, frame->error))
+		goto done;
+	frame->dirs_live = true;
+	std_vec_new(&frame->strays, sizeof(ChunksPacksRemovalFile), _Alignof(ChunksPacksRemovalFile));
+	frame->strays_live = true;
+	frame->view = chunks_packs_backend_Packs_view_lock(self, HOST_IO_IO_TAKES_SHORT(frame->io));
+	frame->view_live = true;
+	if (!host_shared_Record_lock_long(record, host_lock_Lending_io(&frame->view), CHUNKS_PACKS_SHARED_BARRIER_INDEX,
+									  &frame->barrier, &host))
+		goto failed;
+	frame->barrier_live = true;
+	barrier_io = host_shared_LongGuard_io(&frame->barrier);
+	if (!host_shared_LongIo_lock_long(&barrier_io, CHUNKS_PACKS_SHARED_LISTS_LOCK_INDEX, &frame->lists, &host))
+		goto failed;
+	frame->lists_live = true;
+	lists_io = host_shared_LongGuard_io(&frame->lists);
+	if (!chunks_packs_view_View_refresh_under(host_lock_Lending_DerefMut_deref_mut(&frame->view), &lists_io, record,
+											  &frame->snapshot, frame->error))
+		goto done;
+	frame->snapshot_live = true;
+	frame->snapshot_live = false;
+	chunks_packs_shared_Snapshot_drop(&frame->snapshot);
+	frame->lists_live = false;
+	host_shared_LongGuard_drop(&frame->lists);
+	chunks_packs_barrier_held();
+	found = chunks_packs_marking_vectors_found(frame);
+	chunks_packs_barrier_left();
+	if (!found)
+		goto done;
+	frame->barrier_live = false;
+	host_shared_LongGuard_drop(&frame->barrier);
+	frame->view_live = false;
+	host_lock_Lending_drop(&frame->view);
+	if (frame->strays.len != 0)
+	{
+		if (!chunks_packs_removal_reserve(frame->io, frame->strays.len, &frame->reservation, frame->error))
+			goto done;
+		queued = Min(frame->strays.len, chunks_packs_removal_Reservation_entries(&frame->reservation));
+		if (!chunks_packs_removal_queue(frame->io, &frame->reservation, (uint32) self->repository, frame->strays.ptr,
+										queued, frame->error))
+			goto done;
+	}
+	frame->ok = true;
+	goto done;
+
+failed:
+	*frame->error = chunks_error_Error_FromError_from(&host);
+done:
+	chunks_packs_marking_vectors_pad_0(frame);
+}
+
+/*
+ * chunks_packs_marking_queue_vectors is the marking's begin's pass over the
+ * deletion vectors (H14; bugs row 499): it queues through the removal queue
+ * each vector file the pack table doesn't name, which a failed or crashed
+ * retirement or the vector a later one replaced leaves, removes each vector
+ * write's temporary a crash left; a retirement's new generation passes
+ * every one on disk (Packs_highest_vector), so no vector is written again
+ * under a stray's name. Doltgrust has no vectors.
+ */
+static bool
+chunks_packs_marking_queue_vectors(const ChunksPacksBackendPacks *self, HostIoIo *io, ChunksErrorError *error)
+{
+	chunks_packs_marking_vectors_frame_0_t frame = {.self = self, .io = io, .error = error};
+
+	std_landing(&frame, chunks_packs_marking_vectors_body_0, chunks_packs_marking_vectors_pad_0);
+	return frame.ok;
+}
+
+/* chunks_packs_marking_highest_frame_0_t is highest_vector's state across its pad: the directories and a listing. */
+typedef struct chunks_packs_marking_highest_frame_0_t
+{
+	const ChunksPacksBackendPacks *self;
+	HostIoIo   *io;
+	uint64	   *result;
+	ChunksErrorError *error;
+	bool		ok;
+
+	/*
+	 * dirs is a Vec<(u32, PathBuf)> of the repository's directories with
+	 * their tablespaces.
+	 */
+	StdVec		dirs;
+	bool		dirs_live;
+	StdVec		names;
+	bool		names_live;
+
+	/*
+	 * queued is a Vec<Removal> of the removal queue's entries for the
+	 * repository.
+	 */
+	StdVec		queued;
+	bool		queued_live;
+} chunks_packs_marking_highest_frame_0_t;
+
+/* chunks_packs_marking_highest_pad_0 is highest_vector's pad: the queue's entries, the listing, then the directories. */
+static void
+chunks_packs_marking_highest_pad_0(void *frame_)
+{
+	chunks_packs_marking_highest_frame_0_t *frame = frame_;
+
+	if (frame->queued_live)
+	{
+		frame->queued_live = false;
+		std_vec_free_Checked(&frame->queued, sizeof(ChunksPacksSingleRemoval), _Alignof(ChunksPacksSingleRemoval));
+	}
+
+	if (frame->names_live)
+	{
+		frame->names_live = false;
+		std_vec_drop_Checked(&frame->names, sizeof(StdString), _Alignof(StdString), std_String_drop);
+	}
+	if (frame->dirs_live)
+	{
+		frame->dirs_live = false;
+		for (size_t k = 0, k_len = frame->dirs.len; k < k_len; k++)
+			std_vec_free_Checked(&STD_VEC_AT(&frame->dirs, chunks_TupleU32PathBuf_t, k).f1.bytes, 1, 1);
+		std_vec_free_Checked(&frame->dirs, sizeof(chunks_TupleU32PathBuf_t), _Alignof(chunks_TupleU32PathBuf_t));
+	}
+}
+
+/* chunks_packs_marking_highest_body_0 is highest_vector's body: each directory listed, and the highest vector generation in their names and in the removal queue's entries. */
+static void
+chunks_packs_marking_highest_body_0(void *frame_)
+{
+	chunks_packs_marking_highest_frame_0_t *frame = frame_;
+
+	frame->ok = false;
+	*frame->result = 0;
+	if (!chunks_packs_open_spaced_directories(HOST_IO_IO_READ_DOORS(frame->io), (uint32) frame->self->repository,
+											  frame->self->own, &frame->dirs, frame->error))
+		return;
+	frame->dirs_live = true;
+	for (size_t d = 0, d_len = frame->dirs.len; d < d_len; d++)
+	{
+		const chunks_TupleU32PathBuf_t *dir = &STD_VEC_AT(&frame->dirs, chunks_TupleU32PathBuf_t, d);
+
+		if (!chunks_file_file_names(HOST_IO_IO_READ_DOORS(frame->io), dir->f1.bytes.ptr, dir->f1.bytes.len,
+									&frame->names, frame->error))
+			goto done;
+		frame->names_live = true;
+		for (size_t k = 0, k_len = frame->names.len; k < k_len; k++)
+		{
+			ChunksPackPackId id;
+			uint64		generation;
+			bool		temp;
+
+			if (chunks_packs_marking_vector_of(&STD_VEC_AT(&frame->names, StdString, k), &id, &generation, &temp))
+				*frame->result = Max(*frame->result, generation);
+		}
+		frame->names_live = false;
+		std_vec_drop_Checked(&frame->names, sizeof(StdString), _Alignof(StdString), std_String_drop);
+	}
+	if (!chunks_packs_removal_queued(frame->io, (uint32) frame->self->repository, &frame->queued, frame->error))
+		goto done;
+	frame->queued_live = true;
+	for (size_t k = 0, k_len = frame->queued.len; k < k_len; k++)
+	{
+		const ChunksPacksSingleRemoval *entry = &STD_VEC_AT(&frame->queued, ChunksPacksSingleRemoval, k);
+
+		if (entry->kind.tag == CHUNKS_PACKS_SINGLE_QUEUED_VECTOR)
+			*frame->result = Max(*frame->result, entry->kind.u.vector);
+	}
+	frame->ok = true;
+done:
+	chunks_packs_marking_highest_pad_0(frame);
+}
+
+/*
+ * chunks_packs_marking_Packs_highest_vector returns the highest generation of
+ * any deletion vector or vector write's temporary on disk in the
+ * repository's directories, or of any vector the removal queue holds for
+ * it, read under its barrier held exclusively, so that a retirement's new
+ * vectors pass every name on disk or in the queue, and no entry, a
+ * duplicate's second whose file the first removed among them, ever removes
+ * a vector written again under its name (H14; bugs row 499): a marking
+ * another collection took over still retires, so the generation is the
+ * retirement's own reading, never its marking's begin's.
+ */
+bool
+chunks_packs_marking_Packs_highest_vector(const ChunksPacksBackendPacks *self, HostIoIo *io, uint64 *result,
+										  ChunksErrorError *error)
+{
+	chunks_packs_marking_highest_frame_0_t frame = {.self = self, .io = io, .result = result, .error = error};
+
+	std_landing(&frame, chunks_packs_marking_highest_body_0, chunks_packs_marking_highest_pad_0);
+	return frame.ok;
+}
+
 /* chunks_packs_marking_begin_frame_0_t is begin_marking's state across its pad: the numbers listed, the barriers, and the other record. */
 typedef struct chunks_packs_marking_begin_frame_0_t
 {
@@ -664,7 +1126,7 @@ chunks_packs_marking_begin_pad_0(void *frame_)
 
 /*
  * chunks_packs_marking_begin_body_0 is begin_marking's body: the strays
- * removed and listed again, then the hits named for the repository's record
+ * removed and listed again and the stray vectors queued, then the hits named for the repository's record
  * under its barrier, a name another collector left cleared first under its
  * repository's barrier.
  */
@@ -681,7 +1143,8 @@ chunks_packs_marking_begin_body_0(void *frame_)
 
 	frame->ok = false;
 	if (!chunks_packs_marking_Packs_remove_strays(self, frame->io, frame->error) ||
-		!chunks_packs_marking_Packs_relist_strays(self, frame->io, frame->reading, frame->error))
+		!chunks_packs_marking_Packs_relist_strays(self, frame->io, frame->reading, frame->error) ||
+		!chunks_packs_marking_queue_vectors(self, frame->io, frame->error))
 		return;
 	if (!host_shared_single(&CHUNKS_PACKS_SINGLE_CHUNKS_STATE_SINGLE_OPS, &hits, &host))
 	{
@@ -750,7 +1213,8 @@ done:
  * chunk it finds in a pack numbered at or below that. A name left by a
  * collector that was terminated in its marking is cleared first under that
  * repository's barrier. Before any of it, with nothing held and nothing
- * marked, it removes the unfinished packs no writer has open.
+ * marked, it removes the unfinished packs no writer has open, and queues
+ * the deletion vectors the pack table doesn't name.
  */
 bool
 chunks_packs_marking_Packs_begin_marking(const ChunksPacksBackendPacks *self, HostIoIo *io,
@@ -977,7 +1441,7 @@ chunks_packs_marking_noted_body_0(void *frame_)
 		bool		dead;
 		bool		recorded;
 
-		if (!chunks_packs_view_View_refresh(view, frame->io, record, frame->error))
+		if (!chunks_packs_view_View_refresh(view, HOST_IO_IO_TAKES_SHORT(frame->io), record, frame->error))
 			goto done;
 		if (!host_shared_Record_lock_long_shared(record, frame->io, CHUNKS_PACKS_SHARED_BARRIER_INDEX, &frame->barrier,
 												 &host))

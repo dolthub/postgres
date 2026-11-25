@@ -18,9 +18,7 @@
  * The row tuples that tables' leaves hold: a varint of the field count and
  * flags, a bitmap of NULLs, one of external fields when any is, each field's
  * end as two bytes, the fields' data, and the address of the rest of a row
- * too wide for one tuple. Verus proves the Rust's parse, field, and walk
- * against the tuple's well-formedness; the C's guarantee is tested
- * equivalence.
+ * too wide for one tuple.
  */
 #ifndef FRONTEND
 #include "postgres.h"

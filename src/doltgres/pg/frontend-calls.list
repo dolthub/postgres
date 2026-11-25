@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Every port layer function the frontend build's Rust calls (design item D12), one per line, tab-separated: the name
-# of its wrapper, its C return type, which is int64, the C parameters, how it fails (errno: it returns a negative
-# number, with errno in its error), the C statements the wrapper runs, which set `result`, and the test of pg's
-# frontend tests (`cargo test -p pg` inside src/doltgres/fsck, over the real wrappers) that exercises the wrapper. No
-# wrapper may exit or call what exits (pg_fatal, exit, pg_log_*, the pg_malloc family), since the
-# check runs under Rust frames. The build generates the C wrapper and its Rust function.
+# Every port layer function the frontend build calls (design item D12), one per line, tab-separated: the name of its
+# wrapper, its C return type, which is int64, the C parameters, how it fails (errno: it returns a negative number,
+# with errno in its error), the C statements the wrapper runs, which set `result`, and the case of pg's frontend test
+# binary (t/123, over the real wrappers) that exercises the wrapper. No wrapper may exit or call what exits (pg_fatal,
+# exit, pg_log_*, the pg_malloc family), since each returns its failure to its caller as a status (design item 11).
+# The build generates the C wrapper and its form in pg's frontend calls.
 
 open	int64	const char *path	errno	result = open(path, O_RDONLY | PG_BINARY, 0)	tests::a_file_opens_reads_and_closes
 close	int64	int fd	errno	result = close(fd)	tests::a_file_opens_reads_and_closes

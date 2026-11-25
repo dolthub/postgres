@@ -22,8 +22,7 @@
  * then each child's subtree entry count. A leaf's keys are front coded; an
  * internal node's are an offset per key and the key bytes, or fixed-width
  * keys back to back. Decoding lays a node out flat, which Node reads in
- * place. shared_prefix is proved by Verus against shared_len; the C's
- * guarantee is tested equivalence.
+ * place.
  */
 #ifndef FRONTEND
 #include "postgres.h"
@@ -54,9 +53,16 @@
  * numbers its entry count, its body's offset, its key width, the offsets of
  * its keys, key bytes, values, value bytes, and summaries, and the lengths of
  * its bytes, its subtree counts, its address table, its locators, and its
- * stamps.
+ * decoded stamps.
  */
 #define TREES_NODE_HEADER ((size_t) (34 + 4 * 13))
+
+/*
+ * TREES_NODE_STAMP_COUNTS is how many eight-byte numbers open a flat node's
+ * decoded stamps: the lengths of their single stamps, runs, ends, subtrees'
+ * highest tuple ids, and value entries, and whether they keep ends.
+ */
+#define TREES_NODE_STAMP_COUNTS 6
 
 /* TREES_NODE_BLOB is BLOB, the flat header's flag of a blob leaf. */
 #define TREES_NODE_BLOB ((uint8) 1)
@@ -564,8 +570,73 @@ static bool trees_node_Decoded_of(ChunksAddressAddress address, const uint8 *has
 								  TreesNodeDecoded *result, ChunksErrorError *error);
 
 /*
+ * TreesNodeValues is a flat node's value entry: the entry's index, and where
+ * its value ids start among the node's ids and how many it has.
+ */
+typedef struct TreesNodeValues
+{
+	uint64		index;
+	uint64		at;
+	uint64		len;
+} TreesNodeValues;
+
+/*
+ * trees_node_stamps_len returns the length of a node's decoded stamps in its
+ * flat bytes: their counts, each array of their stamps, ends, and highest
+ * tuple ids, the value entries, and the value ids.
+ */
+static size_t
+trees_node_stamps_len(const ChunksTrailerStamps *stamps)
+{
+	size_t		len = TREES_NODE_STAMP_COUNTS * sizeof(uint64) +
+		stamps->single.len * sizeof(ChunksTrailerStamp) +
+		stamps->runs.len * sizeof(chunks_trailer_Stamps_runs_t) +
+		(stamps->ends.len + stamps->max_tuples.len) * sizeof(uint64) +
+		stamps->values.len * sizeof(TreesNodeValues);
+
+	for (size_t k = 0; k < stamps->values.len; k++)
+		len += STD_VEC_AT(&stamps->values, chunks_trailer_Stamps_values_t, k).f1.len * sizeof(uint32);
+	return len;
+}
+
+/*
+ * trees_node_stamps_write appends a node's decoded stamps to its flat bytes,
+ * each array in the form ChunksTrailerStamps holds it, so a view of the flat
+ * bytes reads them in place.
+ */
+static void
+trees_node_stamps_write(StdVec *flat, const ChunksTrailerStamps *stamps)
+{
+	uint64		counts[TREES_NODE_STAMP_COUNTS] = {stamps->single.len, stamps->runs.len, stamps->ends.len,
+	stamps->max_tuples.len, stamps->values.len, stamps->has_ends};
+	uint64		at = 0;
+
+	std_vec_extend_from_slice_Checked(flat, counts, sizeof(counts), 1, 1);
+	std_vec_extend_from_slice_Checked(flat, stamps->single.ptr, stamps->single.len * sizeof(ChunksTrailerStamp), 1, 1);
+	std_vec_extend_from_slice_Checked(flat, stamps->runs.ptr,
+									  stamps->runs.len * sizeof(chunks_trailer_Stamps_runs_t), 1, 1);
+	std_vec_extend_from_slice_Checked(flat, stamps->ends.ptr, stamps->ends.len * sizeof(uint64), 1, 1);
+	std_vec_extend_from_slice_Checked(flat, stamps->max_tuples.ptr, stamps->max_tuples.len * sizeof(uint64), 1, 1);
+	for (size_t k = 0; k < stamps->values.len; k++)
+	{
+		const chunks_trailer_Stamps_values_t *values = &STD_VEC_AT(&stamps->values, chunks_trailer_Stamps_values_t, k);
+		TreesNodeValues entry = {values->f0, at, values->f1.len};
+
+		std_vec_extend_from_slice_Checked(flat, &entry, sizeof(entry), 1, 1);
+		at += values->f1.len;
+	}
+	for (size_t k = 0; k < stamps->values.len; k++)
+	{
+		const chunks_trailer_Stamps_values_t *values = &STD_VEC_AT(&stamps->values, chunks_trailer_Stamps_values_t, k);
+
+		std_vec_extend_from_slice_Checked(flat, values->f1.ptr, values->f1.len * sizeof(uint32), 1, 1);
+	}
+}
+
+/*
  * trees_node_flat_of_frame_0_t is flat_of's state across its pad: its
- * arguments, its results, the decoded node, and the flat bytes it builds.
+ * arguments, its results, the decoded node, its decoded stamps, and the flat
+ * bytes it builds.
  */
 typedef struct trees_node_flat_of_frame_0_t
 {
@@ -579,6 +650,8 @@ typedef struct trees_node_flat_of_frame_0_t
 	uint8		reads;
 	TreesNodeDecoded decoded;
 	bool		decoded_live;
+	ChunksTrailerStamps stamped;
+	bool		stamped_live;
 	StdVec		flat;
 	bool		flat_live;
 	StdVec	   *result;
@@ -591,6 +664,10 @@ static void
 trees_node_flat_of_body_0(void *frame_)
 {
 	trees_node_flat_of_frame_0_t *frame = frame_;
+	StdBytes	empty = {STD_DANGLING, 0};
+	StdBytes	locators = {frame->locators, frame->locators_len};
+	StdBytes	stamps = {frame->stamps, frame->stamps_len};
+	ChunksTrailerStored stored = chunks_trailer_Stored_of_trailer(empty, locators, stamps, frame->reads);
 	size_t		parts[5];
 	size_t		offsets[8];
 	size_t		len;
@@ -601,23 +678,30 @@ trees_node_flat_of_body_0(void *frame_)
 		return;
 	}
 	frame->decoded_live = true;
+	if (!chunks_trailer_Stored_stamps(&stored, &frame->stamped, frame->error))
+	{
+		frame->decoded_live = false;
+		trees_node_Decoded_drop(&frame->decoded);
+		frame->ok = false;
+		return;
+	}
+	frame->stamped_live = true;
 	parts[0] = frame->decoded.bytes.len;
 	parts[1] = frame->decoded.prefix.len;
 	parts[2] = frame->decoded.table.len;
 	parts[3] = frame->locators_len;
-	parts[4] = frame->stamps_len;
+	parts[4] = trees_node_stamps_len(&frame->stamped);
 	len = STD_ADD(usize, TREES_NODE_HEADER, parts[0], 253, 15);
 	len = STD_ADD(usize, len, STD_MUL(usize, 8, parts[1], 253, 35), 253, 15);
 	len = STD_ADD(usize, len, STD_MUL(usize, 4, parts[2], 253, 50), 253, 15);
 	len = STD_ADD(usize, len, parts[3], 253, 15);
-	len = STD_ADD(usize, len, parts[4], 253, 15);
+	len = STD_ADD(usize, len, parts[4] + sizeof(uint64) - 1, 253, 15);
 	std_vec_with_capacity_Checked(&frame->flat, len, 1, 1);
 	frame->flat_live = true;
 	std_vec_extend_from_slice_Checked(&frame->flat, frame->address.f0, CHUNKS_ADDRESS_ADDRESS_LEN, 1, 1);
 	std_vec_u8_push_Checked(&frame->flat, frame->decoded.level);
 	std_vec_u8_push_Checked(&frame->flat, (frame->decoded.blob ? TREES_NODE_BLOB : 0) |
-							(frame->decoded.comparator ? TREES_NODE_BY_COMPARATOR : 0) |
-							STD_SHL_FOLDED(u8, frame->reads, 2));
+							(frame->decoded.comparator ? TREES_NODE_BY_COMPARATOR : 0));
 	offsets[0] = frame->decoded.count;
 	offsets[1] = frame->decoded.body;
 	offsets[2] = frame->decoded.key_width;
@@ -645,6 +729,8 @@ trees_node_flat_of_body_0(void *frame_)
 			*frame->error = chunks_error_Error_corrupt(&message);
 			frame->flat_live = false;
 			std_vec_free_Checked(&frame->flat, 1, 1);
+			frame->stamped_live = false;
+			chunks_trailer_Stamps_drop(&frame->stamped);
 			frame->decoded_live = false;
 			trees_node_Decoded_drop(&frame->decoded);
 			frame->ok = false;
@@ -669,15 +755,19 @@ trees_node_flat_of_body_0(void *frame_)
 		std_vec_extend_from_slice_Checked(&frame->flat, le, 4, 1, 1);
 	}
 	std_vec_extend_from_slice_Checked(&frame->flat, frame->locators, frame->locators_len, 1, 1);
-	std_vec_extend_from_slice_Checked(&frame->flat, frame->stamps, frame->stamps_len, 1, 1);
+	while (frame->flat.len % sizeof(uint64) != 0)
+		std_vec_u8_push_Checked(&frame->flat, 0);
+	trees_node_stamps_write(&frame->flat, &frame->stamped);
 	frame->flat_live = false;
 	*frame->result = frame->flat;
+	frame->stamped_live = false;
+	chunks_trailer_Stamps_drop(&frame->stamped);
 	frame->decoded_live = false;
 	trees_node_Decoded_drop(&frame->decoded);
 	frame->ok = true;
 }
 
-/* trees_node_flat_of_pad_0 is flat_of's pad: the flat bytes and the decoded node, while it holds them. */
+/* trees_node_flat_of_pad_0 is flat_of's pad: the flat bytes, the decoded stamps, and the decoded node, while it holds them. */
 static void
 trees_node_flat_of_pad_0(void *frame_)
 {
@@ -685,11 +775,17 @@ trees_node_flat_of_pad_0(void *frame_)
 
 	if (frame->flat_live)
 		std_vec_free_Checked(&frame->flat, 1, 1);
+	if (frame->stamped_live)
+		chunks_trailer_Stamps_drop(&frame->stamped);
 	if (frame->decoded_live)
 		trees_node_Decoded_drop(&frame->decoded);
 }
 
-/* trees_node_flat_of lays a node out flat from its hashed bytes and its trailer's locators and stamps. */
+/*
+ * trees_node_flat_of lays a node out flat from its hashed bytes and its
+ * trailer's locators and stamps, which it decodes, so that a read of an
+ * entry's stamps decodes nothing (Doltgrust's cached_stamps).
+ */
 static bool
 trees_node_flat_of(ChunksAddressAddress address, const uint8 *hashed, size_t hashed_len, const uint8 *locators,
 				   size_t locators_len, const uint8 *stamps, size_t stamps_len, uint8 reads, StdVec *result,
@@ -1201,7 +1297,6 @@ trees_node_Node_Debug_fmt(const void *value, StdFormatter *f)
 	std_DebugStruct_field(&s, "comparator", 10, &self->comparator, std_bool_Debug_fmt);
 	std_DebugStruct_field(&s, "locators", 8, &self->locators, std_bytes_Debug_fmt);
 	std_DebugStruct_field(&s, "stamps", 6, &self->stamps, std_bytes_Debug_fmt);
-	std_DebugStruct_field(&s, "reads", 5, &self->reads, std_u8_Debug_fmt);
 	return std_DebugStruct_finish(&s);
 }
 
@@ -1238,6 +1333,7 @@ trees_node_Node_view(const uint8 *flat, size_t flat_len)
 	const void *rest_4;
 	size_t		rest_4_len;
 	size_t		mid;
+	size_t		pad;
 
 	std_range_from_check(TREES_NODE_HEADER, flat_len, RUST_FILE, 415, 33);
 	mid = trees_node_Node_view_closure_0(&captures, 8);
@@ -1281,22 +1377,123 @@ trees_node_Node_view(const uint8 *flat, size_t flat_len)
 	node.locators.ptr = locators;
 	node.locators.len = locators_len;
 	mid = trees_node_Node_view_closure_0(&captures, 12);
-	std_range_to_check(mid, rest_4_len, RUST_FILE, 436, 26);
-	node.stamps.ptr = rest_4;
+	pad = TYPEALIGN(sizeof(uint64), (const uint8 *) rest_4 - flat) - ((const uint8 *) rest_4 - flat);
+	std_range_to_check(pad + mid, rest_4_len, RUST_FILE, 436, 26);
+	node.stamps.ptr = (const uint8 *) rest_4 + pad;
 	node.stamps.len = mid;
-	std_index_check(33, flat_len, RUST_FILE, 437, 20);
-	node.reads = STD_SHR_FOLDED(u8, flat[33], 2);
 	return node;
 }
 
-/* trees_node_Node_stamps returns the stamps of the node's entries, from its trailer. */
-bool
-trees_node_Node_stamps(const TreesNodeNode *self, ChunksTrailerStamps *result, ChunksErrorError *error)
+/* trees_node_Node_counts returns the eight-byte numbers that open a node's decoded stamps. */
+static const uint64 *
+trees_node_Node_counts(const TreesNodeNode *self)
 {
-	StdBytes	empty = {STD_DANGLING, 0};
-	ChunksTrailerStored stored = chunks_trailer_Stored_of_trailer(empty, self->locators, self->stamps, self->reads);
+	Assert((uintptr_t) self->stamps.ptr % _Alignof(uint64) == 0);
+	return (const uint64 *) self->stamps.ptr;
+}
 
-	return chunks_trailer_Stored_stamps(&stored, result, error);
+/* trees_node_borrowed returns a Vec that borrows an array of a node's flat bytes, which nothing frees. */
+static StdVec
+trees_node_borrowed(const uint8 *at, uint64 len)
+{
+	StdVec		borrowed = {(void *) at, len, len};
+
+	return borrowed;
+}
+
+/*
+ * trees_node_Node_stamps_view returns the node's decoded stamps as a view of
+ * its flat bytes, valid while they are and never dropped, with no value
+ * entries: an entry's value ids come from trees_node_Node_values.
+ */
+ChunksTrailerStamps
+trees_node_Node_stamps_view(const TreesNodeNode *self)
+{
+	const uint64 *counts = trees_node_Node_counts(self);
+	const uint8 *at = (const uint8 *) (counts + TREES_NODE_STAMP_COUNTS);
+	ChunksTrailerStamps view = {0};
+
+	view.single = trees_node_borrowed(at, counts[0]);
+	at += counts[0] * sizeof(ChunksTrailerStamp);
+	view.runs = trees_node_borrowed(at, counts[1]);
+	at += counts[1] * sizeof(chunks_trailer_Stamps_runs_t);
+	view.ends = trees_node_borrowed(at, counts[2]);
+	at += counts[2] * sizeof(uint64);
+	view.max_tuples = trees_node_borrowed(at, counts[3]);
+	view.has_ends = counts[5] != 0;
+	view.values = trees_node_borrowed(STD_DANGLING_FOR(_Alignof(chunks_trailer_Stamps_values_t)), 0);
+	return view;
+}
+
+/*
+ * trees_node_Node_value_entries returns the value entries of a node's decoded
+ * stamps, in ascending index order, with their count and the ids they name.
+ */
+static const TreesNodeValues *
+trees_node_Node_value_entries(const TreesNodeNode *self, size_t *len, const uint32 **ids)
+{
+	const uint64 *counts = trees_node_Node_counts(self);
+	const TreesNodeValues *values = (const TreesNodeValues *)
+		((const uint8 *) (counts + TREES_NODE_STAMP_COUNTS) + counts[0] * sizeof(ChunksTrailerStamp) +
+		 counts[1] * sizeof(chunks_trailer_Stamps_runs_t) + (counts[2] + counts[3]) * sizeof(uint64));
+
+	*len = counts[4];
+	*ids = (const uint32 *) (values + counts[4]);
+	return values;
+}
+
+/* trees_node_Node_values returns an entry's value ids from the node's decoded stamps, none for an entry with none. */
+const uint32 *
+trees_node_Node_values(const TreesNodeNode *self, size_t i, size_t *result_len)
+{
+	const uint32 *ids;
+	size_t		len;
+	const TreesNodeValues *values = trees_node_Node_value_entries(self, &len, &ids);
+	size_t		low = 0;
+	size_t		high = len;
+
+	while (low < high)
+	{
+		size_t		mid = low + (high - low) / 2;
+
+		if (values[mid].index < i)
+			low = mid + 1;
+		else
+			high = mid;
+	}
+	if (low < len && values[low].index == i)
+	{
+		*result_len = values[low].len;
+		return ids + values[low].at;
+	}
+	*result_len = 0;
+	return (const uint32 *) STD_DANGLING_FOR(_Alignof(uint32));
+}
+
+/* trees_node_Node_stamps returns an owned copy of the stamps of the node's entries, which its flat bytes hold decoded. */
+void
+trees_node_Node_stamps(const TreesNodeNode *self, ChunksTrailerStamps *result)
+{
+	ChunksTrailerStamps view = trees_node_Node_stamps_view(self);
+	const uint32 *ids;
+	size_t		len;
+	const TreesNodeValues *values = trees_node_Node_value_entries(self, &len, &ids);
+
+	std_vec_clone(&result->single, &view.single, sizeof(ChunksTrailerStamp), _Alignof(ChunksTrailerStamp));
+	std_vec_clone(&result->runs, &view.runs, sizeof(chunks_trailer_Stamps_runs_t),
+				  _Alignof(chunks_trailer_Stamps_runs_t));
+	result->has_ends = view.has_ends;
+	std_vec_clone(&result->ends, &view.ends, sizeof(uint64), _Alignof(uint64));
+	std_vec_clone(&result->max_tuples, &view.max_tuples, sizeof(uint64), _Alignof(uint64));
+	std_vec_with_capacity_Checked(&result->values, len, sizeof(chunks_trailer_Stamps_values_t),
+								  _Alignof(chunks_trailer_Stamps_values_t));
+	for (size_t k = 0; k < len; k++)
+	{
+		chunks_trailer_Stamps_values_t entry = {.f0 = values[k].index};
+
+		std_slice_to_vec_Checked(&entry.f1, ids + values[k].at, values[k].len, sizeof(uint32), _Alignof(uint32));
+		std_vec_push_Checked(&result->values, &entry, sizeof(entry), _Alignof(chunks_trailer_Stamps_values_t));
+	}
 }
 
 /* trees_node_Node_counted returns the entry count of the subtrees before the child at the position. */
@@ -3389,6 +3586,151 @@ test_trees_node_tests_refuses_offsets_and_counts_its_accessors_cannot_read(void)
 	test_trees_node_tests_refuses_offsets_and_counts_its_accessors_cannot_read_frame_0_t frame = {0};
 
 	std_landing(&frame, test_trees_node_tests_refuses_offsets_and_counts_its_accessors_cannot_read_body_0, test_trees_node_tests_refuses_offsets_and_counts_its_accessors_cannot_read_pad_0);
+}
+
+/*
+ * trees_node_tests_stamped_leaf returns a leaf of entries keyed by their
+ * index, with the stamps of a kind (0 none, 1 one each, 2 zero to three each,
+ * runs and lone stamps of several transactions) and, when valued, value ids
+ * on every third entry.
+ */
+static void
+trees_node_tests_stamped_leaf(size_t entries, int kind, bool valued, ChunksChunkChunk *result)
+{
+	StdVec		keys;
+	StdVec		values;
+	StdVec		addresses;
+	StdVec		hashed;
+	StdVec		key_buffer;
+	ChunksTrailerStamps stamps = chunks_trailer_Stamps_Default_default();
+	uint8	   *key_bytes;
+
+	std_vec_with_capacity_Checked(&key_buffer, Max(entries, 1) * sizeof(uint64), 1, 1);
+	key_bytes = key_buffer.ptr;
+	std_vec_new(&keys, sizeof(StdBytes), _Alignof(StdBytes));
+	std_vec_new(&values, sizeof(StdBytes), _Alignof(StdBytes));
+	std_vec_new(&addresses, sizeof(StdVec), _Alignof(StdVec));
+	for (size_t i = 0; i < entries; i++)
+	{
+		StdBytes	key;
+		StdBytes	value = {(const uint8 *) "v", 1};
+		StdVec		none;
+		ChunksTrailerStamp entry[3];
+		uint32		ids[2] = {(uint32) i, (uint32) i + 7};
+		size_t		count = kind == 0 ? 0 : kind == 1 ? 1 : i % 4;
+
+		std_u64_to_be_bytes(i, &key_bytes[i * sizeof(uint64)]);
+		key.ptr = &key_bytes[i * sizeof(uint64)];
+		key.len = sizeof(uint64);
+		std_vec_push_Checked(&keys, &key, sizeof(key), _Alignof(StdBytes));
+		std_vec_push_Checked(&values, &value, sizeof(value), _Alignof(StdBytes));
+		std_vec_new(&none, sizeof(uint32), _Alignof(uint32));
+		std_vec_push_Checked(&addresses, &none, sizeof(none), _Alignof(StdVec));
+		for (size_t s = 0; s < count; s++)
+		{
+			entry[s].txn = 100 + i % 3;
+			entry[s].tuple = 10 * i + (s == 2 ? 5 : s);
+		}
+		if (kind != 0)
+			chunks_trailer_Stamps_push(&stamps, entry, count);
+		if (kind != 0 && valued && i % 3 == 0)
+			chunks_trailer_Stamps_push_values(&stamps, ids, lengthof(ids));
+	}
+	trees_node_encode_leaf(keys.ptr, keys.len, values.ptr, values.len, addresses.ptr, addresses.len, false, &hashed);
+	chunks_chunk_Chunk_stored(hashed.ptr, hashed.len, NULL, 0, &stamps, result);
+	chunks_trailer_Stamps_drop(&stamps);
+	std_vec_free_Checked(&hashed, 1, 1);
+	for (size_t i = 0; i < addresses.len; i++)
+		std_vec_free_Checked(&STD_VEC_AT(&addresses, StdVec, i), sizeof(uint32), _Alignof(uint32));
+	std_vec_free_Checked(&addresses, sizeof(StdVec), _Alignof(StdVec));
+	std_vec_free_Checked(&values, sizeof(StdBytes), _Alignof(StdBytes));
+	std_vec_free_Checked(&keys, sizeof(StdBytes), _Alignof(StdBytes));
+	std_vec_free_Checked(&key_buffer, 1, 1);
+}
+
+/*
+ * trees_node_tests_reads_as_decoded asserts that every entry of a chunk's
+ * flat node reads the stamps and value ids its trailer decodes to, past the
+ * last entry too, and that the node's owned stamps equal the decoded ones.
+ */
+static void
+trees_node_tests_reads_as_decoded(const ChunksChunkChunk *chunk, size_t entries)
+{
+	StdVec		flat;
+	ChunksErrorError error;
+	ChunksTrailerStamps decoded;
+	ChunksTrailerStamps owned;
+	TreesNodeNode node;
+	ChunksTrailerStamps view;
+
+	STD_ASSERT(0, 0, trees_node_flatten(chunk, &flat, &error), "flatten(chunk).is_ok()");
+	STD_ASSERT(0, 0, trees_store_stamps_of(chunk, &decoded, &error), "stamps_of(chunk).is_ok()");
+	node = trees_node_Node_view(flat.ptr, flat.len);
+	view = trees_node_Node_stamps_view(&node);
+	for (size_t i = 0; i <= entries; i++)
+	{
+		StdVec		got;
+		StdVec		want;
+		size_t		got_len;
+		size_t		want_len;
+		const uint32 *got_ids = trees_node_Node_values(&node, i, &got_len);
+		const uint32 *want_ids = chunks_trailer_Stamps_values(&decoded, i, &want_len);
+
+		chunks_trailer_Stamps_entry(&view, i, &got);
+		chunks_trailer_Stamps_entry(&decoded, i, &want);
+		STD_ASSERT(0, 0, chunks_trailer_VecStamp_PartialEq_eq(&got, &want), "view.entry(i) == decoded.entry(i)");
+		STD_ASSERT(0, 0, got_len == want_len && memcmp(got_ids, want_ids, got_len * sizeof(uint32)) == 0,
+				   "node.values(i) == decoded.values(i)");
+		std_vec_free_Checked(&got, sizeof(ChunksTrailerStamp), _Alignof(ChunksTrailerStamp));
+		std_vec_free_Checked(&want, sizeof(ChunksTrailerStamp), _Alignof(ChunksTrailerStamp));
+	}
+	trees_node_Node_stamps(&node, &owned);
+	STD_ASSERT(0, 0, chunks_trailer_Stamps_PartialEq_eq(&owned, &decoded), "node.stamps() == decoded");
+	chunks_trailer_Stamps_drop(&owned);
+	chunks_trailer_Stamps_drop(&decoded);
+	std_vec_free_Checked(&flat, 1, 1);
+}
+
+/*
+ * test_trees_node_tests_a_flat_nodes_stamps_read_in_place_as_its_trailer_decodes
+ * is bugs row 477's case: a flat node keeps its trailer's stamps decoded, and
+ * every entry of empty, one-entry, and large leaves of every stamp kind, with
+ * and without value ids, and an internal node's subtrees' highest tuple ids,
+ * read in place exactly as the trailer decodes.
+ */
+void
+test_trees_node_tests_a_flat_nodes_stamps_read_in_place_as_its_trailer_decodes(void)
+{
+	static const size_t sizes[] = {0, 1, 1000};
+	ChunksAddressAddress children[2] = {{{1}}, {{2}}};
+	uint64		counts[2] = {3, 4};
+	StdBytes	keys[2] = {{(const uint8 *) "a", 1}, {(const uint8 *) "b", 1}};
+	ChunksTrailerLocator locators[2] = {chunks_trailer_Locator_Default_default(),
+	chunks_trailer_Locator_Default_default()};
+	StdVec		max_tuples;
+	ChunksTrailerStamps subtrees;
+	StdVec		internal;
+	ChunksChunkChunk chunk;
+
+	for (size_t s = 0; s < lengthof(sizes); s++)
+		for (int kind = 0; kind < 3; kind++)
+			for (int valued = 0; valued < 2; valued++)
+			{
+				trees_node_tests_stamped_leaf(sizes[s], kind, valued, &chunk);
+				trees_node_tests_reads_as_decoded(&chunk, sizes[s]);
+				chunks_chunk_Chunk_drop(&chunk);
+			}
+	std_vec_new(&max_tuples, sizeof(uint64), _Alignof(uint64));
+	std_vec_push_Checked(&max_tuples, &counts[0], sizeof(uint64), _Alignof(uint64));
+	std_vec_push_Checked(&max_tuples, &counts[1], sizeof(uint64), _Alignof(uint64));
+	subtrees = chunks_trailer_Stamps_subtrees(&max_tuples);
+	trees_node_encode_internal_with_summaries(1, keys, lengthof(keys), children, lengthof(children), counts,
+											  lengthof(counts), NULL, 0, false, &internal);
+	chunks_chunk_Chunk_stored(internal.ptr, internal.len, locators, lengthof(locators), &subtrees, &chunk);
+	trees_node_tests_reads_as_decoded(&chunk, lengthof(children));
+	chunks_chunk_Chunk_drop(&chunk);
+	chunks_trailer_Stamps_drop(&subtrees);
+	std_vec_free_Checked(&internal, 1, 1);
 }
 
 #endif							/* DOLTGRES_TEST_TREES */

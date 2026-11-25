@@ -175,7 +175,7 @@ TXN_MEMTABLE_BRANCH_NAME(txn_memtable_branch_identity_prepare_body) (void *frame
 	frame->ok = txn_memtable_table_prepared(frame->io, frame->aims.ptr, frame->aims.len, false, none,
 											TXN_MEMTABLE_BRANCH_NAME(txn_memtable_branch_inside), frame->captures,
 											TXN_MEMTABLE_BRANCH_NAME(txn_memtable_branch_dropped), &has_unstored,
-											&unstored, frame->error);
+											&unstored, NULL, frame->error);
 	TXN_MEMTABLE_BRANCH_NAME(txn_memtable_branch_identity_prepare_pad) (frame);
 }
 

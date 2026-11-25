@@ -908,6 +908,28 @@ std_RawTable_reserve(StdHashMap *map, const StdHashMapType *t, size_t additional
 		std_RawTable_reserve_rehash(map, t, additional);
 }
 
+/*
+ * std_hashmap_shaped checks the layout STD_HASHMAP_SHAPE or STD_HASHSET_SHAPE
+ * wrote for a map's type (bugs row 411): a map's key and value within its
+ * element, the value past the key, or a set's key the whole element.
+ */
+static void
+std_hashmap_shaped(const StdHashMapType *t)
+{
+	Assert(t->key_size > 0 && t->key_size <= t->value_offset);
+	Assert(t->value_size == 0 ? t->value_offset == t->size && t->key_size == t->size :
+		   t->value_offset + t->value_size <= t->size);
+}
+
+/* std_hashmap_filled writes a key and a value, each its own bytes, into an element's bucket. */
+static void
+std_hashmap_filled(uint8 *bucket, const StdHashMapType *t, const void *key, const void *value)
+{
+	std_hashmap_shaped(t);
+	memcpy(bucket, key, t->key_size);
+	memcpy(bucket + t->value_offset, value, t->value_size);
+}
+
 /* std_RawTable_insert_at_index puts an element in a free bucket a hash's probe found. */
 static void *
 std_RawTable_insert_at_index(StdRawTableInner *self, const StdHashMapType *t, uint64 hash, size_t index,
@@ -917,8 +939,7 @@ std_RawTable_insert_at_index(StdRawTableInner *self, const StdHashMapType *t, ui
 
 	std_RawTableInner_record_item_insert_at(self, index, self->ctrl[index], std_Tag_full(hash));
 	bucket = std_RawTableInner_bucket_ptr(self, index, t->size);
-	memcpy(bucket, key, t->value_offset);
-	memcpy(bucket + t->value_offset, value, t->size - t->value_offset);
+	std_hashmap_filled(bucket, t, key, value);
 	return bucket;
 }
 
@@ -1011,10 +1032,10 @@ std_HashMap_insert(StdHashMap *map, const StdHashMapType *t, void *key, void *va
 	if (std_RawTableInner_find_or_find_insert_index_inner(&map->table, t, hash, key, &index))
 	{
 		uint8	   *elem = std_RawTableInner_bucket_ptr(&map->table, index, t->size);
-		size_t		value_size = t->size - t->value_offset;
 
-		memcpy(result, elem + t->value_offset, value_size);
-		memcpy(elem + t->value_offset, value, value_size);
+		std_hashmap_shaped(t);
+		memcpy(result, elem + t->value_offset, t->value_size);
+		memcpy(elem + t->value_offset, value, t->value_size);
 		if (t->key_drop != NULL)
 			t->key_drop(key);
 		return true;
@@ -1034,7 +1055,8 @@ std_HashMap_remove(StdHashMap *map, const StdHashMapType *t, const void *key, vo
 		return false;
 	std_RawTableInner_erase(&map->table, index);
 	elem = std_RawTableInner_bucket_ptr(&map->table, index, t->size);
-	memcpy(result, elem + t->value_offset, t->size - t->value_offset);
+	std_hashmap_shaped(t);
+	memcpy(result, elem + t->value_offset, t->value_size);
 	if (t->key_drop != NULL)
 		t->key_drop(elem);
 	return true;
@@ -1068,8 +1090,7 @@ std_HashMap_VacantEntry_insert(StdHashMap *map, const StdHashMapType *t, const S
 	uint8	   *bucket = std_RawTableInner_bucket_ptr(self, index, t->size);
 
 	self->growth_left -= std_Tag_special_is_empty(old_ctrl) ? 1 : 0;
-	memcpy(bucket, key, t->value_offset);
-	memcpy(bucket + t->value_offset, value, t->size - t->value_offset);
+	std_hashmap_filled(bucket, t, key, value);
 	self->items += 1;
 	return bucket;
 }
@@ -1227,3 +1248,97 @@ std_HashMap_drop(StdHashMap *map, const StdHashMapType *t)
 {
 	std_RawTableInner_drop_inner_table(&map->table, t);
 }
+
+#ifdef DOLTGRES_TEST_HOST
+#include "doltgres/std/foldhash.h"
+
+/* std_hashmap_tests_Padded_t is the case's element: a key and a one-byte value its element pads past. */
+typedef struct std_hashmap_tests_Padded_t
+{
+	uint64		f0;
+	uint8		f1;
+} std_hashmap_tests_Padded_t;
+
+/* std_hashmap_tests_Canaried_t is a value with bytes after it a copy past the value overwrites. */
+typedef struct std_hashmap_tests_Canaried_t
+{
+	uint8		value;
+	uint8		canary[15];
+} std_hashmap_tests_Canaried_t;
+
+/* std_hashmap_tests_key_hash is the case's key's Hash. */
+static void
+std_hashmap_tests_key_hash(const void *key, StdHasher state)
+{
+	std_Hasher_write_u64(state, *(const uint64 *) key);
+}
+
+/* std_hashmap_tests_key_eq is the case's key's Eq. */
+static bool
+std_hashmap_tests_key_eq(const void *a, const void *b)
+{
+	return *(const uint64 *) a == *(const uint64 *) b;
+}
+
+/* STD_HASHMAP_TESTS_PADDED is the case's map's type, a HashMap<u64, u8>. */
+static const StdHashMapType STD_HASHMAP_TESTS_PADDED = {
+	STD_HASHMAP_SHAPE(std_hashmap_tests_Padded_t),
+	.key_hash = std_hashmap_tests_key_hash,
+	.key_eq = std_hashmap_tests_key_eq,
+	.hasher = &FOLDHASH_FAST_RANDOM_STATE_BUILD_HASHER_OPS,
+	.hasher_default = foldhash_fast_RandomState_Default_default,
+};
+
+/* std_hashmap_tests_canaried returns a value with its canary set. */
+static std_hashmap_tests_Canaried_t
+std_hashmap_tests_canaried(uint8 value)
+{
+	std_hashmap_tests_Canaried_t canaried = {.value = value};
+
+	memset(canaried.canary, 0xa5, sizeof(canaried.canary));
+	return canaried;
+}
+
+/* std_hashmap_tests_kept reports whether a value's canary is as set. */
+static bool
+std_hashmap_tests_kept(const std_hashmap_tests_Canaried_t *canaried)
+{
+	for (size_t at = 0; at < sizeof(canaried->canary); at++)
+		if (canaried->canary[at] != 0xa5)
+			return false;
+	return true;
+}
+
+/*
+ * test_std_hashmap_tests_a_maps_copies_move_only_their_values (bugs row 411):
+ * a map whose element pads past a one-byte value reads and writes only that
+ * byte of a caller's value, old value, and removed value, as Rust's HashMap
+ * moves a V, so the bytes after each are untouched.
+ */
+void
+test_std_hashmap_tests_a_maps_copies_move_only_their_values(void)
+{
+	StdHashMap	map;
+	uint64		key = 7;
+	std_hashmap_tests_Canaried_t first = std_hashmap_tests_canaried(1);
+	std_hashmap_tests_Canaried_t second = std_hashmap_tests_canaried(2);
+	std_hashmap_tests_Canaried_t old = std_hashmap_tests_canaried(0);
+	std_hashmap_tests_Canaried_t removed = std_hashmap_tests_canaried(0);
+	bool		replaced;
+	bool		held;
+
+	std_HashMap_Default_default(&map, &STD_HASHMAP_TESTS_PADDED);
+	(void) std_HashMap_insert(&map, &STD_HASHMAP_TESTS_PADDED, &key, &first.value, &old.value);
+	replaced = std_HashMap_insert(&map, &STD_HASHMAP_TESTS_PADDED, &key, &second.value, &old.value);
+	held = std_HashMap_remove(&map, &STD_HASHMAP_TESTS_PADDED, &key, &removed.value);
+	if (!replaced || old.value != 1 || !held || removed.value != 2)
+		std_panic(__FILE__, __LINE__, 0, "a map read back other values than it was given",
+				  sizeof("a map read back other values than it was given") - 1);
+	if (!std_hashmap_tests_kept(&first) || !std_hashmap_tests_kept(&second) || !std_hashmap_tests_kept(&old) ||
+		!std_hashmap_tests_kept(&removed))
+		std_panic(__FILE__, __LINE__, 0, "a map's copy wrote past a value",
+				  sizeof("a map's copy wrote past a value") - 1);
+	std_HashMap_drop(&map, &STD_HASHMAP_TESTS_PADDED);
+}
+
+#endif							/* DOLTGRES_TEST_HOST */

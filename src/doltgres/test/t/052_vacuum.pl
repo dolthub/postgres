@@ -982,10 +982,8 @@ $aged_held->quit;
 # their commit and it installs nothing, keeping both versions, where before A it
 # installed them and kept them for the snapshot. Once the snapshot goes, the next
 # fold installs and drops them. A rolled-back
-# insert's row version goes at its abort's take-back, so a fold that applies
-# nothing installs nothing; the drop of a version the take-back leaves, past its
-# list's cap of 64K keys, is the fold's unit's
-# (a_fold_that_changes_no_entry_still_drops_what_it_is_done_with).
+# insert's row version stays until a fold's logged decision drops it (bugs row
+# 432), so the next fold installs and drops it.
 $node->safe_psql('postgres', 'CREATE TABLE netted (k int4, v text)');
 my $netted_holder = $node->background_psql('postgres');
 $netted_holder->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
@@ -1011,10 +1009,14 @@ $node->safe_psql('postgres',
 	written('netted', "BEGIN; INSERT INTO % VALUES (2, 'b'); ROLLBACK"));
 is( $node->safe_psql(
 		'postgres', "SELECT doltgres_test_held('netted', '(0,2)')"),
-	'f',
-	"a rolled-back insert's row version goes at its abort's take-back");
+	't',
+	"a rolled-back insert's row version stays until a fold drops it");
 is($node->safe_psql('postgres', "SELECT doltgres_test_fold('netted')"),
-	'f', 'a fold that applies nothing installs nothing');
+	't', "the fold that drops the rolled-back insert's row version installs");
+is( $node->safe_psql(
+		'postgres', "SELECT doltgres_test_held('netted', '(0,2)')"),
+	'f',
+	"the fold drops the rolled-back insert's row version");
 is( $node->safe_psql(
 		'postgres',
 		"SELECT doltgres_test_standing('netted', 'SELECT count(*) FROM netted')"

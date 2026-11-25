@@ -769,6 +769,8 @@ chunks_packs_retire_Packs_retire_body_0(void *frame_)
 	HostSharedLongGuard lists;
 	HostError	host;
 	uint64		marked;
+	bool		unmarked PG_USED_FOR_ASSERTS_ONLY;
+	bool		kept;
 
 	frame->ok = false;
 	if (frame->forwarded->packs != chunks_packs_backend_Packs_location(self))
@@ -817,7 +819,10 @@ chunks_packs_retire_Packs_retire_body_0(void *frame_)
 	std_vec_new(&frame->kept, sizeof(uint64), _Alignof(uint64));
 	frame->kept_live = true;
 	frame->keep_live = false;
-	if (!frame->keep(frame->keep_captures, &frame->marking, &frame->recorded, &frame->kept, frame->error))
+	chunks_packs_barrier_held();
+	kept = frame->keep(frame->keep_captures, &frame->marking, &frame->recorded, &frame->kept, frame->error);
+	chunks_packs_barrier_left();
+	if (!kept)
 		goto done;
 
 	io = host_shared_LongGuard_io(&frame->held);
@@ -858,8 +863,8 @@ chunks_packs_retire_Packs_retire_body_0(void *frame_)
 	if (!chunks_packs_lists_Change_install(&frame->change, frame->error))
 		goto done;
 	chunks_packs_shared_set(record, CHUNKS_PACKS_SHARED_MARKED_INDEX, 0);
-	if (!host_shared_Record_unmark(hits, CHUNKS_PACKS_SINGLE_HITS, &frame->held, &host))
-		goto failed;
+	unmarked = host_shared_Record_unmark(hits, CHUNKS_PACKS_SINGLE_HITS, &frame->held, &host);
+	Assert(unmarked);
 	chunks_trace_emit(self->repository, chunks_packs_retire_marking_retired, NULL, NULL);
 	frame->result->packs = self;
 	frame->result->numbers = frame->retired;
@@ -1865,6 +1870,10 @@ typedef struct chunks_packs_retire_tests_set_t
 {
 	bool		set;
 } chunks_packs_retire_tests_set_t;
+
+static bool chunks_packs_retire_tests_set_second(void *captures, ChunksPacksRetireMarking *marking, StdVec *entries,
+												 StdVec *result, ChunksErrorError *error)
+			STD_REQUIRES(CHUNKS_PACKS_BARRIER_HOLDING);
 
 /* chunks_packs_retire_tests_set_second is a keep that sets the first pack's vector's second generation, of no offsets. */
 static bool

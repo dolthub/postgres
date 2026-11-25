@@ -34,8 +34,12 @@
 
 #define RUST_FILE "shmem" STD_SEP "src" STD_SEP "lib.rs"
 
-/* SHMEM_TRANCHE is the name of the lock's tranche, which wait events show. */
-static const char SHMEM_TRANCHE[] = "versioned shared memory";
+/* SHMEM_TRANCHES are the names of the fork's LWLock tranches, by DoltgresTranche. */
+static const char *const SHMEM_TRANCHES[DOLTGRES_TRANCHE_COUNT] = {
+#define DOLTGRES_TRANCHE(id, name) [DOLTGRES_TRANCHE_##id] = name,
+#include "doltgres/tranchelist.h"
+#undef DOLTGRES_TRANCHE
+};
 
 /* SHMEM_FILE_WAITS are the names of the wait events of the file door's reads, writes, and syncs, in that order. */
 static const char *const SHMEM_FILE_WAITS[3] = {"versioned file read", "versioned file write", "versioned file sync"};
@@ -51,24 +55,27 @@ shmem_request(const PgMayRaise *raise, const ShmemRecordsKind *kinds, size_t kin
 	size_t		procs = (size_t) pg_calls_max_procs();
 	size_t		size = shmem_records_size(kinds, kinds_len, procs);
 
-	return pg_calls_request_shmem(raise, size, error);
+	return pg_calls_request_shmem(raise, size, error) &&
+		shmem_records_index_request(raise, kinds, kinds_len, error);
 }
 
 /*
  * shmem_initialize sets the region up in the postmaster's initialization
- * callback: the lock, the file door's wait events, the seed of the delta's
- * shapes, and the kinds' records.
+ * callback: every one of the fork's LWLock tranches, the lock, the file door's
+ * wait events, the seed of the delta's shapes, and the kinds' records.
  */
 bool
 shmem_initialize(const PgMayRaise *raise, const ShmemRecordsKind *kinds, size_t kinds_len, PgPgError *error)
 {
 	ShmemControl *control = (ShmemControl *) pg_calls_shmem_base();
-	int32		tranche;
 	uint32		file_waits[3] = {0};
 	uint8		seed[32] = {0};
 
-	if (!pg_calls_new_tranche(raise, SHMEM_TRANCHE, &tranche, error))
-		return false;
+	for (size_t i = 0; i < DOLTGRES_TRANCHE_COUNT; i++)
+	{
+		if (!pg_calls_new_tranche(raise, SHMEM_TRANCHES[i], &control->tranches[i], error))
+			return false;
+	}
 	for (size_t i = 0; i < 3; i++)
 	{
 		if (!pg_calls_wait_event_new(raise, SHMEM_FILE_WAITS[i], &file_waits[i], error))
@@ -76,13 +83,21 @@ shmem_initialize(const PgMayRaise *raise, const ShmemRecordsKind *kinds, size_t 
 	}
 	if (!pg_calls_strong_random(raise, seed, sizeof(seed), error))
 		return false;
-	pg_calls_lwlock_initialize(&control->lock, tranche);
+	pg_calls_lwlock_initialize(&control->lock, control->tranches[DOLTGRES_TRANCHE_SHMEM]);
 	memcpy(control->file_waits, file_waits, sizeof(file_waits));
 	memcpy(control->seed, seed, sizeof(seed));
 #ifdef USE_INJECTION_POINTS
 	control->test = 0;
 #endif
-	return shmem_records_initialize(raise, control, tranche, kinds, kinds_len, error);
+	return shmem_records_initialize(raise, control, control->tranches[DOLTGRES_TRANCHE_SHMEM], kinds, kinds_len, error) &&
+		shmem_records_index_initialize(raise, kinds, kinds_len, error);
+}
+
+/* shmem_tranche returns the id of one of the fork's LWLock tranches, which shmem_initialize registered. */
+int32
+shmem_tranche(DoltgresTranche which)
+{
+	return ((ShmemControl *) pg_calls_shmem_base())->tranches[which];
 }
 
 /* shmem_file_waits returns the wait events of the file door's reads, writes, and syncs, in that order. */

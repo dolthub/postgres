@@ -41,6 +41,12 @@ typedef struct SimcTestIo
 	void	   *process;
 } SimcTestIo;
 
+/* SimcProcess is sim's Process: a hold of the test process, a Box<Process> the drop releases. */
+typedef struct SimcProcess
+{
+	void	   *f0;
+} SimcProcess;
+
 /* SimcTaken is sim's Taken: a snapshot a test took, which simc_Taken_lent lends, a Box<Taken>. */
 typedef struct SimcTaken
 {
@@ -150,6 +156,26 @@ typedef struct simc_TupleSqlstateString_t
 	StdString	f1;
 } simc_TupleSqlstateString_t;
 
+/* simc_TupleU8VecU8Lsn_t is the tuple (u8, Vec<u8>, Lsn): a logged record's kind's value, its body, and its end. */
+typedef struct simc_TupleU8VecU8Lsn_t
+{
+	uint8		f0;
+	StdVec		f1;
+	HostLsn		f2;
+} simc_TupleU8VecU8Lsn_t;
+
+/*
+ * simc_TupleStorageRowNewCidLsn_t is the tuple (Storage, Row, NewCid, Lsn): a
+ * logged new cid record's storage, its row, its command ids, and its end.
+ */
+typedef struct simc_TupleStorageRowNewCidLsn_t
+{
+	HostStorage f0;
+	HostRow		f1;
+	HostNewCid	f2;
+	HostLsn		f3;
+} simc_TupleStorageRowNewCidLsn_t;
+
 /*
  * SimcReport is sim's Report: the run's outcome, each exit work that failed,
  * and the Rust's report, a Box<Report>, which holds the rest and the test
@@ -165,6 +191,8 @@ typedef struct SimcReport
 
 extern SimcTestIo simc_io(void);
 extern void simc_TestIo_drop(void *self);
+extern SimcProcess simc_process(void);
+extern void simc_Process_drop(void *self);
 extern bool simc_tempdir(SimcTempDir *result, StdIoError *error);
 extern const char *simc_TempDir_path(const SimcTempDir *self, size_t *len);
 extern void simc_TempDir_drop(void *self);
@@ -176,18 +204,27 @@ extern void simc_set_disk_space(uint64 free, uint64 total);
 extern void simc_refuse_owned_append(uint64 after);
 extern void simc_refuse_open(HostDeltaPagePage name, uint64 after);
 extern void simc_refuse_record(uint64 shape, uint64 location, uint64 after);
+extern void simc_refuse_any_open(uint64 after);
 extern void simc_refuse_any_take(uint64 after);
 extern void simc_refuse_nothing(void);
 extern HostXid simc_begin(void);
 extern HostXid simc_begin_under(HostXid parent);
 extern void simc_commit(HostXid xid);
 extern void simc_abort(HostXid xid);
+extern void simc_truncate_commit_log(HostXid oldest);
+extern void simc_savepoint(void);
+extern void simc_rollback_to(void);
+extern void simc_release(void);
+extern void simc_next_command(void);
 extern SimcTaken simc_historic(HostXid xmin, HostXid xmax, const HostXid *committed, size_t committed_len,
 							   const HostXid *own, size_t own_len, HostCommand command);
 extern SimcTaken simc_snapshot(HostSnapshotKind kind, bool recovery);
+extern SimcTaken simc_non_vacuumable(HostXid horizon);
 extern HostSnapshot simc_Taken_lent(const SimcTaken *self);
 extern void simc_Taken_drop(void *self);
 extern size_t simc_scratch_files(void);
+extern uint64 simc_collecting(void);
+extern uint64 simc_interrupts_held(void);
 extern void simc_out_of_memory_at_next_decompress(void);
 extern void simc_fail_allocation(uint64 nth);
 extern void simc_connect(uint32 database, uint32 tablespace);
@@ -197,6 +234,8 @@ extern StdPathBuf simc_data_dir(void);
 extern StdVec simc_take_warnings(void);
 extern StdVec simc_take_logs(void);
 extern bool simc_kept_wal_read(HostLsn *from, HostLsn *to);
+extern StdVec simc_logged(void);
+extern StdVec simc_new_cids(void);
 extern SimcSim simc_Sim_start(const char *root, size_t root_len, uint64 seed);
 extern void simc_Sim_stop(const SimcSim *self);
 extern StdVec simc_Sim_trace(const SimcSim *self);
@@ -214,11 +253,13 @@ extern SimcReport simc_Run_finish(SimcRun self);
 extern void simc_Run_drop(void *self);
 extern void simc_Report_drop(void *self);
 extern bool simc_Report_Debug_fmt(const void *value, StdFormatter *f);
+extern StdVec simc_Report_trace(const SimcReport *report);
 extern bool simc_Outcome_Debug_fmt(const void *value, StdFormatter *f);
 extern bool simc_Ending_Debug_fmt(const void *value, StdFormatter *f);
 extern bool simc_Ending_PartialEq_eq(const SimcEnding *self, const SimcEnding *other);
 extern void simc_size_delta(uint64 budget);
 extern uint64 simc_delta_holds(void);
+extern size_t simc_free_slots(void);
 extern uint64 simc_delta_waiting(void);
 extern uint64 simc_delta_wakes(void);
 extern void simc_unfreed(uint64 shape, size_t *records, size_t *pages);

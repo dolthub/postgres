@@ -29,6 +29,7 @@
 #include "doltgres/chunks/index.h"
 #include "doltgres/chunks/packs.h"
 #include "doltgres/chunks/packs/backend.h"
+#include "doltgres/chunks/packs/dropped.h"
 #include "doltgres/chunks/packs/lists.h"
 #include "doltgres/chunks/packs/merge.h"
 #include "doltgres/chunks/packs/open.h"
@@ -137,7 +138,9 @@ _Alignof(HostLockIoMutexOpen), host_lock_IoMutexOpen_Default_default, chunks_pac
  * CHUNKS_PACKS_BACKEND_OPEN is OPEN: the locations of the pack records this
  * process holds through its Packs, one for each, which its exit reads to
  * append the adds they defer; its BackendLocal header and the process's
- * value, which follows it.
+ * value, which follows it. Under its lock a section grows the list only into
+ * room it reserved first, so nothing there unwinds and the lock is never
+ * poisoned (bugs row 517).
  */
 static struct
 {
@@ -358,7 +361,8 @@ chunks_packs_backend_Closing_body_0(void *frame_)
 		if (!host_shared_read(frame->io, &frame->reading, frame->error))
 			goto done;
 		frame->reading_live = true;
-		if (!chunks_packs_backend_Packs_flush(&frame->packs, frame->io, &frame->reading, &failed))
+		if (!chunks_packs_backend_Packs_flush(&frame->packs, HOST_IO_IO_TAKES_SHORT(frame->io), &frame->reading,
+											  &failed))
 		{
 			*frame->error = chunks_packs_shared_raised(&failed);
 			goto done;
@@ -454,6 +458,15 @@ chunks_packs_backend_Packs_over_body_0(void *frame_)
 	frame->open_live = true;
 	list = chunks_packs_backend_open_lock(&frame->open, &frame->io->held, &frame->guard);
 	frame->guard_live = true;
+	if (!std_vec_try_reserve(&list->locations, 1, sizeof(frame->location), _Alignof(uint64)))
+	{
+		frame->guard_live = false;
+		host_lock_LockedRwLockWriteGuard_drop(&frame->guard);
+		host = host_Error_out_of_memory();
+		*frame->error = chunks_error_Error_FromError_from(&host);
+		chunks_packs_backend_Packs_over_pad_0(frame);
+		return;
+	}
 	std_vec_push_Checked(&list->locations, &frame->location, sizeof(frame->location), _Alignof(uint64));
 	frame->guard_live = false;
 	host_lock_LockedRwLockWriteGuard_drop(&frame->guard);
@@ -517,14 +530,66 @@ chunks_packs_backend_Packs_drop(ChunksPacksBackendPacks *self)
 	std_free(self->view, sizeof(ChunksPacksBackendViewMutex), _Alignof(ChunksPacksBackendViewMutex));
 }
 
-static bool chunks_packs_backend_copied_dir(HostIoIoDoors io, const char *dir, size_t dir_len, const char *into,
-											size_t into_len, ChunksErrorError *error);
+static bool chunks_packs_backend_copied_dir(HostIoIoDoors io, const char *dir, size_t dir_len, const StdVec *skipped,
+											const HostSharedPauses *pauses, const char *into,
+											size_t into_len, bool created, ChunksErrorError *error);
 
-/* chunks_packs_backend_Packs_view_lock takes the backend's view under its lock, for the modules of packs that change it. */
+/* chunks_packs_backend_view_lock_frame_0_t is view_lock's state across its pad: the packs, and the view while it lends it. */
+typedef struct chunks_packs_backend_view_lock_frame_0_t
+{
+	const ChunksPacksBackendPacks *self;
+	HostIoTakesShort io;
+	HostLockLending view;
+	bool		view_live;
+} chunks_packs_backend_view_lock_frame_0_t;
+
+/* chunks_packs_backend_view_lock_pad_0 is view_lock's pad: the view, which an unwind gives back poisoned. */
+static void
+chunks_packs_backend_view_lock_pad_0(void *frame_)
+{
+	chunks_packs_backend_view_lock_frame_0_t *frame = frame_;
+
+	if (frame->view_live)
+	{
+		frame->view_live = false;
+		host_lock_Lending_drop(&frame->view);
+	}
+}
+
+/*
+ * chunks_packs_backend_view_lock_body_0 is view_lock's body: the view taken,
+ * and made again for the repository when a panic's poisoning rebuilt it to
+ * View's default, which names no directory (B5; bugs row 499).
+ */
+static void
+chunks_packs_backend_view_lock_body_0(void *frame_)
+{
+	chunks_packs_backend_view_lock_frame_0_t *frame = frame_;
+	ChunksPacksViewView *value;
+
+	frame->view = host_lock_LongMutex_lock(&frame->self->view->mutex.header, &CHUNKS_PACKS_BACKEND_VIEW_LOCK_TYPE,
+										   frame->io);
+	frame->view_live = true;
+	value = host_lock_Lending_DerefMut_deref_mut(&frame->view);
+	if (value->repository != 0)
+		return;
+	chunks_packs_view_View_drop(value);
+	chunks_packs_view_View_Default_default(value);
+	chunks_packs_view_View_new((uint32) frame->self->repository, frame->self->own, value);
+}
+
+/*
+ * chunks_packs_backend_Packs_view_lock takes the backend's view under its
+ * lock, for the modules of packs that change it and every read of it, made
+ * again for the repository when a panic's poisoning left View's default.
+ */
 HostLockLending
 chunks_packs_backend_Packs_view_lock(const ChunksPacksBackendPacks *self, HostIoTakesShort io)
 {
-	return host_lock_LongMutex_lock(&self->view->mutex.header, &CHUNKS_PACKS_BACKEND_VIEW_LOCK_TYPE, io);
+	chunks_packs_backend_view_lock_frame_0_t frame = {.self = self, .io = io};
+
+	std_landing(&frame, chunks_packs_backend_view_lock_body_0, chunks_packs_backend_view_lock_pad_0);
+	return frame.view;
 }
 
 /* chunks_packs_backend_Packs_viewed_frame_0_t is viewed's state across its pad: the view's guard. */
@@ -563,11 +628,11 @@ chunks_packs_backend_Packs_viewed_body_0(void *frame_)
 	frame->ok = false;
 	if (!chunks_packs_roots_Packs_settle_roots(frame->self, frame->io, frame->error))
 		return;
-	frame->view = host_lock_LongMutex_lock(&frame->self->view->mutex.header, &CHUNKS_PACKS_BACKEND_VIEW_LOCK_TYPE,
-										   HOST_IO_IO_TAKES_SHORT(frame->io));
+	frame->view = chunks_packs_backend_Packs_view_lock(frame->self, HOST_IO_IO_TAKES_SHORT(frame->io));
 	frame->view_live = true;
 	view = host_lock_Lending_DerefMut_deref_mut(&frame->view);
-	frame->ok = chunks_packs_view_View_refresh(view, frame->io, host_shared_Held_record(&frame->self->held),
+	frame->ok = chunks_packs_view_View_refresh(view, HOST_IO_IO_TAKES_SHORT(frame->io),
+											   host_shared_Held_record(&frame->self->held),
 											   frame->error) &&
 		frame->read(frame->captures, view, frame->io, frame->error);
 	chunks_packs_backend_Packs_viewed_pad_0(frame);
@@ -635,8 +700,7 @@ chunks_packs_backend_Packs_changed_body_0(void *frame_)
 	HostError	host;
 
 	frame->ok = false;
-	frame->view = host_lock_LongMutex_lock(&frame->self->view->mutex.header, &CHUNKS_PACKS_BACKEND_VIEW_LOCK_TYPE,
-										   frame->io);
+	frame->view = chunks_packs_backend_Packs_view_lock(frame->self, frame->io);
 	frame->view_live = true;
 	if (!host_shared_Record_lock_long(record, host_lock_Lending_io(&frame->view), CHUNKS_PACKS_SHARED_LISTS_LOCK_INDEX,
 									  &long_, &host))
@@ -675,13 +739,16 @@ chunks_packs_backend_Packs_changed(const ChunksPacksBackendPacks *self, HostIoTa
 
 /*
  * chunks_packs_backend_Packs_compact_frame_0_t is compact's state across its
- * pad: the view's guard, the list files' flag, and the rewrite under way.
+ * pad, and remove_space's: the view's guard, the list files' flag, and the
+ * rewrite under way.
  */
 typedef struct chunks_packs_backend_Packs_compact_frame_0_t
 {
 	const ChunksPacksBackendPacks *self;
 	HostIoTakesShort io;
 	bool		all;
+	bool		removing;
+	uint32		space;
 	ChunksErrorError *error;
 	bool		ok;
 	HostLockLending view;
@@ -715,7 +782,7 @@ chunks_packs_backend_Packs_compact_pad_0(void *frame_)
 	}
 }
 
-/* chunks_packs_backend_Packs_compact_body_0 is compact's body: the list files due a whole write written whole. */
+/* chunks_packs_backend_Packs_compact_body_0 is compact's body, the list files due a whole write written whole, and remove_space's, its tablespace taken out of them. */
 static void
 chunks_packs_backend_Packs_compact_body_0(void *frame_)
 {
@@ -726,11 +793,10 @@ chunks_packs_backend_Packs_compact_body_0(void *frame_)
 	HostError	host;
 
 	frame->ok = false;
-	frame->view = host_lock_LongMutex_lock(&frame->self->view->mutex.header, &CHUNKS_PACKS_BACKEND_VIEW_LOCK_TYPE,
-										   frame->io);
+	frame->view = chunks_packs_backend_Packs_view_lock(frame->self, frame->io);
 	frame->view_live = true;
 	view = host_lock_Lending_DerefMut_deref_mut(&frame->view);
-	if (!frame->all && !chunks_packs_lists_past_slack(view))
+	if (!frame->removing && !frame->all && !chunks_packs_lists_past_slack(view))
 	{
 		frame->ok = true;
 		goto done;
@@ -746,7 +812,8 @@ chunks_packs_backend_Packs_compact_body_0(void *frame_)
 	if (!chunks_packs_lists_Rewrite_begin(view, record, &flag_io, &frame->rewrite, frame->error))
 		goto done;
 	frame->rewrite_live = true;
-	if (!chunks_packs_lists_Rewrite_compact(&frame->rewrite, frame->all, frame->error))
+	if (frame->removing ? !chunks_packs_lists_Rewrite_remove_space(&frame->rewrite, frame->space, frame->error) :
+		!chunks_packs_lists_Rewrite_compact(&frame->rewrite, frame->all, frame->error))
 		goto done;
 	frame->rewrite_live = false;
 	frame->ok = chunks_packs_lists_Change_install(&frame->rewrite, frame->error);
@@ -770,14 +837,65 @@ chunks_packs_backend_Packs_compact(const ChunksPacksBackendPacks *self, HostIoTa
 	return frame.ok;
 }
 
-/* chunks_packs_backend_none_deferred is flush's read: whether the view defers no add. */
-static bool
-chunks_packs_backend_none_deferred(void *captures, ChunksPacksViewView *view, HostIoIo *io, ChunksErrorError *error)
+/*
+ * chunks_packs_backend_Packs_remove_space takes a tablespace out of the
+ * repository's list files under their flag once none of its packs is listed,
+ * refusing while one is (bugs row 99).
+ */
+bool
+chunks_packs_backend_Packs_remove_space(const ChunksPacksBackendPacks *self, HostIoTakesShort io,
+										const HostSharedReader *reading, uint32 space, ChunksErrorError *error)
 {
-	(void) io;
-	(void) error;
-	*(bool *) captures = view->deferred.len == 0;
-	return true;
+	chunks_packs_backend_Packs_compact_frame_0_t frame = {.self = self, .io = io, .removing = true, .space = space,
+	.error = error};
+
+	(void) reading;
+	std_landing(&frame, chunks_packs_backend_Packs_compact_body_0, chunks_packs_backend_Packs_compact_pad_0);
+	return frame.ok;
+}
+
+/*
+ * chunks_packs_backend_Packs_flush_frame_0_t is flush's state across its
+ * pad: the view's guard, and whether the view defers no add.
+ */
+typedef struct chunks_packs_backend_Packs_flush_frame_0_t
+{
+	const ChunksPacksBackendPacks *self;
+	HostIoTakesShort io;
+	ChunksErrorError *error;
+	bool		ok;
+	bool		none;
+	HostLockLending view;
+	bool		view_live;
+} chunks_packs_backend_Packs_flush_frame_0_t;
+
+/* chunks_packs_backend_Packs_flush_pad_0 is flush's pad: the view's guard. */
+static void
+chunks_packs_backend_Packs_flush_pad_0(void *frame_)
+{
+	chunks_packs_backend_Packs_flush_frame_0_t *frame = frame_;
+
+	if (frame->view_live)
+	{
+		frame->view_live = false;
+		host_lock_Lending_drop(&frame->view);
+	}
+}
+
+/* chunks_packs_backend_Packs_flush_body_0 is flush's body: the view refreshed, then whether it defers no add. */
+static void
+chunks_packs_backend_Packs_flush_body_0(void *frame_)
+{
+	chunks_packs_backend_Packs_flush_frame_0_t *frame = frame_;
+	ChunksPacksViewView *value;
+
+	frame->view = chunks_packs_backend_Packs_view_lock(frame->self, frame->io);
+	frame->view_live = true;
+	value = host_lock_Lending_DerefMut_deref_mut(&frame->view);
+	frame->ok = chunks_packs_view_View_refresh(value, frame->io, host_shared_Held_record(&frame->self->held),
+											   frame->error);
+	frame->none = value->deferred.len == 0;
+	chunks_packs_backend_Packs_flush_pad_0(frame);
 }
 
 /* chunks_packs_backend_flushed is flush's change: every deferred add appended. */
@@ -794,15 +912,16 @@ chunks_packs_backend_flushed(void *captures, ChunksPacksListsChange *change, Chu
  * its base rests on, so a crash's recovery finds them listed.
  */
 bool
-chunks_packs_backend_Packs_flush(const ChunksPacksBackendPacks *self, HostIoIo *io, const HostSharedReader *reading,
-								 ChunksErrorError *error)
+chunks_packs_backend_Packs_flush(const ChunksPacksBackendPacks *self, HostIoTakesShort io,
+								 const HostSharedReader *reading, ChunksErrorError *error)
 {
-	bool		none;
+	chunks_packs_backend_Packs_flush_frame_0_t frame = {.self = self, .io = io, .error = error};
 
-	if (!chunks_packs_backend_Packs_viewed(self, io, chunks_packs_backend_none_deferred, &none, error))
+	std_landing(&frame, chunks_packs_backend_Packs_flush_body_0, chunks_packs_backend_Packs_flush_pad_0);
+	if (!frame.ok)
 		return false;
-	return none || chunks_packs_backend_Packs_changed(self, HOST_IO_IO_TAKES_SHORT(io), reading,
-													  chunks_packs_backend_flushed, NULL, error);
+	return frame.none || chunks_packs_backend_Packs_changed(self, io, reading, chunks_packs_backend_flushed, NULL,
+															error);
 }
 
 /*
@@ -814,7 +933,7 @@ bool
 chunks_packs_backend_Packs_close(ChunksPacksBackendPacks *self, HostIoIo *io, const HostSharedReader *reading,
 								 ChunksErrorError *error)
 {
-	bool		ok = chunks_packs_backend_Packs_flush(self, io, reading, error);
+	bool		ok = chunks_packs_backend_Packs_flush(self, HOST_IO_IO_TAKES_SHORT(io), reading, error);
 
 	chunks_packs_backend_Packs_drop(self);
 	return ok;
@@ -921,6 +1040,69 @@ chunks_packs_backend_copied_file(HostIoIoDoors io, const char *from_path, size_t
 }
 
 /*
+ * chunks_packs_backend_left_out reports whether a creation's copy leaves an
+ * entry of a repository's directory out: the manifest's previous generation,
+ * the checkpoint's runs and spills, which the new repository's own runs
+ * replace, the backups' generations, which are the template's, and a
+ * creation's mark (bugs row 404).
+ */
+static bool
+chunks_packs_backend_left_out(const StdString *name)
+{
+	static const char *const names[] = {CHUNKS_PACKS_MANIFEST ".prev", CHUNKS_PACKS_DELTA, CHUNKS_PACKS_BACKUP,
+	CHUNKS_PACKS_DROPPED_CREATING};
+
+	for (size_t k = 0; k < lengthof(names); k++)
+		if (name->len == strlen(names[k]) && memcmp(name->ptr, names[k], name->len) == 0)
+			return true;
+	return false;
+}
+
+/*
+ * chunks_packs_backend_named reports whether a list of names holds a name.
+ */
+static bool
+chunks_packs_backend_named(const StdVec *names, const StdString *name)
+{
+	for (size_t k = 0, k_len = names->len; k < k_len; k++)
+	{
+		const StdString *held = &STD_VEC_AT(names, StdString, k);
+
+		if (held->len == name->len && memcmp(held->ptr, name->ptr, name->len) == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * chunks_packs_backend_queued_names returns the names of the files the
+ * removal queue holds for a repository in a space, which a whole copy of that
+ * space's directory leaves out, since nothing would list them in the copy
+ * (bugs row 451).
+ */
+static bool
+chunks_packs_backend_queued_names(HostIoIo *io, uint32 repository, uint32 space, StdVec *result,
+								  ChunksErrorError *error)
+{
+	StdVec		entries;
+
+	if (!chunks_packs_removal_queued(io, repository, &entries, error))
+		return false;
+	for (size_t k = 0, k_len = entries.len; k < k_len; k++)
+	{
+		const ChunksPacksSingleRemoval *entry = &STD_VEC_AT(&entries, ChunksPacksSingleRemoval, k);
+		StdString	name;
+
+		if (entry->space != space)
+			continue;
+		name = chunks_packs_removal_file_name(entry);
+		std_vec_push_Checked(result, &name, sizeof(name), _Alignof(StdString));
+	}
+	std_vec_free_Checked(&entries, sizeof(ChunksPacksSingleRemoval), _Alignof(ChunksPacksSingleRemoval));
+	return true;
+}
+
+/*
  * chunks_packs_backend_copied_dir_frame_0_t is copied_dir's state across its
  * pad: the names listed and the paths of the entry it copies.
  */
@@ -929,8 +1111,11 @@ typedef struct chunks_packs_backend_copied_dir_frame_0_t
 	HostIoIoDoors io;
 	const char *dir;
 	size_t		dir_len;
+	const StdVec *skipped;
+	const HostSharedPauses *pauses;
 	const char *into;
 	size_t		into_len;
+	bool		created;
 	ChunksErrorError *error;
 	bool		ok;
 	StdVec		names;
@@ -961,17 +1146,26 @@ static void
 chunks_packs_backend_copied_dir_body_0(void *frame_)
 {
 	chunks_packs_backend_copied_dir_frame_0_t *frame = frame_;
+	HostError	host;
 
 	frame->ok = false;
 	if (!chunks_file_file_names(HOST_IO_IO_DOORS_READ_DOORS(frame->io), frame->dir, frame->dir_len, &frame->names,
 								frame->error))
 		goto done;
+	if (frame->pauses != NULL && !host_pause(*frame->pauses, "doltgres-packs-copy-listed", &host))
+	{
+		*frame->error = chunks_error_Error_FromError_from(&host);
+		goto done;
+	}
 	for (size_t k = 0, k_len = frame->names.len; k < k_len; k++)
 	{
 		const StdString *name = &STD_VEC_AT(&frame->names, StdString, k);
 		bool		there;
 		bool		copied;
 
+		if ((frame->created && chunks_packs_backend_left_out(name)) ||
+			(frame->skipped != NULL && chunks_packs_backend_named(frame->skipped, name)))
+			continue;
 		std_vec_free_Checked(&frame->from_path.bytes, 1, 1);
 		std_PathBuf_new(&frame->from_path);
 		std_path_join(frame->dir, frame->dir_len, name->ptr, name->len, &frame->from_path);
@@ -985,7 +1179,8 @@ chunks_packs_backend_copied_dir_body_0(void *frame_)
 			copied = chunks_file_create_dir(frame->io, frame->to_path.bytes.ptr, frame->to_path.bytes.len,
 											frame->error) &&
 				chunks_packs_backend_copied_dir(frame->io, frame->from_path.bytes.ptr, frame->from_path.bytes.len,
-												frame->to_path.bytes.ptr, frame->to_path.bytes.len, frame->error);
+												NULL, NULL, frame->to_path.bytes.ptr, frame->to_path.bytes.len,
+												false, frame->error);
 		else
 			copied = chunks_packs_backend_copied_file(frame->io, frame->from_path.bytes.ptr,
 													  frame->from_path.bytes.len, frame->to_path.bytes.ptr,
@@ -1001,14 +1196,18 @@ done:
 /*
  * chunks_packs_backend_copied_dir copies each entry of a directory whole
  * into another directory, made already, as Postgres' copydir copies a
- * database's, and then syncs the directory it copied into.
+ * database's, and then syncs the directory it copied into; it leaves out the
+ * entries of the directory itself that the skipped names list, pausing at
+ * the pauses given once it has listed them, and a creation's copy leaves out
+ * the entries left_out names.
  */
 static bool
-chunks_packs_backend_copied_dir(HostIoIoDoors io, const char *dir, size_t dir_len, const char *into, size_t into_len,
+chunks_packs_backend_copied_dir(HostIoIoDoors io, const char *dir, size_t dir_len, const StdVec *skipped,
+								const HostSharedPauses *pauses, const char *into, size_t into_len, bool created,
 								ChunksErrorError *error)
 {
-	chunks_packs_backend_copied_dir_frame_0_t frame = {.io = io, .dir = dir, .dir_len = dir_len, .into = into,
-	.into_len = into_len, .error = error};
+	chunks_packs_backend_copied_dir_frame_0_t frame = {.io = io, .dir = dir, .dir_len = dir_len, .skipped = skipped,
+	.pauses = pauses, .into = into, .into_len = into_len, .created = created, .error = error};
 
 	std_vec_new(&frame.names, sizeof(StdString), _Alignof(StdString));
 	std_PathBuf_new(&frame.from_path);
@@ -1031,11 +1230,12 @@ typedef struct chunks_packs_backend_Packs_copied_frame_0_t
 	ChunksErrorError *error;
 	bool		ok;
 	StdPathBuf	dir;
+	StdVec		skipped;
 	HostSharedFlagGuard rewriting;
 	bool		rewriting_live;
 } chunks_packs_backend_Packs_copied_frame_0_t;
 
-/* chunks_packs_backend_Packs_copied_pad_0 is copied's pad: the flag, then the directory. */
+/* chunks_packs_backend_Packs_copied_pad_0 is copied's pad: the flag, the names it skips, then the directory. */
 static void
 chunks_packs_backend_Packs_copied_pad_0(void *frame_)
 {
@@ -1046,6 +1246,8 @@ chunks_packs_backend_Packs_copied_pad_0(void *frame_)
 		frame->rewriting_live = false;
 		host_shared_FlagGuard_drop(&frame->rewriting);
 	}
+	std_vec_drop_Checked(&frame->skipped, sizeof(StdString), _Alignof(StdString), std_String_drop);
+	std_vec_new(&frame->skipped, sizeof(StdString), _Alignof(StdString));
 	std_vec_free_Checked(&frame->dir.bytes, 1, 1);
 	std_PathBuf_new(&frame->dir);
 }
@@ -1057,14 +1259,20 @@ chunks_packs_backend_Packs_copied_body_0(void *frame_)
 	chunks_packs_backend_Packs_copied_frame_0_t *frame = frame_;
 	const ChunksPacksBackendPacks *self = frame->self;
 	HostSharedFlagIo flag_io;
+	HostSharedPauses pauses;
 	HostError	host;
 
 	frame->ok = false;
 	if (!chunks_packs_backend_Packs_unreserve(self, frame->io, frame->reading, frame->error) ||
 		!chunks_packs_backend_Packs_even_manifest(self, frame->io, frame->error) ||
-		!chunks_packs_backend_Packs_flush(self, frame->io, frame->reading, frame->error) ||
+		!chunks_packs_backend_Packs_flush(self, HOST_IO_IO_TAKES_SHORT(frame->io), frame->reading, frame->error) ||
 		!chunks_packs_open_made_dir(frame->io, frame->into, frame->into_len, frame->error))
 		goto done;
+	if (!host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-packs-copy-made", &host))
+	{
+		*frame->error = chunks_error_Error_FromError_from(&host);
+		goto done;
+	}
 	frame->dir = host_tablespace_dir((uint32) self->repository, self->own);
 	if (!host_shared_Record_flag(host_shared_Held_record(&self->held), HOST_IO_IO_TAKES_SHORT(frame->io),
 								 CHUNKS_PACKS_SHARED_REWRITING_INDEX, &frame->rewriting, &host))
@@ -1073,9 +1281,14 @@ chunks_packs_backend_Packs_copied_body_0(void *frame_)
 		goto done;
 	}
 	frame->rewriting_live = true;
+	if (!chunks_packs_backend_queued_names(frame->io, (uint32) self->repository, self->own, &frame->skipped,
+										   frame->error))
+		goto done;
 	flag_io = host_shared_FlagGuard_io(&frame->rewriting);
+	pauses = HOST_SHARED_FLAG_IO_PAUSES(&flag_io);
 	frame->ok = chunks_packs_backend_copied_dir(HOST_SHARED_FLAG_IO_IO_DOORS(&flag_io), frame->dir.bytes.ptr,
-												frame->dir.bytes.len, frame->into, frame->into_len, frame->error);
+												frame->dir.bytes.len, &frame->skipped, &pauses, frame->into,
+												frame->into_len, false, frame->error);
 done:
 	chunks_packs_backend_Packs_copied_pad_0(frame);
 }
@@ -1084,7 +1297,8 @@ done:
  * chunks_packs_backend_Packs_copied writes what the record owes the
  * repository's own files and then copies its own directory whole into
  * another directory, made first, under the files' flag every whole write of
- * a kept file holds.
+ * a kept file holds and the removal pass tries, leaving out the files the
+ * removal queue holds, read under the flag before the directory is listed.
  */
 bool
 chunks_packs_backend_Packs_copied(const ChunksPacksBackendPacks *self, HostIoIo *io, const HostSharedReader *reading,
@@ -1094,7 +1308,123 @@ chunks_packs_backend_Packs_copied(const ChunksPacksBackendPacks *self, HostIoIo 
 	.into_len = into_len, .error = error};
 
 	std_PathBuf_new(&frame.dir);
+	std_vec_new(&frame.skipped, sizeof(StdString), _Alignof(StdString));
 	std_landing(&frame, chunks_packs_backend_Packs_copied_body_0, chunks_packs_backend_Packs_copied_pad_0);
+	return frame.ok;
+}
+
+/*
+ * chunks_packs_backend_Packs_created_frame_0_t is created's state across its
+ * pad: the repository's directories, the one it copies into, and the files'
+ * flag.
+ */
+typedef struct chunks_packs_backend_Packs_created_frame_0_t
+{
+	const ChunksPacksBackendPacks *self;
+	HostIoIo   *io;
+	const HostSharedReader *reading;
+	uint32		database;
+	uint32		own;
+	ChunksErrorError *error;
+	bool		ok;
+	StdVec		dirs;
+	StdPathBuf	into;
+	StdVec		skipped;
+	HostSharedFlagGuard rewriting;
+	bool		rewriting_live;
+} chunks_packs_backend_Packs_created_frame_0_t;
+
+/* chunks_packs_backend_Packs_created_pad_0 is created's pad: the flag, the names it skips, the directory it copies into, then the directories. */
+static void
+chunks_packs_backend_Packs_created_pad_0(void *frame_)
+{
+	chunks_packs_backend_Packs_created_frame_0_t *frame = frame_;
+
+	if (frame->rewriting_live)
+	{
+		frame->rewriting_live = false;
+		host_shared_FlagGuard_drop(&frame->rewriting);
+	}
+	std_vec_drop_Checked(&frame->skipped, sizeof(StdString), _Alignof(StdString), std_String_drop);
+	std_vec_new(&frame->skipped, sizeof(StdString), _Alignof(StdString));
+	std_vec_free_Checked(&frame->into.bytes, 1, 1);
+	std_PathBuf_new(&frame->into);
+	for (size_t k = 0, k_len = frame->dirs.len; k < k_len; k++)
+		std_vec_free_Checked(&STD_VEC_AT(&frame->dirs, chunks_TupleU32PathBuf_t, k).f1.bytes, 1, 1);
+	std_vec_free_Checked(&frame->dirs, sizeof(chunks_TupleU32PathBuf_t), _Alignof(chunks_TupleU32PathBuf_t));
+	std_vec_new(&frame->dirs, sizeof(chunks_TupleU32PathBuf_t), _Alignof(chunks_TupleU32PathBuf_t));
+}
+
+/* chunks_packs_backend_Packs_created_body_0 is created's body: what the record owes written, then each directory's copy. */
+static void
+chunks_packs_backend_Packs_created_body_0(void *frame_)
+{
+	chunks_packs_backend_Packs_created_frame_0_t *frame = frame_;
+	const ChunksPacksBackendPacks *self = frame->self;
+	HostSharedFlagIo flag_io;
+	HostSharedPauses pauses;
+	HostError	host;
+
+	frame->ok = false;
+	if (!chunks_packs_backend_Packs_unreserve(self, frame->io, frame->reading, frame->error) ||
+		!chunks_packs_backend_Packs_even_manifest(self, frame->io, frame->error) ||
+		!chunks_packs_backend_Packs_flush(self, HOST_IO_IO_TAKES_SHORT(frame->io), frame->reading, frame->error))
+		goto done;
+	if (!host_shared_Record_flag(host_shared_Held_record(&self->held), HOST_IO_IO_TAKES_SHORT(frame->io),
+								 CHUNKS_PACKS_SHARED_REWRITING_INDEX, &frame->rewriting, &host))
+	{
+		*frame->error = chunks_error_Error_FromError_from(&host);
+		goto done;
+	}
+	frame->rewriting_live = true;
+	if (!chunks_packs_open_spaced_directories(HOST_IO_IO_READ_DOORS(frame->io), (uint32) self->repository, self->own,
+											  &frame->dirs, frame->error))
+		goto done;
+	flag_io = host_shared_FlagGuard_io(&frame->rewriting);
+	pauses = HOST_SHARED_FLAG_IO_PAUSES(&flag_io);
+	for (size_t k = 0, k_len = frame->dirs.len; k < k_len; k++)
+	{
+		const chunks_TupleU32PathBuf_t *dir = &STD_VEC_AT(&frame->dirs, chunks_TupleU32PathBuf_t, k);
+
+		std_vec_free_Checked(&frame->into.bytes, 1, 1);
+		frame->into = host_tablespace_dir(frame->database,
+										  dir->f0 == CHUNKS_PACKS_DEFAULT_SPACE ? frame->own : dir->f0);
+		std_vec_drop_Checked(&frame->skipped, sizeof(StdString), _Alignof(StdString), std_String_drop);
+		std_vec_new(&frame->skipped, sizeof(StdString), _Alignof(StdString));
+		if (!chunks_packs_open_made_dir(frame->io, frame->into.bytes.ptr, frame->into.bytes.len, frame->error) ||
+			!chunks_packs_backend_queued_names(frame->io, (uint32) self->repository,
+											   dir->f0 == CHUNKS_PACKS_DEFAULT_SPACE ? self->own : dir->f0,
+											   &frame->skipped, frame->error) ||
+			!chunks_packs_backend_copied_dir(HOST_SHARED_FLAG_IO_IO_DOORS(&flag_io), dir->f1.bytes.ptr,
+											 dir->f1.bytes.len, &frame->skipped, &pauses, frame->into.bytes.ptr,
+											 frame->into.bytes.len, true, frame->error))
+			goto done;
+	}
+	frame->ok = true;
+done:
+	chunks_packs_backend_Packs_created_pad_0(frame);
+}
+
+/*
+ * chunks_packs_backend_Packs_created writes what the record owes the
+ * repository's files and then copies each of its directories into a new
+ * database's directory in the same tablespace, its own into the new
+ * database's own in the tablespace given, under the files' flag every whole
+ * write of a kept file holds and the removal pass tries, leaving out what a
+ * creation's copy leaves out (bugs row 404) and the files the removal queue
+ * holds, read under the flag before each directory is listed (bugs row 451).
+ */
+bool
+chunks_packs_backend_Packs_created(const ChunksPacksBackendPacks *self, HostIoIo *io, const HostSharedReader *reading,
+								   uint32 database, uint32 own, ChunksErrorError *error)
+{
+	chunks_packs_backend_Packs_created_frame_0_t frame = {.self = self, .io = io, .reading = reading,
+	.database = database, .own = own, .error = error};
+
+	std_vec_new(&frame.dirs, sizeof(chunks_TupleU32PathBuf_t), _Alignof(chunks_TupleU32PathBuf_t));
+	std_PathBuf_new(&frame.into);
+	std_vec_new(&frame.skipped, sizeof(StdString), _Alignof(StdString));
+	std_landing(&frame, chunks_packs_backend_Packs_created_body_0, chunks_packs_backend_Packs_created_pad_0);
 	return frame.ok;
 }
 
@@ -1862,7 +2192,7 @@ chunks_packs_backend_forward_change(void *captures, ChunksPacksListsChange *chan
 	return ok;
 }
 
-/* chunks_packs_backend_Packs_forward_frame_0_t is forward's state across its pad: the places, the run's name, path, and entries, the packs, and the line. */
+/* chunks_packs_backend_Packs_forward_frame_0_t is forward's state across its pad: the places, the view while it lends it, the run's name, path, and entries, the packs, and the line. */
 typedef struct chunks_packs_backend_Packs_forward_frame_0_t
 {
 	const ChunksPacksBackendPacks *self;
@@ -1876,6 +2206,8 @@ typedef struct chunks_packs_backend_Packs_forward_frame_0_t
 	/* froms is a BTreeSet<(u64, u64)> of the old places, a vector in order. */
 	StdVec		froms;
 	bool		froms_live;
+	HostLockLending view;
+	bool		view_live;
 	StdString	name;
 	bool		name_live;
 	StdPathBuf	path;
@@ -1921,6 +2253,11 @@ chunks_packs_backend_Packs_forward_pad_0(void *frame_)
 		frame->name_live = false;
 		std_vec_free_Checked(&frame->name, 1, 1);
 	}
+	if (frame->view_live)
+	{
+		frame->view_live = false;
+		host_lock_Lending_drop(&frame->view);
+	}
 	if (frame->froms_live)
 	{
 		frame->froms_live = false;
@@ -1952,14 +2289,17 @@ chunks_packs_backend_Packs_forward_body_0(void *frame_)
 	if (frame->moves_len != 0)
 	{
 		ChunksPackPackId id = chunks_pack_PackId_new();
-		HostLockLending view = chunks_packs_backend_Packs_view_lock(frame->self, HOST_IO_IO_TAKES_SHORT(frame->io));
-		const ChunksPacksViewView *value = host_lock_Lending_DerefMut_deref_mut(&view);
+		const ChunksPacksViewView *value;
 
+		frame->view = chunks_packs_backend_Packs_view_lock(frame->self, HOST_IO_IO_TAKES_SHORT(frame->io));
+		frame->view_live = true;
+		value = host_lock_Lending_DerefMut_deref_mut(&frame->view);
 		frame->name = chunks_pack_PackId_file_name(&id, "fwd", 3);
 		frame->name_live = true;
 		std_path_join(value->dir.bytes.ptr, value->dir.bytes.len, frame->name.ptr, frame->name.len, &frame->path);
 		frame->path_live = true;
-		host_lock_Lending_drop(&view);
+		frame->view_live = false;
+		host_lock_Lending_drop(&frame->view);
 		chunks_packs_forward_entries((const chunks_TupleLocatorLocator_t *) frame->moves, frame->moves_len,
 									 &frame->entries);
 		frame->entries_live = true;
@@ -2775,7 +3115,7 @@ chunks_packs_backend_Packs_merge_runs_body_0(void *frame_)
 	frame->view = chunks_packs_backend_Packs_view_lock(self, HOST_IO_IO_TAKES_SHORT(frame->io));
 	frame->view_live = true;
 	value = host_lock_Lending_DerefMut_deref_mut(&frame->view);
-	if (!chunks_packs_view_View_refresh(value, frame->io, record, frame->error))
+	if (!chunks_packs_view_View_refresh(value, HOST_IO_IO_TAKES_SHORT(frame->io), record, frame->error))
 		goto done;
 	if (!chunks_packs_merge_due(value, &space, &from, &to))
 	{
@@ -5052,6 +5392,105 @@ test_chunks_packs_backend_tests_a_view_keeps_the_packs_of_a_missing_tablespace_u
 	if (has_before)
 		chunks_packs_backend_Packs_drop(&before);
 	host_shared_Reader_drop(&reading);
+	simc_TestIo_drop(&test_io);
+}
+
+/* chunks_packs_backend_tests_oom is the failed-allocation case's hook: a failed allocation panics, as pg's hook unwinds. */
+static void
+chunks_packs_backend_tests_oom(size_t size, size_t align)
+{
+	std_panic(__FILE__, __LINE__, 0, "out of memory", sizeof("out of memory") - 1);
+}
+
+/* CHUNKS_PACKS_BACKEND_TESTS_OOM_HOOK is the failed-allocation case's hook, set while it fails a reallocation. */
+static const StdAllocErrorHook CHUNKS_PACKS_BACKEND_TESTS_OOM_HOOK = {chunks_packs_backend_tests_oom};
+
+/* ChunksPacksBackendTestsOver is the failed-allocation case's over: its record, location, packs, and answer. */
+typedef struct ChunksPacksBackendTestsOver
+{
+	HostIoIo   *io;
+	HostSharedHeld held;
+	uint64		location;
+	ChunksPacksBackendPacks packs;
+	ChunksErrorError error;
+	bool		ok;
+} ChunksPacksBackendTestsOver;
+
+/* chunks_packs_backend_tests_over is the failed-allocation case's call: packs over the record. */
+static void
+chunks_packs_backend_tests_over(void *captures)
+{
+	ChunksPacksBackendTestsOver *over = captures;
+
+	over->ok = chunks_packs_backend_Packs_over(over->io, &over->held, over->location, &over->packs, &over->error);
+}
+
+/* chunks_packs_backend_tests_listed counts OPEN's entries at a location, taking OPEN's lock, and takes off the rest past a length. */
+static size_t
+chunks_packs_backend_tests_listed(HostIoIo *io, uint64 location, size_t keep)
+{
+	HostLocalLocal local = host_local_BackendLocal_get(&CHUNKS_PACKS_BACKEND_OPEN.local, &CHUNKS_PACKS_BACKEND_OPEN_TYPE);
+	HostLockLockedRwLockWriteGuard guard;
+	ChunksPacksBackendOpen *open = chunks_packs_backend_open_lock(&local, &io->held, &guard);
+	size_t		found = 0;
+
+	for (size_t k = 0; k < open->locations.len; k++)
+		found += STD_VEC_AT(&open->locations, uint64, k) == location;
+	open->locations.len = Min(open->locations.len, keep);
+	host_lock_LockedRwLockWriteGuard_drop(&guard);
+	host_local_Local_drop(&local, &CHUNKS_PACKS_BACKEND_OPEN_TYPE);
+	return found;
+}
+
+/*
+ * test_chunks_packs_backend_tests_a_failed_allocation_in_a_packs_over_keeps_the_process_list:
+ * with the process's list of open pack records at its room, packs over a
+ * record whose list's growth fails answer out of memory and leave every
+ * earlier entry for the next take of the list's lock, which the exit reads to
+ * append deferred adds (bugs row 517). Before, the growth unwound under the
+ * lock, which poisoned it, and the next take rebuilt an empty list.
+ */
+void
+test_chunks_packs_backend_tests_a_failed_allocation_in_a_packs_over_keeps_the_process_list(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	ChunksPacksBackendPacks packs;
+	ChunksPacksBackendTestsOver over = {.io = io};
+	HostLocalLocal local;
+	HostLockLockedRwLockWriteGuard guard;
+	ChunksPacksBackendOpen *open;
+	size_t		listed;
+	uint64		placeholder = PG_UINT64_MAX;
+	HostError	host;
+	StdCaught	caught;
+	bool		has;
+	bool		returned;
+
+	chunks_packs_fixtures_created(io, 41, &packs);
+	over.location = chunks_packs_backend_Packs_location(&packs);
+	local = host_local_BackendLocal_get(&CHUNKS_PACKS_BACKEND_OPEN.local, &CHUNKS_PACKS_BACKEND_OPEN_TYPE);
+	open = chunks_packs_backend_open_lock(&local, &io->held, &guard);
+	listed = open->locations.len;
+	while (open->locations.len < open->locations.cap)
+		std_vec_push_Checked(&open->locations, &placeholder, sizeof(uint64), _Alignof(uint64));
+	host_lock_LockedRwLockWriteGuard_drop(&guard);
+	host_local_Local_drop(&local, &CHUNKS_PACKS_BACKEND_OPEN_TYPE);
+	if (!host_shared_open(HOST_SHARED_IO_WITHIN(io), &CHUNKS_PACKS_SHARED_PACK_STATE_POOL_OPS, over.location, &has,
+						  &over.held, &host) || !has)
+		std_panic(__FILE__, __LINE__, 0, "the record didn't open", sizeof("the record didn't open") - 1);
+	std_alloc_set_alloc_error_hook(&CHUNKS_PACKS_BACKEND_TESTS_OOM_HOOK);
+	test_std_alloc_tests_fail_reallocation(1);
+	returned = std_catch_unwind(chunks_packs_backend_tests_over, &over, &caught);
+	test_std_alloc_tests_fail_reallocation(0);
+	std_alloc_set_alloc_error_hook(NULL);
+	if (!returned)
+		std_Caught_drop(&caught);
+	STD_ASSERT(__LINE__, 5, returned && !over.ok, "packs over a record whose list's growth fails answer out of memory");
+	chunks_error_Error_drop(&over.error);
+	STD_ASSERT(__LINE__, 5, chunks_packs_backend_tests_listed(io, over.location, listed) == 1,
+			   "the first packs' entry outlived a failed growth of the list");
+	chunks_packs_backend_Packs_drop(&packs);
 	simc_TestIo_drop(&test_io);
 }
 

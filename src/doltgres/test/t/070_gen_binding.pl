@@ -27,12 +27,12 @@ my $pg = $ENV{doltgres_pg_dir};
 my $script = "$pg/gen_binding.pl";
 
 # capabilities returns the capabilities an entry's exported side runs with in
-# the generator's export.rs.
+# the generator's export.c.
 sub capabilities
 {
 	my ($export, $entry) = @_;
 	return $export =~
-	  /fn doltgres_rs_$entry\(.*?\$crate::run::<\$crate::(\w+), _>/s
+	  /^doltgres_rs_$entry\(.*?\bpg_run_(CatalogCaps|Cleanup|Caps)/ms
 	  ? $1
 	  : 'none';
 }
@@ -40,7 +40,7 @@ sub capabilities
 my $out = PostgreSQL::Test::Utils::tempdir;
 command_ok([ $^X, $script, $pg, $out ],
 	'the generator writes the binding from the lists');
-my $export = slurp_file("$out/export.rs");
+my $export = slurp_file("$out/export.c");
 is(capabilities($export, 'doltgres_shared_release'),
 	'Cleanup', 'an entry whose panic becomes a PANIC gets no capability');
 is(capabilities($export, 'doltgres_dolt_version'),

@@ -16,6 +16,7 @@
 #include "access/xloginsert.h"
 #include "catalog/pg_type.h"
 #include "catalog/storage_xlog.h"
+#include "doltgres/hooks.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
@@ -105,6 +106,7 @@ pg_visibility_map(PG_FUNCTION_ARGS)
 	tupdesc = pg_visibility_tupdesc(false, false);
 
 	mapbits = (int32) visibilitymap_get_status(rel, blkno, &vmbuffer);
+	mapbits = doltgres_visibility_bits(rel, blkno, mapbits);
 	if (vmbuffer != InvalidBuffer)
 		ReleaseBuffer(vmbuffer);
 	values[0] = BoolGetDatum((mapbits & VISIBILITYMAP_ALL_VISIBLE) != 0);
@@ -146,13 +148,15 @@ pg_visibility(PG_FUNCTION_ARGS)
 	tupdesc = pg_visibility_tupdesc(false, true);
 
 	mapbits = (int32) visibilitymap_get_status(rel, blkno, &vmbuffer);
+	mapbits = doltgres_visibility_bits(rel, blkno, mapbits);
 	if (vmbuffer != InvalidBuffer)
 		ReleaseBuffer(vmbuffer);
 	values[0] = BoolGetDatum((mapbits & VISIBILITYMAP_ALL_VISIBLE) != 0);
 	values[1] = BoolGetDatum((mapbits & VISIBILITYMAP_ALL_FROZEN) != 0);
 
 	/* Here we have to explicitly check rel size ... */
-	if (blkno < RelationGetNumberOfBlocks(rel))
+	if (blkno < RelationGetNumberOfBlocks(rel) &&
+		!doltgres_visibility_kept(rel))
 	{
 		buffer = ReadBuffer(rel, blkno);
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
@@ -165,12 +169,30 @@ pg_visibility(PG_FUNCTION_ARGS)
 	else
 	{
 		/* As with the vismap, silently return 0 for pages past EOF */
-		values[2] = BoolGetDatum(false);
+		if (!doltgres_visibility_page(rel, blkno, &values[2]))
+		{
+			values[2] = BoolGetDatum(false);
+		}
 	}
 
 	relation_close(rel, AccessShareLock);
 
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/*
+ * doltgres_visibility_page gives pg_visibility's page-level all-visible flag
+ * of a fork table's block, set for each block within the table since the
+ * fork has no pages and keeps every block all-visible, answering whether the
+ * fork stores the table.
+ */
+bool
+doltgres_visibility_page(Relation rel, BlockNumber blkno, Datum *all_visible)
+{
+	if (!doltgres_visibility_kept(rel))
+		return false;
+	*all_visible = BoolGetDatum(blkno < RelationGetNumberOfBlocks(rel));
+	return true;
 }
 
 /*
@@ -503,7 +525,8 @@ collect_visibility_data(Oid relid, bool include_pd)
 	info->count = nblocks;
 
 	/* Create a stream if reading main fork. */
-	if (include_pd)
+	if (include_pd &&
+		!doltgres_visibility_kept(rel))
 	{
 		p.current_blocknum = 0;
 		p.last_exclusive = nblocks;
@@ -541,7 +564,8 @@ collect_visibility_data(Oid relid, bool include_pd)
 		 * caller needs it.  Use a buffer access strategy, too, to prevent
 		 * cache-trashing.
 		 */
-		if (include_pd)
+		if (include_pd &&
+			!doltgres_visibility_kept(rel))
 		{
 			Buffer		buffer;
 			Page		page;
@@ -557,11 +581,13 @@ collect_visibility_data(Oid relid, bool include_pd)
 		}
 	}
 
-	if (include_pd)
+	if (include_pd &&
+		!doltgres_visibility_kept(rel))
 	{
 		Assert(read_stream_next_buffer(stream, NULL) == InvalidBuffer);
 		read_stream_end(stream);
 	}
+	doltgres_visibility_collected(rel, include_pd, info);
 
 	/* Clean up. */
 	if (vmbuffer != InvalidBuffer)
@@ -569,6 +595,19 @@ collect_visibility_data(Oid relid, bool include_pd)
 	relation_close(rel, AccessShareLock);
 
 	return info;
+}
+
+/*
+ * doltgres_visibility_collected sets each block of a fork table all-visible
+ * and all-frozen in collect_visibility_data's bits, and all-visible on its
+ * page too when the caller asked for pages, since the fork keeps no
+ * visibility map and has no pages to read.
+ */
+void
+doltgres_visibility_collected(Relation rel, bool include_pd, vbits *info)
+{
+	if (doltgres_visibility_kept(rel))
+		memset(info->bits, include_pd ? (1 << 0) | (1 << 1) | (1 << 2) : (1 << 0) | (1 << 1), info->count);
 }
 
 /*

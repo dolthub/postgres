@@ -28,6 +28,9 @@
 extern bool chunks_packs_marking_Packs_begin_marking(const ChunksPacksBackendPacks *self, HostIoIo *io,
 													 const HostSharedReader *reading, uint64 *result,
 													 ChunksErrorError *error);
+extern bool chunks_packs_marking_Packs_highest_vector(const ChunksPacksBackendPacks *self, HostIoIo *io,
+													  uint64 *result, ChunksErrorError *error)
+			STD_REQUIRES(CHUNKS_PACKS_BARRIER_HOLDING);
 extern bool chunks_packs_marking_Packs_end_marking(const ChunksPacksBackendPacks *self, HostIoIo *io,
 												   ChunksErrorError *error);
 extern bool chunks_packs_marking_Packs_hits(const ChunksPacksBackendPacks *self, HostIoIo *io, StdVec *result,

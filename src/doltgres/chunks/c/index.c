@@ -18,8 +18,6 @@
  * The address index (chunks' index.rs): a set of runs, each a file of
  * entries sorted by address in 4 KB blocks, each ending in a checksum of its
  * entries, of which only the first address of each block stays in memory.
- * Its searches and their checks are Verus-proved in the Rust; their C forms
- * are the proved code's statements.
  */
 #ifndef FRONTEND
 #include "postgres.h"

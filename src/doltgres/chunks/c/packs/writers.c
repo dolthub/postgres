@@ -150,7 +150,9 @@ _Alignof(HostLockIoMutexOpen), host_lock_IoMutexOpen_Default_default, chunks_pac
 /*
  * CHUNKS_PACKS_WRITERS_OPEN is OPEN: the process's open packs, one for every
  * Packs the process has, as its slot is; its BackendLocal header and the
- * process's value, which follows it.
+ * process's value, which follows it. Under its lock a section grows the list
+ * only into room it reserved first and builds no error, so nothing there
+ * unwinds and the lock is never poisoned (bugs row 517).
  */
 static struct
 {
@@ -565,6 +567,8 @@ chunks_packs_writers_Writing_open_body_0(void *frame_)
 		StdFmtPiece pieces[] = {STD_FMT_LIT("a process writes packs of two repositories at once")};
 		StdFmtArguments arguments = {pieces, 1, NULL};
 
+		frame->guard_live = false;
+		host_lock_LockedRwLockWriteGuard_drop(&frame->guard);
 		frame->error->tag = CHUNKS_ERROR_ERROR_INVARIANT;
 		std_fmt_format_Checked(&frame->error->u.invariant, &arguments);
 		chunks_packs_writers_Writing_open_pad_0(frame);
@@ -614,6 +618,15 @@ chunks_packs_writers_Writing_open_body_0(void *frame_)
 		}
 	}
 	open = chunks_packs_writers_Writing_open_lock_0(frame);
+	if (!std_vec_try_reserve(&open->numbers, 1, sizeof(entry), _Alignof(std_TupleU64U32_t)))
+	{
+		frame->guard_live = false;
+		host_lock_LockedRwLockWriteGuard_drop(&frame->guard);
+		host = host_Error_out_of_memory();
+		*frame->error = chunks_error_Error_FromError_from(&host);
+		chunks_packs_writers_Writing_open_pad_0(frame);
+		return;
+	}
 	entry.f0 = frame->hold.number;
 	entry.f1 = frame->space;
 	if (chunks_packs_writers_Open_find(open, frame->hold.number, &at))
@@ -711,3 +724,133 @@ chunks_packs_writers_Writing_drop(ChunksPacksWritersWriting *self)
 	}
 	host_local_Local_drop(&local, &CHUNKS_PACKS_WRITERS_OPEN_TYPE);
 }
+
+#ifdef DOLTGRES_TEST_CHUNKS
+#include "doltgres/chunks/packs/fixtures.h"
+#include "doltgres/simc/simc.h"
+#include "doltgres/std/alloc.h"
+#include "doltgres/std/test.h"
+
+/* chunks_packs_writers_tests_oom is the failed-allocation case's hook: a failed allocation panics, as pg's hook unwinds. */
+static void
+chunks_packs_writers_tests_oom(size_t size, size_t align)
+{
+	std_panic(__FILE__, __LINE__, 0, "out of memory", sizeof("out of memory") - 1);
+}
+
+/* CHUNKS_PACKS_WRITERS_TESTS_OOM_HOOK is the failed-allocation case's hook, set while it fails a reallocation. */
+static const StdAllocErrorHook CHUNKS_PACKS_WRITERS_TESTS_OOM_HOOK = {chunks_packs_writers_tests_oom};
+
+/* CHUNKS_PACKS_WRITERS_TESTS_PLACEHOLDER is the least of the placeholder numbers the case fills OPEN's room with. */
+#define CHUNKS_PACKS_WRITERS_TESTS_PLACEHOLDER (PG_UINT64_MAX - 1024)
+
+/* ChunksPacksWritersTestsWriting is the failed-allocation case's writer: its packs, reader, writer, and answer. */
+typedef struct ChunksPacksWritersTestsWriting
+{
+	const ChunksPacksBackendPacks *packs;
+	HostIoIo   *io;
+	const HostSharedReader *reading;
+	ChunksPackPackWriterInDir writer;
+	ChunksErrorError error;
+	bool		ok;
+} ChunksPacksWritersTestsWriting;
+
+/* chunks_packs_writers_tests_writing is the failed-allocation case's call: a writer of the packs started. */
+static void
+chunks_packs_writers_tests_writing(void *captures)
+{
+	ChunksPacksWritersTestsWriting *writing = captures;
+
+	writing->ok = chunks_packs_backend_Packs_writer(writing->packs, writing->io, writing->reading, 0, &writing->writer,
+													&writing->error);
+}
+
+/*
+ * chunks_packs_writers_tests_open takes OPEN's lock and, when filling, fills
+ * its numbers' room with placeholders past every number, else takes the
+ * placeholders out; it returns the least number it holds.
+ */
+static uint64
+chunks_packs_writers_tests_open(HostIoIo *io, bool filling)
+{
+	HostLocalLocal local = host_local_BackendLocal_get(&CHUNKS_PACKS_WRITERS_OPEN.local,
+													   &CHUNKS_PACKS_WRITERS_OPEN_TYPE);
+	HostLockLockedRwLockWriteGuard guard = host_lock_IoMutex_lock((HostLockIoMutex *) host_local_Local_Deref_deref(&local,
+																												   &CHUNKS_PACKS_WRITERS_OPEN_TYPE),
+																  &CHUNKS_PACKS_WRITERS_OPEN_LOCK_TYPE, &io->held);
+	ChunksPacksWritersOpen *open = host_lock_LockedRwLockWriteGuard_DerefMut_deref_mut(&guard);
+	std_TupleU64U32_t placeholder = {CHUNKS_PACKS_WRITERS_TESTS_PLACEHOLDER, 0};
+	uint64		least;
+
+	if (filling)
+		while (open->numbers.len < open->numbers.cap)
+		{
+			std_vec_push_Checked(&open->numbers, &placeholder, sizeof(placeholder), _Alignof(std_TupleU64U32_t));
+			placeholder.f0++;
+		}
+	else
+		while (open->numbers.len != 0 &&
+			   STD_VEC_AT(&open->numbers, std_TupleU64U32_t, open->numbers.len - 1).f0 >=
+			   CHUNKS_PACKS_WRITERS_TESTS_PLACEHOLDER)
+			open->numbers.len--;
+	least = open->numbers.len != 0 ? STD_VEC_AT(&open->numbers, std_TupleU64U32_t, 0).f0 : 0;
+	host_lock_LockedRwLockWriteGuard_drop(&guard);
+	host_local_Local_drop(&local, &CHUNKS_PACKS_WRITERS_OPEN_TYPE);
+	return least;
+}
+
+/*
+ * test_chunks_packs_writers_tests_a_failed_allocation_in_a_writers_number_keeps_the_open_numbers:
+ * with the process's open numbers at their room, a writer whose
+ * reallocations fail in turn either starts or fails out of memory, and either
+ * way the first writer's number is still found under the lock (bugs row 517).
+ * Before, the numbers' growth unwound under the lock, which poisoned it, and
+ * the next take rebuilt them empty.
+ */
+void
+test_chunks_packs_writers_tests_a_failed_allocation_in_a_writers_number_keeps_the_open_numbers(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedReader reading = chunks_packs_tests_reading(RUST_FILE, io, 0, 0);
+	ChunksPacksBackendPacks packs;
+	ChunksPackPackWriterInDir first;
+	ChunksErrorError error;
+	uint64		number;
+	bool		started = false;
+
+	chunks_packs_fixtures_created(io, 43, &packs);
+	first = chunks_packs_tests_writer(RUST_FILE, &packs, io, &reading, 0, 0);
+	number = chunks_packs_writers_tests_open(io, false);
+	for (uint64 nth = 1; !started; nth++)
+	{
+		ChunksPacksWritersTestsWriting writing = {.packs = &packs, .io = io, .reading = &reading};
+		StdCaught	caught;
+		bool		returned;
+		bool		some;
+		uint32		space;
+
+		(void) chunks_packs_writers_tests_open(io, true);
+		std_alloc_set_alloc_error_hook(&CHUNKS_PACKS_WRITERS_TESTS_OOM_HOOK);
+		test_std_alloc_tests_fail_reallocation(nth);
+		returned = std_catch_unwind(chunks_packs_writers_tests_writing, &writing, &caught);
+		test_std_alloc_tests_fail_reallocation(0);
+		std_alloc_set_alloc_error_hook(NULL);
+		if (!returned)
+			std_Caught_drop(&caught);
+		else if (!writing.ok)
+			chunks_error_Error_drop(&writing.error);
+		started = returned && writing.ok;
+		chunks_packs_writers_space_of(HOST_IO_IO_TAKES_SHORT(io), packs.repository, number, &some, &space);
+		STD_ASSERT(__LINE__, 9, some, "the first writer's number outlived a failed start of another");
+		(void) chunks_packs_writers_tests_open(io, false);
+		if (started && !chunks_pack_PackWriterInDir_abandon(&writing.writer, HOST_IO_IO_TAKES_SHORT(io), &error))
+			chunks_packs_tests_unwrapped(RUST_FILE, &error, 0, 0);
+	}
+	if (!chunks_pack_PackWriterInDir_abandon(&first, HOST_IO_IO_TAKES_SHORT(io), &error))
+		chunks_packs_tests_unwrapped(RUST_FILE, &error, 0, 0);
+	chunks_packs_backend_Packs_drop(&packs);
+	host_shared_Reader_drop(&reading);
+	simc_TestIo_drop(&test_io);
+}
+#endif							/* DOLTGRES_TEST_CHUNKS */

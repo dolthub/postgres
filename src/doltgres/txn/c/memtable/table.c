@@ -28,6 +28,7 @@
 #endif
 
 #include "doltgres/host/delta.h"
+#include "doltgres/host/delta/blocks.h"
 #include "doltgres/host/delta/list.h"
 #include "doltgres/host/delta/page.h"
 #include "doltgres/host/shared.h"
@@ -39,6 +40,7 @@
 #include "doltgres/std/tuple.h"
 #include "doltgres/std/unwind.h"
 #include "doltgres/std/vec.h"
+#include "doltgres/txn/outcome.h"
 #include "doltgres/txn/memtable/index.h"
 #include "doltgres/txn/memtable/map.h"
 #include "doltgres/txn/memtable/pins.h"
@@ -335,7 +337,8 @@ txn_memtable_table_Reserve_drop(TxnMemtableTableReserve *self)
 /*
  * txn_memtable_table_Reserve_push makes a version its key's newest in an
  * open range with the reserve, which always has room, and keeps what the
- * push saw of the range for the settle.
+ * push saw of the range for the settle. A version but a lock's that the
+ * reserve's step counts carries the counted mark.
  */
 bool
 txn_memtable_table_Reserve_push(TxnMemtableTableReserve *self, TxnMemtableIndexKeyedOpen *open,
@@ -343,10 +346,29 @@ txn_memtable_table_Reserve_push(TxnMemtableTableReserve *self, TxnMemtableIndexK
 								const uint8 *key, size_t key_len, const TxnMemtableVersionChange *change,
 								TxnMemtableVersionHandle *result, HostError *error)
 {
+	TxnMemtableIndexFound found;
+
+	return txn_memtable_index_lookup(open, hold, key, key_len, &found, error) &&
+		txn_memtable_table_Reserve_push_found(self, open, hold, found, key, key_len, change, result, error);
+}
+
+/*
+ * txn_memtable_table_Reserve_push_found is Reserve_push with the key's lookup
+ * in the same open already made, its Found taken by value as
+ * txn_memtable_version_push_found takes it.
+ */
+bool
+txn_memtable_table_Reserve_push_found(TxnMemtableTableReserve *self, TxnMemtableIndexKeyedOpen *open,
+									  const HostDeltaHold *hold, TxnMemtableIndexFound found, const uint8 *key,
+									  size_t key_len, const TxnMemtableVersionChange *change,
+									  TxnMemtableVersionHandle *result, HostError *error)
+{
 	TxnMemtableVersionPushed pushed;
 	HostSharedRecord record = host_shared_Guard_record(open->open.guard);
 	HostSharedOp load = {.tag = HOST_SHARED_OP_LOAD};
 	HostDeltaListListView pages;
+	bool		counted = self->counting && change->op->tag != TXN_MEMTABLE_OP_LOCK &&
+		change->op->tag != TXN_MEMTABLE_OP_LOCK_ROW;
 
 	if (txn_memtable_version_encoded(&change->writer, change->op, change->shown, change->has_lsn, change->lsn) >
 		self->buffer.cap)
@@ -354,8 +376,8 @@ txn_memtable_table_Reserve_push(TxnMemtableTableReserve *self, TxnMemtableIndexK
 		*error = txn_memtable_table_internal("a prepared version is longer than its prepare's record");
 		return false;
 	}
-	if (!txn_memtable_version_push(open, hold, key, key_len, change,
-								   &self->has_fresh, &self->fresh, &self->spare, &self->buffer, &pushed, error))
+	if (!txn_memtable_version_push_found(open, hold, found, key, key_len, change, counted,
+										 &self->has_fresh, &self->fresh, &self->spare, &self->buffer, &pushed, error))
 		return false;
 	if (pushed.tag != TXN_MEMTABLE_VERSION_PUSHED_VERSION)
 	{
@@ -369,6 +391,7 @@ txn_memtable_table_Reserve_push(TxnMemtableTableReserve *self, TxnMemtableIndexK
 	self->seen.bytes = host_shared_Record_atomic(record, TXN_MEMTABLE_RANGE_RANGE_BYTES, load);
 	self->seen.pages = host_delta_list_ListView_len(&pages);
 	self->seen.longest = (uint64) key_len;
+	self->counted = self->counted || counted;
 	*result = pushed.u.version;
 	return true;
 }
@@ -502,25 +525,23 @@ txn_memtable_table_passed(HostIoTakesShort io, const HostDeltaHold *hold, uint64
 }
 
 /*
- * txn_memtable_table_reached runs a step under the exclusive lock of the
- * open range that now holds a key, from the range a hand-off found: a closed
- * range's replacement words name its halves, stored before closed and read
- * with no lock, of which the key's is picked by the upper's first key, and a
- * closed range with none sends it to a search of the memtable's list; each
- * step takes one lock at a time, opens only what the hold reaches, and
- * allocates nothing.
+ * txn_memtable_table_opened takes the exclusive lock of the open range that
+ * now holds a key, from the range a hand-off found, answering its guard and
+ * its open: a closed range's replacement words name its halves, stored
+ * before closed and read with no lock, of which the key's is picked by the
+ * upper's first key, and a closed range with none sends it to a search of
+ * the memtable's list; each step takes one lock at a time, opens only what
+ * the hold reaches, and allocates nothing. A range one of kept already
+ * holds is answered as shared, its index there, with no lock taken.
  */
 static bool
-txn_memtable_table_reached(HostIoTakesShort io, const HostDeltaHold *hold, TxnMemtableTableAt *at, const uint8 *key,
-						   size_t key_len, bool (*step) (void *captures, TxnMemtableIndexKeyedOpen *open,
-														 HostError *error),
-						   void *captures, HostError *error)
+txn_memtable_table_opened(HostIoTakesShort io, const HostDeltaHold *hold, TxnMemtableTableAt *at, const uint8 *key,
+						  size_t key_len, const TxnMemtableTableKept *kept, size_t kept_len, size_t *shared,
+						  HostSharedGuard *guard, TxnMemtableIndexKeyedOpen *open, HostError *error)
 {
 	for (;;)
 	{
 		HostSharedRecord record;
-		HostSharedGuard guard;
-		TxnMemtableIndexKeyedOpen open;
 		HostSharedPast lower;
 		HostSharedPast upper;
 		uint64		lower_at;
@@ -528,21 +549,19 @@ txn_memtable_table_reached(HostIoTakesShort io, const HostDeltaHold *hold, TxnMe
 		bool		has_lower;
 		bool		has_upper;
 
+		for (*shared = 0; *shared < kept_len; (*shared)++)
+			if (kept[*shared].owns && kept[*shared].range == at->range)
+				return true;
 		if (!host_delta_Hold_record(hold, &TXN_MEMTABLE_RANGE_RANGE_AGED_OPS, at->range, &record, error) ||
-			!host_shared_Record_lock(record, io, TXN_MEMTABLE_RANGE_RANGE_LOCK, &guard, error))
+			!host_shared_Record_lock(record, io, TXN_MEMTABLE_RANGE_RANGE_LOCK, guard, error))
 			return false;
-		if (txn_memtable_index_keyed_open(&TXN_MEMTABLE_RANGE_RANGE_KEYED_OPS, &guard, &open))
-		{
-			bool		ok = step(captures, &open, error);
-
-			host_shared_Guard_drop(&guard);
-			return ok;
-		}
+		if (txn_memtable_index_keyed_open(&TXN_MEMTABLE_RANGE_RANGE_KEYED_OPS, guard, open))
+			return true;
 		lower = host_shared_Record_names_past(record, TXN_MEMTABLE_RANGE_RANGE_LOWER);
 		upper = host_shared_Record_names_past(record, TXN_MEMTABLE_RANGE_RANGE_UPPER);
 		has_lower = host_shared_Past_load(&lower, &lower_at);
 		has_upper = host_shared_Past_load(&upper, &upper_at);
-		host_shared_Guard_drop(&guard);
+		host_shared_Guard_drop(guard);
 		if (has_lower && has_upper)
 		{
 			HostDeltaLent first;
@@ -560,17 +579,73 @@ txn_memtable_table_reached(HostIoTakesShort io, const HostDeltaHold *hold, TxnMe
 	}
 }
 
+/* txn_memtable_table_reached runs a step under the exclusive lock of the open range that now holds a key (opened). */
+static bool
+txn_memtable_table_reached(HostIoTakesShort io, const HostDeltaHold *hold, TxnMemtableTableAt *at, const uint8 *key,
+						   size_t key_len, bool (*step) (void *captures, TxnMemtableIndexKeyedOpen *open,
+														 HostError *error),
+						   void *captures, HostError *error)
+{
+	HostSharedGuard guard;
+	TxnMemtableIndexKeyedOpen open;
+	size_t		shared;
+	bool		ok;
+
+	if (!txn_memtable_table_opened(io, hold, at, key, key_len, NULL, 0, &shared, &guard, &open, error))
+		return false;
+	ok = step(captures, &open, error);
+	host_shared_Guard_drop(&guard);
+	return ok;
+}
+
+static bool txn_memtable_table_deferred(HostIoIo *io, bool *result, HostError *error);
+
+/*
+ * A memtable's first range's page, which holds the first node alone, is the
+ * smallest range page, a quarter of its body words, and that body is one
+ * slot of the smallest class (bugs row 338).
+ */
+StaticAssertDecl(TXN_MEMTABLE_PAGES_FIRST + TXN_MEMTABLE_INDEX_LEAST_WORDS <= TXN_MEMTABLE_PAGES_SMALLEST / 32 &&
+				 TXN_MEMTABLE_PAGES_SMALLEST <= HOST_DELTA_PAGE_SLOT_BYTES,
+				 "a memtable's first page is one slot of the smallest class");
+
+/* txn_memtable_table_first_size returns the size of a memtable's first range's page. */
+static HostDeltaPageSize
+txn_memtable_table_first_size(void)
+{
+	return txn_memtable_pages_size(false, 0, 0, txn_memtable_index_least(NULL, 0).words);
+}
+
 /* txn_memtable_table_prepared_frame_0_t is prepared's state across its pad: the sizes, the hold, the hand-offs, the pages, the targets, and inside's closure, while live. */
 typedef struct txn_memtable_table_prepared_frame_0_t
 {
 	HostIoIo   *io;
+	/* all and all_len are the caller's aims, which groups take in turn. */
+	const TxnMemtableTableAim *all;
+	size_t		all_len;
 	const TxnMemtableTableAim *aims;
 	size_t		aims_len;
+	/* pinned is the count of aims from aims whose trees the try pinned. */
+	size_t		pinned;
+	/* cap is the most aims a group's next try takes, halved by a refusal. */
+	size_t		cap;
 	bool		(*inside) (void *captures, HostIoIo *io, TxnMemtableTablePreparedState *prepared, HostError *error);
 	void	   *inside_captures;
 	void		(*inside_drop) (void *captures);
 	bool	   *has_unstored;
 	TxnMemtableTableReservation *unstored;
+
+	/*
+	 * refused, for a carry's prepare, answers whether the delta's budget
+	 * refused it, with its refusal.
+	 */
+	TxnMemtableTableRefusal *refused;
+
+	/*
+	 * answered is whether a group answered the delta's refusal through
+	 * refused.
+	 */
+	bool		answered;
 	HostError  *error;
 	bool		ok;
 	bool		inside_live;
@@ -587,14 +662,115 @@ typedef struct txn_memtable_table_prepared_frame_0_t
 	bool		targets_live;
 	TxnMemtableTableTarget target;
 	bool		target_live;
+
+	/*
+	 * missing is a Vec<usize> of the aims whose trees a try makes a memtable
+	 * for.
+	 */
+	StdVec		missing;
+	bool		missing_live;
+
+	/*
+	 * firsts is a Vec<FirstFrame>: the records and first page of each
+	 * memtable a try makes, missing's last first, until it is linked.
+	 */
+	StdVec		firsts;
+	bool		firsts_live;
 } txn_memtable_table_prepared_frame_0_t;
 
-/* txn_memtable_table_prepared_unpinned clears the process's pin of each aim's tree. */
+static bool txn_memtable_table_prepared_firsts(txn_memtable_table_prepared_frame_0_t *frame, bool *refused,
+											   HostDeltaFull *full);
+static bool txn_memtable_table_prepared_linked(txn_memtable_table_prepared_frame_0_t *frame, bool *some);
+static void txn_memtable_table_prepared_firsts_drop(txn_memtable_table_prepared_frame_0_t *frame);
+
+/* txn_memtable_table_prepared_unpinned clears the process's pin of each pinned aim's tree. */
 static void
 txn_memtable_table_prepared_unpinned(txn_memtable_table_prepared_frame_0_t *frame)
 {
-	for (size_t k = 0; k < frame->aims_len; k++)
+	for (size_t k = 0; k < frame->pinned; k++)
 		txn_memtable_pins_unpin(&frame->mine, frame->aims[k].tree->pin);
+}
+
+/*
+ * An aim's pages, its version page, a list page for each level, and its
+ * missing memtable's first page, each at most a block, fit the smallest
+ * delta_memory's blocks, 1MB's, so a group always takes its first aim (bugs
+ * row 338).
+ */
+StaticAssertDecl((2 + HOST_DELTA_LIST_DEEPEST) * HOST_DELTA_PAGE_BLOCK <= 1024 * 1024,
+				 "an aim's pages fit the smallest delta_memory");
+
+/*
+ * TXN_MEMTABLE_TABLE_WHOLE aims are one group at every delta_memory: each
+ * aim's version page takes at most a block, the list pages, a list page's
+ * words to a slot, pack into whole blocks, and so do the missing memtables'
+ * first pages, a slot of the smallest class each.
+ */
+StaticAssertDecl(TXN_MEMTABLE_TABLE_WHOLE +
+				 (TXN_MEMTABLE_TABLE_WHOLE * HOST_DELTA_LIST_DEEPEST * HOST_DELTA_LIST_FANOUT * 8 +
+				  HOST_DELTA_PAGE_BLOCK - 1) / HOST_DELTA_PAGE_BLOCK +
+				 (TXN_MEMTABLE_TABLE_WHOLE * HOST_DELTA_PAGE_SLOT_BYTES + HOST_DELTA_PAGE_BLOCK - 1) /
+				 HOST_DELTA_PAGE_BLOCK <= 1024 * 1024 / HOST_DELTA_PAGE_BLOCK,
+				 "a prepare of WHOLE aims is one group at the smallest delta_memory");
+
+/*
+ * txn_memtable_table_prepared_least returns the fewest aims a group takes:
+ * all of a prepare of at most TXN_MEMTABLE_TABLE_WHOLE aims, which never
+ * splits, and one of a larger one, whose inside takes groups.
+ */
+static size_t
+txn_memtable_table_prepared_least(const txn_memtable_table_prepared_frame_0_t *frame)
+{
+	return frame->all_len <= TXN_MEMTABLE_TABLE_WHOLE ? frame->aims_len : 1;
+}
+
+/*
+ * txn_memtable_table_prepared_fitting returns how many of the try's aims,
+ * from its first, its group takes: its least, and then, to its cap, each one
+ * more whose pages, a missing memtable's first page with its aim's, their
+ * slots counted by class into whole blocks with the
+ * group's, fit the budget's blocks no page takes now, so no allocation of a
+ * prepare asks more than an empty budget holds, and a large one asks what the
+ * budget has free (bugs row 338).
+ */
+static size_t
+txn_memtable_table_prepared_fitting(const txn_memtable_table_prepared_frame_0_t *frame, size_t each,
+									HostDeltaPageSize first)
+{
+	size_t		missing = 0;
+	uint64		budgeted = host_delta_budget() / HOST_DELTA_PAGE_BLOCK;
+	uint64		used = host_delta_used() / HOST_DELTA_PAGE_BLOCK;
+	uint64		free = budgeted > used ? budgeted - used : 0;
+	size_t		least = txn_memtable_table_prepared_least(frame);
+	uint64		taken[HOST_DELTA_BLOCKS_CLASSES] = {0};
+
+	for (size_t k = 0; k < frame->aims_len; k++)
+	{
+		uint64		with[HOST_DELTA_BLOCKS_CLASSES];
+		uint64		blocks = 0;
+
+		memcpy(with, taken, sizeof(taken));
+		for (size_t d = 0; d < each; d++)
+		{
+			HostDeltaPageSize size = STD_VEC_AT(&frame->sizes, HostDeltaPageSize, k * each + d);
+			uint32		class = host_delta_blocks_class(host_delta_page_Size_body(size));
+
+			with[class] += HOST_DELTA_PAGE_SLOT_BYTES << class;
+		}
+		if (missing < frame->missing.len && STD_VEC_AT(&frame->missing, size_t, missing) == k)
+		{
+			uint32		class = host_delta_blocks_class(host_delta_page_Size_body(first));
+
+			with[class] += HOST_DELTA_PAGE_SLOT_BYTES << class;
+			missing++;
+		}
+		for (uint32 c = 0; c < HOST_DELTA_BLOCKS_CLASSES; c++)
+			blocks += (with[c] + HOST_DELTA_PAGE_BLOCK - 1) / HOST_DELTA_PAGE_BLOCK;
+		if (k >= least && (blocks > free || k >= frame->cap))
+			return k;
+		memcpy(taken, with, sizeof(taken));
+	}
+	return frame->aims_len;
 }
 
 /* txn_memtable_table_prepared_pages_free drops the pages a try allocated that no target took. */
@@ -610,7 +786,7 @@ txn_memtable_table_prepared_pages_free(txn_memtable_table_prepared_frame_0_t *fr
 	}
 }
 
-/* txn_memtable_table_prepared_pad_0 is prepared's pad: the targets, the pages, the hold, the hand-offs, the sizes, and inside's closure, while live. */
+/* txn_memtable_table_prepared_pad_0 is prepared's pad: the targets, the memtables unlinked, the pages, the hold, the hand-offs, the sizes, and inside's closure, while live. */
 static void
 txn_memtable_table_prepared_pad_0(void *frame_)
 {
@@ -628,6 +804,7 @@ txn_memtable_table_prepared_pad_0(void *frame_)
 		std_vec_free_Checked(&frame->prepared.targets, sizeof(TxnMemtableTableTarget),
 							 _Alignof(TxnMemtableTableTarget));
 	}
+	txn_memtable_table_prepared_firsts_drop(frame);
 	txn_memtable_table_prepared_pages_free(frame);
 	if (frame->hold_live)
 	{
@@ -644,6 +821,11 @@ txn_memtable_table_prepared_pad_0(void *frame_)
 		frame->sizes_live = false;
 		std_vec_free_Checked(&frame->sizes, sizeof(HostDeltaPageSize), _Alignof(HostDeltaPageSize));
 	}
+	if (frame->missing_live)
+	{
+		frame->missing_live = false;
+		std_vec_free_Checked(&frame->missing, sizeof(size_t), _Alignof(size_t));
+	}
 	if (frame->inside_live)
 	{
 		frame->inside_live = false;
@@ -653,22 +835,38 @@ txn_memtable_table_prepared_pad_0(void *frame_)
 }
 
 /*
- * txn_memtable_table_prepared_try is one try of prepared's: it makes each
- * memtable a tree lacks, begins the hold, hands each push off, and takes
- * every push's reserve, answering false on an error and setting ready once
- * the frame holds the targets.
+ * txn_memtable_table_prepared_try is one try of prepared's: it begins the
+ * hold, which a readied prepare keeps; hands each push to a tree with a
+ * memtable off to its key's range, pinning its memtable; takes the reserves
+ * of the pushes that fit the budget, and the first page of each of their
+ * memtables a tree lacks, in one allocation; then takes the records of every one of those memtables before
+ * it makes any, and then makes each on its page as its first writer and
+ * hands its push off. A refused try takes nothing, the refusal of any one
+ * memtable's records included, so a refused writer leaves no memtable for a
+ * walk to close and free. It answers
+ * false on an error, sets ready once the frame holds the targets, and sets
+ * refused, with the delta's refusal, when the delta refused the pages of a
+ * group's least or a memtable's records, the try's pins given back.
  */
 static bool
-txn_memtable_table_prepared_try(txn_memtable_table_prepared_frame_0_t *frame, bool *ready)
+txn_memtable_table_prepared_try(txn_memtable_table_prepared_frame_0_t *frame, bool *ready, bool *refused,
+								HostDeltaFull *full)
 {
 	size_t		each = 1 + HOST_DELTA_LIST_DEEPEST;
+	size_t		sized = std_wrapping_mul_usize(frame->aims_len, each);
+	HostDeltaPageSize first = txn_memtable_table_first_size();
+	HostDeltaPageSize list_page = HOST_DELTA_LIST_PAGE;
 	bool		allocated;
-	HostDeltaFull full;
+	size_t		kept = 0;
 
 	*ready = false;
-	for (size_t k = 0; k < frame->aims_len; k++)
-		if (!txn_memtable_table_first(frame->aims[k].tree, frame->io, frame->aims[k].owner, frame->error))
-			return false;
+	*refused = false;
+	frame->pinned = frame->aims_len;
+	frame->sizes.len = sized;
+	if (frame->missing_live)
+		std_vec_free_Checked(&frame->missing, sizeof(size_t), _Alignof(size_t));
+	std_vec_new(&frame->missing, sizeof(size_t), _Alignof(size_t));
+	frame->missing_live = true;
 	if (!host_delta_hold(frame->io, &frame->prepared.hold, frame->error))
 		return false;
 	frame->hold_live = true;
@@ -682,43 +880,91 @@ txn_memtable_table_prepared_try(txn_memtable_table_prepared_frame_0_t *frame, bo
 	for (size_t k = 0; k < frame->aims_len; k++)
 	{
 		const TxnMemtableTableAim *aim = &frame->aims[k];
-		bool		some;
-		TxnMemtableTableAt at;
+		TxnMemtableTableAt at = {0};
+		uint64		location;
+		uint64		newest = first.words;
 
-		if (!txn_memtable_table_handed(aim->tree, frame->io, &frame->prepared.hold, &frame->mine, aim->owner,
-									   aim->key.ptr, aim->key.len, &some, &at, frame->error))
+		if (!txn_memtable_table_memtable(aim->tree, aim->owner, &location))
+		{
+			if (!std_vec_try_reserve(&frame->missing, 1, sizeof(size_t), _Alignof(size_t)) ||
+				!std_vec_try_reserve(&frame->sizes, 1, sizeof(HostDeltaPageSize), _Alignof(HostDeltaPageSize)))
+			{
+				*frame->error = host_Error_out_of_memory();
+				return false;
+			}
+			std_vec_push_Checked(&frame->missing, &k, sizeof(size_t), _Alignof(size_t));
+			std_vec_push_Checked(&frame->sizes, &first, sizeof(first), _Alignof(HostDeltaPageSize));
+		}
+		else
+		{
+			HostSharedRecord range;
+			HostSharedOp load = {.tag = HOST_SHARED_OP_LOAD};
+			bool		some;
+
+			if (!txn_memtable_table_handed(aim->tree, frame->io, &frame->prepared.hold, &frame->mine, aim->owner,
+										   aim->key.ptr, aim->key.len, &some, &at, frame->error))
+				return false;
+			if (!some)
+			{
+				txn_memtable_table_prepared_unpinned(frame);
+				return true;
+			}
+			if (!host_delta_Hold_record(&frame->prepared.hold, &TXN_MEMTABLE_RANGE_RANGE_AGED_OPS, at.range, &range,
+										frame->error))
+				return false;
+			newest = host_shared_Record_atomic(range, TXN_MEMTABLE_RANGE_RANGE_NEWEST, load);
+		}
+		std_vec_push_Checked(&frame->ats, &at, sizeof(at), _Alignof(TxnMemtableTableAt));
+		STD_VEC_AT(&frame->sizes, HostDeltaPageSize, std_wrapping_mul_usize(k, each)) =
+			txn_memtable_version_reserve(newest, aim->key.len, aim->need);
+		for (size_t d = 1; d < each; d++)
+			STD_VEC_AT(&frame->sizes, HostDeltaPageSize, std_wrapping_mul_usize(k, each) + d) = list_page;
+	}
+	frame->aims_len = txn_memtable_table_prepared_fitting(frame, each, first);
+	for (size_t i = 0; i < frame->missing.len; i++)
+		if (STD_VEC_AT(&frame->missing, size_t, i) < frame->aims_len)
+			STD_VEC_AT(&frame->missing, size_t, kept++) = STD_VEC_AT(&frame->missing, size_t, i);
+	frame->missing.len = kept;
+	for (size_t i = 0; i < kept; i++)
+		STD_VEC_AT(&frame->sizes, HostDeltaPageSize, std_wrapping_mul_usize(frame->aims_len, each) + i) = first;
+	frame->sizes.len = std_wrapping_mul_usize(frame->aims_len, each) + kept;
+	frame->ats.len = frame->aims_len;
+	if (!host_delta_alloc(frame->io, frame->sizes.ptr, frame->sizes.len, &allocated, &frame->pages, full,
+						  frame->error))
+		return false;
+	if (!allocated)
+	{
+		size_t		least = txn_memtable_table_prepared_least(frame);
+
+		txn_memtable_table_prepared_unpinned(frame);
+		if (frame->aims_len > least)
+			frame->cap = Max(frame->aims_len / 2, least);
+		else
+			*refused = true;
+		return true;
+	}
+	frame->pages_live = true;
+	frame->pages_at = 0;
+	if (!txn_memtable_table_prepared_firsts(frame, refused, full))
+		return false;
+	if (*refused)
+	{
+		txn_memtable_table_prepared_unpinned(frame);
+		return true;
+	}
+	{
+		bool		some;
+
+		if (!txn_memtable_table_prepared_linked(frame, &some))
 			return false;
 		if (!some)
 		{
 			txn_memtable_table_prepared_unpinned(frame);
 			return true;
 		}
-		std_vec_push_Checked(&frame->ats, &at, sizeof(at), _Alignof(TxnMemtableTableAt));
 	}
-	for (size_t k = 0; k < frame->aims_len; k++)
-	{
-		HostSharedRecord range;
-		HostSharedOp load = {.tag = HOST_SHARED_OP_LOAD};
-
-		if (!host_delta_Hold_record(&frame->prepared.hold, &TXN_MEMTABLE_RANGE_RANGE_AGED_OPS,
-									STD_VEC_AT(&frame->ats, TxnMemtableTableAt, k).range, &range, frame->error))
-			return false;
-		STD_VEC_AT(&frame->sizes, HostDeltaPageSize, std_wrapping_mul_usize(k, each)) =
-			txn_memtable_version_reserve(host_shared_Record_atomic(range, TXN_MEMTABLE_RANGE_RANGE_NEWEST, load),
-										 frame->aims[k].key.len, frame->aims[k].need);
-	}
-	if (!host_delta_alloc(frame->io, frame->sizes.ptr, frame->sizes.len, &allocated, &frame->pages, &full,
-						  frame->error))
-		return false;
-	if (!allocated)
-	{
-		txn_memtable_table_prepared_unpinned(frame);
-		frame->hold_live = false;
-		host_delta_Hold_drop(&frame->prepared.hold);
-		return txn_memtable_table_waited(frame->io, full, false, frame->error);
-	}
-	frame->pages_live = true;
-	frame->pages_at = 0;
+	frame->missing_live = false;
+	std_vec_free_Checked(&frame->missing, sizeof(size_t), _Alignof(size_t));
 	std_vec_new(&frame->prepared.targets, sizeof(TxnMemtableTableTarget), _Alignof(TxnMemtableTableTarget));
 	frame->targets_live = true;
 	if (!std_vec_try_reserve(&frame->prepared.targets, frame->aims_len, sizeof(TxnMemtableTableTarget),
@@ -768,48 +1014,39 @@ txn_memtable_table_prepared_try(txn_memtable_table_prepared_frame_0_t *frame, bo
 	return true;
 }
 
-/* txn_memtable_table_prepared_body_0 is prepared's body. */
-static void
-txn_memtable_table_prepared_body_0(void *frame_)
+/*
+ * txn_memtable_table_prepared_group readies the aims from start that fit an
+ * empty budget, as many as its try keeps, runs inside with them, and settles
+ * them, answering false on an error, or ends at a refusal it answered.
+ */
+static bool
+txn_memtable_table_prepared_group(txn_memtable_table_prepared_frame_0_t *frame, size_t start)
 {
-	txn_memtable_table_prepared_frame_0_t *frame = frame_;
 	size_t		each = 1 + HOST_DELTA_LIST_DEEPEST;
 	bool		ready = false;
 	bool		ok;
-	HostDeltaPageSize list_page = HOST_DELTA_LIST_PAGE;
+	bool		refused;
+	HostDeltaFull full;
 
-	if (!host_shared_mine(HOST_IO_IO_TAKES_SHORT(frame->io), &TXN_MEMTABLE_PINS_PINS_PROC_SLOTS_OPS, &frame->mine,
-						  frame->error))
-	{
-		txn_memtable_table_prepared_pad_0(frame);
-		return;
-	}
-	std_vec_new(&frame->sizes, sizeof(HostDeltaPageSize), _Alignof(HostDeltaPageSize));
-	frame->sizes_live = true;
+	frame->aims = frame->all + start;
+	frame->aims_len = frame->all_len - start;
+	frame->cap = frame->aims_len;
+	frame->sizes.len = 0;
 	if (!std_vec_try_reserve(&frame->sizes, STD_MUL(usize, frame->aims_len, each, 454, 23),
 							 sizeof(HostDeltaPageSize), _Alignof(HostDeltaPageSize)))
 	{
 		*frame->error = host_Error_out_of_memory();
-		txn_memtable_table_prepared_pad_0(frame);
-		return;
-	}
-	for (size_t k = 0; k < frame->aims_len; k++)
-	{
-		HostDeltaPageSize size = txn_memtable_version_reserve(0, frame->aims[k].key.len, frame->aims[k].need);
-
-		std_vec_push_Checked(&frame->sizes, &size, sizeof(size), _Alignof(HostDeltaPageSize));
-		for (size_t d = 0; d < HOST_DELTA_LIST_DEEPEST; d++)
-			std_vec_push_Checked(&frame->sizes, &list_page, sizeof(list_page), _Alignof(HostDeltaPageSize));
+		return false;
 	}
 	while (!ready)
 	{
-		if (!txn_memtable_table_prepared_try(frame, &ready))
-		{
-			txn_memtable_table_prepared_pad_0(frame);
-			return;
-		}
+		frame->aims_len = frame->all_len - start;
+		if (!txn_memtable_table_prepared_try(frame, &ready, &refused, &full))
+			return false;
 		if (!ready)
 		{
+			bool		answered;
+
 			txn_memtable_table_prepared_pages_free(frame);
 			if (frame->ats_live)
 			{
@@ -821,16 +1058,34 @@ txn_memtable_table_prepared_body_0(void *frame_)
 				frame->hold_live = false;
 				host_delta_Hold_drop(&frame->prepared.hold);
 			}
+			if (refused && frame->refused == NULL && frame->prepared.has_tuple)
+			{
+				if (!txn_memtable_tuples_given(frame->io, frame->all[0].owner, frame->error) ||
+					!host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-tuple-given", frame->error) ||
+					!txn_memtable_table_waited(frame->io, full, false, frame->error) ||
+					!txn_memtable_tuples_reserve(frame->io, frame->all[0].owner, frame->all[0].key.ptr,
+												 frame->all[0].key.len, &frame->prepared.tuple, NULL, frame->error))
+					return false;
+				continue;
+			}
+			if (refused && !txn_memtable_table_refused(frame->io, full, frame->refused, &answered, frame->error))
+				return false;
+			if (refused && answered)
+			{
+				frame->answered = true;
+				return true;
+			}
 		}
 	}
 	frame->prepared.aims = frame->aims;
 	frame->prepared.aims_len = frame->aims_len;
+	frame->prepared.first = start;
 	ok = host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-memtable-prepared", frame->error);
-	frame->inside_live = false;
 	if (ok)
+	{
+		frame->inside_live = false;
 		ok = frame->inside(frame->inside_captures, frame->io, &frame->prepared, frame->error);
-	else if (frame->inside_drop != NULL)
-		frame->inside_drop(frame->inside_captures);
+	}
 	txn_memtable_table_prepared_unpinned(frame);
 	frame->hold_live = false;
 	host_delta_Hold_drop(&frame->prepared.hold);
@@ -846,21 +1101,62 @@ txn_memtable_table_prepared_body_0(void *frame_)
 		std_vec_clear(&reserve->spare, sizeof(HostDeltaOwned), host_delta_Owned_drop);
 	}
 	if (!ok || !host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-memtable-unpinned", frame->error))
-	{
-		txn_memtable_table_prepared_pad_0(frame);
-		return;
-	}
+		return false;
 	for (size_t k = 0, k_len = frame->prepared.targets.len; k < k_len; k++)
 	{
 		const TxnMemtableTableTarget *target = &STD_VEC_AT(&frame->prepared.targets, TxnMemtableTableTarget, k);
 
 		if (!txn_memtable_table_settled(target->tree, frame->io, frame->aims[k].owner, target->at,
 										target->reserve.has_seen, &target->reserve.seen, frame->error))
+			return false;
+	}
+	frame->targets_live = false;
+	std_vec_clear(&frame->prepared.targets, sizeof(TxnMemtableTableTarget), txn_memtable_table_Target_drop);
+	std_vec_free_Checked(&frame->prepared.targets, sizeof(TxnMemtableTableTarget), _Alignof(TxnMemtableTableTarget));
+	return true;
+}
+
+/*
+ * txn_memtable_table_prepared_body_0 is prepared's body: its groups in turn,
+ * each the aims after the last group that an empty budget can give (bugs row
+ * 338).
+ */
+static void
+txn_memtable_table_prepared_body_0(void *frame_)
+{
+	txn_memtable_table_prepared_frame_0_t *frame = frame_;
+	size_t		start = 0;
+
+	if (!host_shared_mine(HOST_IO_IO_TAKES_SHORT(frame->io), &TXN_MEMTABLE_PINS_PINS_PROC_SLOTS_OPS, &frame->mine,
+						  frame->error))
+	{
+		txn_memtable_table_prepared_pad_0(frame);
+		return;
+	}
+	std_vec_new(&frame->sizes, sizeof(HostDeltaPageSize), _Alignof(HostDeltaPageSize));
+	frame->sizes_live = true;
+	do
+	{
+		if (!txn_memtable_table_prepared_group(frame, start))
 		{
+			if (frame->inside_live && frame->inside_drop != NULL)
+			{
+				frame->inside_live = false;
+				frame->inside_drop(frame->inside_captures);
+			}
 			txn_memtable_table_prepared_pad_0(frame);
 			return;
 		}
-	}
+		if (frame->answered)
+		{
+			Assert(start == 0);
+			*frame->has_unstored = false;
+			frame->ok = true;
+			txn_memtable_table_prepared_pad_0(frame);
+			return;
+		}
+		start += frame->aims_len;
+	} while (start < frame->all_len);
 	*frame->has_unstored = frame->prepared.has_tuple;
 	if (frame->prepared.has_tuple)
 		*frame->unstored = frame->prepared.tuple;
@@ -872,16 +1168,24 @@ txn_memtable_table_prepared_body_0(void *frame_)
  * txn_memtable_table_prepared readies pushes to its owners' trees before a
  * checkpoint window and runs the window's work with them, taking inside's
  * closure, whose captures carry its result and what the caller hands it.
- * Each try makes the memtable a tree lacks as its first writer, with no
- * hold; begins the hold, which it keeps; hands each push off to its key's
- * range, pinning its memtable; and then takes every push's reserve in one
- * allocation, going around when a hand-off or the allocation can't. It then
- * runs inside, whose finishes allocate nothing, and settles: it clears its
- * pins, gives back what the finishes left of the reserves, and, unless
- * inside failed, splits each range a finish left past SPLIT keys and closes
- * each memtable a prepare made or pinned that no finish reached. It answers
- * the tuple id table's reservation the prepare was given, if no finish
- * stored it.
+ * Each try hands each push off to its key's range, pinning its memtable, and
+ * takes in one allocation the reserves of the pushes from the group's first
+ * that an empty budget can give, with the records and first page of each
+ * memtable the group's trees lack, which it takes before it links any, going
+ * around when a hand-off or the allocation can't and meeting the delta
+ * budget's refusal as refused says, a writer giving back the tuple id
+ * table's reservation while it waits and reserving again after, so its wait
+ * keeps nothing a packing would move, the pause doltgres-tuple-given coming
+ * between the give-back and the wait (bugs row 143). It then runs inside with
+ * that group, whose finishes allocate nothing, and settles, group after
+ * group, so no allocation asks more than the budget holds (bugs row 338); a
+ * prepare of at most TXN_MEMTABLE_TABLE_WHOLE pushes is one group, and a
+ * refused group of more than its least tries again with half as many. A
+ * group's settle clears its pins, gives back what the finishes left of the
+ * reserves, and, unless inside failed, splits each range a finish left past
+ * SPLIT keys and closes each memtable a prepare made or pinned that no finish
+ * reached. It answers the tuple id table's reservation the prepare was given,
+ * if no finish stored it.
  */
 bool
 txn_memtable_table_prepared(HostIoIo *io, const TxnMemtableTableAim *aims, size_t aims_len, bool has_tuple,
@@ -889,14 +1193,44 @@ txn_memtable_table_prepared(HostIoIo *io, const TxnMemtableTableAim *aims, size_
 							bool (*inside) (void *captures, HostIoIo *io, TxnMemtableTablePreparedState *prepared,
 											HostError *error),
 							void *inside_captures, void (*inside_drop) (void *captures), bool *has_unstored,
-							TxnMemtableTableReservation *unstored, HostError *error)
+							TxnMemtableTableReservation *unstored, TxnMemtableTableRefusal *refused, HostError *error)
 {
-	txn_memtable_table_prepared_frame_0_t frame = {.io = io, .aims = aims, .aims_len = aims_len, .inside = inside,
+	txn_memtable_table_prepared_frame_0_t frame = {.io = io, .all = aims, .all_len = aims_len, .inside = inside,
 		.inside_captures = inside_captures, .inside_drop = inside_drop, .has_unstored = has_unstored,
-	.unstored = unstored, .error = error, .inside_live = true, .prepared = {.has_tuple = has_tuple, .tuple = tuple}};
+		.unstored = unstored, .refused = refused, .error = error, .inside_live = true,
+	.prepared = {.has_tuple = has_tuple, .tuple = tuple}};
 
+	if (refused != NULL)
+		refused->refused = false;
 	std_landing(&frame, txn_memtable_table_prepared_body_0, txn_memtable_table_prepared_pad_0);
 	return frame.ok;
+}
+
+/*
+ * txn_memtable_table_refused meets the delta budget's refusal of a prepare:
+ * a writer's, whose refused is NULL, waits for a free and tries again; a
+ * rewrite's carry's tries again after a deferred compaction or a spill freed
+ * the budget, and otherwise answers the refusal through refused, having
+ * taken nothing, so its caller, which holds the catalog, folds the new
+ * storage first. It answers whether it answered the refusal.
+ */
+bool
+txn_memtable_table_refused(HostIoIo *io, HostDeltaFull full, TxnMemtableTableRefusal *refused, bool *result,
+						   HostError *error)
+{
+	bool		freed;
+
+	*result = false;
+	if (refused == NULL)
+		return txn_memtable_table_waited(io, full, false, error);
+	if (!txn_memtable_table_deferred(io, &freed, error))
+		return false;
+	if (!freed && !txn_spill_relieved(io, &freed, error))
+		return false;
+	refused->refused = !freed;
+	refused->full = full;
+	*result = !freed;
+	return true;
 }
 
 /* txn_memtable_table_within_t is within's step's captures: the caller's step and its captures, the hold, the key, and the reserve. */
@@ -921,14 +1255,101 @@ txn_memtable_table_within_step(void *captures, TxnMemtableIndexKeyedOpen *open, 
 }
 
 /*
+ * txn_memtable_table_kept takes and keeps the exclusive locks of the open
+ * ranges that hold prepared aims' keys, aims of one map, before its caller's
+ * window, so no removal or other take moves their chains until unkept, as
+ * heap holds its buffers' locks across its critical section; every finish of
+ * those keys runs on them meanwhile (bugs rows 342 and 432). It locks in the
+ * keys' order, so a range is locked only after every lower one its keeper
+ * holds and two keepers never wait on each other, and two keys in one range
+ * share its lock.
+ */
+bool
+txn_memtable_table_kept(HostIoTakesShort io, TxnMemtableTablePreparedState *prepared, const size_t *indices,
+						size_t len, HostError *error)
+{
+	size_t		order[TXN_MEMTABLE_TABLE_KEPT_MOST];
+
+	for (size_t i = 0; i < len; i++)
+	{
+		size_t		at = i;
+
+		for (; at > 0; at--)
+		{
+			const StdBytes *key = &prepared->aims[indices[i]].key;
+			const StdBytes *before = &prepared->aims[order[at - 1]].key;
+
+			if (std_bytes_Ord_cmp(before->ptr, before->len, key->ptr, key->len) != STD_ORDERING_GREATER)
+				break;
+			order[at] = order[at - 1];
+		}
+		order[at] = indices[i];
+	}
+	for (size_t i = 0; i < len; i++)
+	{
+		TxnMemtableTableTarget *target = &STD_VEC_AT(&prepared->targets, TxnMemtableTableTarget, order[i]);
+		TxnMemtableTableKept *kept = &prepared->kept[prepared->kept_len];
+		size_t		shared;
+
+		if (!txn_memtable_table_opened(io, &prepared->hold, &target->at, prepared->aims[order[i]].key.ptr,
+									   prepared->aims[order[i]].key.len, prepared->kept, prepared->kept_len, &shared,
+									   &kept->guard, &kept->open, error))
+			return false;
+		kept->aim = order[i];
+		kept->range = target->at.range;
+		kept->owns = shared == prepared->kept_len;
+		if (!kept->owns)
+			kept->open = prepared->kept[shared].open;
+		prepared->kept_len++;
+	}
+	return true;
+}
+
+/* txn_memtable_table_unkept releases the ranges kept keeps, the last locked first. */
+void
+txn_memtable_table_unkept(TxnMemtableTablePreparedState *prepared)
+{
+	while (prepared->kept_len > 0)
+	{
+		TxnMemtableTableKept *kept = &prepared->kept[--prepared->kept_len];
+
+		if (kept->owns)
+			host_shared_Guard_drop(&kept->guard);
+	}
+}
+
+/* txn_memtable_table_keeps returns the kept aim whose key is a prepared aim's, or NULL when kept keeps none. */
+TxnMemtableTableKept *
+txn_memtable_table_keeps(TxnMemtableTablePreparedState *prepared, size_t index)
+{
+	const TxnMemtableTableAim *aim = &prepared->aims[index];
+
+	for (size_t k = 0; k < prepared->kept_len; k++)
+	{
+		const TxnMemtableTableAim *held = &prepared->aims[prepared->kept[k].aim];
+
+		if (held->tree == aim->tree && held->owner.place == aim->owner.place &&
+			std_bytes_Ord_cmp(held->key.ptr, held->key.len, aim->key.ptr, aim->key.len) == STD_ORDERING_EQUAL)
+			return &prepared->kept[k];
+	}
+	return NULL;
+}
+
+/*
  * txn_memtable_table_within runs a step of a finish inside the window on a
  * prepared target: it follows the target's range to the open range that
  * holds its key now and runs the step there, under that range's exclusive
  * lock, with the prepare's hold, the target's key, and its reserve, then
- * marks a push the target made, which a key lock's view keeps.
+ * marks a push the target made, which a key lock's view keeps. In a tree
+ * that counts, a writer with a room counts its version: one is added at the
+ * room's entry before the step and taken back after it, a failed step's
+ * included, unless the step pushed a version it marked counted, so the count
+ * never falls below the versions that name the entry, and a step that pushed
+ * none leaves it as it was.
  */
 bool
 txn_memtable_table_within(HostIoTakesShort io, TxnMemtableTablePreparedState *prepared, size_t index,
+						  bool has_roomed, TxnStatusRoomed roomed,
 						  bool (*step) (void *captures, TxnMemtableIndexKeyedOpen *open, const HostDeltaHold *hold,
 										const uint8 *key, size_t key_len, TxnMemtableTableReserve *reserve,
 										HostError *error),
@@ -936,8 +1357,11 @@ txn_memtable_table_within(HostIoTakesShort io, TxnMemtableTablePreparedState *pr
 {
 	TxnMemtableTableTarget *target;
 	txn_memtable_table_within_t within;
+	TxnMemtableTableKept *kept;
 	bool		ok;
 	uint64		grown;
+	bool		counting;
+	HostError	given;
 
 	if (index >= prepared->aims_len || index >= prepared->targets.len)
 	{
@@ -949,8 +1373,25 @@ txn_memtable_table_within(HostIoTakesShort io, TxnMemtableTablePreparedState *pr
 	{
 		step, captures, &prepared->hold, &prepared->aims[index], &target->reserve
 	};
-	ok = txn_memtable_table_reached(io, &prepared->hold, &target->at, prepared->aims[index].key.ptr,
-									prepared->aims[index].key.len, txn_memtable_table_within_step, &within, error);
+	counting = has_roomed && prepared->aims[index].tree->counted;
+	target->reserve.counting = counting;
+	target->reserve.counted = false;
+	if (counting && !txn_status_counted(io, &prepared->hold, roomed, 1, error))
+		return false;
+	kept = txn_memtable_table_keeps(prepared, index);
+	if (kept != NULL)
+		ok = txn_memtable_table_within_step(&within, &kept->open, error);
+	else
+		ok = txn_memtable_table_reached(io, &prepared->hold, &target->at, prepared->aims[index].key.ptr,
+										prepared->aims[index].key.len, txn_memtable_table_within_step, &within,
+										error);
+	if (counting && !target->reserve.counted)
+	{
+		if (ok)
+			ok = txn_status_counted(io, &prepared->hold, roomed, PG_UINT64_MAX, error);
+		else if (!txn_status_counted(io, &prepared->hold, roomed, PG_UINT64_MAX, &given))
+			host_Error_drop(&given);
+	}
 	if (target->reserve.has_seen)
 		host_pushed(io);
 	grown = target->reserve.grown;
@@ -992,6 +1433,12 @@ typedef struct txn_memtable_table_readied_frame_0_t
 	bool		(*inside) (void *captures, HostIoIo *io, TxnMemtableTablePreparedState *prepared, HostError *error);
 	void	   *inside_captures;
 	void		(*inside_drop) (void *captures);
+
+	/*
+	 * refused, for a carry's prepare, answers whether the delta's budget
+	 * refused it, with its refusal.
+	 */
+	TxnMemtableTableRefusal *refused;
 	HostError  *error;
 	bool		ok;
 	bool		inside_live;
@@ -1087,8 +1534,18 @@ txn_memtable_table_readied_body_0(void *frame_)
 	if (frame->tuple && row_count > 0)
 	{
 		if (!txn_memtable_tuples_reserve(frame->io, frame->state, frame->rows[0].f0.ptr, frame->rows[0].f0.len,
-										 &reservation, frame->error) ||
-			!host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-tuple-reserved", frame->error))
+										 &reservation, frame->refused, frame->error))
+		{
+			txn_memtable_table_readied_pad_0(frame);
+			return;
+		}
+		if (frame->refused != NULL && frame->refused->refused)
+		{
+			frame->ok = true;
+			txn_memtable_table_readied_pad_0(frame);
+			return;
+		}
+		if (!host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-tuple-reserved", frame->error))
 		{
 			txn_memtable_table_readied_pad_0(frame);
 			return;
@@ -1098,12 +1555,14 @@ txn_memtable_table_readied_body_0(void *frame_)
 	frame->inside_live = false;
 	if (!txn_memtable_table_prepared(frame->io, frame->aims.ptr, frame->aims.len, has_tuple, reservation,
 									 frame->inside, frame->inside_captures, frame->inside_drop, &has_unstored,
-									 &unstored, frame->error))
+									 &unstored, frame->refused, frame->error))
 	{
 		txn_memtable_table_readied_pad_0(frame);
 		return;
 	}
 	txn_memtable_table_readied_pad_0(frame);
+	if (frame->refused != NULL && frame->refused->refused)
+		has_unstored = has_tuple;
 	frame->ok = !has_unstored || row_count == 0 || txn_memtable_tuples_given(frame->io, frame->state, frame->error);
 }
 
@@ -1112,18 +1571,22 @@ txn_memtable_table_readied_body_0(void *frame_)
  * prepare of map takes alone, and map takes, each in the storage its take
  * names, as prepare and map's prepare do, with the first row's tuple id slot
  * when tuple is set, taking inside's closure, whose captures carry its
- * result and what the caller hands it.
+ * result and what the caller hands it, and meeting the delta budget's
+ * refusal as refused says (refused): a carry's refused prepare gives back
+ * the slot it reserved.
  */
 bool
 txn_memtable_table_readied(HostIoIo *io, bool has_rows, HostSharedRecord state, const txn_TupleRefSliceU8Usize_t *rows,
 						   size_t rows_len, const TxnMemtableMapTake *takes, size_t takes_len, bool tuple,
 						   bool (*inside) (void *captures, HostIoIo *io, TxnMemtableTablePreparedState *prepared,
 										   HostError *error),
-						   void *inside_captures, void (*inside_drop) (void *captures), HostError *error)
+						   void *inside_captures, void (*inside_drop) (void *captures),
+						   TxnMemtableTableRefusal *refused, HostError *error)
 {
 	txn_memtable_table_readied_frame_0_t frame = {.io = io, .has_rows = has_rows, .state = state, .rows = rows,
 		.rows_len = rows_len, .takes = takes, .takes_len = takes_len, .tuple = tuple, .inside = inside,
-	.inside_captures = inside_captures, .inside_drop = inside_drop, .error = error, .inside_live = true};
+		.inside_captures = inside_captures, .inside_drop = inside_drop, .refused = refused, .error = error,
+	.inside_live = true};
 
 	std_landing(&frame, txn_memtable_table_readied_body_0, txn_memtable_table_readied_pad_0);
 	return frame.ok;
@@ -1149,22 +1612,20 @@ txn_memtable_table_pushed_step(void *captures, TxnMemtableIndexKeyedOpen *open, 
 	return txn_memtable_table_Reserve_push(reserve, open, hold, key, key_len, pushed->change, pushed->result, error);
 }
 
-/* txn_memtable_table_pushed pushes a prepared target's version inside the window with its reserve, allocating nothing. */
+/*
+ * txn_memtable_table_pushed pushes a prepared target's version inside the
+ * window with its reserve, allocating nothing, and counts it at its writer's
+ * entry when it names one.
+ */
 bool
 txn_memtable_table_pushed(HostIoTakesShort io, TxnMemtableTablePreparedState *prepared, size_t index,
-						  const TxnMemtableVersionChange *change, TxnMemtableVersionHandle *result, HostError *error)
+						  const TxnMemtableVersionChange *change, bool has_roomed, TxnStatusRoomed roomed,
+						  TxnMemtableVersionHandle *result, HostError *error)
 {
 	txn_memtable_table_pushed_t pushed = {.change = change, .result = result};
 
-	return txn_memtable_table_within(io, prepared, index, txn_memtable_table_pushed_step, &pushed, error);
-}
-
-/* txn_memtable_table_counted_at counts a pushed version at its writer's entry when it names one. */
-static bool
-txn_memtable_table_counted_at(HostIoTakesShort io, const TxnMemtableTablePreparedState *prepared, bool has_roomed,
-							  TxnStatusRoomed roomed, HostError *error)
-{
-	return !has_roomed || txn_status_counted(io, &prepared->hold, roomed, error);
+	return txn_memtable_table_within(io, prepared, index, has_roomed, roomed, txn_memtable_table_pushed_step, &pushed,
+									 error);
 }
 
 /*
@@ -1207,8 +1668,8 @@ txn_memtable_table_finish_speculative(HostIoTakesShort io, TxnMemtableTablePrepa
 {
 	txn_memtable_table_pushed_t pushed = {.change = change, .result = result, .token = token};
 
-	return txn_memtable_table_within(io, prepared, 0, txn_memtable_table_speculated_step, &pushed, error) &&
-		txn_memtable_table_counted_at(io, prepared, has_roomed, roomed, error);
+	return txn_memtable_table_within(io, prepared, 0, has_roomed, roomed, txn_memtable_table_speculated_step, &pushed,
+									 error);
 }
 
 /* txn_memtable_table_rowed refuses a row index past the prepare's rows with an error of its text. */
@@ -1252,8 +1713,8 @@ txn_memtable_table_finish_showing(HostIoTakesShort io, TxnMemtableTablePreparedS
 	txn_memtable_table_pushed_t pushed = {.change = change, .result = result, .ended = ended, .combo = combo};
 
 	return txn_memtable_table_rowed(prepared, row, "a row's finish names a row the prepare didn't ready", error) &&
-		txn_memtable_table_within(io, prepared, row, txn_memtable_table_shown_step, &pushed, error) &&
-		txn_memtable_table_counted_at(io, prepared, has_roomed, roomed, error);
+		txn_memtable_table_within(io, prepared, row, has_roomed, roomed, txn_memtable_table_shown_step, &pushed,
+								  error);
 }
 
 /*
@@ -1266,8 +1727,7 @@ txn_memtable_table_finished(HostIoTakesShort io, TxnMemtableTablePreparedState *
 							const TxnMemtableVersionChange *change, bool has_roomed, TxnStatusRoomed roomed,
 							TxnMemtableVersionHandle *result, HostError *error)
 {
-	return txn_memtable_table_pushed(io, prepared, index, change, result, error) &&
-		txn_memtable_table_counted_at(io, prepared, has_roomed, roomed, error);
+	return txn_memtable_table_pushed(io, prepared, index, change, has_roomed, roomed, result, error);
 }
 
 /*
@@ -1283,20 +1743,6 @@ txn_memtable_table_finish_row(HostIoTakesShort io, TxnMemtableTablePreparedState
 {
 	return txn_memtable_table_rowed(prepared, row, "a row's finish names a row the prepare didn't ready", error) &&
 		txn_memtable_table_finished(io, prepared, row, change, has_roomed, roomed, result, error);
-}
-
-/*
- * txn_memtable_table_counted counts a map version a transaction pushed
- * inside its window at its writer's entry, as finish_row counts a row's, so
- * the entry stays while the version does, and uncounted takes it back when
- * the fold's drop removes it; a version written with no Roomed, by no
- * transaction, counts nothing.
- */
-bool
-txn_memtable_table_counted(HostIoTakesShort io, const TxnMemtableTablePreparedState *prepared, bool has_roomed,
-						   TxnStatusRoomed roomed, HostError *error)
-{
-	return txn_memtable_table_counted_at(io, prepared, has_roomed, roomed, error);
 }
 
 /* txn_memtable_table_newest_t is newest's step's captures: its answer. */
@@ -1335,10 +1781,12 @@ txn_memtable_table_newest(HostIoTakesShort io, TxnMemtableTablePreparedState *pr
 						  TxnMemtableVersionHandle *result, HostError *error)
 {
 	txn_memtable_table_newest_t newest = {some, result};
+	TxnStatusRoomed unroomed = {0};
 
 	return txn_memtable_table_rowed(prepared, row, "a row's newest version names a row the prepare didn't ready",
 									error) &&
-		txn_memtable_table_within(io, prepared, row, txn_memtable_table_newest_step, &newest, error);
+		txn_memtable_table_within(io, prepared, row, false, unroomed, txn_memtable_table_newest_step,
+								  &newest, error);
 }
 
 /*
@@ -1501,13 +1949,16 @@ txn_memtable_table_holds(HostIoIo *io, HostSharedRecord state, const uint8 *key,
 {
 	if (!txn_memtable_table_held(&TXN_MEMTABLE_TABLE_ROWS_TREE_OPS, io, state, key, key_len, lsn, result, error))
 		return false;
-	return *result || txn_spill_holds(io, state, TXN_RUNS_KIND_SPILLED_ROWS, key, key_len, lsn, result, error);
+	return *result || txn_spill_holds(&TXN_SPILL_STATE_HOME_OPS, io, state, TXN_RUNS_KIND_SPILLED_ROWS, key, key_len,
+									  lsn, result, error);
 }
 
 /* txn_memtable_table_alone_t is alone's inside's captures: the change and the handle it gives. */
 typedef struct txn_memtable_table_alone_t
 {
 	const TxnMemtableVersionChange *change;
+	bool		has_roomed;
+	TxnStatusRoomed roomed;
 	TxnMemtableVersionHandle *result;
 } txn_memtable_table_alone_t;
 
@@ -1518,28 +1969,30 @@ txn_memtable_table_alone_inside(void *captures, HostIoIo *io, TxnMemtableTablePr
 {
 	txn_memtable_table_alone_t *alone = captures;
 
-	return txn_memtable_table_pushed(HOST_IO_IO_TAKES_SHORT(io), prepared, 0, alone->change, alone->result, error);
+	return txn_memtable_table_pushed(HOST_IO_IO_TAKES_SHORT(io), prepared, 0, alone->change, alone->has_roomed,
+									 alone->roomed, alone->result, error);
 }
 
 /*
  * txn_memtable_table_alone makes a version a key's newest in one of an
  * owner's trees with no window, a prepare of that one push, its finish, and
- * its settle in one call, as a row's push and the runs' loader do.
+ * its settle in one call, as a row's push and the runs' loader do, counting
+ * it at its writer's entry when it names one.
  */
 bool
 txn_memtable_table_alone(const TxnMemtableTableTreeOps *tree, HostIoIo *io, HostSharedRecord owner, const uint8 *key,
-						 size_t key_len, const TxnMemtableVersionChange *change, TxnMemtableVersionHandle *result,
-						 HostError *error)
+						 size_t key_len, const TxnMemtableVersionChange *change, bool has_roomed,
+						 TxnStatusRoomed roomed, TxnMemtableVersionHandle *result, HostError *error)
 {
 	TxnMemtableTableAim aims[1] = {{.owner = owner, .tree = tree, .key = {key, key_len},
 	.need = txn_memtable_version_encoded(&change->writer, change->op, change->shown, change->has_lsn, change->lsn)}};
-	txn_memtable_table_alone_t alone = {change, result};
+	txn_memtable_table_alone_t alone = {change, has_roomed, roomed, result};
 	TxnMemtableTableReservation none = {0};
 	bool		has_unstored;
 	TxnMemtableTableReservation unstored;
 
 	return txn_memtable_table_prepared(io, aims, 1, false, none, txn_memtable_table_alone_inside, &alone, NULL,
-									   &has_unstored, &unstored, error);
+									   &has_unstored, &unstored, NULL, error);
 }
 
 /*
@@ -1551,10 +2004,13 @@ txn_memtable_table_alone_State(HostIoIo *io, HostSharedRecord owner, bool has_wh
 							   const uint8 *key, size_t key_len, const TxnMemtableVersionChange *change,
 							   TxnMemtableVersionHandle *result, HostError *error)
 {
+	TxnStatusRoomed unroomed = {0};
+
 	const TxnMemtableTableTreeOps *tree = !has_which ? &TXN_MEMTABLE_TABLE_ROWS_TREE_OPS :
 		which == TXN_MEMTABLE_MAP_MAP_FREE ? &TXN_MEMTABLE_MAP_FREE_TREE_OPS : &TXN_MEMTABLE_MAP_VALUES_TREE_OPS;
 
-	return txn_memtable_table_alone(tree, io, owner, key, key_len, change, result, error);
+	return txn_memtable_table_alone(tree, io, owner, key, key_len, change, false, unroomed, result,
+									error);
 }
 
 /*
@@ -1566,7 +2022,10 @@ bool
 txn_memtable_table_push(HostIoIo *io, HostSharedRecord state, const uint8 *key, size_t key_len,
 						const TxnMemtableVersionChange *change, TxnMemtableVersionHandle *result, HostError *error)
 {
-	return txn_memtable_table_alone(&TXN_MEMTABLE_TABLE_ROWS_TREE_OPS, io, state, key, key_len, change, result, error);
+	TxnStatusRoomed unroomed = {0};
+
+	return txn_memtable_table_alone(&TXN_MEMTABLE_TABLE_ROWS_TREE_OPS, io, state, key, key_len, change, false,
+									unroomed, result, error);
 }
 
 /* TxnMemtableTableOnePage is an iterator over one owned page, the pages a first range's lock owns at its link. */
@@ -1636,6 +2095,19 @@ typedef struct txn_memtable_table_first_frame_0_t
 	bool		with_live;
 	HostSharedGuard guard;
 	bool		guard_live;
+
+	/*
+	 * given is the first page the prepare's allocation took, until the
+	 * memtable takes it.
+	 */
+	HostDeltaOwned given;
+	bool		has_given;
+
+	/*
+	 * refused is whether the delta refused a record, with its refusal.
+	 */
+	bool	   *refused;
+	HostDeltaFull *full;
 } txn_memtable_table_first_frame_0_t;
 
 /* txn_memtable_table_first_pad_0 is first's pad: the guard, the With, the first page, the memtable, the range, and the pages, while live. */
@@ -1655,6 +2127,11 @@ txn_memtable_table_first_pad_0(void *frame_)
 		host_delta_With_drop(&frame->with);
 	}
 	txn_memtable_table_OnePage_drop(&frame->page);
+	if (frame->has_given)
+	{
+		frame->has_given = false;
+		host_delta_Owned_drop(&frame->given);
+	}
 	if (frame->memtable_live)
 	{
 		frame->memtable_live = false;
@@ -1674,57 +2151,45 @@ txn_memtable_table_first_pad_0(void *frame_)
 }
 
 /*
- * txn_memtable_table_first_made takes the first range's page and makes the
- * range and the memtable, waiting while the delta can't give them, answering
- * false on an error.
+ * txn_memtable_table_first_made takes the first range's page it was given and
+ * makes the range and the memtable in one try, answering the delta's refusal
+ * of a record, with what it took given back by the pad, rather than waiting,
+ * and false on an error.
  */
 static bool
-txn_memtable_table_first_made(txn_memtable_table_first_frame_0_t *frame, HostDeltaPageSize size)
+txn_memtable_table_first_made(txn_memtable_table_first_frame_0_t *frame)
 {
-	for (;;)
-	{
-		bool		allocated;
-		HostDeltaFull full;
+	bool		allocated;
 
-		if (!host_delta_alloc(frame->io, &size, 1, &allocated, &frame->pages, &full, frame->error))
-			return false;
-		if (!allocated)
-		{
-			if (!txn_memtable_table_waited(frame->io, full, false, frame->error))
-				return false;
-			continue;
-		}
-		frame->pages_live = true;
-		if (!host_delta_make(frame->io, &TXN_MEMTABLE_RANGE_RANGE_AGED_OPS, &allocated, &frame->range, &full,
-							 frame->error))
-			return false;
-		if (!allocated)
-		{
-			txn_memtable_table_first_pad_0(frame);
-			if (!txn_memtable_table_waited(frame->io, full, false, frame->error))
-				return false;
-			continue;
-		}
-		frame->range_live = true;
-		if (!host_delta_make(frame->io, &TXN_MEMTABLE_RANGE_MEMTABLE_AGED_OPS, &allocated, &frame->memtable, &full,
-							 frame->error))
-			return false;
-		if (!allocated)
-		{
-			txn_memtable_table_first_pad_0(frame);
-			if (!txn_memtable_table_waited(frame->io, full, false, frame->error))
-				return false;
-			continue;
-		}
-		frame->memtable_live = true;
-		frame->page.has = std_vec_pop(&frame->pages, &frame->page.page, sizeof(HostDeltaOwned));
-		if (!frame->page.has)
-		{
-			*frame->error = txn_memtable_table_internal("an allocation gave no page");
-			return false;
-		}
+	std_vec_with_capacity_Checked(&frame->pages, 1, sizeof(HostDeltaOwned), _Alignof(HostDeltaOwned));
+	std_vec_push_Checked(&frame->pages, &frame->given, sizeof(HostDeltaOwned), _Alignof(HostDeltaOwned));
+	frame->has_given = false;
+	frame->pages_live = true;
+	if (!host_delta_make(frame->io, &TXN_MEMTABLE_RANGE_RANGE_AGED_OPS, &allocated, &frame->range, frame->full,
+						 frame->error))
+		return false;
+	if (!allocated)
+	{
+		*frame->refused = true;
 		return true;
 	}
+	frame->range_live = true;
+	if (!host_delta_make(frame->io, &TXN_MEMTABLE_RANGE_MEMTABLE_AGED_OPS, &allocated, &frame->memtable, frame->full,
+						 frame->error))
+		return false;
+	if (!allocated)
+	{
+		*frame->refused = true;
+		return true;
+	}
+	frame->memtable_live = true;
+	frame->page.has = std_vec_pop(&frame->pages, &frame->page.page, sizeof(HostDeltaOwned));
+	if (!frame->page.has)
+	{
+		*frame->error = txn_memtable_table_internal("an allocation gave no page");
+		return false;
+	}
+	return true;
 }
 
 /* txn_memtable_table_filled fills one of a made record's lists with its one entry while it is unlinked. */
@@ -1743,48 +2208,38 @@ txn_memtable_table_filled(const HostDeltaMade *made, const HostSharedShapeOps *s
 	return true;
 }
 
-/* txn_memtable_table_first_body_0 is first's body. */
-static void
-txn_memtable_table_first_body_0(void *frame_)
+/*
+ * txn_memtable_table_first_linked makes, once its records are taken, the
+ * memtable on its page: the empty key as its range's first and each record's
+ * list with its one entry; then, under the owner's lock, one link of the
+ * memtable into the tree's word makes them live together if the word still
+ * names none. It answers false on an error, the pad giving back what isn't
+ * linked.
+ */
+static bool
+txn_memtable_table_first_linked(txn_memtable_table_first_frame_0_t *frame)
 {
-	txn_memtable_table_first_frame_0_t *frame = frame_;
 	uint64		location;
-	HostDeltaPageSize size;
+	HostDeltaPageSize size = txn_memtable_table_first_size();
 	uint64		name;
 	HostSharedOp op = {.tag = HOST_SHARED_OP_EXCHANGE};
 	StdIterator pages;
 	HostSharedPast word;
 
-	if (txn_memtable_table_memtable(frame->tree, frame->owner, &location))
-	{
-		frame->ok = true;
-		return;
-	}
-	size = txn_memtable_pages_size(false, 0, 0, txn_memtable_index_least(NULL, 0).words);
-	if (!txn_memtable_table_first_made(frame, size) ||
-		!txn_memtable_index_begin(&TXN_MEMTABLE_RANGE_RANGE_KEYED_OPS, &frame->range, &frame->page.page, 0, NULL, 0,
+	if (!txn_memtable_index_begin(&TXN_MEMTABLE_RANGE_RANGE_KEYED_OPS, &frame->range, &frame->page.page, 0, NULL, 0,
 								  frame->error))
-	{
-		txn_memtable_table_first_pad_0(frame);
-		return;
-	}
+		return false;
 	name = host_delta_page_Page_value(host_delta_Owned_name(&frame->page.page));
 	if (!txn_memtable_table_filled(&frame->range, &TXN_MEMTABLE_RANGE_RANGE_AGED_OPS.shape, TXN_MEMTABLE_INDEX_PAGES,
 								   name, frame->error))
-	{
-		txn_memtable_table_first_pad_0(frame);
-		return;
-	}
+		return false;
 	op.u.exchange.f1 = name;
 	host_delta_Made_atomic(&frame->range, TXN_MEMTABLE_RANGE_RANGE_START, op);
 	op.u.exchange.f1 = (uint64) size.words;
 	host_delta_Made_atomic(&frame->range, TXN_MEMTABLE_RANGE_RANGE_NEWEST, op);
 	if (!txn_memtable_table_filled(&frame->memtable, &TXN_MEMTABLE_RANGE_MEMTABLE_AGED_OPS.shape,
 								   TXN_MEMTABLE_RANGE_RANGES, host_delta_Made_location(&frame->range), frame->error))
-	{
-		txn_memtable_table_first_pad_0(frame);
-		return;
-	}
+		return false;
 	frame->with = host_delta_With_Default_default();
 	frame->with_live = true;
 	pages = (StdIterator)
@@ -1797,10 +2252,7 @@ txn_memtable_table_first_body_0(void *frame_)
 		!host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-memtable-first", frame->error) ||
 		!host_shared_Record_lock(frame->owner, HOST_IO_IO_TAKES_SHORT(frame->io), frame->tree->lock, &frame->guard,
 								 frame->error))
-	{
-		txn_memtable_table_first_pad_0(frame);
-		return;
-	}
+		return false;
 	frame->guard_live = true;
 	word = host_shared_Record_names_past(frame->owner, frame->tree->word);
 	if (!host_shared_Past_load(&word, &location))
@@ -1811,27 +2263,166 @@ txn_memtable_table_first_body_0(void *frame_)
 		frame->with_live = false;
 		host_delta_Made_link(&frame->memtable, &TXN_MEMTABLE_RANGE_MEMTABLE_AGED_OPS, names, &frame->with);
 	}
-	frame->ok = true;
+	return true;
+}
+
+/*
+ * txn_memtable_table_prepared_firsts takes, for every memtable the try's
+ * trees lack, its range's and memtable's records on the first page the try's
+ * allocation took for it, all before any memtable is made, so the refusal of
+ * any one's records gives every record and page taken back and leaves no
+ * memtable. It answers false on an error.
+ */
+static bool
+txn_memtable_table_prepared_firsts(txn_memtable_table_prepared_frame_0_t *frame, bool *refused, HostDeltaFull *full)
+{
+	size_t		missing = frame->missing.len;
+
+	std_vec_new(&frame->firsts, sizeof(txn_memtable_table_first_frame_0_t), _Alignof(txn_memtable_table_first_frame_0_t));
+	frame->firsts_live = true;
+	if (!std_vec_try_reserve_exact(&frame->firsts, missing, sizeof(txn_memtable_table_first_frame_0_t),
+								   _Alignof(txn_memtable_table_first_frame_0_t)))
+	{
+		*frame->error = host_Error_out_of_memory();
+		return false;
+	}
+	for (size_t i = 0; i < missing; i++)
+	{
+		const TxnMemtableTableAim *aim = &frame->aims[STD_VEC_AT(&frame->missing, size_t, missing - 1 - i)];
+		txn_memtable_table_first_frame_0_t first = {.tree = aim->tree, .io = frame->io, .owner = aim->owner,
+			.error = frame->error, .refused = refused, .full = full,
+		.given = STD_VEC_AT(&frame->pages, HostDeltaOwned, frame->pages.len - 1), .has_given = true};
+		uint64		location;
+
+		frame->pages.len--;
+		std_vec_push_Checked(&frame->firsts, &first, sizeof(first), _Alignof(txn_memtable_table_first_frame_0_t));
+		if (txn_memtable_table_memtable(aim->tree, aim->owner, &location))
+			continue;
+		if (!txn_memtable_table_first_made(&STD_VEC_AT(&frame->firsts, txn_memtable_table_first_frame_0_t, i)))
+			return false;
+		if (*refused)
+		{
+			txn_memtable_table_prepared_firsts_drop(frame);
+			return true;
+		}
+	}
+	return true;
+}
+
+/*
+ * txn_memtable_table_prepared_linked makes and links each memtable whose
+ * records the try took, then hands its aim's push off to its key's range,
+ * answering some false when a range gave out and false on an error.
+ */
+static bool
+txn_memtable_table_prepared_linked(txn_memtable_table_prepared_frame_0_t *frame, bool *some)
+{
+	size_t		missing = frame->missing.len;
+
+	*some = true;
+	for (size_t i = 0; i < frame->firsts.len && *some; i++)
+	{
+		txn_memtable_table_first_frame_0_t *first = &STD_VEC_AT(&frame->firsts, txn_memtable_table_first_frame_0_t, i);
+		size_t		k = STD_VEC_AT(&frame->missing, size_t, missing - 1 - i);
+		const TxnMemtableTableAim *aim = &frame->aims[k];
+		bool		linked = !first->memtable_live || txn_memtable_table_first_linked(first);
+
+		txn_memtable_table_first_pad_0(first);
+		if (!linked ||
+			!txn_memtable_table_handed(aim->tree, frame->io, &frame->prepared.hold, &frame->mine, aim->owner,
+									   aim->key.ptr, aim->key.len, some, &STD_VEC_AT(&frame->ats, TxnMemtableTableAt, k),
+									   frame->error))
+			return false;
+	}
+	txn_memtable_table_prepared_firsts_drop(frame);
+	frame->missing.len = 0;
+	return true;
+}
+
+/* txn_memtable_table_prepared_firsts_drop gives back what each unlinked memtable's records and first page hold, while live. */
+static void
+txn_memtable_table_prepared_firsts_drop(txn_memtable_table_prepared_frame_0_t *frame)
+{
+	if (!frame->firsts_live)
+		return;
+	frame->firsts_live = false;
+	for (size_t i = 0; i < frame->firsts.len; i++)
+		txn_memtable_table_first_pad_0(&STD_VEC_AT(&frame->firsts, txn_memtable_table_first_frame_0_t, i));
+	std_vec_free_Checked(&frame->firsts, sizeof(txn_memtable_table_first_frame_0_t),
+						 _Alignof(txn_memtable_table_first_frame_0_t));
+}
+
+#ifdef DOLTGRES_TEST_TXN
+/* txn_memtable_table_first_body_0 is made's body. */
+static void
+txn_memtable_table_first_body_0(void *frame_)
+{
+	txn_memtable_table_first_frame_0_t *frame = frame_;
+	uint64		location;
+
+	if (txn_memtable_table_memtable(frame->tree, frame->owner, &location))
+	{
+		frame->ok = true;
+		return;
+	}
+	frame->ok = txn_memtable_table_first_made(frame) && (*frame->refused || txn_memtable_table_first_linked(frame));
 	txn_memtable_table_first_pad_0(frame);
 }
 
 /*
- * txn_memtable_table_first makes a tree's memtable as its first writer: with
- * no hold and no lock it takes the range's first page, makes the range and
- * the memtable, writes the empty key there as the range's first, and starts
- * each record's list with its one entry; then, under the owner's lock, one
- * link of the memtable into the tree's word makes them live together if the
- * word still names none, and otherwise its drops give everything back. It
- * does nothing for a tree whose word names a memtable.
+ * txn_memtable_table_made_on makes a tree's memtable as its first writer in
+ * one try, on the first page a prepare's allocation took with its reserves:
+ * with no lock it makes the range and the memtable on the page, writes the
+ * empty key there as the range's first, and starts each record's list with
+ * its one entry; then, under the owner's lock, one link of the memtable into
+ * the tree's word makes them live together if the word still names none,
+ * and otherwise its drops give everything back. It gives the page back for a
+ * tree whose word names a memtable, and answers the delta's refusal of a
+ * record, with what it took given back, rather than waiting.
  */
+static bool
+txn_memtable_table_made_on(const TxnMemtableTableTreeOps *tree, HostIoIo *io, HostSharedRecord owner,
+						   HostDeltaOwned page, bool *refused, HostDeltaFull *full, HostError *error)
+{
+	txn_memtable_table_first_frame_0_t frame = {.tree = tree, .io = io, .owner = owner, .error = error,
+	.refused = refused, .full = full, .given = page, .has_given = true};
+
+	*refused = false;
+	std_landing(&frame, txn_memtable_table_first_body_0, txn_memtable_table_first_pad_0);
+	if (frame.has_given)
+		host_delta_Owned_drop(&frame.given);
+	return frame.ok;
+}
+
+/* txn_memtable_table_first makes a tree's memtable as its first writer, as made_on does on a page it takes, waiting at the delta's budget when it refuses. */
 bool
 txn_memtable_table_first(const TxnMemtableTableTreeOps *tree, HostIoIo *io, HostSharedRecord owner, HostError *error)
 {
-	txn_memtable_table_first_frame_0_t frame = {.tree = tree, .io = io, .owner = owner, .error = error};
+	for (;;)
+	{
+		HostDeltaPageSize size = txn_memtable_table_first_size();
+		bool		allocated;
+		bool		refused = true;
+		StdVec		pages;
+		HostDeltaFull full;
 
-	std_landing(&frame, txn_memtable_table_first_body_0, txn_memtable_table_first_pad_0);
-	return frame.ok;
+		if (!host_delta_alloc(io, &size, 1, &allocated, &pages, &full, error))
+			return false;
+		if (allocated)
+		{
+			HostDeltaOwned page = STD_VEC_AT(&pages, HostDeltaOwned, 0);
+
+			std_vec_free_Checked(&pages, sizeof(HostDeltaOwned), _Alignof(HostDeltaOwned));
+			if (!txn_memtable_table_made_on(tree, io, owner, page, &refused, &full, error))
+				return false;
+		}
+		if (!refused)
+			return true;
+		if (!txn_memtable_table_waited(io, full, false, error))
+			return false;
+	}
 }
+#endif
 
 /* txn_memtable_table_abandoned_frame_0_t is abandoned's state across its pad: the hold and the range's guard, while live. */
 typedef struct txn_memtable_table_abandoned_frame_0_t
@@ -2125,6 +2716,7 @@ typedef struct txn_memtable_table_removed_frame_0_t
 	bool		names_live;
 	StdVec		counted;
 	bool		counted_live;
+	StdVec	   *given;
 } txn_memtable_table_removed_frame_0_t;
 
 /* txn_memtable_table_removed_take_pad drops the lists of one range's take, while live. */
@@ -2225,7 +2817,8 @@ txn_memtable_table_removed_keys(txn_memtable_table_removed_frame_0_t *frame, Txn
 		if (some)
 		{
 			if (!txn_memtable_version_removed(open, &frame->hold, node, key->handles, key->handles_len, taken->ptr,
-											  taken->len, &emptied, &frame->touched, &bytes, frame->error))
+											  taken->len, frame->given, &emptied, &frame->touched, &bytes,
+											  frame->error))
 				return false;
 			frame->touched_live = true;
 			if (bytes > 0)
@@ -2567,23 +3160,42 @@ txn_memtable_table_removed_body_0(void *frame_)
 }
 
 /*
+ * txn_memtable_table_removing is removed_all's walk, appending to given the
+ * top-level xid of each version it takes out that its push counted.
+ */
+static bool
+txn_memtable_table_removing(const TxnMemtableTableTreeOps *tree, HostIoIo *io, HostSharedRecord owner,
+							const TxnMemtableTableRemoving *keys, size_t keys_len, StdVec *result, StdVec *given,
+							HostError *error)
+{
+	txn_memtable_table_removed_frame_0_t frame = {.tree = tree, .io = io, .owner = owner, .keys = keys,
+	.keys_len = keys_len, .result = result, .given = given, .error = error};
+
+	std_landing(&frame, txn_memtable_table_removed_body_0, txn_memtable_table_removed_pad_0);
+	return frame.ok;
+}
+
+/*
  * txn_memtable_table_removed_all takes versions out of the chains of keys
  * given in byte order, as removed does for one key, each range taking out
  * every key of the run it holds under one take of its exclusive lock, with
  * one sweep of its dropped pages and one compaction after, as a spill takes
  * a transaction's keys out of its memtable. It answers, for each key at each
- * handle's place, whether this removal took it out.
+ * handle's place, whether this removal took it out. It gives back no count,
+ * since a spill moves the versions to its file, whose own count names them.
  */
 bool
 txn_memtable_table_removed_all(const TxnMemtableTableTreeOps *tree, HostIoIo *io, HostSharedRecord owner,
 							   const TxnMemtableTableRemoving *keys, size_t keys_len, StdVec *result,
 							   HostError *error)
 {
-	txn_memtable_table_removed_frame_0_t frame = {.tree = tree, .io = io, .owner = owner, .keys = keys,
-	.keys_len = keys_len, .result = result, .error = error};
+	StdVec		given;
+	bool		ok;
 
-	std_landing(&frame, txn_memtable_table_removed_body_0, txn_memtable_table_removed_pad_0);
-	return frame.ok;
+	std_vec_new(&given, sizeof(uint64), _Alignof(uint64));
+	ok = txn_memtable_table_removing(tree, io, owner, keys, keys_len, result, &given, error);
+	std_vec_free_Checked(&given, sizeof(uint64), _Alignof(uint64));
+	return ok;
 }
 
 /*
@@ -2592,8 +3204,9 @@ txn_memtable_table_removed_all(const TxnMemtableTableTreeOps *tree, HostIoIo *io
  * range's exclusive lock: the versions leave the chain, a key left with none
  * leaves the index, and its dropped pages and its compaction are as
  * removed_all's. A key the tree doesn't hold, and a handle its chain
- * doesn't, are passed over. It answers, at each handle's place, whether this
- * removal took it out.
+ * doesn't, are passed over. Each version it takes out that its push counted
+ * gives its count back at its top-level transaction's entry, after the take.
+ * It answers, at each handle's place, whether this removal took it out.
  */
 bool
 txn_memtable_table_removed(const TxnMemtableTableTreeOps *tree, HostIoIo *io, HostSharedRecord owner,
@@ -2602,8 +3215,24 @@ txn_memtable_table_removed(const TxnMemtableTableTreeOps *tree, HostIoIo *io, Ho
 {
 	TxnMemtableTableRemoving keys[1] = {{{key, key_len}, handles, handles_len}};
 	StdVec		taken;
+	StdVec		given;
+	bool		ok;
 
-	if (!txn_memtable_table_removed_all(tree, io, owner, keys, 1, &taken, error))
+	std_vec_new(&given, sizeof(uint64), _Alignof(uint64));
+	ok = txn_memtable_table_removing(tree, io, owner, keys, 1, &taken, &given, error);
+	for (size_t i = 0; ok && i < given.len;)
+	{
+		HostXid		top = {STD_VEC_AT(&given, uint64, i)};
+		uint64		count = 0;
+		bool		has;
+		uint64		added;
+
+		for (; i < given.len && STD_VEC_AT(&given, uint64, i) == top.f0; i++)
+			count++;
+		ok = txn_status_add(io, top, std_wrapping_sub_u64(0, count), &has, &added, error);
+	}
+	std_vec_free_Checked(&given, sizeof(uint64), _Alignof(uint64));
+	if (!ok)
 		return false;
 	if (!std_vec_pop(&taken, result, sizeof(StdVec)))
 		std_vec_new(result, sizeof(bool), _Alignof(bool));
@@ -2612,13 +3241,12 @@ txn_memtable_table_removed(const TxnMemtableTableTreeOps *tree, HostIoIo *io, Ho
 	return true;
 }
 
-/* txn_memtable_table_Pruning_t is a chain entry pruned reads: a version's handle, its writer, its hint, and whether it is a lock's. */
+/* txn_memtable_table_Pruning_t is a chain entry pruned reads: a version's handle, its writer, and its hint. */
 typedef struct txn_memtable_table_Pruning_t
 {
 	TxnMemtableVersionHandle handle;
 	TxnMemtableVersionWriter writer;
 	TxnMemtableVersionHint hint;
-	bool		lock;
 } txn_memtable_table_Pruning_t;
 
 /* txn_memtable_table_pruned_t is pruned's reading's captures: the key and the chain read. */
@@ -2628,15 +3256,6 @@ typedef struct txn_memtable_table_pruned_t
 	size_t		key_len;
 	StdVec		chain;
 } txn_memtable_table_pruned_t;
-
-/* txn_memtable_table_is_lock reports whether a version's op is a lock's, which counts nothing. */
-static bool
-txn_memtable_table_is_lock(const TxnMemtableVersionRecord *record)
-{
-	TxnMemtableVersionOpRefTag op = txn_memtable_version_Record_op(record).tag;
-
-	return op == TXN_MEMTABLE_VERSION_OP_REF_LOCK || op == TXN_MEMTABLE_VERSION_OP_REF_LOCK_ROW;
-}
 
 /* txn_memtable_table_pruned_reading reads a key's chain's writers under its range's shared lock. */
 static bool
@@ -2673,10 +3292,19 @@ txn_memtable_table_pruned_reading(void *captures, const HostDeltaHold *hold, Txn
 		entry.handle = version.handle;
 		entry.writer = txn_memtable_version_Record_writer(&record);
 		entry.hint = txn_memtable_version_Version_hint(&version);
-		entry.lock = txn_memtable_table_is_lock(&record);
 		txn_memtable_version_Version_drop(&version);
 		std_vec_push_Checked(&pruned->chain, &entry, sizeof(entry), _Alignof(txn_memtable_table_Pruning_t));
 	}
+}
+
+/* txn_memtable_table_aborting reports whether a version's writer is one of an abort's xids, or a subtransaction of one. */
+bool
+txn_memtable_table_aborting(TxnMemtableVersionWriter writer, const uint64 *aborting, size_t aborting_len)
+{
+	for (size_t k = 0; k < aborting_len; k++)
+		if (writer.xid == aborting[k] || (writer.has_top && writer.top == aborting[k]))
+			return true;
+	return false;
 }
 
 /* txn_memtable_table_pruned_frame_0_t is pruned's state across its pad: the chain read, the aborted handles, and the answers, while live. */
@@ -2687,8 +3315,15 @@ typedef struct txn_memtable_table_pruned_frame_0_t
 	HostSharedRecord owner;
 	const uint8 *key;
 	size_t		key_len;
-	bool		has_aborting;
-	uint64		aborting;
+	const uint64 *aborting;
+	size_t		aborting_len;
+
+	/*
+	 * listed takes out only the versions of aborting's xids, which ended
+	 * passes as committed writers no fold still needs.
+	 */
+	bool		listed;
+	bool	   *result;
 	HostError  *error;
 	bool		ok;
 	txn_memtable_table_pruned_t pruned;
@@ -2749,8 +3384,10 @@ txn_memtable_table_pruned_body_0(void *frame_)
 		uint64		xid = entry->writer.xid;
 		bool		gone;
 
-		if (frame->has_aborting && (entry->writer.has_top ? entry->writer.top : xid) == frame->aborting)
+		if (txn_memtable_table_aborting(entry->writer, frame->aborting, frame->aborting_len))
 			gone = true;
+		else if (frame->listed)
+			gone = false;
 		else if (entry->hint == TXN_MEMTABLE_VERSION_HINT_ABORTED)
 			gone = true;
 		else if (entry->hint == TXN_MEMTABLE_VERSION_HINT_COMMITTED)
@@ -2763,7 +3400,7 @@ txn_memtable_table_pruned_body_0(void *frame_)
 			gone = false;
 			if (xid != TXN_MEMTABLE_VERSION_NO_TRANSACTION.xid)
 			{
-				if (!host_status(HOST_IO_IO_IO_DOORS(frame->io), asked, &status, frame->error))
+				if (!txn_outcome_stamped(frame->io, asked.f0, &status, frame->error))
 				{
 					txn_memtable_table_pruned_pad_0(frame);
 					return;
@@ -2794,27 +3431,8 @@ txn_memtable_table_pruned_body_0(void *frame_)
 		return;
 	}
 	frame->taken_live = true;
-	for (size_t k = 0; k < kept && k < frame->taken.len; k++)
-	{
-		const txn_memtable_table_Pruning_t *entry = &STD_VEC_AT(&frame->pruned.chain,
-																txn_memtable_table_Pruning_t, k);
-		TxnMemtableVersionWriter none = TXN_MEMTABLE_VERSION_NO_TRANSACTION;
-
-		if (!STD_VEC_AT(&frame->taken, bool, k))
-			continue;
-		if (frame->tree->counted && !entry->lock && !txn_memtable_version_Writer_PartialEq_eq(&entry->writer, &none))
-		{
-			HostXid		top = {entry->writer.has_top ? entry->writer.top : entry->writer.xid};
-			bool		has;
-			uint64		added;
-
-			if (!txn_status_add(frame->io, top, PG_UINT64_MAX, &has, &added, frame->error))
-			{
-				txn_memtable_table_pruned_pad_0(frame);
-				return;
-			}
-		}
-	}
+	for (size_t k = 0; k < frame->taken.len && frame->result != NULL; k++)
+		*frame->result |= STD_VEC_AT(&frame->taken, bool, k);
 	frame->ok = true;
 	txn_memtable_table_pruned_pad_0(frame);
 }
@@ -2826,44 +3444,40 @@ txn_memtable_table_pruned_body_0(void *frame_)
  * asked with no lock held, a version hinted aborted taking no question and a
  * frozen one none, and the remover takes out the aborted ones, passing over
  * any a concurrent removal took first. A committed version is the fold's,
- * never pruned here. A top-level transaction's abort names its xid as
- * aborting, and every version it or one of its subtransactions wrote is
- * aborted with no question. Each version but a lock's this removal took out
- * gives its count back at its top-level transaction's entry, so a rolled-back
- * savepoint's versions leave a committed transaction's count as they found
- * it.
+ * never pruned here. An abort names its xids as aborting, and every version
+ * one of them or one of their subtransactions wrote is aborted with no
+ * question (bugs row 332). The remover gives back the count of each counted
+ * version it took out, so a rolled-back savepoint's versions leave a
+ * committed transaction's count as they found it.
  */
 bool
 txn_memtable_table_pruned(const TxnMemtableTableTreeOps *tree, HostIoIo *io, HostSharedRecord owner,
-						  const uint8 *key, size_t key_len, bool has_aborting, uint64 aborting, HostError *error)
+						  const uint8 *key, size_t key_len, const uint64 *aborting, size_t aborting_len,
+						  HostError *error)
 {
 	txn_memtable_table_pruned_frame_0_t frame = {.tree = tree, .io = io, .owner = owner, .key = key,
-	.key_len = key_len, .has_aborting = has_aborting, .aborting = aborting, .error = error};
+	.key_len = key_len, .aborting = aborting, .aborting_len = aborting_len, .error = error};
 
 	std_landing(&frame, txn_memtable_table_pruned_body_0, txn_memtable_table_pruned_pad_0);
 	return frame.ok;
 }
 
 /*
- * txn_memtable_table_uncounted takes back the add a version's push made at
- * its writer's entry, for a version taken out of the delta: every version
- * but a lock's, as the finishes count them, at its top-level transaction's
- * entry; a writer whose entry is gone takes nothing back.
+ * txn_memtable_table_ended takes out of a key's chain the versions whose
+ * writers, or their top-level transactions, are among ended, committed
+ * transactions no fold still needs the versions of, as pruned takes out an
+ * abort's, and adds to result whether it took one (bugs row 301).
  */
 bool
-txn_memtable_table_uncounted(HostIoIo *io, const TxnMemtableVersionVersion *version, HostError *error)
+txn_memtable_table_ended(const TxnMemtableTableTreeOps *tree, HostIoIo *io, HostSharedRecord owner, const uint8 *key,
+						 size_t key_len, const uint64 *ended, size_t ended_len, bool *result, HostError *error)
 {
-	TxnMemtableVersionRecord record = txn_memtable_version_Version_record(version);
-	TxnMemtableVersionWriter writer;
-	HostXid		top;
-	bool		has;
-	uint64		added;
+	txn_memtable_table_pruned_frame_0_t frame = {.tree = tree, .io = io, .owner = owner, .key = key,
+		.key_len = key_len, .aborting = ended, .aborting_len = ended_len, .listed = true, .result = result,
+	.error = error};
 
-	if (txn_memtable_table_is_lock(&record))
-		return true;
-	writer = txn_memtable_version_Record_writer(&record);
-	top.f0 = writer.has_top ? writer.top : writer.xid;
-	return txn_status_add(io, top, PG_UINT64_MAX, &has, &added, error);
+	std_landing(&frame, txn_memtable_table_pruned_body_0, txn_memtable_table_pruned_pad_0);
+	return frame.ok;
 }
 
 /* TxnMemtableTableEmptyPage is a page dropped_pages found with no live record: its entry, its name, and its page. */
@@ -3073,6 +3687,12 @@ typedef struct txn_memtable_table_compacted_frame_0_t
 	bool		copies_live;
 	HostSharedGuard guard;
 	bool		guard_live;
+
+	/*
+	 * record is the range, whose first page's name a copy of that page takes
+	 * over (bugs row 143).
+	 */
+	HostSharedRecord record;
 	StdVec		heads;
 	bool		heads_live;
 	StdVec		old;
@@ -3204,6 +3824,12 @@ txn_memtable_table_compacted_page(txn_memtable_table_compacted_frame_0_t *frame,
 	*linked = true;
 	if (!host_delta_list_ListMut_set_page(&list, frame->hold, found->entry, copy, &set, frame->error))
 		return false;
+	{
+		HostSharedOp moved = {.tag = HOST_SHARED_OP_EXCHANGE,
+		.u.exchange = {found->name, host_delta_page_Page_value(set)}};
+
+		(void) host_shared_Record_atomic(frame->record, TXN_MEMTABLE_RANGE_RANGE_START, moved);
+	}
 	std_vec_push_Checked(&frame->old, &found->name, sizeof(uint64), _Alignof(uint64));
 	return true;
 }
@@ -3241,6 +3867,7 @@ txn_memtable_table_compacted_body_0(void *frame_)
 		return;
 	}
 	frame->guard_live = true;
+	frame->record = record;
 	if (!txn_memtable_index_keyed_open(&TXN_MEMTABLE_RANGE_RANGE_KEYED_OPS, &frame->guard, &open))
 	{
 		frame->ok = true;
@@ -3275,6 +3902,11 @@ txn_memtable_table_compacted_body_0(void *frame_)
 	frame->guard_live = false;
 	host_shared_Guard_drop(&frame->guard);
 	*frame->result = frame->old.len > 0;
+	if (!host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-memtable-moved", frame->error))
+	{
+		txn_memtable_table_compacted_pad_0(frame);
+		return;
+	}
 	names = (TxnMemtableTableRetiring)
 	{
 		frame->old.ptr, frame->old.len, 0
@@ -3296,8 +3928,9 @@ txn_memtable_table_compacted_body_0(void *frame_)
  * still names it, its live records only, and links the copy over its index;
  * then it retires the old pages. A closed range, or an entry changed
  * meanwhile, gives its copy back. The pause doltgres-memtable-compacting
- * comes between the allocation and the lock. It answers whether it replaced
- * a page.
+ * comes between the allocation and the lock, and doltgres-memtable-moved
+ * between the lock's release and the old pages' retirement (bugs row 143).
+ * It answers whether it replaced a page.
  */
 static bool
 txn_memtable_table_compacted(HostIoIo *io, const HostDeltaHold *hold, uint64 range, StdVec *found, bool *result,
@@ -3308,6 +3941,102 @@ txn_memtable_table_compacted(HostIoIo *io, const HostDeltaHold *hold, uint64 ran
 
 	std_landing(&frame, txn_memtable_table_compacted_body_0, txn_memtable_table_compacted_pad_0);
 	return frame.ok;
+}
+
+/*
+ * txn_memtable_table_moved finds a page a packing moves in its range's list
+ * under the range's shared lock, and moves it as a compaction copies a page,
+ * its first, newest, or only page included, at its own size, so its copy
+ * takes the room the packing ordered for it (bugs row 143). A closed range, a
+ * page no longer in its list, and one more than one list names stay; it
+ * answers whether it moved the page.
+ */
+static bool
+txn_memtable_table_moved(HostIoIo *io, const HostDeltaHold *hold, const HostDeltaDirectoryPacked *packed,
+						 bool *result, HostError *error)
+{
+	HostSharedRecord record;
+	HostSharedGuard guard;
+	TxnMemtableIndexKeyedOpen open;
+	TxnMemtableTableCompactable found = {.name = packed->name, .size = packed->size};
+	bool		listed = false;
+	bool		ok = true;
+	StdVec		moving;
+
+	*result = false;
+	if (!host_delta_Hold_record(hold, &TXN_MEMTABLE_RANGE_RANGE_AGED_OPS, packed->location, &record, error) ||
+		!host_shared_Record_lock_shared(record, HOST_IO_IO_TAKES_SHORT(io), TXN_MEMTABLE_RANGE_RANGE_LOCK, &guard,
+										error))
+		return false;
+	if (txn_memtable_index_keyed_open(&TXN_MEMTABLE_RANGE_RANGE_KEYED_OPS, &guard, &open))
+	{
+		HostDeltaListListView view = host_delta_list_Guard_list(open.open.guard, open.open.closes->shape,
+																TXN_MEMTABLE_INDEX_PAGES);
+
+		for (uint64 entry = 0, len = host_delta_list_ListView_len(&view); ok && !listed && entry < len; entry++)
+		{
+			uint64		name;
+
+			ok = host_delta_list_ListView_get(&view, hold, entry, &name, error);
+			listed = ok && name == packed->name;
+			found.entry = entry;
+		}
+		if (listed)
+		{
+			HostDeltaPageRef page;
+			HostDeltaWord lists;
+
+			ok = host_delta_Hold_page(hold, host_delta_page_Page_named(packed->name), &page, error) &&
+				host_delta_PageRef_word(&page, TXN_MEMTABLE_PAGES_LISTS, &lists, error);
+			listed = ok && host_delta_Word_load(&lists) == 1;
+		}
+	}
+	host_shared_Guard_drop(&guard);
+	if (!ok || !listed)
+		return ok;
+	std_vec_with_capacity_Checked(&moving, 1, sizeof(found), _Alignof(TxnMemtableTableCompactable));
+	std_vec_push_Checked(&moving, &found, sizeof(found), _Alignof(TxnMemtableTableCompactable));
+	return txn_memtable_table_compacted(io, hold, packed->location, &moving, result, error);
+}
+
+/*
+ * txn_memtable_table_packed packs the delta's blocks for a writer the budget
+ * refused with nothing left to compact or spill (bugs row 143): it moves each
+ * live page out of the blocks the packing drains by its owner's move, under
+ * its owner's lock, a range's page as a compaction copies it, and answers
+ * whether it moved one, so the writer asks again once the moved pages free.
+ * Its hold begins before it reads the blocks, so every page it lists, and
+ * its owner, stay reachable while it moves them.
+ */
+bool
+txn_memtable_table_packed(HostIoIo *io, bool *result, HostError *error)
+{
+	uint64		shapes[] = {TXN_MEMTABLE_RANGE_RANGE_AGED_OPS.shape.id, TXN_MEMTABLE_TUPLES_TUPLES_AGED_OPS.shape.id};
+	StdVec		packed;
+	HostDeltaHold hold;
+	bool		packed_ok;
+	bool		ok;
+
+	*result = false;
+	if (!host_delta_hold(io, &hold, error))
+		return false;
+	packed_ok = host_delta_packing(shapes, lengthof(shapes), &packed, error);
+	ok = packed_ok;
+	for (size_t k = 0; ok && k < packed.len; k++)
+	{
+		const HostDeltaDirectoryPacked *page = &STD_VEC_AT(&packed, HostDeltaDirectoryPacked, k);
+		bool		moved = false;
+
+		if (page->shape == TXN_MEMTABLE_RANGE_RANGE_AGED_OPS.shape.id)
+			ok = txn_memtable_table_moved(io, &hold, page, &moved, error);
+		else if (page->shape == TXN_MEMTABLE_TUPLES_TUPLES_AGED_OPS.shape.id)
+			ok = txn_memtable_tuples_relocated(io, page->location, &moved, error);
+		*result = *result || moved;
+	}
+	host_delta_Hold_drop(&hold);
+	if (packed_ok)
+		std_vec_free_Checked(&packed, sizeof(HostDeltaDirectoryPacked), _Alignof(HostDeltaDirectoryPacked));
+	return ok;
 }
 
 /* txn_memtable_table_swept_memtables adds the memtables a pool's records name through a tree's word to a list. */
@@ -3626,6 +4355,10 @@ txn_memtable_table_waited(HostIoIo *io, HostDeltaFull full, bool spilling, HostE
 		return false;
 	if (relieved)
 		return true;
+	if (!txn_memtable_table_packed(io, &replaced, error))
+		return false;
+	if (replaced)
+		return true;
 	return host_delta_wait(io, &full, error);
 }
 
@@ -3748,30 +4481,77 @@ txn_memtable_table_chain(const TxnMemtableTableTreeOps *tree, HostIoIo *io, cons
 }
 
 /*
+ * txn_memtable_table_versions_read_t is versions' read's captures: its
+ * arguments, the versions it lends, and the key's spilled versions, while
+ * live.
+ */
+typedef struct txn_memtable_table_versions_read_t
+{
+	HostIoIo   *io;
+	const HostDeltaHold *hold;
+	HostSharedRecord state;
+	const uint8 *key;
+	size_t		key_len;
+	StdVec	   *result;
+	StdVec		spilled;
+	bool		spilled_live;
+} txn_memtable_table_versions_read_t;
+
+/* txn_memtable_table_versions_dropped drops the versions a read of versions lent. */
+static void
+txn_memtable_table_versions_dropped(void *captures)
+{
+	txn_memtable_table_versions_read_t *c = captures;
+
+	if (c->spilled_live)
+		txn_memtable_version_versions_drop(&c->spilled, 0);
+	c->spilled_live = false;
+	std_vec_clear(c->result, sizeof(TxnMemtableVersionVersion), txn_memtable_table_Version_drop);
+	std_vec_free_Checked(c->result, sizeof(TxnMemtableVersionVersion), _Alignof(TxnMemtableVersionVersion));
+}
+
+/* txn_memtable_table_versions_read is versions' read: the key's chain in the memtable, then its versions in the spills. */
+static bool
+txn_memtable_table_versions_read(void *captures, uint64 *listed, HostError *error)
+{
+	txn_memtable_table_versions_read_t *c = captures;
+
+	if (!txn_memtable_table_chain(&TXN_MEMTABLE_TABLE_ROWS_TREE_OPS, c->io, c->hold, c->state, c->key, c->key_len,
+								  c->result, error))
+		return false;
+	if (!txn_spill_versions(&TXN_SPILL_STATE_HOME_OPS, c->io, c->hold, c->state, TXN_RUNS_KIND_SPILLED_ROWS, c->key,
+							c->key_len, listed, &c->spilled, error))
+	{
+		txn_memtable_table_versions_dropped(c);
+		return false;
+	}
+	c->spilled_live = true;
+	return true;
+}
+
+/*
  * txn_memtable_table_versions lends a key's versions in a storage's rows,
- * newest first, the memtable's and then its spills', for a caller's hold:
- * read under the range's shared lock through the hand-off and answered with
- * the lock released, so a reader can ask Postgres each writer's outcome. It
- * answers none when the delta holds no version of the key.
+ * newest first, the memtable's with its spills' placed among them in commit
+ * order (bugs row 397), for a caller's hold: read under the range's shared
+ * lock through the hand-off and answered with the lock released, so a reader
+ * can ask Postgres each writer's outcome. It answers none when the delta
+ * holds no version of the key.
  */
 bool
 txn_memtable_table_versions(HostIoIo *io, const HostDeltaHold *hold, HostSharedRecord state, const uint8 *key,
 							size_t key_len, StdVec *result, HostError *error)
 {
-	StdVec		spilled;
+	txn_memtable_table_versions_read_t captures = {io, hold, state, key, key_len, result};
 
-	if (!txn_memtable_table_chain(&TXN_MEMTABLE_TABLE_ROWS_TREE_OPS, io, hold, state, key, key_len, result, error))
+	if (!txn_spill_taken(&TXN_SPILL_STATE_HOME_OPS, io, state, txn_memtable_table_versions_read,
+						 txn_memtable_table_versions_dropped, &captures, error))
 		return false;
-	if (!txn_spill_versions(&TXN_SPILL_STATE_HOME_OPS, io, hold, state, TXN_RUNS_KIND_SPILLED_ROWS, key, key_len,
-							&spilled, error))
+	if (!txn_spill_ordered(io, result, &captures.spilled, error))
 	{
-		std_vec_clear(result, sizeof(TxnMemtableVersionVersion), txn_memtable_table_Version_drop);
-		std_vec_free_Checked(result, sizeof(TxnMemtableVersionVersion), _Alignof(TxnMemtableVersionVersion));
+		txn_memtable_table_versions_dropped(&captures);
 		return false;
 	}
-	std_vec_extend_from_slice_Checked(result, spilled.ptr, spilled.len, sizeof(TxnMemtableVersionVersion),
-									  _Alignof(TxnMemtableVersionVersion));
-	std_vec_free_Checked(&spilled, sizeof(TxnMemtableVersionVersion), _Alignof(TxnMemtableVersionVersion));
+	std_vec_free_Checked(&captures.spilled, sizeof(TxnMemtableVersionVersion), _Alignof(TxnMemtableVersionVersion));
 	return true;
 }
 
@@ -3799,7 +4579,7 @@ txn_memtable_table_CopiedKey_drop(void *self_)
 	std_vec_free_Checked(&self->key, 1, 1);
 	std_vec_clear(&self->records, sizeof(StdVec), txn_memtable_table_bytes_drop);
 	std_vec_free_Checked(&self->records, sizeof(StdVec), _Alignof(StdVec));
-	std_vec_free_Checked(&self->handles, sizeof(txn_TupleHandleU64_t), _Alignof(txn_TupleHandleU64_t));
+	std_vec_free_Checked(&self->handles, sizeof(txn_TupleHandleU64Bool_t), _Alignof(txn_TupleHandleU64Bool_t));
 }
 
 /* txn_memtable_table_copied_reading_t is copied's reading's captures: the walk's place, whether it hands out killed versions, and the copy. */
@@ -3825,15 +4605,16 @@ txn_memtable_table_copied_key(txn_memtable_table_copied_reading_t *reading, cons
 	{
 		std_slice_to_vec_Checked(&copy.key, key.ptr, key.len, 1, 1);
 		std_vec_new(&copy.records, sizeof(StdVec), _Alignof(StdVec));
-		std_vec_new(&copy.handles, sizeof(txn_TupleHandleU64_t), _Alignof(txn_TupleHandleU64_t));
+		std_vec_new(&copy.handles, sizeof(txn_TupleHandleU64Bool_t), _Alignof(txn_TupleHandleU64Bool_t));
 		for (size_t k = 0; k < chain.len; k++)
 		{
 			const TxnMemtableVersionVersion *version = &STD_VEC_AT(&chain, TxnMemtableVersionVersion, k);
 			TxnMemtableVersionRecord record = txn_memtable_version_Version_record(version);
 			TxnMemtableVersionWriter writer = txn_memtable_version_Record_writer(&record);
-			txn_TupleHandleU64_t handle = {version->handle, writer.has_top ? writer.top : writer.xid};
+			txn_TupleHandleU64Bool_t handle = {version->handle, writer.has_top ? writer.top : writer.xid,
+			txn_memtable_version_Version_killed(version)};
 
-			std_vec_push_Checked(&copy.handles, &handle, sizeof(handle), _Alignof(txn_TupleHandleU64_t));
+			std_vec_push_Checked(&copy.handles, &handle, sizeof(handle), _Alignof(txn_TupleHandleU64Bool_t));
 			if (reading->killed || !txn_memtable_version_Version_killed(version))
 			{
 				StdVec		stored;
@@ -3895,7 +4676,7 @@ typedef struct txn_memtable_table_copied_frame_0_t
 	HostSharedRecord owner;
 	bool		killed;
 	bool		(*each) (void *captures, HostIoIo *io, const uint8 *key, size_t key_len, const StdVec *records,
-						 size_t records_len, const txn_TupleHandleU64_t *handles, size_t handles_len,
+						 size_t records_len, const txn_TupleHandleU64Bool_t *handles, size_t handles_len,
 						 HostError *error);
 	void	   *captures;
 	HostError  *error;
@@ -4006,12 +4787,12 @@ txn_memtable_table_copied_body_0(void *frame_)
  * txn_memtable_table_copied hands out every key of a tree's memtable that
  * has a version, in byte order, with its versions' records newest first, as
  * a checkpoint's runs write them, a speculative insert its writer killed
- * among them only when killed says so, and every version's handle and its
- * writer's top-level xid, newest first, the killed included. Each step
- * copies one range's keys from the walk's place up to the key the step stops
- * at, the next entry's first key, under the range's shared lock, and hands
- * them out with the lock released, so no lock is held across the caller's
- * writes; it goes on from that key. A range that splits or is emptied and
+ * among them only when killed says so, and every version's handle, its
+ * writer's top-level xid, and whether it is killed, newest first, the killed
+ * included. Each step copies one range's keys from the walk's place up to
+ * the key the step stops at, the next entry's first key, under the range's
+ * shared lock, and hands them out with the lock released, so no lock is held
+ * across the caller's writes; it goes on from that key. A range that splits or is emptied and
  * retired between the steps leaves no key skipped or handed out twice.
  * Copying allocates, since a range's records must outlive its lock.
  */
@@ -4019,7 +4800,7 @@ bool
 txn_memtable_table_copied(const TxnMemtableTableTreeOps *tree, HostIoIo *io, HostSharedRecord owner, bool killed,
 						  bool (*each) (void *captures, HostIoIo *io, const uint8 *key, size_t key_len,
 										const StdVec *records, size_t records_len,
-										const txn_TupleHandleU64_t *handles, size_t handles_len, HostError *error),
+										const txn_TupleHandleU64Bool_t *handles, size_t handles_len, HostError *error),
 						  void *captures, HostError *error)
 {
 	txn_memtable_table_copied_frame_0_t frame = {.tree = tree, .io = io, .owner = owner, .killed = killed,
@@ -4040,7 +4821,7 @@ typedef struct txn_memtable_table_walk_t
 /* txn_memtable_table_walk_each hands a key with records to the caller's each, passing over one with none. */
 static bool
 txn_memtable_table_walk_each(void *captures, HostIoIo *io, const uint8 *key, size_t key_len, const StdVec *records,
-							 size_t records_len, const txn_TupleHandleU64_t *handles, size_t handles_len,
+							 size_t records_len, const txn_TupleHandleU64Bool_t *handles, size_t handles_len,
 							 HostError *error)
 {
 	txn_memtable_table_walk_t *walk = captures;
@@ -4211,6 +4992,7 @@ txn_memtable_table_step(const TxnMemtableTableTreeOps *tree, HostIoIo *io, const
 						StdVec *stop, HostError *error)
 {
 	*some = false;
+	*has_stop = false;
 	for (;;)
 	{
 		uint64		location;
@@ -5527,27 +6309,61 @@ txn_memtable_table_nearest(HostIoIo *io, const HostDeltaHold *hold, HostSharedRe
 }
 
 /*
- * txn_memtable_table_next lends the nearest key past a key, or before it
- * going backward, or the first or the last with none, that a storage's rows
- * hold a version of, in the memtable or its spills, with its versions newest
- * first, the memtable's and then the spills' for a key both hold, for a
- * caller's hold; it answers nothing past the last.
+ * txn_memtable_table_next_read_t is next's read's captures: its arguments,
+ * the key it lends with its memtable versions, and the key's spilled
+ * versions, while it lends a key.
  */
-bool
-txn_memtable_table_next(HostIoIo *io, const HostDeltaHold *hold, HostSharedRecord state, bool has_after,
-						const uint8 *after, size_t after_len, TxnMemtableTableDirection way, bool *some,
-						txn_TupleVecU8VecVersion_t *result, HostError *error)
+typedef struct txn_memtable_table_next_read_t
 {
+	HostIoIo   *io;
+	const HostDeltaHold *hold;
+	HostSharedRecord state;
+	bool		has_after;
+	const uint8 *after;
+	size_t		after_len;
+	TxnMemtableTableDirection way;
+	bool	   *some;
+	txn_TupleVecU8VecVersion_t *result;
+	StdVec		spilled;
+} txn_memtable_table_next_read_t;
+
+/* txn_memtable_table_next_dropped drops the key a read of next lent. */
+static void
+txn_memtable_table_next_dropped(void *captures)
+{
+	txn_memtable_table_next_read_t *c = captures;
+
+	if (*c->some)
+	{
+		txn_memtable_table_Versions_drop(c->result);
+		txn_memtable_version_versions_drop(&c->spilled, 0);
+	}
+	*c->some = false;
+}
+
+/*
+ * txn_memtable_table_next_read is next's read: the memtable's nearest key,
+ * then the spills', the nearer lent, its spilled versions apart.
+ */
+static bool
+txn_memtable_table_next_read(void *captures, uint64 *listed, HostError *error)
+{
+	txn_memtable_table_next_read_t *c = captures;
+	HostIoIo   *io = c->io;
+	TxnMemtableTableDirection way = c->way;
+	bool	   *some = c->some;
+	txn_TupleVecU8VecVersion_t *result = c->result;
 	bool		has_delta;
 	txn_TupleVecU8VecVersion_t delta;
 	bool		has_spilled;
 	txn_TupleVecU8VecVersion_t spilled;
 
 	*some = false;
-	if (!txn_memtable_table_nearest(io, hold, state, has_after, after, after_len, way, &has_delta, &delta, error))
+	if (!txn_memtable_table_nearest(io, c->hold, c->state, c->has_after, c->after, c->after_len, way, &has_delta,
+									&delta, error))
 		return false;
-	if (!txn_spill_next(&TXN_SPILL_STATE_HOME_OPS, io, hold, state, TXN_RUNS_KIND_SPILLED_ROWS, has_after, after,
-						after_len, way, &has_spilled, &spilled, error))
+	if (!txn_spill_next(&TXN_SPILL_STATE_HOME_OPS, io, c->hold, c->state, TXN_RUNS_KIND_SPILLED_ROWS, c->has_after,
+						c->after, c->after_len, way, listed, &has_spilled, &spilled, error))
 	{
 		if (has_delta)
 			txn_memtable_table_Versions_drop(&delta);
@@ -5559,32 +6375,68 @@ txn_memtable_table_next(HostIoIo *io, const HostDeltaHold *hold, HostSharedRecor
 
 		if (order == STD_ORDERING_EQUAL)
 		{
-			std_vec_extend_from_slice_Checked(&delta.f1, spilled.f1.ptr, spilled.f1.len,
-											  sizeof(TxnMemtableVersionVersion),
-											  _Alignof(TxnMemtableVersionVersion));
 			std_vec_free_Checked(&spilled.f0, 1, 1);
-			std_vec_free_Checked(&spilled.f1, sizeof(TxnMemtableVersionVersion),
-								 _Alignof(TxnMemtableVersionVersion));
+			c->spilled = spilled.f1;
 			*result = delta;
 		}
 		else if (way == TXN_MEMTABLE_TABLE_DIRECTION_FORWARD ? order == STD_ORDERING_LESS :
 				 order == STD_ORDERING_GREATER)
 		{
 			txn_memtable_table_Versions_drop(&delta);
-			*result = spilled;
+			c->spilled = spilled.f1;
+			result->f0 = spilled.f0;
+			std_vec_new(&result->f1, sizeof(TxnMemtableVersionVersion), _Alignof(TxnMemtableVersionVersion));
 		}
 		else
 		{
 			txn_memtable_table_Versions_drop(&spilled);
+			std_vec_new(&c->spilled, sizeof(TxnMemtableVersionVersion), _Alignof(TxnMemtableVersionVersion));
 			*result = delta;
 		}
 		*some = true;
 	}
-	else if (has_delta || has_spilled)
+	else if (has_delta)
 	{
-		*result = has_delta ? delta : spilled;
+		std_vec_new(&c->spilled, sizeof(TxnMemtableVersionVersion), _Alignof(TxnMemtableVersionVersion));
+		*result = delta;
 		*some = true;
 	}
+	else if (has_spilled)
+	{
+		c->spilled = spilled.f1;
+		result->f0 = spilled.f0;
+		std_vec_new(&result->f1, sizeof(TxnMemtableVersionVersion), _Alignof(TxnMemtableVersionVersion));
+		*some = true;
+	}
+	return true;
+}
+
+/*
+ * txn_memtable_table_next lends the nearest key past a key, or before it
+ * going backward, or the first or the last with none, that a storage's rows
+ * hold a version of, in the memtable or its spills, with its versions newest
+ * first, the spills' placed among the memtable's in commit order (bugs row
+ * 397), for a caller's hold; it answers nothing past the last.
+ */
+bool
+txn_memtable_table_next(HostIoIo *io, const HostDeltaHold *hold, HostSharedRecord state, bool has_after,
+						const uint8 *after, size_t after_len, TxnMemtableTableDirection way, bool *some,
+						txn_TupleVecU8VecVersion_t *result, HostError *error)
+{
+	txn_memtable_table_next_read_t captures = {io, hold, state, has_after, after, after_len, way, some, result};
+
+	*some = false;
+	if (!txn_spill_taken(&TXN_SPILL_STATE_HOME_OPS, io, state, txn_memtable_table_next_read,
+						 txn_memtable_table_next_dropped, &captures, error))
+		return false;
+	if (!*some)
+		return true;
+	if (!txn_spill_ordered(io, &result->f1, &captures.spilled, error))
+	{
+		txn_memtable_table_next_dropped(&captures);
+		return false;
+	}
+	std_vec_free_Checked(&captures.spilled, sizeof(TxnMemtableVersionVersion), _Alignof(TxnMemtableVersionVersion));
 	return true;
 }
 
@@ -8010,7 +8862,8 @@ txn_memtable_table_tests_raw_body_0(void *frame_)
 		change.op = &frame->op;
 		std_vec_new(&frame->buffer, 1, 1);
 		frame->buffer_live = true;
-		if (!txn_memtable_version_push(&open, &frame->hold, frame->key.ptr, frame->key.len, &change, &frame->has_fresh,
+		if (!txn_memtable_version_push(&open, &frame->hold, frame->key.ptr, frame->key.len, &change, false,
+									   &frame->has_fresh,
 									   &frame->fresh, &frame->spare, &frame->buffer, &pushed, frame->error))
 		{
 			txn_memtable_table_tests_raw_pad_0(frame);
@@ -9071,6 +9924,8 @@ txn_memtable_table_tests_taken_bool_Debug_fmt(const void *value, StdFormatter *f
 			return std_DebugTuple_finish(&tuple);
 		case TXN_MEMTABLE_MAP_TAKEN_RETRY:
 			return std_fmt_write_str(f, "Retry", 5);
+		case TXN_MEMTABLE_MAP_TAKEN_MOVED:
+			return std_fmt_write_str(f, "Moved", 5);
 		default:
 			return std_fmt_write_str(f, "Refused", 7);
 	}
@@ -9126,7 +9981,8 @@ txn_memtable_table_tests_first_insert_inside(void *captures, HostIoIo *io, TxnMe
 	*result_0 = txn_memtable_table_memtable(&TXN_MEMTABLE_TABLE_ROWS_TREE_OPS, c->state, &location);
 	*result_1 = txn_memtable_table_memtable(&TXN_MEMTABLE_MAP_FREE_TREE_OPS, c->state, &location);
 	return txn_memtable_map_finish_Bool(HOST_IO_IO_TAKES_SHORT(io), prepared, 0, txn_memtable_testing_writer(7), false,
-										0, false, NULL, 0, txn_memtable_table_tests_free_step, NULL, NULL,
+										roomed, false,
+										0, false, NULL, 0, NULL, txn_memtable_table_tests_free_step, NULL, NULL,
 										txn_memtable_table_tests_free_then, NULL, NULL, result_2, result_3, error) &&
 		txn_memtable_table_finish(HOST_IO_IO_TAKES_SHORT(io), prepared, c->change, false, roomed, &handle, error);
 }
@@ -10991,7 +11847,7 @@ txn_memtable_table_tests_prunes(uint32 line, uint32 col, HostIoIo *io, HostShare
 {
 	HostError	error;
 
-	if (!txn_memtable_table_pruned(&TXN_MEMTABLE_TABLE_ROWS_TREE_OPS, io, state, (const uint8 *) key, strlen(key), false,
+	if (!txn_memtable_table_pruned(&TXN_MEMTABLE_TABLE_ROWS_TREE_OPS, io, state, (const uint8 *) key, strlen(key), NULL,
 								   0, &error))
 		STD_RESULT_EXPECT_FAILED(line, col, "called `Result::unwrap()` on an `Err` value", &error,
 								 host_Error_Debug_fmt);
@@ -11097,14 +11953,12 @@ txn_memtable_table_tests_wrote(HostIoIo *io, HostSharedRecord state, const HostS
 }
 
 /*
- * 2g's take-back: the keys a transaction wrote to, recorded in its list, are
- * pruned at its abort, which Postgres records first, so its versions go and
- * another transaction's committed ones stay; a subtransaction's abort takes
- * back only the keys it and its children wrote to since its mark, and its
- * parent's stay listed and kept.
+ * An abort, a subtransaction's or its top's, leaves the versions its writers
+ * pushed beside another transaction's committed ones, for the fold's logged
+ * decision to drop (bugs row 432).
  */
 void
-test_txn_memtable_table_tests_an_abort_takes_back_the_versions_of_the_keys_its_transaction_wrote_to(void)
+test_txn_memtable_table_tests_an_abort_leaves_its_transactions_versions_for_a_fold(void)
 {
 	SimcTestIo	test_io = simc_io();
 	HostIoIo   *io = &test_io.io;
@@ -11114,13 +11968,12 @@ test_txn_memtable_table_tests_an_abort_takes_back_the_versions_of_the_keys_its_t
 	HostXid		top = simc_begin();
 	HostXid		other = simc_begin();
 	HostXid		sub;
-	TxnMemtableVersionHandle kept;
 	HostError	error;
 	StdVec		handles;
 	size_t		len;
 	size_t		two = 2;
 
-	kept = txn_memtable_table_tests_wrote(io, state, &at, other, "a");
+	(void) txn_memtable_table_tests_wrote(io, state, &at, other, "a");
 	simc_commit(other);
 	(void) txn_memtable_table_tests_wrote(io, state, &at, top, "a");
 	if (!txn_written_sub_started(io, 2, &error))
@@ -11133,17 +11986,16 @@ test_txn_memtable_table_tests_an_abort_takes_back_the_versions_of_the_keys_its_t
 		STD_RESULT_EXPECT_FAILED(3495, 44, "called `Result::unwrap()` on an `Err` value", &error,
 								 host_Error_Debug_fmt);
 	txn_memtable_table_tests_handles_of(3497, 40, 45, io, state, (const uint8 *) "b", 1, &handles);
-	STD_ASSERT(3500, 9, handles.len == 0, "handles(io, b\"b\").is_empty()");
+	STD_ASSERT(3500, 9, handles.len == 1, "the subtransaction's abort leaves its version");
 	std_vec_free_Checked(&handles, sizeof(TxnMemtableVersionHandle), _Alignof(TxnMemtableVersionHandle));
+	simc_abort(top);
+	if (!txn_written_aborted(io, 0, &error))
+		STD_RESULT_EXPECT_FAILED(3503, 37, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
 	txn_memtable_table_tests_handles_of(3497, 40, 45, io, state, (const uint8 *) "a", 1, &handles);
 	len = handles.len;
 	std_vec_free_Checked(&handles, sizeof(TxnMemtableVersionHandle), _Alignof(TxnMemtableVersionHandle));
 	STD_ASSERT_EQ(3501, 9, len == 2, &len, std_usize_Debug_fmt, &two, std_usize_Debug_fmt);
-	simc_abort(top);
-	if (!txn_written_aborted(io, &error))
-		STD_RESULT_EXPECT_FAILED(3503, 37, "called `Result::unwrap()` on an `Err` value", &error,
-								 host_Error_Debug_fmt);
-	txn_memtable_table_tests_handles_are(3504, 3497, 45, io, state, (const uint8 *) "a", 1, &kept, 1);
 	host_shared_Held_drop(&held);
 	simc_TestIo_drop(&test_io);
 }
@@ -12346,13 +13198,13 @@ txn_memtable_table_tests_written_by(HostIoIo *io, HostSharedRecord state, const 
 }
 
 /*
- * CommPF 7's condition on 2g's take-back: a subtransaction's write rolled
- * back while its top-level transaction commits goes at the subtransaction's
- * abort, since the prune asks about the version's own writer, and the
- * top-level's write stays after its commit ends the list.
+ * A subtransaction's write rolled back while its top-level transaction
+ * commits stays after the subtransaction's abort and the top's commit, for the
+ * fold's logged decision to drop, and the top-level's write stays (bugs row
+ * 432).
  */
 void
-test_txn_memtable_table_tests_a_subtransactions_write_rolled_back_while_its_top_commits_is_taken_back_and_the_tops_kept(void)
+test_txn_memtable_table_tests_a_subtransactions_write_rolled_back_while_its_top_commits_stays_for_a_fold(void)
 {
 	SimcTestIo	test_io = simc_io();
 	HostIoIo   *io = &test_io.io;
@@ -12383,80 +13235,9 @@ test_txn_memtable_table_tests_a_subtransactions_write_rolled_back_while_its_top_
 		STD_RESULT_EXPECT_FAILED(3959, 35, "called `Result::unwrap()` on an `Err` value", &error,
 								 host_Error_Debug_fmt);
 	txn_memtable_table_tests_handles_of(3961, 40, 45, io, state, (const uint8 *) "b", 1, &handles);
-	STD_ASSERT(3964, 9, handles.len == 0, "handles(io, b\"b\").is_empty()");
+	STD_ASSERT(3964, 9, handles.len == 1, "the rolled-back write stays");
 	std_vec_free_Checked(&handles, sizeof(TxnMemtableVersionHandle), _Alignof(TxnMemtableVersionHandle));
 	txn_memtable_table_tests_handles_are(3965, 3961, 45, io, state, (const uint8 *) "a", 1, &kept, 1);
-	host_shared_Held_drop(&held);
-	simc_TestIo_drop(&test_io);
-}
-
-/* txn_memtable_table_tests_count returns the count of a key's versions lent for a hold of its own, as the cap case's count closure does. */
-static size_t
-txn_memtable_table_tests_count(HostIoIo *io, HostSharedRecord state, const char *key)
-{
-	HostDeltaHold hold;
-	HostError	error;
-	StdVec		lent;
-	size_t		count;
-
-	if (!host_delta_hold(io, &hold, &error))
-		STD_RESULT_EXPECT_FAILED(3996, 40, "called `Result::unwrap()` on an `Err` value", &error,
-								 host_Error_Debug_fmt);
-	txn_memtable_table_tests_lent(3997, 45, io, &hold, state, (const uint8 *) key, strlen(key), &lent);
-	count = lent.len;
-	txn_memtable_table_tests_lent_free(&lent);
-	host_delta_Hold_drop(&hold);
-	return count;
-}
-
-/*
- * 2g's take-back past its list's cap: a transaction that wrote to more keys
- * than the list keeps aborts, the take-back removes the listed keys'
- * versions, and the next prune over a key past the cap removes its version.
- */
-void
-test_txn_memtable_table_tests_a_transaction_past_the_lists_cap_leaves_its_unlisted_versions_to_the_next_prune(void)
-{
-	SimcTestIo	test_io = simc_io();
-	HostIoIo   *io = &test_io.io;
-	HostSharedHeld held = txn_memtable_testing_created(io, 9386);
-	HostSharedRecord state = host_shared_Held_record(&held);
-	HostStorage at = txn_memtable_testing_storage(9386);
-	HostXid		aborted = simc_begin();
-	TxnMemtableVersionWriter writer = txn_memtable_testing_writer(aborted.f0);
-	HostError	error;
-	StdTupleRef left;
-	StdTupleRef right;
-	size_t		counts[2];
-	size_t		wanted[2] = {0, 1};
-	size_t		past;
-	size_t		zero = 0;
-
-	txn_memtable_table_tests_touches(3986, 85, io, &at, (const uint8 *) "listed", 6);
-	(void) txn_memtable_table_tests_pushes(3987, 45, io, state, "listed", writer);
-	for (uint64 number = 0; number < TXN_WRITTEN_CAP; number++)
-	{
-		StdVec		key;
-
-		txn_memtable_testing_numbered(number, &key);
-		txn_memtable_table_tests_touches(3989, 97, io, &at, key.ptr, key.len);
-		std_vec_free_Checked(&key, 1, 1);
-	}
-	txn_memtable_table_tests_touches(3991, 83, io, &at, (const uint8 *) "past", 4);
-	(void) txn_memtable_table_tests_pushes(3992, 43, io, state, "past", writer);
-	simc_abort(aborted);
-	if (!txn_written_aborted(io, &error))
-		STD_RESULT_EXPECT_FAILED(3994, 37, "called `Result::unwrap()` on an `Err` value", &error,
-								 host_Error_Debug_fmt);
-	counts[0] = txn_memtable_table_tests_count(io, state, "listed");
-	counts[1] = txn_memtable_table_tests_count(io, state, "past");
-	left = STD_TUPLE(2, STD_ITEM(&counts[0], std_usize_Debug_fmt), STD_ITEM(&counts[1], std_usize_Debug_fmt));
-	right = STD_TUPLE(2, STD_ITEM(&wanted[0], std_usize_Debug_fmt), STD_ITEM(&wanted[1], std_usize_Debug_fmt));
-	STD_ASSERT_EQ(3999, 9, counts[0] == 0 && counts[1] == 1, &left, std_tuple_Debug_fmt, &right,
-				  std_tuple_Debug_fmt);
-	txn_memtable_table_tests_prunes(4000, 50, io, state, "past");
-	past = txn_memtable_table_tests_count(io, state, "past");
-	STD_ASSERT_EQ(4001, 9, past == 0, &past, std_usize_Debug_fmt, &zero, std_usize_Debug_fmt);
 	host_shared_Held_drop(&held);
 	simc_TestIo_drop(&test_io);
 }
@@ -13346,7 +14127,7 @@ test_txn_memtable_table_tests_a_prepare_with_no_tuple_slot_leaves_its_unstored_s
 	TxnMemtableVersionChange change = {.writer = txn_memtable_testing_writer(7), .op = &op,
 	.lock = TXN_MEMTABLE_LOCK_MODE_UPDATE, .shown = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND}};
 	TxnMemtableVersionHandle handle;
-	txn_memtable_table_alone_t alone = {&change, &handle};
+	txn_memtable_table_alone_t alone = {.change = &change, .result = &handle};
 	TxnMemtableTableAim aims[1] = {{.owner = host_shared_Held_record(&held), .tree = &TXN_MEMTABLE_TABLE_ROWS_TREE_OPS,
 	.key = {(const uint8 *) "k", 1}, .need = txn_memtable_version_encoded(&change.writer, &op, change.shown, false, 0)}};
 	TxnMemtableTableReservation tuple = {UINT64CONST(0xA11)};
@@ -13355,12 +14136,350 @@ test_txn_memtable_table_tests_a_prepare_with_no_tuple_slot_leaves_its_unstored_s
 	HostError	error;
 
 	if (!txn_memtable_table_prepared(io, aims, 1, false, tuple, txn_memtable_table_alone_inside, &alone, NULL,
-									 &has_unstored, &unstored, &error))
+									 &has_unstored, &unstored, NULL, &error))
 		STD_RESULT_EXPECT_FAILED(__LINE__, 5, "called `Result::unwrap()` on an `Err` value", &error,
 								 host_Error_Debug_fmt);
 	STD_ASSERT(__LINE__, 5, !has_unstored && unstored.place == UINT64CONST(0x5EED),
 			   "a prepare with no tuple id slot answers none and leaves its unstored slot as it was");
 	txn_memtable_Op_drop(&op);
+	host_shared_Held_drop(&held);
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * A refused try takes nothing: with one free block left, a prepare whose
+ * tree has no memtable and whose push needs a whole block for its version is
+ * refused in one allocation, the memtable's first page with its reserve, and
+ * leaves no memtable, range record, or page behind for a walk to close and
+ * free.
+ */
+void
+test_txn_memtable_table_tests_a_refused_try_leaves_no_memtable_range_or_page_behind(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedHeld held;
+	HostSharedRecord state;
+	HostDeltaPageSize block = {.bytes = (64 << 10) - 8, .words = 1};
+	TxnMemtableOp op = txn_memtable_testing_put((const uint8 *) "v", 1);
+	TxnMemtableVersionChange change = {.writer = txn_memtable_testing_writer(7), .op = &op,
+	.lock = TXN_MEMTABLE_LOCK_MODE_UPDATE, .shown = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND}};
+	TxnMemtableVersionHandle handle;
+	txn_memtable_table_alone_t alone = {.change = &change, .result = &handle};
+	TxnMemtableTableAim aims[1];
+	TxnMemtableTableReservation none = {0};
+	TxnMemtableTableReservation unstored = {0};
+	TxnMemtableTableRefusal refusal = {0};
+	StdVec		filler;
+	HostError	error;
+	size_t		ranges_before;
+	size_t		pages_before;
+	size_t		ranges_after;
+	size_t		pages_after;
+	uint64		location;
+	bool		has_unstored = false;
+
+	simc_size_delta(UINT64CONST(4) << 16);
+	held = txn_memtable_testing_created(io, 9791);
+	state = host_shared_Held_record(&held);
+	aims[0] = (TxnMemtableTableAim)
+	{
+		.owner = state, .tree = &TXN_MEMTABLE_TABLE_ROWS_TREE_OPS, .key =
+		{
+			(const uint8 *) "k", 1
+		}, .need = 40000
+	};
+	std_vec_new(&filler, sizeof(HostDeltaOwned), _Alignof(HostDeltaOwned));
+	for (;;)
+	{
+		StdVec		pages;
+		HostDeltaFull full;
+		bool		allocated;
+
+		if (!host_delta_alloc(io, &block, 1, &allocated, &pages, &full, &error))
+			STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+									 host_Error_Debug_fmt);
+		if (!allocated)
+			break;
+		std_vec_push_Checked(&filler, &STD_VEC_AT(&pages, HostDeltaOwned, 0), sizeof(HostDeltaOwned),
+							 _Alignof(HostDeltaOwned));
+		std_vec_free_Checked(&pages, sizeof(HostDeltaOwned), _Alignof(HostDeltaOwned));
+	}
+	STD_ASSERT(__LINE__, 9, filler.len > 0, "!filler.is_empty()");
+	filler.len--;
+	host_delta_Owned_drop(&STD_VEC_AT(&filler, HostDeltaOwned, filler.len));
+	simc_unfreed(TXN_MEMTABLE_RANGE_RANGE_AGED_OPS.shape.id, &ranges_before, &pages_before);
+	if (!txn_memtable_table_prepared(io, aims, 1, false, none, txn_memtable_table_alone_inside, &alone, NULL,
+									 &has_unstored, &unstored, &refusal, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT(__LINE__, 9, refusal.refused, "refusal.refused");
+	STD_ASSERT(__LINE__, 9, !txn_memtable_table_memtable(&TXN_MEMTABLE_TABLE_ROWS_TREE_OPS, state, &location),
+			   "the refused try made no memtable");
+	simc_unfreed(TXN_MEMTABLE_RANGE_RANGE_AGED_OPS.shape.id, &ranges_after, &pages_after);
+	STD_ASSERT_EQ_U64(__LINE__, 9, ranges_after, ranges_before);
+	STD_ASSERT_EQ_U64(__LINE__, 9, pages_after, pages_before);
+	std_vec_clear(&filler, sizeof(HostDeltaOwned), host_delta_Owned_drop);
+	std_vec_free_Checked(&filler, sizeof(HostDeltaOwned), _Alignof(HostDeltaOwned));
+	txn_memtable_Op_drop(&op);
+	host_shared_Held_drop(&held);
+	simc_TestIo_drop(&test_io);
+}
+
+
+/*
+ * The refused try of two trees (bugs row 291's review F2): a prepare whose
+ * two trees, the rows and the free space map, both lack a memtable takes
+ * the delta's pages in one allocation and then every memtable's range and
+ * memtable records before it makes either, so a take that fails, the
+ * allocation or any of the four records, the second tree's included, leaves
+ * neither memtable and no range record or page behind (bugs row 321).
+ */
+void
+test_txn_memtable_table_tests_a_refused_try_of_two_trees_leaves_neither_memtable_behind(void)
+{
+	for (uint64 after = 0; after < 5; after++)
+	{
+		SimcTestIo	test_io = simc_io();
+		HostIoIo   *io = &test_io.io;
+		HostSharedHeld held = txn_memtable_testing_created(io, 9792);
+		HostSharedRecord state = host_shared_Held_record(&held);
+		TxnMemtableOp op = txn_memtable_testing_put((const uint8 *) "v", 1);
+		TxnMemtableVersionChange change = {.writer = txn_memtable_testing_writer(7), .op = &op,
+		.lock = TXN_MEMTABLE_LOCK_MODE_UPDATE, .shown = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND}};
+		TxnMemtableVersionHandle handle;
+		txn_memtable_table_alone_t alone = {.change = &change, .result = &handle};
+		static const uint8 block[4] = {0};
+		TxnMemtableTableAim aims[2] = {
+			{.owner = state, .tree = &TXN_MEMTABLE_TABLE_ROWS_TREE_OPS, .key = {(const uint8 *) "k", 1}, .need = 64},
+		{.owner = state, .tree = &TXN_MEMTABLE_MAP_FREE_TREE_OPS, .key = {block, sizeof(block)}, .need = 64}};
+		TxnMemtableTableReservation none = {0};
+		TxnMemtableTableReservation unstored = {0};
+		TxnMemtableTableRefusal refusal = {0};
+		HostError	error;
+		size_t		ranges_before;
+		size_t		pages_before;
+		size_t		ranges_after;
+		size_t		pages_after;
+		uint64		location;
+		bool		has_unstored = false;
+		bool		prepared;
+
+
+		simc_unfreed(TXN_MEMTABLE_RANGE_RANGE_AGED_OPS.shape.id, &ranges_before, &pages_before);
+		simc_refuse_any_take(after);
+		prepared = txn_memtable_table_prepared(io, aims, 2, false, none, txn_memtable_table_alone_inside, &alone, NULL,
+											   &has_unstored, &unstored, &refusal, &error);
+		simc_refuse_nothing();
+		if (prepared)
+			STD_ASSERT(__LINE__, 9, refusal.refused, "a try refused at a take is refused, or fails");
+		else
+			host_Error_drop(&error);
+		STD_ASSERT(__LINE__, 9, !txn_memtable_table_memtable(&TXN_MEMTABLE_TABLE_ROWS_TREE_OPS, state, &location),
+				   "the refused try made no rows memtable");
+		STD_ASSERT(__LINE__, 9, !txn_memtable_table_memtable(&TXN_MEMTABLE_MAP_FREE_TREE_OPS, state, &location),
+				   "the refused try made no free space map memtable");
+		simc_unfreed(TXN_MEMTABLE_RANGE_RANGE_AGED_OPS.shape.id, &ranges_after, &pages_after);
+		STD_ASSERT_EQ_U64(__LINE__, 9, ranges_after, ranges_before);
+		STD_ASSERT_EQ_U64(__LINE__, 9, pages_after, pages_before);
+		txn_memtable_Op_drop(&op);
+		host_shared_Held_drop(&held);
+		simc_TestIo_drop(&test_io);
+	}
+}
+
+/* txn_memtable_table_tests_mover_t is the moved page case's mover's captures: the range and the page a packing moves, and whether it moved it. */
+typedef struct txn_memtable_table_tests_mover_t
+{
+	uint64		range;
+	uint64		name;
+	bool		moved;
+} txn_memtable_table_tests_mover_t;
+
+/* txn_memtable_table_tests_mover is the moved page case's mover: a packing's move of the range's only page, under a hold of its own. */
+static bool
+txn_memtable_table_tests_mover(void *captures, HostIoIo *io, HostError *error)
+{
+	txn_memtable_table_tests_mover_t *c = captures;
+	HostDeltaDirectoryPacked packed = {c->name, TXN_MEMTABLE_RANGE_RANGE_AGED_OPS.shape.id, c->range,
+	txn_memtable_table_first_size()};
+	HostDeltaHold hold;
+	bool		ok;
+
+	if (!host_delta_hold(io, &hold, error))
+		return false;
+	ok = txn_memtable_table_moved(io, &hold, &packed, &c->moved, error);
+	host_delta_Hold_drop(&hold);
+	return ok;
+}
+
+/*
+ * txn_memtable_table_tests_mid_move_t is the moved page case's reader's
+ * captures: the range and its old page, the old page's filled bytes before
+ * the move, and what the reader saw while the move was paused.
+ */
+typedef struct txn_memtable_table_tests_mid_move_t
+{
+	uint64		range;
+	uint64		old;
+	uint64		filled;
+	bool		linked;
+	bool		kept;
+} txn_memtable_table_tests_mid_move_t;
+
+/*
+ * txn_memtable_table_tests_mid_move is the moved page case's reader, run
+ * while the move is paused between the copy's link and the old page's
+ * retirement: it sees the range's list name the copy, reads the old page as
+ * it was, and writes a second key, which lands on the copy.
+ */
+static bool
+txn_memtable_table_tests_mid_move(void *captures, HostIoIo *io, HostError *error)
+{
+	txn_memtable_table_tests_mid_move_t *c = captures;
+	HostSharedHeld held;
+	HostDeltaHold hold;
+	HostDeltaPageRef page;
+
+	c->linked = txn_memtable_table_tests_entry(io, c->range, 0) != c->old;
+	if (!host_delta_hold(io, &hold, error))
+		return false;
+	if (!host_delta_Hold_page(&hold, host_delta_page_Page_named(c->old), &page, error))
+	{
+		host_delta_Hold_drop(&hold);
+		return false;
+	}
+	c->kept = host_delta_PageRef_filled(&page) == c->filled;
+	host_delta_Hold_drop(&hold);
+	if (!txn_memtable_testing_stated(io, 9443, &held, error))
+		return false;
+	txn_memtable_table_tests_numbered_writes(__LINE__, 9, io, host_shared_Held_record(&held), 1);
+	host_shared_Held_drop(&held);
+	return true;
+}
+
+/*
+ * A packing's move of a range's only page, its first and its newest (bugs
+ * row 143), paused between the copy's link and the old page's retirement:
+ * another process then sees the range's list name the copy, reads the old
+ * page as it was, and writes a key that lands on the copy; this process's
+ * hold, begun before the move, keeps the retired old page unfreed until it
+ * ends; and every key reads back.
+ */
+void
+test_txn_memtable_table_tests_a_moved_only_page_stays_for_an_older_hold_and_takes_later_writes(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	uint64		start = host_delta_used();
+	HostSharedHeld held = txn_memtable_testing_created(io, 9443);
+	HostSharedRecord state = host_shared_Held_record(&held);
+	txn_memtable_table_tests_mover_t mover_captures = {0};
+	txn_memtable_table_tests_mid_move_t reader_captures = {0};
+	SimcActor	mover = {txn_memtable_table_tests_mover, &mover_captures};
+	SimcActor	reader = {txn_memtable_table_tests_mid_move, &reader_captures};
+	SimcStep	steps[1] = {{"reader", 6, PG_UINT64_MAX}};
+	SimcRun		run;
+	SimcReport	report;
+	HostError	error;
+	StdVec		ranges;
+	StdVec		keys;
+	uint64		kept;
+	uint64		range;
+	uint64		old;
+	size_t		ranges_held;
+	size_t		pages_held;
+	size_t		ranges_after;
+	size_t		pages_after;
+	HostDeltaHold hold;
+	HostDeltaPageRef page;
+
+	txn_memtable_table_tests_numbered_writes(__LINE__, 9, io, state, 0);
+	if (!txn_memtable_table_tests_listed(io, state, &ranges, &kept, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	range = txn_memtable_table_tests_range_at(&ranges, 0, __LINE__, 9);
+	std_vec_free_Checked(&ranges, sizeof(uint64), _Alignof(uint64));
+	old = txn_memtable_table_tests_entry(io, range, 0);
+	if (!host_delta_hold(io, &hold, &error) ||
+		!host_delta_Hold_page(&hold, host_delta_page_Page_named(old), &page, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	mover_captures.range = reader_captures.range = range;
+	mover_captures.name = reader_captures.old = old;
+	reader_captures.filled = host_delta_PageRef_filled(&page);
+	run = simc_Run_new(1);
+	simc_Run_actor(&run, "mover", 5, mover);
+	simc_Run_actor(&run, "reader", 6, reader);
+	simc_Run_until(&run, "mover", 5, "doltgres-memtable-moved");
+	simc_Run_script(&run, steps, lengthof(steps));
+	report = simc_Run_finish(run);
+	txn_memtable_table_tests_returned(&report);
+	simc_Report_drop(&report);
+	STD_ASSERT(__LINE__, 9, mover_captures.moved, "the packing's move moves the range's only page");
+	STD_ASSERT(__LINE__, 9, reader_captures.linked, "the move links its copy over the range's only page");
+	STD_ASSERT(__LINE__, 9, reader_captures.kept, "the old page reads as it was while the move is paused");
+	txn_memtable_table_tests_passed(io);
+	if (!host_delta_Hold_page(&hold, host_delta_page_Page_named(old), &page, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	simc_unfreed(TXN_MEMTABLE_RANGE_RANGE_AGED_OPS.shape.id, &ranges_held, &pages_held);
+	host_delta_Hold_drop(&hold);
+	txn_memtable_table_tests_passed(io);
+	simc_unfreed(TXN_MEMTABLE_RANGE_RANGE_AGED_OPS.shape.id, &ranges_after, &pages_after);
+	STD_ASSERT(__LINE__, 9, pages_after < pages_held, "the old page frees once the older hold ends");
+	txn_memtable_table_tests_on_page(io, state, 0, &keys);
+	STD_ASSERT_EQ_U64(__LINE__, 9, (uint64) keys.len, 2);
+	txn_memtable_table_tests_reads_free(&keys);
+	host_shared_Held_drop(&held);
+	txn_memtable_table_tests_unlinks(__LINE__, 9, io, 9443);
+	txn_memtable_table_tests_used_is(__LINE__, 9, io, start);
+	simc_TestIo_drop(&test_io);
+}
+
+/* txn_memtable_table_tests_unread is a step's reading that a tree with no memtable never calls. */
+static bool
+txn_memtable_table_tests_unread(void *captures, const HostDeltaHold *hold, const HostSharedGuard *guard,
+								bool has_stop, const uint8 *stop, size_t stop_len, HostError *error)
+{
+	(void) captures;
+	(void) hold;
+	(void) guard;
+	(void) has_stop;
+	(void) stop;
+	(void) stop_len;
+	(void) error;
+	STD_ASSERT(__LINE__, 5, false, "a step over no memtable reads no range");
+	return false;
+}
+
+/*
+ * A step over a tree with no memtable answers no range and no stop, whatever
+ * its caller's places held before (bugs row 472).
+ */
+void
+test_txn_memtable_table_tests_a_step_with_no_memtable_answers_no_stop(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	HostSharedHeld held = txn_memtable_testing_created(io, 4720);
+	HostDeltaHold hold;
+	HostError	error;
+	StdVec		stop;
+	bool		some = true;
+	bool		has_stop = true;
+
+	std_vec_new(&stop, 1, 1);
+	if (!host_delta_hold(io, &hold, &error) ||
+		!txn_memtable_table_stepped(&TXN_MEMTABLE_TABLE_ROWS_TREE_OPS, io, &hold, host_shared_Held_record(&held), false,
+									NULL, 0, TXN_MEMTABLE_TABLE_DIRECTION_FORWARD, txn_memtable_table_tests_unread, NULL,
+									&some, &has_stop, &stop, &error))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 9, "called `Result::unwrap()` on an `Err` value", &error,
+								 host_Error_Debug_fmt);
+	STD_ASSERT(__LINE__, 5, !some, "a step over no memtable answers no range");
+	STD_ASSERT(__LINE__, 5, !has_stop, "a step over no memtable answers no stop");
+	host_delta_Hold_drop(&hold);
+	std_vec_free_Checked(&stop, 1, 1);
 	host_shared_Held_drop(&held);
 	simc_TestIo_drop(&test_io);
 }

@@ -32,17 +32,28 @@
 #include "doltgres/std/vec.h"
 #include "doltgres/trees/store.h"
 
-/* RepoSpilled is Spilled: a transaction's spill file among a checkpoint's runs, by its top-level xid and its number. */
+/*
+ * RepoSpilled is Spilled: a transaction's spill file among a checkpoint's
+ * runs, by its top-level xid and its number, for a free space map's spill its
+ * transaction's abort kept, the point a fold passes it at, and, for a fold's
+ * residual of a map's spills, the fold's point, from which readers read it.
+ */
 typedef struct RepoSpilled
 {
 	uint64		xid;
 	uint32		number;
+	bool		has_passed;
+	uint64		passed;
+	bool		has_from;
+	uint64		from;
 } RepoSpilled;
 
 /*
  * RepoRunFile is RunFile: one file of a checkpoint's runs, its tree's kind,
  * its storage's tablespace and relation, its length, the xxh3 its trailer
- * holds, and, for a transaction's spill, its xid and number.
+ * holds, for a transaction's spill, its xid and number, and the tablespace
+ * its names carry, which no move of its database changes (bugs rows 438 and
+ * 442).
  */
 typedef struct RepoRunFile
 {
@@ -53,6 +64,7 @@ typedef struct RepoRunFile
 	uint64		hash;
 	bool		has_spilled;
 	RepoSpilled spilled;
+	uint32		space;
 } RepoRunFile;
 
 /* RepoRuns is Runs: the files of the delta's runs a checkpoint wrote at its redo point, one for each tree it wrote. */
@@ -227,6 +239,15 @@ extern bool repo_Repo_save(const RepoRepo *self, HostIoIo *io, const HostSharedR
 						   void *gather_captures,
 						   bool (*saved) (void *captures, HostIoIo *io, ChunksErrorError *error),
 						   void *saved_captures, ChunksErrorError *error);
+extern bool repo_Repo_save_between(const RepoRepo *self, HostIoIo *io, const HostSharedReader *reading,
+								   RepoRuns *runs,
+								   bool (*gather) (void *captures, HostIoIo *io, const RepoRead *read, StdVec *result,
+												   ChunksErrorError *error),
+								   void *gather_captures,
+								   bool (*saved) (void *captures, HostIoIo *io, ChunksErrorError *error),
+								   void *saved_captures, ChunksErrorError *error);
+extern bool repo_Repo_records(const RepoRepo *self, HostIoIo *io, const HostSharedReader *reading, StdVec *result,
+							  ChunksErrorError *error);
 extern bool repo_Repo_rekeyed(const RepoRepo *self, HostIoIo *io, const HostSharedReader *reading, uint32 from,
 							  uint32 to, ChunksErrorError *error);
 #ifdef DOLTGRES_TEST_REPO

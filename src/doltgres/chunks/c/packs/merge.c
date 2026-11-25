@@ -536,7 +536,7 @@ chunks_packs_merge_tests_merged(HostIoIo *io, HostSharedRecord record, ChunksPac
 								ChunksPacksMergeTestsMerged *result, ChunksErrorError *error)
 {
 	result->has = false;
-	if (!chunks_packs_view_View_refresh(view, io, record, error))
+	if (!chunks_packs_view_View_refresh(view, HOST_IO_IO_TAKES_SHORT(io), record, error))
 		return false;
 	return chunks_packs_merge_tests_merge_stale(io, record, view, result, error);
 }

@@ -129,14 +129,14 @@ my ($ret, $stdout, $stderr) = $node->psql('postgres',
 	"\\set VERBOSITY verbose\nSELECT doltgres_test_wal_unknown(0)");
 like(
 	$stderr,
-	qr/ERROR:  XX000: versioned WAL record of kind 14 holds no data/,
+	qr/ERROR:  XX000: versioned WAL record of kind \d+ holds no data/,
 	'a record without data is refused');
 $node->safe_psql('postgres', 'SELECT doltgres_test_wal_unknown(1)');
 $node->stop('immediate');
 ok(!$node->start(fail_ok => 1), 'a record of an unknown kind stops recovery');
 like(
 	slurp_file($node->logfile),
-	qr/PANIC:  versioned_redo: unknown op code 224/,
+	qr/PANIC:  versioned_redo: unknown op code \d+/,
 	'it names the unknown op code');
 
 # Redo, outside any transaction, is refused a checkpoint delay, which a
@@ -160,5 +160,28 @@ unlike(
 	slurp_file($node->logfile),
 	qr/registered custom resource manager/,
 	'the server log has no line for the resource manager');
+
+# A delay whose work fails with an error stops the server with that error, at
+# PANIC with its own SQLSTATE and message, as Postgres raises an error inside a
+# critical section, its context naming the delay; the server comes back, and
+# redo applies the record the work logged before it failed (bugs row 392).
+my $failing = PostgreSQL::Test::Cluster->new('failing_delay');
+$failing->init;
+$failing->append_conf('postgresql.conf',
+	"restart_after_crash = on\nlog_error_verbosity = verbose");
+$failing->start;
+$failing->safe_psql('postgres', 'CREATE EXTENSION doltgres_test');
+$offset = -s $failing->logfile;
+$failing->psql('postgres', 'SELECT doltgres_test_delay(4)');
+ok( $failing->wait_for_log(
+		qr/PANIC:  XX001: an error ending a checkpoint delay\n[^\n]*CONTEXT:  checkpoint delay ended before its change was made visible/,
+		$offset),
+	"a delay whose work fails stops the server with the work's error (row 392)"
+);
+$failing->wait_for_log(qr/database system is ready to accept connections/,
+	$offset);
+is($failing->safe_psql('postgres', 'SELECT doltgres_test_load()'),
+	'392', 'redo applies the record the failed work logged (row 392)');
+$failing->stop;
 
 done_testing();

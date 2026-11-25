@@ -52,4 +52,8 @@ extern bool chunks_packs_writers_Writing_open(HostIoIo *io, uint64 repository, u
 extern uint64 chunks_packs_writers_Writing_number(const ChunksPacksWritersWriting *self);
 extern void chunks_packs_writers_Writing_drop(ChunksPacksWritersWriting *self);
 
+#ifdef DOLTGRES_TEST_CHUNKS
+extern void test_chunks_packs_writers_tests_a_failed_allocation_in_a_writers_number_keeps_the_open_numbers(void);
+#endif
+
 #endif							/* DOLTGRES_CHUNKS_PACKS_WRITERS_H */

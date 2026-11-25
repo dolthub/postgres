@@ -18,6 +18,7 @@
 #include "access/xloginsert.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_control.h"
+#include "doltgres/hooks.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "utils/acl.h"
@@ -116,7 +117,7 @@ heap_force_common(FunctionCallInfo fcinfo, HeapTupleForceOption heap_force_opt)
 						RelationGetRelationName(rel)),
 				 errdetail_relkind_not_supported(rel->rd_rel->relkind)));
 
-	if (rel->rd_rel->relam != HEAP_TABLE_AM_OID)
+	if (rel->rd_rel->relam != HEAP_TABLE_AM_OID || doltgres_heap_only_refused(rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("only heap AM is supported")));

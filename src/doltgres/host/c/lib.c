@@ -344,9 +344,6 @@ host_WalKind_of(uint8 value, HostWalKind *result)
 		case 5:
 			*result = HOST_WAL_KIND_REPOSITORY_DROPPED;
 			return true;
-		case 6:
-			*result = HOST_WAL_KIND_REPOSITORY_COPIED;
-			return true;
 		case 7:
 			*result = HOST_WAL_KIND_REPOSITORY_MOVED;
 			return true;
@@ -382,6 +379,12 @@ host_WalKind_of(uint8 value, HostWalKind *result)
 		case 13:
 			*result = HOST_WAL_KIND_DATABASE_CHANGE;
 			return true;
+		case 14:
+			*result = HOST_WAL_KIND_CARRY_UNLISTED;
+			return true;
+		case 16:
+			*result = HOST_WAL_KIND_FOLD_STATUSES;
+			return true;
 		default:
 			return false;
 	}
@@ -397,8 +400,6 @@ host_WalKind_value(HostWalKind self)
 			return 4;
 		case HOST_WAL_KIND_REPOSITORY_DROPPED:
 			return 5;
-		case HOST_WAL_KIND_REPOSITORY_COPIED:
-			return 6;
 		case HOST_WAL_KIND_REPOSITORY_MOVED:
 			return 7;
 		case HOST_WAL_KIND_ROW_CHANGE:
@@ -423,6 +424,10 @@ host_WalKind_value(HostWalKind self)
 			return 12;
 		case HOST_WAL_KIND_DATABASE_CHANGE:
 			return 13;
+		case HOST_WAL_KIND_CARRY_UNLISTED:
+			return 14;
+		case HOST_WAL_KIND_FOLD_STATUSES:
+			return 16;
 	}
 	pg_unreachable();
 }
@@ -437,8 +442,6 @@ host_WalKind_name(HostWalKind self)
 			return "RepositoryCreated";
 		case HOST_WAL_KIND_REPOSITORY_DROPPED:
 			return "RepositoryDropped";
-		case HOST_WAL_KIND_REPOSITORY_COPIED:
-			return "RepositoryCopied";
 		case HOST_WAL_KIND_REPOSITORY_MOVED:
 			return "RepositoryMoved";
 		case HOST_WAL_KIND_ROW_CHANGE:
@@ -459,6 +462,10 @@ host_WalKind_name(HostWalKind self)
 			return "MapCarried";
 		case HOST_WAL_KIND_DATABASE_CHANGE:
 			return "DatabaseChange";
+		case HOST_WAL_KIND_CARRY_UNLISTED:
+			return "CarryUnlisted";
+		case HOST_WAL_KIND_FOLD_STATUSES:
+			return "FoldStatuses";
 #ifdef USE_INJECTION_POINTS
 		case HOST_WAL_KIND_TEST:
 			return "Test";
@@ -480,6 +487,17 @@ void
 host_DelayCheckpoint_drop(HostDelayCheckpoint *self)
 {
 	self->host.ops->resume_checkpoints(self->host.self, self->finished);
+}
+
+/*
+ * host_DelayCheckpoint_failed ends a window whose work failed with an error,
+ * stopping the server with that error, as Postgres raises an error inside a
+ * critical section; the drop is left for an unwind (bugs row 392).
+ */
+void
+host_DelayCheckpoint_failed(HostDelayCheckpoint *self, const HostError *error)
+{
+	self->host.ops->fail_checkpoints(self->host.self, error);
 }
 
 /* host_CompressDictionary_new wraps a dictionary a host prepared; it takes the box. */
@@ -578,6 +596,17 @@ host_Xid_Debug_fmt(const void *value, StdFormatter *f)
 	StdDebugTuple t = std_fmt_debug_tuple(f, "Xid", 3);
 
 	std_DebugTuple_field(&t, &self->f0, std_u64_Debug_fmt);
+	return std_DebugTuple_finish(&t);
+}
+
+/* host_Command_Debug_fmt is Command's derived Debug. */
+bool
+host_Command_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const HostCommand *self = value;
+	StdDebugTuple t = std_fmt_debug_tuple(f, "Command", 7);
+
+	std_DebugTuple_field(&t, &self->f0, std_u32_Debug_fmt);
 	return std_DebugTuple_finish(&t);
 }
 
@@ -713,14 +742,31 @@ host_reading(void)
 /*
  * host_pause holds the calling process at a named place when the fork's tests
  * ask for it. A crate reaches it only through pause!, whose name is a
- * literal.
+ * literal. A test that attached the point's name with "-fails" after it has
+ * the pause fail instead, with XX000 "injected failure at" the point, so a
+ * test can fail a checkpoint window's work from inside it (bugs row 392).
  */
 bool
 host_pause(HostSharedPauses at, const char *point, HostError *error)
 {
 	HostHost	host = host_current();
 	HostMayRaise raise = host_MayRaise_of(host_shared_raising(at));
+	char		fails[HOST_PAUSE_NAME];
+	bool		failing;
 
+	snprintf(fails, sizeof(fails), "%s-fails", point);
+	if (!host.ops->injected(host.self, &raise, fails, &failing, error))
+		return false;
+	if (failing)
+	{
+		char		failure[HOST_PAUSE_NAME + 32];
+		StdString	message;
+
+		snprintf(failure, sizeof(failure), "injected failure at %s", point);
+		std_string_from_Checked(&message, failure, strlen(failure));
+		*error = host_Error_fork((const uint8 *) "XX000", &message);
+		return false;
+	}
 	return host.ops->pause(host.self, &raise, point, error);
 }
 
@@ -795,6 +841,15 @@ host_process_id(void)
 	HostHost	host = host_current();
 
 	return host.ops->process_id(host.self);
+}
+
+/* host_work_mem returns the bytes a query operation may hold before it spills, Postgres' work_mem (bugs row 487). */
+uint64
+host_work_mem(void)
+{
+	HostHost	host = host_current();
+
+	return host.ops->work_mem(host.self);
 }
 
 /*
@@ -1441,6 +1496,22 @@ host_wal_insert(HostIoIoDoors io, HostWalKind kind, const uint8 *body, size_t bo
 	return host.ops->wal_insert(host.self, &raise, kind, body, body_len, result, error);
 }
 
+/* host_NewCid_Debug_fmt is NewCid's derived Debug. */
+bool
+host_NewCid_Debug_fmt(const void *value, StdFormatter *f)
+{
+	const HostNewCid *self = value;
+	StdOptionRef cmin = {self->has_cmin, {&self->cmin, host_Command_Debug_fmt}};
+	StdOptionRef cmax = {self->has_cmax, {&self->cmax, host_Command_Debug_fmt}};
+	StdOptionRef combo = {self->has_combo, {&self->combo, host_Command_Debug_fmt}};
+	StdDebugStruct s = std_fmt_debug_struct(f, "NewCid", 6);
+
+	std_DebugStruct_field(&s, "cmin", 4, &cmin, std_option_Debug_fmt);
+	std_DebugStruct_field(&s, "cmax", 4, &cmax, std_option_Debug_fmt);
+	std_DebugStruct_field(&s, "combo", 5, &combo, std_option_Debug_fmt);
+	return std_DebugStruct_finish(&s);
+}
+
 /*
  * host_wal_new_cid appends heap's own record of the command ids of a row a
  * transaction wrote or changed in a relation logical decoding reads, so
@@ -1965,17 +2036,18 @@ host_warn_kept_wal(HostIoIoDoors io, HostLsn from, HostLsn to, uint32 timeline, 
 
 /*
  * host_next_fork_record reads the first of the fork's records whose kind is
- * in a mask past a record's end, up to the replayed WAL in recovery and the
- * flushed WAL otherwise (PLAN item 8's "Standbys' roots").
+ * in a mask past a record's end, up to the replayed WAL in recovery, or the
+ * received WAL when asked and it is further, and the flushed WAL otherwise
+ * (PLAN item 8's "Standbys' roots").
  */
 bool
-host_next_fork_record(HostIoIoDoors io, HostLsn from, uint32 kinds, bool *has_result, HostForkRecord *result,
-					  HostError *error)
+host_next_fork_record(HostIoIoDoors io, HostLsn from, uint32 kinds, bool received, bool *has_result,
+					  HostForkRecord *result, HostError *error)
 {
 	HostHost	host = host_current();
 	HostMayRaise raise = host_doors_of_io_doors(io);
 
-	return host.ops->next_fork_record(host.self, &raise, from, kinds, has_result, result, error);
+	return host.ops->next_fork_record(host.self, &raise, from, kinds, received, has_result, result, error);
 }
 
 /*
@@ -2025,6 +2097,21 @@ host_refuse_recovery(HostIoIoDoors io, const char *detail, size_t detail_len)
 	HostHost	host = host_current();
 
 	host.ops->refuse_recovery(host.self, detail, detail_len);
+}
+
+/*
+ * host_load_pauses loads pauses a later checkpoint window runs, so a failure
+ * to load one comes before the change the window finishes, as Postgres'
+ * INJECTION_POINT_LOAD comes before its START_CRIT_SECTION; with no pauses
+ * built in, it does nothing.
+ */
+bool
+host_load_pauses(HostIoIoDoors io, const char *const *pauses, size_t pauses_len, HostError *error)
+{
+	HostHost	host = host_current();
+	HostMayRaise raise = host_doors_of_io_doors(io);
+
+	return host.ops->load_pauses(host.self, &raise, pauses, pauses_len, error);
 }
 
 /*
@@ -2189,30 +2276,31 @@ host_collection_end(void)
 
 /*
  * host_collection_ask asks the collector worker for a full collection of a
- * database's repository and waits for its answer, the packs it retired, those
+ * database's repository, emptying a tablespace unless that is
+ * CHUNKS_PACKS_DEFAULT_SPACE, and waits for its answer, the packs it retired, those
  * it copied out, and its live bytes, each PG_UINT64_MAX when it failed (the
  * collector text's §8.2); a cancel ends the wait with Postgres' error, the ask
  * taken back, and the collection goes on.
  */
 bool
-host_collection_ask(HostIoIo *io, uint32 database, uint64 *result, HostError *error)
+host_collection_ask(HostIoIo *io, uint32 database, uint32 emptied, uint64 *result, HostError *error)
 {
 	HostHost	host = host_current();
 	HostMayRaise raise = host_doors(HOST_IO_IO_READ_DOORS(io));
 
-	return host.ops->collection_ask(host.self, &raise, database, result, error);
+	return host.ops->collection_ask(host.self, &raise, database, emptied, result, error);
 }
 
 /*
- * host_collection_asked returns the unanswered ask's word and the database it
- * asks for, which the collector worker reads.
+ * host_collection_asked returns the unanswered ask's word, the database it
+ * asks for, and the tablespace it empties, which the collector worker reads.
  */
 bool
-host_collection_asked(uint64 *result_0, uint32 *result_1)
+host_collection_asked(uint64 *result_0, uint32 *result_1, uint32 *result_2)
 {
 	HostHost	host = host_current();
 
-	return host.ops->collection_asked(host.self, result_0, result_1);
+	return host.ops->collection_asked(host.self, result_0, result_1, result_2);
 }
 
 /* host_collection_answer answers an ask, by its word, with the collection's counts, and wakes its asker. */
@@ -2231,6 +2319,15 @@ host_collector_started(void)
 	HostHost	host = host_current();
 
 	host.ops->collector_started(host.self);
+}
+
+/* host_collector_running reports whether a collector worker has started, without which an ask would wait for good. */
+bool
+host_collector_running(void)
+{
+	HostHost	host = host_current();
+
+	return host.ops->collector_running(host.self);
 }
 
 /*
@@ -2410,6 +2507,13 @@ host_tests_Test_Host_instant(void *self)
 	return test->base_value;
 }
 
+/* host_tests_Test_Host_work_mem returns work_mem's default, 4 MB. */
+static uint64
+host_tests_Test_Host_work_mem(void *self)
+{
+	return (uint64) 4096 * 1024;
+}
+
 /* host_tests_Test_Host_process_id returns 7. */
 static uint32
 host_tests_Test_Host_process_id(void *self)
@@ -2436,6 +2540,20 @@ static uint64
 host_tests_Test_Host_unique(void *self)
 {
 	return pg_atomic_fetch_add_u64(&((HostTestsTest *) self)->next, 1);
+}
+
+/* host_tests_Test_Host_hold_interrupts holds nothing: these tests check no interrupt. */
+static void
+host_tests_Test_Host_hold_interrupts(void *self)
+{
+	(void) self;
+}
+
+/* host_tests_Test_Host_resume_interrupts gives back nothing: these tests check no interrupt. */
+static void
+host_tests_Test_Host_resume_interrupts(void *self)
+{
+	(void) self;
 }
 
 /* host_tests_Test_Host_check_interrupts is unreachable here: only `pghost` makes the capability a seam that can raise takes. */
@@ -2697,7 +2815,7 @@ host_tests_Test_Host_warn_kept_wal(void *self, const HostMayRaise *raise, HostLs
 
 /* host_tests_Test_Host_next_fork_record is unreachable here: only `pghost` makes the capability a WAL seam takes. */
 static bool
-host_tests_Test_Host_next_fork_record(void *self, const HostMayRaise *raise, HostLsn from, uint32 kinds, bool *has_result, HostForkRecord *result, HostError *error)
+host_tests_Test_Host_next_fork_record(void *self, const HostMayRaise *raise, HostLsn from, uint32 kinds, bool received, bool *has_result, HostForkRecord *result, HostError *error)
 {
 	static const char text[] = "internal error: entered unreachable code: only `pghost` makes the capability a WAL seam takes";
 
@@ -2742,6 +2860,19 @@ host_tests_Test_Host_refuse_recovery(void *self, const char *detail, size_t deta
 	std_panic(RUST_FILE, 2157, 13, text, sizeof(text) - 1);
 }
 
+/* host_tests_Test_Host_load_pauses loads nothing: the test host runs no pause. */
+static bool
+host_tests_Test_Host_load_pauses(void *self, const HostMayRaise *raise, const char *const *pauses, size_t pauses_len,
+								 HostError *error)
+{
+	(void) self;
+	(void) raise;
+	(void) pauses;
+	(void) pauses_len;
+	(void) error;
+	return true;
+}
+
 /* host_tests_Test_Host_delay_checkpoints is unreachable here: only `pghost` makes the capability a WAL seam takes. */
 static bool
 host_tests_Test_Host_delay_checkpoints(void *self, const HostMayRaise *raise, const char *const *pauses, size_t pauses_len, HostError *error)
@@ -2754,6 +2885,12 @@ host_tests_Test_Host_delay_checkpoints(void *self, const HostMayRaise *raise, co
 /* host_tests_Test_Host_resume_checkpoints does nothing. */
 static void
 host_tests_Test_Host_resume_checkpoints(void *self, bool finished)
+{
+}
+
+/* host_tests_Test_Host_fail_checkpoints does nothing, leaving the error to its caller. */
+static void
+host_tests_Test_Host_fail_checkpoints(void *self, const HostError *error)
 {
 }
 
@@ -3070,6 +3207,33 @@ host_tests_Test_Host_shared_sweep(void *self, const HostMayRaise *raise, const H
 	std_panic(RUST_FILE, 2302, 13, text, sizeof(text) - 1);
 }
 
+/* host_tests_Test_Host_shared_index_find is unreachable here: only `pghost` makes the capability a shared-memory seam takes. */
+static bool
+host_tests_Test_Host_shared_index_find(void *self, const HostMayRaise *raise, const HostSharedKind *kind, const uint8 *key, bool *has, uint64 *location, HostError *error)
+{
+	static const char text[] = "internal error: entered unreachable code: only `pghost` makes the capability a shared-memory seam takes";
+
+	std_panic(RUST_FILE, 2302, 13, text, sizeof(text) - 1);
+}
+
+/* host_tests_Test_Host_shared_index_put is unreachable here: only `pghost` makes the capability a shared-memory seam takes. */
+static bool
+host_tests_Test_Host_shared_index_put(void *self, const HostMayRaise *raise, const HostSharedKind *kind, const uint8 *key, uint64 location, HostError *error)
+{
+	static const char text[] = "internal error: entered unreachable code: only `pghost` makes the capability a shared-memory seam takes";
+
+	std_panic(RUST_FILE, 2302, 13, text, sizeof(text) - 1);
+}
+
+/* host_tests_Test_Host_shared_index_remove is unreachable here: only `pghost` makes the capability a shared-memory seam takes. */
+static bool
+host_tests_Test_Host_shared_index_remove(void *self, const HostMayRaise *raise, const HostSharedKind *kind, const uint8 *key, uint64 location, HostError *error)
+{
+	static const char text[] = "internal error: entered unreachable code: only `pghost` makes the capability a shared-memory seam takes";
+
+	std_panic(RUST_FILE, 2302, 13, text, sizeof(text) - 1);
+}
+
 /* host_tests_Test_Host_shared_single is unreachable here: only `pghost` makes the capability a shared-memory seam takes. */
 static bool
 host_tests_Test_Host_shared_single(void *self, const HostSharedKind *kind, uint64 *result, HostError *error)
@@ -3111,6 +3275,16 @@ host_tests_Test_Host_flag_take(void *self, const HostMayRaise *raise, uint64 pla
 	static const char text[] = "internal error: entered unreachable code: only `pghost` makes the capability a shared-memory seam takes";
 
 	std_panic(RUST_FILE, 2322, 13, text, sizeof(text) - 1);
+}
+
+/* host_tests_Test_Host_flag_try is unreachable here: only `pghost` makes the capability a shared-memory seam takes. */
+static bool
+host_tests_Test_Host_flag_try(void *self, const HostMayRaise *raise, uint64 place, size_t flag, bool *result,
+							  HostError *error)
+{
+	static const char text[] = "internal error: entered unreachable code: only `pghost` makes the capability a shared-memory seam takes";
+
+	std_panic(RUST_FILE, 2324, 13, text, sizeof(text) - 1);
 }
 
 /* host_tests_Test_Host_flag_clear is unreachable here: only `pghost` makes the capability a shared-memory seam takes. */
@@ -3509,6 +3683,15 @@ host_tests_Test_Host_delta_retire(void *self, const HostDeltaLeaving *records, s
 	std_panic(RUST_FILE, 2514, 13, text, sizeof(text) - 1);
 }
 
+/* host_tests_Test_Host_delta_packing is unreachable here: no test of `host` packs the delta's blocks. */
+static bool
+host_tests_Test_Host_delta_packing(void *self, const uint64 *shapes, size_t shapes_len, StdVec *result)
+{
+	static const char text[] = "internal error: entered unreachable code: no test of `host` packs the delta's blocks";
+
+	std_panic(RUST_FILE, 2514, 13, text, sizeof(text) - 1);
+}
+
 /* host_tests_Test_Host_delta_make is unreachable here: no test of `host` makes a record of the delta. */
 static bool
 host_tests_Test_Host_delta_make(void *self, const HostMayRaise *raise, const HostSharedKind *kind, const char *name, size_t name_len, bool *result_ok, uint64 *result_0, uint64 *result_1, uint64 *result_err, HostError *error)
@@ -3646,7 +3829,8 @@ host_tests_Test_Host_collection_end(void *self)
 
 /* host_tests_Test_Host_collection_ask is unreachable here: no test of `host` collects. */
 static bool
-host_tests_Test_Host_collection_ask(void *self, const HostMayRaise *raise, uint32 database, uint64 *result, HostError *error)
+host_tests_Test_Host_collection_ask(void *self, const HostMayRaise *raise, uint32 database, uint32 emptied,
+									uint64 *result, HostError *error)
 {
 	static const char text[] = "internal error: entered unreachable code: no test of `host` collects";
 
@@ -3655,7 +3839,7 @@ host_tests_Test_Host_collection_ask(void *self, const HostMayRaise *raise, uint3
 
 /* host_tests_Test_Host_collection_asked is unreachable here: no test of `host` collects. */
 static bool
-host_tests_Test_Host_collection_asked(void *self, uint64 *result_0, uint32 *result_1)
+host_tests_Test_Host_collection_asked(void *self, uint64 *result_0, uint32 *result_1, uint32 *result_2)
 {
 	static const char text[] = "internal error: entered unreachable code: no test of `host` collects";
 
@@ -3678,6 +3862,15 @@ host_tests_Test_Host_collector_started(void *self)
 	static const char text[] = "internal error: entered unreachable code: no test of `host` collects";
 
 	std_panic(RUST_FILE, 2590, 13, text, sizeof(text) - 1);
+}
+
+/* host_tests_Test_Host_collector_running is unreachable here: no test of `host` collects. */
+static bool
+host_tests_Test_Host_collector_running(void *self)
+{
+	static const char text[] = "internal error: entered unreachable code: no test of `host` collects";
+
+	std_panic(__FILE__, __LINE__, 0, text, sizeof(text) - 1);
 }
 
 /* host_tests_Test_Host_database_locked is unreachable here: no test of `host` collects. */
@@ -3852,10 +4045,13 @@ static const HostHostOps HOST_TESTS_TEST_HOST_OPS = {
 	.now = host_tests_Test_Host_now,
 	.instant = host_tests_Test_Host_instant,
 	.process_id = host_tests_Test_Host_process_id,
+	.work_mem = host_tests_Test_Host_work_mem,
 	.session_database = host_tests_Test_Host_session_database,
 	.exiting = host_tests_Test_Host_exiting,
 	.unique = host_tests_Test_Host_unique,
 	.check_interrupts = host_tests_Test_Host_check_interrupts,
+	.hold_interrupts = host_tests_Test_Host_hold_interrupts,
+	.resume_interrupts = host_tests_Test_Host_resume_interrupts,
 	.open_ = host_tests_Test_Host_open,
 	.create_if_absent = host_tests_Test_Host_create_if_absent,
 	.open_scratch = host_tests_Test_Host_open_scratch,
@@ -3889,7 +4085,9 @@ static const HostHostOps HOST_TESTS_TEST_HOST_OPS = {
 	.log = host_tests_Test_Host_log,
 	.refuse_recovery = host_tests_Test_Host_refuse_recovery,
 	.delay_checkpoints = host_tests_Test_Host_delay_checkpoints,
+	.load_pauses = host_tests_Test_Host_load_pauses,
 	.resume_checkpoints = host_tests_Test_Host_resume_checkpoints,
+	.fail_checkpoints = host_tests_Test_Host_fail_checkpoints,
 	.xid_status = host_tests_Test_Host_xid_status,
 	.xid_in_progress = host_tests_Test_Host_xid_in_progress,
 	.xids_answered = host_tests_Test_Host_xids_answered,
@@ -3927,11 +4125,15 @@ static const HostHostOps HOST_TESTS_TEST_HOST_OPS = {
 	.shared_reclaimed = host_tests_Test_Host_shared_reclaimed,
 	.shared_unreclaim = host_tests_Test_Host_shared_unreclaim,
 	.shared_sweep = host_tests_Test_Host_shared_sweep,
+	.shared_index_find = host_tests_Test_Host_shared_index_find,
+	.shared_index_put = host_tests_Test_Host_shared_index_put,
+	.shared_index_remove = host_tests_Test_Host_shared_index_remove,
 	.shared_single = host_tests_Test_Host_shared_single,
 	.shared_ready = host_tests_Test_Host_shared_ready,
 	.shared_lock = host_tests_Test_Host_shared_lock,
 	.shared_unlock = host_tests_Test_Host_shared_unlock,
 	.flag_take = host_tests_Test_Host_flag_take,
+	.flag_try = host_tests_Test_Host_flag_try,
 	.flag_clear = host_tests_Test_Host_flag_clear,
 	.atomic = host_tests_Test_Host_atomic,
 	.shared_atomics = host_tests_Test_Host_shared_atomics,
@@ -3976,6 +4178,7 @@ static const HostHostOps HOST_TESTS_TEST_HOST_OPS = {
 	.delta_append = host_tests_Test_Host_delta_append,
 	.delta_seal = host_tests_Test_Host_delta_seal,
 	.delta_retire = host_tests_Test_Host_delta_retire,
+	.delta_packing = host_tests_Test_Host_delta_packing,
 	.delta_make = host_tests_Test_Host_delta_make,
 	.delta_record = host_tests_Test_Host_delta_record,
 	.delta_publish = host_tests_Test_Host_delta_publish,
@@ -3995,6 +4198,7 @@ static const HostHostOps HOST_TESTS_TEST_HOST_OPS = {
 	.collection_asked = host_tests_Test_Host_collection_asked,
 	.collection_answer = host_tests_Test_Host_collection_answer,
 	.collector_started = host_tests_Test_Host_collector_started,
+	.collector_running = host_tests_Test_Host_collector_running,
 	.database_locked = host_tests_Test_Host_database_locked,
 	.database_unlocked = host_tests_Test_Host_database_unlocked,
 	.database_lock_waited = host_tests_Test_Host_database_lock_waited,

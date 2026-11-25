@@ -252,9 +252,7 @@ trees_store_VecU8_PartialEq_eq(const void *a, const void *b)
 
 /* TREES_STORE_HASH_MAP_ADDRESS_VEC_U8_TYPE is the table of a HashMap<Address, Vec<u8>, AddressState>. */
 static const StdHashMapType TREES_STORE_HASH_MAP_ADDRESS_VEC_U8_TYPE = {
-	.size = sizeof(trees_TupleAddressVecU8_t),
-	.align = _Alignof(trees_TupleAddressVecU8_t),
-	.value_offset = offsetof(trees_TupleAddressVecU8_t, f1),
+	STD_HASHMAP_SHAPE(trees_TupleAddressVecU8_t),
 	.key_hash = chunks_address_Address_Hash_hash,
 	.key_eq = chunks_address_Address_PartialEq_eq,
 	.value_drop = trees_store_VecU8_drop,
@@ -264,9 +262,7 @@ static const StdHashMapType TREES_STORE_HASH_MAP_ADDRESS_VEC_U8_TYPE = {
 
 /* TREES_STORE_HASH_MAP_ADDRESS_CHUNK_TYPE is the table of a HashMap<Address, Chunk, AddressState>. */
 static const StdHashMapType TREES_STORE_HASH_MAP_ADDRESS_CHUNK_TYPE = {
-	.size = sizeof(trees_TupleAddressChunk_t),
-	.align = _Alignof(trees_TupleAddressChunk_t),
-	.value_offset = offsetof(trees_TupleAddressChunk_t, f1),
+	STD_HASHMAP_SHAPE(trees_TupleAddressChunk_t),
 	.key_hash = chunks_address_Address_Hash_hash,
 	.key_eq = chunks_address_Address_PartialEq_eq,
 	.value_drop = chunks_chunk_Chunk_drop,
@@ -611,13 +607,7 @@ trees_store_cached_stamps_body_0(void *frame_)
 	}
 	frame->read_live = true;
 	node = trees_node_Flat_node(&frame->read);
-	if (!trees_node_Node_stamps(&node, &frame->stamps, frame->error))
-	{
-		frame->read_live = false;
-		trees_node_Flat_drop(&frame->read);
-		frame->ok = false;
-		return;
-	}
+	trees_node_Node_stamps(&node, &frame->stamps);
 	frame->stamps_live = true;
 	*frame->result = std_arc_new(&frame->stamps, sizeof(ChunksTrailerStamps), _Alignof(ChunksTrailerStamps));
 	frame->stamps_live = false;
@@ -1183,9 +1173,7 @@ typedef struct trees_TupleAddressLocated_t
 
 /* TREES_STORE_HASH_MAP_ADDRESS_LOCATED_TYPE is the table of a HashMap<Address, Located, AddressState>. */
 static const StdHashMapType TREES_STORE_HASH_MAP_ADDRESS_LOCATED_TYPE = {
-	.size = sizeof(trees_TupleAddressLocated_t),
-	.align = _Alignof(trees_TupleAddressLocated_t),
-	.value_offset = offsetof(trees_TupleAddressLocated_t, f1),
+	STD_HASHMAP_SHAPE(trees_TupleAddressLocated_t),
 	.key_hash = chunks_address_Address_Hash_hash,
 	.key_eq = chunks_address_Address_PartialEq_eq,
 	.hasher = &FOLDHASH_FAST_RANDOM_STATE_BUILD_HASHER_OPS,
@@ -1224,9 +1212,7 @@ trees_store_StdState_Default_default(void *result)
 
 /* TREES_STORE_HASH_MAP_LOCATOR_VEC_U8_TYPE is the table of a HashMap<Locator, Vec<u8>, StdState>. */
 static const StdHashMapType TREES_STORE_HASH_MAP_LOCATOR_VEC_U8_TYPE = {
-	.size = sizeof(trees_TupleLocatorVecU8_t),
-	.align = _Alignof(trees_TupleLocatorVecU8_t),
-	.value_offset = offsetof(trees_TupleLocatorVecU8_t, f1),
+	STD_HASHMAP_SHAPE(trees_TupleLocatorVecU8_t),
 	.key_hash = chunks_trailer_Locator_Hash_hash,
 	.key_eq = trees_store_Locator_eq,
 	.value_drop = trees_store_VecU8_drop,

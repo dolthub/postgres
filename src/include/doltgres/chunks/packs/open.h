@@ -46,6 +46,7 @@ extern bool chunks_packs_open_read_whole(const ChunksPacksViewListOps *ops, Host
  * is a StdVec of std_TupleU32U32_t in order.
  */
 extern bool chunks_packs_open_repositories(HostIoReadDoors io, StdVec *result, ChunksErrorError *error);
+extern bool chunks_packs_open_creations(HostIoReadDoors io, StdVec *result, ChunksErrorError *error);
 extern bool chunks_packs_open_directories(HostIoReadDoors io, uint32 repository, uint32 own, StdVec *result,
 										  ChunksErrorError *error);
 extern bool chunks_packs_open_spaced_directories(HostIoReadDoors io, uint32 repository, uint32 own, StdVec *result,

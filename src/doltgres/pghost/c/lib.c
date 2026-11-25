@@ -616,6 +616,14 @@ pghost_PgHost_Host_instant(void *self)
 	return std_Instant_now();
 }
 
+/* pghost_PgHost_Host_work_mem returns work_mem in bytes, read anew at each call. */
+static uint64
+pghost_PgHost_Host_work_mem(void *self)
+{
+	(void) self;
+	return STD_MUL(u64, (uint64) std_i32_unsigned_abs(pg_calls_work_mem()), 1024, 1, 1);
+}
+
 /* pghost_PgHost_Host_process_id returns the backend's process id. */
 static uint32
 pghost_PgHost_Host_process_id(void *self)
@@ -652,6 +660,22 @@ pghost_PgHost_Host_unique(void *self)
 {
 	(void) self;
 	return std_AtomicU64_fetch_add_relaxed(&PGHOST_NEXT, 1);
+}
+
+/* pghost_PgHost_Host_hold_interrupts runs Postgres' HOLD_INTERRUPTS. */
+static void
+pghost_PgHost_Host_hold_interrupts(void *self)
+{
+	(void) self;
+	pg_calls_hold_interrupts();
+}
+
+/* pghost_PgHost_Host_resume_interrupts runs Postgres' RESUME_INTERRUPTS. */
+static void
+pghost_PgHost_Host_resume_interrupts(void *self)
+{
+	(void) self;
+	pg_calls_resume_interrupts();
 }
 
 /* pghost_PgHost_Host_check_interrupts runs Postgres' CHECK_FOR_INTERRUPTS. */
@@ -1792,6 +1816,7 @@ typedef struct pghost_PgHost_Host_next_fork_record_frame_0_t
 	const HostMayRaise *raise;
 	HostLsn		from;
 	uint32		kinds;
+	bool		received;
 	bool	   *has_result;
 	HostForkRecord *result;
 	HostError  *error;
@@ -1819,8 +1844,8 @@ pghost_PgHost_Host_next_fork_record_body_0(void *frame_)
 		uint64		at;
 		uint8		zero = 0;
 
-		if (!pg_calls_next_fork_record(pghost_pg_raise(frame->raise), frame->from, frame->kinds, frame->buffer.ptr,
-									   frame->buffer.len, &needed, &error_))
+		if (!pg_calls_next_fork_record(pghost_pg_raise(frame->raise), frame->from, frame->kinds, frame->received,
+									   frame->buffer.ptr, frame->buffer.len, &needed, &error_))
 		{
 			*frame->error = pghost_held(&error_);
 			frame->done = false;
@@ -1868,10 +1893,10 @@ pghost_PgHost_Host_next_fork_record_pad_0(void *frame_)
 /* pghost_PgHost_Host_next_fork_record returns the next of the fork's WAL records of some kinds from a position: its kind, its end, and its body. */
 static bool
 pghost_PgHost_Host_next_fork_record(void *self, const HostMayRaise *raise, HostLsn from, uint32 kinds,
-									bool *has_result, HostForkRecord *result, HostError *error)
+									bool received, bool *has_result, HostForkRecord *result, HostError *error)
 {
 	pghost_PgHost_Host_next_fork_record_frame_0_t frame = {.raise = raise, .from = from, .kinds = kinds,
-	.has_result = has_result, .result = result, .error = error};
+	.received = received, .has_result = has_result, .result = result, .error = error};
 
 	(void) self;
 	std_landing(&frame, pghost_PgHost_Host_next_fork_record_body_0, pghost_PgHost_Host_next_fork_record_pad_0);
@@ -1919,6 +1944,40 @@ pghost_PgHost_Host_refuse_recovery(void *self, const char *detail, size_t detail
 	shmem_delta_refuse(detail, detail_len);
 }
 
+/*
+ * pghost_PgHost_Host_load_pauses loads pauses' callbacks, as
+ * INJECTION_POINT_LOAD does, and each one's failing point, which host_pause
+ * looks up inside the window (bugs row 392), and does nothing in a build
+ * without injection points.
+ */
+static bool
+pghost_PgHost_Host_load_pauses(void *self, const HostMayRaise *raise, const char *const *pauses, size_t pauses_len,
+							   HostError *error)
+{
+	(void) self;
+#ifdef USE_INJECTION_POINTS
+	for (size_t i = 0, i_len = pauses_len; i < i_len; i++)
+	{
+		PgPgError	error_;
+		char		fails[HOST_PAUSE_NAME];
+
+		snprintf(fails, sizeof(fails), "%s-fails", pauses[i]);
+		if (!pg_calls_injection_point_load(pghost_pg_raise(raise), pauses[i], &error_) ||
+			!pg_calls_injection_point_load(pghost_pg_raise(raise), fails, &error_))
+		{
+			*error = pghost_held(&error_);
+			return false;
+		}
+	}
+#else
+	(void) raise;
+	(void) pauses;
+	(void) pauses_len;
+	(void) error;
+#endif
+	return true;
+}
+
 /* pghost_PgHost_Host_delay_checkpoints holds checkpoints off, loading first the pauses its window runs inside its critical section. */
 static bool
 pghost_PgHost_Host_delay_checkpoints(void *self, const HostMayRaise *raise, const char *const *pauses,
@@ -1926,20 +1985,8 @@ pghost_PgHost_Host_delay_checkpoints(void *self, const HostMayRaise *raise, cons
 {
 	PgPgError	error_;
 
-	(void) self;
-#ifdef USE_INJECTION_POINTS
-	for (size_t i = 0, i_len = pauses_len; i < i_len; i++)
-	{
-		if (!pg_calls_injection_point_load(pghost_pg_raise(raise), pauses[i], &error_))
-		{
-			*error = pghost_held(&error_);
-			return false;
-		}
-	}
-#else
-	(void) pauses;
-	(void) pauses_len;
-#endif
+	if (!pghost_PgHost_Host_load_pauses(self, raise, pauses, pauses_len, error))
+		return false;
 	if (!pg_calls_delay_checkpoints(pghost_pg_raise(raise), &error_))
 	{
 		*error = pghost_held(&error_);
@@ -1956,6 +2003,38 @@ pghost_PgHost_Host_resume_checkpoints(void *self, bool finished)
 	(void) self;
 	std_AtomicBool_store_relaxed(&PGHOST_IN_WINDOW, false);
 	pg_calls_resume_checkpoints(finished);
+}
+
+/*
+ * pghost_PgHost_Host_fail_checkpoints stops the server with the error that
+ * ended a window, a Postgres error by its own data, which it reads without
+ * taking (bugs row 392).
+ */
+static void
+pghost_PgHost_Host_fail_checkpoints(void *self, const HostError *error)
+{
+	const PgPgError *raised = error->cause.tag == HOST_CAUSE_POSTGRES ?
+		std_any_downcast(error->cause.u.postgres, &PG_PG_ERROR_TYPE_ID) : NULL;
+	StdStr		message = host_Error_message(error);
+	StdStr		hint = host_Error_hint(error);
+	StdCString	message_c;
+	StdCString	hint_c;
+	StdNulError nul;
+
+	(void) self;
+	if (!std_CString_new_bytes((const uint8 *) message.ptr, message.len, &message_c, &nul))
+	{
+		std_NulError_drop(&nul);
+		std_CString_default(&message_c);
+	}
+	if (!std_CString_new_bytes((const uint8 *) hint.ptr, hint.len, &hint_c, &nul))
+	{
+		std_NulError_drop(&nul);
+		std_CString_default(&hint_c);
+	}
+	std_AtomicBool_store_relaxed(&PGHOST_IN_WINDOW, false);
+	pg_calls_fail_checkpoint_delay(raised != NULL ? raised->raw.data : NULL, host_Error_sqlstate(error), 5,
+								   std_CString_as_ptr(&message_c), std_CString_as_ptr(&hint_c));
 }
 
 /* pghost_PgHost_Host_xid_status returns a transaction's status in the commit log. */
@@ -2271,6 +2350,48 @@ pghost_PgHost_Host_shared_sweep(void *self, const HostMayRaise *raise, const Hos
 	return pghost_shared_sweep(raise, kind->id, atomic, result, error);
 }
 
+/* pghost_PgHost_Host_shared_index_find answers the location a pool's index holds for a key, or nothing (bugs row 405). */
+static bool
+pghost_PgHost_Host_shared_index_find(void *self, const HostMayRaise *raise, const HostSharedKind *kind,
+									 const uint8 *key, bool *has, uint64 *location, HostError *error)
+{
+	PgPgError	error_;
+
+	(void) self;
+	if (shmem_records_index_find(pghost_pg_raise(raise), kind->id, key, has, location, &error_))
+		return true;
+	*error = pghost_held(&error_);
+	return false;
+}
+
+/* pghost_PgHost_Host_shared_index_put sets the location a pool's index holds for a key (bugs row 405). */
+static bool
+pghost_PgHost_Host_shared_index_put(void *self, const HostMayRaise *raise, const HostSharedKind *kind,
+									const uint8 *key, uint64 location, HostError *error)
+{
+	PgPgError	error_;
+
+	(void) self;
+	if (shmem_records_index_put(pghost_pg_raise(raise), kind->id, key, location, &error_))
+		return true;
+	*error = pghost_held(&error_);
+	return false;
+}
+
+/* pghost_PgHost_Host_shared_index_remove takes a key out of a pool's index when it holds that location (bugs row 405). */
+static bool
+pghost_PgHost_Host_shared_index_remove(void *self, const HostMayRaise *raise, const HostSharedKind *kind,
+									   const uint8 *key, uint64 location, HostError *error)
+{
+	PgPgError	error_;
+
+	(void) self;
+	if (shmem_records_index_remove(pghost_pg_raise(raise), kind->id, key, location, &error_))
+		return true;
+	*error = pghost_held(&error_);
+	return false;
+}
+
 /* pghost_PgHost_Host_shared_single returns the place of the server's one record of a kind. */
 static bool
 pghost_PgHost_Host_shared_single(void *self, const HostSharedKind *kind, uint64 *result, HostError *error)
@@ -2472,6 +2593,25 @@ pghost_PgHost_Host_flag_take(void *self, const HostMayRaise *raise, uint64 place
 	return true;
 }
 
+/* pghost_PgHost_Host_flag_try takes one of a record's flags when no process holds it, answering whether it did. */
+static bool
+pghost_PgHost_Host_flag_try(void *self, const HostMayRaise *raise, uint64 place, size_t flag, bool *result,
+							HostError *error)
+{
+	size_t		kind;
+	uint32		index;
+	PgPgError	error_;
+
+	(void) self;
+	pghost_shared_placed(place, &kind, &index);
+	if (!shmem_records_flag_try(pghost_pg_raise(raise), kind, index, flag, result, &error_))
+	{
+		*error = pghost_held(&error_);
+		return false;
+	}
+	return true;
+}
+
 /* pghost_PgHost_Host_flag_clear clears one of a record's flags. */
 static void
 pghost_PgHost_Host_flag_clear(void *self, uint64 place, size_t flag)
@@ -2518,6 +2658,9 @@ pghost_PgHost_Host_atomic(void *self, uint64 place, size_t atomic, HostSharedOp 
 			records_op.tag = SHMEM_RECORDS_OP_EXCHANGE;
 			records_op.u.exchange.f0 = op.u.exchange.f0;
 			records_op.u.exchange.f1 = op.u.exchange.f1;
+			break;
+		case HOST_SHARED_OP_LOAD_ACQUIRE:
+			records_op.tag = SHMEM_RECORDS_OP_LOAD_ACQUIRE;
 			break;
 	}
 	pghost_shared_placed(place, &kind, &index);
@@ -2952,6 +3095,14 @@ pghost_PgHost_Host_delta_retire(void *self, const HostDeltaLeaving *records, siz
 	pghost_delta_retire(records, records_len, names, names_len);
 }
 
+/* pghost_PgHost_Host_delta_packing orders the delta's partly used blocks and returns the live pages a packing moves. */
+static bool
+pghost_PgHost_Host_delta_packing(void *self, const uint64 *shapes, size_t shapes_len, StdVec *result)
+{
+	(void) self;
+	return pghost_delta_packing(shapes, shapes_len, result);
+}
+
 /* pghost_PgHost_Host_delta_make makes an aged record of a kind by a name, or answers the one of that name. */
 static bool
 pghost_PgHost_Host_delta_make(void *self, const HostMayRaise *raise, const HostSharedKind *kind, const char *name,
@@ -3088,15 +3239,15 @@ pghost_PgHost_Host_collection_end(void *self)
 	shmem_collection_collection_end();
 }
 
-/* pghost_PgHost_Host_collection_ask asks the collector to collect a database and waits for its counts. */
+/* pghost_PgHost_Host_collection_ask asks the collector to collect a database, emptying a tablespace, and waits for its counts. */
 static bool
-pghost_PgHost_Host_collection_ask(void *self, const HostMayRaise *raise, uint32 database, uint64 *result,
-								  HostError *error)
+pghost_PgHost_Host_collection_ask(void *self, const HostMayRaise *raise, uint32 database, uint32 emptied,
+								  uint64 *result, HostError *error)
 {
 	PgPgError	error_;
 
 	(void) self;
-	if (!shmem_collection_ask(pghost_pg_raise(raise), database, result, &error_))
+	if (!shmem_collection_ask(pghost_pg_raise(raise), database, emptied, result, &error_))
 	{
 		*error = pghost_held(&error_);
 		return false;
@@ -3104,14 +3255,14 @@ pghost_PgHost_Host_collection_ask(void *self, const HostMayRaise *raise, uint32 
 	return true;
 }
 
-/* pghost_PgHost_Host_collection_asked returns the unanswered ask's word and the database it asks for. */
+/* pghost_PgHost_Host_collection_asked returns the unanswered ask's word, the database it asks for, and the tablespace it empties. */
 static bool
-pghost_PgHost_Host_collection_asked(void *self, uint64 *result_0, uint32 *result_1)
+pghost_PgHost_Host_collection_asked(void *self, uint64 *result_0, uint32 *result_1, uint32 *result_2)
 {
 	std_TupleU64U32_t asked;
 
 	(void) self;
-	if (!shmem_collection_asked_for(&asked))
+	if (!shmem_collection_asked_for(&asked, result_2))
 		return false;
 	*result_0 = asked.f0;
 	*result_1 = asked.f1;
@@ -3132,6 +3283,14 @@ pghost_PgHost_Host_collector_started(void *self)
 {
 	(void) self;
 	shmem_collection_worker_started();
+}
+
+/* pghost_PgHost_Host_collector_running reports whether a collector worker has started. */
+static bool
+pghost_PgHost_Host_collector_running(void *self)
+{
+	(void) self;
+	return shmem_collection_worker_running();
 }
 
 /* pghost_PgHost_Host_database_locked takes a database's lock without waiting, reporting whether it did. */
@@ -4101,10 +4260,13 @@ static const HostHostOps PGHOST_PG_HOST_HOST_OPS = {
 	.now = pghost_PgHost_Host_now,
 	.instant = pghost_PgHost_Host_instant,
 	.process_id = pghost_PgHost_Host_process_id,
+	.work_mem = pghost_PgHost_Host_work_mem,
 	.session_database = pghost_PgHost_Host_session_database,
 	.exiting = pghost_PgHost_Host_exiting,
 	.unique = pghost_PgHost_Host_unique,
 	.check_interrupts = pghost_PgHost_Host_check_interrupts,
+	.hold_interrupts = pghost_PgHost_Host_hold_interrupts,
+	.resume_interrupts = pghost_PgHost_Host_resume_interrupts,
 	.open_ = pghost_PgHost_Host_open,
 	.create_if_absent = pghost_PgHost_Host_create_if_absent,
 	.open_scratch = pghost_PgHost_Host_open_scratch,
@@ -4138,7 +4300,9 @@ static const HostHostOps PGHOST_PG_HOST_HOST_OPS = {
 	.log = pghost_PgHost_Host_log,
 	.refuse_recovery = pghost_PgHost_Host_refuse_recovery,
 	.delay_checkpoints = pghost_PgHost_Host_delay_checkpoints,
+	.load_pauses = pghost_PgHost_Host_load_pauses,
 	.resume_checkpoints = pghost_PgHost_Host_resume_checkpoints,
+	.fail_checkpoints = pghost_PgHost_Host_fail_checkpoints,
 	.xid_status = pghost_PgHost_Host_xid_status,
 	.xid_in_progress = pghost_PgHost_Host_xid_in_progress,
 	.xids_answered = pghost_PgHost_Host_xids_answered,
@@ -4176,11 +4340,15 @@ static const HostHostOps PGHOST_PG_HOST_HOST_OPS = {
 	.shared_reclaimed = pghost_PgHost_Host_shared_reclaimed,
 	.shared_unreclaim = pghost_PgHost_Host_shared_unreclaim,
 	.shared_sweep = pghost_PgHost_Host_shared_sweep,
+	.shared_index_find = pghost_PgHost_Host_shared_index_find,
+	.shared_index_put = pghost_PgHost_Host_shared_index_put,
+	.shared_index_remove = pghost_PgHost_Host_shared_index_remove,
 	.shared_single = pghost_PgHost_Host_shared_single,
 	.shared_ready = pghost_PgHost_Host_shared_ready,
 	.shared_lock = pghost_PgHost_Host_shared_lock,
 	.shared_unlock = pghost_PgHost_Host_shared_unlock,
 	.flag_take = pghost_PgHost_Host_flag_take,
+	.flag_try = pghost_PgHost_Host_flag_try,
 	.flag_clear = pghost_PgHost_Host_flag_clear,
 	.atomic = pghost_PgHost_Host_atomic,
 	.shared_atomics = pghost_PgHost_Host_shared_atomics,
@@ -4225,6 +4393,7 @@ static const HostHostOps PGHOST_PG_HOST_HOST_OPS = {
 	.delta_append = pghost_PgHost_Host_delta_append,
 	.delta_seal = pghost_PgHost_Host_delta_seal,
 	.delta_retire = pghost_PgHost_Host_delta_retire,
+	.delta_packing = pghost_PgHost_Host_delta_packing,
 	.delta_make = pghost_PgHost_Host_delta_make,
 	.delta_record = pghost_PgHost_Host_delta_record,
 	.delta_publish = pghost_PgHost_Host_delta_publish,
@@ -4244,6 +4413,7 @@ static const HostHostOps PGHOST_PG_HOST_HOST_OPS = {
 	.collection_asked = pghost_PgHost_Host_collection_asked,
 	.collection_answer = pghost_PgHost_Host_collection_answer,
 	.collector_started = pghost_PgHost_Host_collector_started,
+	.collector_running = pghost_PgHost_Host_collector_running,
 	.database_locked = pghost_PgHost_Host_database_locked,
 	.database_unlocked = pghost_PgHost_Host_database_unlocked,
 	.database_lock_waited = pghost_PgHost_Host_database_lock_waited,

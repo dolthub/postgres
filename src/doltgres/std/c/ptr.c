@@ -89,31 +89,6 @@ std_Alignment_new_unchecked_check(size_t align, const char *file, uint32 line, u
 		STD_PTR_VIOLATED("Alignment::new_unchecked requires a power of two", file, line, col);
 }
 
-/* std_Alignment_new is Alignment::new: whether the alignment is a power of two, made by new_unchecked when it is. */
-static bool
-std_Alignment_new(size_t align)
-{
-	if (align != 0 && (align & (align - 1)) == 0)
-	{
-		std_Alignment_new_unchecked_check(align, ALIGNMENT_FILE, 173, 27);
-		return true;
-	}
-	return false;
-}
-
-/*
- * std_Layout_is_size_align_valid is Layout::is_size_align_valid: a
- * power-of-two alignment and a size within max_size_for_alignment, the
- * largest whose round-up stays within isize::MAX.
- */
-static bool
-std_Layout_is_size_align_valid(size_t size, size_t align)
-{
-	if (!std_Alignment_new(align))
-		return false;
-	return size <= ((size_t) PG_INT64_MAX + 1) - align;
-}
-
 /* std_ub_checks_is_valid_allocation_size is ub_checks' is_valid_allocation_size. */
 static bool
 std_ub_checks_is_valid_allocation_size(size_t size, size_t len)
@@ -147,6 +122,33 @@ std_ub_checks_maybe_is_nonoverlapping(const void *src, const void *dst, size_t s
 }
 
 #endif							/* USE_ASSERT_CHECKING */
+
+/* std_Alignment_new is Alignment::new: whether the alignment is a power of two, made by new_unchecked when it is. */
+static bool
+std_Alignment_new(size_t align)
+{
+	if (align != 0 && (align & (align - 1)) == 0)
+	{
+#ifdef USE_ASSERT_CHECKING
+		std_Alignment_new_unchecked_check(align, ALIGNMENT_FILE, 173, 27);
+#endif
+		return true;
+	}
+	return false;
+}
+
+/*
+ * std_Layout_is_size_align_valid is Layout::is_size_align_valid: a
+ * power-of-two alignment and a size within max_size_for_alignment, the
+ * largest whose round-up stays within isize::MAX.
+ */
+static bool
+std_Layout_is_size_align_valid(size_t size, size_t align)
+{
+	if (!std_Alignment_new(align))
+		return false;
+	return size <= ((size_t) PG_INT64_MAX + 1) - align;
+}
 
 /* copy_nonoverlapping and copy_from_slice as the crates' code runs them, checked, and as std's own code does. */
 #define STD_COPY_DEFINE
@@ -244,7 +246,11 @@ std_ptr_const_align_offset(const void *self, size_t stride, size_t align)
 	return std_ptr_align_offset(self, stride, align);
 }
 
-/* std_ptr_copy is ptr::copy of count elements of a size and alignment, the ranges possibly overlapping. */
+/*
+ * std_ptr_copy is ptr::copy of count elements of a size and alignment, the
+ * ranges possibly overlapping; a copy of no bytes calls no memmove, since core
+ * lets its pointers be null and memmove doesn't.
+ */
 void
 std_ptr_copy(const void *src, void *dst, size_t count, size_t size, size_t align)
 {
@@ -260,10 +266,15 @@ std_ptr_copy(const void *src, void *dst, size_t count, size_t size, size_t align
 	if (!valid)
 		STD_PTR_VIOLATED("ptr::copy requires that both pointer arguments are aligned and non-null", PTR_FILE, 652, 9);
 #endif
-	memmove(dst, src, count * size);
+	if (count * size > 0)
+		memmove(dst, src, count * size);
 }
 
-/* std_ptr_write_bytes is ptr::write_bytes: count elements of a size and alignment set to a byte. */
+/*
+ * std_ptr_write_bytes is ptr::write_bytes: count elements of a size and
+ * alignment set to a byte; a write of no bytes calls no memset, since core
+ * lets its pointer be null and memset doesn't.
+ */
 void
 std_ptr_write_bytes(void *dst, uint8 val, size_t count, size_t size, size_t align)
 {
@@ -279,7 +290,8 @@ std_ptr_write_bytes(void *dst, uint8 val, size_t count, size_t size, size_t alig
 		STD_PTR_VIOLATED("ptr::write_bytes requires that the destination pointer is aligned and non-null",
 						 PTR_FILE, 726, 9);
 #endif
-	memset(dst, val, count * size);
+	if (count * size > 0)
+		memset(dst, val, count * size);
 }
 
 /* std_ptr_swap_chunk is swap_chunk: two chunks of n bytes exchanged through copies of both. */

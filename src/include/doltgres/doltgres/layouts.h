@@ -37,6 +37,10 @@ extern bool doltgres_layouts_reading(const PgCatalogCaps *caps, HostIoIo *io, Ho
 extern bool doltgres_layouts_rekeyed(const PgCatalogCaps *caps, PgPgError *error);
 extern void doltgres_layouts_sub_aborted(HostIoIo *io, uint32 subtransaction);
 extern void doltgres_layouts_ended(HostIoIo *io);
+
+#ifdef DOLTGRES_TEST_DOLTGRES
+extern void test_doltgres_layouts_tests_a_failed_allocation_in_a_kept_transform_keeps_the_earlier_ones(void);
+#endif
 #endif
 
 #endif							/* DOLTGRES_DOLTGRES_LAYOUTS_H */

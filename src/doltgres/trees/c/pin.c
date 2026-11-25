@@ -56,9 +56,7 @@ trees_pin_BoxFlat_drop(void *value)
 
 /* TREES_PIN_NODES_TYPE is the table of a pin's nodes, a FrozenMap<Tree, Box<Flat>, AddressState>. */
 const StdHashMapType TREES_PIN_NODES_TYPE = {
-	.size = sizeof(trees_TupleTreeBoxFlat_t),
-	.align = _Alignof(trees_TupleTreeBoxFlat_t),
-	.value_offset = offsetof(trees_TupleTreeBoxFlat_t, f1),
+	STD_HASHMAP_SHAPE(trees_TupleTreeBoxFlat_t),
 	.key_hash = trees_store_Tree_Hash_hash,
 	.key_eq = trees_store_Tree_PartialEq_eq,
 	.value_drop = trees_pin_BoxFlat_drop,
@@ -310,12 +308,12 @@ trees_pin_Pin_stamps_body_0(void *frame_)
 	trees_pin_Pin_stamps_frame_0_t *frame = frame_;
 	TreesNodeNode node;
 
-	if (!trees_pin_Pin_node(frame->self, frame->io, frame->tree, &node, frame->error) ||
-		!trees_node_Node_stamps(&node, &frame->stamps, frame->error))
+	if (!trees_pin_Pin_node(frame->self, frame->io, frame->tree, &node, frame->error))
 	{
 		frame->ok = false;
 		return;
 	}
+	trees_node_Node_stamps(&node, &frame->stamps);
 	frame->stamps_live = true;
 	*frame->result = std_arc_new(&frame->stamps, sizeof(ChunksTrailerStamps), _Alignof(ChunksTrailerStamps));
 	frame->stamps_live = false;

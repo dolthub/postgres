@@ -25,15 +25,25 @@
 #include "doltgres/host/io.h"
 #include "doltgres/host/lib.h"
 #include "doltgres/std/str.h"
+#include "doltgres/txn/insert.h"
 
 extern HostError store_databases_failed(const uint8 *code, const char *said, uint32 database);
 extern bool store_databases_warned(HostIoIo *io, HostError *failure, const char *context, uint8 *code,
 								   HostError *error);
 extern bool store_databases_created(HostIoIo *io, uint32 template, uint32 database, uint32 tablespace,
 									HostError *error);
+extern bool store_databases_settled(HostIoIo *io, uint32 database, uint32 tablespace, bool committed,
+									HostError *error);
+extern bool store_databases_creation_ended(HostIoIo *io, bool committed, bool *settled, HostError *error);
+extern bool store_databases_started(HostIoIo *io, const TxnInsertPage *page, bool *loaded, HostError *error);
+extern bool store_databases_checkpointed(HostIoIo *io, HostError *error);
+extern bool store_databases_redo_settled(HostIoIo *io, const TxnInsertPage *page, uint64 xid, bool committed,
+										 bool *loaded, HostError *error);
+extern bool store_databases_redo_ended(HostIoIo *io, HostError *error);
 extern bool store_databases_dropped(HostIoIo *io, uint32 database, HostError *error);
 extern bool store_databases_conflicts(HostIoReadDoors io, uint32 database, bool *result, HostError *error);
-extern bool store_databases_redo_created(HostIoIo *io, const uint8 *body, size_t body_len, HostError *error);
+extern bool store_databases_redo_created(HostIoIo *io, const uint8 *body, size_t body_len, uint64 xid, HostLsn end,
+										 HostError *error);
 extern bool store_databases_redo_dropped(HostIoIo *io, const uint8 *body, size_t body_len, HostError *error);
 extern bool store_databases_moved_copy(HostIoIo *io, uint32 database, uint32 from, uint32 to, HostError *error);
 extern bool store_databases_marked_moves(HostIoIo *io, HostError *error);
@@ -42,8 +52,11 @@ extern bool store_databases_committed(HostIoIo *io, uint32 repository, uint32 ta
 									  HostError *error);
 extern bool store_databases_unfinished(HostIoReadDoors io, uint32 repository, uint32 tablespace, bool *result,
 									   HostError *error);
-extern bool store_databases_redo_copied(HostIoIo *io, const uint8 *body, size_t body_len, HostError *error);
-extern bool store_databases_redo_moved(HostIoIo *io, const uint8 *body, size_t body_len, HostError *error);
+extern bool store_databases_redo_moved(HostIoIo *io, const uint8 *body, size_t body_len, HostLsn end,
+									   HostError *error);
+extern bool store_databases_moves_load(HostIoReadDoors io, HostError *error);
+extern void store_databases_moves_freed(void);
+extern void store_databases_replayed_storage(HostStorage *storage, HostLsn replayed);
 extern bool store_databases_describe_moved(const uint8 *body, size_t body_len, StdString *result, HostError *error);
 extern bool store_databases_describe_created(const uint8 *body, size_t body_len, StdString *result,
 											 HostError *error);

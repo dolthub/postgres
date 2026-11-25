@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The test-only wrappers, in calls.list's form, generated only with the injection_points feature, which cargo.pl turns
-# on exactly when Postgres is built with injection points (design item 17).
+# The test-only wrappers, in calls.list's form, generated only with --testing, which meson passes exactly when Postgres
+# is built with injection points (design item 17).
 
 escalate	void		escalates	nocatalog	it raises on purpose, and its wrapper turns what it raises into a PANIC	elog(ERROR, "an error inside an escalating wrapper")	test/t/003_shmem.pl: an error inside an escalating wrapper becomes a PANIC
 injection_point_cached	void	const char *name	raises	nocatalog	InjectionPointCached runs a callback loaded before, so it allocates nothing and can run in a critical section; it reads no catalog	INJECTION_POINT_CACHED(name, NULL)	test/t/006_wal.pl: a checkpoint waits for the delay guard

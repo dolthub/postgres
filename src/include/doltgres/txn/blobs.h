@@ -78,7 +78,22 @@ extern bool txn_blobs_written(HostIoIo *io, const HostSharedHeld *deltas, uint32
 							  bool (*packed) (void *captures, HostIoIo *io, const ChunksAddressAddress *address,
 											  bool *result, HostError *error),
 							  void *packed_captures, void (*packed_drop) (void *captures), HostError *error);
+extern bool txn_blobs_wrote(HostIoIo *io, TxnMemtableVersionWriter writer, uint32 repository, HostError *error);
+extern void txn_blobs_redo_committed(HostIoIo *io, uint64 xid);
+extern bool txn_blobs_redo_aborted(HostIoIo *io, const uint64 *aborting, size_t aborting_len, HostError *error);
+extern bool txn_blobs_redo_ended(HostIoIo *io, bool (*picked) (void *captures, HostIoIo *io, uint64 top, bool *result,
+															   HostError *error),
+								 void *picked_captures, HostError *error);
+extern bool txn_blobs_redo_prepared(HostIoIo *io, HostError *error);
 extern bool txn_blobs_redo(HostIoIo *io, const HostSharedHeld *deltas, TxnRecordChunkWrite chunk, uint64 lsn,
 						   HostError *error);
+
+#ifdef DOLTGRES_TEST_TXN
+extern void test_txn_blobs_tests_a_logged_write_logs_a_chunk_an_unlogged_one_left_and_redo_makes_it_durable(void);
+extern void test_txn_blobs_tests_a_blob_in_the_delta_reads_back_through_blobs(void);
+extern void test_txn_blobs_tests_a_transactions_chunks_spill_read_back_and_leave_at_its_abort(void);
+extern void test_txn_blobs_tests_a_chunk_another_running_transaction_holds_stays_after_that_ones_abort(void);
+extern void test_txn_blobs_tests_a_rolled_back_chunk_takes_nothing_from_its_tops_count(void);
+#endif
 
 #endif							/* DOLTGRES_TXN_BLOBS_H */

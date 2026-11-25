@@ -94,6 +94,12 @@ typedef struct ShmemRecordsKind
 	 */
 	const std_TupleUsizeUsize_t *arrays;
 	size_t		arrays_len;
+
+	/*
+	 * index is the length of the key of the kind's index of its records, or 0
+	 * when it has none.
+	 */
+	size_t		index;
 } ShmemRecordsKind;
 
 /* ShmemRecordsOpTag is Op's variants. */
@@ -102,9 +108,13 @@ typedef enum ShmemRecordsOpTag
 	SHMEM_RECORDS_OP_LOAD,
 	SHMEM_RECORDS_OP_ADD,
 	SHMEM_RECORDS_OP_EXCHANGE,
+	SHMEM_RECORDS_OP_LOAD_ACQUIRE,
 } ShmemRecordsOpTag;
 
-/* ShmemRecordsOp is an operation on an atomic: a load, an add, or an exchange of the second value for the first. */
+/*
+ * ShmemRecordsOp is an operation on an atomic: a load, an add, an exchange of
+ * the second value for the first, or a load after a read barrier.
+ */
 typedef struct ShmemRecordsOp
 {
 	ShmemRecordsOpTag tag;
@@ -123,6 +133,16 @@ extern size_t shmem_records_size(const ShmemRecordsKind *kinds, size_t kinds_len
 extern bool shmem_records_initialize(const PgMayRaise *raise, ShmemControl *control, int32 tranche,
 									 const ShmemRecordsKind *kinds, size_t kinds_len, PgPgError *error);
 extern size_t shmem_records_kinds(void);
+extern bool shmem_records_index_request(const PgMayRaise *raise, const ShmemRecordsKind *kinds, size_t kinds_len,
+										PgPgError *error);
+extern bool shmem_records_index_initialize(const PgMayRaise *raise, const ShmemRecordsKind *kinds, size_t kinds_len,
+										   PgPgError *error);
+extern bool shmem_records_index_find(const PgMayRaise *raise, uint64 id, const uint8 *key, bool *has,
+									 uint64 *location, PgPgError *error);
+extern bool shmem_records_index_put(const PgMayRaise *raise, uint64 id, const uint8 *key, uint64 location,
+									PgPgError *error);
+extern bool shmem_records_index_remove(const PgMayRaise *raise, uint64 id, const uint8 *key, uint64 location,
+									   PgPgError *error);
 extern bool shmem_records_aged(size_t kind, std_TupleU32U32_t *result);
 extern bool shmem_records_kind(uint64 id, size_t *result);
 extern uint32 shmem_records_count(size_t kind);
@@ -132,10 +152,14 @@ extern bool shmem_records_pool(size_t kind, std_TupleU32U32_t *result);
 extern uint64 shmem_records_word(uint32 at);
 extern bool shmem_records_swap(uint32 at, uint64 loaded, uint64 word);
 extern uint32 shmem_records_hand(size_t kind);
+extern uint64 shmem_records_retired(size_t kind);
+extern bool shmem_records_retired_swap(size_t kind, uint64 loaded, uint64 word);
 extern void shmem_records_clear(size_t kind, uint32 index);
 extern bool shmem_records_lock(const PgMayRaise *raise, size_t kind, uint32 index, size_t lock, bool exclusive,
 							   PgPgError *error);
 extern void shmem_records_unlock(size_t kind, uint32 index, size_t lock);
+extern bool shmem_records_flag_try(const PgMayRaise *raise, size_t kind, uint32 index, size_t flag,
+								   bool *taken, PgPgError *error);
 extern bool shmem_records_flag_take(const PgMayRaise *raise, size_t kind, uint32 index, size_t flag,
 									PgPgError *error);
 extern void shmem_records_flag_clear(size_t kind, uint32 index, size_t flag);

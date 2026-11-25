@@ -15,6 +15,7 @@
 #include "access/htup_details.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_type.h"
+#include "doltgres/hooks.h"
 #include "funcapi.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
@@ -165,7 +166,7 @@ brin_page_items(PG_FUNCTION_ARGS)
 
 	indexRel = index_open(indexRelid, AccessShareLock);
 
-	if (!IS_BRIN(indexRel))
+	if (!IS_BRIN(indexRel) || doltgres_heap_only_refused(indexRel))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not a %s index",

@@ -26,7 +26,20 @@
 
 #ifndef FRONTEND
 
+#include "doltgres/hooks.h"
 #include "doltgres/pg/lib.h"
+
+/* DoltgresTranche numbers the fork's LWLock tranches, as doltgres/tranchelist.h lists them. */
+typedef enum DoltgresTranche
+{
+#define DOLTGRES_TRANCHE(id, name) DOLTGRES_TRANCHE_##id,
+#include "doltgres/tranchelist.h"
+#undef DOLTGRES_TRANCHE
+	DOLTGRES_TRANCHE_COUNT
+} DoltgresTranche;
+
+StaticAssertDecl(DOLTGRES_TRANCHE_COUNT == DOLTGRES_LWLOCK_TRANCHES,
+				 "hooks.h's DOLTGRES_LWLOCK_TRANCHES must count every tranche in doltgres/tranchelist.h");
 
 struct ShmemRecordsKind;
 
@@ -54,8 +67,8 @@ typedef struct ShmemControl
 	 * reader's epoch.
 	 */
 	uint32		procs;
-	/* tranche is the fork's LWLock tranche, which records' locks take. */
-	int32		tranche;
+	/* tranches are the fork's LWLock tranches' ids, by DoltgresTranche. */
+	int32		tranches[DOLTGRES_TRANCHE_COUNT];
 	/* flag_wait is the wait event of a wait for another process's flag. */
 	uint32		flag_wait;
 	/* kinds is the number of kinds of records. */
@@ -110,6 +123,7 @@ extern bool shmem_request(const PgMayRaise *raise, const struct ShmemRecordsKind
 						  PgPgError *error);
 extern bool shmem_initialize(const PgMayRaise *raise, const struct ShmemRecordsKind *kinds, size_t kinds_len,
 							 PgPgError *error);
+extern int32 shmem_tranche(DoltgresTranche which);
 extern void shmem_file_waits(uint32 result[3]);
 extern void shmem_seed(uint8 result[32]);
 extern ShmemRegion shmem_Region_mapped(void);

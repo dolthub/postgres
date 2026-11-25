@@ -88,6 +88,7 @@
 #include "access/amapi.h"
 #include "access/htup_details.h"
 #include "access/tsmapi.h"
+#include "doltgres/hooks.h"
 #include "executor/executor.h"
 #include "executor/nodeAgg.h"
 #include "executor/nodeHash.h"
@@ -745,6 +746,10 @@ cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
 			min_IO_cost = 0;
 	}
 
+	doltgres_index_scan_io(index->indexoid, indexonly, tuples_fetched, indexSelectivity, loop_count,
+						   spc_random_page_cost, spc_seq_page_cost, cpu_operator_cost, &max_IO_cost, &min_IO_cost,
+						   &rand_heap_pages);
+
 	if (partial_path)
 	{
 		/*
@@ -1063,6 +1068,9 @@ cost_bitmap_heap_scan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
 			* sqrt(pages_fetched / T);
 	else
 		cost_per_page = spc_random_page_cost;
+	doltgres_bitmap_page_cost(planner_rt_fetch(baserel->relid, root)->relid, tuples_fetched, pages_fetched,
+							  baserel->pages, tbm_calculate_entries(work_mem * (Size) 1024), spc_random_page_cost,
+							  cpu_operator_cost, &cost_per_page);
 
 	run_cost += pages_fetched * cost_per_page;
 

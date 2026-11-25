@@ -59,6 +59,13 @@ sub rows
 	return $on->safe_psql('postgres', "SELECT count(*) FROM doltgres_test_scan('$table', false, -1)");
 }
 
+# based returns how many rows a fork table's newest base holds on a server.
+sub based
+{
+	my ($on, $table) = @_;
+	return $on->safe_psql('postgres', "SELECT split_part(doltgres_test_base_sizes('$table'), ' ', 2)");
+}
+
 # held holds a server's fold launcher at its injection point, so no fold
 # starts, the one a checkpoint asks for included.
 sub held
@@ -89,8 +96,9 @@ $node->stop('immediate');
 $node->start;
 isnt(outcome($node, $crashed), '0', 'a crash keeps the end of a commit made before its checkpoint');
 is(rows($node, 'crashed'), '2', 'the committed rows read after the crash');
-is($node->safe_psql('postgres', "SELECT doltgres_test_fold('crashed')"),
-	't', 'a fold after the crash applies a transaction committed before its checkpoint');
+$node->safe_psql('postgres', "SELECT doltgres_test_fold('crashed')");
+is(based($node, 'crashed'), '2',
+	'a fold after the crash applies a transaction committed before its checkpoint, whichever fold installs it');
 is(rows($node, 'crashed'), '2', 'the folded rows read back');
 
 # A hot standby made from a base backup taken after a commit: the backup's
@@ -130,9 +138,51 @@ $running->quit;
 $node->stop('immediate');
 $node->start;
 isnt(outcome($node, $across), '0', 'redo gives a commit past the checkpoint its end');
-is($node->safe_psql('postgres', "SELECT doltgres_test_fold('across')"),
-	't', 'a fold after the crash applies a transaction committed after the checkpoint');
+$node->safe_psql('postgres', "SELECT doltgres_test_fold('across')");
+is(based($node, 'across'), '1',
+	'a fold after the crash applies a transaction committed after the checkpoint, whichever fold installs it');
 is(rows($node, 'across'), '1', 'its row reads back');
 
 $node->stop;
+
+# The same transaction, still running at a checkpoint and committed after it,
+# on a server whose fold launcher folds its table soon after the crash (bugs
+# row 428): the launcher's fold applies it first, so the case's own fold
+# installs nothing and answers false, and the row is in the base either way.
+my $raced = PostgreSQL::Test::Cluster->new('status_run_raced');
+$raced->init;
+$raced->append_conf('postgresql.conf', 'fold_timeout = 1s');
+$raced->start;
+$raced->safe_psql('postgres', 'CREATE EXTENSION doltgres_test');
+$raced->safe_psql('postgres', 'CREATE TABLE across (k int4 PRIMARY KEY, v text)');
+$running = $raced->background_psql('postgres');
+$running->query_safe(q{BEGIN; SELECT doltgres_test_write('across', true, 'INSERT INTO across VALUES (1, ''v'')')});
+$raced->safe_psql('postgres', 'CHECKPOINT');
+$running->query_safe('COMMIT');
+$running->quit;
+$raced->stop('immediate');
+$raced->start;
+$raced->poll_query_until('postgres', q{SELECT split_part(doltgres_test_base_sizes('across'), ' ', 2) = '1'})
+  or die 'the fold launcher never folded across';
+is($raced->safe_psql('postgres', "SELECT doltgres_test_fold('across')"),
+	'f', "a fold after the launcher's applies nothing and installs no base");
+is(based($raced, 'across'), '1', "the launcher's fold applied the transaction committed after the checkpoint");
+is(rows($raced, 'across'), '1', 'its row reads back');
+
+# A transaction committed before a checkpoint, then a crash, on the same
+# server (bugs row 436): the launcher's fold applies it first, so the case's
+# own fold answers false, and its rows are in the base either way.
+$raced->safe_psql('postgres', 'CREATE TABLE crashed (k int4 PRIMARY KEY, v text)');
+$raced->safe_psql('postgres',
+	q{SELECT doltgres_test_write('crashed', true, 'INSERT INTO crashed SELECT g, ''v'' FROM generate_series(1, 2) g')});
+$raced->safe_psql('postgres', 'CHECKPOINT');
+$raced->stop('immediate');
+$raced->start;
+$raced->poll_query_until('postgres', q{SELECT split_part(doltgres_test_base_sizes('crashed'), ' ', 2) = '2'})
+  or die 'the fold launcher never folded crashed';
+is($raced->safe_psql('postgres', "SELECT doltgres_test_fold('crashed')"),
+	'f', "a fold after the launcher's applies nothing of the commit made before the checkpoint");
+is(based($raced, 'crashed'), '2', "the launcher's fold applied the transaction committed before the checkpoint");
+is(rows($raced, 'crashed'), '2', 'the folded rows read back');
+$raced->stop;
 done_testing();

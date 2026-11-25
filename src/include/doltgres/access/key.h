@@ -175,6 +175,7 @@ extern void access_TupleUsizeOrderKeyType_drop(void *keyed);
 extern void access_key_Attribute_Clone_clone(const AccessKeyAttribute *self, AccessKeyAttribute *result);
 extern void access_key_Inner_Clone_clone(const AccessKeyInner *self, AccessKeyInner *result);
 extern void access_key_KeyType_Clone_clone(const AccessKeyKeyType *self, AccessKeyKeyType *result);
+extern bool access_key_KeyType_try_clone(const AccessKeyKeyType *self, AccessKeyKeyType *result);
 extern void access_key_KeyType_write(const AccessKeyKeyType *self, StdVec *out);
 extern bool access_key_KeyType_read(const uint8 *bytes, size_t bytes_len, AccessKeyKeyType *result_0,
 									StdBytes *result_1);

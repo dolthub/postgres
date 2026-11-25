@@ -38,6 +38,16 @@
 #define XXH_STATIC_LINKING_ONLY
 #include "xxhash.h"
 
+#ifdef DOLTGRES_TEST_TXN
+#include "doltgres/repo/lib.h"
+#include "doltgres/simc/simc.h"
+#include "doltgres/std/test.h"
+#include "doltgres/txn/insert.h"
+#include "doltgres/txn/state.h"
+#endif
+
+#define RUST_FILE "txn" STD_SEP "src" STD_SEP "change.rs"
+
 /* The prepare whose closure answers an end, or none to start over. */
 #define TXN_MEMTABLE_TABLE_RS OptionEnded
 #define TXN_MEMTABLE_TABLE_RETURNS bool
@@ -330,6 +340,8 @@ txn_change_end_closure_0(void *captures, HostIoIo *io, TxnMemtableTablePreparedS
 	.has_result = has_result, .result = result, .error = error};
 
 	std_landing(&frame, txn_change_end_closure_0_body, txn_change_end_closure_0_pad);
+	if (frame.window_live && !frame.ok)
+		host_DelayCheckpoint_failed(&frame.window, frame.error);
 	txn_change_end_closure_0_pad(&frame);
 	return frame.ok;
 }
@@ -484,3 +496,490 @@ txn_change_redo(HostIoIo *io, const HostSharedHeld *held, const TxnRecordRowChan
 	return txn_memtable_table_prepare_Handle(io, record, &rows, 1, NULL, 0, false, txn_change_redo_closure_0, &inside,
 											 NULL, &handle, error);
 }
+
+#ifdef DOLTGRES_TEST_TXN
+
+/*
+ * test_txn_change_tests_a_keys_stripe_is_its_storage_and_bytes_or_its_storage_alone:
+ * a key's stripe of the key lock is the same every time and below the
+ * stripes' count; two storages' stripes of one key differ, as do two keys'
+ * of one storage, for the keys this case picks; and a storage whose equal
+ * keys can have other bytes takes one stripe for every key.
+ */
+void
+test_txn_change_tests_a_keys_stripe_is_its_storage_and_bytes_or_its_storage_alone(void)
+{
+	HostStorage one = {.tablespace = HOST_PG_DEFAULT, .database = 5, .relation = 16384};
+	HostStorage two = {.tablespace = HOST_PG_DEFAULT, .database = 5, .relation = 16385};
+	const uint8 *k = (const uint8 *) "k";
+	const uint8 *l = (const uint8 *) "l";
+
+	STD_ASSERT(__LINE__, 9, txn_change_stripe(&one, k, 1, true) == txn_change_stripe(&one, k, 1, true),
+			   "a key's stripe is the same every time");
+	STD_ASSERT(__LINE__, 9, txn_change_stripe(&one, k, 1, true) < HOST_STRIPES, "a key's stripe is below the count");
+	STD_ASSERT(__LINE__, 9, txn_change_stripe(&one, k, 1, true) != txn_change_stripe(&two, k, 1, true),
+			   "two storages' stripes of one key differ");
+	STD_ASSERT(__LINE__, 9, txn_change_stripe(&one, k, 1, true) != txn_change_stripe(&one, l, 1, true),
+			   "two keys' stripes of one storage differ");
+	STD_ASSERT(__LINE__, 9, txn_change_stripe(&one, k, 1, false) == txn_change_stripe(&one, l, 1, false),
+			   "a storage whose equal keys can differ in bytes takes one stripe for every key");
+}
+
+/* TXN_CHANGE_TESTS_UNWRAP_FAILED is a Result's unwrap's panic on a HostError at a line and column. */
+#define TXN_CHANGE_TESTS_UNWRAP_FAILED(line, col, error) \
+	STD_RESULT_EXPECT_FAILED((line), (col), "called `Result::unwrap()` on an `Err` value", (error), \
+							 host_Error_Debug_fmt)
+
+/* txn_change_tests_made_t is made's (Storage, Repo, Held<State>) with the reader its store reads through. */
+typedef struct txn_change_tests_made_t
+{
+	HostStorage storage;
+	RepoRepo	repo;
+	HostSharedReader reading;
+	HostSharedHeld held;
+} txn_change_tests_made_t;
+
+/* txn_change_tests_made returns a new database's storage in pg_default with its repository, a reader, and its state. */
+static txn_change_tests_made_t
+txn_change_tests_made(HostIoIo *io, uint32 database)
+{
+	txn_change_tests_made_t made = {.storage = txn_insert_tests_stored(database)};
+	ChunksErrorError failed;
+	HostError	error;
+
+	if (!repo_Repo_create(io, database, HOST_PG_DEFAULT, &made.repo, &failed))
+		STD_RESULT_EXPECT_FAILED(__LINE__, 0, "called `Result::unwrap()` on an `Err` value", &failed,
+								 chunks_error_Error_Debug_fmt);
+	if (!host_shared_read(io, &made.reading, &error) ||
+		!txn_state_state(io, &made.repo, &made.reading, &made.storage, TXN_STATE_PERSISTENCE_PERMANENT, false, NULL,
+						 &made.held, &error))
+		TXN_CHANGE_TESTS_UNWRAP_FAILED(__LINE__, 0, &error);
+	return made;
+}
+
+/* txn_change_tests_made_drop frees what made returned. */
+static void
+txn_change_tests_made_drop(txn_change_tests_made_t *made)
+{
+	host_shared_Held_drop(&made->held);
+	host_shared_Reader_drop(&made->reading);
+	repo_Repo_drop(&made->repo);
+}
+
+/* txn_change_tests_logged_t is one of changes' row changes with its record's end. */
+typedef struct txn_change_tests_logged_t
+{
+	TxnRecordRowChange change;
+	uint64		end;
+} txn_change_tests_logged_t;
+
+/* txn_change_tests_changes returns a database's storages' logged row changes, each with its record's end. */
+static StdVec
+txn_change_tests_changes(uint32 database)
+{
+	StdVec		logged = simc_logged();
+	StdVec		changes;
+
+	std_vec_new(&changes, sizeof(txn_change_tests_logged_t), _Alignof(txn_change_tests_logged_t));
+	for (size_t k = 0; k < logged.len; k++)
+	{
+		simc_TupleU8VecU8Lsn_t *one = &STD_VEC_AT(&logged, simc_TupleU8VecU8Lsn_t, k);
+		txn_change_tests_logged_t row = {.end = one->f2};
+		HostWalKind kind;
+		HostError	error;
+
+		if (host_WalKind_of(one->f0, &kind) && kind == HOST_WAL_KIND_ROW_CHANGE)
+		{
+			if (!txn_record_RowChange_decode(one->f1.ptr, one->f1.len, &row.change, &error))
+				host_Error_drop(&error);
+			else if (row.change.storage.database != database)
+				txn_record_RowChange_drop(&row.change);
+			else
+				std_vec_push_Checked(&changes, &row, sizeof(row), _Alignof(txn_change_tests_logged_t));
+		}
+		std_vec_free_Checked(&one->f1, 1, 1);
+	}
+	std_vec_free_Checked(&logged, sizeof(simc_TupleU8VecU8Lsn_t), _Alignof(simc_TupleU8VecU8Lsn_t));
+	return changes;
+}
+
+/* txn_change_tests_changes_drop frees what changes returned. */
+static void
+txn_change_tests_changes_drop(StdVec *changes)
+{
+	for (size_t k = 0; k < changes->len; k++)
+		txn_record_RowChange_drop(&STD_VEC_AT(changes, txn_change_tests_logged_t, k).change);
+	std_vec_free_Checked(changes, sizeof(txn_change_tests_logged_t), _Alignof(txn_change_tests_logged_t));
+}
+
+/* txn_change_tests_shown_t is shown's (String, u32, Option<u64>): what a version does, its command, and its LSN. */
+typedef struct txn_change_tests_shown_t
+{
+	const char *does;
+	uint32		raw;
+	bool		has_lsn;
+	uint64		lsn;
+} txn_change_tests_shown_t;
+
+/* txn_change_tests_shown returns key k's versions newest first, each as what it does, its command, and its LSN. */
+static StdVec
+txn_change_tests_shown(HostIoIo *io, const HostSharedHeld *held)
+{
+	HostDeltaHold hold;
+	StdVec		versions;
+	StdVec		shown;
+	HostError	error;
+
+	if (!host_delta_hold(io, &hold, &error) ||
+		!txn_memtable_table_versions(io, &hold, host_shared_Held_record(held), (const uint8 *) "k", 1, &versions,
+									 &error))
+		TXN_CHANGE_TESTS_UNWRAP_FAILED(__LINE__, 0, &error);
+	std_vec_new(&shown, sizeof(txn_change_tests_shown_t), _Alignof(txn_change_tests_shown_t));
+	for (size_t k = 0; k < versions.len; k++)
+	{
+		TxnMemtableVersionRecord record = txn_memtable_version_Version_record(&STD_VEC_AT(&versions,
+																						  TxnMemtableVersionVersion,
+																						  k));
+		TxnMemtableVersionOpRefTag op = txn_memtable_version_Record_op(&record).tag;
+		txn_change_tests_shown_t one = {.does = "other", .raw = txn_memtable_version_Record_raw(&record)};
+
+		if (op == TXN_MEMTABLE_VERSION_OP_REF_PUT)
+			one.does = "put";
+		else if (op == TXN_MEMTABLE_VERSION_OP_REF_DELETE)
+			one.does = "delete";
+		else if (op == TXN_MEMTABLE_VERSION_OP_REF_LOCK)
+			one.does = "lock";
+		one.has_lsn = txn_memtable_version_Record_lsn(&record, &one.lsn);
+		std_vec_push_Checked(&shown, &one, sizeof(one), _Alignof(txn_change_tests_shown_t));
+	}
+	txn_memtable_version_versions_drop(&versions, 0);
+	host_delta_Hold_drop(&hold);
+	return shown;
+}
+
+/* txn_change_tests_shown_eq reports whether two shown versions are the same. */
+static bool
+txn_change_tests_shown_eq(const txn_change_tests_shown_t *a, const txn_change_tests_shown_t *b)
+{
+	return strcmp(a->does, b->does) == 0 && a->raw == b->raw && a->has_lsn == b->has_lsn &&
+		(!a->has_lsn || a->lsn == b->lsn);
+}
+
+/* txn_change_tests_shown_is asserts that key k's versions show as expected, freeing what shown returned. */
+static void
+txn_change_tests_shown_is(uint32 line, StdVec *got, const txn_change_tests_shown_t *want, size_t want_len)
+{
+	bool		eq = got->len == want_len;
+
+	for (size_t k = 0; eq && k < want_len; k++)
+		eq = txn_change_tests_shown_eq(&STD_VEC_AT(got, txn_change_tests_shown_t, k), &want[k]);
+	STD_ASSERT(line, 9, eq, "a key's versions show as expected");
+	std_vec_free_Checked(got, sizeof(txn_change_tests_shown_t), _Alignof(txn_change_tests_shown_t));
+}
+
+/* txn_change_tests_row returns an insert of key k's row by a writer, with its writer's room or none. */
+static TxnInsertInsert
+txn_change_tests_row(HostStorage storage, TxnMemtableVersionWriter writer, bool has_roomed, TxnStatusRoomed roomed)
+{
+	TxnInsertInsert row = txn_insert_tests_row(storage, 0);
+
+	std_vec_free_Checked(&row.key, 1, 1);
+	std_slice_to_vec_Checked(&row.key, (const uint8 *) "k", 1, 1, 1);
+	row.writer = writer;
+	row.has_roomed = has_roomed;
+	row.roomed = roomed;
+	return row;
+}
+
+/* txn_change_tests_inserted inserts key k's row and returns its tuple id. */
+static uint64
+txn_change_tests_inserted(HostIoIo *io, const txn_change_tests_made_t *made, TxnInsertInsert row)
+{
+	TreesStoreReader store = repo_Repo_reader(&made->repo, HOST_CACHE_PLACEMENT_SERVER, &made->reading);
+	TxnInsertRoom room = {.bytes = 28, .page = 8168, .most = 291};
+	uint64		tid;
+	HostError	error;
+
+	if (!txn_insert_tests_taken(io, TREES_STORE_READER_NODE_STORE(&store), &made->held, &row, &room, NULL, NULL, 0,
+								&tid, &error))
+		TXN_CHANGE_TESTS_UNWRAP_FAILED(__LINE__, 0, &error);
+	return tid;
+}
+
+/* txn_change_tests_ending returns the end of key k's row of a tuple id by a writer at a command, doing an op. */
+static TxnChangeEnding
+txn_change_tests_ending(HostStorage storage, TxnMemtableOp op, TxnMemtableVersionWriter writer, uint32 command,
+						TxnStatusRoomed roomed, uint64 tid)
+{
+	TxnChangeEnding ending = {.storage = storage, .table = 16385, .op = op, .writer = writer, .roomed = roomed,
+	.lock = TXN_MEMTABLE_LOCK_MODE_UPDATE, .logged = true, .tuple = {tid}};
+
+	ending.writer.command = command;
+	std_slice_to_vec_Checked(&ending.key, (const uint8 *) "k", 1, 1, 1);
+	return ending;
+}
+
+/* txn_change_tests_stop is a read that stops with the count of the versions it read, its Stop's usize. */
+static bool
+txn_change_tests_stop(void *captures, HostIoIo *io, TxnMemtableVersionVersion *versions, size_t versions_len,
+					  TxnChangeRead *result, void *stopped, HostError *error)
+{
+	result->tag = TXN_CHANGE_READ_STOP;
+	*(size_t *) stopped = versions_len;
+	return true;
+}
+
+/* txn_change_tests_go is a read that goes on to the push, its version showing its writer's command. */
+static bool
+txn_change_tests_go(void *captures, HostIoIo *io, TxnMemtableVersionVersion *versions, size_t versions_len,
+					TxnChangeRead *result, void *stopped, HostError *error)
+{
+	result->tag = TXN_CHANGE_READ_GO;
+	result->u.go.shown.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND;
+	result->u.go.cmin = 0;
+	result->u.go.has_row = false;
+	return true;
+}
+
+/* txn_change_tests_ended ends a row with a read and returns whether it pushed, a Stop's count in stopped. */
+static TxnChangeEnded
+txn_change_tests_ended(HostIoIo *io, const HostSharedHeld *held, TxnChangeEnding ending, TxnChangeDecide decide,
+					   size_t *stopped)
+{
+	HostIoWaits waits = host_io_Waits_testing();
+	uint32		stripe = txn_change_stripe(&ending.storage, (const uint8 *) "k", 1, true);
+	TxnChangeEnded ended;
+	HostError	error;
+
+	if (!txn_change_end(io, held, &ending, &waits, stripe, decide, NULL, NULL, stopped, &ended, &error))
+		TXN_CHANGE_TESTS_UNWRAP_FAILED(__LINE__, 0, &error);
+	return ended;
+}
+
+/* txn_change_tests_op_delete returns a delete's op. */
+static TxnMemtableOp
+txn_change_tests_op_delete(void)
+{
+	TxnMemtableOp op = {.tag = TXN_MEMTABLE_OP_DELETE};
+
+	return op;
+}
+
+/* txn_change_tests_op_share returns a share lock's op. */
+static TxnMemtableOp
+txn_change_tests_op_share(void)
+{
+	TxnMemtableOp op = {.tag = TXN_MEMTABLE_OP_LOCK, .u.lock = TXN_MEMTABLE_LOCK_MODE_SHARE};
+
+	return op;
+}
+
+/*
+ * test_txn_change_tests_a_delete_is_logged_pushed_and_redone_once_and_a_lock_is_never_logged:
+ * a delete whose read stops, seeing the key's one version, pushes nothing and
+ * gives back what it stopped with, and a logged delete of an inserted row
+ * appends its row change and pushes its version with the record's LSN,
+ * showing its own command; redone on another storage, the insert and the
+ * delete each show command 0, as heap's redo writes FirstCommandId, and a
+ * delete redone again, which the delta holds by its key and LSN, pushes
+ * nothing. A lock pushes its version with no record.
+ */
+void
+test_txn_change_tests_a_delete_is_logged_pushed_and_redone_once_and_a_lock_is_never_logged(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	txn_change_tests_made_t made = txn_change_tests_made(io, 9361);
+	TxnMemtableVersionWriter writer = {.xid = 41, .command = 2};
+	bool		has_roomed;
+	TxnStatusRoomed roomed;
+	uint64		tid;
+	size_t		stopped = 0;
+	StdVec		logged;
+	const txn_change_tests_logged_t *inserted;
+	const txn_change_tests_logged_t *deleted;
+	txn_change_tests_made_t replica;
+	TreesStoreReader replica_store;
+	TxnInsertPage page = {.bytes = 8168, .most = 291};
+	HostError	error;
+
+	if (!txn_status_redo_roomed(io, &writer, &has_roomed, &roomed, &error))
+		TXN_CHANGE_TESTS_UNWRAP_FAILED(__LINE__, 9, &error);
+	STD_ASSERT(__LINE__, 9, has_roomed, "the writer takes room");
+	tid = txn_change_tests_inserted(io, &made, txn_change_tests_row(made.storage, writer, true, roomed));
+	STD_ASSERT(__LINE__, 9,
+			   txn_change_tests_ended(io, &made.held,
+									  txn_change_tests_ending(made.storage, txn_change_tests_op_delete(), writer, 3,
+															  roomed, tid),
+									  txn_change_tests_stop, &stopped) == TXN_CHANGE_ENDED_STOPPED && stopped == 1,
+			   "a delete whose read stops pushes nothing and gives back what it stopped with");
+	STD_ASSERT(__LINE__, 9,
+			   txn_change_tests_ended(io, &made.held,
+									  txn_change_tests_ending(made.storage, txn_change_tests_op_delete(), writer, 3,
+															  roomed, tid),
+									  txn_change_tests_go, &stopped) == TXN_CHANGE_ENDED_PUSHED,
+			   "a delete whose read goes on pushes its version");
+	logged = txn_change_tests_changes(9361);
+	STD_ASSERT(__LINE__, 9, logged.len == 2, "the insert and the delete each logged a row change");
+	inserted = &STD_VEC_AT(&logged, txn_change_tests_logged_t, 0);
+	deleted = &STD_VEC_AT(&logged, txn_change_tests_logged_t, 1);
+	STD_ASSERT(__LINE__, 9, deleted->change.op.tag == TXN_MEMTABLE_OP_DELETE, "the second row change is the delete");
+	{
+		txn_change_tests_shown_t want[] = {{"delete", 3, true, deleted->end}, {"put", 2, true, inserted->end}};
+		StdVec		got = txn_change_tests_shown(io, &made.held);
+
+		txn_change_tests_shown_is(__LINE__, &got, want, lengthof(want));
+	}
+	replica = txn_change_tests_made(io, 9362);
+	replica_store = repo_Repo_reader(&replica.repo, HOST_CACHE_PLACEMENT_SERVER, &replica.reading);
+	for (size_t k = 0; k < logged.len; k++)
+	{
+		const txn_change_tests_logged_t *one = &STD_VEC_AT(&logged, txn_change_tests_logged_t, k);
+		const TxnMemtablePut *put;
+		bool		ok;
+
+		if (txn_record_RowChange_put(&one->change, &put))
+			ok = txn_insert_redo(io, TREES_STORE_READER_NODE_STORE(&replica_store), &replica.held, &one->change,
+								 one->end, &page, NULL, NULL, NULL, 0, &error);
+		else
+			ok = txn_change_redo(io, &replica.held, &one->change, one->end, &error);
+		if (!ok)
+			TXN_CHANGE_TESTS_UNWRAP_FAILED(__LINE__, 13, &error);
+	}
+	if (!txn_change_redo(io, &replica.held, &deleted->change, deleted->end, &error))
+		TXN_CHANGE_TESTS_UNWRAP_FAILED(__LINE__, 9, &error);
+	{
+		txn_change_tests_shown_t want[] = {{"delete", 0, true, deleted->end}, {"put", 0, true, inserted->end}};
+		StdVec		got = txn_change_tests_shown(io, &replica.held);
+
+		txn_change_tests_shown_is(__LINE__, &got, want, lengthof(want));
+	}
+	STD_ASSERT(__LINE__, 9,
+			   txn_change_tests_ended(io, &made.held,
+									  txn_change_tests_ending(made.storage, txn_change_tests_op_share(), writer, 4,
+															  roomed, tid),
+									  txn_change_tests_go, &stopped) == TXN_CHANGE_ENDED_PUSHED,
+			   "a lock pushes its version");
+	{
+		StdVec		got = txn_change_tests_shown(io, &made.held);
+		txn_change_tests_shown_t lock = {"lock", 4, false, 0};
+
+		STD_ASSERT(__LINE__, 9, got.len > 0 &&
+				   txn_change_tests_shown_eq(&STD_VEC_AT(&got, txn_change_tests_shown_t, 0), &lock),
+				   "the key's newest version is the lock, with no LSN");
+		std_vec_free_Checked(&got, sizeof(txn_change_tests_shown_t), _Alignof(txn_change_tests_shown_t));
+	}
+	{
+		StdVec		again = txn_change_tests_changes(9361);
+
+		STD_ASSERT(__LINE__, 9, again.len == 2, "a lock logs no row change");
+		txn_change_tests_changes_drop(&again);
+	}
+	if (!txn_written_ended(io, &error))
+		TXN_CHANGE_TESTS_UNWRAP_FAILED(__LINE__, 21, &error);
+	txn_change_tests_changes_drop(&logged);
+	txn_change_tests_made_drop(&replica);
+	txn_change_tests_made_drop(&made);
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * test_txn_change_tests_an_aborted_delete_and_lock_stay_until_a_fold: an
+ * aborted transaction's delete and lock of a committed row stay beside the
+ * committed row's put after its take-back, which drops only what a fold's
+ * logged decision drops (bugs row 432).
+ */
+void
+test_txn_change_tests_an_aborted_delete_and_lock_stay_until_a_fold(void)
+{
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	txn_change_tests_made_t made = txn_change_tests_made(io, 9363);
+	HostXid		committed = simc_begin();
+	HostXid		aborted = simc_begin();
+	TxnMemtableVersionWriter by_committed = {.xid = committed.f0};
+	TxnMemtableVersionWriter by_aborted = {.xid = aborted.f0};
+	TxnStatusRoomed unroomed = {0};
+	TxnStatusRoomed roomed;
+	uint64		tid;
+	StdVec		got;
+	HostError	error;
+
+	tid = txn_change_tests_inserted(io, &made, txn_change_tests_row(made.storage, by_committed, false, unroomed));
+	simc_commit(committed);
+	if (!txn_written_ended(io, &error) || !txn_status_roomed(io, aborted, &roomed, &error))
+		TXN_CHANGE_TESTS_UNWRAP_FAILED(__LINE__, 9, &error);
+	txn_change_tests_ended(io, &made.held,
+						   txn_change_tests_ending(made.storage, txn_change_tests_op_share(), by_aborted, 0, roomed,
+												   tid),
+						   txn_change_tests_go, NULL);
+	txn_change_tests_ended(io, &made.held,
+						   txn_change_tests_ending(made.storage, txn_change_tests_op_delete(), by_aborted, 0, roomed,
+												   tid),
+						   txn_change_tests_go, NULL);
+	got = txn_change_tests_shown(io, &made.held);
+	STD_ASSERT(__LINE__, 9, got.len == 3, "the key holds the put, the lock, and the delete");
+	std_vec_free_Checked(&got, sizeof(txn_change_tests_shown_t), _Alignof(txn_change_tests_shown_t));
+	simc_abort(aborted);
+	if (!txn_written_aborted(io, 0, &error))
+		TXN_CHANGE_TESTS_UNWRAP_FAILED(__LINE__, 9, &error);
+	got = txn_change_tests_shown(io, &made.held);
+	STD_ASSERT(__LINE__, 9, got.len == 3, "the take-back leaves the put, the lock, and the delete");
+	std_vec_free_Checked(&got, sizeof(txn_change_tests_shown_t), _Alignof(txn_change_tests_shown_t));
+	txn_change_tests_made_drop(&made);
+	simc_TestIo_drop(&test_io);
+}
+
+/*
+ * test_txn_change_tests_a_change_of_a_spilled_row_reads_its_spilled_version:
+ * a change of a row whose version its transaction spilled reads that version
+ * from the spill, though the row's slice of the memtable's chain holds none of
+ * the key's versions, and pushes its own version over it.
+ */
+void
+test_txn_change_tests_a_change_of_a_spilled_row_reads_its_spilled_version(void)
+{
+	SimcProcess process = simc_process();
+	SimcTestIo	test_io = simc_io();
+	HostIoIo   *io = &test_io.io;
+	txn_change_tests_made_t made = txn_change_tests_made(io, 9524);
+	HostXid		xid = simc_begin();
+	TxnMemtableVersionWriter writer = {.xid = xid.f0, .command = 2};
+	TxnStatusRoomed roomed;
+	uint64		tid;
+	bool		spilled;
+	size_t		stopped = 0;
+	StdVec		got;
+	HostError	error;
+
+	if (!txn_status_roomed(io, xid, &roomed, &error))
+		TXN_CHANGE_TESTS_UNWRAP_FAILED(__LINE__, 9, &error);
+	tid = txn_change_tests_inserted(io, &made, txn_change_tests_row(made.storage, writer, true, roomed));
+	if (!txn_spill_spilled(io, &made.storage, TXN_WRITTEN_OF_ROWS, writer.xid, &spilled, &error))
+		TXN_CHANGE_TESTS_UNWRAP_FAILED(__LINE__, 9, &error);
+	STD_ASSERT(__LINE__, 5, spilled, "the insert spilled its row");
+	STD_ASSERT(__LINE__, 9,
+			   txn_change_tests_ended(io, &made.held,
+									  txn_change_tests_ending(made.storage, txn_change_tests_op_delete(), writer, 3,
+															  roomed, tid),
+									  txn_change_tests_stop, &stopped) == TXN_CHANGE_ENDED_STOPPED && stopped == 1,
+			   "the change reads the row's spilled version");
+	STD_ASSERT(__LINE__, 9,
+			   txn_change_tests_ended(io, &made.held,
+									  txn_change_tests_ending(made.storage, txn_change_tests_op_delete(), writer, 3,
+															  roomed, tid),
+									  txn_change_tests_go, &stopped) == TXN_CHANGE_ENDED_PUSHED,
+			   "the change pushes its own version over it");
+	got = txn_change_tests_shown(io, &made.held);
+	STD_ASSERT(__LINE__, 9, got.len == 2 && strcmp(STD_VEC_AT(&got, txn_change_tests_shown_t, 0).does, "delete") == 0 &&
+			   strcmp(STD_VEC_AT(&got, txn_change_tests_shown_t, 1).does, "put") == 0,
+			   "the key's versions are the delete over the put");
+	std_vec_free_Checked(&got, sizeof(txn_change_tests_shown_t), _Alignof(txn_change_tests_shown_t));
+	if (!txn_written_ended(io, &error))
+		TXN_CHANGE_TESTS_UNWRAP_FAILED(__LINE__, 9, &error);
+	txn_change_tests_made_drop(&made);
+	simc_TestIo_drop(&test_io);
+	simc_Process_drop(&process);
+}
+
+#endif							/* DOLTGRES_TEST_TXN */

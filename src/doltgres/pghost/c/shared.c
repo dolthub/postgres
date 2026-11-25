@@ -227,7 +227,7 @@ pghost_shared_kinds_closure_0(const HostSharedLimits *limits, const HostSharedKi
 	{
 		kind->id, form, count, kind->locks, kind->flags,
 			STD_ADD(usize, kind->atomics, run, 112, 26), kind->blobs, kind->blobs_len,
-			kind->arrays, kind->arrays_len
+			kind->arrays, kind->arrays_len, kind->index
 	};
 }
 
@@ -1515,6 +1515,37 @@ pghost_shared_exit(void)
 
 	std_landing(&frame, pghost_shared_exit_body_0, pghost_shared_exit_pad_0);
 }
+
+#ifdef USE_INJECTION_POINTS
+/*
+ * pghost_shared_held returns the number of handles this process holds of a
+ * pool's records, which the fork's tests read to see a scan's hold released
+ * (bugs row 358).
+ */
+bool
+pghost_shared_held(uint64 id, uint64 *result, HostError *error)
+{
+	PghostSharedPool pool;
+	StdRwLockWriteGuard guard;
+	const StdVec *handles;
+
+	if (!pghost_shared_pool(id, &pool, error))
+		return false;
+	*result = 0;
+	guard = pghost_shared_handles();
+	handles = guard.data;
+	for (size_t i = 0; i < handles->len; i++)
+	{
+		const PghostSharedHandle *handle = &STD_VEC_AT(handles, PghostSharedHandle, i);
+
+		if (handle->slot >= pool.first && handle->slot - pool.first < pool.count &&
+			handle->role.tag == PGHOST_SHARED_ROLE_HOLDER)
+			*result += handle->role.u.holder;
+	}
+	std_RwLockWriteGuard_drop(&guard);
+	return true;
+}
+#endif
 
 #ifdef DOLTGRES_TEST_PGHOST
 

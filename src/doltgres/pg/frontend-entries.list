@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Every entry the frontend build's Rust exports (design item D12), one per line, tab-separated: its name, its C
+# Every entry the frontend build exports (design item D12), one per line, tab-separated: its name, its C
 # parameters, and the test that exercises it. The program's main calls it, and it reports a failure in its buffer and
-# returns false, never exiting and never unwinding into C.
+# returns false, never exiting.
 
 doltgres_fsck	const char *datadir, DgLine line, DgKept kept	test/t/025_checkversioned.pl: a clean cluster exits 0

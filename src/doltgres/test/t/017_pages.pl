@@ -273,15 +273,16 @@ sub restamped
 
 # The region is listed at its blocks, the setting's sixteen and one more for
 # the copies compactions take past the budget (bugs rows 110 and 116), and the
-# directory at its header, ten cache lines, a cache line for each 1 KiB page
+# directory at its header, eleven cache lines, a cache line for each 1 KiB page
 # the region's blocks can hold, that block's included, three words for each
-# block, and a word of the free hint for each 64 slots below the block past
-# the budget's (bugs row 150).
+# block, a word of the free hint for each 64 slots below the block past the
+# budget's (bugs row 150), and a slot's four-byte link in the retired list for
+# each slot (bugs row 309).
 is( $node->safe_psql(
 		'postgres',
 		"SELECT name, size FROM pg_shmem_allocations WHERE name LIKE 'versioned delta%' ORDER BY name"
 	),
-	"versioned delta|1114112\nversioned delta directory|70808",
+	"versioned delta|1114112\nversioned delta directory|75224",
 	"the delta's region and its directory are listed with their sizes");
 
 # On the fresh server the region gives sixteen pages of a block at once, the
@@ -566,20 +567,31 @@ is(delta(0, 0, 0) . '|' . delta(17, 0, 0),
 	"$used|$free",
 	'a backend terminated while it owns a page gives the page back');
 
-# A free pass paused after its claim of a slot: a second pass frees nothing,
-# and the count is right once the first goes on.
+# A free pass paused after its claim of a slot holds the pass's lock: a
+# second pass waits at it and frees nothing meanwhile, and the count is right
+# once the first goes on (bugs row 309's one pass at a time).
 $kept = paged($LARGE);
 $used = delta(0, 0, 0);
-hold('doltgres-delta-claimed');
 my $passer = $node->background_psql('postgres', on_error_stop => 0);
+$passer->query_safe(
+	"SELECT injection_points_set_local(); SELECT injection_points_attach('doltgres-delta-claimed', 'wait')"
+);
 start($passer, "SELECT doltgres_test_delta(4, $kept, 0)");
 $node->wait_for_event('client backend', 'doltgres-delta-claimed');
-delta(23, 0, 0);
+my $second_pass = $node->background_psql('postgres', on_error_stop => 0);
+start($second_pass, 'SELECT doltgres_test_delta(23, 0, 0)');
+$node->poll_query_until('postgres',
+	"SELECT wait_event_type = 'LWLock' FROM pg_stat_activity WHERE pid = $second_pass->{pid}"
+) or die 'the second free pass never waited at the first';
 is(delta(0, 0, 0),
-	$used, "a second free pass at a pass's pause frees nothing");
-release('doltgres-delta-claimed');
+	$used, "a second free pass at a pass's pause waits and frees nothing");
+$node->safe_psql('postgres',
+	"SELECT injection_points_wakeup('doltgres-delta-claimed')");
 is(ended($passer), '0', 'a paused free pass goes on when woken');
+isnt(ended($second_pass), undef,
+	'the waiting free pass goes on once the first ends');
 leave($passer);
+leave($second_pass);
 is( delta(0, 0, 0),
 	$used - $BLOCK,
 	'a free pass that was paused frees what it claimed');
@@ -1349,5 +1361,88 @@ ROLLBACK;
 }))[-1];
 ok($below->($unlinking, $before_abort + int(($aborted_filled - $before_abort) / 2)),
 	"an aborted table's storage gives its delta's pages back at the abort");
+
+
+# Bugs row 229's wait: a writer whose first write into a table finds room for
+# its memtable's first page and none for its version waits asleep at the
+# budget, and a cancel ends it with Postgres' 57014. Spill's relieved spills
+# nothing for it, and its walk closes the memtable the refused try left, a
+# free that ended the wait at once, so the writer tried again forever and
+# never reached the sleep a cancel ends. A write to another table first
+# gives the commit status table room for the writer's entry; then the delta is
+# filled with test pages of every size but one free 1 KB slot, in a block
+# other pages keep.
+$node->safe_psql('postgres', 'DROP TABLE kilobytes');
+$node->append_conf('postgresql.conf', 'delta_memory = 1MB');
+$node->restart;
+$node->safe_psql(
+	'postgres', q{
+CREATE TABLE first_write (k int4, v text);
+CREATE TABLE status_warmed (k int4);
+SELECT doltgres_test_write('status_warmed', true, 'INSERT INTO status_warmed VALUES (1)');
+});
+my $slot = paged($PAGE);
+my @sizes = ($LARGE, map { (8 << 32) | ((1024 << $_) - 64) } 0 .. 5);
+my @filled;
+for (1 .. 2)
+{
+	delta(23, 0, 0);
+	for my $size (@sizes)
+	{
+		my $record = record();
+		push @filled, $record if delta(20, $record, $size) > 0;
+	}
+}
+delta(4, $slot, 0);
+ok($node->poll_query_until('postgres', "SELECT doltgres_test_delta(10, $PAGE, 1) = 1"),
+	"the delta frees the one slot a test page left");
+is(join(',', map { delta(10, $_, $_ == $PAGE ? 2 : 1) } @sizes),
+	'0,0,0,0,0,0,0', 'the delta has no other free slot');
+my $first_writer = $node->background_psql('postgres', on_error_stop => 0);
+$first_writer->query_safe('\set VERBOSITY verbose');
+start($first_writer,
+	"SELECT doltgres_test_write('first_write', true, 'INSERT INTO first_write VALUES (1, repeat(''x'', 2000))')");
+ok( $node->poll_query_until(
+		'postgres',
+		"SELECT count(*) = 1 FROM pg_stat_activity WHERE wait_event = 'versioned delta budget'"
+	),
+	"a first write with room for its memtable's first page alone waits asleep at the budget");
+$node->safe_psql('postgres', "SELECT pg_cancel_backend($first_writer->{pid})");
+awaited($first_writer, \$first_writer->{stderr}, qr/ERROR:/);
+like($first_writer->{stderr},
+	qr/ERROR:  57014: canceling statement due to user request/,
+	'a cancel ends a wait at a full delta with 57014');
+delta(21, $_, 0) for @filled;
+leave($first_writer);
+
+# Bugs row 355: a process answers a repeat of an open the directory admitted
+# from its own table, for the same name at the same epoch only. A repeat
+# reads what the first open read; once the page is retired and its slot freed
+# and taken again, the old name is refused and the new one reads the new page.
+my $cached = record();
+my $cached_name = delta(1, $cached, $PAGE);
+delta(2, $cached, 41);
+my $cacher = $node->background_psql('postgres', on_error_stop => 0);
+is( $cacher->query_safe("SELECT doltgres_test_delta(27, 0, $cached_name)")
+	  . ' '
+	  . $cacher->query_safe("SELECT doltgres_test_delta(27, 0, $cached_name)"),
+	'41 41',
+	'a repeat of an admitted open in one process reads what the first open read');
+my $free_before = delta(17, 0, 0);
+delta(4, $cached, 0);
+delta(23, 0, 0);
+is(delta(17, 0, 0), $free_before + 1, "the cached page's slot is freed");
+$cacher->query("SELECT doltgres_test_delta(27, 0, $cached_name)");
+like(
+	$cacher->{stderr},
+	qr/a name of the delta names no page its hold reaches/,
+	"the process's open of the freed page's name is refused");
+$cacher->{stderr} = '';
+my $taker = record();
+my $taker_name = delta(1, $taker, $PAGE);
+delta(2, $taker, 42);
+is( $cacher->query_safe("SELECT doltgres_test_delta(27, 0, $taker_name)"),
+	'42', 'and its open of the page that took the slot reads the new page');
+$cacher->quit;
 
 done_testing();

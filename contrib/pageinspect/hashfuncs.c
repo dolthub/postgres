@@ -15,6 +15,7 @@
 #include "access/relation.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_type.h"
+#include "doltgres/hooks.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pageinspect.h"
@@ -421,7 +422,7 @@ hash_bitmap_info(PG_FUNCTION_ARGS)
 	 */
 	indexRel = relation_open(indexRelid, AccessShareLock);
 
-	if (!IS_INDEX(indexRel) || !IS_HASH(indexRel))
+	if (!IS_INDEX(indexRel) || !IS_HASH(indexRel) || doltgres_heap_only_refused(indexRel))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not a %s index",

@@ -111,9 +111,7 @@ chunks_hash_tests_RandomState_Default_default(void *result)
 
 /* CHUNKS_HASH_TESTS_MAP_TYPE is the table of a HashMap<Counted, u32>. */
 static const StdHashMapType CHUNKS_HASH_TESTS_MAP_TYPE = {
-	.size = sizeof(chunks_hash_tests_TupleCountedU32_t),
-	.align = _Alignof(chunks_hash_tests_TupleCountedU32_t),
-	.value_offset = offsetof(chunks_hash_tests_TupleCountedU32_t, f1),
+	STD_HASHMAP_SHAPE(chunks_hash_tests_TupleCountedU32_t),
 	.key_hash = chunks_hash_tests_Counted_Hash_hash,
 	.key_eq = chunks_hash_tests_Counted_PartialEq_eq,
 	.key_drop = chunks_hash_tests_Counted_drop,
@@ -123,9 +121,7 @@ static const StdHashMapType CHUNKS_HASH_TESTS_MAP_TYPE = {
 
 /* CHUNKS_HASH_TESTS_SET_TYPE is the table of a HashSet<Counted>. */
 static const StdHashMapType CHUNKS_HASH_TESTS_SET_TYPE = {
-	.size = sizeof(ChunksHashTestsCounted),
-	.align = _Alignof(ChunksHashTestsCounted),
-	.value_offset = sizeof(ChunksHashTestsCounted),
+	STD_HASHSET_SHAPE(ChunksHashTestsCounted),
 	.key_hash = chunks_hash_tests_Counted_Hash_hash,
 	.key_eq = chunks_hash_tests_Counted_PartialEq_eq,
 	.key_drop = chunks_hash_tests_Counted_drop,
@@ -296,9 +292,7 @@ chunks_hash_tests_u32_lt(void *captures, const void *a, const void *b)
 
 /* CHUNKS_HASH_TESTS_U32_MAP_TYPE is the table of a HashMap<u32, u32> of the walk tests. */
 static const StdHashMapType CHUNKS_HASH_TESTS_U32_MAP_TYPE = {
-	.size = sizeof(std_TupleU32U32_t),
-	.align = _Alignof(std_TupleU32U32_t),
-	.value_offset = offsetof(std_TupleU32U32_t, f1),
+	STD_HASHMAP_SHAPE(std_TupleU32U32_t),
 	.key_hash = chunks_hash_tests_u32_Hash_hash,
 	.key_eq = chunks_hash_tests_u32_PartialEq_eq,
 	.hasher = &STD_RANDOM_STATE_BUILD_HASHER_OPS,
@@ -325,9 +319,7 @@ static const StdHashMapType CHUNKS_HASH_TESTS_U32_MAP_TYPE = {
 
 /* CHUNKS_HASH_TESTS_U32_FAST_MAP_TYPE is the table of a HashMap<u32, u32> of the walk tests. */
 static const StdHashMapType CHUNKS_HASH_TESTS_U32_FAST_MAP_TYPE = {
-	.size = sizeof(std_TupleU32U32_t),
-	.align = _Alignof(std_TupleU32U32_t),
-	.value_offset = offsetof(std_TupleU32U32_t, f1),
+	STD_HASHMAP_SHAPE(std_TupleU32U32_t),
 	.key_hash = chunks_hash_tests_u32_Hash_hash,
 	.key_eq = chunks_hash_tests_u32_PartialEq_eq,
 	.hasher = &FOLDHASH_FAST_RANDOM_STATE_BUILD_HASHER_OPS,
@@ -354,9 +346,7 @@ static const StdHashMapType CHUNKS_HASH_TESTS_U32_FAST_MAP_TYPE = {
 
 /* CHUNKS_HASH_TESTS_U32_SET_TYPE is the table of a HashSet<u32> of the walk tests. */
 static const StdHashMapType CHUNKS_HASH_TESTS_U32_SET_TYPE = {
-	.size = sizeof(uint32),
-	.align = _Alignof(uint32),
-	.value_offset = sizeof(uint32),
+	STD_HASHSET_SHAPE(uint32),
 	.key_hash = chunks_hash_tests_u32_Hash_hash,
 	.key_eq = chunks_hash_tests_u32_PartialEq_eq,
 	.hasher = &STD_RANDOM_STATE_BUILD_HASHER_OPS,
@@ -380,9 +370,7 @@ static const StdHashMapType CHUNKS_HASH_TESTS_U32_SET_TYPE = {
 
 /* CHUNKS_HASH_TESTS_U32_FAST_SET_TYPE is the table of a HashSet<u32> of the walk tests. */
 static const StdHashMapType CHUNKS_HASH_TESTS_U32_FAST_SET_TYPE = {
-	.size = sizeof(uint32),
-	.align = _Alignof(uint32),
-	.value_offset = sizeof(uint32),
+	STD_HASHSET_SHAPE(uint32),
 	.key_hash = chunks_hash_tests_u32_Hash_hash,
 	.key_eq = chunks_hash_tests_u32_PartialEq_eq,
 	.hasher = &FOLDHASH_FAST_RANDOM_STATE_BUILD_HASHER_OPS,

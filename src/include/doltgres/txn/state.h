@@ -74,6 +74,9 @@ extern const HostSharedPoolOps TXN_STATE_STATE_POOL_OPS;
 /* TXN_STATE_SPILLS_CHANGED_INDEX is SpillsChanged's atomic: the generation of the storage's spills' manifest. */
 #define TXN_STATE_SPILLS_CHANGED_INDEX (22 + TXN_FREE_SPACE_CATEGORIES)
 
+/* TXN_STATE_SPILLS_TAKEN_INDEX is SpillsTaken's atomic: the take generation of the storage's spills. */
+#define TXN_STATE_SPILLS_TAKEN_INDEX (31 + TXN_FREE_SPACE_CATEGORIES)
+
 /* TXN_STATE_MAKERS_SINGLE_OPS is Makers' Shape and Single. */
 extern const HostSharedSingleOps TXN_STATE_MAKERS_SINGLE_OPS;
 
@@ -201,13 +204,27 @@ typedef struct txn_TupleU64HeldState_t
 	HostSharedHeld f1;
 } txn_TupleU64HeldState_t;
 
-/* TxnStateSaving is Saving: what a save's gathering stored in the states it gathered, its token and the states' locations. */
+/*
+ * TxnStateSaving is Saving: what a save's gathering stored in the states it
+ * gathered, its token and the states' locations, with the end the WAL is
+ * flushed through before the manifest names their bases.
+ */
 typedef struct TxnStateSaving
 {
 	uint64		token;
 	/* locations is a Vec<u64>. */
 	StdVec		locations;
+	HostLsn		end;
 } TxnStateSaving;
+
+/*
+ * TxnStateLogged is an install's logging, run before the new base is
+ * published, under the state's logging flag and no lock, with the flag's
+ * doors: it inserts the record that names the base, given the end of the
+ * record a standby's fold reached, and gives the end the WAL must reach
+ * before a manifest names the base, or zero.
+ */
+typedef bool (*TxnStateLogged) (void *captures, HostIoIoDoors io, HostLsn reached, HostLsn *end, HostError *error);
 
 extern TxnBaseSizes txn_state_totals(const HostSharedHeld *held);
 extern bool txn_state_known(const HostSharedHeld *held);
@@ -225,16 +242,23 @@ extern void txn_state_grew(HostSharedRecord record, uint64 bytes);
 extern void txn_state_shrank(HostSharedRecord record, uint64 bytes);
 extern bool txn_state_aged(HostIoIo *io, HostSharedRecord record, HostError *error);
 extern std_TupleU64U64_t txn_state_pending(HostSharedRecord record);
-extern bool txn_state_reach(HostIoIo *io, const HostSharedHeld *held, const TxnBaseBase *base, uint64 end,
-							bool *result, HostError *error);
+extern bool txn_state_reach(HostIoIo *io, const HostSharedHeld *held, const TxnBaseBase *base, uint64 start,
+							uint64 end, bool *result, HostError *error);
 extern bool txn_state_deferring(HostIoIo *io, const HostSharedHeld *held, uint64 end, bool *result,
 								HostError *error);
 extern bool txn_state_past(HostIoIo *io, const HostSharedHeld *held, bool *some, uint64 *result, HostError *error);
 extern bool txn_state_read_past(HostIoIo *io, const HostSharedHeld *held, uint64 to, bool has_next,
-								const TxnBaseBase *next_base, uint64 next_end, bool *result, HostError *error);
+								const TxnBaseBase *next_base, uint64 next_from, uint64 next_end, bool *result,
+								HostError *error);
 extern bool txn_state_held_back(HostIoIo *io, bool *some, txn_TupleU64StorageU64_t *result, HostError *error);
+extern void txn_state_dropping(HostSharedRecord record, bool dropping);
+extern bool txn_state_dropped(HostIoIo *io, HostSharedRecord record, HostError *error);
+extern void txn_state_walked(HostSharedRecord record, bool walking);
+extern uint64 txn_state_walkers(HostSharedRecord record);
+extern void txn_state_rolled(HostSharedRecord record, bool rolling);
+extern bool txn_state_rolling(HostSharedRecord record);
 extern bool txn_state_behind(HostIoIo *io, const HostSharedHeld *held, bool *some, TxnBaseBase *result,
-							 HostError *error);
+							 uint64 *from, uint64 *end, HostError *error);
 extern bool txn_state_founded(HostIoIo *io, const HostSharedHeld *held, uint32 table, bool has_index, uint32 index,
 							  HostError *error);
 extern bool txn_state_hint(HostSharedRecord record, uint8 category, uint32 *result, HostError *error);
@@ -245,6 +269,9 @@ extern bool txn_state_advanced(HostSharedRecord record, uint8 category, uint32 f
 extern bool txn_state_described(HostSharedRecord record, HostStorage *result_0, TxnStatePersistence *result_1);
 extern bool txn_state_mapped(HostSharedRecord record);
 extern void txn_state_kept(const TxnBaseBase *base, StdVec *result);
+#ifdef USE_INJECTION_POINTS
+extern uint64 txn_state_bases_decoded;
+#endif
 extern bool txn_state_unkept(const uint8 *blob, size_t blob_len,
 							 HostError (*fault) (const char *text, size_t text_len), bool *some, TxnBaseBase *result,
 							 HostError *error);
@@ -254,18 +281,31 @@ extern bool txn_state_state(HostIoIo *io, const RepoRepo *repo, const HostShared
 							const HostStorage *storage, TxnStatePersistence persistence, bool has_made,
 							TxnStateMade *made, HostSharedHeld *result, HostError *error);
 extern bool txn_state_rechained(HostIoTakesShort io, const HostSharedHeld *held, uint64 read,
-								const TxnBaseBase *base, bool *result, HostError *error);
+								const TxnBaseBase *base, TxnStateLogged logged, void *logged_captures, bool *result,
+								HostError *error);
 extern bool txn_state_stored_base(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading,
 								  const HostStorage *storage, bool *some, TxnBaseBase *result, HostError *error);
+extern void txn_state_crash_redo(HostIoIo *io, uint32 repository, HostLsn redo);
+extern void txn_state_crash_cut(HostIoIo *io, const HostStorage *storage, uint64 cut);
 extern bool txn_state_base_record(HostIoIo *io, const HostSharedHeld *held, bool *some, TxnBaseBase *result,
 								  HostError *error);
 extern bool txn_state_installed(HostIoTakesShort io, const HostSharedHeld *held, uint64 read,
-								const TxnBaseBase *base, bool *result, HostError *error);
+								const TxnBaseBase *base, TxnStateLogged logged, void *logged_captures, bool *result,
+								HostError *error);
+extern void txn_state_raised(HostSharedRecord record, uint64 counter);
 extern void txn_state_grown(HostSharedRecord record, const TxnBaseBase *base);
 extern bool txn_state_newest(HostIoIo *io, const HostSharedHeld *held, bool *some, TxnBaseBase *result,
 							 HostError *error);
+extern bool txn_state_read_point(HostIoIo *io, HostSharedRecord record, uint64 *result, HostError *error);
+extern bool txn_state_committed_taken(HostSharedRecord record, uint64 id);
+extern void txn_state_committed_given(HostSharedRecord record, uint64 id);
+extern uint32 txn_state_numbered(HostSharedRecord record, uint32 past);
+extern uint64 txn_state_delta_bytes(HostSharedRecord record);
 extern bool txn_state_readable(HostIoIo *io, const HostSharedHeld *held, const HostSnapshot *snapshot, bool *some,
 							   TxnBaseBase *result, HostError *error);
+extern bool txn_state_readable_since(HostIoIo *io, HostSharedRecord record, const HostSnapshot *snapshot,
+									 uint64 generation, bool *moved, bool *some, TxnBaseBase *result, uint64 *now,
+									 HostError *error);
 extern bool txn_state_emptied(HostIoIo *io, const HostSharedHeld *held, HostError *error);
 extern bool txn_state_redo_emptied(HostIoIo *io, const HostSharedHeld *held, HostError *error);
 extern bool txn_state_unlinked(HostIoIo *io, const HostStorage *storage, HostError *error);
@@ -281,7 +321,12 @@ extern bool txn_state_held_to_end(HostIoIo *io, const HostStorage *storage, bool
 								  HostError *error);
 extern uint64 txn_state_counter(HostSharedRecord record);
 extern uint32 txn_state_space(HostSharedRecord record);
+extern uint32 txn_state_spill_space(HostSharedRecord record);
+extern void txn_state_spill_space_loaded(HostSharedRecord record, uint32 named);
+extern uint32 txn_state_manifest_space(HostSharedRecord record);
+extern void txn_state_manifest_space_moved(HostSharedRecord record, uint32 named);
 extern uint64 txn_state_generation(HostSharedRecord record);
+extern bool txn_state_moved_past(HostSharedRecord record, uint64 generation);
 extern void txn_state_moved(HostSharedRecord record, uint64 from, uint64 to);
 
 extern bool txn_state_spills_generation(uint64 *result, HostError *error);
@@ -311,7 +356,8 @@ extern void test_txn_state_tests_an_install_keeps_a_key_recorded_after_its_fold_
 extern void test_txn_state_tests_an_install_replaces_the_newest_and_refuses_a_moved_generation(void);
 extern void test_txn_state_tests_a_backend_records_its_key_in_a_state_and_redo_takes_none(void);
 extern void test_txn_state_tests_a_linked_free_space_map_or_tuple_id_table_keeps_the_counter_from_falling_back(void);
-extern void test_txn_state_tests_a_save_gathers_a_linked_states_counter_and_lets_an_idle_ones_fall_back(void);
+extern void test_txn_state_tests_a_state_with_spills_keeps_the_counter_from_falling_back(void);
+extern void test_txn_state_tests_a_save_keeps_a_linked_states_counter_and_lets_an_idle_ones_fall_back(void);
 extern void test_txn_state_tests_a_backend_holds_its_transactions_states_until_its_end(void);
 extern void test_txn_state_tests_a_state_saved_reclaimed_and_made_again_reads_the_same(void);
 extern void test_txn_state_tests_the_free_at_the_unlink_takes_a_held_state(void);
@@ -323,6 +369,14 @@ extern void test_txn_state_tests_of_two_racing_fillers_the_second_to_the_lock_dr
 extern void test_txn_state_tests_a_state_is_filled_from_its_base_and_found_again(void);
 extern void test_txn_state_tests_the_largest_base_record_fits_a_states_blob_and_reads_back(void);
 extern void test_txn_state_tests_two_backends_that_open_one_storage_make_one_state(void);
+extern void test_txn_state_tests_a_make_while_running_writers_hold_every_unsaved_state_gets_the_pools_error(void);
+extern void test_txn_state_tests_a_rechain_keeps_a_key_recorded_while_it_logs(void);
+extern void test_txn_state_tests_a_find_reaches_a_state_through_the_index_alone(void);
+extern void test_txn_state_tests_a_find_passes_over_a_location_whose_slot_was_freed_and_made_again(void);
+extern void test_txn_state_tests_a_lookup_right_after_a_states_publish_finds_it(void);
+extern bool txn_state_tests_reopened(HostIoIo *io, uint32 database, RepoRepo *result, HostError *error);
+extern void txn_state_tests_saved(HostIoIo *io, const RepoRepo *repo, uint32 database,
+								  void (*between) (void *captures, HostIoIo *io), void *between_captures);
 #endif
 
 #endif							/* DOLTGRES_TXN_STATE_H */

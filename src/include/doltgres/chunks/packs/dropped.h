@@ -33,11 +33,23 @@
 /* CHUNKS_PACKS_DROPPED_MARK names the file in a repository's own directory that says it is dropped. */
 #define CHUNKS_PACKS_DROPPED_MARK "dropped"
 
+/*
+ * CHUNKS_PACKS_DROPPED_CREATING names the file in a copied repository's own
+ * directory that holds its creating transaction's xid until the creation's
+ * outcome is known (bugs row 404).
+ */
+#define CHUNKS_PACKS_DROPPED_CREATING "creating"
+
 extern const HostSharedPoolOps CHUNKS_PACKS_DROPPED_DROPPED_REPOSITORY_POOL_OPS;
 
 extern bool chunks_packs_dropped_marked(HostIoReadDoors io, const char *dir, size_t dir_len, bool *result,
 										ChunksErrorError *error);
 extern bool chunks_packs_dropped_mark(HostIoIoDoors io, const char *dir, size_t dir_len, ChunksErrorError *error);
+extern bool chunks_packs_dropped_creation_mark(HostIoIoDoors io, uint32 repository, uint32 own, uint64 xid,
+											   ChunksErrorError *error);
+extern bool chunks_packs_dropped_creating(HostIoReadDoors io, uint32 repository, uint32 own, bool *has_result,
+										  uint64 *result, ChunksErrorError *error);
+extern bool chunks_packs_dropped_created(HostIoIoDoors io, uint32 repository, uint32 own, ChunksErrorError *error);
 extern bool chunks_packs_dropped_remove_directories(HostIoIo *io, uint32 repository, uint32 own, bool *result,
 													ChunksErrorError *error);
 extern bool chunks_packs_dropped_remove_dropped(HostIoIo *io, bool *result, ChunksErrorError *error);

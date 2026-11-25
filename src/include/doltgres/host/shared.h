@@ -70,6 +70,12 @@ typedef struct HostSharedPoolOps
 	StdStr		name;
 	size_t		(*count) (const HostSharedLimits *limits);
 	bool		(*reclaim) (struct HostIoIo *io, bool *result, struct HostError *error);
+
+	/*
+	 * index is the length of the key of the pool's index of its records, or 0
+	 * for none.
+	 */
+	size_t		index;
 } HostSharedPoolOps;
 
 /* HostSharedAgedOps is the Aged trait: a shape, its records' name, the aged shapes they name, and its count. */
@@ -152,6 +158,8 @@ typedef struct HostSharedKind
 	const std_TupleUsizeUsize_t *arrays;
 	size_t		arrays_len;
 	HostSharedForm form;
+	/* index is the length of the key of a pool's index, or 0 for none. */
+	size_t		index;
 } HostSharedKind;
 
 /* HostSharedOpTag is Op's variants: an operation on an atomic. */
@@ -160,9 +168,13 @@ typedef enum HostSharedOpTag
 	HOST_SHARED_OP_LOAD,
 	HOST_SHARED_OP_ADD,
 	HOST_SHARED_OP_EXCHANGE,
+	HOST_SHARED_OP_LOAD_ACQUIRE,
 } HostSharedOpTag;
 
-/* HostSharedOp is an operation on an atomic: a load, an add, or an exchange from a value to another. */
+/*
+ * HostSharedOp is an operation on an atomic: a load, an add, an exchange from
+ * a value to another, or a load after every read before it.
+ */
 typedef struct HostSharedOp
 {
 	HostSharedOpTag tag;
@@ -524,6 +536,13 @@ extern void host_shared_Reclaim_drop(HostSharedReclaim *self);
 extern void host_shared_Look_drop(HostSharedLook *self);
 extern bool host_shared_sweep(HostSharedWithin within, const HostSharedPoolOps *s, size_t a,
 							  StdVec *result, HostError *error);
+extern bool host_shared_index_find(HostSharedWithin within, const HostSharedPoolOps *s, const uint8 *key, bool *has,
+								   uint64 *location, HostError *error);
+extern bool host_shared_index_put(HostSharedWithin within, const HostSharedPoolOps *s, const uint8 *key,
+								  uint64 location, HostError *error);
+extern bool host_shared_index_remove(HostSharedWithin within, const HostSharedPoolOps *s, const uint8 *key,
+									 uint64 location, HostError *error);
+extern uint64 host_shared_Owned_location(const HostSharedOwned *self);
 extern bool host_shared_gone(const HostSharedPoolOps *s, uint64 location, bool *result,
 							 HostError *error);
 extern bool host_shared_ready(void);
@@ -540,6 +559,8 @@ extern bool host_shared_Record_lock_long_shared(HostSharedRecord self, HostIoIo 
 												HostSharedLongGuard *result, HostError *error);
 extern bool host_shared_Record_flag(HostSharedRecord self, HostIoTakesShort io, size_t f,
 									HostSharedFlagGuard *result, HostError *error);
+extern bool host_shared_Record_try_flag(HostSharedRecord self, HostIoTakesShort io, size_t f, bool *taken,
+										HostSharedFlagGuard *result, HostError *error);
 extern uint64 host_shared_Record_atomic(HostSharedRecord self, size_t a, HostSharedOp op);
 extern bool host_shared_Record_atomic_in(HostSharedRecord self, size_t a_first, size_t a_count,
 										 size_t number, HostSharedOp op, uint64 *result,

@@ -29,6 +29,7 @@
 #include "postgres.h"
 
 #include "doltgres/shmem/cache.h"
+#include "doltgres/shmem/lib.h"
 #include "doltgres/std/iter.h"
 #include "doltgres/std/num.h"
 #include "doltgres/std/ptr.h"
@@ -39,9 +40,6 @@
 #include "pg_calls.h"
 
 #define RUST_FILE "shmem" STD_SEP "src" STD_SEP "cache.rs"
-
-/* SHMEM_CACHE_TRANCHE is the name of the shared cache's partition locks' tranche, which wait events show. */
-static const char SHMEM_CACHE_TRANCHE[] = "versioned node cache";
 
 /* SHMEM_CACHE_PINS is the state word's pin count. */
 #define SHMEM_CACHE_PINS ((uint64) PG_UINT32_MAX)
@@ -280,8 +278,7 @@ shmem_cache_initialize(const PgMayRaise *raise, const ShmemCacheLayout *layout, 
 	void	   *base;
 	ShmemCacheHeader *header;
 
-	if (!pg_calls_new_tranche(raise, SHMEM_CACHE_TRANCHE, &tranche, error))
-		return false;
+	tranche = shmem_tranche(DOLTGRES_TRANCHE_CACHE);
 	base = pg_calls_cache_base();
 	header = base;
 	for (size_t at = 0, at_end = SHMEM_CACHE_PARTITIONS; at < at_end; at = std_forward_unchecked_usize_Checked(at, 1))

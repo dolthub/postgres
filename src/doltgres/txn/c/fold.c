@@ -34,6 +34,8 @@
 #include "doltgres/host/delta.h"
 #include "doltgres/repo/lib.h"
 #include "doltgres/std/fmt.h"
+#include "doltgres/std/foldhash.h"
+#include "doltgres/std/hashmap.h"
 #include "doltgres/std/num.h"
 #include "doltgres/std/slice.h"
 #include "doltgres/std/unwind.h"
@@ -57,6 +59,8 @@
 #include "doltgres/txn/status.h"
 #include "doltgres/txn/vacuum.h"
 #include "doltgres/txn/values.h"
+
+#include "blake3.h"
 
 #define RUST_FILE "txn" STD_SEP "src" STD_SEP "fold.rs"
 
@@ -131,22 +135,56 @@ txn_fold_Pending_drop(void *pending)
 }
 
 static bool txn_fold_in_order(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading,
-							  const HostSharedHeld *held, const TreesKeyOrder *order, bool keyless, StdVec *warned,
-							  const TxnInsertPage *page, uint64 upto, bool *installed, bool *left, HostError *error);
+							  const HostSharedHeld *held, const TreesKeyOrder *order, bool keyless, bool startup,
+							  StdVec *warned, const TxnInsertPage *page, uint64 upto,
+							  const TxnFoldStatuses *redone, bool *installed, bool *left, HostError *error);
 static bool txn_fold_bounded(HostIoIo *io, const HostSharedHeld *held, HostLsn point, uint64 horizon,
 							 HostLsn *result, HostError *error);
 
 /*
- * txn_fold_mutated applies edits, taking them once it reaches the mutate, to
- * a tree or to an empty one a branded writer writes, and answers the new
- * root's place in the writer.
+ * TxnFoldChunks is Doltgrust's Chunks, which a base's writes place the chunks
+ * its entries name through (bugs rows 364 and 387): the repository and its
+ * reader, the storage's state, whose database's delta and chunk spills hold
+ * a chunk no pack holds yet, that delta, found at the first chunk that needs
+ * it, and written, a HashMap<Address, Locator> of where each chunk placed so
+ * far is, so each is written once.
+ */
+typedef struct TxnFoldChunks
+{
+	const RepoRepo *repo;
+	const HostSharedReader *reading;
+	const HostSharedHeld *held;
+	bool		looked;
+	bool		deltas_live;
+	HostSharedHeld deltas;
+	StdHashMap	written;
+} TxnFoldChunks;
+
+static void txn_fold_Chunks_drop(TxnFoldChunks *self);
+static bool txn_fold_Chunks_resolve(HostIoIo *io, TxnFoldChunks *chunks, TreesStoreBrandedWriter *writer,
+									const StdVec *value, StdVec *addresses, HostError *error);
+
+/*
+ * txn_fold_mutated places each chunk the edits name at an unknown locator,
+ * then applies the edits, taking them once it reaches the mutate, to a tree
+ * or to an empty one a branded writer writes, and answers the new root's
+ * place in the writer.
  */
 static bool
-txn_fold_mutated(TreesStoreBrandedWriter *writer, HostIoIo *io, bool has_tree, TreesStoreTree tree, StdVec *edits,
-				 bool *edits_live, const TreesShape *shape, size_t *result, HostError *error)
+txn_fold_mutated(TreesStoreBrandedWriter *writer, HostIoIo *io, TxnFoldChunks *chunks, bool has_tree,
+				 TreesStoreTree tree, StdVec *edits, bool *edits_live, const TreesShape *shape, size_t *result,
+				 HostError *error)
 {
 	ChunksErrorError failed;
 
+	for (size_t i = 0; i < edits->len; i++)
+	{
+		TreesMutateEdit *edit = &STD_VEC_AT(edits, TreesMutateEdit, i);
+
+		if (edit->tag == TREES_MUTATE_EDIT_PUT &&
+			!txn_fold_Chunks_resolve(io, chunks, writer, &edit->u.put.value, &edit->u.put.addresses, error))
+			return false;
+	}
 	if (!has_tree)
 	{
 		size_t		empty;
@@ -287,6 +325,55 @@ txn_fold_applied_by(HostIoIo *io, TxnMemtableVersionWriter writer, bool has_lsn,
 }
 
 /*
+ * txn_fold_top_stays reports whether a subtransaction's version stays
+ * because its top-level transaction is undecided at the point: running,
+ * prepared, or committed past it. It reads only the top's status.
+ */
+static bool
+txn_fold_top_stays(HostIoIo *io, const TxnMemtableVersionVersion *version, HostLsn point, bool *result,
+				   HostError *error)
+{
+	TxnMemtableVersionRecord record = txn_memtable_version_Version_record(version);
+	TxnMemtableVersionWriter writer = txn_memtable_version_Record_writer(&record);
+	TxnMemtableVersionWriter top = {.xid = writer.top};
+	HostStatus	status;
+	TxnFoldApplied applied;
+
+	*result = false;
+	if (!writer.has_top || writer.top == writer.xid)
+		return true;
+	if (!txn_outcome_stamped(io, writer.top, &status, error) ||
+		!txn_fold_applied_by(io, top, false, 0, status, point, &applied, error))
+		return false;
+	*result = applied.tag == TXN_FOLD_APPLIED_STAYS;
+	return true;
+}
+
+/*
+ * txn_fold_map_applied is applied's decision for a free space or value map's
+ * version, whose entries a fold reads from the memtable and the spills alike:
+ * a subtransaction's version stays while its top-level transaction is
+ * undecided at the point wherever it lives, so a memtable version and its
+ * spilled twin on a standby decide alike and an older spilled version never
+ * outlives a newer one the fold took out (bugs row 432).
+ */
+bool
+txn_fold_map_applied(HostIoIo *io, TxnMemtableVersionVersion *version, HostLsn point, TxnFoldApplied *result,
+					 HostError *error)
+{
+	bool		stays;
+
+	if (!txn_fold_top_stays(io, version, point, &stays, error))
+		return false;
+	if (stays)
+	{
+		result->tag = TXN_FOLD_APPLIED_STAYS;
+		return true;
+	}
+	return txn_fold_applied(io, version, point, result, error);
+}
+
+/*
  * txn_fold_Applied_PartialEq_eq is Applied's derived PartialEq: the same
  * variant, and for Yes the same top-level xid.
  */
@@ -423,7 +510,7 @@ txn_fold_Every_Rule_ended(const void *self, HostIoIo *io, TxnMemtableVersionVers
 }
 
 /* TXN_FOLD_EVERY_RULE_OPS is Every's Rule: every row begun and none ended. */
-static const TxnVisibleRuleOps TXN_FOLD_EVERY_RULE_OPS = {
+const TxnVisibleRuleOps TXN_FOLD_EVERY_RULE_OPS = {
 	.begun = txn_fold_Every_Rule_begun,
 	.ended = txn_fold_Every_Rule_ended,
 };
@@ -601,6 +688,7 @@ typedef struct txn_fold_apply_ctids_frame_t
 {
 	HostIoIo   *io;
 	TreesStoreBrandedWriter *writer;
+	TxnFoldChunks *chunks;
 	bool		has_ctids;
 	TreesStoreTree ctids;
 	const TxnFoldCtidEdit *edits;
@@ -669,8 +757,8 @@ txn_fold_apply_ctids_body(void *frame_)
 	std_vec_free_Checked(&frame->sorted, TXN_FOLD_POINTER);
 	frame->shape = trees_Shape_Default_default();
 	frame->shape_live = true;
-	if (!txn_fold_mutated(frame->writer, frame->io, frame->has_ctids, frame->ctids, &frame->tree, &frame->tree_live,
-						  &frame->shape, frame->result, frame->error))
+	if (!txn_fold_mutated(frame->writer, frame->io, frame->chunks, frame->has_ctids, frame->ctids, &frame->tree,
+						  &frame->tree_live, &frame->shape, frame->result, frame->error))
 		return;
 	frame->ok = true;
 }
@@ -698,10 +786,12 @@ txn_fold_apply_ctids_pad(void *frame_)
  * key and then the heap bytes.
  */
 static bool
-txn_fold_apply_ctids(HostIoIo *io, TreesStoreBrandedWriter *writer, bool has_ctids, TreesStoreTree ctids,
-					 const TxnFoldCtidEdit *edits, size_t edits_len, size_t *result, HostError *error)
+txn_fold_apply_ctids(HostIoIo *io, TreesStoreBrandedWriter *writer, TxnFoldChunks *chunks, bool has_ctids,
+					 TreesStoreTree ctids, const TxnFoldCtidEdit *edits, size_t edits_len, size_t *result,
+					 HostError *error)
 {
-	txn_fold_apply_ctids_frame_t frame = {.io = io, .writer = writer, .has_ctids = has_ctids, .ctids = ctids,
+	txn_fold_apply_ctids_frame_t frame = {.io = io, .writer = writer, .chunks = chunks, .has_ctids = has_ctids,
+		.ctids = ctids,
 	.edits = edits, .edits_len = edits_len, .result = result, .error = error};
 
 	std_landing(&frame, txn_fold_apply_ctids_body, txn_fold_apply_ctids_pad);
@@ -888,6 +978,19 @@ txn_fold_ending(HostIoIo *io, TxnVisibleRule rule, TxnMemtableVersionVersion *ch
 	return true;
 }
 
+/*
+ * txn_fold_owned returns a pending tuple id's ender word for a row's
+ * ender's xid: marked TXN_BASE_OWN when it is the row's own writer's, 0 for
+ * none.
+ */
+static uint64
+txn_fold_owned(uint64 ender, uint64 writer)
+{
+	return ender != 0 && ender == writer ? ender | TXN_BASE_OWN : ender;
+}
+
+static void txn_fold_PendingRow_drop(void *row_);
+
 /* TxnFoldFormedTag is Formed's variants, and none before a key's entry is formed. */
 typedef enum TxnFoldFormedTag
 {
@@ -911,6 +1014,12 @@ typedef struct txn_fold_folded_key_frame_t
 	bool		has_base;
 	TreesStoreTree base;
 	const TreesKeyOrder *order;
+
+	/*
+	 * given is the key's base entry its caller read already, which the fold
+	 * takes in place of a seek of the base, or NULL (bugs row 404).
+	 */
+	const TxnFoldBased *given;
 	bool		keyless;
 	bool		index;
 	TxnVisibleRule rule;
@@ -948,6 +1057,9 @@ typedef struct txn_fold_folded_key_frame_t
 	bool	   *has_result;
 	TxnFoldKeyFold *result;
 	uint64	   *result_ended;
+	/* gone is a Vec<PendingRow> of the delta rows the fold ends. */
+	StdVec	   *gone;
+	bool		gone_live;
 	HostError  *error;
 	bool		ok;
 } txn_fold_folded_key_frame_t;
@@ -973,9 +1085,21 @@ txn_fold_stamp_order(const void *a, const void *b)
 	return (x->tuple > y->tuple) - (x->tuple < y->tuple);
 }
 
+/* txn_fold_stamp_tuple_order orders stamps by tuple id, for qsort. */
+static int
+txn_fold_stamp_tuple_order(const void *a, const void *b)
+{
+	const ChunksTrailerStamp *x = a;
+	const ChunksTrailerStamp *y = b;
+
+	return (x->tuple > y->tuple) - (x->tuple < y->tuple);
+}
+
 /*
  * txn_fold_folded_key_ended reads which rows the rule's appliers ended: each
- * delta row it began, for the newest ender, and each base copy, for its
+ * delta row it began, for the newest ender, and, but in an index's storage,
+ * made pending by its tuple id with its ender's xid, its heap bytes, and its
+ * value ids, since it never reaches the base; and each base copy, for its
  * ender's xid.
  */
 static bool
@@ -987,13 +1111,36 @@ txn_fold_folded_key_ended(txn_fold_folded_key_frame_t *frame)
 	{
 		const TxnVisibleSeenRow *seen = &STD_VEC_AT(&frame->every.rows, TxnVisibleSeenRow, i);
 		TxnVisibleDirty dirty = txn_visible_Dirty_Default_default();
+		uint64		writer = txn_fold_writer_xid(seen->row.version);
 		bool		begun;
+		TxnFoldPendingRow gone;
+		TxnMemtableVersionValues values;
+		uint32		id;
 
 		if (!frame->rule.ops->begun(frame->rule.self, frame->io, &seen->row, &dirty, &begun, frame->error))
 			return false;
-		if (begun && !txn_fold_ending(frame->io, frame->rule, seen->changer, txn_fold_writer_xid(seen->row.version),
-									  &frame->max_ended, &ender, frame->error))
+		if (!begun)
+			continue;
+		if (!txn_fold_ending(frame->io, frame->rule, seen->changer, writer, &frame->max_ended, &ender, frame->error))
 			return false;
+		if (ender == 0 || frame->index)
+			continue;
+		gone = (TxnFoldPendingRow)
+		{
+			.tuple = seen->row.put.tuple.f0, .ender = txn_fold_owned(ender, writer),
+				.bytes = seen->row.put.heap_bytes
+		};
+		std_vec_new(&gone.ids, TXN_FOLD_U32);
+		values = txn_memtable_version_PutRef_values(&seen->row.put);
+		while (txn_memtable_version_Values_Iterator_next(&values, &id))
+			std_vec_push_Checked(&gone.ids, &id, TXN_FOLD_U32);
+		if (!std_vec_try_reserve(frame->gone, 1, TXN_FOLD_PENDING_ROW))
+		{
+			std_vec_free_Checked(&gone.ids, TXN_FOLD_U32);
+			*frame->error = host_Error_out_of_memory();
+			return false;
+		}
+		std_vec_push_Checked(frame->gone, &gone, TXN_FOLD_PENDING_ROW);
 	}
 	std_vec_new(&frame->enders, TXN_FOLD_U64);
 	frame->enders_live = true;
@@ -1046,7 +1193,7 @@ txn_fold_folded_key_kept(txn_fold_folded_key_frame_t *frame, bool *ended)
 		}
 		*ended = true;
 		pended.f0 = stamp->tuple;
-		pended.f1 = STD_VEC_AT(&frame->enders, uint64, i);
+		pended.f1 = txn_fold_owned(STD_VEC_AT(&frame->enders, uint64, i), stamp->txn);
 		std_vec_reserve_Checked(&frame->pending, 1, TXN_FOLD_PENDED);
 		std_vec_clone(&pended.f2, &frame->based.ids, TXN_FOLD_U32);
 		std_vec_push_Checked(&frame->pending, &pended, TXN_FOLD_PENDED);
@@ -1174,13 +1321,23 @@ txn_fold_folded_key_body(void *frame_)
 	size_t		stored_len = 0;
 
 	fold->has_formed_by = false;
+	std_vec_new(frame->gone, TXN_FOLD_PENDING_ROW);
+	frame->gone_live = true;
 	if (!txn_visible_seen(frame->io, frame->rule, frame->versions, frame->versions_len, NULL, &frame->seen,
 						  frame->error))
 		return;
 	frame->seen_live = true;
-	if (frame->has_base &&
-		!trees_pin_pin_ResultOptionBased(frame->io, frame->store, txn_fold_folded_key_closure_0, &captures, NULL,
-										 &frame->based_live, &frame->based, &failed))
+	if (frame->given != NULL)
+	{
+		std_vec_clone(&frame->based.value, &frame->given->value, TXN_FOLD_BYTES);
+		std_vec_clone(&frame->based.addresses, &frame->given->addresses, TXN_FOLD_ADDRESS);
+		std_vec_clone(&frame->based.ids, &frame->given->ids, TXN_FOLD_U32);
+		std_vec_clone(&frame->based.stored, &frame->given->stored, TXN_FOLD_STAMP);
+		frame->based_live = true;
+	}
+	else if (frame->has_base &&
+			 !trees_pin_pin_ResultOptionBased(frame->io, frame->store, txn_fold_folded_key_closure_0, &captures,
+											  NULL, &frame->based_live, &frame->based, &failed))
 	{
 		*frame->error = txn_base_storage(&failed);
 		return;
@@ -1223,6 +1380,7 @@ txn_fold_folded_key_body(void *frame_)
 	if (!ended && frame->stamps.len == base_copies)
 	{
 		*frame->has_result = false;
+		frame->gone_live = false;
 		frame->ok = true;
 		return;
 	}
@@ -1249,6 +1407,7 @@ txn_fold_folded_key_body(void *frame_)
 			fold->has_formed_by = false;
 			frame->ctids_live = frame->pending_live = false;
 		}
+		frame->gone_live = false;
 		frame->ok = true;
 		return;
 	}
@@ -1260,6 +1419,8 @@ txn_fold_folded_key_body(void *frame_)
 		frame->stamps.len = 0;
 	else if (frame->index)
 		qsort(frame->stamps.ptr, frame->stamps.len, sizeof(ChunksTrailerStamp), txn_fold_stamp_order);
+	else
+		qsort(frame->stamps.ptr, frame->stamps.len, sizeof(ChunksTrailerStamp), txn_fold_stamp_tuple_order);
 	fold->edit.tag = TREES_MUTATE_EDIT_PUT;
 	txn_fold_bytes(frame->key, frame->key_len, &fold->edit.u.put.key);
 	fold->edit.u.put.value = frame->value;
@@ -1271,6 +1432,7 @@ txn_fold_folded_key_body(void *frame_)
 	frame->value_live = frame->addresses_live = frame->stamps_live = frame->formed_ids_live = false;
 	frame->ctids_live = frame->pending_live = false;
 	*frame->has_result = true;
+	frame->gone_live = false;
 	frame->ok = true;
 }
 
@@ -1304,6 +1466,9 @@ txn_fold_folded_key_pad(void *frame_)
 		txn_visible_Seen_drop(&frame->every);
 	if (frame->seen_live)
 		txn_visible_Seen_drop(&frame->seen);
+	if (frame->gone_live)
+		std_vec_drop_Checked(frame->gone, TXN_FOLD_PENDING_ROW, txn_fold_PendingRow_drop);
+	frame->gone_live = false;
 	frame->addresses_live = frame->value_live = frame->ctids_live = frame->written_live = false;
 	frame->formed_ids_live = frame->formed_addresses_live = frame->pending_live = frame->stamps_live = false;
 	frame->enders_live = frame->based_live = frame->every_live = frame->seen_live = false;
@@ -1321,17 +1486,24 @@ txn_fold_folded_key_pad(void *frame_)
  * PLAN's form of an index storage's base leaf entry: a keyed table's keeps no
  * stamp and is one copy of its row, and a keyless table's counts its copies
  * with a stamp each, by writer and then tuple id; it makes no tuple id edit.
+ * A table's entry keeps its stamps in tuple id order, which the reads' search
+ * of them needs, as Doltgrust's Copies::live sorts them (bugs row 388).
+ * Last, it answers each delta row the fold applies and an applied version
+ * ends, which never reaches the base, by its tuple id, with its ender's xid,
+ * its heap bytes, and its value ids, whose tuple id the fold makes pending,
+ * so its take leaves the delta with the rest of its block's run (bugs row
+ * 228's (E)).
  */
 bool
 txn_fold_folded_key(HostIoIo *io, TreesStoreNodeStore store, bool has_base, TreesStoreTree base,
 					const TreesKeyOrder *order, bool keyless, bool index, TxnVisibleRule rule, const uint8 *key,
 					size_t key_len, TxnMemtableVersionVersion *versions, size_t versions_len, bool *has_result,
-					TxnFoldKeyFold *result, uint64 *max_ended, HostError *error)
+					TxnFoldKeyFold *result, uint64 *max_ended, StdVec *gone, HostError *error)
 {
 	txn_fold_folded_key_frame_t frame = {.io = io, .store = store, .has_base = has_base, .base = base,
 		.order = order, .keyless = keyless, .index = index, .rule = rule, .key = key, .key_len = key_len,
 		.versions = versions, .versions_len = versions_len, .has_result = has_result, .result = result,
-	.result_ended = max_ended, .error = error};
+	.result_ended = max_ended, .gone = gone, .error = error};
 
 	std_landing(&frame, txn_fold_folded_key_body, txn_fold_folded_key_pad);
 	txn_fold_folded_key_pad(&frame);
@@ -1445,6 +1617,28 @@ txn_fold_PendingRows_insert(StdVec *rows, TxnFoldPendingRow *row)
 		return;
 	}
 	std_vec_insert(rows, low, row, TXN_FOLD_PENDING_ROW, RUST_FILE, 480, 25);
+}
+
+/* txn_fold_PendingRows_absent inserts a pending tuple id, taking it, only when the rows hold none of its tuple id, dropping it otherwise. */
+static void
+txn_fold_PendingRows_absent(StdVec *rows, TxnFoldPendingRow *row)
+{
+	size_t		low = 0;
+	size_t		high = rows->len;
+
+	while (low < high)
+	{
+		size_t		mid = low + (high - low) / 2;
+
+		if (STD_VEC_AT(rows, TxnFoldPendingRow, mid).tuple < row->tuple)
+			low = mid + 1;
+		else
+			high = mid;
+	}
+	if (low < rows->len && STD_VEC_AT(rows, TxnFoldPendingRow, low).tuple == row->tuple)
+		txn_fold_PendingRow_drop(row);
+	else
+		std_vec_insert(rows, low, row, TXN_FOLD_PENDING_ROW, RUST_FILE, 488, 46);
 }
 
 /* txn_fold_FoldedRows_drop frees what a fold makes of a storage's rows. */
@@ -1619,6 +1813,7 @@ txn_fold_folded_rows_body(void *frame_)
 		bool		has_next;
 		bool		has_fold;
 		uint64		ended;
+		StdVec		gone;
 
 		if (!host_delta_hold(frame->io, &frame->hold, frame->error))
 			return;
@@ -1652,9 +1847,12 @@ txn_fold_folded_rows_body(void *frame_)
 		}
 		if (!txn_fold_folded_key(frame->io, frame->store, frame->has_base, frame->base, frame->order, frame->keyless,
 								 frame->index, rule, frame->next.f0.ptr, frame->next.f0.len, frame->next.f1.ptr,
-								 frame->next.f1.len, &has_fold, &frame->fold, &ended, frame->error))
+								 frame->next.f1.len, &has_fold, &frame->fold, &ended, &gone, frame->error))
 			return;
 		rows->max_ended = Max(rows->max_ended, ended);
+		for (size_t i = 0; i < gone.len; i++)
+			txn_fold_PendingRows_absent(&rows->pending, &STD_VEC_AT(&gone, TxnFoldPendingRow, i));
+		std_vec_free_Checked(&gone, TXN_FOLD_PENDING_ROW);
 		if (has_fold)
 		{
 			frame->fold_live = true;
@@ -1731,6 +1929,7 @@ typedef struct txn_fold_committed_moves_frame_t
 	const TreesKeyOrder *order;
 	bool		keyless;
 	bool		index;
+	HostLsn		folded;
 	uint64		own;
 	const uint8 *key;
 	size_t		key_len;
@@ -1755,13 +1954,15 @@ txn_fold_committed_moves_closure_0(txn_fold_committed_moves_frame_t *frame, uint
 	TxnVisibleRule rule = {&TXN_FOLD_COMMITTING_RULE_OPS, &committing};
 	bool		has_fold;
 	uint64		ended;
+	StdVec		gone;
 
 	memset(added, 0, sizeof(*added));
 	memset(removed, 0, sizeof(*removed));
 	if (!txn_fold_folded_key(frame->io, frame->store, frame->has_base, frame->base, frame->order, frame->keyless,
 							 frame->index, rule, frame->key, frame->key_len, frame->versions.ptr,
-							 frame->versions.len, &has_fold, &frame->fold, &ended, frame->error))
+							 frame->versions.len, &has_fold, &frame->fold, &ended, &gone, frame->error))
 		return false;
+	std_vec_drop_Checked(&gone, TXN_FOLD_PENDING_ROW, txn_fold_PendingRow_drop);
 	if (!has_fold)
 		return true;
 	frame->fold_live = true;
@@ -1803,8 +2004,8 @@ txn_fold_committed_moves_body(void *frame_)
 	if (!host_delta_hold(frame->io, &frame->hold, frame->error))
 		return;
 	frame->hold_live = true;
-	if (!txn_memtable_table_versions(frame->io, &frame->hold, host_shared_Held_record(frame->held), frame->key,
-									 frame->key_len, &frame->versions, frame->error))
+	if (!txn_visible_versions(frame->io, &frame->hold, host_shared_Held_record(frame->held), frame->key,
+							  frame->key_len, frame->folded, &frame->versions, frame->error))
 		return;
 	frame->versions_live = true;
 	if (!txn_fold_committed_moves_closure_0(frame, frame->own, &with_added, &with_removed) ||
@@ -1835,18 +2036,20 @@ txn_fold_committed_moves_pad(void *frame_)
  * own moves a storage's totals at a key: what the key's fold over the base
  * writes and gives back with the transaction's versions applied, against
  * what it does without them, as the sizes it adds and those it takes away,
- * neither below zero.
+ * neither below zero. It folds only the versions a base folded at folded
+ * didn't apply, so a version a restart's redo replayed under a base that
+ * holds it counts once (bugs row 323).
  */
 bool
 txn_fold_committed_moves(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held, bool has_base,
 						 TreesStoreTree base, bool has_tuple_ids, TreesStoreTree tuple_ids, const TreesKeyOrder *order,
-						 bool keyless, bool index, uint64 own, const uint8 *key, size_t key_len,
+						 bool keyless, bool index, HostLsn folded, uint64 own, const uint8 *key, size_t key_len,
 						 TxnBaseSizes *result_0, TxnBaseSizes *result_1, HostError *error)
 {
 	txn_fold_committed_moves_frame_t frame = {.io = io, .store = store, .held = held, .has_base = has_base,
 		.base = base, .has_tuple_ids = has_tuple_ids, .tuple_ids = tuple_ids, .order = order, .keyless = keyless,
-		.index = index, .own = own, .key = key, .key_len = key_len, .result_0 = result_0, .result_1 = result_1,
-	.error = error};
+		.index = index, .folded = folded, .own = own, .key = key, .key_len = key_len, .result_0 = result_0,
+	.result_1 = result_1, .error = error};
 
 	std_landing(&frame, txn_fold_committed_moves_body, txn_fold_committed_moves_pad);
 	txn_fold_committed_moves_pad(&frame);
@@ -1988,42 +2191,76 @@ txn_fold_committed_value_moves(HostIoIo *io, TreesStoreNodeStore store, const Ho
 	return frame.ok;
 }
 
-/* txn_TupleHandleWriter_t is ran_key's (Handle, Writer): a version a drop removes, with its writer. */
-typedef struct txn_TupleHandleWriter_t
-{
-	TxnMemtableVersionHandle f0;
-	TxnMemtableVersionWriter f1;
-} txn_TupleHandleWriter_t;
-
-/* txn_TupleU32VecTupleHandleWriter_t is Spaced's (u32, Vec<(Handle, Writer)>): a key's versions a drop removes. */
-typedef struct txn_TupleU32VecTupleHandleWriter_t
+/* txn_TupleU32VecHandle_t is Spaced's (u32, Vec<Handle>): a key's versions a drop removes. */
+typedef struct txn_TupleU32VecHandle_t
 {
 	uint32		f0;
 	StdVec		f1;
-} txn_TupleU32VecTupleHandleWriter_t;
+} txn_TupleU32VecHandle_t;
+
+/* txn_fold_pending_holds reports whether pending rows, in tuple id order, hold a tuple id. */
+static bool
+txn_fold_pending_holds(const StdVec *pending, uint64 tid)
+{
+	size_t		low = 0;
+	size_t		high = pending->len;
+
+	while (low < high)
+	{
+		size_t		mid = low + (high - low) / 2;
+		uint64		at = STD_VEC_AT(pending, TxnFoldPendingRow, mid).tuple;
+
+		if (at == tid)
+			return true;
+		if (at < tid)
+			low = mid + 1;
+		else
+			high = mid;
+	}
+	return false;
+}
+
+/* txn_fold_edit_order orders edits by their keys' bytes, for qsort. */
+static int
+txn_fold_edit_order(const void *a, const void *b)
+{
+	StdBytes	x = trees_mutate_Edit_key(a);
+	StdBytes	y = trees_mutate_Edit_key(b);
+	int			c = memcmp(x.ptr, y.ptr, Min(x.len, y.len));
+
+	if (c != 0)
+		return c;
+	return (x.len > y.len) - (x.len < y.len);
+}
 
 /*
  * TxnFoldSpaced is Spaced: what the drop through a point takes out of a
- * storage's map, the base's tree's edits, each key's versions it removes with
- * their writers, whether it removes every version the map holds, and
- * whether it met a version whose writer the point leaves for later.
+ * storage's map, the base's tree's edits, each key's versions it removes,
+ * whether it removes every version the map holds, and whether it met a
+ * version whose writer the point leaves for later.
  */
 typedef struct TxnFoldSpaced
 {
 	/* edits is a Vec<Edit>. */
 	StdVec		edits;
-	/* removed is a Vec<(u32, Vec<(Handle, Writer)>)>. */
+	/* removed is a Vec<(u32, Vec<Handle>)>. */
 	StdVec		removed;
 	bool		emptied;
 	bool		unresolved;
+
+	/*
+	 * kept is a Vec<Kept> of the spilled versions the drop keeps, each key's
+	 * newest first, which the fold lists in a residual before their files
+	 * leave.
+	 */
+	StdVec		kept;
 } TxnFoldSpaced;
 
-#define TXN_FOLD_REMOVED sizeof(txn_TupleU32VecTupleHandleWriter_t), _Alignof(txn_TupleU32VecTupleHandleWriter_t)
-#define TXN_FOLD_HANDLE_WRITER sizeof(txn_TupleHandleWriter_t), _Alignof(txn_TupleHandleWriter_t)
+#define TXN_FOLD_REMOVED sizeof(txn_TupleU32VecHandle_t), _Alignof(txn_TupleU32VecHandle_t)
 
-/* TxnFoldFits reports whether a run of a key's versions, newest first, may leave the delta. */
-typedef bool (*TxnFoldFits) (void *captures, HostIoIo *io, TxnMemtableVersionVersion *run, size_t run_len,
-							 bool *result, HostError *error);
+/* TxnFoldEach reads a run of a key's versions, newest first, that leaves the delta. */
+typedef bool (*TxnFoldEach) (void *captures, HostIoIo *io, TxnMemtableVersionVersion *run, size_t run_len,
+							 HostError *error);
 
 /* TxnFoldPaired reports whether the installed base's tuple id tree pairs a tuple id. */
 typedef bool (*TxnFoldPaired) (void *captures, HostIoIo *io, uint64 tuple, bool *result, HostError *error);
@@ -2032,9 +2269,19 @@ typedef bool (*TxnFoldPaired) (void *captures, HostIoIo *io, uint64 tuple, bool 
 static void
 txn_fold_Removed_drop(void *removed_)
 {
-	txn_TupleU32VecTupleHandleWriter_t *removed = removed_;
+	txn_TupleU32VecHandle_t *removed = removed_;
 
-	std_vec_free_Checked(&removed->f1, TXN_FOLD_HANDLE_WRITER);
+	std_vec_free_Checked(&removed->f1, TXN_FOLD_HANDLE);
+}
+
+/* txn_fold_Kept_drop frees a kept version's key and bytes. */
+static void
+txn_fold_Kept_drop(void *kept_)
+{
+	TxnSpillKept *kept = kept_;
+
+	std_vec_free_Checked(&kept->key, TXN_FOLD_BYTES);
+	std_vec_free_Checked(&kept->bytes, TXN_FOLD_BYTES);
 }
 
 /* txn_fold_Spaced_drop frees what a drop takes out of a map. */
@@ -2043,6 +2290,7 @@ txn_fold_Spaced_drop(TxnFoldSpaced *self)
 {
 	std_vec_drop_Checked(&self->edits, TXN_FOLD_EDIT, trees_mutate_Edit_drop);
 	std_vec_drop_Checked(&self->removed, TXN_FOLD_REMOVED, txn_fold_Removed_drop);
+	std_vec_drop_Checked(&self->kept, sizeof(TxnSpillKept), _Alignof(TxnSpillKept), txn_fold_Kept_drop);
 }
 
 /* txn_fold_ran_key_frame_t is ran_key's state across its pad: the new entry's key, while live. */
@@ -2058,8 +2306,9 @@ typedef struct txn_fold_ran_key_frame_t
 	size_t		own;
 	HostLsn		point;
 	bool		committed;
-	TxnFoldFits fits;
-	void	   *fits_captures;
+	TxnRunsKind spilled;
+	TxnFoldEach each;
+	void	   *each_captures;
 	StdVec		named;
 	bool		named_live;
 	HostError  *error;
@@ -2077,8 +2326,9 @@ txn_fold_ran_key_named(TxnMemtableVersionVersion *version)
 
 /*
  * txn_fold_ran_key_body finds the oldest run of the key's versions the point
- * applies or drops, the longest one that fits, and adds its source's entry
- * and its memtable versions' removal.
+ * applies or drops, hands it to each, keeps each spilled version above it
+ * the point applies or drops, and adds its source's entry and its memtable
+ * versions' removal.
  */
 static void
 txn_fold_ran_key_body(void *frame_)
@@ -2086,34 +2336,44 @@ txn_fold_ran_key_body(void *frame_)
 	txn_fold_ran_key_frame_t *frame = frame_;
 	TxnFoldSpaced *spaced = frame->spaced;
 	size_t		len = frame->versions_len;
-	size_t		longest = 0;
-	size_t		run;
+	size_t		run = 0;
 	size_t		first;
 	TxnMemtableVersionVersion *source = NULL;
-	txn_TupleU32VecTupleHandleWriter_t removed = {.f0 = frame->id};
+	txn_TupleU32VecHandle_t removed = {.f0 = frame->id};
 
 	for (size_t i = len; i-- > 0;)
 	{
 		TxnFoldApplied applied;
 
-		if (!txn_fold_applied(frame->io, &frame->versions[i], frame->point, &applied, frame->error))
+		if (!txn_fold_map_applied(frame->io, &frame->versions[i], frame->point, &applied, frame->error))
 			return;
 		if (applied.tag == TXN_FOLD_APPLIED_STAYS)
 		{
 			spaced->unresolved = true;
 			break;
 		}
-		longest++;
+		run++;
 	}
-	for (run = longest; run > 0; run--)
+	if (run > 0 && frame->each != NULL &&
+		!frame->each(frame->each_captures, frame->io, &frame->versions[len - run], run, frame->error))
+		return;
+	for (size_t i = Min(frame->own, len - run); i < len - run; i++)
 	{
-		bool		fits = true;
+		TxnFoldApplied applied;
+		TxnSpillKept kept = {.kind = frame->spilled};
 
-		if (frame->fits != NULL &&
-			!frame->fits(frame->fits_captures, frame->io, &frame->versions[len - run], run, &fits, frame->error))
+		if (!txn_fold_map_applied(frame->io, &frame->versions[i], frame->point, &applied, frame->error))
 			return;
-		if (fits)
-			break;
+		if (applied.tag == TXN_FOLD_APPLIED_STAYS)
+			continue;
+		if (!std_vec_try_reserve(&spaced->kept, 1, sizeof(kept), _Alignof(TxnSpillKept)))
+		{
+			*frame->error = host_Error_out_of_memory();
+			return;
+		}
+		txn_fold_bytes(frame->key, frame->key_len, &kept.key);
+		txn_memtable_version_Version_stored(&frame->versions[i], &kept.bytes);
+		std_vec_push_Checked(&spaced->kept, &kept, sizeof(kept), _Alignof(TxnSpillKept));
 	}
 	spaced->emptied &= run == len;
 	if (run == 0)
@@ -2175,14 +2435,9 @@ txn_fold_ran_key_body(void *frame_)
 		*frame->error = host_Error_out_of_memory();
 		return;
 	}
-	std_vec_new(&removed.f1, TXN_FOLD_HANDLE_WRITER);
+	std_vec_new(&removed.f1, TXN_FOLD_HANDLE);
 	for (size_t i = first; i < Max(frame->own, first); i++)
-	{
-		TxnMemtableVersionRecord record = txn_memtable_version_Version_record(&frame->versions[i]);
-		txn_TupleHandleWriter_t handle = {frame->versions[i].handle, txn_memtable_version_Record_writer(&record)};
-
-		std_vec_push_Checked(&removed.f1, &handle, TXN_FOLD_HANDLE_WRITER);
-	}
+		std_vec_push_Checked(&removed.f1, &frame->versions[i].handle, TXN_FOLD_HANDLE);
 	std_vec_push_Checked(&spaced->removed, &removed, TXN_FOLD_REMOVED);
 	frame->ok = true;
 }
@@ -2206,11 +2461,11 @@ txn_fold_ran_key_pad(void *frame_)
 static bool
 txn_fold_ran_key(HostIoIo *io, TxnFoldSpaced *spaced, const uint8 *key, size_t key_len, uint32 id,
 				 TxnMemtableVersionVersion *versions, size_t versions_len, size_t own, HostLsn point, bool committed,
-				 TxnFoldFits fits, void *fits_captures, HostError *error)
+				 TxnRunsKind spilled, TxnFoldEach each, void *each_captures, HostError *error)
 {
 	txn_fold_ran_key_frame_t frame = {.io = io, .spaced = spaced, .key = key, .key_len = key_len, .id = id,
 		.versions = versions, .versions_len = versions_len, .own = own, .point = point, .committed = committed,
-	.fits = fits, .fits_captures = fits_captures, .error = error};
+	.spilled = spilled, .each = each, .each_captures = each_captures, .error = error};
 
 	std_landing(&frame, txn_fold_ran_key_body, txn_fold_ran_key_pad);
 	txn_fold_ran_key_pad(&frame);
@@ -2230,8 +2485,8 @@ typedef struct txn_fold_ran_frame_t
 	bool		committed;
 	bool		has_spilled;
 	TxnRunsKind spilled;
-	TxnFoldFits fits;
-	void	   *fits_captures;
+	TxnFoldEach each;
+	void	   *each_captures;
 	TxnFoldSpaced spaced;
 	bool		spaced_live;
 	StdVec		walked;
@@ -2263,9 +2518,47 @@ typedef struct txn_fold_ran_closure_1_frame_t
 	bool		versions_live;
 	StdVec		spills;
 	bool		spills_live;
+	/* own is how many of the key's versions the memtable gave. */
+	size_t		own;
 	HostError  *error;
 	bool		ok;
 } txn_fold_ran_closure_1_frame_t;
+
+/* txn_fold_ran_closure_1_dropped drops the key's versions a read gave. */
+static void
+txn_fold_ran_closure_1_dropped(void *captures)
+{
+	txn_fold_ran_closure_1_frame_t *frame = captures;
+
+	frame->versions_live = false;
+	txn_memtable_version_versions_drop(&frame->versions, 0);
+}
+
+/* txn_fold_ran_closure_1_read reads the key's memtable versions, then its spills' below them. */
+static bool
+txn_fold_ran_closure_1_read(void *captures, uint64 *listed, HostError *error)
+{
+	txn_fold_ran_closure_1_frame_t *frame = captures;
+	txn_fold_ran_frame_t *ran = frame->ran;
+	HostSharedRecord record = host_shared_Held_record(ran->held);
+
+	if (!txn_memtable_map_versions(ran->tree, frame->io, &frame->hold, record, std_u32_from_be_bytes(frame->key),
+								   &frame->versions, error))
+		return false;
+	frame->versions_live = true;
+	frame->own = frame->versions.len;
+	if (ran->has_spilled)
+	{
+		if (!txn_spill_versions(&TXN_SPILL_STATE_HOME_OPS, frame->io, &frame->hold, record, ran->spilled, frame->key,
+								frame->key_len, listed, &frame->spills, error))
+			return false;
+		frame->spills_live = true;
+		std_vec_extend_from_slice_Checked(&frame->versions, frame->spills.ptr, frame->spills.len, TXN_FOLD_VERSION);
+		frame->spills_live = false;
+		std_vec_free_Checked(&frame->spills, TXN_FOLD_VERSION);
+	}
+	return true;
+}
 
 /* txn_fold_ran_closure_1_body reads the key's memtable versions, then its spills' below them, and adds its run. */
 static void
@@ -2273,9 +2566,7 @@ txn_fold_ran_closure_1_body(void *frame_)
 {
 	txn_fold_ran_closure_1_frame_t *frame = frame_;
 	txn_fold_ran_frame_t *ran = frame->ran;
-	HostSharedRecord record = host_shared_Held_record(ran->held);
 	uint32		id;
-	size_t		own;
 
 	if (frame->key_len != 4)
 	{
@@ -2286,19 +2577,11 @@ txn_fold_ran_closure_1_body(void *frame_)
 	if (!host_delta_hold(frame->io, &frame->hold, frame->error))
 		return;
 	frame->hold_live = true;
-	if (!txn_memtable_map_versions(ran->tree, frame->io, &frame->hold, record, id, &frame->versions, frame->error))
+	if (!txn_spill_taken(&TXN_SPILL_STATE_HOME_OPS, frame->io, host_shared_Held_record(ran->held),
+						 txn_fold_ran_closure_1_read, txn_fold_ran_closure_1_dropped, frame, frame->error))
 		return;
-	frame->versions_live = true;
-	own = frame->versions.len;
 	if (ran->has_spilled)
 	{
-		if (!txn_spill_versions(&TXN_SPILL_STATE_HOME_OPS, frame->io, &frame->hold, record, ran->spilled, frame->key,
-								frame->key_len, &frame->spills, frame->error))
-			return;
-		frame->spills_live = true;
-		std_vec_extend_from_slice_Checked(&frame->versions, frame->spills.ptr, frame->spills.len, TXN_FOLD_VERSION);
-		frame->spills_live = false;
-		std_vec_free_Checked(&frame->spills, TXN_FOLD_VERSION);
 		if (!std_vec_try_reserve(&ran->walked, 1, TXN_FOLD_U32))
 		{
 			*frame->error = host_Error_out_of_memory();
@@ -2307,8 +2590,8 @@ txn_fold_ran_closure_1_body(void *frame_)
 		std_vec_push_Checked(&ran->walked, &id, TXN_FOLD_U32);
 	}
 	frame->ok = txn_fold_ran_key(frame->io, &ran->spaced, frame->key, frame->key_len, id, frame->versions.ptr,
-								 frame->versions.len, own, ran->point, ran->committed, ran->fits, ran->fits_captures,
-								 frame->error);
+								 frame->versions.len, frame->own, ran->point, ran->committed, ran->spilled, ran->each,
+								 ran->each_captures, frame->error);
 }
 
 /* txn_fold_ran_closure_1_pad frees what the walk holds live: the spills' versions, the versions, and its hold. */
@@ -2362,6 +2645,7 @@ txn_fold_ran_body(void *frame_)
 
 	std_vec_new(&frame->spaced.edits, TXN_FOLD_EDIT);
 	std_vec_new(&frame->spaced.removed, TXN_FOLD_REMOVED);
+	std_vec_new(&frame->spaced.kept, sizeof(TxnSpillKept), _Alignof(TxnSpillKept));
 	frame->spaced.emptied = true;
 	frame->spaced.unresolved = false;
 	frame->spaced_live = true;
@@ -2379,7 +2663,7 @@ txn_fold_ran_body(void *frame_)
 		frame->hold_live = true;
 		if (!txn_spill_next(&TXN_SPILL_STATE_HOME_OPS, frame->io, &frame->hold, record, frame->spilled,
 							frame->has_after, frame->after.ptr, frame->after.len,
-							TXN_MEMTABLE_TABLE_DIRECTION_FORWARD, &some, &frame->next, frame->error))
+							TXN_MEMTABLE_TABLE_DIRECTION_FORWARD, NULL, &some, &frame->next, frame->error))
 			return;
 		if (!some)
 			break;
@@ -2393,7 +2677,7 @@ txn_fold_ran_body(void *frame_)
 		if (bsearch(&id, frame->walked.ptr, frame->walked.len, sizeof(uint32), txn_fold_id_order) == NULL &&
 			!txn_fold_ran_key(frame->io, &frame->spaced, frame->next.f0.ptr, frame->next.f0.len, id,
 							  frame->next.f1.ptr, frame->next.f1.len, 0, frame->point, frame->committed,
-							  frame->fits, frame->fits_captures, frame->error))
+							  frame->spilled, frame->each, frame->each_captures, frame->error))
 			return;
 		if (frame->has_after)
 			std_vec_free_Checked(&frame->after, TXN_FOLD_BYTES);
@@ -2404,6 +2688,8 @@ txn_fold_ran_body(void *frame_)
 		frame->hold_live = false;
 		host_delta_Hold_drop(&frame->hold);
 	}
+	if (frame->has_spilled && frame->spaced.edits.len > 1)
+		qsort(frame->spaced.edits.ptr, frame->spaced.edits.len, sizeof(TreesMutateEdit), txn_fold_edit_order);
 	*frame->result = frame->spaced;
 	frame->spaced_live = false;
 	frame->ok = true;
@@ -2434,20 +2720,22 @@ txn_fold_ran_pad(void *frame_)
 /*
  * txn_fold_ran reads what a drop at a fold point takes out of a storage's
  * map: for each key, the oldest run of versions whose writers the point
- * applies or that aborted, the longest such run that fits, whose newest, or
- * its newest committed one when committed, none leaving the base's entry, is
- * the key's entry in the new base, a removal its deletion, a values mark
- * passed over. A map whose spills are of a kind reads each key's spilled
- * versions below its memtable's, then the keys its spills alone hold. Only
+ * applies or that aborted, which it hands each, whose newest, or its newest
+ * committed one when committed, none leaving the base's entry, is the key's
+ * entry in the new base, a removal its deletion, a values mark passed over.
+ * A map whose spills are of a kind reads each key's spilled versions below
+ * its memtable's, then the keys its spills alone hold, and puts the edits in
+ * key order, the map's tree's; the spilled versions above a key's run that
+ * the point applies or drops are kept for a residual (bugs row 228). Only
  * the memtable's versions are listed for removal.
  */
 static bool
 txn_fold_ran(HostIoIo *io, const HostSharedHeld *held, const TxnMemtableTableTreeOps *tree, HostLsn point,
-			 bool committed, bool has_spilled, TxnRunsKind spilled, TxnFoldFits fits, void *fits_captures,
+			 bool committed, bool has_spilled, TxnRunsKind spilled, TxnFoldEach each, void *each_captures,
 			 TxnFoldSpaced *result, HostError *error)
 {
 	txn_fold_ran_frame_t frame = {.io = io, .held = held, .tree = tree, .point = point, .committed = committed,
-		.has_spilled = has_spilled, .spilled = spilled, .fits = fits, .fits_captures = fits_captures,
+		.has_spilled = has_spilled, .spilled = spilled, .each = each, .each_captures = each_captures,
 	.result = result, .error = error};
 
 	std_landing(&frame, txn_fold_ran_body, txn_fold_ran_pad);
@@ -2455,99 +2743,92 @@ txn_fold_ran(HostIoIo *io, const HostSharedHeld *held, const TxnMemtableTableTre
 	return frame.ok;
 }
 
-/*
- * txn_fold_freed reports whether a run of a block's free space versions,
- * newest first, may leave the delta: each take in it, and each take's values
- * mark, names a tuple id its newest entry holds free, which VACUUM freed, or
- * the installed base's tuple id tree pairs.
- */
-static bool
-txn_fold_freed(HostIoIo *io, TxnMemtableVersionVersion *run, size_t run_len, HostLsn point, TxnFoldPaired paired,
-			   void *paired_captures, bool *result, HostError *error)
+/* TxnFoldTakenOut is spaced's gathering's captures: the store, the base, the page, the pairing, the fold's pending rows, and the takes no layer frees. */
+typedef struct TxnFoldTakenOut
 {
-	bool		has_newest = false;
-	StdBytes	newest = {0};
-
-	for (size_t i = 0; i < run_len; i++)
-	{
-		TxnMemtableVersionRecord record = txn_memtable_version_Version_record(&run[i]);
-		TxnMemtableVersionOpRef op = txn_memtable_version_Record_op(&record);
-
-		if (op.tag == TXN_MEMTABLE_VERSION_OP_REF_NAMED)
-			continue;
-		if (op.tag == TXN_MEMTABLE_VERSION_OP_REF_PUT)
-		{
-			has_newest = true;
-			newest = op.u.put.value;
-		}
-		break;
-	}
-	*result = true;
-	for (size_t i = 0; i < run_len; i++)
-	{
-		TxnMemtableVersionRecord record = txn_memtable_version_Version_record(&run[i]);
-		HostRow		tuple = txn_memtable_map_taken(txn_memtable_version_Record_op(&record));
-		TxnFoldApplied applied;
-		TxnFoldApplied stays = {.tag = TXN_FOLD_APPLIED_STAYS};
-		bool		frees = false;
-		bool		pairs;
-
-		if (tuple.f0 == 0)
-			continue;
-		if (!txn_fold_applied(io, &run[i], point, &applied, error))
-			return false;
-		if (txn_fold_Applied_PartialEq_eq(&applied, &stays))
-			continue;
-		if (has_newest &&
-			!txn_free_space_frees(newest.ptr, newest.len, (uint16) (tuple.f0 & 0xffff), &frees, error))
-			return false;
-		if (frees)
-			continue;
-		if (!paired(paired_captures, io, tuple.f0, &pairs, error))
-			return false;
-		if (!pairs)
-		{
-			*result = false;
-			return true;
-		}
-	}
-	return true;
-}
-
-/* txn_fold_spaced_closure_0_captures_t is spaced's fits' captures: the point and the pairing. */
-typedef struct txn_fold_spaced_closure_0_captures_t
-{
-	HostLsn		point;
+	TreesStoreNodeStore store;
+	const TxnBaseBase *base;
+	const TxnInsertPage *page;
 	TxnFoldPaired paired;
 	void	   *paired_captures;
-} txn_fold_spaced_closure_0_captures_t;
+	const StdVec *pending;
+	/* unfreed is a Vec<PendingRow>. */
+	StdVec	   *unfreed;
+} TxnFoldTakenOut;
 
-/* txn_fold_spaced_closure_0 is spaced's fits: whether a run of a block's versions is freed. */
+/*
+ * txn_fold_taken_out adds to the unfreed each take of a run of a block's
+ * free space versions, newest first, that leaves the delta naming a tuple id
+ * no layer frees, as VACUUM's find reads the run's takes (vacuum's leaving):
+ * neither the run's newest entry holds it free, which VACUUM freed, nor the
+ * installed base's tuple id tree pairs it, nor the fold makes it pending,
+ * the fold's ended rows'; so its row aborted, or a prune gave its bytes back
+ * and left it dead, and only VACUUM frees it, from the base's pending tuple
+ * ids (bugs row 228's (E)). Each goes with its stored ender, marked
+ * TXN_BASE_OWN when it is its take's writer's, the bytes its take lowered, 0
+ * for a dead one, and its row's value ids when the writer whose commit
+ * decides them committed.
+ */
 static bool
-txn_fold_spaced_closure_0(void *captures, HostIoIo *io, TxnMemtableVersionVersion *run, size_t run_len,
-						  bool *result, HostError *error)
+txn_fold_taken_out(void *captures, HostIoIo *io, TxnMemtableVersionVersion *run, size_t run_len, HostError *error)
 {
-	txn_fold_spaced_closure_0_captures_t *spaced = captures;
+	TxnFoldTakenOut *c = captures;
+	StdVec		leaving;
+	bool		ok = true;
 
-	return txn_fold_freed(io, run, run_len, spaced->point, spaced->paired, spaced->paired_captures, result, error);
+	if (!txn_vacuum_leaving(io, c->store, c->base, c->page, run, run_len, &leaving, error))
+		return false;
+	for (size_t k = 0; k < leaving.len && ok; k++)
+	{
+		TxnVacuumLeaving *take = &STD_VEC_AT(&leaving, TxnVacuumLeaving, k);
+		TxnFoldPendingRow row;
+		bool		pairs;
+
+		if (txn_fold_pending_holds(c->pending, take->tid))
+			continue;
+		ok = c->paired(c->paired_captures, io, take->tid, &pairs, error);
+		if (!ok || pairs)
+			continue;
+		if (take->bytes > PG_UINT32_MAX)
+		{
+			*error = txn_fold_fork("XX001", "a take lowered its entry past a page");
+			ok = false;
+			continue;
+		}
+		if (!std_vec_try_reserve(c->unfreed, 1, TXN_FOLD_PENDING_ROW))
+		{
+			*error = host_Error_out_of_memory();
+			ok = false;
+			continue;
+		}
+		row = (TxnFoldPendingRow)
+		{
+			.tuple = take->tid, .ender = txn_fold_owned(take->ender, take->writer.xid), .bytes = (uint32) take->bytes,
+				.ids = take->ids
+		};
+		std_vec_new(&take->ids, TXN_FOLD_U32);
+		std_vec_push_Checked(c->unfreed, &row, TXN_FOLD_PENDING_ROW);
+	}
+	txn_vacuum_leaving_drop(&leaving);
+	return ok;
 }
 
 /*
  * txn_fold_spaced reads what the drop at a fold point takes out of a
  * storage's free space map: for each block, the oldest run of versions whose
- * takers the point applies, each take among them naming a tuple id the run's
- * newest entry holds free or the installed base's tuple id tree pairs; the
- * newest of the run is the block's entry in the new base, a removal its
- * deletion.
+ * takers the point applies, whose takes each reads before they leave the
+ * delta, since a take whose tuple id no layer frees goes to the base's
+ * pending tuple ids (bugs row 228's (E)); the newest of the run is the
+ * block's entry in the new base, a removal its deletion, so the base stays
+ * the state before the delta's oldest take of each block. Its spilled
+ * versions are read below its memtable's.
  */
 static bool
-txn_fold_spaced(HostIoIo *io, const HostSharedHeld *held, HostLsn point, TxnFoldPaired paired,
-				void *paired_captures, TxnFoldSpaced *result, HostError *error)
+txn_fold_spaced(HostIoIo *io, const HostSharedHeld *held, HostLsn point, TxnFoldEach each, void *each_captures,
+				TxnFoldSpaced *result, HostError *error)
 {
-	txn_fold_spaced_closure_0_captures_t fits = {point, paired, paired_captures};
-
-	return txn_fold_ran(io, held, &TXN_MEMTABLE_MAP_FREE_TREE_OPS, point, false, false, 0,
-						txn_fold_spaced_closure_0, &fits, result, error);
+	return txn_fold_ran(io, held, &TXN_MEMTABLE_MAP_FREE_TREE_OPS, point, false, true, TXN_RUNS_KIND_SPILLED_FREE,
+						each, each_captures, result, error);
 }
 
 /* txn_fold_valued_frame_t is valued's state across its pad: what it takes out of the value map, while live. */
@@ -2738,7 +3019,11 @@ typedef struct txn_fold_recount_frame_t
 	bool		ok;
 } txn_fold_recount_frame_t;
 
-/* txn_fold_recount_body folds every committed version over the newest base and moves its sizes by what that writes. */
+/*
+ * txn_fold_recount_body folds every committed version over the newest base
+ * and moves its sizes by what that writes; it pauses at
+ * doltgres-recount-based after it reads the base.
+ */
 static void
 txn_fold_recount_body(void *frame_)
 {
@@ -2756,6 +3041,8 @@ txn_fold_recount_body(void *frame_)
 		frame->ok = true;
 		return;
 	}
+	if (!host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-recount-based", frame->error))
+		return;
 	if (!txn_fold_folded_rows(frame->io, frame->store, frame->held, base->has_root, base->root, base->has_tuple_ids,
 							  base->tuple_ids, frame->order, frame->keyless, base->has_index, PG_UINT64_MAX,
 							  base->folded, &frame->folded, frame->error))
@@ -2854,7 +3141,7 @@ txn_fold_held_pairing(void *captures, HostIoIo *io, uint64 tuple, bool *result, 
 
 /*
  * txn_fold_unspaced_frame_t is unspaced's state across its pad: the keys it
- * takes, a key's handles and removal, each while live.
+ * takes and a key's removal, while live.
  */
 typedef struct txn_fold_unspaced_frame_t
 {
@@ -2863,82 +3150,49 @@ typedef struct txn_fold_unspaced_frame_t
 	const TxnMemtableTableTreeOps *tree;
 	StdVec		removed;
 	size_t		at;
-	StdVec		handles;
-	bool		handles_live;
 	StdVec		taken;
 	bool		taken_live;
 	HostError  *error;
 	bool		ok;
 } txn_fold_unspaced_frame_t;
 
-/* txn_fold_unspaced_body takes each key's versions out and gives each taken one's count back at its writer's entry. */
+/* txn_fold_unspaced_body takes each key's versions out, the remover giving back each counted one's count. */
 static void
 txn_fold_unspaced_body(void *frame_)
 {
 	txn_fold_unspaced_frame_t *frame = frame_;
-	TxnMemtableVersionWriter none = TXN_MEMTABLE_VERSION_NO_TRANSACTION;
 
 	for (; frame->at < frame->removed.len; frame->at++)
 	{
-		txn_TupleU32VecTupleHandleWriter_t *key = &STD_VEC_AT(&frame->removed, txn_TupleU32VecTupleHandleWriter_t,
-															  frame->at);
+		txn_TupleU32VecHandle_t *key = &STD_VEC_AT(&frame->removed, txn_TupleU32VecHandle_t, frame->at);
 		uint8		be[4];
-		size_t		zipped;
 
-		std_vec_with_capacity_Checked(&frame->handles, key->f1.len, TXN_FOLD_HANDLE);
-		frame->handles_live = true;
-		for (size_t i = 0; i < key->f1.len; i++)
-			std_vec_push_Checked(&frame->handles, &STD_VEC_AT(&key->f1, txn_TupleHandleWriter_t, i).f0,
-								 TXN_FOLD_HANDLE);
 		std_u32_to_be_bytes(key->f0, be);
 		if (!txn_memtable_table_removed(frame->tree, frame->io, host_shared_Held_record(frame->held), be, sizeof(be),
-										frame->handles.ptr, frame->handles.len, &frame->taken, frame->error))
+										key->f1.ptr, key->f1.len, &frame->taken, frame->error))
 			return;
-		frame->taken_live = true;
-		zipped = Min(key->f1.len, frame->taken.len);
-		for (size_t i = 0; i < zipped; i++)
-		{
-			const TxnMemtableVersionWriter *writer = &STD_VEC_AT(&key->f1, txn_TupleHandleWriter_t, i).f1;
-			HostXid		top = {writer->has_top ? writer->top : writer->xid};
-			bool		has_added;
-			uint64		added;
-
-			if (!STD_VEC_AT(&frame->taken, bool, i) || txn_memtable_version_Writer_PartialEq_eq(writer, &none))
-				continue;
-			if (!txn_status_add(frame->io, top, PG_UINT64_MAX, &has_added, &added, frame->error))
-				return;
-		}
-		frame->taken_live = false;
 		std_vec_free_Checked(&frame->taken, sizeof(bool), _Alignof(bool));
-		frame->handles_live = false;
-		std_vec_free_Checked(&frame->handles, TXN_FOLD_HANDLE);
 		txn_fold_Removed_drop(key);
 	}
 	frame->ok = true;
 }
 
-/* txn_fold_unspaced_pad frees what unspaced holds live: a key's removal and handles, and the keys left. */
+/* txn_fold_unspaced_pad frees what unspaced holds live: the keys left. */
 static void
 txn_fold_unspaced_pad(void *frame_)
 {
 	txn_fold_unspaced_frame_t *frame = frame_;
 
-	if (frame->taken_live)
-		std_vec_free_Checked(&frame->taken, sizeof(bool), _Alignof(bool));
-	if (frame->handles_live)
-		std_vec_free_Checked(&frame->handles, TXN_FOLD_HANDLE);
 	for (; frame->at < frame->removed.len; frame->at++)
-		txn_fold_Removed_drop(&STD_VEC_AT(&frame->removed, txn_TupleU32VecTupleHandleWriter_t, frame->at));
+		txn_fold_Removed_drop(&STD_VEC_AT(&frame->removed, txn_TupleU32VecHandle_t, frame->at));
 	std_vec_free_Checked(&frame->removed, TXN_FOLD_REMOVED);
-	frame->taken_live = frame->handles_live = false;
 }
 
 /*
  * txn_fold_unspaced takes out of a storage's map, through the remover, the
  * versions an installed base now holds, as spaced or valued read them,
- * taking the list, and takes back the count of each version this removal
- * took out at its writer's entry; a version written by no transaction counts
- * nothing.
+ * taking the list; the remover gives back the count of each counted version
+ * it took out.
  */
 static bool
 txn_fold_unspaced(HostIoIo *io, const HostSharedHeld *held, const TxnMemtableTableTreeOps *tree, StdVec *removed,
@@ -3066,6 +3320,7 @@ txn_fold_dropped_closure_0_body(void *frame_)
 			if (seen->changer == NULL || !txn_fold_rows_holds(&frame->unpaired, seen->row.put.tuple))
 				continue;
 			if (!txn_memtable_map_ended(frame->io, walk->record, seen->row.put.tuple,
+										txn_fold_writer_xid(seen->row.version),
 										(uint32) txn_fold_writer_xid(seen->changer), frame->error))
 				return;
 		}
@@ -3087,11 +3342,6 @@ txn_fold_dropped_closure_0_body(void *frame_)
 									frame->error))
 		return;
 	frame->taken_live = true;
-	for (size_t i = 0; i < Min(frame->done.len, frame->taken.len); i++)
-		if (STD_VEC_AT(&frame->taken, bool, i) &&
-			!txn_memtable_table_uncounted(frame->io, STD_VEC_AT(&frame->done, TxnMemtableVersionVersion *, i),
-										  frame->error))
-			return;
 	frame->ok = true;
 }
 
@@ -3225,41 +3475,6 @@ txn_fold_pended_closure_0(void *captures, HostIoIo *io, TreesPinPin *pin, Chunks
 	return frame.ok;
 }
 
-/* txn_fold_pending_holds reports whether pending rows, in tuple id order, hold a tuple id. */
-static bool
-txn_fold_pending_holds(const StdVec *pending, uint64 tid)
-{
-	size_t		low = 0;
-	size_t		high = pending->len;
-
-	while (low < high)
-	{
-		size_t		mid = low + (high - low) / 2;
-		uint64		at = STD_VEC_AT(pending, TxnFoldPendingRow, mid).tuple;
-
-		if (at == tid)
-			return true;
-		if (at < tid)
-			low = mid + 1;
-		else
-			high = mid;
-	}
-	return false;
-}
-
-/* txn_fold_edit_order orders edits by their keys' bytes, for qsort. */
-static int
-txn_fold_edit_order(const void *a, const void *b)
-{
-	StdBytes	x = trees_mutate_Edit_key(a);
-	StdBytes	y = trees_mutate_Edit_key(b);
-	int			c = memcmp(x.ptr, y.ptr, Min(x.len, y.len));
-
-	if (c != 0)
-		return c;
-	return (x.len > y.len) - (x.len < y.len);
-}
-
 /*
  * txn_fold_pended_frame_t is pended's state across its pad: the tuple ids the
  * tree holds and the edits, each while live.
@@ -3270,8 +3485,9 @@ typedef struct txn_fold_pended_frame_t
 	TreesStoreNodeStore store;
 	const HostSharedHeld *held;
 	const TxnBaseBase *base;
-	const StdVec *pending;
+	StdVec	   *pending;
 	const StdVec *paired;
+	StdVec	   *unfreed;
 	StdVec		tids;
 	bool		tids_live;
 	StdVec		edits;
@@ -3280,6 +3496,7 @@ typedef struct txn_fold_pended_frame_t
 	bool		named_live;
 	StdVec	   *result;
 	bool	   *left;
+	HostLsn		point;
 	HostError  *error;
 	bool		ok;
 } txn_fold_pended_frame_t;
@@ -3294,7 +3511,7 @@ static void
 txn_fold_pended_body(void *frame_)
 {
 	txn_fold_pended_frame_t *frame = frame_;
-	size_t		left = frame->pending->len;
+	size_t		left;
 	ChunksErrorError failed;
 
 	std_vec_new(&frame->tids, TXN_FOLD_U64);
@@ -3309,6 +3526,17 @@ txn_fold_pended_body(void *frame_)
 			return;
 		}
 	}
+	for (size_t i = 0; i < frame->unfreed->len; i++)
+	{
+		TxnFoldPendingRow *row = &STD_VEC_AT(frame->unfreed, TxnFoldPendingRow, i);
+
+		if (bsearch(&row->tuple, frame->tids.ptr, frame->tids.len, sizeof(uint64), txn_fold_tuple_order) != NULL)
+			txn_fold_PendingRow_drop(row);
+		else
+			txn_fold_PendingRows_absent(frame->pending, row);
+	}
+	frame->unfreed->len = 0;
+	left = frame->pending->len;
 	std_vec_new(&frame->edits, TXN_FOLD_EDIT);
 	frame->edits_live = true;
 	for (size_t i = 0; i < frame->tids.len; i++)
@@ -3322,7 +3550,8 @@ txn_fold_pended_body(void *frame_)
 			continue;
 		if (!txn_fold_holds(frame->paired, tid))
 		{
-			if (!txn_vacuum_frees(frame->io, frame->store, frame->held, frame->base, tid, &frees, frame->error))
+			if (!txn_vacuum_frees(frame->io, frame->store, frame->held, frame->base, tid, frame->point, &frees,
+								  frame->error))
 				return;
 			if (!frees)
 			{
@@ -3376,17 +3605,20 @@ txn_fold_pended_pad(void *frame_)
 /*
  * txn_fold_pended returns the edits of a storage's pending tuple ids' tree a
  * fold makes, in key order, and whether the tree holds a tuple id after
- * them: a put of each base row's tuple id the fold unpairs, with its ender's
- * xid and its heap bytes, and a removal of each pending tuple id the fold
- * doesn't unpair that VACUUM has freed or that a row took again, the fold
- * pairing it (paired, ascending).
+ * them: a put of each base row's or delta row's tuple id the fold ends, with
+ * its ender's xid, its heap bytes, and its row's value ids, and of each
+ * tuple id no layer frees whose take leaves the delta (unfreed, which it
+ * takes) that the tree doesn't hold, and a removal of each pending tuple id
+ * the fold doesn't unpair that VACUUM has freed by the fold's point or that
+ * a row took again, the fold pairing it (paired, ascending).
  */
 static bool
 txn_fold_pended(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held, const TxnBaseBase *base,
-				const StdVec *pending, const StdVec *paired, StdVec *result, bool *left, HostError *error)
+				StdVec *pending, const StdVec *paired, StdVec *unfreed, HostLsn point, StdVec *result, bool *left,
+				HostError *error)
 {
 	txn_fold_pended_frame_t frame = {.io = io, .store = store, .held = held, .base = base, .pending = pending,
-	.paired = paired, .result = result, .left = left, .error = error};
+	.paired = paired, .unfreed = unfreed, .result = result, .left = left, .point = point, .error = error};
 
 	std_landing(&frame, txn_fold_pended_body, txn_fold_pended_pad);
 	txn_fold_pended_pad(&frame);
@@ -3424,6 +3656,268 @@ txn_fold_Installed_drop(TxnFoldInstalled *self)
 	self->some = false;
 }
 
+/* txn_fold_advanced inserts a base's record and gives its end, for an install's logging. */
+static bool
+txn_fold_advanced(HostIoIoDoors io, const TxnRecordBaseAdvanced *advanced, HostLsn *end, HostError *error)
+{
+	StdVec		body;
+	bool		ok;
+
+	txn_record_BaseAdvanced_encode(advanced, &body);
+	ok = host_wal_insert(io, HOST_WAL_KIND_BASE_ADVANCED, body.ptr, body.len, end, error);
+	std_vec_free_Checked(&body, TXN_FOLD_BYTES);
+	return ok;
+}
+
+/*
+ * TXN_FOLD_STATUSES_MOST is how many writers one FoldStatuses record names,
+ * which keeps it far under XLogRecordMaxSize, so a fold logs any number of
+ * them in as many records (bugs row 432).
+ */
+#define TXN_FOLD_STATUSES_MOST ((size_t) 1 << 16)
+
+/* txn_fold_slice returns the part of ascending writers from one place to another, borrowed, for a record's encode. */
+static StdVec
+txn_fold_slice(const StdVec *xids, size_t from, size_t to)
+{
+	StdVec		slice = {(uint64 *) xids->ptr + from, to - from, to - from};
+
+	return slice;
+}
+
+/*
+ * txn_fold_statuses logs a fold's writers answered aborted, then its
+ * committed writers whose killed versions it answered aborted, as
+ * FoldStatuses records of at most TXN_FOLD_STATUSES_MOST writers each, ahead
+ * of its BaseAdvanced, and answers how many it logged.
+ */
+static bool
+txn_fold_statuses(HostIoIoDoors io, const HostStorage *storage, uint64 folded, const StdVec *aborted,
+				  const StdVec *killed, uint64 *count, HostError *error)
+{
+	size_t		total = aborted->len + killed->len;
+
+	*count = 0;
+	for (size_t at = 0; at < total; at += TXN_FOLD_STATUSES_MOST)
+	{
+		size_t		end = Min(total, at + TXN_FOLD_STATUSES_MOST);
+		TxnRecordFoldStatuses statuses = {.storage = *storage, .folded = folded, .index = *count,
+			.aborted = txn_fold_slice(aborted, Min(at, aborted->len), Min(end, aborted->len)),
+		.killed = txn_fold_slice(killed, Max(at, aborted->len) - aborted->len, Max(end, aborted->len) - aborted->len)};
+		StdVec		body;
+		HostLsn		lsn;
+		bool		ok;
+
+		txn_record_FoldStatuses_encode(&statuses, &body);
+		ok = host_wal_insert(io, HOST_WAL_KIND_FOLD_STATUSES, body.ptr, body.len, &lsn, error);
+		std_vec_free_Checked(&body, TXN_FOLD_BYTES);
+		if (!ok)
+			return false;
+		(*count)++;
+	}
+	return true;
+}
+
+/*
+ * TxnFoldNoted is the start of a replayed fold's first statuses record, at
+ * its point in a storage, which the redo of the fold's BaseAdvanced reads its
+ * statuses from.
+ */
+typedef struct TxnFoldNoted
+{
+	HostStorage storage;
+	uint64		folded;
+	uint64		start;
+} TxnFoldNoted;
+
+/* txn_fold_noted is the startup process's notes, a Vec<Noted>, one for each storage whose fold's statuses records it is replaying. */
+static StdVec txn_fold_noted;
+
+/*
+ * txn_fold_statuses_redone notes the start of a replayed fold's first
+ * statuses record, by its index, in place of any its storage had; a later
+ * record of the fold notes nothing (bugs row 432).
+ */
+void
+txn_fold_statuses_redone(const TxnRecordFoldStatuses *statuses, uint64 start)
+{
+	TxnFoldNoted noted = {.storage = statuses->storage, .folded = statuses->folded, .start = start};
+
+	if (statuses->index != 0)
+		return;
+	if (txn_fold_noted.ptr == NULL)
+		std_vec_new(&txn_fold_noted, sizeof(TxnFoldNoted), _Alignof(TxnFoldNoted));
+	for (size_t k = 0; k < txn_fold_noted.len; k++)
+		if (host_Storage_PartialEq_eq(&STD_VEC_AT(&txn_fold_noted, TxnFoldNoted, k).storage, &noted.storage))
+		{
+			STD_VEC_AT(&txn_fold_noted, TxnFoldNoted, k) = noted;
+			return;
+		}
+	std_vec_push_Checked(&txn_fold_noted, &noted, sizeof(TxnFoldNoted), _Alignof(TxnFoldNoted));
+}
+
+/* txn_fold_noted_taken takes the note of a storage's fold at a point, answering whether there was one. */
+static bool
+txn_fold_noted_taken(const HostStorage *storage, uint64 folded, uint64 *start)
+{
+	for (size_t k = 0; k < txn_fold_noted.len; k++)
+	{
+		TxnFoldNoted *noted = &STD_VEC_AT(&txn_fold_noted, TxnFoldNoted, k);
+
+		if (host_Storage_PartialEq_eq(&noted->storage, storage) && noted->folded == folded)
+		{
+			*start = noted->start;
+			*noted = STD_VEC_AT(&txn_fold_noted, TxnFoldNoted, txn_fold_noted.len - 1);
+			txn_fold_noted.len--;
+			return true;
+		}
+	}
+	return false;
+}
+
+/* txn_fold_Statuses_drop frees a fold's statuses read back. */
+void
+txn_fold_Statuses_drop(TxnFoldStatuses *self)
+{
+	std_vec_free_Checked(&self->aborted, TXN_FOLD_U64);
+	std_vec_free_Checked(&self->killed, TXN_FOLD_U64);
+}
+
+/* txn_fold_statuses_read_frame_t is statuses_read's state across its pad: the record read and decoded, each while live. */
+typedef struct txn_fold_statuses_read_frame_t
+{
+	HostIoIoDoors doors;
+	const TxnRecordBaseAdvanced *advanced;
+	uint64		from;
+	uint64		end;
+	TxnFoldStatuses *result;
+	HostError  *error;
+	bool		ok;
+	HostForkRecord record;
+	bool		record_live;
+	TxnRecordFoldStatuses statuses;
+	bool		statuses_live;
+} txn_fold_statuses_read_frame_t;
+
+/* txn_fold_statuses_read_body reads the fold's statuses records from the position up to its BaseAdvanced's end, in order. */
+static void
+txn_fold_statuses_read_body(void *frame_)
+{
+	txn_fold_statuses_read_frame_t *frame = frame_;
+	const TxnRecordBaseAdvanced *advanced = frame->advanced;
+	uint32		kinds = 1u << host_WalKind_value(HOST_WAL_KIND_FOLD_STATUSES);
+	uint64		count = 0;
+
+	std_vec_new(&frame->result->aborted, TXN_FOLD_U64);
+	std_vec_new(&frame->result->killed, TXN_FOLD_U64);
+	for (;;)
+	{
+		if (!host_next_fork_record(frame->doors, frame->from, kinds, false, &frame->record_live, &frame->record,
+								   frame->error))
+			return;
+		if (!frame->record_live || frame->record.f1 > frame->end)
+			break;
+		frame->from = frame->record.f1;
+		if (!txn_record_FoldStatuses_decode(frame->record.f2.ptr, frame->record.f2.len, &frame->statuses,
+											frame->error))
+			return;
+		frame->statuses_live = true;
+		if (host_Storage_PartialEq_eq(&frame->statuses.storage, &advanced->storage) &&
+			frame->statuses.folded == advanced->folded)
+		{
+			if (frame->statuses.index != count)
+			{
+				*frame->error = txn_fold_fork("XX001", "a fold's statuses records are out of order in the WAL");
+				return;
+			}
+			std_vec_extend_from_slice_Checked(&frame->result->aborted, frame->statuses.aborted.ptr,
+											  frame->statuses.aborted.len, TXN_FOLD_U64);
+			std_vec_extend_from_slice_Checked(&frame->result->killed, frame->statuses.killed.ptr,
+											  frame->statuses.killed.len, TXN_FOLD_U64);
+			count++;
+		}
+		frame->statuses_live = false;
+		txn_record_FoldStatuses_drop(&frame->statuses);
+		frame->record_live = false;
+		std_vec_free_Checked(&frame->record.f2, TXN_FOLD_BYTES);
+	}
+	if (count != 0 && count != advanced->statuses)
+	{
+		*frame->error = txn_fold_fork("XX001", "a fold's statuses records are missing from the WAL");
+		return;
+	}
+	frame->ok = true;
+}
+
+/* txn_fold_statuses_read_pad frees what statuses_read holds live, and its result unless it read it whole. */
+static void
+txn_fold_statuses_read_pad(void *frame_)
+{
+	txn_fold_statuses_read_frame_t *frame = frame_;
+
+	if (frame->statuses_live)
+		txn_record_FoldStatuses_drop(&frame->statuses);
+	if (frame->record_live)
+		std_vec_free_Checked(&frame->record.f2, TXN_FOLD_BYTES);
+	frame->statuses_live = frame->record_live = false;
+}
+
+/*
+ * txn_fold_statuses_read reads back a fold's statuses: its statuses records
+ * of its storage and point from a position up to its BaseAdvanced's end,
+ * their lists joined in order. A position at the BaseAdvanced itself, since
+ * no first record was noted, reads none, and the fold answers by the empty
+ * rule, which the drop's state saved after it makes exact; from a noted
+ * first record, fewer records than the BaseAdvanced counts, or one out of
+ * order, is data corruption (bugs row 432). It answers the lists only when it
+ * read them whole.
+ */
+static bool
+txn_fold_statuses_read(HostIoIoDoors doors, const TxnRecordBaseAdvanced *advanced, uint64 from, uint64 end,
+					   TxnFoldStatuses *result, HostError *error)
+{
+	txn_fold_statuses_read_frame_t frame = {.doors = doors, .advanced = advanced, .from = from, .end = end,
+	.result = result, .error = error};
+
+	std_landing(&frame, txn_fold_statuses_read_body, txn_fold_statuses_read_pad);
+	txn_fold_statuses_read_pad(&frame);
+	if (!frame.ok)
+		txn_fold_Statuses_drop(result);
+	return frame.ok;
+}
+
+/*
+ * txn_fold_statuses_replayed reads back, at the redo of a fold's BaseAdvanced
+ * that starts at start, the fold's statuses from its first record's start,
+ * which its redo noted, else from the BaseAdvanced itself, and gives that
+ * position, where a later read of the reached point starts. No note while
+ * the BaseAdvanced counts records means they lie before this replay's start:
+ * replay reads every record from there in order, each checked by its CRC,
+ * so none past it is passed over, and the fold answers by the empty rule.
+ */
+bool
+txn_fold_statuses_replayed(HostIoIo *io, const TxnRecordBaseAdvanced *advanced, uint64 start, uint64 end,
+						   uint64 *from, TxnFoldStatuses *result, HostError *error)
+{
+	if (!txn_fold_noted_taken(&advanced->storage, advanced->folded, from))
+		*from = start;
+	return txn_fold_statuses_read(HOST_IO_IO_IO_DOORS(io), advanced, *from, end, result, error);
+}
+
+/*
+ * txn_fold_replayed is a replayed install's logging: it gives the end of the
+ * record being replayed, which captures names.
+ */
+static bool
+txn_fold_replayed(void *captures, HostIoIoDoors io, HostLsn reached, HostLsn *end, HostError *error)
+{
+	(void) io;
+	(void) reached;
+	(void) error;
+	*end = *(const HostLsn *) captures;
+	return true;
+}
+
 /* txn_fold_published_drop frees a writer's published roots. */
 static void
 txn_fold_published_drop(StdVec *published)
@@ -3437,8 +3931,9 @@ static bool txn_fold_reformed(HostIoIo *io, TreesStoreNodeStore store, const Txn
 							  const TxnVisibleLive *chain, size_t chain_len, StdVec *edits, StdVec *formed,
 							  StdVec *ctids, TxnFoldReform *reform, StdVec *out_edits, StdVec *out_ctids,
 							  TxnBaseSizes *sizes, uint32 *epoch, HostError *error);
-static bool txn_fold_matched(HostIoIoDoors io, const HostSharedHeld *held, const TxnBaseBase *folded,
-							 TxnFoldReached *reached, const TreesKeyOrder *order, bool *result, HostError *error);
+static bool txn_fold_matched(HostIoIoDoors io, const HostSharedHeld *held, uint64 generation,
+							 const TxnBaseBase *folded, TxnFoldReached *reached, const TreesKeyOrder *order,
+							 bool *result, HostError *error);
 
 /*
  * txn_fold_folded_frame_t is folded's state across its pad: the newest base,
@@ -3452,9 +3947,11 @@ typedef struct txn_fold_folded_frame_t
 	const RepoRepo *repo;
 	const HostSharedReader *reading;
 	const HostSharedHeld *held;
+	TxnFoldChunks chunks;
 	const TreesKeyOrder *order;
 	bool		keyless;
 	HostLsn		point;
+	const TxnInsertPage *page;
 	TxnFoldReform *reform;
 	TxnFoldReached *reached;
 	uint64		generation;
@@ -3503,6 +4000,19 @@ typedef struct txn_fold_folded_frame_t
 	bool		paired_now_live;
 	StdVec		pends;
 	bool		pends_live;
+
+	/*
+	 * unfreed is a Vec<PendingRow> of the takes no layer frees that leave the
+	 * delta.
+	 */
+	StdVec		unfreed;
+	bool		unfreed_live;
+	/* kept is a Vec<Kept> of the spilled map versions the drop keeps. */
+	StdVec		kept;
+	bool		kept_live;
+	/* residuals is a Vec<File> of the residuals the fold listed. */
+	StdVec		residuals;
+	bool		residuals_live;
 	bool		keeps;
 	bool		has_pended;
 	size_t		pended;
@@ -3510,6 +4020,20 @@ typedef struct txn_fold_folded_frame_t
 	uint64		counter;
 	uint64		fresh_end;
 	TxnFoldInstalled installed;
+
+	/*
+	 * dropping is whether the fold marked the state as between its install
+	 * and its drop's end, holding the process's interrupts.
+	 */
+	bool		dropping;
+
+	/*
+	 * rolled_back is whether the fold reads a running top's rolled-back
+	 * subtransactions' memtable versions, as VACUUM's does, and rolling
+	 * whether it is counted in its state's rolling for it.
+	 */
+	bool		rolled_back;
+	bool		rolling;
 	bool	   *result;
 	HostError  *error;
 	bool		ok;
@@ -3572,10 +4096,56 @@ txn_fold_held(TreesStoreBrandedWriter *writer, HostIoTakesShort io, ChunksPacksR
 }
 
 /*
+ * txn_fold_folded_logging_t is a fold's install's logging's captures: the
+ * fold, its storage, its install, and whether the fork's tests attached
+ * doltgres-fold-record-root, asked before the install's checkpoint window,
+ * since asking loads the point, which allocates (bugs row 368).
+ */
+typedef struct txn_fold_folded_logging_t
+{
+	const txn_fold_folded_frame_t *folded;
+	HostStorage storage;
+	const TxnFoldInstalled *installed;
+	bool		injected;
+} txn_fold_folded_logging_t;
+
+/*
+ * txn_fold_folded_logged is a fold's install's logging: outside recovery it
+ * inserts the records of the writers the fold answered aborted, then the
+ * installed base's record, and gives its end, and from then on the fold answers as its
+ * record decided; in recovery it gives the later of the point and the end of
+ * the record the fold reached.
+ */
+static bool
+txn_fold_folded_logged(void *captures, HostIoIoDoors io, HostLsn reached, HostLsn *end, HostError *error)
+{
+	const txn_fold_folded_logging_t *logging = captures;
+	const txn_fold_folded_frame_t *folded = logging->folded;
+	TxnRecordBaseAdvanced advanced = {.storage = logging->storage, .folded = folded->point,
+		.max_folded = folded->max_folded, .base = logging->installed->next,
+	.packs = logging->installed->packs};
+	StdVec		aborted;
+	StdVec		killed;
+
+	if (host_wal_stand(io).recovering)
+	{
+		*end = Max(reached, folded->point);
+		return true;
+	}
+	txn_outcome_settled(&aborted, &killed);
+	if (!txn_fold_statuses(io, &logging->storage, folded->point, &aborted, &killed, &advanced.statuses, error))
+		return false;
+	if (logging->injected && advanced.base.has_root)
+		advanced.base.root.address = chunks_address_Address_of((const uint8 *) "doltgres-fold-record-root", 25);
+	return txn_fold_advanced(io, &advanced, end, error);
+}
+
+/*
  * txn_fold_folded_closure_11_body holds the fold's roots in the fold's four
  * slots, publishes them, and installs the base that names them when the
  * generation is still the one read before the fold and a standby's roots
- * match its primary's.
+ * match its primary's; a permanent storage's packs are listed first and its
+ * record logged in the install's step.
  */
 static void
 txn_fold_folded_closure_11_body(void *frame_)
@@ -3590,6 +4160,11 @@ txn_fold_folded_closure_11_body(void *frame_)
 	bool		held;
 	bool		installed;
 	HostError	host;
+	TxnStatePersistence persistence;
+	txn_fold_folded_logging_t logging = {.folded = folded, .installed = frame->result};
+	bool		permanent = txn_state_described(host_shared_Held_record(folded->held), &logging.storage,
+												&persistence) &&
+		persistence == TXN_STATE_PERSISTENCE_PERMANENT;
 
 	chunks_packs_roots_RootSlots_fold(frame->slots, &slot);
 	held = txn_fold_held(&folded->writer, io, slot.s0, true, folded->root, true, frame->error);
@@ -3623,9 +4198,14 @@ txn_fold_folded_closure_11_body(void *frame_)
 			next->pending = trees_published_Published_base(&STD_VEC_AT(&frame->published, TreesPublishedPublished,
 																	   at++));
 	}
-	next->counter = folded->counter;
-	next->fresh_end = folded->fresh_end;
+
+	/*
+	 * A standby's replay may already hold versions past the point, so its
+	 * fresh end is its primary's at the point, from the record.
+	 */
+	next->fresh_end = folded->reached != NULL ? folded->reached->base->fresh_end : folded->fresh_end;
 	next->folded = folded->point;
+	next->read = folded->point;
 	next->max_folded = folded->max_folded;
 	next->max_ended = Max(folded->base.max_ended, folded->rows.max_ended);
 	next->sizes = folded->sizes;
@@ -3635,7 +4215,8 @@ txn_fold_folded_closure_11_body(void *frame_)
 	{
 		bool		matched;
 
-		if (!txn_fold_matched(doors, folded->held, next, folded->reached, folded->order, &matched, &host))
+		if (!txn_fold_matched(doors, folded->held, folded->generation, next, folded->reached, folded->order,
+							  &matched, &host))
 		{
 			*frame->error = chunks_error_Error_FromError_from(&host);
 			return;
@@ -3647,7 +4228,16 @@ txn_fold_folded_closure_11_body(void *frame_)
 			return;
 		}
 	}
-	if (!txn_state_installed(io, folded->held, folded->generation, next, &installed, &host))
+	if (permanent &&
+		!chunks_packs_backend_Packs_flush(&folded->repo->packs, io, folded->reading, frame->error))
+		return;
+	if (permanent && !host_injected(doors, "doltgres-fold-record-root", &logging.injected, &host))
+	{
+		*frame->error = chunks_error_Error_FromError_from(&host);
+		return;
+	}
+	if (!txn_state_installed(io, folded->held, folded->generation, next, permanent ? txn_fold_folded_logged : NULL,
+							 &logging, &installed, &host))
 	{
 		*frame->error = chunks_error_Error_FromError_from(&host);
 		return;
@@ -3847,13 +4437,15 @@ txn_fold_folded_write(txn_fold_folded_frame_t *frame)
 	}
 	trees_store_Writer_brand(&frame->plain, &frame->writer);
 	frame->writer_live = true;
-	if (!txn_fold_mutated(&frame->writer, frame->io, frame->base.has_root, frame->base.root, &frame->edits,
+	if (!txn_fold_mutated(&frame->writer, frame->io, &frame->chunks, frame->base.has_root, frame->base.root,
+						  &frame->edits,
 						  &frame->edits_live, &frame->shape, &frame->root, frame->error))
 		return false;
 	frame->has_paired = frame->ctids.len > 0;
 	if (frame->has_paired)
 	{
-		if (!txn_fold_apply_ctids(frame->io, &frame->writer, frame->base.has_tuple_ids, frame->base.tuple_ids,
+		if (!txn_fold_apply_ctids(frame->io, &frame->writer, &frame->chunks, frame->base.has_tuple_ids,
+								  frame->base.tuple_ids,
 								  frame->ctids.ptr, frame->ctids.len, &frame->paired, frame->error))
 			return false;
 	}
@@ -3871,9 +4463,16 @@ txn_fold_folded_write(txn_fold_folded_frame_t *frame)
 	frame->held_pairing.store = store;
 	frame->held_pairing.has_tuple_ids = frame->base.has_tuple_ids;
 	frame->held_pairing.tuple_ids = frame->base.tuple_ids;
-	if (!txn_fold_spaced(frame->io, frame->held, frame->point, txn_fold_folded_closure_8, frame, &frame->spaces,
-						 frame->error))
-		return false;
+	std_vec_new(&frame->unfreed, TXN_FOLD_PENDING_ROW);
+	frame->unfreed_live = true;
+	{
+		TxnFoldTakenOut gathered = {store, &frame->base, frame->page, txn_fold_folded_closure_8, frame,
+		&frame->rows.pending, &frame->unfreed};
+
+		if (!txn_fold_spaced(frame->io, frame->held, frame->point, txn_fold_taken_out, &gathered, &frame->spaces,
+							 frame->error))
+			return false;
+	}
 	frame->spaces_live = true;
 	frame->has_spaced = frame->spaces.edits.len > 0;
 	if (frame->has_spaced)
@@ -3882,7 +4481,8 @@ txn_fold_folded_write(txn_fold_folded_frame_t *frame)
 		bool		edits_live = true;
 		bool		done;
 
-		done = txn_fold_mutated(&frame->writer, frame->io, frame->base.has_free_space, frame->base.free_space,
+		done = txn_fold_mutated(&frame->writer, frame->io, &frame->chunks, frame->base.has_free_space,
+								frame->base.free_space,
 								&frame->spaces.edits, &edits_live, &shape, &frame->spaced, frame->error);
 		trees_Shape_drop(&shape);
 		if (edits_live)
@@ -3895,8 +4495,14 @@ txn_fold_folded_write(txn_fold_folded_frame_t *frame)
 		frame->fresh_end = frame->counter;
 	else
 	{
-		frame->counter = frame->base.counter;
 		frame->fresh_end = frame->base.fresh_end;
+		for (size_t i = 0; i < frame->ctids.len; i++)
+		{
+			const TxnFoldCtidEdit *ctid = &STD_VEC_AT(&frame->ctids, TxnFoldCtidEdit, i);
+
+			if (ctid->has_f1)
+				frame->fresh_end = Max(frame->fresh_end, ctid->f0 + 1);
+		}
 	}
 	std_vec_new(&frame->paired_now, TXN_FOLD_U64);
 	frame->paired_now_live = true;
@@ -3905,7 +4511,7 @@ txn_fold_folded_write(txn_fold_folded_frame_t *frame)
 			std_vec_push_Checked(&frame->paired_now, &STD_VEC_AT(&frame->pairs, txn_TupleU64Bool_t, i).f0,
 								 TXN_FOLD_U64);
 	if (!txn_fold_pended(frame->io, store, frame->held, &frame->base, &frame->rows.pending, &frame->paired_now,
-						 &frame->pends, &left, frame->error))
+						 &frame->unfreed, frame->point, &frame->pends, &left, frame->error))
 		return false;
 	frame->pends_live = true;
 	frame->keeps = frame->pends.len == 0;
@@ -3915,7 +4521,8 @@ txn_fold_folded_write(txn_fold_folded_frame_t *frame)
 		TreesShape	shape = trees_Shape_Default_default();
 		bool		done;
 
-		done = txn_fold_mutated(&frame->writer, frame->io, frame->base.has_pending, frame->base.pending,
+		done = txn_fold_mutated(&frame->writer, frame->io, &frame->chunks, frame->base.has_pending,
+								frame->base.pending,
 								&frame->pends, &frame->pends_live, &shape, &frame->pended, frame->error);
 		trees_Shape_drop(&shape);
 		if (!done)
@@ -3925,62 +4532,51 @@ txn_fold_folded_write(txn_fold_folded_frame_t *frame)
 }
 
 /*
- * txn_fold_folded_logged flushes a permanent storage's packs and the WAL
- * through the point, and outside recovery logs the installed base's record,
- * taking the install.
+ * txn_fold_folded_scope opens the fold's scope of its writers' answers: a
+ * standby's fold at a reached point answers as the point's record decided
+ * them, and a fold outside recovery records its answers for its record.
  */
 static bool
-txn_fold_folded_logged(txn_fold_folded_frame_t *frame)
+txn_fold_folded_scope(txn_fold_folded_frame_t *frame)
 {
 	HostIoIoDoors doors = HOST_IO_IO_IO_DOORS(frame->io);
+
+	if (frame->reached != NULL)
+	{
+		txn_outcome_decided(frame->point, &frame->reached->statuses->aborted, &frame->reached->statuses->killed);
+		return true;
+	}
+	if (host_wal_stand(doors).recovering)
+		return true;
+	txn_outcome_recording(frame->point, frame->rolled_back);
+	return true;
+}
+
+/* txn_fold_folded_flushed flushes the WAL through the point for a permanent storage. */
+static bool
+txn_fold_folded_flushed(txn_fold_folded_frame_t *frame)
+{
 	HostStorage storage;
 	TxnStatePersistence persistence;
-	ChunksErrorError failed;
-	TxnRecordBaseAdvanced advanced;
-	bool		injected;
-	StdVec		body;
-	HostLsn		lsn;
-	bool		ok;
 
 	if (!txn_state_described(host_shared_Held_record(frame->held), &storage, &persistence) ||
 		persistence != TXN_STATE_PERSISTENCE_PERMANENT)
 		return true;
-	if (!chunks_packs_backend_Packs_flush(&frame->repo->packs, frame->io, frame->reading, &failed))
-	{
-		*frame->error = txn_base_storage(&failed);
-		return false;
-	}
-	if (!host_wal_flush(doors, frame->point, frame->error))
-		return false;
-	if (host_wal_stand(doors).recovering)
-		return true;
-	advanced.storage = storage;
-	advanced.folded = frame->point;
-	advanced.max_folded = frame->max_folded;
-	advanced.base = frame->installed.next;
-	advanced.packs = frame->installed.packs;
-	advanced.built = false;
-	advanced.horizon = 0;
-	advanced.has_chain = false;
-	frame->installed.some = false;
-	ok = host_injected(doors, "doltgres-fold-record-root", &injected, frame->error);
-	if (ok && injected && advanced.base.has_root)
-		advanced.base.root.address = chunks_address_Address_of((const uint8 *) "doltgres-fold-record-root", 25);
-	if (ok)
-	{
-		txn_record_BaseAdvanced_encode(&advanced, &body);
-		ok = host_wal_insert(doors, HOST_WAL_KIND_BASE_ADVANCED, body.ptr, body.len, &lsn, frame->error);
-		std_vec_free_Checked(&body, TXN_FOLD_BYTES);
-	}
-	txn_record_BaseAdvanced_drop(&advanced);
-	return ok;
+	return host_wal_flush(HOST_IO_IO_IO_DOORS(frame->io), frame->point, frame->error);
 }
 
 /*
  * txn_fold_folded_body folds the storage's rows and maps at the point,
  * re-forming its rows through a live chain, writes the new base's trees, and
- * installs the base under the registration that holds its roots, then gives
- * back the chain's counts, logs the base, and drops what the install folded.
+ * installs and logs the base under the registration that holds its roots,
+ * then gives back the chain's counts, flushes the WAL through the point, and
+ * drops what the install folded. From the drop's mark to its end it holds
+ * the process's interrupts, as Postgres holds them over work that must
+ * finish, so a cancel or a termination lands after the drop (bugs row 461):
+ * the window's one wait, a read of a key's versions napping while another
+ * process's spill take-out runs, loops on its latch under the hold and ends
+ * with that take-out, which runs no user code and which its process's exit
+ * settles.
  */
 static void
 txn_fold_folded_body(void *frame_)
@@ -3994,6 +4590,10 @@ txn_fold_folded_body(void *frame_)
 	bool		go;
 
 	*frame->result = false;
+	if (frame->rolled_back && !txn_spill_rolling(frame->io, record, &frame->rolling, frame->error))
+		return;
+	if (!txn_fold_folded_scope(frame))
+		return;
 	if (!txn_fold_folded_chain(frame, &go))
 		return;
 	if (!go)
@@ -4004,7 +4604,7 @@ txn_fold_folded_body(void *frame_)
 	store = TREES_STORE_READER_NODE_STORE(&frame->reader);
 	if (!txn_fold_folded_rows(frame->io, store, frame->held, frame->base.has_root, frame->base.root,
 							  frame->base.has_tuple_ids, frame->base.tuple_ids, frame->order, frame->keyless,
-							  frame->base.has_index, frame->point, frame->base.folded, &frame->rows, frame->error))
+							  frame->base.has_index, frame->point, frame->base.read, &frame->rows, frame->error))
 		return;
 	frame->rows_live = true;
 	if (frame->rows.overlapping)
@@ -4039,11 +4639,13 @@ txn_fold_folded_body(void *frame_)
 	if (!txn_fold_valued(frame->io, frame->held, frame->point, &frame->values, frame->error))
 		return;
 	frame->values_live = true;
-	if (!frame->rows.applied && frame->values.removed.len == 0 && !frame->has_sizes)
+	if (!frame->rows.applied && frame->values.removed.len == 0 && !frame->has_sizes && !txn_outcome_aborting())
 	{
 		txn_fold_held_pairing_t pairing = {store, frame->base.has_tuple_ids, frame->base.tuple_ids};
 
-		frame->ok = txn_fold_dropped(frame->io, frame->held, frame->base.folded, txn_fold_held_pairing, &pairing,
+		txn_outcome_shut();
+		txn_outcome_decided(frame->base.read, NULL, NULL);
+		frame->ok = txn_fold_dropped(frame->io, frame->held, frame->base.read, txn_fold_held_pairing, &pairing,
 									 frame->error) &&
 			txn_memtable_tuples_emptied(frame->io, record, frame->error);
 		return;
@@ -4069,6 +4671,31 @@ txn_fold_folded_body(void *frame_)
 	std_vec_new(&frame->values.edits, TXN_FOLD_EDIT);
 	if (!txn_fold_folded_sort(frame) || !txn_fold_folded_write(frame))
 		return;
+	std_vec_new(&frame->kept, sizeof(TxnSpillKept), _Alignof(TxnSpillKept));
+	frame->kept_live = true;
+	if (!std_vec_try_reserve_exact(&frame->kept, frame->spaces.kept.len + frame->values.kept.len,
+								   sizeof(TxnSpillKept), _Alignof(TxnSpillKept)))
+	{
+		*frame->error = host_Error_out_of_memory();
+		return;
+	}
+	std_vec_extend_from_slice_Checked(&frame->kept, frame->spaces.kept.ptr, frame->spaces.kept.len,
+									  sizeof(TxnSpillKept), _Alignof(TxnSpillKept));
+	frame->spaces.kept.len = 0;
+	std_vec_extend_from_slice_Checked(&frame->kept, frame->values.kept.ptr, frame->values.kept.len,
+									  sizeof(TxnSpillKept), _Alignof(TxnSpillKept));
+	frame->values.kept.len = 0;
+	if (!txn_spill_residual(frame->io, record, frame->point, frame->kept.ptr, frame->kept.len, &frame->residuals,
+							frame->error))
+		return;
+	frame->residuals_live = true;
+	if (!host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-fold-residual-listed", frame->error))
+		return;
+	host_io_Io_hold(frame->io);
+	txn_state_dropping(record, true);
+	frame->dropping = true;
+	if (!host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-fold-dropping", frame->error))
+		return;
 	if (!chunks_packs_roots_RootSlots_register(frame->io, txn_fold_folded_closure_11, frame, NULL, &frame->installed,
 											   &failed))
 	{
@@ -4077,7 +4704,7 @@ txn_fold_folded_body(void *frame_)
 	}
 	if (!frame->installed.some)
 	{
-		frame->ok = true;
+		frame->ok = txn_spill_unlisted(frame->io, record, &frame->residuals, frame->error);
 		return;
 	}
 	for (size_t i = 0; i < frame->chained.len; i++)
@@ -4089,33 +4716,73 @@ txn_fold_folded_body(void *frame_)
 		if (!txn_status_add(frame->io, xid, PG_UINT64_MAX, &has_added, &added, frame->error))
 			return;
 	}
-	if (!txn_fold_folded_logged(frame) ||
-		!host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-fold-installed", frame->error) ||
+	if (!host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-fold-installed", frame->error) ||
+		!txn_fold_folded_flushed(frame) ||
 		!txn_fold_dropped(frame->io, frame->held, frame->point, txn_fold_folded_closure_8, frame, frame->error) ||
 		!host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-drop-installed", frame->error))
 		return;
 	frame->spaces_live = false;
 	std_vec_free_Checked(&frame->spaces.edits, TXN_FOLD_EDIT);
+	std_vec_free_Checked(&frame->spaces.kept, sizeof(TxnSpillKept), _Alignof(TxnSpillKept));
 	if (!txn_fold_unspaced(frame->io, frame->held, &TXN_MEMTABLE_MAP_FREE_TREE_OPS, &frame->spaces.removed,
 						   frame->error))
 		return;
 	frame->values_live = false;
 	std_vec_free_Checked(&frame->values.edits, TXN_FOLD_EDIT);
+	std_vec_free_Checked(&frame->values.kept, sizeof(TxnSpillKept), _Alignof(TxnSpillKept));
 	if (!txn_fold_unspaced(frame->io, frame->held, &TXN_MEMTABLE_MAP_VALUES_TREE_OPS, &frame->values.removed,
 						   frame->error) ||
 		!txn_memtable_tuples_emptied(frame->io, record, frame->error))
 		return;
+	frame->dropping = false;
+	txn_state_dropping(record, false);
+	host_io_Io_resume(frame->io);
 	*frame->result = true;
 	frame->ok = true;
 }
 
-/* txn_fold_folded_pad frees what folded holds live. */
+/*
+ * TXN_FOLD_UNDROPPED is the message of a fold whose drop failed after its
+ * install: the records that name the install describe its drop, so, as
+ * Postgres does for a change its record names, the process ends and the
+ * server's recovery, which no checkpoint since the install lets start past
+ * those records, makes the drop again. A drop fails only when memory runs out
+ * or a spill's file can't be read or written, never on user input.
+ */
+#define TXN_FOLD_UNDROPPED "a fold's drop failed after its install"
+
+/* txn_fold_folded_pad frees what folded holds live, ending the process when the fold installed and its drop failed. */
 static void
 txn_fold_folded_pad(void *frame_)
 {
 	txn_fold_folded_frame_t *frame = frame_;
 
+	if (frame->dropping && frame->installed.some)
+		std_panic_nounwind(__FILE__, __LINE__, 0, TXN_FOLD_UNDROPPED, sizeof(TXN_FOLD_UNDROPPED) - 1);
+	if (frame->dropping)
+	{
+		txn_state_dropping(host_shared_Held_record(frame->held), false);
+		host_io_Io_resume(frame->io);
+	}
+	frame->dropping = false;
+	if (frame->rolling)
+	{
+		HostError	rolled;
+
+		if (!txn_spill_rolled(frame->io, host_shared_Held_record(frame->held), &rolled))
+			host_Error_drop(&rolled);
+	}
+	frame->rolling = false;
+	txn_outcome_shut();
+	txn_fold_Chunks_drop(&frame->chunks);
 	txn_fold_Installed_drop(&frame->installed);
+	if (frame->residuals_live)
+		std_vec_free_Checked(&frame->residuals, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	if (frame->kept_live)
+		std_vec_drop_Checked(&frame->kept, sizeof(TxnSpillKept), _Alignof(TxnSpillKept), txn_fold_Kept_drop);
+	if (frame->unfreed_live)
+		std_vec_drop_Checked(&frame->unfreed, TXN_FOLD_PENDING_ROW, txn_fold_PendingRow_drop);
+	frame->residuals_live = frame->kept_live = frame->unfreed_live = false;
 	if (frame->pends_live)
 		std_vec_drop_Checked(&frame->pends, TXN_FOLD_EDIT, trees_mutate_Edit_drop);
 	if (frame->paired_now_live)
@@ -4171,17 +4838,27 @@ txn_fold_folded_pad(void *frame_)
  * with more than one row refuses its install. A base whose chain holds a live
  * transform installs only with a re-form and every live transform's commit
  * at or below the point. A fold in recovery logs no record, and with reached
- * installs only a base whose roots matched accepts. It answers whether it
- * installed.
+ * installs only a base whose roots matched accepts. The spilled map
+ * versions its drop keeps go to residuals listed before it installs, taken
+ * back out when its install is refused (bugs row 228). A fold reads no
+ * version of a running top's subtransaction unless rolled_back, VACUUM's,
+ * which first counts itself in the state's rolling and waits out its walking
+ * spills, so every spill after leaves the rolled-back rows it reads to its
+ * drop; it logs each writer it answers aborted once, so a rolled-back
+ * subtransaction is logged at most twice: by the VACUUM that drops its rows,
+ * and by the first fold past its top's end, which drops its free space map
+ * takes, kept until then above the top's own (bugs row 432). It answers
+ * whether it installed.
  */
 bool
 txn_fold_folded(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading, const HostSharedHeld *held,
-				const TreesKeyOrder *order, bool keyless, HostLsn point, TxnFoldReform *reform,
-				TxnFoldReached *reached, bool *result, HostError *error)
+				const TreesKeyOrder *order, bool keyless, HostLsn point, const TxnInsertPage *page,
+				TxnFoldReform *reform, TxnFoldReached *reached, bool rolled_back, bool *result, HostError *error)
 {
-	txn_fold_folded_frame_t frame = {.io = io, .repo = repo, .reading = reading, .held = held, .order = order,
-		.keyless = keyless, .point = point, .reform = reform, .reached = reached, .result = result,
-	.error = error};
+	txn_fold_folded_frame_t frame = {.io = io, .repo = repo, .reading = reading, .held = held,
+		.chunks = {.repo = repo, .reading = reading, .held = held}, .order = order,
+		.keyless = keyless, .point = point, .page = page, .reform = reform, .reached = reached,
+	.rolled_back = rolled_back, .result = result, .error = error};
 
 	std_landing(&frame, txn_fold_folded_body, txn_fold_folded_pad);
 	txn_fold_folded_pad(&frame);
@@ -4221,20 +4898,23 @@ txn_fold_point(HostIoIo *io, bool *has_result, HostLsn *result, HostError *error
 bool
 txn_fold_fold_now(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading, const HostSharedHeld *held,
 				  const TreesKeyOrder *order, bool keyless, bool has_point, HostLsn point, uint64 horizon,
-				  StdVec *warned, const TxnInsertPage *page, TxnFoldReform *reform, bool *result, HostError *error)
+				  StdVec *warned, const TxnInsertPage *page, TxnFoldReform *reform, bool rolled_back, bool *result,
+				  HostError *error)
 {
 	bool		installed;
 	bool		left;
 	HostLsn		bounded;
 	bool		folded;
 
-	if (!txn_fold_in_order(io, repo, reading, held, order, keyless, warned, page, 0, &installed, &left, error))
+	if (!txn_fold_in_order(io, repo, reading, held, order, keyless, false, warned, page, 0, NULL, &installed, &left,
+						   error))
 		return false;
 	*result = installed;
 	if (!has_point || left)
 		return true;
 	if (!txn_fold_bounded(io, held, point, horizon, &bounded, error) ||
-		!txn_fold_folded(io, repo, reading, held, order, keyless, bounded, reform, NULL, &folded, error))
+		!txn_fold_folded(io, repo, reading, held, order, keyless, bounded, page, reform, NULL, rolled_back, &folded,
+						 error))
 		return false;
 	*result = folded || installed;
 	return true;
@@ -4249,18 +4929,102 @@ typedef struct txn_fold_in_order_frame_t
 	const HostSharedHeld *held;
 	const TreesKeyOrder *order;
 	bool		keyless;
+	bool		startup;
 	StdVec	   *warned;
 	const TxnInsertPage *page;
 	uint64		upto;
+	const TxnFoldStatuses *redone;
 	TxnBaseBase base;
 	bool		base_live;
+	HostForkRecord record;
+	bool		record_live;
+	TxnRecordBaseAdvanced advanced;
+	bool		advanced_live;
+	TxnFoldStatuses statuses;
+	bool		statuses_live;
 	bool	   *installed;
 	bool	   *left;
 	HostError  *error;
 	bool		ok;
 } txn_fold_in_order_frame_t;
 
-/* txn_fold_in_order_body folds at each reached point, oldest first, reading the records past each before the next. */
+/*
+ * txn_fold_in_order_bytes reports whether the startup process, which reads
+ * no catalog, folds at a reached point: its key orders the storage's rows by
+ * their bytes, keyless or with no column compared through its class, and the
+ * state gets the empty base a fold builds on; it sets keyless for a keyless
+ * table.
+ */
+static bool
+txn_fold_in_order_bytes(txn_fold_in_order_frame_t *frame, bool *keyless, bool *result)
+{
+	*result = false;
+	*keyless = frame->base.key.tag == TXN_BASE_KEY_NONE && !frame->base.has_index;
+	if (!*keyless && frame->base.key.tag != TXN_BASE_KEY_COLUMNS)
+		return true;
+	for (size_t i = 0; !*keyless && i < frame->base.key.u.columns.len; i++)
+		if (STD_VEC_AT(&frame->base.key.u.columns, TxnBaseKeyColumn, i).compared)
+			return true;
+	*result = true;
+	return txn_state_founded(frame->io, frame->held, frame->base.table, frame->base.has_index, frame->base.index,
+							 frame->error);
+}
+
+/* txn_fold_in_order_record_drop frees a reached point's record and what it decoded, each while live. */
+static void
+txn_fold_in_order_record_drop(txn_fold_in_order_frame_t *frame)
+{
+	if (frame->statuses_live)
+		txn_fold_Statuses_drop(&frame->statuses);
+	if (frame->advanced_live)
+		txn_record_BaseAdvanced_drop(&frame->advanced);
+	if (frame->record_live)
+		std_vec_free_Checked(&frame->record.f2, TXN_FOLD_BYTES);
+	frame->statuses_live = frame->advanced_live = frame->record_live = false;
+}
+
+/*
+ * txn_fold_in_order_record reads back the record of the reached point the
+ * slot holds, from where its read started to its end, and the fold's
+ * statuses from there (bugs row 432): a restartpoint never passes where the
+ * read starts, so the WAL still holds them.
+ */
+static bool
+txn_fold_in_order_record(txn_fold_in_order_frame_t *frame, uint64 from, uint64 end)
+{
+	HostIoIoDoors doors = HOST_IO_IO_IO_DOORS(frame->io);
+	uint32		kinds = 1u << host_WalKind_value(HOST_WAL_KIND_BASE_ADVANCED);
+	uint64		start = from;
+
+	for (;;)
+	{
+		if (!host_next_fork_record(doors, from, kinds, false, &frame->record_live, &frame->record, frame->error))
+			return false;
+		if (!frame->record_live || frame->record.f1 > end)
+		{
+			*frame->error = txn_fold_fork("XX000", "a reached fold point's record is gone from the WAL");
+			return false;
+		}
+		from = frame->record.f1;
+		if (from == end)
+			break;
+		std_vec_free_Checked(&frame->record.f2, TXN_FOLD_BYTES);
+		frame->record_live = false;
+	}
+	if (!txn_record_BaseAdvanced_decode(frame->record.f2.ptr, frame->record.f2.len, &frame->advanced, frame->error))
+		return false;
+	frame->advanced_live = true;
+	if (!txn_fold_statuses_read(doors, &frame->advanced, start, end, &frame->statuses, frame->error))
+		return false;
+	frame->statuses_live = true;
+	return true;
+}
+
+/*
+ * txn_fold_in_order_body folds at each reached point, oldest first, reading
+ * the records past each before the next; the startup process leaves a point
+ * whose key it can't order (bugs row 341).
+ */
 static void
 txn_fold_in_order_body(void *frame_)
 {
@@ -4271,17 +5035,32 @@ txn_fold_in_order_body(void *frame_)
 	for (;;)
 	{
 		TxnFoldCaught caught;
+		uint64		from;
+		uint64		end;
 
-		if (!txn_state_behind(frame->io, frame->held, &frame->base_live, &frame->base, frame->error))
+		if (!txn_state_behind(frame->io, frame->held, &frame->base_live, &frame->base, &from, &end, frame->error))
 			return;
 		if (frame->base_live)
 		{
-			TxnFoldReached reached = {&frame->base, frame->warned};
+			TxnFoldReached reached = {&frame->base, frame->warned,
+			frame->redone != NULL && end == frame->upto ? frame->redone : &frame->statuses};
+			bool		keyless = frame->keyless;
+			bool		bytes = true;
 			bool		folded;
 
-			if (!txn_fold_folded(frame->io, frame->repo, frame->reading, frame->held, frame->order, frame->keyless,
-								 frame->base.folded, NULL, &reached, &folded, frame->error))
+			if (frame->startup && !txn_fold_in_order_bytes(frame, &keyless, &bytes))
 				return;
+			if (!bytes)
+			{
+				*frame->left = true;
+				frame->ok = true;
+				return;
+			}
+			if ((reached.statuses == &frame->statuses && !txn_fold_in_order_record(frame, from, end)) ||
+				!txn_fold_folded(frame->io, frame->repo, frame->reading, frame->held, frame->order, keyless,
+								 frame->base.folded, frame->page, NULL, &reached, false, &folded, frame->error))
+				return;
+			txn_fold_in_order_record_drop(frame);
 			frame->base_live = false;
 			txn_base_Base_drop(&frame->base);
 			if (!folded)
@@ -4291,6 +5070,8 @@ txn_fold_in_order_body(void *frame_)
 				return;
 			}
 			*frame->installed = true;
+			if (!host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-fold-in-order-installed", frame->error))
+				return;
 		}
 		if (!txn_fold_caught_up(frame->io, frame->held, frame->page, frame->upto, &caught, frame->error))
 			return;
@@ -4302,12 +5083,13 @@ txn_fold_in_order_body(void *frame_)
 	}
 }
 
-/* txn_fold_in_order_pad frees what in_order holds live: a reached point's base. */
+/* txn_fold_in_order_pad frees what in_order holds live: a reached point's base and record. */
 static void
 txn_fold_in_order_pad(void *frame_)
 {
 	txn_fold_in_order_frame_t *frame = frame_;
 
+	txn_fold_in_order_record_drop(frame);
 	if (frame->base_live)
 		txn_base_Base_drop(&frame->base);
 	frame->base_live = false;
@@ -4318,23 +5100,25 @@ txn_fold_in_order_pad(void *frame_)
  * reached past its newest base, oldest first, and reads the records past
  * each point's record before the next, answering whether it installed a
  * base and whether a reached point or a read past one is left. A record its
- * caller redoes now is upto.
+ * caller redoes now is upto, decoded as redone, which a point that record
+ * reached answers from, since the WAL past replay isn't read. The startup
+ * process, with no catalog's order, checks each point's key (in_order_bytes).
  */
 static bool
 txn_fold_in_order(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading, const HostSharedHeld *held,
-				  const TreesKeyOrder *order, bool keyless, StdVec *warned, const TxnInsertPage *page, uint64 upto,
-				  bool *installed, bool *left, HostError *error)
+				  const TreesKeyOrder *order, bool keyless, bool startup, StdVec *warned, const TxnInsertPage *page,
+				  uint64 upto, const TxnFoldStatuses *redone, bool *installed, bool *left, HostError *error)
 {
 	txn_fold_in_order_frame_t frame = {.io = io, .repo = repo, .reading = reading, .held = held, .order = order,
-		.keyless = keyless, .warned = warned, .page = page, .upto = upto, .installed = installed, .left = left,
-	.error = error};
+		.keyless = keyless, .startup = startup, .warned = warned, .page = page, .upto = upto,
+	.redone = redone, .installed = installed, .left = left, .error = error};
 
 	std_landing(&frame, txn_fold_in_order_body, txn_fold_in_order_pad);
 	txn_fold_in_order_pad(&frame);
 	return frame.ok;
 }
 
-/* txn_fold_startup_fold_frame_t is startup_fold's state across its pad: the oldest reached base, its warnings, and its order. */
+/* txn_fold_startup_fold_frame_t is startup_fold's state across its pad: its warnings and its order. */
 typedef struct txn_fold_startup_fold_frame_t
 {
 	HostIoIo   *io;
@@ -4343,8 +5127,7 @@ typedef struct txn_fold_startup_fold_frame_t
 	const HostSharedHeld *held;
 	const TxnInsertPage *page;
 	uint64		upto;
-	TxnBaseBase base;
-	bool		base_live;
+	const TxnFoldStatuses *redone;
 	StdVec		warned;
 	bool		warned_live;
 	TreesKeyOrder bytes;
@@ -4354,50 +5137,24 @@ typedef struct txn_fold_startup_fold_frame_t
 	bool		ok;
 } txn_fold_startup_fold_frame_t;
 
-/* txn_fold_startup_fold_body folds at the reached points when the oldest one's key orders the rows by their bytes. */
+/* txn_fold_startup_fold_body folds at the reached points whose keys order the rows by their bytes, in order. */
 static void
 txn_fold_startup_fold_body(void *frame_)
 {
 	txn_fold_startup_fold_frame_t *frame = frame_;
-	bool		keyless = false;
 	bool		left;
 
 	*frame->result = false;
-	if (!txn_state_behind(frame->io, frame->held, &frame->base_live, &frame->base, frame->error))
-		return;
-	if (frame->base_live)
-	{
-		if (frame->base.key.tag == TXN_BASE_KEY_NONE && !frame->base.has_index)
-			keyless = true;
-		else if (frame->base.key.tag == TXN_BASE_KEY_COLUMNS)
-		{
-			for (size_t i = 0; i < frame->base.key.u.columns.len; i++)
-				if (STD_VEC_AT(&frame->base.key.u.columns, TxnBaseKeyColumn, i).compared)
-				{
-					frame->ok = true;
-					return;
-				}
-		}
-		else
-		{
-			frame->ok = true;
-			return;
-		}
-		if (!txn_state_founded(frame->io, frame->held, frame->base.table, frame->base.has_index, frame->base.index,
-							   frame->error))
-			return;
-		frame->base_live = false;
-		txn_base_Base_drop(&frame->base);
-	}
 	frame->bytes = trees_KeyOrder_Default_default();
 	frame->bytes_live = true;
 	std_vec_new(&frame->warned, sizeof(StdString), _Alignof(StdString));
 	frame->warned_live = true;
-	frame->ok = txn_fold_in_order(frame->io, frame->repo, frame->reading, frame->held, &frame->bytes, keyless,
-								  &frame->warned, frame->page, frame->upto, frame->result, &left, frame->error);
+	frame->ok = txn_fold_in_order(frame->io, frame->repo, frame->reading, frame->held, &frame->bytes, false, true,
+								  &frame->warned, frame->page, frame->upto, frame->redone, frame->result, &left,
+								  frame->error);
 }
 
-/* txn_fold_startup_fold_pad frees what startup_fold holds live: the warnings, the order, and the base. */
+/* txn_fold_startup_fold_pad frees what startup_fold holds live: the warnings and the order. */
 static void
 txn_fold_startup_fold_pad(void *frame_)
 {
@@ -4407,24 +5164,23 @@ txn_fold_startup_fold_pad(void *frame_)
 		std_vec_drop_Checked(&frame->warned, sizeof(StdString), _Alignof(StdString), std_String_drop);
 	if (frame->bytes_live)
 		trees_KeyOrder_drop(&frame->bytes);
-	if (frame->base_live)
-		txn_base_Base_drop(&frame->base);
-	frame->warned_live = frame->bytes_live = frame->base_live = false;
+	frame->warned_live = frame->bytes_live = false;
 }
 
 /*
  * txn_fold_startup_fold folds a storage in the startup process, which reads
  * no catalog, at each point its replayed fold records reached past its
- * newest base, in order, while the oldest one's key orders the storage's rows
- * by their bytes: a keyless table's, or one whose key has no column compared
- * through its class. It answers whether it installed a base.
+ * newest base, in order, while each point's key orders the storage's rows by
+ * their bytes: a keyless table's, or one whose key has no column compared
+ * through its class (bugs row 341). It answers whether it installed a base.
  */
 bool
 txn_fold_startup_fold(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading, const HostSharedHeld *held,
-					  const TxnInsertPage *page, uint64 upto, bool *result, HostError *error)
+					  const TxnInsertPage *page, uint64 upto, const TxnFoldStatuses *redone, bool *result,
+					  HostError *error)
 {
 	txn_fold_startup_fold_frame_t frame = {.io = io, .repo = repo, .reading = reading, .held = held, .page = page,
-	.upto = upto, .result = result, .error = error};
+	.upto = upto, .redone = redone, .result = result, .error = error};
 
 	std_landing(&frame, txn_fold_startup_fold_body, txn_fold_startup_fold_pad);
 	txn_fold_startup_fold_pad(&frame);
@@ -4474,6 +5230,7 @@ txn_fold_caught_up_body(void *frame_)
 	TxnStatePersistence persistence;
 	uint32		kinds = (1u << host_WalKind_value(HOST_WAL_KIND_BASE_ADVANCED)) |
 		(1u << host_WalKind_value(HOST_WAL_KIND_TIDS_FREED));
+	HostWalStand stand = host_wal_stand(doors);
 	bool		done;
 
 	*frame->result = TXN_FOLD_CAUGHT_DONE;
@@ -4486,10 +5243,17 @@ txn_fold_caught_up_body(void *frame_)
 	}
 	for (;;)
 	{
-		if (!host_next_fork_record(doors, from, kinds, &frame->record_live, &frame->record, frame->error))
+		uint64		searched = from;
+
+		if (!host_next_fork_record(doors, from, kinds, false, &frame->record_live, &frame->record, frame->error))
 			return;
 		if (!frame->record_live)
 			break;
+		if (stand.recovering && frame->record.f1 > Max(stand.replayed, frame->upto))
+		{
+			txn_fold_caught_up_record_drop(frame);
+			break;
+		}
 		from = frame->record.f1;
 		if (frame->record.f0 == host_WalKind_value(HOST_WAL_KIND_BASE_ADVANCED))
 		{
@@ -4499,7 +5263,7 @@ txn_fold_caught_up_body(void *frame_)
 			frame->advanced_live = true;
 			if (host_Storage_PartialEq_eq(&frame->advanced.storage, &storage))
 			{
-				if (!txn_state_read_past(frame->io, frame->held, frame->record.f1, true, &frame->advanced.base,
+				if (!txn_state_read_past(frame->io, frame->held, frame->record.f1, true, &frame->advanced.base, searched,
 										 frame->record.f1, &done, frame->error))
 					return;
 				*frame->result = TXN_FOLD_CAUGHT_NEXT;
@@ -4519,7 +5283,7 @@ txn_fold_caught_up_body(void *frame_)
 		}
 		txn_fold_caught_up_record_drop(frame);
 	}
-	if (!txn_state_read_past(frame->io, frame->held, Max(from, frame->upto), false, NULL, 0, &done, frame->error))
+	if (!txn_state_read_past(frame->io, frame->held, Max(from, frame->upto), false, NULL, 0, 0, &done, frame->error))
 		return;
 	*frame->result = done ? TXN_FOLD_CAUGHT_DONE : TXN_FOLD_CAUGHT_WAITING;
 	frame->ok = true;
@@ -4538,7 +5302,10 @@ txn_fold_caught_up_pad(void *frame_)
  * free's take-outs, which its redo deferred, are done as the primary's VACUUM
  * did them after that fold, up to the next fold's record, which the slot
  * takes for the next fold; with none left the read is done once no record
- * past its last was deferred, upto being one its caller redoes now.
+ * past its last was deferred, upto being one its caller redoes now. In
+ * recovery it reads no record replay hasn't passed, so a fold at a point
+ * runs only after its record's replay, which every commit at or below the
+ * point precedes (bugs row 432).
  */
 bool
 txn_fold_caught_up(HostIoIo *io, const HostSharedHeld *held, const TxnInsertPage *page, uint64 upto,
@@ -4574,11 +5341,15 @@ txn_fold_shown(bool has_root, const ChunksAddressAddress *root, StdString *resul
  * installs it. A byte-ordered tree whose root differs publishes the
  * mismatch, whose FATAL ends recovery, and the fold installs nothing; a rows
  * tree in a comparator's order whose root differs is reported and the
- * standby keeps its own.
+ * standby keeps its own. A fold whose state's base generation moved past the
+ * one it read its base at compares nothing and installs nothing, as its
+ * install would fail, since a newer install's drop may have taken what it
+ * read (bugs row 249); with the generation unmoved, nothing it read has
+ * changed since, so a mismatch it finds is its primary's.
  */
 static bool
-txn_fold_matched(HostIoIoDoors io, const HostSharedHeld *held, const TxnBaseBase *folded, TxnFoldReached *reached,
-				 const TreesKeyOrder *order, bool *result, HostError *error)
+txn_fold_matched(HostIoIoDoors io, const HostSharedHeld *held, uint64 generation, const TxnBaseBase *folded,
+				 TxnFoldReached *reached, const TreesKeyOrder *order, bool *result, HostError *error)
 {
 	static const char *const names[] = {"rows", "tuple id", "free space", "pending tuple id"};
 	const TxnBaseBase *theirs = reached->base;
@@ -4591,8 +5362,8 @@ txn_fold_matched(HostIoIoDoors io, const HostSharedHeld *held, const TxnBaseBase
 	HostStorage storage;
 	TxnStatePersistence persistence;
 
-	*result = true;
-	if (!txn_state_described(host_shared_Held_record(held), &storage, &persistence))
+	*result = txn_state_generation(host_shared_Held_record(held)) == generation;
+	if (!*result || !txn_state_described(host_shared_Held_record(held), &storage, &persistence))
 		return true;
 	for (int at = 0; at < lengthof(names); at++)
 	{
@@ -4800,8 +5571,9 @@ txn_fold_bounded_map(HostIoIo *io, HostSharedRecord record, const TxnMemtableTab
  * txn_fold_bounded lowers a fold point so the fold applies no top-level
  * transaction at or past a horizon: below the commit end, at or below the
  * point, of each committed writer at or past the horizon among the storage's
- * row versions its newest base didn't apply and its free space and value
- * maps' versions, every version a fold applies.
+ * row versions its newest base didn't apply, its free space and value maps'
+ * versions, and its listed spills' transactions, every version a fold
+ * applies.
  */
 static bool
 txn_fold_bounded(HostIoIo *io, const HostSharedHeld *held, HostLsn point, uint64 horizon, HostLsn *result,
@@ -4811,19 +5583,32 @@ txn_fold_bounded(HostIoIo *io, const HostSharedHeld *held, HostLsn point, uint64
 	txn_fold_bounded_captures_t walk = {.record = record, .horizon = horizon, .bound = result};
 	bool		some;
 	TxnBaseBase newest;
+	HostStorage storage;
+	TxnStatePersistence persistence;
+	txn_TupleVecFileU64_t listed;
+	bool		ok = true;
 
 	*result = point;
 	if (!txn_state_newest(io, held, &some, &newest, error))
 		return false;
 	if (some)
 	{
-		walk.folded = newest.folded;
+		walk.folded = newest.read;
 		txn_base_Base_drop(&newest);
 	}
-	return txn_memtable_table_walked(&TXN_MEMTABLE_TABLE_ROWS_TREE_OPS, io, record, txn_fold_bounded_closure_1, &walk,
-									 NULL, error) &&
-		txn_fold_bounded_map(io, record, &TXN_MEMTABLE_MAP_FREE_TREE_OPS, horizon, result, error) &&
-		txn_fold_bounded_map(io, record, &TXN_MEMTABLE_MAP_VALUES_TREE_OPS, horizon, result, error);
+	if (!txn_memtable_table_walked(&TXN_MEMTABLE_TABLE_ROWS_TREE_OPS, io, record, txn_fold_bounded_closure_1, &walk,
+								   NULL, error) ||
+		!txn_fold_bounded_map(io, record, &TXN_MEMTABLE_MAP_FREE_TREE_OPS, horizon, result, error) ||
+		!txn_fold_bounded_map(io, record, &TXN_MEMTABLE_MAP_VALUES_TREE_OPS, horizon, result, error))
+		return false;
+	if (!txn_state_described(record, &storage, &persistence))
+		return true;
+	if (!txn_spill_listed(&TXN_SPILL_STATE_HOME_OPS, io, record, &storage, &listed, error))
+		return false;
+	for (size_t k = 0; k < listed.f0.len && ok; k++)
+		ok = txn_fold_kept_out(io, STD_VEC_AT(&listed.f0, TxnSpillFile, k).xid, horizon, result, error);
+	std_vec_free_Checked(&listed.f0, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+	return ok;
 }
 
 /*
@@ -4837,11 +5622,14 @@ typedef struct txn_fold_rechained_base_frame_t
 	const RepoRepo *repo;
 	const HostSharedReader *reading;
 	const HostSharedHeld *held;
+	TxnFoldChunks chunks;
 	uint64		generation;
 	TxnBaseBase base;
 	bool		base_live;
 	const TxnBasePending *entries;
 	size_t		entries_len;
+	TxnStateLogged logged;
+	void	   *logged_captures;
 	TreesStoreWriter plain;
 	TreesStoreBrandedWriter writer;
 	bool		writer_live;
@@ -4870,7 +5658,11 @@ typedef struct txn_fold_rechained_base_closure_1_frame_t
 	bool		ok;
 } txn_fold_rechained_base_closure_1_frame_t;
 
-/* txn_fold_rechained_base_closure_1_body holds the chain's root in one slot, publishes it, and replaces the base. */
+/*
+ * txn_fold_rechained_base_closure_1_body holds the chain's root in one slot,
+ * publishes it, and replaces the base, listing its pack first when the
+ * replace logs.
+ */
 static void
 txn_fold_rechained_base_closure_1_body(void *frame_)
 {
@@ -4895,7 +5687,11 @@ txn_fold_rechained_base_closure_1_body(void *frame_)
 	frame->result->next.has_chain = true;
 	frame->result->next.chain = trees_published_Published_base(&STD_VEC_AT(&frame->published,
 																		   TreesPublishedPublished, 0));
-	if (!txn_state_rechained(io, rechained->held, rechained->generation, &frame->result->next, &replaced, &host))
+	if (rechained->logged != NULL &&
+		!chunks_packs_backend_Packs_flush(&rechained->repo->packs, io, rechained->reading, frame->error))
+		return;
+	if (!txn_state_rechained(io, rechained->held, rechained->generation, &frame->result->next, rechained->logged,
+							 rechained->logged_captures, &replaced, &host))
 	{
 		*frame->error = chunks_error_Error_FromError_from(&host);
 		return;
@@ -4991,7 +5787,8 @@ txn_fold_rechained_base_body(void *frame_)
 	}
 	frame->shape = trees_Shape_Default_default();
 	frame->shape_live = true;
-	if (!txn_fold_mutated(&frame->writer, frame->io, false, none, &frame->edits, &frame->edits_live, &frame->shape,
+	if (!txn_fold_mutated(&frame->writer, frame->io, &frame->chunks, false, none, &frame->edits, &frame->edits_live,
+						  &frame->shape,
 						  &frame->tree, frame->error))
 		return;
 	if (!chunks_packs_roots_RootSlots_register(frame->io, txn_fold_rechained_base_closure_1, frame, NULL,
@@ -5009,6 +5806,7 @@ txn_fold_rechained_base_pad(void *frame_)
 {
 	txn_fold_rechained_base_frame_t *frame = frame_;
 
+	txn_fold_Chunks_drop(&frame->chunks);
 	if (frame->shape_live)
 		trees_Shape_drop(&frame->shape);
 	if (frame->named_live)
@@ -5027,16 +5825,18 @@ txn_fold_rechained_base_pad(void *frame_)
  * replaces a state's newest base, which it takes, with one naming it when the
  * base generation is still the one read with the base, answering the new
  * base and the packs it wrote, or nothing when another install moved the
- * generation.
+ * generation. The replace logs through logged, when given.
  */
 static bool
 txn_fold_rechained_base(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading,
 						const HostSharedHeld *held, uint64 generation, TxnBaseBase *base,
-						const TxnBasePending *entries, size_t entries_len, TxnFoldInstalled *result, HostError *error)
+						const TxnBasePending *entries, size_t entries_len, TxnStateLogged logged,
+						void *logged_captures, TxnFoldInstalled *result, HostError *error)
 {
 	txn_fold_rechained_base_frame_t frame = {.io = io, .repo = repo, .reading = reading, .held = held,
+		.chunks = {.repo = repo, .reading = reading, .held = held},
 		.generation = generation, .base = *base, .base_live = true, .entries = entries, .entries_len = entries_len,
-	.result = result, .error = error};
+	.logged = logged, .logged_captures = logged_captures, .result = result, .error = error};
 
 	result->some = false;
 	std_landing(&frame, txn_fold_rechained_base_body, txn_fold_rechained_base_pad);
@@ -5061,6 +5861,10 @@ typedef struct txn_fold_chain_frame_t
 	size_t		recorded_entries_len;
 	TxnBaseBase recorded;
 	bool		recorded_live;
+	/* end is a replayed chain record's end. */
+	HostLsn		end;
+	/* storage is a DDL's storage, which its record names. */
+	HostStorage storage;
 	TxnBaseBase base;
 	bool		base_live;
 	StdVec		current;
@@ -5076,6 +5880,22 @@ typedef struct txn_fold_chain_frame_t
 	HostError  *error;
 	bool		ok;
 } txn_fold_chain_frame_t;
+
+/*
+ * txn_fold_chain_logged is a DDL's replace's logging: it inserts the record
+ * of the pass's base and its chain's entries, and gives its end.
+ */
+static bool
+txn_fold_chain_logged(void *captures, HostIoIoDoors io, HostLsn reached, HostLsn *end, HostError *error)
+{
+	const txn_fold_chain_frame_t *frame = captures;
+	TxnRecordBaseAdvanced advanced = {.storage = frame->storage, .folded = frame->installed.next.folded,
+		.max_folded = frame->installed.next.max_folded, .base = frame->installed.next,
+	.packs = frame->installed.packs, .has_chain = true, .chain = frame->entries};
+
+	(void) reached;
+	return txn_fold_advanced(io, &advanced, end, error);
+}
 
 /* txn_fold_chain_pass_drop frees what a pass of a chain loop holds: its install, counts, entries, chain, and base. */
 static void
@@ -5177,8 +5997,8 @@ txn_fold_chained_body(void *frame_)
 		HostXid		xid = {frame->pending.xid};
 		bool		has_added;
 		uint64		added;
-		HostStorage storage;
 		TxnStatePersistence persistence;
+		bool		permanent;
 
 		txn_fold_chain_pass_drop(frame);
 		if (!txn_fold_chain_read(frame, "a DDL's transform found its storage with no base", &some, &generation))
@@ -5211,34 +6031,17 @@ txn_fold_chained_body(void *frame_)
 		txn_base_Pending_Clone_clone(&frame->pending, &pending);
 		std_vec_push_Checked(&frame->entries, &pending, TXN_FOLD_CHAIN);
 		frame->base_live = false;
+		permanent = txn_state_described(host_shared_Held_record(frame->held), &frame->storage, &persistence) &&
+			persistence == TXN_STATE_PERSISTENCE_PERMANENT;
 		if (!txn_fold_rechained_base(frame->io, frame->repo, frame->reading, frame->held, generation, &frame->base,
-									 frame->entries.ptr, frame->entries.len, &frame->installed, frame->error))
+									 frame->entries.ptr, frame->entries.len, permanent ? txn_fold_chain_logged : NULL,
+									 frame, &frame->installed, frame->error))
 			return;
 		if (!frame->installed.some)
 			continue;
 		if (!txn_fold_chain_given(frame) ||
 			!txn_status_add(frame->io, xid, 1, &has_added, &added, frame->error))
 			return;
-		if (txn_state_described(host_shared_Held_record(frame->held), &storage, &persistence) &&
-			persistence == TXN_STATE_PERSISTENCE_PERMANENT)
-		{
-			TxnRecordBaseAdvanced advanced = {.storage = storage, .folded = frame->installed.next.folded,
-				.max_folded = frame->installed.next.max_folded, .base = frame->installed.next,
-			.packs = frame->installed.packs, .has_chain = true, .chain = frame->entries};
-			StdVec		body;
-			HostLsn		lsn;
-			bool		ok;
-
-			frame->installed.some = false;
-			frame->entries_live = false;
-			txn_record_BaseAdvanced_encode(&advanced, &body);
-			ok = host_wal_insert(HOST_IO_IO_IO_DOORS(frame->io), HOST_WAL_KIND_BASE_ADVANCED, body.ptr, body.len,
-								 &lsn, frame->error);
-			std_vec_free_Checked(&body, TXN_FOLD_BYTES);
-			txn_record_BaseAdvanced_drop(&advanced);
-			if (!ok)
-				return;
-		}
 		frame->ok = true;
 		return;
 	}
@@ -5314,7 +6117,8 @@ txn_fold_redo_chained_body(void *frame_)
 		}
 		frame->base_live = false;
 		if (!txn_fold_rechained_base(frame->io, frame->repo, frame->reading, frame->held, generation, &frame->base,
-									 frame->entries.ptr, frame->entries.len, &frame->installed, frame->error))
+									 frame->entries.ptr, frame->entries.len, txn_fold_replayed, &frame->end,
+									 &frame->installed, frame->error))
 			return;
 		if (!frame->installed.some)
 			continue;
@@ -5360,15 +6164,16 @@ txn_fold_redo_chained_body(void *frame_)
  * server's save wrote; each entry without an end the replaced chain lacked
  * counts at its top-level entry, and each without one it held that the
  * record lacks gives its count back. A storage this server holds no base of
- * yet takes the record's base, which it takes, with no chain.
+ * yet takes the record's base, which it takes, with no chain. The replaced
+ * base keeps the record's end.
  */
 bool
 txn_fold_redo_chained(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading,
 					  const HostSharedHeld *held, const TxnBasePending *entries, size_t entries_len,
-					  TxnBaseBase *recorded, HostError *error)
+					  TxnBaseBase *recorded, HostLsn end, HostError *error)
 {
 	txn_fold_chain_frame_t frame = {.io = io, .repo = repo, .reading = reading, .held = held,
-		.recorded_entries = entries, .recorded_entries_len = entries_len, .recorded = *recorded,
+		.recorded_entries = entries, .recorded_entries_len = entries_len, .recorded = *recorded, .end = end,
 	.recorded_live = true, .error = error};
 
 	std_landing(&frame, txn_fold_redo_chained_body, txn_fold_chain_pad);
@@ -5455,7 +6260,8 @@ txn_fold_settled_body(void *frame_)
 			break;
 		frame->base_live = false;
 		if (!txn_fold_rechained_base(frame->io, frame->repo, frame->reading, frame->held, generation, &frame->base,
-									 frame->entries.ptr, frame->entries.len, &frame->installed, frame->error))
+									 frame->entries.ptr, frame->entries.len, NULL, NULL, &frame->installed,
+									 frame->error))
 			return;
 		if (!frame->installed.some)
 			continue;
@@ -5513,6 +6319,8 @@ typedef struct txn_fold_whole_frame_t
 	TxnBaseBase base;
 	bool		base_live;
 	HostLsn		point;
+	/* read is the installed base's read point. */
+	HostLsn		read;
 	uint64		generation;
 	uint64		horizon;
 	bool		has_nodes;
@@ -5526,6 +6334,30 @@ typedef struct txn_fold_whole_frame_t
 	HostError  *error;
 	bool		ok;
 } txn_fold_whole_frame_t;
+
+/* txn_fold_whole_logging_t is a built base's install's logging's captures: the build, its storage, and its install. */
+typedef struct txn_fold_whole_logging_t
+{
+	const txn_fold_whole_frame_t *whole;
+	HostStorage storage;
+	const TxnFoldInstalled *installed;
+} txn_fold_whole_logging_t;
+
+/*
+ * txn_fold_whole_advanced is a built base's install's logging: it inserts
+ * the base's record, after its nodes', and gives its end.
+ */
+static bool
+txn_fold_whole_advanced(void *captures, HostIoIoDoors io, HostLsn reached, HostLsn *end, HostError *error)
+{
+	const txn_fold_whole_logging_t *logging = captures;
+	TxnRecordBaseAdvanced advanced = {.storage = logging->storage, .folded = logging->whole->point,
+		.max_folded = logging->installed->next.max_folded, .base = logging->installed->next,
+	.packs = logging->installed->packs, .built = true, .horizon = logging->whole->horizon};
+
+	(void) reached;
+	return txn_fold_advanced(io, &advanced, end, error);
+}
 
 /* txn_fold_whole_closure_0_frame_t is whole's run's state across its pad: the roots it published. */
 typedef struct txn_fold_whole_closure_0_frame_t
@@ -5559,6 +6391,11 @@ txn_fold_whole_closure_0_body(void *frame_)
 	HostError	host;
 	bool	   *has[4];
 	TreesStoreTree *named[4];
+	TxnStatePersistence persistence;
+	txn_fold_whole_logging_t logging = {.whole = whole, .installed = frame->result};
+	bool		permanent = txn_state_described(host_shared_Held_record(whole->held), &logging.storage,
+												&persistence) &&
+		persistence == TXN_STATE_PERSISTENCE_PERMANENT;
 
 	chunks_packs_roots_RootSlots_fold(frame->slots, &slot);
 	held = txn_fold_held(whole->writer, io, slot.s0, whole->has_roots[0], whole->roots[0], true, frame->error);
@@ -5590,7 +6427,11 @@ txn_fold_whole_closure_0_body(void *frame_)
 			*named[i] = trees_published_Published_base(&STD_VEC_AT(&frame->published, TreesPublishedPublished, at++));
 	}
 	next->folded = whole->point;
-	if (!txn_state_installed(io, whole->held, whole->generation, next, &installed, &host))
+	next->read = whole->read;
+	if (permanent && !chunks_packs_backend_Packs_flush(&whole->repo->packs, io, whole->reading, frame->error))
+		return;
+	if (!txn_state_installed(io, whole->held, whole->generation, next, permanent ? txn_fold_whole_advanced : NULL,
+							 &logging, &installed, &host))
 	{
 		*frame->error = chunks_error_Error_FromError_from(&host);
 		return;
@@ -5661,9 +6502,10 @@ txn_fold_Logged_drop(void *logged_)
 }
 
 /*
- * txn_fold_whole_logged logs a permanent storage's built base: its packs and
- * the WAL flushed, each node the writer kept as a Chunk record in its own
- * checkpoint window, children before parents, then the base's record.
+ * txn_fold_whole_logged logs a permanent storage's built base's nodes: the
+ * WAL flushed, each node the writer kept as a Chunk record in its own
+ * checkpoint window, children before parents, a blob's chunk under the
+ * build's top-level transaction as its writer (bugs row 364).
  */
 static bool
 txn_fold_whole_logged(txn_fold_whole_frame_t *frame)
@@ -5671,8 +6513,6 @@ txn_fold_whole_logged(txn_fold_whole_frame_t *frame)
 	HostIoIoDoors doors = HOST_IO_IO_IO_DOORS(frame->io);
 	HostStorage storage;
 	TxnStatePersistence persistence;
-	ChunksErrorError failed;
-	TxnRecordBaseAdvanced advanced;
 	StdVec		body;
 	HostLsn		lsn;
 	bool		ok;
@@ -5680,11 +6520,6 @@ txn_fold_whole_logged(txn_fold_whole_frame_t *frame)
 	if (!txn_state_described(host_shared_Held_record(frame->held), &storage, &persistence) ||
 		persistence != TXN_STATE_PERSISTENCE_PERMANENT)
 		return true;
-	if (!chunks_packs_backend_Packs_flush(&frame->repo->packs, frame->io, frame->reading, &failed))
-	{
-		*frame->error = txn_base_storage(&failed);
-		return false;
-	}
 	if (!host_wal_flush(doors, frame->point, frame->error))
 		return false;
 	if (storage.database == 0)
@@ -5709,6 +6544,11 @@ txn_fold_whole_logged(txn_fold_whole_frame_t *frame)
 			write.node.point = frame->point;
 			write.node.writer = frame->nodes;
 		}
+		else
+		{
+			write.has_writer = true;
+			write.writer.xid = frame->nodes;
+		}
 		txn_record_ChunkWrite_encode(&write, &body);
 		ok = host_delay_checkpoint(doors, NULL, 0, &window, frame->error);
 		if (ok)
@@ -5717,31 +6557,22 @@ txn_fold_whole_logged(txn_fold_whole_frame_t *frame)
 			if (ok)
 				host_DelayCheckpoint_finish(&window);
 			else
+			{
+				host_DelayCheckpoint_failed(&window, frame->error);
 				host_DelayCheckpoint_drop(&window);
+			}
 		}
 		std_vec_free_Checked(&body, TXN_FOLD_BYTES);
 		if (!ok)
 			return false;
 	}
-	if (!host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-built-logged", frame->error))
-		return false;
-	advanced.storage = storage;
-	advanced.folded = frame->point;
-	advanced.max_folded = frame->installed.next.max_folded;
-	advanced.base = frame->installed.next;
-	advanced.packs = frame->installed.packs;
-	advanced.built = true;
-	advanced.horizon = frame->horizon;
-	advanced.has_chain = false;
-	frame->installed.some = false;
-	txn_record_BaseAdvanced_encode(&advanced, &body);
-	ok = host_wal_insert(doors, HOST_WAL_KIND_BASE_ADVANCED, body.ptr, body.len, &lsn, frame->error);
-	std_vec_free_Checked(&body, TXN_FOLD_BYTES);
-	txn_record_BaseAdvanced_drop(&advanced);
-	return ok;
+	return host_pause(HOST_SHARED_IO_PAUSES(frame->io), "doltgres-built-logged", frame->error);
 }
 
-/* txn_fold_whole_body takes the writer's logged nodes, installs the base under the registration, and logs it. */
+/*
+ * txn_fold_whole_body takes the writer's logged nodes and logs them, then
+ * installs and logs the base under the registration.
+ */
 static void
 txn_fold_whole_body(void *frame_)
 {
@@ -5750,6 +6581,8 @@ txn_fold_whole_body(void *frame_)
 
 	trees_store_Writer_logged(&frame->writer->core, &frame->logged);
 	frame->logged_live = true;
+	if (!txn_fold_whole_logged(frame))
+		return;
 	if (!chunks_packs_roots_RootSlots_register(frame->io, txn_fold_whole_closure_0, frame, NULL, &frame->installed,
 											   &failed))
 	{
@@ -5757,12 +6590,7 @@ txn_fold_whole_body(void *frame_)
 		return;
 	}
 	*frame->result = frame->installed.some;
-	if (!frame->installed.some)
-	{
-		frame->ok = true;
-		return;
-	}
-	frame->ok = txn_fold_whole_logged(frame);
+	frame->ok = true;
 }
 
 /* txn_fold_whole_pad frees what whole holds live: the install, the logged nodes, the base, and the writer. */
@@ -5786,22 +6614,22 @@ txn_fold_whole_pad(void *frame_)
  * txn_fold_whole installs a base a backend wrote whole, taking the base and
  * the writer whose packs hold its trees' roots, held in the registration's
  * slots until the base that names them is installed as the state's newest,
- * at a fold point, when its base generation is still the one read before the
- * build, and for a permanent storage logged as built, after every node the
+ * at a fold point and a read point, when its base generation is still the
+ * one read before the build, and for a permanent storage logged as built, after every node the
  * writer kept as a Chunk record, each in its own checkpoint window, children
  * before parents; with nodes none it logs no chunk. The record carries its
  * replay's conflict horizon. It answers whether it installed.
  */
-static bool
+bool
 txn_fold_whole(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading, const HostSharedHeld *held,
 			   TreesStoreBrandedWriter *writer, const bool *has_roots, const size_t *roots, TxnBaseBase *base,
-			   HostLsn point, uint64 generation, uint64 horizon, bool has_nodes, uint64 nodes, bool *result,
-			   HostError *error)
+			   HostLsn point, HostLsn read, uint64 generation, uint64 horizon, bool has_nodes, uint64 nodes,
+			   bool *result, HostError *error)
 {
 	txn_fold_whole_frame_t frame = {.io = io, .repo = repo, .reading = reading, .held = held, .writer = writer,
 		.writer_live = true, .has_roots = has_roots, .roots = roots, .base = *base, .base_live = true,
-		.point = point, .generation = generation, .horizon = horizon, .has_nodes = has_nodes, .nodes = nodes,
-	.result = result, .error = error};
+		.point = point, .read = read, .generation = generation, .horizon = horizon, .has_nodes = has_nodes,
+	.nodes = nodes, .result = result, .error = error};
 
 	std_landing(&frame, txn_fold_whole_body, txn_fold_whole_pad);
 	txn_fold_whole_pad(&frame);
@@ -5859,6 +6687,7 @@ typedef struct txn_fold_built_frame_t
 	TreesStoreWriter plain;
 	TreesStoreBrandedWriter writer;
 	bool		writer_live;
+	TxnFoldChunks chunks;
 	TreesStoreBrandedBuilder builder;
 	bool		builder_live;
 	StdVec	   *building;
@@ -5869,6 +6698,254 @@ typedef struct txn_fold_built_frame_t
 	HostError  *error;
 	bool		ok;
 } txn_fold_built_frame_t;
+
+/* txn_fold_TupleAddressLocator_t is an (Address, Locator), an entry of Chunks' written map. */
+typedef struct txn_fold_TupleAddressLocator_t
+{
+	ChunksAddressAddress f0;
+	ChunksTrailerLocator f1;
+} txn_fold_TupleAddressLocator_t;
+
+/* TXN_FOLD_WRITTEN_TYPE is the table of Chunks' written map, a HashMap<Address, Locator>. */
+static const StdHashMapType TXN_FOLD_WRITTEN_TYPE = {
+	STD_HASHMAP_SHAPE(txn_fold_TupleAddressLocator_t),
+	.key_hash = chunks_address_Address_Hash_hash,
+	.key_eq = chunks_address_Address_PartialEq_eq,
+	.hasher = &FOLDHASH_FAST_RANDOM_STATE_BUILD_HASHER_OPS,
+	.hasher_default = foldhash_fast_RandomState_Default_default,
+};
+
+/*
+ * txn_fold_Chunks_locate_frame_t is locate's state across its pad: the
+ * chunk's bytes, the chunks it names, and their locators, each while live.
+ */
+typedef struct txn_fold_Chunks_locate_frame_t
+{
+	HostIoIo   *io;
+	TxnFoldChunks *chunks;
+	TreesStoreBrandedWriter *writer;
+	ChunksAddressAddress address;
+	ChunksTrailerLocator *result;
+	HostError  *error;
+	bool		ok;
+	StdVec		hashed;
+	bool		hashed_live;
+	StdVec		addresses;
+	bool		addresses_live;
+	StdVec		locators;
+	bool		locators_live;
+} txn_fold_Chunks_locate_frame_t;
+
+static bool txn_fold_Chunks_locate(HostIoIo *io, TxnFoldChunks *chunks, TreesStoreBrandedWriter *writer,
+								   ChunksAddressAddress address, ChunksTrailerLocator *result, HostError *error);
+
+/* txn_fold_Chunks_unheld returns the error of a base's chunk that nothing holds. */
+static HostError
+txn_fold_Chunks_unheld(const ChunksAddressAddress *address)
+{
+	StdFmtPiece pieces[] = {STD_FMT_LIT("a base's chunk "), STD_FMT_ARG(0),
+	STD_FMT_LIT(" is in no pack, delta, or chunk spill")};
+	StdFmtArg	args[] = {{address, chunks_address_Address_Display_fmt}};
+	StdFmtArguments arguments = {pieces, lengthof(pieces), args};
+	StdString	message;
+
+	std_fmt_format_Checked(&message, &arguments);
+	return host_Error_fork((const uint8 *) "XX001", &message);
+}
+
+/*
+ * txn_fold_Chunks_locate_body answers the chunk's locator from the written
+ * map, or writes the chunk from the delta or its chunk spills into the
+ * writer, each chunk it names located first, or else finds it in a pack.
+ */
+static void
+txn_fold_Chunks_locate_body(void *frame_)
+{
+	txn_fold_Chunks_locate_frame_t *frame = frame_;
+	TreesStoreNodeStore written = TREES_STORE_WRITER_NODE_STORE(&frame->writer->core);
+	ChunksErrorError failed;
+	ChunksTrailerStamps stamps;
+	TreesStoreTreeRef ref;
+	ChunksTrailerLocator old;
+	uint8	   *known;
+	bool		some = false;
+	bool		wrote;
+
+	known = std_HashMap_get(&frame->chunks->written, &TXN_FOLD_WRITTEN_TYPE, &frame->address);
+	if (known != NULL)
+	{
+		*frame->result = *(ChunksTrailerLocator *) (known + offsetof(txn_fold_TupleAddressLocator_t, f1));
+		frame->ok = true;
+		return;
+	}
+	if (frame->chunks->deltas_live &&
+		!txn_spill_chunk(frame->io, host_shared_Held_record(&frame->chunks->deltas), frame->address.f0,
+						 sizeof(frame->address.f0), &some, &frame->hashed, frame->error))
+		return;
+	if (some)
+	{
+		frame->hashed_live = true;
+		if (!chunks_header_addresses(frame->hashed.ptr, frame->hashed.len, &frame->addresses, &failed))
+			goto storage;
+		frame->addresses_live = true;
+		std_vec_with_capacity_Checked(&frame->locators, frame->addresses.len, TXN_FOLD_LOCATOR);
+		frame->locators_live = true;
+		for (size_t at = 0; at < frame->addresses.len; at++)
+		{
+			ChunksTrailerLocator child;
+
+			if (!txn_fold_Chunks_locate(frame->io, frame->chunks, frame->writer,
+										STD_VEC_AT(&frame->addresses, ChunksAddressAddress, at), &child,
+										frame->error))
+				return;
+			std_vec_push_Checked(&frame->locators, &child, TXN_FOLD_LOCATOR);
+		}
+		stamps = chunks_trailer_Stamps_Default_default();
+		frame->hashed_live = false;
+		wrote = written.ops->write(written.self, frame->io, &frame->hashed, frame->locators.ptr,
+								   frame->locators.len, &stamps, &ref, &failed);
+		chunks_trailer_Stamps_drop(&stamps);
+		if (!wrote)
+			goto storage;
+		*frame->result = ref.locator;
+	}
+	else
+	{
+		if (!chunks_packs_backend_Packs_find(&frame->chunks->repo->packs, frame->io, frame->chunks->reading,
+											 &frame->address, &some, frame->result, &failed))
+			goto storage;
+		if (!some)
+		{
+			*frame->error = txn_fold_Chunks_unheld(&frame->address);
+			return;
+		}
+	}
+	std_HashMap_insert(&frame->chunks->written, &TXN_FOLD_WRITTEN_TYPE, &frame->address, frame->result, &old);
+	frame->ok = true;
+	return;
+storage:
+	*frame->error = txn_base_storage(&failed);
+}
+
+/* txn_fold_Chunks_locate_pad frees what locate holds live: the locators, the addresses, and the bytes. */
+static void
+txn_fold_Chunks_locate_pad(void *frame_)
+{
+	txn_fold_Chunks_locate_frame_t *frame = frame_;
+
+	if (frame->locators_live)
+		std_vec_free_Checked(&frame->locators, TXN_FOLD_LOCATOR);
+	if (frame->addresses_live)
+		std_vec_free_Checked(&frame->addresses, sizeof(ChunksAddressAddress), _Alignof(ChunksAddressAddress));
+	if (frame->hashed_live)
+		std_vec_free_Checked(&frame->hashed, TXN_FOLD_BYTES);
+	frame->locators_live = frame->addresses_live = frame->hashed_live = false;
+}
+
+/*
+ * txn_fold_Chunks_locate returns where a base's out-of-line chunk is stored,
+ * as Doltgrust's Chunks::locate does: from the written map, or from the
+ * writer, which writes it from the working state's delta or its chunk spills
+ * (none when the repository has no published delta), each chunk it names
+ * located first, or from a pack that holds it. The delta comes first, since a
+ * fold publishes a chunk into a pack before taking it out of the delta. It
+ * looks in every tablespace's packs, as the blob writes pass over a chunk any
+ * pack holds, where Doltgrust looks in the writer's and leaves the locator
+ * unknown for a reader to find in another's, so a chunk none of them holds is
+ * lost, which it reports as corruption.
+ */
+static bool
+txn_fold_Chunks_locate(HostIoIo *io, TxnFoldChunks *chunks, TreesStoreBrandedWriter *writer,
+					   ChunksAddressAddress address, ChunksTrailerLocator *result, HostError *error)
+{
+	txn_fold_Chunks_locate_frame_t frame = {.io = io, .chunks = chunks, .writer = writer, .address = address,
+	.result = result, .error = error};
+
+	std_landing(&frame, txn_fold_Chunks_locate_body, txn_fold_Chunks_locate_pad);
+	txn_fold_Chunks_locate_pad(&frame);
+	return frame.ok;
+}
+
+/*
+ * txn_fold_built_resolved resolves the locators the trees' entries lack
+ * before the trees are written, so the base names no chunk only the delta or
+ * its chunk spills hold, as a copied row's chunks may be (bugs row 364).
+ */
+static bool
+txn_fold_built_resolved(txn_fold_built_frame_t *frame)
+{
+	StdVec	   *lists[4] = {&frame->trees.rows, &frame->trees.tuple_ids, &frame->trees.free_space,
+	&frame->trees.pending};
+
+	for (int t = 0; t < 4; t++)
+		for (size_t i = 0; i < lists[t]->len; i++)
+		{
+			TreesBuildEntry *entry = &STD_VEC_AT(lists[t], TreesBuildEntry, i);
+
+			if (!txn_fold_Chunks_resolve(frame->io, &frame->chunks, &frame->writer, &entry->value,
+										 &entry->addresses, frame->error))
+				return false;
+		}
+	return true;
+}
+
+/*
+ * txn_fold_Chunks_resolve fills in the locators an entry's value lacks for
+ * the addresses it holds, as Doltgrust's Chunks::resolve does, so no base a
+ * fold writes names a chunk only the delta or its chunk spills hold (bugs
+ * rows 364 and 387).
+ */
+static bool
+txn_fold_Chunks_resolve(HostIoIo *io, TxnFoldChunks *chunks, TreesStoreBrandedWriter *writer, const StdVec *value,
+						StdVec *addresses, HostError *error)
+{
+	for (size_t k = 0; k < addresses->len; k++)
+	{
+		chunks_TupleU32Locator_t *named = &STD_VEC_AT(addresses, chunks_TupleU32Locator_t, k);
+		ChunksAddressAddress address;
+
+		if (chunks_trailer_Locator_is_known(&named->f1))
+			continue;
+		if (!chunks->looked)
+		{
+			HostStorage storage;
+			TxnStatePersistence persistence;
+			bool		some;
+
+			chunks->looked = true;
+			std_HashMap_Default_default(&chunks->written, &TXN_FOLD_WRITTEN_TYPE);
+			if (!txn_state_described(host_shared_Held_record(chunks->held), &storage, &persistence))
+			{
+				*error = txn_fold_fork("XX000", "a base's storage isn't described");
+				return false;
+			}
+			if (!txn_memtable_branch_find(HOST_SHARED_IO_WITHIN(io), storage.database, &some, &chunks->deltas,
+										  error))
+				return false;
+			chunks->deltas_live = some;
+		}
+		if (named->f0 > value->len || value->len - named->f0 < sizeof(address.f0))
+		{
+			*error = txn_fold_fork("XX001", "an entry's address is past its value");
+			return false;
+		}
+		memcpy(address.f0, (const uint8 *) value->ptr + named->f0, sizeof(address.f0));
+		if (!txn_fold_Chunks_locate(io, chunks, writer, address, &named->f1, error))
+			return false;
+	}
+	return true;
+}
+
+/* txn_fold_Chunks_drop is Chunks' drop: its delta's handle and its written map, while live. */
+static void
+txn_fold_Chunks_drop(TxnFoldChunks *self)
+{
+	if (self->deltas_live)
+		host_shared_Held_drop(&self->deltas);
+	if (self->looked)
+		std_HashMap_drop(&self->written, &TXN_FOLD_WRITTEN_TYPE);
+	self->deltas_live = self->looked = false;
+}
 
 /*
  * txn_fold_built_body sorts the trees' entries, builds each nonempty tree in
@@ -5911,6 +6988,12 @@ txn_fold_built_body(void *frame_)
 	qsort(frame->trees.tuple_ids.ptr, frame->trees.tuple_ids.len, sizeof(TreesBuildEntry), txn_fold_entry_order);
 	qsort(frame->trees.free_space.ptr, frame->trees.free_space.len, sizeof(TreesBuildEntry), txn_fold_entry_order);
 	qsort(frame->trees.pending.ptr, frame->trees.pending.len, sizeof(TreesBuildEntry), txn_fold_entry_order);
+	for (size_t i = 0; !frame->base.has_index && i < frame->trees.rows.len; i++)
+	{
+		StdVec	   *stamps = &STD_VEC_AT(&frame->trees.rows, TreesBuildEntry, i).stamps;
+
+		qsort(stamps->ptr, stamps->len, sizeof(ChunksTrailerStamp), txn_fold_stamp_tuple_order);
+	}
 	frame->shapes[0].has_summarizer = false;
 	trees_KeyOrder_Clone_clone(frame->order, &frame->shapes[0].order);
 	frame->shapes_live = 1;
@@ -5929,6 +7012,8 @@ txn_fold_built_body(void *frame_)
 		trees_store_Writer_logging(&frame->plain);
 	trees_store_Writer_brand(&frame->plain, &frame->writer);
 	frame->writer_live = true;
+	if (!txn_fold_built_resolved(frame))
+		return;
 	lists[0] = &frame->trees.rows;
 	lists[1] = &frame->trees.tuple_ids;
 	lists[2] = &frame->trees.free_space;
@@ -5965,7 +7050,7 @@ txn_fold_built_body(void *frame_)
 	}
 	frame->writer_live = frame->base_live = false;
 	frame->ok = txn_fold_whole(frame->io, frame->repo, frame->reading, frame->held, &frame->writer, frame->has_roots,
-							   frame->roots, &frame->base, frame->point, generation, frame->horizon,
+							   frame->roots, &frame->base, frame->point, frame->point, generation, frame->horizon,
 							   frame->has_nodes, frame->nodes, frame->result, frame->error);
 }
 
@@ -5983,6 +7068,7 @@ txn_fold_built_pad(void *frame_)
 			trees_build_Entry_drop(&STD_VEC_AT(frame->building, TreesBuildEntry, i));
 		frame->building->len = 0;
 	}
+	txn_fold_Chunks_drop(&frame->chunks);
 	if (frame->writer_live)
 		trees_store_BrandedWriter_drop(&frame->writer);
 	while (frame->shapes_live > 0)
@@ -6015,15 +7101,17 @@ txn_fold_built_pad(void *frame_)
  * installed as the state's newest, at a fold point, when its base
  * generation is still the one read before the build. A permanent storage's
  * base is logged as built after every node of its trees as a Chunk record;
- * a relfilenode whose writes skip the WAL (nodes none) logs none. It
- * answers whether it installed.
+ * a relfilenode whose writes skip the WAL (nodes none) logs none. A table's
+ * entries keep their stamps in tuple id order, as a fold's do (bugs row
+ * 388). It answers whether it installed.
  */
 bool
 txn_fold_built(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading, const HostSharedHeld *held,
 			   const TreesKeyOrder *order, TxnFoldTrees *trees, TxnBaseBase *base, HostLsn point, bool has_nodes,
 			   uint64 nodes, uint64 horizon, bool *result, HostError *error)
 {
-	txn_fold_built_frame_t frame = {.io = io, .repo = repo, .reading = reading, .held = held, .order = order,
+	txn_fold_built_frame_t frame = {.io = io, .repo = repo, .reading = reading, .held = held,
+		.chunks = {.repo = repo, .reading = reading, .held = held}, .order = order,
 		.trees = *trees, .trees_live = true, .base = *base, .base_live = true, .point = point,
 	.has_nodes = has_nodes, .nodes = nodes, .horizon = horizon, .result = result, .error = error};
 
@@ -6277,33 +7365,26 @@ txn_fold_reformed_body(void *frame_)
 		TreesBuildEntry *entry = &row->entry;
 		ChunksTrailerStamp stamp;
 		uint32		heap_bytes;
+		uint64		copies_bytes = 0;
 		txn_TupleU64VecU8U32_t pair;
 		TreesMutateEdit edit = {.tag = TREES_MUTATE_EDIT_PUT};
 
-		if (entry->stamps.len != 1)
-		{
-			*frame->error = txn_fold_fork("XX001", "a keyed table's entry holds other than one row");
-			return;
-		}
-		stamp = STD_VEC_AT(&entry->stamps, ChunksTrailerStamp, 0);
-		if (row->epoch == end)
-		{
-			if (!txn_fold_written_heap(&frame->ctids, stamp.tuple, &heap_bytes))
-			{
-				txn_fold_reformed_corrupt(frame);
-				return;
-			}
-		}
-		else
+		if (row->epoch != end)
 		{
 			size_t		from;
 
+			if (entry->stamps.len != 1)
+			{
+				*frame->error = txn_fold_fork("XX001", "a keyed table's entry holds other than one row");
+				return;
+			}
 			if (row->epoch < frame->base->epoch || row->epoch - frame->base->epoch > frame->chain_len)
 			{
 				txn_fold_reformed_corrupt(frame);
 				return;
 			}
 			from = row->epoch - frame->base->epoch;
+			stamp = STD_VEC_AT(&entry->stamps, ChunksTrailerStamp, 0);
 			if (!frame->reform->ops->reformed(frame->reform->self, frame->io, entry->key.ptr, entry->key.len, stamp,
 											  entry->value.ptr, entry->value.len, entry->addresses.ptr,
 											  entry->addresses.len, entry->values.ptr, entry->values.len,
@@ -6318,14 +7399,25 @@ txn_fold_reformed_body(void *frame_)
 			entry->values = frame->reformed.values;
 			heap_bytes = frame->reformed.heap_bytes;
 		}
+		for (size_t c = 0; c < entry->stamps.len; c++)
+		{
+			stamp = STD_VEC_AT(&entry->stamps, ChunksTrailerStamp, c);
+			if (row->epoch == end && !txn_fold_written_heap(&frame->ctids, stamp.tuple, &heap_bytes))
+			{
+				txn_fold_reformed_corrupt(frame);
+				return;
+			}
+			copies_bytes += heap_bytes;
+			pair.f0 = stamp.tuple;
+			pair.f2 = heap_bytes;
+			std_vec_reserve_Checked(&frame->paired, 1, TXN_FOLD_PAIRED);
+			txn_fold_bytes(entry->key.ptr, entry->key.len, &pair.f1);
+			txn_fold_paired_insert(&frame->paired, &pair);
+		}
 		*frame->sizes = txn_base_Sizes_summed(*frame->sizes, txn_fold_sized(entry->key.ptr, entry->key.len,
-																			entry->value.ptr, entry->value.len, 1));
-		frame->sizes->heap_bytes = STD_ADD(u64, frame->sizes->heap_bytes, heap_bytes, 1844, 9);
-		pair.f0 = stamp.tuple;
-		pair.f2 = heap_bytes;
-		std_vec_reserve_Checked(&frame->paired, 1, TXN_FOLD_PAIRED);
-		txn_fold_bytes(entry->key.ptr, entry->key.len, &pair.f1);
-		txn_fold_paired_insert(&frame->paired, &pair);
+																			entry->value.ptr, entry->value.len,
+																			entry->stamps.len));
+		frame->sizes->heap_bytes = STD_ADD(u64, frame->sizes->heap_bytes, copies_bytes, 1844, 9);
 		edit.u.put = *entry;
 		std_vec_reserve_Checked(&frame->out, 1, TXN_FOLD_EDIT);
 		std_vec_push_Checked(&frame->out, &edit, TXN_FOLD_EDIT);
@@ -6408,8 +7500,11 @@ txn_fold_reformed_pad(void *frame_)
  * is stored at, through the caller's re-form, its tuple id paired again with
  * its new heap bytes, a row written at the chain's end kept as it is, and
  * the base's sizes counted afresh over every row it keeps. A keyed table's
- * entry is one row with one stamp. It answers the edits, the tuple id tree's
- * edits, the sizes, and the chain's end as the base's epoch.
+ * entry is one row with one stamp. A keyless table's rows are all at the
+ * chain's end, since its DDL re-keys every row at its commit, so each entry
+ * is kept with every copy's tuple id paired (bugs row 328). It answers the
+ * edits, the tuple id tree's edits, the sizes, and the chain's end as the
+ * base's epoch.
  */
 static bool
 txn_fold_reformed(HostIoIo *io, TreesStoreNodeStore store, const TxnBaseBase *base, const TxnVisibleLive *chain,
@@ -6482,7 +7577,8 @@ static bool txn_fold_copied_chunk(HostIoIo *io, TreesStoreNodeStore store, Trees
 
 /*
  * txn_fold_copied_chunk_body reads the chunk and gives each child a pack holds
- * its copy's locator, written first once.
+ * its copy's locator, written first once. A child at an unknown locator is
+ * corruption, since every write of a base places its chunks (bugs row 387).
  */
 static void
 txn_fold_copied_chunk_body(void *frame_)
@@ -6510,8 +7606,8 @@ txn_fold_copied_chunk_body(void *frame_)
 
 		if (!chunks_trailer_Locator_is_known(&known))
 		{
-			std_vec_push_Checked(&frame->locators, &known, TXN_FOLD_LOCATOR);
-			continue;
+			*frame->error = txn_fold_fork("XX001", "a base's chunk names a chunk at an unknown locator");
+			return;
 		}
 		copy = bsearch(&known, frame->memo->copies.ptr, frame->memo->copies.len, sizeof(txn_TupleLocatorLocator_t),
 					   txn_fold_copy_order);
@@ -6610,6 +7706,8 @@ typedef struct txn_fold_copied_frame_t
 	TxnBaseBase base;
 	bool		base_live;
 	HostLsn		point;
+	/* read is the installed base's read point. */
+	HostLsn		read;
 	bool		has_nodes;
 	uint64		nodes;
 	TxnFoldCopies *memo;
@@ -6671,8 +7769,8 @@ txn_fold_copied_body(void *frame_)
 	}
 	frame->writer_live = frame->base_live = false;
 	frame->ok = txn_fold_whole(frame->io, frame->repo, frame->reading, frame->held, &frame->writer, has_roots, roots,
-							   &frame->base, frame->point, generation, frame->base.max_folded, frame->has_nodes,
-							   frame->nodes, frame->result, frame->error);
+							   &frame->base, frame->point, frame->read, generation, frame->base.max_folded,
+							   frame->has_nodes, frame->nodes, frame->result, frame->error);
 }
 
 /* txn_fold_copied_pad frees what copied holds live: its writer and the base. */
@@ -6692,20 +7790,21 @@ txn_fold_copied_pad(void *frame_)
  * txn_fold_copied installs a copy of a base in a new storage, taking the
  * base, its four trees written again chunk by chunk into packs of the
  * storage's tablespace, every chunk they reach that a pack holds, each
- * keeping its address, hashed bytes, and stamps, at a fold point, and logged
- * as a built base whose replay's conflict horizon is its maxFolded. A chunk
- * the working state's delta holds keeps its unknown locator. A memo of the
+ * keeping its address, hashed bytes, and stamps, at a fold point and a read
+ * point, and logged as a built base whose replay's conflict horizon is its
+ * maxFolded. A chunk
+ * at an unknown locator is data corruption (bugs row 387). A memo of the
  * chunks copied writes a chunk the base names more than once once. It
  * answers whether it installed.
  */
 bool
 txn_fold_copied(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading, const HostSharedHeld *held,
-				TxnBaseBase *base, HostLsn point, bool has_nodes, uint64 nodes, TxnFoldCopies *memo, bool *result,
-				HostError *error)
+				TxnBaseBase *base, HostLsn point, HostLsn read, bool has_nodes, uint64 nodes, TxnFoldCopies *memo,
+				bool *result, HostError *error)
 {
 	txn_fold_copied_frame_t frame = {.io = io, .repo = repo, .reading = reading, .held = held, .base = *base,
-		.base_live = true, .point = point, .has_nodes = has_nodes, .nodes = nodes, .memo = memo, .result = result,
-	.error = error};
+		.base_live = true, .point = point, .read = read, .has_nodes = has_nodes, .nodes = nodes, .memo = memo,
+	.result = result, .error = error};
 
 	std_landing(&frame, txn_fold_copied_body, txn_fold_copied_pad);
 	txn_fold_copied_pad(&frame);
@@ -6725,14 +7824,16 @@ txn_fold_installs_done(HostIoIo *io, const RepoRepo *repo, const HostSharedReade
 	txn_fold_held_pairing_t paired = {TREES_STORE_READER_NODE_STORE(&reader), base->has_tuple_ids, base->tuple_ids};
 	TxnFoldSpaced spaced;
 
-	if (!txn_fold_dropped(io, held, base->folded, txn_fold_held_pairing, &paired, error) ||
-		!txn_fold_spaced(io, held, base->folded, txn_fold_held_pairing, &paired, &spaced, error))
+	if (!txn_fold_dropped(io, held, base->read, txn_fold_held_pairing, &paired, error) ||
+		!txn_fold_spaced(io, held, base->read, NULL, NULL, &spaced, error))
 		return false;
 	std_vec_drop_Checked(&spaced.edits, TXN_FOLD_EDIT, trees_mutate_Edit_drop);
+	std_vec_drop_Checked(&spaced.kept, sizeof(TxnSpillKept), _Alignof(TxnSpillKept), txn_fold_Kept_drop);
 	if (!txn_fold_unspaced(io, held, &TXN_MEMTABLE_MAP_FREE_TREE_OPS, &spaced.removed, error) ||
-		!txn_fold_valued(io, held, base->folded, &spaced, error))
+		!txn_fold_valued(io, held, base->read, &spaced, error))
 		return false;
 	std_vec_drop_Checked(&spaced.edits, TXN_FOLD_EDIT, trees_mutate_Edit_drop);
+	std_vec_drop_Checked(&spaced.kept, sizeof(TxnSpillKept), _Alignof(TxnSpillKept), txn_fold_Kept_drop);
 	return txn_fold_unspaced(io, held, &TXN_MEMTABLE_MAP_VALUES_TREE_OPS, &spaced.removed, error) &&
 		txn_memtable_tuples_emptied(io, host_shared_Held_record(held), error);
 }
@@ -6908,8 +8009,8 @@ txn_fold_rewritten_body(void *frame_)
 		built = true;
 	}
 	else if (frame->blob &&
-			 !txn_memtable_branch_get(frame->io, frame->deltas, frame->address.f0, sizeof(frame->address.f0), &some,
-									  &frame->stored, frame->error))
+			 !txn_spill_chunk(frame->io, frame->deltas, frame->address.f0, sizeof(frame->address.f0), &some,
+							  &frame->stored, frame->error))
 		return;
 	if (!some)
 	{
@@ -6991,7 +8092,8 @@ txn_fold_rewritten_body(void *frame_)
 				*frame->error = host_Error_fork((const uint8 *) "XX001", &message);
 				return;
 			}
-			locator = chunks_trailer_Locator_Default_default();
+			*frame->error = txn_fold_Chunks_unheld(&child);
+			return;
 		}
 		std_vec_push_Checked(&frame->locators, &locator, TXN_FOLD_LOCATOR);
 	}
@@ -7028,12 +8130,13 @@ txn_fold_rewritten_pad(void *frame_)
 
 /*
  * txn_fold_rewritten readies a built base's chunk for a writer by its
- * address: one the working state's delta holds, each chunk it names readied
- * first and written at this server's locators, its key added to taken, a
+ * address: one the working state's delta holds, or for a blob's chunk its
+ * chunk spills hold (bugs row 364), each chunk it names readied first and
+ * written at this server's locators, its key added to taken, a
  * tree's node under the base with the stamps its Chunk record carried; or,
  * for a blob's chunk, one this server's packs hold; or nothing for a chunk
- * neither holds. A leaf names such a chunk under an unknown locator; an
- * internal node naming one is data corruption. A chunk under a leaf (blob)
+ * neither holds, which a node naming it reports as data corruption (bugs
+ * row 387). A chunk under a leaf (blob)
  * is held in the delta under the base when it is an internal node and by its
  * address alone when it is a leaf.
  */
@@ -7064,6 +8167,8 @@ typedef struct txn_fold_rebuilt_frame_t
 	const HostSharedReader *reading;
 	const HostSharedHeld *held;
 	const TxnRecordBaseAdvanced *advanced;
+	/* end is the replayed record's end. */
+	HostLsn		end;
 	uint64		generation;
 	HostSharedHeld deltas;
 	bool		deltas_live;
@@ -7144,7 +8249,10 @@ txn_fold_rebuilt_closure_2_body(void *frame_)
 		if (rebuilt->has_roots[i])
 			*named[i] = trees_published_Published_base(&STD_VEC_AT(&frame->published, TreesPublishedPublished, at++));
 	}
-	if (!txn_state_installed(io, rebuilt->held, rebuilt->generation, next, &installed, &host))
+	if (!chunks_packs_backend_Packs_flush(&rebuilt->repo->packs, io, rebuilt->reading, frame->error))
+		return;
+	if (!txn_state_installed(io, rebuilt->held, rebuilt->generation, next, txn_fold_replayed, &rebuilt->end,
+							 &installed, &host))
 	{
 		*frame->error = chunks_error_Error_FromError_from(&host);
 		return;
@@ -7289,11 +8397,6 @@ txn_fold_rebuilt_body(void *frame_)
 		frame->ok = true;
 		return;
 	}
-	if (!chunks_packs_backend_Packs_flush(&frame->repo->packs, frame->io, frame->reading, &failed))
-	{
-		*frame->error = txn_base_storage(&failed);
-		return;
-	}
 	for (size_t i = 0; i < frame->nodes.len; i++)
 	{
 		const txn_TupleAddressBool_t *node = &STD_VEC_AT(&frame->nodes, txn_TupleAddressBool_t, i);
@@ -7334,14 +8437,16 @@ txn_fold_rebuilt_pad(void *frame_)
  * packs, children before parents, and installs the base that names them at
  * this server's locators, when its base generation is still the one read;
  * once the packs are flushed it takes those nodes out of the delta. It
- * clones the record's key, since the installed base outlives the record.
+ * clones the record's key, since the installed base outlives the record. The
+ * installed base keeps the record's end.
  */
 static bool
 txn_fold_rebuilt(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading, const HostSharedHeld *held,
-				 const TxnRecordBaseAdvanced *advanced, uint64 generation, bool *result, HostError *error)
+				 const TxnRecordBaseAdvanced *advanced, HostLsn end, uint64 generation, bool *result,
+				 HostError *error)
 {
 	txn_fold_rebuilt_frame_t frame = {.io = io, .repo = repo, .reading = reading, .held = held,
-	.advanced = advanced, .generation = generation, .result = result, .error = error};
+	.advanced = advanced, .end = end, .generation = generation, .result = result, .error = error};
 
 	std_landing(&frame, txn_fold_rebuilt_body, txn_fold_rebuilt_pad);
 	txn_fold_rebuilt_pad(&frame);
@@ -7368,6 +8473,8 @@ typedef struct txn_fold_redo_frame_t
 	const HostSharedReader *reading;
 	const HostSharedHeld *held;
 	const TxnRecordBaseAdvanced *advanced;
+	const TxnFoldStatuses *statuses;
+	uint64		from;
 	uint64		end;
 	TxnBaseBase newest;
 	bool		newest_live;
@@ -7375,6 +8482,45 @@ typedef struct txn_fold_redo_frame_t
 	HostError  *error;
 	bool		ok;
 } txn_fold_redo_frame_t;
+
+/*
+ * txn_fold_redo_residuals lists, before a replayed fold's install, the
+ * residuals of the spilled map versions its drop keeps at its point, as its
+ * primary's fold listed them; a built base keeps none.
+ */
+static bool
+txn_fold_redo_residuals(txn_fold_redo_frame_t *frame, StdVec *result)
+{
+	const TxnRecordBaseAdvanced *advanced = frame->advanced;
+	TxnFoldSpaced free;
+	TxnFoldSpaced values;
+	StdVec		kept;
+	bool		ok;
+
+	if (advanced->built)
+	{
+		std_vec_new(result, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+		return true;
+	}
+	if (!txn_fold_spaced(frame->io, frame->held, advanced->folded, NULL, NULL, &free, frame->error))
+		return false;
+	if (!txn_fold_valued(frame->io, frame->held, advanced->folded, &values, frame->error))
+	{
+		txn_fold_Spaced_drop(&free);
+		return false;
+	}
+	kept = free.kept;
+	std_vec_new(&free.kept, sizeof(TxnSpillKept), _Alignof(TxnSpillKept));
+	std_vec_extend_from_slice_Checked(&kept, values.kept.ptr, values.kept.len, sizeof(TxnSpillKept),
+									  _Alignof(TxnSpillKept));
+	values.kept.len = 0;
+	txn_fold_Spaced_drop(&free);
+	txn_fold_Spaced_drop(&values);
+	ok = txn_spill_residual(frame->io, host_shared_Held_record(frame->held), advanced->folded, kept.ptr, kept.len,
+							result, frame->error);
+	std_vec_drop_Checked(&kept, sizeof(TxnSpillKept), _Alignof(TxnSpillKept), txn_fold_Kept_drop);
+	return ok;
+}
 
 /* txn_fold_redo_body installs the record's base, rebuilds a built one, or records the point, unless a newer base passed it. */
 static void
@@ -7394,15 +8540,17 @@ txn_fold_redo_body(void *frame_)
 	}
 	if (!holds && !advanced->built)
 	{
-		frame->ok = txn_state_reach(frame->io, frame->held, &advanced->base, frame->end, frame->result,
+		frame->ok = txn_state_reach(frame->io, frame->held, &advanced->base, frame->from, frame->end, frame->result,
 									frame->error);
 		return;
 	}
+	txn_outcome_decided(advanced->folded, &frame->statuses->aborted, &frame->statuses->killed);
 	for (;;)
 	{
 		uint64		generation = txn_state_generation(host_shared_Held_record(frame->held));
 		bool		passed = false;
 		bool		installed;
+		StdVec		residuals;
 
 		if (!txn_state_newest(frame->io, frame->held, &frame->newest_live, &frame->newest, frame->error))
 			return;
@@ -7423,7 +8571,8 @@ txn_fold_redo_body(void *frame_)
 		{
 			bool		rebuilt;
 
-			if (!txn_fold_rebuilt(frame->io, frame->repo, frame->reading, frame->held, advanced, generation, &rebuilt,
+			if (!txn_fold_rebuilt(frame->io, frame->repo, frame->reading, frame->held, advanced, frame->end, generation,
+								  &rebuilt,
 								  frame->error))
 				return;
 			if (rebuilt)
@@ -7433,11 +8582,26 @@ txn_fold_redo_body(void *frame_)
 			}
 			continue;
 		}
-		if (!txn_state_installed(HOST_IO_IO_TAKES_SHORT(frame->io), frame->held, generation, &advanced->base,
-								 &installed, frame->error))
+		if (!txn_fold_redo_residuals(frame, &residuals))
 			return;
+		if (!txn_state_installed(HOST_IO_IO_TAKES_SHORT(frame->io), frame->held, generation, &advanced->base,
+								 txn_fold_replayed, &frame->end,
+								 &installed, frame->error))
+		{
+			std_vec_free_Checked(&residuals, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+			return;
+		}
 		if (!installed)
+		{
+			bool		unlisted = txn_spill_unlisted(frame->io, host_shared_Held_record(frame->held), &residuals,
+													  frame->error);
+
+			std_vec_free_Checked(&residuals, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
+			if (!unlisted)
+				return;
 			continue;
+		}
+		std_vec_free_Checked(&residuals, sizeof(TxnSpillFile), _Alignof(TxnSpillFile));
 		if (advanced->built)
 		{
 			txn_state_grown(host_shared_Held_record(frame->held), &advanced->base);
@@ -7456,6 +8620,7 @@ txn_fold_redo_pad(void *frame_)
 {
 	txn_fold_redo_frame_t *frame = frame_;
 
+	txn_outcome_shut();
 	if (frame->newest_live)
 		txn_base_Base_drop(&frame->newest);
 	frame->newest_live = false;
@@ -7468,18 +8633,735 @@ txn_fold_redo_pad(void *frame_)
  * records left in the working state's delta; and for a fold's base on a
  * server without its packs it records the fold point for this server's own
  * fold to reach and installs nothing. An install is passed over when the
- * state's newest base is already the record's or a later one. It answers
+ * state's newest base is already the record's or a later one; what the base
+ * folded leaves the delta as the record decided its writers. It answers
  * false when a standby's slot holds an earlier point its fold hasn't
  * reached, and true otherwise.
  */
 bool
 txn_fold_redo(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading, const HostSharedHeld *held,
-			  const TxnRecordBaseAdvanced *advanced, uint64 end, bool *result, HostError *error)
+			  const TxnRecordBaseAdvanced *advanced, const TxnFoldStatuses *statuses, uint64 from, uint64 end,
+			  bool *result, HostError *error)
 {
 	txn_fold_redo_frame_t frame = {.io = io, .repo = repo, .reading = reading, .held = held, .advanced = advanced,
-	.end = end, .result = result, .error = error};
+	.statuses = statuses, .from = from, .end = end, .result = result, .error = error};
 
 	std_landing(&frame, txn_fold_redo_body, txn_fold_redo_pad);
 	txn_fold_redo_pad(&frame);
+	return frame.ok;
+}
+
+/*
+ * txn_fold_folded_given folds a key as folded_key does over a base entry its
+ * caller read already, or none, and never seeks a base, so it needs no
+ * order: the digest's fold (bugs row 404).
+ */
+static bool
+txn_fold_folded_given(HostIoIo *io, TreesStoreNodeStore store, const TxnFoldBased *given, bool keyless, bool index,
+					  TxnVisibleRule rule, const uint8 *key, size_t key_len, TxnMemtableVersionVersion *versions,
+					  size_t versions_len, bool *has_result, TxnFoldKeyFold *result, uint64 *max_ended,
+					  StdVec *gone, HostError *error)
+{
+	txn_fold_folded_key_frame_t frame = {.io = io, .store = store, .given = given, .keyless = keyless,
+		.index = index, .rule = rule, .key = key, .key_len = key_len, .versions = versions,
+		.versions_len = versions_len, .has_result = has_result, .result = result, .result_ended = max_ended,
+	.gone = gone, .error = error};
+
+	std_landing(&frame, txn_fold_folded_key_body, txn_fold_folded_key_pad);
+	txn_fold_folded_key_pad(&frame);
+	return frame.ok;
+}
+
+/* TXN_FOLD_DIGEST_IDENTITY is the storage the digest hashes the identity tree's entries under, which no storage is. */
+#define TXN_FOLD_DIGEST_IDENTITY PG_UINT32_MAX
+
+/* txn_fold_digest_added adds a hash to a sum, both 256-bit numbers in little-endian bytes, modulo 2^256. */
+static void
+txn_fold_digest_added(uint8 *sum, const uint8 *hash)
+{
+	unsigned	carry = 0;
+
+	for (int k = 0; k < TXN_FOLD_DIGEST_LEN; k++)
+	{
+		carry += (unsigned) sum[k] + hash[k];
+		sum[k] = (uint8) carry;
+		carry >>= 8;
+	}
+}
+
+/* txn_fold_digest_part adds a part's length, eight bytes little-endian, and then its bytes to a hasher. */
+static void
+txn_fold_digest_part(blake3_hasher *hasher, const void *bytes, size_t len)
+{
+	uint8		framed[8];
+
+	std_u64_to_le_bytes((uint64) len, framed);
+	blake3_hasher_update(hasher, framed, sizeof(framed));
+	blake3_hasher_update(hasher, bytes, len);
+}
+
+/*
+ * txn_fold_digest_entry adds an entry's hash to a sum: BLAKE3 over its
+ * storage, its key, its value, its stamps, its value ids, and the offsets of
+ * the addresses its value holds, each part framed by its length, and never
+ * the addresses' locators, which are positions in one server's packs.
+ */
+static void
+txn_fold_digest_entry(uint8 *sum, uint32 tablespace, uint32 relation, StdBytes key, StdBytes value,
+					  const StdVec *stamps, const StdVec *ids, const StdVec *addresses)
+{
+	blake3_hasher hasher;
+	uint8		storage[8];
+	uint8		word[8];
+	uint8		hash[TXN_FOLD_DIGEST_LEN];
+
+	blake3_hasher_init(&hasher);
+	std_u32_to_be_bytes(tablespace, storage);
+	std_u32_to_be_bytes(relation, storage + 4);
+	blake3_hasher_update(&hasher, storage, sizeof(storage));
+	txn_fold_digest_part(&hasher, key.ptr, key.len);
+	txn_fold_digest_part(&hasher, value.ptr, value.len);
+	std_u64_to_le_bytes((uint64) stamps->len, word);
+	blake3_hasher_update(&hasher, word, sizeof(word));
+	for (size_t k = 0; k < stamps->len; k++)
+	{
+		const ChunksTrailerStamp *stamp = &STD_VEC_AT(stamps, ChunksTrailerStamp, k);
+
+		std_u64_to_le_bytes(stamp->txn, word);
+		blake3_hasher_update(&hasher, word, sizeof(word));
+		std_u64_to_le_bytes(stamp->tuple, word);
+		blake3_hasher_update(&hasher, word, sizeof(word));
+	}
+	std_u64_to_le_bytes((uint64) ids->len, word);
+	blake3_hasher_update(&hasher, word, sizeof(word));
+	for (size_t k = 0; k < ids->len; k++)
+	{
+		std_u32_to_le_bytes(STD_VEC_AT(ids, uint32, k), word);
+		blake3_hasher_update(&hasher, word, 4);
+	}
+	std_u64_to_le_bytes((uint64) addresses->len, word);
+	blake3_hasher_update(&hasher, word, sizeof(word));
+	for (size_t k = 0; k < addresses->len; k++)
+	{
+		std_u32_to_le_bytes(STD_VEC_AT(addresses, chunks_TupleU32Locator_t, k).f0, word);
+		blake3_hasher_update(&hasher, word, 4);
+	}
+	blake3_hasher_finalize(&hasher, hash, sizeof(hash));
+	txn_fold_digest_added(sum, hash);
+}
+
+/*
+ * txn_fold_digest_storage_t is a storage the digest folds: its own
+ * tablespace and relation, its base, and its state's place among the
+ * database's states, when it has one.
+ */
+typedef struct txn_fold_digest_storage_t
+{
+	uint32		tablespace;
+	uint32		relation;
+	bool		has_base;
+	TxnBaseBase base;
+	bool		has_state;
+	size_t		state;
+} txn_fold_digest_storage_t;
+
+/* txn_fold_digest_storage_order orders the digest's storages by tablespace and then relation, for qsort. */
+static int
+txn_fold_digest_storage_order(const void *a, const void *b)
+{
+	const txn_fold_digest_storage_t *x = a;
+	const txn_fold_digest_storage_t *y = b;
+
+	if (x->tablespace != y->tablespace)
+		return x->tablespace < y->tablespace ? -1 : 1;
+	return x->relation < y->relation ? -1 : x->relation > y->relation;
+}
+
+/*
+ * txn_fold_digest_frame_t is digest's state across its pad: its arguments,
+ * the storages, the states, a storage's delta keys and the base entries
+ * stashed for them, a step's hold and key, a key's fold, and a walk's
+ * cursor, while live.
+ */
+typedef struct txn_fold_digest_frame_t
+{
+	HostIoIo   *io;
+	const RepoRepo *repo;
+	const HostSharedReader *reading;
+	uint32		database;
+	const StdVec *given;
+	StdVec	   *kinds;
+	uint8	   *result;
+	bool	   *disagreed;
+	TxnFoldDigested *at;
+	HostError  *error;
+	bool		ok;
+	TreesStoreReader reader;
+	StdArcInner *manifest;
+	bool		manifest_live;
+	/* storages is a Vec<digest_storage_t>. */
+	StdVec		storages;
+	/* states is a Vec<(u64, Held<State>)>. */
+	StdVec		states;
+	bool		states_live;
+	/* keys is a Vec<Vec<u8>> of a storage's delta keys, in byte order. */
+	StdVec		keys;
+
+	/*
+	 * stashed is a Vec<Based> of their base entries, an empty value for none,
+	 * with has_stashed's flags.
+	 */
+	StdVec		stashed;
+	StdVec		has_stashed;
+	HostDeltaHold hold;
+	bool		hold_live;
+	txn_TupleVecU8VecVersion_t next;
+	bool		next_live;
+	bool		has_after;
+	StdVec		after;
+	TxnFoldKeyFold fold;
+	bool		fold_live;
+
+	/*
+	 * walking is the storage whose base the pin scope walks, and walked the
+	 * sum it adds to.
+	 */
+	const txn_fold_digest_storage_t *walking;
+	uint8	   *walked;
+	TreesCursorCursor cursor;
+	bool		cursor_live;
+} txn_fold_digest_frame_t;
+
+/* txn_fold_digest_Based_drop frees a stashed base entry's parts. */
+static void
+txn_fold_digest_Based_drop(TxnFoldBased *based)
+{
+	std_vec_free_Checked(&based->stored, TXN_FOLD_STAMP);
+	std_vec_free_Checked(&based->ids, TXN_FOLD_U32);
+	std_vec_free_Checked(&based->addresses, TXN_FOLD_ADDRESS);
+	std_vec_free_Checked(&based->value, TXN_FOLD_BYTES);
+}
+
+/* txn_fold_digest_keys_drop frees a storage's delta keys and the base entries stashed for them. */
+static void
+txn_fold_digest_keys_drop(txn_fold_digest_frame_t *frame)
+{
+	for (size_t k = 0; k < frame->keys.len; k++)
+		std_vec_free_Checked(&STD_VEC_AT(&frame->keys, StdVec, k), TXN_FOLD_BYTES);
+	frame->keys.len = 0;
+	for (size_t k = 0; k < frame->stashed.len; k++)
+		if (STD_VEC_AT(&frame->has_stashed, bool, k))
+			txn_fold_digest_Based_drop(&STD_VEC_AT(&frame->stashed, TxnFoldBased, k));
+	frame->stashed.len = 0;
+	frame->has_stashed.len = 0;
+}
+
+/* txn_fold_digest_step_drop frees a walk's step: its key's versions, its hold, its fold, and its cursor, while live. */
+static void
+txn_fold_digest_step_drop(txn_fold_digest_frame_t *frame)
+{
+	if (frame->fold_live)
+	{
+		frame->fold_live = false;
+		txn_fold_KeyFold_drop(&frame->fold);
+	}
+	if (frame->next_live)
+	{
+		frame->next_live = false;
+		txn_memtable_version_versions_drop(&frame->next.f1, 0);
+		std_vec_free_Checked(&frame->next.f0, TXN_FOLD_BYTES);
+	}
+	if (frame->hold_live)
+	{
+		frame->hold_live = false;
+		host_delta_Hold_drop(&frame->hold);
+	}
+	if (frame->cursor_live)
+	{
+		frame->cursor_live = false;
+		trees_cursor_Cursor_drop(&frame->cursor);
+	}
+}
+
+/* txn_fold_digest_pad is digest's pad: a step, the keys, the walk's place, the storages' bases, the states, and the manifest. */
+static void
+txn_fold_digest_pad(void *frame_)
+{
+	txn_fold_digest_frame_t *frame = frame_;
+
+	txn_fold_digest_step_drop(frame);
+	txn_fold_digest_keys_drop(frame);
+	if (frame->has_after)
+	{
+		frame->has_after = false;
+		std_vec_free_Checked(&frame->after, TXN_FOLD_BYTES);
+	}
+	for (size_t k = 0; k < frame->storages.len; k++)
+		if (STD_VEC_AT(&frame->storages, txn_fold_digest_storage_t, k).has_base)
+			txn_base_Base_drop(&STD_VEC_AT(&frame->storages, txn_fold_digest_storage_t, k).base);
+	frame->storages.len = 0;
+	if (frame->states_live)
+	{
+		frame->states_live = false;
+		txn_state_states_free(&frame->states);
+	}
+	if (frame->manifest_live)
+	{
+		frame->manifest_live = false;
+		repo_ArcManifest_drop(frame->manifest);
+	}
+}
+
+/*
+ * txn_fold_digest_bases_closure_0 is the digest's walk of the manifest's
+ * base tree: each storage's base record, decoded.
+ */
+static bool
+txn_fold_digest_bases_closure_0(void *captures, HostIoIo *io, TreesPinPin *pin, ChunksErrorError *error)
+{
+	txn_fold_digest_frame_t *frame = captures;
+	TreesStoreTree bases = trees_published_Published_base(&repo_Repo_newest(frame->manifest)->bases);
+	StdVec		addresses;
+	HostError	host;
+
+	if (!trees_cursor_Cursor_first(io, pin, TREES_STORE_TREE_NAMED(&bases), &frame->cursor, error))
+		return false;
+	frame->cursor_live = true;
+	while (trees_cursor_Cursor_is_valid(&frame->cursor))
+	{
+		StdBytes	key = trees_cursor_Cursor_key(&frame->cursor);
+		StdBytes	value = trees_cursor_Cursor_value(&frame->cursor);
+		TreesNodeNode node = trees_cursor_Cursor_node(&frame->cursor);
+		txn_fold_digest_storage_t storage = {.has_base = true};
+		bool		decoded;
+
+		if (key.len != 8)
+		{
+			StdString	message;
+
+			std_string_from_Checked(&message, "a base tree's key isn't a storage's", 35);
+			*error = chunks_error_Error_corrupt(&message);
+			return false;
+		}
+		storage.tablespace = std_u32_from_be_bytes(key.ptr);
+		storage.relation = std_u32_from_be_bytes(key.ptr + 4);
+		trees_node_Node_value_addresses(&node, trees_cursor_Cursor_index(&frame->cursor), &addresses);
+		decoded = txn_base_Base_decode(value.ptr, value.len, addresses.ptr, addresses.len, &storage.base, &host);
+		std_vec_free_Checked(&addresses, TXN_FOLD_ADDRESS);
+		if (!decoded)
+		{
+			*error = chunks_error_Error_FromError_from(&host);
+			return false;
+		}
+		std_vec_push_Checked(&frame->storages, &storage, sizeof(storage), _Alignof(txn_fold_digest_storage_t));
+		if (!trees_cursor_Cursor_next(&frame->cursor, io, pin, error))
+			return false;
+	}
+	frame->cursor_live = false;
+	trees_cursor_Cursor_drop(&frame->cursor);
+	return true;
+}
+
+/* txn_fold_digest_key_at finds a key among the storage's delta keys, answering its place or the keys' count. */
+static size_t
+txn_fold_digest_key_at(const StdVec *keys, StdBytes key)
+{
+	size_t		low = 0;
+	size_t		high = keys->len;
+
+	while (low < high)
+	{
+		size_t		middle = low + (high - low) / 2;
+		const StdVec *at = &STD_VEC_AT(keys, StdVec, middle);
+		StdOrdering order = std_bytes_Ord_cmp(at->ptr, at->len, key.ptr, key.len);
+
+		if (order == STD_ORDERING_EQUAL)
+			return middle;
+		if (order == STD_ORDERING_LESS)
+			low = middle + 1;
+		else
+			high = middle;
+	}
+	return keys->len;
+}
+
+/*
+ * txn_fold_digest_base_closure_0 is the digest's walk of a storage's base,
+ * or of the identity tree: each entry whose key the storage's delta holds is
+ * stashed for its fold, and every other one's hash added as it stands.
+ */
+static bool
+txn_fold_digest_base_closure_0(void *captures, HostIoIo *io, TreesPinPin *pin, ChunksErrorError *error)
+{
+	txn_fold_digest_frame_t *frame = captures;
+	const txn_fold_digest_storage_t *storage = frame->walking;
+	TreesStoreTree root;
+
+	if (storage == NULL)
+		root = trees_published_Published_base(&repo_Repo_newest(frame->manifest)->identity);
+	else
+		root = storage->base.root;
+	if (!trees_cursor_Cursor_first(io, pin, TREES_STORE_TREE_NAMED(&root), &frame->cursor, error))
+		return false;
+	frame->cursor_live = true;
+	while (trees_cursor_Cursor_is_valid(&frame->cursor))
+	{
+		StdBytes	key = trees_cursor_Cursor_key(&frame->cursor);
+		size_t		at = txn_fold_digest_key_at(&frame->keys, key);
+		TreesNodeNode node = trees_cursor_Cursor_node(&frame->cursor);
+		TxnFoldBased based;
+		bool		read;
+
+		txn_fold_bytes(trees_cursor_Cursor_value(&frame->cursor).ptr, trees_cursor_Cursor_value(&frame->cursor).len,
+					   &based.value);
+		trees_node_Node_value_addresses(&node, trees_cursor_Cursor_index(&frame->cursor), &based.addresses);
+		std_vec_new(&based.ids, TXN_FOLD_U32);
+		std_vec_new(&based.stored, TXN_FOLD_STAMP);
+		read = storage == NULL ||
+			(trees_cursor_Cursor_values(&frame->cursor, io, pin, &based.ids, error) &&
+			 trees_cursor_Cursor_stamps(&frame->cursor, io, pin, &based.stored, error));
+		if (read && at < frame->keys.len)
+		{
+			STD_VEC_AT(&frame->stashed, TxnFoldBased, at) = based;
+			STD_VEC_AT(&frame->has_stashed, bool, at) = true;
+		}
+		else
+		{
+			StdBytes	value = {based.value.ptr, based.value.len};
+
+			if (read)
+				txn_fold_digest_entry(frame->walked, storage == NULL ? TXN_FOLD_DIGEST_IDENTITY : storage->tablespace,
+									  storage == NULL ? TXN_FOLD_DIGEST_IDENTITY : storage->relation, key, value,
+									  &based.stored, &based.ids, &based.addresses);
+			txn_fold_digest_Based_drop(&based);
+		}
+		if (!read || !trees_cursor_Cursor_next(&frame->cursor, io, pin, error))
+			return false;
+	}
+	frame->cursor_live = false;
+	trees_cursor_Cursor_drop(&frame->cursor);
+	return true;
+}
+
+/* txn_fold_digest_next reads the state's next delta key past the walk's place, with its versions, under a hold. */
+static bool
+txn_fold_digest_next(txn_fold_digest_frame_t *frame, HostSharedRecord record, bool *some)
+{
+	if (!host_delta_hold(frame->io, &frame->hold, frame->error))
+		return false;
+	frame->hold_live = true;
+	if (!txn_visible_next(frame->io, &frame->hold, record, frame->has_after, frame->after.ptr, frame->after.len,
+						  TXN_MEMTABLE_TABLE_DIRECTION_FORWARD, frame->walking->base.folded, some, &frame->next,
+						  frame->error))
+		return false;
+	frame->next_live = *some;
+	return true;
+}
+
+/* txn_fold_digest_passed makes the step's key the walk's place and frees the step. */
+static void
+txn_fold_digest_passed(txn_fold_digest_frame_t *frame)
+{
+	if (frame->has_after)
+		std_vec_free_Checked(&frame->after, TXN_FOLD_BYTES);
+	frame->after = frame->next.f0;
+	frame->has_after = true;
+	frame->next.f0 = (StdVec) STD_VEC_NEW;
+	txn_fold_digest_step_drop(frame);
+}
+
+/*
+ * txn_fold_digest_storage adds a storage's hashes to the digest: with no
+ * state, every base entry's as it stands; with one, the delta's keys are
+ * gathered, the base entries they hold stashed and every other one's hash
+ * added, and each key's fold of its committed versions over its stashed
+ * entry, at every point (Folding at the end of WAL), added as its put, or
+ * its stashed entry where the fold keeps it, and nothing where it deletes it;
+ * a fold the walk saw an install pass repeats the storage over its new base.
+ */
+static bool
+txn_fold_digest_storage(txn_fold_digest_frame_t *frame, txn_fold_digest_storage_t *storage, bool keyless)
+{
+	TreesStoreNodeStore store = TREES_STORE_READER_NODE_STORE(&frame->reader);
+	TxnFoldFolding folding = {PG_UINT64_MAX};
+	TxnVisibleRule rule = {&TXN_FOLD_FOLDING_RULE_OPS, &folding};
+	uint8		sum[TXN_FOLD_DIGEST_LEN];
+	TxnFoldBased none = {0};
+	bool		unstashed = false;
+	ChunksErrorError failed;
+
+	for (;;)
+	{
+		HostSharedRecord record = {0};
+		uint64		generation = 0;
+		bool		some;
+
+		memset(sum, 0, sizeof(sum));
+		frame->walking = storage;
+		frame->walked = sum;
+		if (storage->has_state)
+		{
+			record = host_shared_Held_record(&STD_VEC_AT(&frame->states, txn_TupleU64HeldState_t, storage->state).f1);
+			generation = txn_state_generation(record);
+			if (storage->has_base)
+			{
+				storage->has_base = false;
+				txn_base_Base_drop(&storage->base);
+			}
+			if (!txn_state_base_record(frame->io,
+									   &STD_VEC_AT(&frame->states, txn_TupleU64HeldState_t, storage->state).f1,
+									   &storage->has_base, &storage->base, frame->error))
+				return false;
+			for (;;)
+			{
+				StdVec		key;
+
+				if (!txn_fold_digest_next(frame, record, &some))
+					return false;
+				if (!some)
+					break;
+				std_vec_clone(&key, &frame->next.f0, TXN_FOLD_BYTES);
+				std_vec_push_Checked(&frame->keys, &key, sizeof(StdVec), _Alignof(StdVec));
+				txn_fold_digest_passed(frame);
+			}
+			txn_fold_digest_step_drop(frame);
+			if (frame->has_after)
+			{
+				frame->has_after = false;
+				std_vec_free_Checked(&frame->after, TXN_FOLD_BYTES);
+			}
+		}
+		std_vec_resize(&frame->stashed, frame->keys.len, &none, sizeof(TxnFoldBased), _Alignof(TxnFoldBased));
+		std_vec_resize(&frame->has_stashed, frame->keys.len, &unstashed, sizeof(bool), _Alignof(bool));
+		if (storage->has_base && storage->base.has_root &&
+			!trees_pin_pin_ResultUnit(frame->io, store, txn_fold_digest_base_closure_0, frame, NULL, &failed))
+		{
+			*frame->error = txn_base_storage(&failed);
+			return false;
+		}
+		for (size_t k = 0; storage->has_state; k++)
+		{
+			bool		has_fold;
+			uint64		ended;
+			StdVec		gone;
+			const TxnFoldBased *based;
+
+			if (!txn_fold_digest_next(frame, record, &some))
+				return false;
+			if (!some)
+				break;
+			based = k < frame->keys.len && STD_VEC_AT(&frame->has_stashed, bool, k) ?
+				&STD_VEC_AT(&frame->stashed, TxnFoldBased, k) : NULL;
+			if (!txn_fold_folded_given(frame->io, store, based, keyless, storage->base.has_index, rule,
+									   frame->next.f0.ptr, frame->next.f0.len, frame->next.f1.ptr, frame->next.f1.len,
+									   &has_fold, &frame->fold, &ended, &gone, frame->error))
+				return false;
+			std_vec_drop_Checked(&gone, TXN_FOLD_PENDING_ROW, txn_fold_PendingRow_drop);
+			frame->fold_live = has_fold;
+			if (has_fold && frame->fold.edit.tag == TREES_MUTATE_EDIT_PUT)
+			{
+				const TreesBuildEntry *put = &frame->fold.edit.u.put;
+				StdBytes	key = {put->key.ptr, put->key.len};
+				StdBytes	value = {put->value.ptr, put->value.len};
+
+				txn_fold_digest_entry(sum, storage->tablespace, storage->relation, key, value, &put->stamps,
+									  &put->values, &put->addresses);
+			}
+			else if (!has_fold && based != NULL)
+			{
+				StdBytes	key = {frame->next.f0.ptr, frame->next.f0.len};
+				StdBytes	value = {based->value.ptr, based->value.len};
+
+				txn_fold_digest_entry(sum, storage->tablespace, storage->relation, key, value, &based->stored,
+									  &based->ids, &based->addresses);
+			}
+			txn_fold_digest_passed(frame);
+		}
+		txn_fold_digest_step_drop(frame);
+		if (frame->has_after)
+		{
+			frame->has_after = false;
+			std_vec_free_Checked(&frame->after, TXN_FOLD_BYTES);
+		}
+		txn_fold_digest_keys_drop(frame);
+		if (!storage->has_state || !txn_state_moved_past(record, generation))
+			break;
+	}
+	txn_fold_digest_added(frame->result, sum);
+	return true;
+}
+
+/*
+ * txn_fold_digest_kind returns what a storage's known key says it is: a
+ * table's storage keyed by its columns or keyless, and an index's storage, or
+ * a key no backend recorded yet, unknown, which the digest folds keyed.
+ */
+static TxnFoldDigestKind
+txn_fold_digest_kind(const txn_fold_digest_storage_t *storage)
+{
+	if (!storage->has_base || storage->base.has_index)
+		return TXN_FOLD_DIGEST_UNKNOWN;
+	switch (storage->base.key.tag)
+	{
+		case TXN_BASE_KEY_COLUMNS:
+			return TXN_FOLD_DIGEST_KEYED;
+		case TXN_BASE_KEY_NONE:
+			return TXN_FOLD_DIGEST_KEYLESS;
+		default:
+			return TXN_FOLD_DIGEST_UNKNOWN;
+	}
+}
+
+/*
+ * txn_fold_digest_given finds a storage in a primary's list of the storages
+ * it digested, in order, or NULL for one the primary's digest held nothing of.
+ */
+static const TxnFoldDigested *
+txn_fold_digest_given(const StdVec *given, const TxnFoldDigested *storage)
+{
+	size_t		low = 0;
+	size_t		high = given->len;
+
+	while (low < high)
+	{
+		size_t		middle = low + (high - low) / 2;
+		const TxnFoldDigested *at = &STD_VEC_AT(given, TxnFoldDigested, middle);
+
+		if (at->tablespace == storage->tablespace && at->relation == storage->relation)
+			return at;
+		if (at->tablespace < storage->tablespace ||
+			(at->tablespace == storage->tablespace && at->relation < storage->relation))
+			low = middle + 1;
+		else
+			high = middle;
+	}
+	return NULL;
+}
+
+/* txn_fold_digest_body is digest's body. */
+static void
+txn_fold_digest_body(void *frame_)
+{
+	txn_fold_digest_frame_t *frame = frame_;
+	const RepoManifest *newest;
+	ChunksErrorError failed;
+
+	*frame->disagreed = false;
+	memset(frame->result, 0, TXN_FOLD_DIGEST_LEN);
+	if (!repo_Repo_manifest(frame->repo, frame->io, &frame->manifest, &failed))
+	{
+		*frame->error = txn_base_storage(&failed);
+		return;
+	}
+	frame->manifest_live = true;
+	newest = repo_Repo_newest(frame->manifest);
+	if (newest->has_bases &&
+		!trees_pin_pin_ResultUnit(frame->io, TREES_STORE_READER_NODE_STORE(&frame->reader),
+								  txn_fold_digest_bases_closure_0, frame, NULL, &failed))
+	{
+		*frame->error = txn_base_storage(&failed);
+		return;
+	}
+	if (!txn_state_states(frame->io, frame->database, &frame->states, frame->error))
+		return;
+	frame->states_live = true;
+	for (size_t k = 0; k < frame->states.len; k++)
+	{
+		HostSharedRecord record = host_shared_Held_record(&STD_VEC_AT(&frame->states, txn_TupleU64HeldState_t, k).f1);
+		HostStorage described;
+		TxnStatePersistence persistence;
+		size_t		at;
+
+		if (!txn_state_described(record, &described, &persistence))
+			continue;
+		for (at = 0; at < frame->storages.len; at++)
+			if (STD_VEC_AT(&frame->storages, txn_fold_digest_storage_t, at).tablespace == described.tablespace &&
+				STD_VEC_AT(&frame->storages, txn_fold_digest_storage_t, at).relation == described.relation)
+				break;
+		if (at == frame->storages.len)
+		{
+			txn_fold_digest_storage_t storage = {.tablespace = described.tablespace,
+			.relation = described.relation};
+
+			std_vec_push_Checked(&frame->storages, &storage, sizeof(storage), _Alignof(txn_fold_digest_storage_t));
+		}
+		STD_VEC_AT(&frame->storages, txn_fold_digest_storage_t, at).has_state = true;
+		STD_VEC_AT(&frame->storages, txn_fold_digest_storage_t, at).state = k;
+	}
+	if (frame->storages.len > 1)
+		qsort(frame->storages.ptr, frame->storages.len, sizeof(txn_fold_digest_storage_t),
+			  txn_fold_digest_storage_order);
+	for (size_t k = 0; k < frame->storages.len; k++)
+	{
+		txn_fold_digest_storage_t *storage = &STD_VEC_AT(&frame->storages, txn_fold_digest_storage_t, k);
+		TxnFoldDigested kind = {.tablespace = storage->tablespace, .relation = storage->relation,
+		.kind = txn_fold_digest_kind(storage)};
+		const TxnFoldDigested *given = frame->given != NULL ? txn_fold_digest_given(frame->given, &kind) : NULL;
+
+		if (given != NULL)
+		{
+			if (given->kind != TXN_FOLD_DIGEST_UNKNOWN && kind.kind != TXN_FOLD_DIGEST_UNKNOWN &&
+				given->kind != kind.kind)
+			{
+				*frame->disagreed = true;
+				*frame->at = kind;
+				frame->ok = true;
+				return;
+			}
+			kind.kind = given->kind;
+		}
+		std_vec_push_Checked(frame->kinds, &kind, sizeof(kind), _Alignof(TxnFoldDigested));
+		if (!txn_fold_digest_storage(frame, storage, kind.kind == TXN_FOLD_DIGEST_KEYLESS))
+			return;
+	}
+	if (newest->has_identity)
+	{
+		ChunksErrorError walked;
+
+		frame->walking = NULL;
+		frame->walked = frame->result;
+		if (!trees_pin_pin_ResultUnit(frame->io, TREES_STORE_READER_NODE_STORE(&frame->reader),
+									  txn_fold_digest_base_closure_0, frame, NULL, &walked))
+		{
+			*frame->error = txn_base_storage(&walked);
+			return;
+		}
+	}
+	frame->ok = true;
+}
+
+/*
+ * txn_fold_digest returns a repository's digest, a sum modulo 2^256 of one
+ * hash for each entry of its storages' rows and index entries and of its
+ * identity tree, after a save folded the identity tree's versions: the
+ * entries as a fold of every committed version over each storage's base
+ * would make them, with each delta key folded over the base entry of the
+ * same bytes, so the digest is the same for the same content however much of
+ * it either server folded (bugs row 404). It lists each storage, in order,
+ * with what its known key says of it; given a primary's list, it folds each
+ * storage the list holds with the primary's kind, any other one, which the
+ * primary's digest held nothing of, with its own, and answers through
+ * disagreed, with the storage, a known kind the primary's known kind
+ * contradicts.
+ */
+bool
+txn_fold_digest(HostIoIo *io, const RepoRepo *repo, const HostSharedReader *reading, uint32 database,
+				const StdVec *given, StdVec *kinds, uint8 *result, bool *disagreed, TxnFoldDigested *at,
+				HostError *error)
+{
+	txn_fold_digest_frame_t frame = {.io = io, .repo = repo, .reading = reading, .database = database,
+		.given = given, .kinds = kinds, .result = result, .disagreed = disagreed, .at = at, .error = error,
+	.reader = repo_Repo_reader(repo, HOST_CACHE_PLACEMENT_SERVER, reading)};
+
+	std_vec_new(&frame.storages, sizeof(txn_fold_digest_storage_t), _Alignof(txn_fold_digest_storage_t));
+	std_vec_new(&frame.keys, sizeof(StdVec), _Alignof(StdVec));
+	std_vec_new(&frame.stashed, sizeof(TxnFoldBased), _Alignof(TxnFoldBased));
+	std_vec_new(&frame.has_stashed, sizeof(bool), _Alignof(bool));
+	std_landing(&frame, txn_fold_digest_body, txn_fold_digest_pad);
+	txn_fold_digest_pad(&frame);
+	std_vec_free_Checked(&frame.has_stashed, sizeof(bool), _Alignof(bool));
+	std_vec_free_Checked(&frame.stashed, sizeof(TxnFoldBased), _Alignof(TxnFoldBased));
+	std_vec_free_Checked(&frame.keys, sizeof(StdVec), _Alignof(StdVec));
+	std_vec_free_Checked(&frame.storages, sizeof(txn_fold_digest_storage_t), _Alignof(txn_fold_digest_storage_t));
 	return frame.ok;
 }

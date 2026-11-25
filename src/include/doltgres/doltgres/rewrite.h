@@ -195,16 +195,6 @@ typedef struct DoltgresRewriteRewritten
 	TxnRewritePacked packed;
 } DoltgresRewriteRewritten;
 
-/*
- * DoltgresRewriteCarry is Carry: a version the new storage carries, its row
- * change, the command it showed, and its row lock.
- */
-typedef struct DoltgresRewriteCarry
-{
-	TxnRecordRowChange f0;
-	TxnMemtableVersionShown f1;
-	TxnMemtableLockMode f2;
-} DoltgresRewriteCarry;
 extern void doltgres_rewrite_Read_drop(DoltgresRewriteRead *self);
 extern bool doltgres_rewrite_read(HostIoIo *io, TreesStoreNodeStore store, const HostSharedHeld *held,
 								  TxnBaseBase *base, uint64 horizon, DoltgresRewriteRead *result, HostError *error);

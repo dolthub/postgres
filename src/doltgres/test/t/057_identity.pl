@@ -387,4 +387,41 @@ ok($new_toast ne $old_toast && id('postgres', 2, $new_toast) eq $added && id('po
 	"a rewrite moves the table's TOAST pair to its new TOAST relation");
 
 $node->stop;
+
+# Bugs row 338: a DROP TABLE of a table whose row type grew by 200 columns
+# removes its 404 identity entries in groups the budget can give, at 8MB and
+# at 1MB, where one prepare asked more pages than the whole budget holds and
+# waited forever.
+foreach my $memory ('8MB', '1MB')
+{
+	my $grown = PostgreSQL::Test::Cluster->new("grown_$memory");
+	$grown->init;
+	$grown->append_conf('postgresql.conf', "delta_memory = $memory");
+	$grown->start;
+	$grown->safe_psql(
+		'postgres', q{
+CREATE TABLE compositetable_type (a int);
+CREATE TABLE compositetable_holder (id int, c compositetable_type);
+INSERT INTO compositetable_holder VALUES (1, ROW(1)::compositetable_type);
+DO $$
+BEGIN
+  FOR i IN 1..200 LOOP
+    EXECUTE format('ALTER TABLE compositetable_type ADD COLUMN x%s bigint', i);
+  END LOOP;
+END $$;
+DROP TABLE compositetable_holder;
+});
+	my ($code, $out, $err) = $grown->psql(
+		'postgres', q{
+SET statement_timeout = '120s';
+DROP TABLE compositetable_type;
+SELECT count(*) FROM pg_class WHERE relname = 'compositetable_type';
+});
+	is( $err . $out,
+		'0',
+		"a DROP TABLE of a table grown by 200 columns finishes at delta_memory $memory"
+	);
+	$grown->stop;
+}
+
 done_testing();

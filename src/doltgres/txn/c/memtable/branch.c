@@ -43,6 +43,7 @@
 #include "doltgres/txn/memtable/range.h"
 #include "doltgres/txn/memtable/table.h"
 #include "doltgres/txn/memtable/version.h"
+#include "doltgres/txn/spill.h"
 #include "doltgres/txn/state.h"
 
 #define RUST_FILE "txn" STD_SEP "src" STD_SEP "memtable" STD_SEP "branch.rs"
@@ -50,9 +51,8 @@
 /* TXN_MEMTABLE_BRANCH_HEAD is HEAD, the length of a built node's first piece's head: its writer's full xid and its value's length. */
 #define TXN_MEMTABLE_BRANCH_HEAD 12
 
-/* The delta's atomics only this file reads: its repository, its identity memtable's word, and its own tablespace. */
+/* The delta's atomics only this file reads: its repository and its own tablespace. */
 #define TXN_MEMTABLE_BRANCH_REPOSITORY 0
-#define TXN_MEMTABLE_BRANCH_IDENTITY_WORD 2
 #define TXN_MEMTABLE_BRANCH_OWN 6
 
 /* txn_memtable_branch_internal returns an internal error of a working state's delta. */
@@ -313,14 +313,14 @@ txn_memtable_branch_node_pad_0(void *frame_)
 	}
 }
 
-/* txn_memtable_branch_node_get reads the piece of a number of the frame's node into a Vec, answering whether the delta holds it. */
+/* txn_memtable_branch_node_get reads the piece of a number of the frame's node into a Vec, answering whether the delta or the chunk spills hold it. */
 static bool
 txn_memtable_branch_node_get(txn_memtable_branch_node_frame_0_t *frame, uint16 piece, bool *some, StdVec *result)
 {
 	uint8		key[TXN_MEMTABLE_BRANCH_PIECE_KEY];
 
 	txn_memtable_branch_piece_key(frame->key, piece, key);
-	return txn_memtable_branch_get(frame->io, frame->deltas, key, sizeof(key), some, result, frame->error);
+	return txn_spill_chunk(frame->io, frame->deltas, key, sizeof(key), some, result, frame->error);
 }
 
 /* txn_memtable_branch_node_missing returns the corruption error of a built node's missing piece of a number. */
@@ -420,10 +420,10 @@ txn_memtable_branch_node_body_0(void *frame_)
 }
 
 /*
- * txn_memtable_branch_node returns a built base's node the delta holds under
- * its key, gathered from its pieces: its writer's full xid and its value,
- * the node's bytes and the trailer of its stamps, or nothing when the delta
- * holds no first piece. A missing, short, or extra piece is data
+ * txn_memtable_branch_node returns a built base's node the delta or the chunk
+ * spills hold under its key, gathered from its pieces: its writer's full xid
+ * and its value, the node's bytes and the trailer of its stamps, or nothing
+ * when they hold no first piece. A missing, short, or extra piece is data
  * corruption, so that a lost piece never reads as a shorter node.
  */
 bool
@@ -454,7 +454,7 @@ txn_memtable_branch_node_taken(HostIoIo *io, HostSharedRecord deltas, const uint
 		bool		some;
 
 		txn_memtable_branch_piece_key(key, piece, piece_key);
-		if (!txn_memtable_branch_get(io, deltas, piece_key, sizeof(piece_key), &some, &part, error))
+		if (!txn_spill_chunk(io, deltas, piece_key, sizeof(piece_key), &some, &part, error))
 			return false;
 		if (!some)
 			return true;
@@ -481,6 +481,97 @@ uint32
 txn_memtable_branch_own(HostSharedRecord record)
 {
 	return (uint32) txn_memtable_branch_load(record, TXN_MEMTABLE_BRANCH_OWN);
+}
+
+/* txn_memtable_branch_rehomed_frame_0_t is rehomed's state across its pad: the working state's handle and its two spill homes' writers' guards, while live. */
+typedef struct txn_memtable_branch_rehomed_frame_0_t
+{
+	HostIoIo   *io;
+	uint32		repository;
+	uint32		from;
+	uint32		to;
+	HostError  *error;
+	bool		ok;
+	HostSharedHeld held;
+	bool		held_live;
+	HostSharedLongGuard chunks;
+	bool		chunks_live;
+	HostSharedLongGuard identity;
+	bool		identity_live;
+} txn_memtable_branch_rehomed_frame_0_t;
+
+/* txn_memtable_branch_rehomed_pad_0 is rehomed's pad: the guards, then the handle, while live. */
+static void
+txn_memtable_branch_rehomed_pad_0(void *frame_)
+{
+	txn_memtable_branch_rehomed_frame_0_t *frame = frame_;
+
+	if (frame->identity_live)
+	{
+		frame->identity_live = false;
+		host_shared_LongGuard_drop(&frame->identity);
+	}
+	if (frame->chunks_live)
+	{
+		frame->chunks_live = false;
+		host_shared_LongGuard_drop(&frame->chunks);
+	}
+	if (frame->held_live)
+	{
+		frame->held_live = false;
+		host_shared_Held_drop(&frame->held);
+	}
+}
+
+/* txn_memtable_branch_rehomed_body_0 is rehomed's body. */
+static void
+txn_memtable_branch_rehomed_body_0(void *frame_)
+{
+	txn_memtable_branch_rehomed_frame_0_t *frame = frame_;
+	HostSharedOp op = {.tag = HOST_SHARED_OP_EXCHANGE, .u.exchange = {frame->from, frame->to}};
+	HostSharedRecord record;
+	bool		some;
+
+	if (!txn_memtable_branch_find(HOST_SHARED_IO_WITHIN(frame->io), frame->repository, &some, &frame->held,
+								  frame->error))
+		return;
+	frame->held_live = some;
+	if (!some)
+	{
+		frame->ok = true;
+		return;
+	}
+	record = host_shared_Held_record(&frame->held);
+	if (!host_shared_Record_lock_long(record, HOST_IO_IO_TAKES_SHORT(frame->io),
+									  TXN_MEMTABLE_BRANCH_CHUNK_SPILLS_WRITING_INDEX, &frame->chunks, frame->error))
+		return;
+	frame->chunks_live = true;
+	if (!host_shared_Record_lock_long(record, HOST_IO_IO_TAKES_SHORT(frame->io),
+									  TXN_MEMTABLE_BRANCH_IDENTITY_SPILLS_WRITING_INDEX, &frame->identity,
+									  frame->error))
+		return;
+	frame->identity_live = true;
+	(void) host_shared_Record_atomic(record, TXN_MEMTABLE_BRANCH_OWN, op);
+	frame->ok = true;
+}
+
+/*
+ * txn_memtable_branch_rehomed stores the tablespace a repository moved to in
+ * place of the one it moved from as its working state's own, under its chunk
+ * and identity spills' writers' locks, at the move's finish, so that both
+ * find their spills where the repository stands (bugs row 441); a working
+ * state that isn't there, or that a finish before already moved, is left as
+ * it is.
+ */
+bool
+txn_memtable_branch_rehomed(HostIoIo *io, uint32 repository, uint32 from, uint32 to, HostError *error)
+{
+	txn_memtable_branch_rehomed_frame_0_t frame = {.io = io, .repository = repository, .from = from, .to = to,
+	.error = error};
+
+	std_landing(&frame, txn_memtable_branch_rehomed_body_0, txn_memtable_branch_rehomed_pad_0);
+	txn_memtable_branch_rehomed_pad_0(&frame);
+	return frame.ok;
 }
 
 /* txn_memtable_branch_repository returns the number of a working state's repository, or nothing when it names none. */
@@ -554,14 +645,16 @@ txn_memtable_branch_reclaim_pad_0(void *frame_)
 	}
 }
 
-/* txn_memtable_branch_named reports whether a delta's words name a memtable or its chunk spills' manifest lists or pends a file. */
+/* txn_memtable_branch_named reports whether a delta's words name a memtable or its chunk or identity spills' manifest lists or pends a file. */
 static bool
 txn_memtable_branch_named(HostSharedRecord record)
 {
 	return txn_memtable_branch_load(record, TXN_MEMTABLE_BRANCH_CHUNK_WORD_INDEX) != 0 ||
 		txn_memtable_branch_load(record, TXN_MEMTABLE_BRANCH_IDENTITY_WORD) != 0 ||
 		txn_memtable_branch_load(record, TXN_MEMTABLE_BRANCH_CHUNK_SPILLS_INDEX) != 0 ||
-		txn_memtable_branch_load(record, TXN_MEMTABLE_BRANCH_CHUNK_SPILLS_PENDING_INDEX) != 0;
+		txn_memtable_branch_load(record, TXN_MEMTABLE_BRANCH_CHUNK_SPILLS_PENDING_INDEX) != 0 ||
+		txn_memtable_branch_load(record, TXN_MEMTABLE_BRANCH_IDENTITY_SPILLS_INDEX) != 0 ||
+		txn_memtable_branch_load(record, TXN_MEMTABLE_BRANCH_IDENTITY_SPILLS_PENDING_INDEX) != 0;
 }
 
 /*
@@ -739,9 +832,9 @@ txn_memtable_branch_BranchDeltas_Pool_reclaim(HostIoIo *io, bool *result, HostEr
 	return frame.ok;
 }
 
-/* TXN_MEMTABLE_BRANCH_BRANCH_DELTAS_POOL_OPS is BranchDeltas' Shape and Pool: a working state's delta, two locks, and seven atomics. */
+/* TXN_MEMTABLE_BRANCH_BRANCH_DELTAS_POOL_OPS is BranchDeltas' Shape and Pool: a working state's delta, three locks, and twelve atomics. */
 const HostSharedPoolOps TXN_MEMTABLE_BRANCH_BRANCH_DELTAS_POOL_OPS = {
-	.shape = {.id = UINT64CONST(0x74786e000014), .locks = 2, .atomics = 7},
+	.shape = {.id = UINT64CONST(0x74786e000014), .locks = 3, .atomics = 12},
 	.name = {"working state's delta", 21},
 	.count = txn_memtable_branch_BranchDeltas_Pool_count,
 	.reclaim = txn_memtable_branch_BranchDeltas_Pool_reclaim,
@@ -948,7 +1041,9 @@ txn_memtable_branch_filled_body_0(void *frame_)
 		frame->held_live = true;
 		record = host_shared_Held_record(&frame->held);
 		named = txn_memtable_branch_load(record, TXN_MEMTABLE_BRANCH_CHUNK_WORD_INDEX) != 0 ||
-			txn_memtable_branch_load(record, TXN_MEMTABLE_BRANCH_IDENTITY_WORD) != 0;
+			txn_memtable_branch_load(record, TXN_MEMTABLE_BRANCH_IDENTITY_WORD) != 0 ||
+			txn_memtable_branch_load(record, TXN_MEMTABLE_BRANCH_IDENTITY_SPILLS_INDEX) != 0 ||
+			txn_memtable_branch_load(record, TXN_MEMTABLE_BRANCH_IDENTITY_SPILLS_PENDING_INDEX) != 0;
 		if (found->f1 != 0 && found->f1 <= PG_UINT32_MAX && named &&
 			txn_memtable_branch_load(record, TXN_MEMTABLE_BRANCH_REPOSITORY) == found->f1)
 		{
@@ -972,9 +1067,9 @@ txn_memtable_branch_filled_body_0(void *frame_)
 
 /*
  * txn_memtable_branch_filled returns each repository whose working state's
- * delta names a memtable, from a sweep of the pool, whose versions a
- * checkpoint saves in its runs whether or not a storage of the repository
- * has a state.
+ * delta names a memtable or an identity spill (bugs row 291), from a sweep
+ * of the pool, whose versions a checkpoint saves in its runs whether or not a
+ * storage of the repository has a state.
  */
 bool
 txn_memtable_branch_filled(HostIoIo *io, StdVec *result, HostError *error)
@@ -1116,7 +1211,7 @@ txn_memtable_branch_prepare(HostIoIo *io, HostSharedRecord deltas, const uint8 *
 	TxnMemtableTableReservation unstored;
 
 	return txn_memtable_table_prepared(io, &aim, 1, false, none, inside, inside_captures, inside_drop, &has_unstored,
-									   &unstored, error);
+									   &unstored, NULL, error);
 }
 
 /*
@@ -1135,12 +1230,14 @@ txn_memtable_branch_finish(HostIoIo *io, TxnMemtableTablePreparedBranchDeltas *p
 	TxnMemtableVersionChange change = {.writer = writer, .op = &op, .lock = TXN_MEMTABLE_LOCK_MODE_KEY_SHARE,
 	.shown = {.tag = TXN_MEMTABLE_VERSION_SHOWN_COMMAND}, .has_lsn = has_lsn, .lsn = lsn};
 	bool		pushed;
+	TxnStatusRoomed unroomed = {0};
 
 	op.u.put.value = *chunk;
 	std_vec_new(chunk, 1, 1);
 	std_vec_new(&op.u.put.addresses, sizeof(chunks_TupleU32Locator_t), _Alignof(chunks_TupleU32Locator_t));
 	std_vec_new(&op.u.put.values, sizeof(uint32), _Alignof(uint32));
-	pushed = txn_memtable_table_pushed(HOST_IO_IO_TAKES_SHORT(io), prepared, 0, &change, result, error);
+	pushed = txn_memtable_table_pushed(HOST_IO_IO_TAKES_SHORT(io), prepared, 0, &change, false,
+									   unroomed, result, error);
 	*chunk = op.u.put.value;
 	return pushed;
 }
@@ -2548,7 +2645,7 @@ test_txn_memtable_branch_tests_an_abort_leaves_the_chunk_a_committed_transaction
 								 host_Error_Debug_fmt);
 	txn_memtable_branch_tests_chunks(812, 68, io, deltas, 4, txn_memtable_branch_tests_wrote(aborted), false, 0);
 	simc_abort(aborted);
-	if (!txn_written_aborted(io, &error))
+	if (!txn_written_aborted(io, 0, &error))
 		STD_RESULT_EXPECT_FAILED(814, 37, "called `Result::unwrap()` on an `Err` value", &error,
 								 host_Error_Debug_fmt);
 	txn_memtable_branch_tests_got_is(815, 9, 815, 58, io, deltas, 4, "chunk");
